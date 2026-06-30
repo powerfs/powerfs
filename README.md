@@ -5,7 +5,7 @@ PowerFS
 
 *Next\-generation high\-performance unified storage for HPC \& AI super clusters*
 
-[Introduction](https://www.doubao.cn) • [Architecture](https://www.doubao.cn) • [Core Features](https://www.doubao.cn) • [Roadmap](https://www.doubao.cn) • [Scenarios](https://www.doubao.cn) • [Benchmark](https://www.doubao.cn) • [License](https://www.doubao.cn)
+[Introduction](https://github.com/FudanPPI/powerfs/tree/master#introduction) • [Architecture](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Core Features](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Roadmap](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Scenarios](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Benchmark](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [License](https://github.com/FudanPPI/powerfs/tree/master#architecture)
 
 
 
