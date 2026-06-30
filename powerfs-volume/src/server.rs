@@ -10,7 +10,6 @@ use powerfs_common::{
 use powerfs_core::storage::StorageManager;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
-use uuid::Uuid;
 
 pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
@@ -46,10 +45,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::CreateVolumeResponse>, Status> {
         let req = request.into_inner();
 
-        let volume_id = VolumeId(
-            Uuid::parse_str(&req.volume_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid volume id: {}", e)))?,
-        );
+        let volume_id = VolumeId(req.volume_id);
 
         let result = self
             .storage_manager
@@ -60,7 +56,7 @@ impl VolumeService for VolumeServer {
                 debug!("Created volume: {:?}", info.id);
                 Ok(Response::new(crate::proto::CreateVolumeResponse {
                     success: true,
-                    volume_id: info.id.0.to_string(),
+                    volume_id: info.id.0,
                 }))
             }
             Err(e) => {
@@ -76,10 +72,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
 
-        let volume_id = VolumeId(
-            Uuid::parse_str(&req.volume_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid volume id: {}", e)))?,
-        );
+        let volume_id = VolumeId(req.volume_id);
 
         match self.storage_manager.delete_volume(&volume_id) {
             Ok(_) => {
@@ -101,20 +94,19 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::WriteNeedleResponse>, Status> {
         let req = request.into_inner();
 
-        let volume_id = VolumeId(
-            Uuid::parse_str(&req.volume_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid volume id: {}", e)))?,
-        );
+        let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
 
         let storage_manager = self.storage_manager.clone();
 
         tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                let result = volume.write_needle(Bytes::from(req.data));
+                let result = volume.write_needle(file_key, Bytes::from(req.data));
                 match result {
                     Ok(info) => Ok(Response::new(crate::proto::WriteNeedleResponse {
                         success: true,
-                        needle_id: info.id.0.to_string(),
+                        volume_id: volume_id.0,
+                        file_key: info.id.0,
                         offset: info.offset,
                     })),
                     Err(e) => Err(Status::internal(format!("{}", e))),
@@ -136,15 +128,8 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::ReadNeedleResponse>, Status> {
         let req = request.into_inner();
 
-        let volume_id = VolumeId(
-            Uuid::parse_str(&req.volume_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid volume id: {}", e)))?,
-        );
-
-        let needle_id = NeedleId(
-            Uuid::parse_str(&req.needle_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid needle id: {}", e)))?,
-        );
+        let volume_id = VolumeId(req.volume_id);
+        let needle_id = NeedleId(req.file_key);
 
         let storage_manager = self.storage_manager.clone();
 
@@ -175,15 +160,8 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::DeleteNeedleResponse>, Status> {
         let req = request.into_inner();
 
-        let volume_id = VolumeId(
-            Uuid::parse_str(&req.volume_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid volume id: {}", e)))?,
-        );
-
-        let needle_id = NeedleId(
-            Uuid::parse_str(&req.needle_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid needle id: {}", e)))?,
-        );
+        let volume_id = VolumeId(req.volume_id);
+        let needle_id = NeedleId(req.file_key);
 
         let storage_manager = self.storage_manager.clone();
 
@@ -216,12 +194,13 @@ impl VolumeService for VolumeServer {
         let volume_infos: Vec<crate::proto::VolumeInfo> = volumes
             .into_iter()
             .map(|v| crate::proto::VolumeInfo {
-                volume_id: v.id.0.to_string(),
+                volume_id: v.id.0,
                 node_id: v.node_id.0,
                 size: v.size,
                 used: v.used,
                 replica_count: v.replica_count,
                 state: v.state as i32,
+                next_file_key: v.next_file_key,
             })
             .collect();
 

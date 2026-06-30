@@ -3,8 +3,9 @@ use log::info;
 
 mod commands;
 mod client;
+mod volume_client;
 
-use commands::{StatusArgs, AssignArgs, LookupArgs, VolumeListArgs, HeartbeatArgs, GrowArgs};
+use commands::{StatusArgs, AssignArgs, LookupArgs, VolumeListArgs, HeartbeatArgs, GrowArgs, WriteArgs, ReadArgs};
 
 /// PowerFS CLI tool for testing and administration
 #[derive(Parser)]
@@ -44,6 +45,12 @@ enum Commands {
 
     /// Request volume growth
     Grow(GrowArgs),
+
+    /// Write data to volume server
+    Write(WriteArgs),
+
+    /// Read data from volume server
+    Read(ReadArgs),
 }
 
 #[tokio::main]
@@ -72,6 +79,8 @@ async fn main() {
         Commands::VolumeList(args) => commands::volume_list(client, args).await,
         Commands::Heartbeat(args) => commands::heartbeat(client, args).await,
         Commands::Grow(args) => commands::grow(client, args).await,
+        Commands::Write(args) => commands::write(args).await,
+        Commands::Read(args) => commands::read(args).await,
     };
 
     if let Err(e) = result {

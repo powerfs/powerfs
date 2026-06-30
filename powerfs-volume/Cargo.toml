@@ -3,16 +3,24 @@ name = "powerfs-volume"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "powerfs-volume"
+path = "src/main.rs"
+
 [build-dependencies]
 tonic-build = { version = "0.11" }
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
+powerfs-master = { path = "../powerfs-master" }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 tonic = { workspace = true }
 prost = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }

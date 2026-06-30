@@ -8,6 +8,7 @@ description = "CLI tool for PowerFS testing and administration"
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-volume = { path = "../powerfs-volume" }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tonic = { workspace = true }

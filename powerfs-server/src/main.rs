@@ -179,7 +179,7 @@ async fn run_master(
         None => format!("0.0.0.0:{}", port),
     };
 
-    let master = MasterNode::new(&address, None).await?;
+    let master = MasterNode::new(&address, None, &raft_dir).await?;
 
     info!("Master node initialized: {:?}", master.id());
     info!("Listening on: {}", address);
@@ -187,7 +187,7 @@ async fn run_master(
     info!("Raft directory: {}", raft_dir);
     info!("Meta directory: {}", meta_dir);
 
-    master.start().await?;
+    Arc::new(master).start().await?;
 
     Ok(())
 }

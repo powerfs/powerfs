@@ -13,17 +13,17 @@ service VolumeService {
 }
 
 message CreateVolumeRequest {
-    string volume_id = 1;
+    uint32 volume_id = 1;
     uint64 size = 2;
 }
 
 message CreateVolumeResponse {
     bool success = 1;
-    string volume_id = 2;
+    uint32 volume_id = 2;
 }
 
 message DeleteVolumeRequest {
-    string volume_id = 1;
+    uint32 volume_id = 1;
 }
 
 message DeleteVolumeResponse {
@@ -31,19 +31,21 @@ message DeleteVolumeResponse {
 }
 
 message WriteNeedleRequest {
-    string volume_id = 1;
-    bytes data = 2;
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    bytes data = 3;
 }
 
 message WriteNeedleResponse {
     bool success = 1;
-    string needle_id = 2;
-    uint64 offset = 3;
+    uint32 volume_id = 2;
+    uint64 file_key = 3;
+    uint64 offset = 4;
 }
 
 message ReadNeedleRequest {
-    string volume_id = 1;
-    string needle_id = 2;
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
 }
 
 message ReadNeedleResponse {
@@ -52,8 +54,8 @@ message ReadNeedleResponse {
 }
 
 message DeleteNeedleRequest {
-    string volume_id = 1;
-    string needle_id = 2;
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
 }
 
 message DeleteNeedleResponse {
@@ -67,12 +69,13 @@ message ListVolumesResponse {
 }
 
 message VolumeInfo {
-    string volume_id = 1;
+    uint32 volume_id = 1;
     string node_id = 2;
     uint64 size = 3;
     uint64 used = 4;
     uint32 replica_count = 5;
     int32 state = 6;
+    uint64 next_file_key = 7;
 }
 
 message GetNodeInfoRequest {}

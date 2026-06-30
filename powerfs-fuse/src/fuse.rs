@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use chrono::Utc;
+use rand::Rng;
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
@@ -289,8 +290,9 @@ impl FileSystem for PowerFsFs {
                         let mut buf = vec![0u8; size as usize];
                         let read_len = _r.read(&mut buf).unwrap_or(0);
                         if read_len > 0 {
+                            let file_key = rand::thread_rng().gen::<u64>();
                             if let Ok(needle_info) =
-                                volume.write_needle(Bytes::from(buf[..read_len].to_vec()))
+                                volume.write_needle(file_key, Bytes::from(buf[..read_len].to_vec()))
                             {
                                 meta.volume_ids.push(volume_id);
                                 meta.needle_ids.push(needle_info.id);

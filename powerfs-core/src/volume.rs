@@ -6,7 +6,6 @@ use powerfs_common::{
     constants::VOLUME_DATA_OFFSET,
     error::{PowerFsError, Result},
     types::{Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo, VolumeState},
-    utils::generate_needle_id,
 };
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -101,7 +100,7 @@ impl Volume {
         *self.free_space.read().unwrap()
     }
 
-    pub fn write_needle(&self, data: Bytes) -> Result<NeedleInfo> {
+    pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
             return Err(PowerFsError::InvalidVolumeState(
@@ -109,8 +108,9 @@ impl Volume {
             ));
         }
 
-        let needle_id = generate_needle_id();
-        let needle = Needle::new(needle_id.clone(), self.id(), data);
+        let needle_id = NeedleId(file_key);
+        let volume_id = info_guard.id.clone();
+        let needle = Needle::new(needle_id.clone(), volume_id, data);
 
         let required_space = needle.size() as u64;
         let mut free_space_guard = self.free_space.write().unwrap();
@@ -130,7 +130,20 @@ impl Volume {
         info_guard.used += required_space;
         info_guard.modified_at = Utc::now();
 
-        let needle_info = needle.to_info();
+        let needle_info = NeedleInfo {
+            id: needle_id.clone(),
+            volume_id: info_guard.id.clone(),
+            data_size: needle.data.len() as u32,
+            offset,
+            checksum: needle.checksum,
+            created_at: Utc::now(),
+        };
+        
+        drop(file_guard);
+        drop(next_offset_guard);
+        drop(free_space_guard);
+        drop(info_guard);
+        
         self.index.insert(needle_id, needle_info.clone());
 
         Ok(needle_info)
