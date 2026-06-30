@@ -158,6 +158,203 @@ PowerFS targets leading performance among mainstream open\-source distributed st
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- Rust 1.70+ (with cargo)
+- Protobuf compiler (`protoc`)
+- FUSE development libraries (for FUSE client)
+- Linux kernel headers (for FUSE)
+
+#### Ubuntu/Debian
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    protobuf-compiler \
+    libfuse-dev \
+    linux-headers-generic
+```
+
+#### CentOS/RHEL
+
+```bash
+sudo yum install -y \
+    protobuf-compiler \
+    fuse-devel
+```
+
+### Build
+
+```bash
+# Clone the repository
+git clone https://github.com/powerfs/powerfs.git
+cd powerfs
+
+# Build all packages
+cargo build --all
+
+# Build in release mode
+cargo build --all --release
+
+# Build and install to PATH
+cargo install --path powerfs-server
+```
+
+### Quick Start
+
+Run PowerFS similar to SeaweedFS:
+
+```bash
+# Step 1: Start master node (default port 9333)
+powerfs master
+
+# Step 2: Start volume node connected to master
+powerfs volume -m localhost:9333
+
+# Step 3: Start filer (REST API, default port 8888)
+powerfs filer -m localhost:9333
+
+# Step 4: Mount FUSE filesystem
+powerfs mount -d /mnt/powerfs -m localhost:9333
+```
+
+### Run
+
+#### Start Master Node
+
+```bash
+# Start master node with default settings
+powerfs master
+
+# Start with custom port and directory
+powerfs master -p 9333 -d ./data/master
+
+# Bind to specific IP
+powerfs master -p 9333 -i 192.168.1.100
+```
+
+#### Start Volume Node
+
+```bash
+# Start volume node with minimal configuration
+powerfs volume -m localhost:9333
+
+# Start with custom settings
+powerfs volume -p 8080 -d ./data/volume -m localhost:9333
+
+# Bind to specific IP with custom max volume size
+powerfs volume -p 8080 -i 192.168.1.101 -d ./data/volume -m localhost:9333 -s 2147483648
+```
+
+#### Start Filer
+
+```bash
+# Start filer connected to master
+powerfs filer -m localhost:9333
+
+# Start with custom port
+powerfs filer -p 8888 -m localhost:9333
+
+# Bind to specific IP
+powerfs filer -p 8888 -i 192.168.1.100 -m localhost:9333
+```
+
+#### Mount FUSE Filesystem
+
+```bash
+# Mount PowerFS to /mnt/powerfs
+powerfs mount -d /mnt/powerfs
+
+# Mount with master connection
+powerfs mount -d /mnt/powerfs -m localhost:9333
+
+# Alternative: use fuse command
+powerfs fuse -d /mnt/powerfs -m localhost:9333
+```
+
+### Command Line Options
+
+```bash
+PowerFS - Zero-jitter unified parallel file system
+
+Usage: powerfs [OPTIONS] <COMMAND>
+
+Commands:
+  master   Start master node (port: 9333, dir: ./data/master)
+  volume   Start volume node (port: 8080, dir: ./data/volume)
+  filer    Start filer (REST API, port: 8888)
+  fuse     Mount FUSE filesystem
+  mount    Mount filesystem (alias for fuse)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --log-level <LOG_LEVEL>  Log level [default: info]
+  -h, --help                   Print help
+  -V, --version                Print version
+
+Master Options:
+  -p, --port <PORT>    Master port [default: 9333]
+  -d, --dir <DIR>      Data directory [default: ./data/master]
+  -i, --ip <IP>        Bind IP address
+
+Volume Options:
+  -p, --port <PORT>           Volume port [default: 8080]
+  -d, --dir <DIR>             Data directory [default: ./data/volume]
+  -m, --master <MASTER>       Master address
+  -i, --ip <IP>               Bind IP address
+  -s, --max-volume-size <MAX_VOLUME_SIZE>  Max volume size in bytes [default: 1073741824]
+
+Filer Options:
+  -p, --port <PORT>    Filer port [default: 8888]
+  -m, --master <MASTER>  Master address
+  -i, --ip <IP>        Bind IP address
+
+Mount/Fuse Options:
+  -d, --dir <DIR>      Mount directory
+  -m, --master <MASTER>  Master address
+```
+
+### Run Tests
+
+```bash
+# Run all tests
+cargo test --all
+
+# Run tests for specific package
+cargo test -p powerfs-core
+```
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Client Layer                           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
+│  │  FUSE    │  │  Filer   │  │      KV Cache Client     │  │
+│  │  Mount   │  │  (HTTP)  │  │  (for LLM Inference)     │  │
+│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
+└───────┼──────────────┼───────────────────┼─────────────────┘
+        │              │                   │
+┌───────▼──────────────▼───────────────────▼─────────────────┐
+│                    Master Layer                            │
+│              (Raft Consensus Cluster)                       │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Cluster Management | Resource Allocation | Metadata │  │
+│  └──────────────────────────────────────────────────────┘  │
+└──────────────────────┬─────────────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────────────┐
+│                   Volume Layer                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │     │
+│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## License
 
 Open Source License To Be Determined \(Planned: Apache 2\.0 / MIT\)

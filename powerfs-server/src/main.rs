@@ -24,41 +24,61 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Master {
-        #[arg(long, default_value = "127.0.0.1:9333")]
-        address: String,
+        #[arg(long, short, default_value = "9333")]
+        port: u16,
+        
+        #[arg(long, short, default_value = "./data/master")]
+        dir: String,
         
         #[arg(long)]
-        data_path: Option<String>,
+        ip: Option<String>,
     },
     
     Volume {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        address: String,
+        #[arg(long, short, default_value = "8080")]
+        port: u16,
+        
+        #[arg(long, short, default_value = "./data/volume")]
+        dir: String,
+        
+        #[arg(long, short)]
+        master: String,
         
         #[arg(long)]
-        master_address: String,
+        ip: Option<String>,
+        
+        #[arg(long, short, default_value = "1073741824")]
+        max_volume_size: u64,
+    },
+    
+    Filer {
+        #[arg(long, short, default_value = "8888")]
+        port: u16,
+        
+        #[arg(long, short)]
+        master: String,
         
         #[arg(long)]
-        data_path: Option<String>,
+        ip: Option<String>,
     },
     
     Fuse {
-        #[arg(long)]
-        mount_point: String,
+        #[arg(long, short)]
+        dir: String,
         
-        #[arg(long)]
-        master_address: Option<String>,
+        #[arg(long, short)]
+        master: Option<String>,
+        
+        #[arg(long, short, default_value = "8080")]
+        volume_port: u16,
     },
     
-    CreateVolume {
-        #[arg(long)]
-        master_address: String,
+    Mount {
+        #[arg(long, short)]
+        dir: String,
         
-        #[arg(long)]
-        node_id: String,
-        
-        #[arg(long, default_value = "1073741824")]
-        size: u64,
+        #[arg(long, short)]
+        master: Option<String>,
     },
 }
 
@@ -77,70 +97,109 @@ async fn main() -> Result<()> {
         .init();
     
     match cli.command {
-        Commands::Master { address, data_path } => {
-            run_master(&address, data_path).await
+        Commands::Master { port, dir, ip } => {
+            run_master(port, &dir, ip).await
         }
         
-        Commands::Volume { address, master_address, data_path } => {
-            run_volume(&address, &master_address, data_path).await
+        Commands::Volume { port, dir, master, ip, max_volume_size } => {
+            run_volume(port, &dir, &master, ip, max_volume_size).await
         }
         
-        Commands::Fuse { mount_point, master_address } => {
-            run_fuse(&mount_point, master_address).await
+        Commands::Filer { port, master, ip } => {
+            run_filer(port, &master, ip).await
         }
         
-        Commands::CreateVolume { master_address, node_id, size } => {
-            create_volume(&master_address, &node_id, size).await
+        Commands::Fuse { dir, master, volume_port } => {
+            run_fuse(&dir, master, volume_port).await
+        }
+        
+        Commands::Mount { dir, master } => {
+            run_mount(&dir, master).await
         }
     }
 }
 
-async fn run_master(address: &str, data_path: Option<String>) -> Result<()> {
+async fn run_master(port: u16, dir: &str, ip: Option<String>) -> Result<()> {
     info!("Starting PowerFS Master node");
     
-    let data_dir = data_path.unwrap_or_else(|| "./data/master".to_string());
-    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(dir)?;
     
-    let master = MasterNode::new(address, None).await?;
+    let address = match ip {
+        Some(ip) => format!("{}:{}", ip, port),
+        None => format!("0.0.0.0:{}", port),
+    };
+    
+    let master = MasterNode::new(&address, None).await?;
     
     info!("Master node initialized: {:?}", master.id());
     info!("Listening on: {}", address);
+    info!("Data directory: {}", dir);
     
     master.start().await?;
     
     Ok(())
 }
 
-async fn run_volume(address: &str, master_address: &str, data_path: Option<String>) -> Result<()> {
+async fn run_volume(port: u16, dir: &str, master: &str, ip: Option<String>, _max_volume_size: u64) -> Result<()> {
     info!("Starting PowerFS Volume node");
     
     let node_id = generate_node_id();
-    let data_dir = data_path.unwrap_or_else(|| "./data/volume".to_string());
-    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(dir)?;
     
-    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), data_dir));
+    let address = match ip {
+        Some(ip) => format!("{}:{}", ip, port),
+        None => format!("0.0.0.0:{}", port),
+    };
+    
+    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), dir.to_string()));
     
     storage_manager.load_volumes()?;
     
     info!("Volume node initialized: {:?}", node_id);
-    info!("Connected to master: {}", master_address);
+    info!("Listening on: {}", address);
+    info!("Data directory: {}", dir);
+    info!("Connected to master: {}", master);
     
     tokio::signal::ctrl_c().await?;
     
     Ok(())
 }
 
-async fn run_fuse(mount_point: &str, master_address: Option<String>) -> Result<()> {
+async fn run_filer(port: u16, master: &str, ip: Option<String>) -> Result<()> {
+    info!("Starting PowerFS Filer");
+    
+    let address = match ip {
+        Some(ip) => format!("{}:{}", ip, port),
+        None => format!("0.0.0.0:{}", port),
+    };
+    
+    info!("Filer initialized");
+    info!("Listening on: {}", address);
+    info!("Connected to master: {}", master);
+    
+    tokio::signal::ctrl_c().await?;
+    
+    Ok(())
+}
+
+async fn run_fuse(dir: &str, master: Option<String>, volume_port: u16) -> Result<()> {
     info!("Starting PowerFS FUSE client");
     
     let node_id = generate_node_id();
-    let storage_manager = Arc::new(StorageManager::new(node_id, "./data/fuse".to_string()));
+    let data_dir = format!("./data/fuse_{}", volume_port);
+    std::fs::create_dir_all(&data_dir)?;
+    
+    let storage_manager = Arc::new(StorageManager::new(node_id, data_dir));
     
     storage_manager.load_volumes()?;
     
-    let fuse_client = FuseClient::new(storage_manager, mount_point);
+    let fuse_client = FuseClient::new(storage_manager, dir);
     
-    info!("Mounting PowerFS at: {}", mount_point);
+    info!("Mounting PowerFS at: {}", dir);
+    
+    if let Some(m) = &master {
+        info!("Connected to master: {}", m);
+    }
     
     if let Err(e) = fuse_client.mount().await {
         error!("Failed to mount FUSE: {}", e);
@@ -154,8 +213,23 @@ async fn run_fuse(mount_point: &str, master_address: Option<String>) -> Result<(
     Ok(())
 }
 
-async fn create_volume(master_address: &str, node_id: &str, size: u64) -> Result<()> {
-    info!("Creating volume on node: {}", node_id);
+async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
+    info!("Mounting PowerFS at: {}", dir);
+    
+    if let Some(m) = &master {
+        info!("Connected to master: {}", m);
+    }
+    
+    let node_id = generate_node_id();
+    let storage_manager = Arc::new(StorageManager::new(node_id, "./data/mount".to_string()));
+    storage_manager.load_volumes()?;
+    
+    let fuse_client = FuseClient::new(storage_manager, dir);
+    fuse_client.mount().await?;
+    
+    tokio::signal::ctrl_c().await?;
+    
+    fuse_client.unmount().await?;
     
     Ok(())
 }
