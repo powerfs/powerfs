@@ -9,6 +9,7 @@ use crate::error::Result;
 /// 
 /// Defines the interface that all storage backends must implement.
 /// This allows for easy swapping of storage implementations.
+#[allow(clippy::result_large_err)]
 pub trait StorageBackend: Send + Sync {
     /// Store a key-value pair
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

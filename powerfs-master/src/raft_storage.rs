@@ -1,10 +1,17 @@
 use std::collections::VecDeque;
 use std::sync::RwLock;
-use log::{debug, warn};
+use log::debug;
 
 pub struct MasterRaftStorage {
     entries: RwLock<VecDeque<Vec<u8>>>,
+    #[allow(dead_code)]
     applied_index: RwLock<u64>,
+}
+
+impl Default for MasterRaftStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MasterRaftStorage {
@@ -23,5 +30,9 @@ impl MasterRaftStorage {
 
     pub fn len(&self) -> usize {
         self.entries.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

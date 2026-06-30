@@ -3,6 +3,7 @@ use powerfs_common::{
     error::{PowerFsError, Result},
 };
 use lru::LruCache;
+use serde_json;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use sled::Db;
@@ -13,6 +14,9 @@ pub trait NeedleIndex: Send + Sync {
     fn remove(&self, needle_id: &NeedleId) -> Option<NeedleInfo>;
     fn contains(&self, needle_id: &NeedleId) -> bool;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub struct MemoryIndex {
@@ -64,6 +68,7 @@ pub struct PersistentIndex {
     lru: RwLock<LruCache<NeedleId, NeedleInfo>>,
 }
 
+#[allow(clippy::result_large_err)]
 impl PersistentIndex {
     pub fn new(path: &str) -> Result<Self> {
         let db = sled::open(path).map_err(|e| PowerFsError::Internal(format!("sled error: {}", e)))?;

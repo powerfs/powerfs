@@ -5,6 +5,7 @@ use powerfs_common::{
     error::{PowerFsError, Result},
 };
 use bytes::Bytes;
+use uuid::Uuid;
 use chrono::Utc;
 use std::io::{Read, Write, Seek, SeekFrom};
 
@@ -17,6 +18,7 @@ pub struct Needle {
     pub checksum: u64,
 }
 
+#[allow(clippy::result_large_err)]
 impl Needle {
     pub fn new(id: NeedleId, volume_id: VolumeId, data: Bytes) -> Self {
         let checksum = calculate_checksum(&data);
@@ -60,7 +62,7 @@ impl Needle {
 
         let mut id_bytes = [0u8; NEEDLE_ID_SIZE];
         id_bytes.copy_from_slice(&bytes[0..NEEDLE_ID_SIZE]);
-        let id = NeedleId(uuid::Uuid::from_bytes(id_bytes));
+        let id = NeedleId(Uuid::from_bytes(id_bytes));
 
         let mut data_size_bytes = [0u8; 4];
         data_size_bytes.copy_from_slice(&bytes[NEEDLE_ID_SIZE..NEEDLE_ID_SIZE + 4]);
@@ -97,15 +99,12 @@ impl Needle {
     pub fn read_from<R: Read + Seek>(reader: &mut R, offset: u64, volume_id: VolumeId) -> Result<Self> {
         reader.seek(SeekFrom::Start(offset))?;
         
-        let mut header = [0u8; NEEDLE_HEADER_SIZE];
-        reader.read_exact(&mut header)?;
-        
         let mut id_bytes = [0u8; NEEDLE_ID_SIZE];
-        id_bytes.copy_from_slice(&header[0..NEEDLE_ID_SIZE]);
-        let id = NeedleId(uuid::Uuid::from_bytes(id_bytes));
+        reader.read_exact(&mut id_bytes)?;
+        let id = NeedleId(Uuid::from_bytes(id_bytes));
         
         let mut data_size_bytes = [0u8; 4];
-        data_size_bytes.copy_from_slice(&header[NEEDLE_ID_SIZE..NEEDLE_ID_SIZE + 4]);
+        reader.read_exact(&mut data_size_bytes)?;
         let data_size = u32::from_be_bytes(data_size_bytes) as usize;
         
         let mut data = vec![0u8; data_size];

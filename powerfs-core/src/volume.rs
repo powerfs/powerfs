@@ -20,6 +20,7 @@ pub struct Volume {
     next_offset: RwLock<u64>,
 }
 
+#[allow(clippy::result_large_err)]
 impl Volume {
     pub fn new(id: VolumeId, node_id: &str, path: &str, size: u64) -> Result<Self> {
         let volume_path = Path::new(path).join(format!("volume_{}", id.0));
@@ -35,12 +36,15 @@ impl Volume {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&data_file_path)?;
         
         let file_size = file.metadata()?.len();
-        let mut file = file;
         if file_size < size {
-            file.set_len(size)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&data_file_path)?
+                .set_len(size)?;
         }
         
         let index: Box<dyn NeedleIndex> = if index_path.exists() {

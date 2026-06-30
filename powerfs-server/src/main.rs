@@ -1,14 +1,12 @@
 use powerfs_common::{
-    types::{NodeId, ClusterConfig, VolumeId},
-    utils::{generate_node_id, generate_volume_id},
-    error::{PowerFsError, Result},
+    utils::generate_node_id,
+    error::Result,
 };
 use powerfs_core::storage::StorageManager;
 use powerfs_master::master::MasterNode;
 use powerfs_fuse::fuse::FuseClient;
-use tokio;
 use clap::{Parser, Subcommand};
-use log::{info, warn, error};
+use log::{info, error};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -112,6 +110,7 @@ enum Commands {
 }
 
 #[tokio::main]
+#[allow(clippy::result_large_err)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     
@@ -191,7 +190,7 @@ async fn run_volume(
     data_dir: Option<String>, 
     master: &str, 
     ip: Option<String>,
-    max_volume_size: u64
+    _max_volume_size: u64
 ) -> Result<()> {
     info!("Starting PowerFS Volume node");
     

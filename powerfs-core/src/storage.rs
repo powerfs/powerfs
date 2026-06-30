@@ -3,6 +3,7 @@ use powerfs_common::{
     error::{PowerFsError, Result},
 };
 use crate::volume::Volume;
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::{RwLock, Arc};
 
@@ -12,6 +13,7 @@ pub struct StorageManager {
     data_path: String,
 }
 
+#[allow(clippy::result_large_err)]
 impl StorageManager {
     pub fn new(node_id: NodeId, data_path: String) -> Self {
         StorageManager {
@@ -123,17 +125,17 @@ impl StorageManager {
             
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if dir_name.starts_with("volume_") {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(&dir_name[7..]) {
+                    if let Some(stripped) = dir_name.strip_prefix("volume_") {
+                        if let Ok(uuid) = Uuid::parse_str(stripped) {
                             let volume_id = VolumeId(uuid);
-                            if !volumes.contains_key(&volume_id) {
+                            if let std::collections::hash_map::Entry::Vacant(e) = volumes.entry(volume_id.clone()) {
                                 let volume = Arc::new(Volume::new(
-                                    volume_id.clone(),
+                                    volume_id,
                                     &self.node_id.0,
                                     &self.data_path,
                                     powerfs_common::constants::DEFAULT_VOLUME_SIZE,
                                 )?);
-                                volumes.insert(volume_id, volume);
+                                e.insert(volume);
                             }
                         }
                     }

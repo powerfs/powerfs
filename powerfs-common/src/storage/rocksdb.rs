@@ -13,6 +13,7 @@ pub struct RocksDbBackend {
     db: DB,
 }
 
+#[allow(clippy::result_large_err)]
 impl RocksDbBackend {
     /// Open or create a RocksDB database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -35,7 +36,7 @@ impl RocksDbBackend {
         let path_str = path.as_ref();
         if !path_str.exists() {
             std::fs::create_dir_all(path_str)
-                .map_err(|e| PowerFsError::Io(e))?;
+                .map_err(PowerFsError::Io)?;
         }
         
         // Optimize for our use case
@@ -64,6 +65,7 @@ impl RocksDbBackend {
     }
 }
 
+#[allow(clippy::result_large_err)]
 impl StorageBackend for RocksDbBackend {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.db.put(key, value)

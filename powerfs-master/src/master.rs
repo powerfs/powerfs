@@ -1,13 +1,14 @@
 use powerfs_common::{
     types::{VolumeId, VolumeInfo, VolumeState, NodeId, NodeInfo, NodeState, ClusterConfig, RaftConfig},
-    constants::{MASTER_DEFAULT_PORT, DEFAULT_VOLUME_SIZE, DEFAULT_REPLICA_COUNT},
+
     utils::{generate_volume_id, generate_node_id},
     error::{PowerFsError, Result},
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::{RwLock, Arc};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
+use chrono::Utc;
 use log::{info, warn, debug};
 
 pub struct MasterNode {
@@ -75,9 +76,8 @@ impl MasterNode {
             return Err(PowerFsError::InvalidRequest("node already exists".to_string()));
         }
         
-        let node_id_clone = node_id.clone();
         let info = NodeInfo {
-            id: node_id_clone.clone(),
+            id: node_id.clone(),
             address,
             rack,
             data_center,
@@ -85,11 +85,11 @@ impl MasterNode {
             used_space: 0,
             volume_count: 0,
             state: NodeState::Healthy,
-            last_heartbeat: chrono::Utc::now(),
+            last_heartbeat: Utc::now(),
         };
         
-        nodes.insert(node_id, info);
-        info!("Added node: {:?}", node_id_clone);
+        nodes.insert(node_id.clone(), info);
+        info!("Added node: {:?}", node_id);
         
         Ok(())
     }
@@ -143,8 +143,8 @@ impl MasterNode {
             used: 0,
             replica_count: config.replication_factor,
             state: VolumeState::Creating,
-            created_at: chrono::Utc::now(),
-            modified_at: chrono::Utc::now(),
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
         };
         
         let mut volumes = self.volumes.write().unwrap();
@@ -172,7 +172,7 @@ impl MasterNode {
         
         if let Some(info) = volumes.get_mut(volume_id) {
             info.state = state;
-            info.modified_at = chrono::Utc::now();
+            info.modified_at = Utc::now();
             Ok(())
         } else {
             Err(PowerFsError::VolumeNotFound(volume_id.clone()))
@@ -197,7 +197,7 @@ impl MasterNode {
         let mut nodes = self.nodes.write().unwrap();
         
         if let Some(info) = nodes.get_mut(node_id) {
-            info.last_heartbeat = chrono::Utc::now();
+            info.last_heartbeat = Utc::now();
             info.state = NodeState::Healthy;
             debug!("Received heartbeat from node: {:?}", node_id);
         } else {

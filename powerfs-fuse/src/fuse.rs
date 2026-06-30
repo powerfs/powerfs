@@ -7,6 +7,7 @@ use powerfs_core::storage::StorageManager;
 use fuse_backend_rs::{
     api::{filesystem::{FileSystem, Context, Entry, DirEntry, ZeroCopyReader, ZeroCopyWriter}},
 };
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{RwLock, Arc};
 use std::ffi::{CStr};
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 use chrono::Utc;
 use libc;
+use nix::mount;
 use log::{info, debug};
 
 struct PowerFsFs {
@@ -65,9 +67,10 @@ fn create_dir_attr(inode: u64) -> libc::stat64 {
     attr.st_size = 0;
     attr.st_blksize = 4096;
     attr.st_blocks = 0;
-    attr.st_atime = chrono::Utc::now().timestamp();
-    attr.st_mtime = chrono::Utc::now().timestamp();
-    attr.st_ctime = chrono::Utc::now().timestamp();
+    let now = Utc::now().timestamp();
+    attr.st_atime = now;
+    attr.st_mtime = now;
+    attr.st_ctime = now;
     attr
 }
 
@@ -81,7 +84,7 @@ fn create_file_attr(inode: u64, meta: &FileMetadata) -> libc::stat64 {
     attr.st_rdev = 0;
     attr.st_size = meta.size as i64;
     attr.st_blksize = 4096;
-    attr.st_blocks = ((meta.size + 4095) / 4096) as i64;
+    attr.st_blocks = meta.size.div_ceil(4096) as i64;
     attr.st_atime = meta.atime.timestamp();
     attr.st_mtime = meta.mtime.timestamp();
     attr.st_ctime = meta.ctime.timestamp();
@@ -99,9 +102,10 @@ fn create_new_file_attr(inode: u64) -> libc::stat64 {
     attr.st_size = 0;
     attr.st_blksize = 4096;
     attr.st_blocks = 0;
-    attr.st_atime = chrono::Utc::now().timestamp();
-    attr.st_mtime = chrono::Utc::now().timestamp();
-    attr.st_ctime = chrono::Utc::now().timestamp();
+    let now = Utc::now().timestamp();
+    attr.st_atime = now;
+    attr.st_mtime = now;
+    attr.st_ctime = now;
     attr
 }
 
@@ -190,7 +194,7 @@ impl FileSystem for PowerFsFs {
         }
     }
 
-    fn read(&self, _ctx: &Context, inode: Self::Inode, _handle: Self::Handle, _w: &mut dyn ZeroCopyWriter, size: u32, offset: u64, _lock_owner: Option<u64>, _flags: u32) -> std::io::Result<usize> {
+    fn read(&self, _ctx: &Context, inode: Self::Inode, _handle: Self::Handle, w: &mut dyn ZeroCopyWriter, size: u32, offset: u64, _lock_owner: Option<u64>, _flags: u32) -> std::io::Result<usize> {
         if let Some(meta) = self.inode_to_metadata(inode) {
             if !meta.needle_ids.is_empty() {
                 if let Some(volume_id) = meta.volume_ids.first() {
@@ -199,7 +203,9 @@ impl FileSystem for PowerFsFs {
                             if let Ok(data) = volume.read_needle(needle_id) {
                                 let start = std::cmp::min(offset as usize, data.len());
                                 let end = std::cmp::min(start + size as usize, data.len());
-                                return Ok(end - start);
+                                let slice = &data[start..end];
+                                w.write_all(slice)?;
+                                return Ok(slice.len());
                             }
                         }
                     }
@@ -221,13 +227,14 @@ impl FileSystem for PowerFsFs {
                 if let Some(volume_id) = self.storage_manager.find_available_volume() {
                     if let Some(volume) = self.storage_manager.get_volume(&volume_id) {
                         let mut buf = vec![0u8; size as usize];
-                        if let Ok(_) = _r.read_exact(&mut buf) {
-                            if let Ok(needle_info) = volume.write_needle(bytes::Bytes::from(buf)) {
+                        let read_len = _r.read(&mut buf).unwrap_or(0);
+                        if read_len > 0 {
+                            if let Ok(needle_info) = volume.write_needle(Bytes::from(buf[..read_len].to_vec())) {
                                 meta.volume_ids.push(volume_id);
                                 meta.needle_ids.push(needle_info.id);
                                 meta.size = data_len;
                                 meta.mtime = Utc::now();
-                                return Ok(size as usize);
+                                return Ok(read_len);
                             }
                         }
                     }
@@ -270,6 +277,7 @@ impl FileSystem for PowerFsFs {
 }
 
 pub struct FuseClient {
+    #[allow(dead_code)]
     fs: Arc<PowerFsFs>,
     mount_point: String,
 }
@@ -295,7 +303,7 @@ impl FuseClient {
 
     pub async fn unmount(&self) -> Result<()> {
         info!("Unmounting PowerFS from: {}", self.mount_point);
-        let _ = nix::mount::umount(self.mount_point.as_str());
+        let _ = mount::umount(self.mount_point.as_str());
         Ok(())
     }
 }

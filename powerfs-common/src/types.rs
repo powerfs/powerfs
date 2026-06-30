@@ -51,8 +51,9 @@ pub struct VolumeInfo {
     pub modified_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VolumeState {
+    #[default]
     Creating,
     Available,
     Full,
@@ -83,8 +84,9 @@ pub struct NodeInfo {
     pub last_heartbeat: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NodeState {
+    #[default]
     Healthy,
     Degraded,
     Unavailable,
@@ -130,18 +132,6 @@ pub struct ClusterConfig {
     pub max_volumes_per_node: u32,
     pub rack_awareness_enabled: bool,
     pub data_center_awareness_enabled: bool,
-}
-
-impl Default for VolumeState {
-    fn default() -> Self {
-        VolumeState::Creating
-    }
-}
-
-impl Default for NodeState {
-    fn default() -> Self {
-        NodeState::Healthy
-    }
 }
 
 impl Default for RaftConfig {

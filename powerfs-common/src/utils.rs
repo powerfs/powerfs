@@ -73,10 +73,10 @@ pub fn humanize_size(bytes: u64) -> String {
     const TB: u64 = GB * 1024;
 
     match bytes {
-        0..=KB => format!("{} B", bytes),
-        KB..=MB => format!("{:.2} KB", bytes as f64 / KB as f64),
-        MB..=GB => format!("{:.2} MB", bytes as f64 / MB as f64),
-        GB..=TB => format!("{:.2} GB", bytes as f64 / GB as f64),
+        0..KB => format!("{} B", bytes),
+        KB..MB => format!("{:.2} KB", bytes as f64 / KB as f64),
+        MB..GB => format!("{:.2} MB", bytes as f64 / MB as f64),
+        GB..TB => format!("{:.2} GB", bytes as f64 / GB as f64),
         _ => format!("{:.2} TB", bytes as f64 / TB as f64),
     }
 }

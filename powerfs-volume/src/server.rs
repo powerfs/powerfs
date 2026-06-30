@@ -1,10 +1,13 @@
+#![allow(clippy::result_large_err)]
+
 use powerfs_common::{
-    types::{VolumeId, VolumeInfo, NeedleId, NodeId},
-    utils::{generate_node_id},
+    types::{VolumeId, NeedleId, NodeId},
     error::{PowerFsError, Result},
 };
 use powerfs_core::storage::StorageManager;
 use crate::proto::{VolumeService, VolumeServiceServer};
+use bytes::Bytes;
+use uuid::Uuid;
 use std::sync::Arc;
 use tonic::{transport::Server, Request, Response, Status};
 use log::{info, debug, warn};
@@ -31,7 +34,7 @@ impl VolumeServer {
             .add_service(VolumeServiceServer::new(self))
             .serve(addr)
             .await
-            .map_err(|e| PowerFsError::TonicTransport(e))
+            .map_err(PowerFsError::TonicTransport)
     }
 }
 
@@ -43,7 +46,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::CreateVolumeResponse>, Status> {
         let req = request.into_inner();
         
-        let volume_id = VolumeId(uuid::Uuid::parse_str(&req.volume_id).map_err(|e| {
+        let volume_id = VolumeId(Uuid::parse_str(&req.volume_id).map_err(|e| {
             Status::invalid_argument(format!("invalid volume id: {}", e))
         })?);
         
@@ -70,7 +73,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
         
-        let volume_id = VolumeId(uuid::Uuid::parse_str(&req.volume_id).map_err(|e| {
+        let volume_id = VolumeId(Uuid::parse_str(&req.volume_id).map_err(|e| {
             Status::invalid_argument(format!("invalid volume id: {}", e))
         })?);
         
@@ -92,7 +95,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::WriteNeedleResponse>, Status> {
         let req = request.into_inner();
         
-        let volume_id = VolumeId(uuid::Uuid::parse_str(&req.volume_id).map_err(|e| {
+        let volume_id = VolumeId(Uuid::parse_str(&req.volume_id).map_err(|e| {
             Status::invalid_argument(format!("invalid volume id: {}", e))
         })?);
         
@@ -100,7 +103,7 @@ impl VolumeService for VolumeServer {
         
         tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                let result = volume.write_needle(bytes::Bytes::from(req.data));
+                let result = volume.write_needle(Bytes::from(req.data));
                 match result {
                     Ok(info) => Ok(Response::new(crate::proto::WriteNeedleResponse {
                         success: true,
@@ -121,11 +124,11 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::ReadNeedleResponse>, Status> {
         let req = request.into_inner();
         
-        let volume_id = VolumeId(uuid::Uuid::parse_str(&req.volume_id).map_err(|e| {
+        let volume_id = VolumeId(Uuid::parse_str(&req.volume_id).map_err(|e| {
             Status::invalid_argument(format!("invalid volume id: {}", e))
         })?);
         
-        let needle_id = NeedleId(uuid::Uuid::parse_str(&req.needle_id).map_err(|e| {
+        let needle_id = NeedleId(Uuid::parse_str(&req.needle_id).map_err(|e| {
             Status::invalid_argument(format!("invalid needle id: {}", e))
         })?);
         
@@ -153,11 +156,11 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::DeleteNeedleResponse>, Status> {
         let req = request.into_inner();
         
-        let volume_id = VolumeId(uuid::Uuid::parse_str(&req.volume_id).map_err(|e| {
+        let volume_id = VolumeId(Uuid::parse_str(&req.volume_id).map_err(|e| {
             Status::invalid_argument(format!("invalid volume id: {}", e))
         })?);
         
-        let needle_id = NeedleId(uuid::Uuid::parse_str(&req.needle_id).map_err(|e| {
+        let needle_id = NeedleId(Uuid::parse_str(&req.needle_id).map_err(|e| {
             Status::invalid_argument(format!("invalid needle id: {}", e))
         })?);
         

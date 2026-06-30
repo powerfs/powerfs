@@ -1,131 +1,31 @@
-warning: multiple patterns overlap on their endpoints
-  --> powerfs-common/src/utils.rs:77:9
-   |
-76 |         0..=KB => format!("{} B", bytes),
-   |         ------ this range overlaps on `1024_u64`...
-77 |         KB..=MB => format!("{:.2} KB", bytes as f64 / KB as f64),
-   |         ^^^^^^^ ... with this range
-   |
-   = note: you likely meant to write mutually exclusive ranges
-   = note: `#[warn(overlapping_range_endpoints)]` on by default
-
-warning: multiple patterns overlap on their endpoints
-  --> powerfs-common/src/utils.rs:78:9
-   |
-77 |         KB..=MB => format!("{:.2} KB", bytes as f64 / KB as f64),
-   |         ------- this range overlaps on `1048576_u64`...
-78 |         MB..=GB => format!("{:.2} MB", bytes as f64 / MB as f64),
-   |         ^^^^^^^ ... with this range
-   |
-   = note: you likely meant to write mutually exclusive ranges
-
-warning: multiple patterns overlap on their endpoints
-  --> powerfs-common/src/utils.rs:79:9
-   |
-78 |         MB..=GB => format!("{:.2} MB", bytes as f64 / MB as f64),
-   |         ------- this range overlaps on `1073741824_u64`...
-79 |         GB..=TB => format!("{:.2} GB", bytes as f64 / GB as f64),
-   |         ^^^^^^^ ... with this range
-   |
-   = note: you likely meant to write mutually exclusive ranges
-
-warning: `powerfs-common` (lib) generated 3 warnings
-warning: variable does not need to be mutable
-  --> powerfs-core/src/volume.rs:41:13
-   |
-41 |         let mut file = file;
-   |             ----^^^^
-   |             |
-   |             help: remove this `mut`
-   |
-   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
-
-warning: `powerfs-core` (lib) generated 1 warning (run `cargo fix --lib -p powerfs-core` to apply 1 suggestion)
-warning: unused imports: `DEFAULT_REPLICA_COUNT`, `DEFAULT_VOLUME_SIZE`, and `MASTER_DEFAULT_PORT`
- --> powerfs-master/src/master.rs:3:17
+    Checking powerfs-server v0.1.0 (/home/ubuntu/PowerFS/powerfs-server)
+error: this import is redundant
+ --> powerfs-server/src/main.rs:8:1
   |
-3 |     constants::{MASTER_DEFAULT_PORT, DEFAULT_VOLUME_SIZE, DEFAULT_REPLICA_COUNT},
-  |                 ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+8 | use tokio;
+  | ^^^^^^^^^^ help: remove it entirely
   |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_component_path_imports
+  = note: `-D clippy::single-component-path-imports` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::single_component_path_imports)]`
 
-warning: unused import: `HashSet`
- --> powerfs-master/src/master.rs:7:33
-  |
-7 | use std::collections::{HashMap, HashSet};
-  |                                 ^^^^^^^
+error: this import is redundant
+  --> powerfs-server/src/main.rs:11:1
+   |
+11 | use env_logger;
+   | ^^^^^^^^^^^^^^^ help: remove it entirely
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_component_path_imports
 
-warning: unused import: `Arc`
- --> powerfs-master/src/master.rs:8:25
-  |
-8 | use std::sync::{RwLock, Arc};
-  |                         ^^^
-
-warning: unused import: `warn`
- --> powerfs-master/src/raft_storage.rs:3:18
-  |
-3 | use log::{debug, warn};
-  |                  ^^^^
-
-warning: field `applied_index` is never read
- --> powerfs-master/src/raft_storage.rs:7:5
-  |
-5 | pub struct MasterRaftStorage {
-  |            ----------------- field in this struct
-6 |     entries: RwLock<VecDeque<Vec<u8>>>,
-7 |     applied_index: RwLock<u64>,
-  |     ^^^^^^^^^^^^^
-  |
-  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
-warning: `powerfs-master` (lib) generated 5 warnings (run `cargo fix --lib -p powerfs-master` to apply 4 suggestions)
-warning: field `fs` is never read
-   --> powerfs-fuse/src/fuse.rs:273:5
+error: the `Err`-variant returned from this function is very large
+   --> powerfs-server/src/main.rs:115:20
     |
-272 | pub struct FuseClient {
-    |            ---------- field in this struct
-273 |     fs: Arc<PowerFsFs>,
-    |     ^^
+115 | async fn main() -> Result<()> {
+    |                    ^^^^^^^^^^ the `Err`-variant is at least 176 bytes
     |
-    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+    = help: try reducing the size of `powerfs_common::error::PowerFsError`, for example by boxing large elements or replacing it with `Box<powerfs_common::error::PowerFsError>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+    = note: `-D clippy::result-large-err` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::result_large_err)]`
 
-warning: unused imports: `VolumeInfo` and `generate_node_id`
- --> powerfs-volume/src/server.rs:2:23
-  |
-2 |     types::{VolumeId, VolumeInfo, NeedleId, NodeId},
-  |                       ^^^^^^^^^^
-3 |     utils::{generate_node_id},
-  |             ^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: `powerfs-fuse` (lib) generated 1 warning
-warning: `powerfs-volume` (lib) generated 1 warning (run `cargo fix --lib -p powerfs-volume` to apply 1 suggestion)
-warning: unused imports: `ClusterConfig`, `NodeId`, `PowerFsError`, `VolumeId`, and `generate_volume_id`
- --> powerfs-server/src/main.rs:2:13
-  |
-2 |     types::{NodeId, ClusterConfig, VolumeId},
-  |             ^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^
-3 |     utils::{generate_node_id, generate_volume_id},
-  |                               ^^^^^^^^^^^^^^^^^^
-4 |     error::{PowerFsError, Result},
-  |             ^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `warn`
-  --> powerfs-server/src/main.rs:11:17
-   |
-11 | use log::{info, warn, error};
-   |                 ^^^^
-
-warning: unused variable: `max_volume_size`
-   --> powerfs-server/src/main.rs:194:5
-    |
-194 |     max_volume_size: u64
-    |     ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_max_volume_size`
-    |
-    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
-
-warning: `powerfs-server` (bin "powerfs") generated 3 warnings (run `cargo fix --bin "powerfs" -p powerfs-server` to apply 3 suggestions)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+error: could not compile `powerfs-server` (bin "powerfs") due to 3 previous errors
