@@ -304,6 +304,7 @@ impl MasterNode {
                         state,
                         created_at: Utc::now(),
                         modified_at: Utc::now(),
+                        next_file_key: 1,
                     },
                 );
 
@@ -334,6 +335,7 @@ impl MasterNode {
                         state,
                         created_at: Utc::now(),
                         modified_at: Utc::now(),
+                        next_file_key: 1,
                     },
                 );
             }
@@ -423,6 +425,7 @@ impl MasterNode {
                     state,
                     created_at: Utc::now(),
                     modified_at: Utc::now(),
+                    next_file_key: 1,
                 },
             );
         }
@@ -437,19 +440,32 @@ impl MasterNode {
             volumes: Vec::new(),
         });
 
-        let mut max_key = self.max_file_key.write().unwrap();
-        *max_key += 1;
+        // Get file_key from this volume's next_file_key counter
+        let mut volumes = self.volumes.write().unwrap();
+        let file_key = if let Some(vol_info) = volumes.get_mut(&volume_id) {
+            let key = vol_info.next_file_key;
+            vol_info.next_file_key += 1;
+            key
+        } else {
+            // If volume not found, start from 1
+            1
+        };
+        drop(volumes);
+
+        // Generate random cookie to prevent FID collision
+        let cookie = rand::random::<u32>() as u64;
 
         let fid = Fid {
             volume_id,
-            cookie: 0,
-            file_key: *max_key,
+            cookie,
+            file_key,
         };
 
         info!(
-            "Assigned volume: {} to nodes: {:?}",
+            "Assigned volume: {} to nodes: {:?}, fid: {},{},{}",
             volume_id,
-            selected_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+            selected_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            volume_id.0, cookie, file_key
         );
 
         Ok((fid, selected_nodes))

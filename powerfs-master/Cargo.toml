@@ -23,6 +23,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+rand = { workspace = true }
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 protobuf = "3"

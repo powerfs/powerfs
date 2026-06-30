@@ -65,6 +65,7 @@ impl Volume {
             state: VolumeState::Available,
             created_at: Utc::now(),
             modified_at: Utc::now(),
+            next_file_key: 1,
         };
 
         Ok(Volume {

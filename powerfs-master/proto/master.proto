@@ -8,6 +8,7 @@ service MasterService {
     rpc LookupVolume(LookupVolumeRequest) returns (LookupVolumeResponse);
     rpc Assign(AssignRequest) returns (AssignResponse);
     rpc VolumeList(VolumeListRequest) returns (VolumeListResponse);
+    rpc VolumeGrow(VolumeGrowRequest) returns (VolumeGrowResponse);
     rpc Ping(PingRequest) returns (PingResponse);
 }
 
@@ -134,4 +135,22 @@ message PingResponse {
     int64 start_time_ns = 1;
     int64 remote_time_ns = 2;
     int64 stop_time_ns = 3;
+}
+
+// VolumeGrow: request to allocate new volumes
+message VolumeGrowRequest {
+    string replication = 1;
+    string collection = 2;
+    string ttl = 3;
+    string data_center = 4;
+    string rack = 5;
+    string data_node = 6;
+    string disk_type = 7;
+    uint32 count = 8;  // number of volumes to allocate
+}
+
+message VolumeGrowResponse {
+    repeated uint32 new_volume_ids = 1;
+    repeated Location locations = 2;
+    string error = 3;
 }

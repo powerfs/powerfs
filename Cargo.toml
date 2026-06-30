@@ -6,6 +6,7 @@ members = [
     "powerfs-fuse",
     "powerfs-common",
     "powerfs-server",
+    "powerfs-cli",
 ]
 resolver = "2"
 

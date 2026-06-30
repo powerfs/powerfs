@@ -9,4 +9,5 @@ pub use powerfs::{
     AssignRequest, AssignResponse, Heartbeat, HeartbeatResponse, KeepConnectedRequest,
     KeepConnectedResponse, Location, LookupVolumeRequest, LookupVolumeResponse, PingRequest,
     PingResponse, VolumeListRequest, VolumeListResponse, VolumeLocation, VolumeShortInfo,
+    VolumeGrowRequest, VolumeGrowResponse,
 };

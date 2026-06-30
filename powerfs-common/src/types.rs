@@ -124,32 +124,92 @@ impl Default for Ttl {
 pub struct ReplicaPlacement {
     pub copies: u32,
     pub same_rack: bool,
+    pub same_data_center: bool,
 }
 
 impl Default for ReplicaPlacement {
     fn default() -> Self {
         ReplicaPlacement {
-            copies: 3,
+            copies: 1,
             same_rack: false,
+            same_data_center: false,
         }
     }
 }
 
 impl ReplicaPlacement {
+    /// Parse SeaweedFS replica placement string format.
+    /// 
+    /// Format: Three-digit string like "001", "010", "100", "002"
+    /// - First digit: copies in same data center (can be on different racks)
+    /// - Second digit: copies in same rack but different data centers (if possible)
+    /// - Third digit: copies in different data centers
+    /// 
+    /// Examples:
+    /// - "001": 1 copy, different rack, different data center
+    /// - "010": 1 copy, same rack, different data center  
+    /// - "100": 1 copy, same data center (any rack)
+    /// - "011": 2 copies total (1 same rack + 1 different dc)
+    /// - "111": 3 copies (1 same dc + 1 same rack + 1 different dc)
+    /// - "002": 2 copies, both in different data centers
     pub fn from_string(s: &str) -> Result<Self, String> {
-        let s = s.to_string();
         if s.is_empty() {
             return Ok(Self::default());
         }
-        let copies: u32 = s.parse().map_err(|_| format!("invalid replica placement: {}", s))?;
+
+        // SeaweedFS three-digit format
+        if s.len() == 3 {
+            let same_dc: u32 = s[0..1]
+                .parse()
+                .map_err(|_| format!("invalid replica placement: {}", s))?;
+            let same_rack_diff_dc: u32 = s[1..2]
+                .parse()
+                .map_err(|_| format!("invalid replica placement: {}", s))?;
+            let diff_rack_dc: u32 = s[2..3]
+                .parse()
+                .map_err(|_| format!("invalid replica placement: {}", s))?;
+
+            let total = same_dc + same_rack_diff_dc + diff_rack_dc;
+            
+            // same_rack is true if we have copies that should stay in same rack
+            // (either same_rack_diff_dc > 0 or same_dc > 0 with implicit same rack)
+            let same_rack = same_rack_diff_dc > 0;
+            
+            // same_data_center is true if any copies should stay in same dc
+            let same_data_center = same_dc > 0 || same_rack_diff_dc > 0;
+
+            return Ok(ReplicaPlacement {
+                copies: total,
+                same_rack,
+                same_data_center,
+            });
+        }
+
+        // Fallback: simple number format (e.g., "3" means 3 copies)
+        let copies: u32 = s
+            .parse()
+            .map_err(|_| format!("invalid replica placement: {}", s))?;
         Ok(ReplicaPlacement {
             copies,
             same_rack: false,
+            same_data_center: false,
         })
     }
 
     pub fn get_copy_count(&self) -> u32 {
         self.copies
+    }
+
+    /// Convert to SeaweedFS three-digit format string
+    pub fn to_string_format(&self) -> String {
+        // Simple conversion back - not exact but representative
+        if self.same_data_center && self.same_rack {
+            format!("{}00", self.copies)
+        } else if self.same_rack {
+            format!("0{}0", self.copies)
+        } else {
+            format!("00{}", self.copies)
+        }
     }
 }
 
@@ -196,6 +256,8 @@ pub struct VolumeInfo {
     pub state: VolumeState,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    /// Next file key to assign for this volume (per-volume counter)
+    pub next_file_key: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

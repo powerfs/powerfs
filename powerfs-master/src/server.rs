@@ -316,4 +316,44 @@ impl MasterService for MasterGrpcServer {
             stop_time_ns: start,
         }))
     }
+
+    async fn volume_grow(
+        &self,
+        request: Request<VolumeGrowRequest>,
+    ) -> Result<Response<VolumeGrowResponse>, Status> {
+        let req = request.into_inner();
+
+        // Use assign_volume logic to allocate new volumes
+        let mut new_volume_ids = Vec::new();
+        let mut locations = Vec::new();
+
+        for _ in 0..req.count {
+            match self.master.assign_volume(&req.replication, &req.collection).await {
+                Ok((fid, nodes)) => {
+                    new_volume_ids.push(fid.volume_id.0);
+                    for node in nodes {
+                        locations.push(Location {
+                            url: node.url(),
+                            public_url: node.public_url.clone(),
+                            grpc_port: node.grpc_port,
+                            data_center: node.data_center_id.to_string(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    return Ok(Response::new(VolumeGrowResponse {
+                        new_volume_ids,
+                        locations,
+                        error: e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        Ok(Response::new(VolumeGrowResponse {
+            new_volume_ids,
+            locations,
+            error: String::new(),
+        }))
+    }
 }
