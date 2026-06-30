@@ -44,4 +44,5 @@ blake3 = { version = "1.5" }
 crossbeam = { version = "0.8" }
 lru = { version = "0.12" }
 sled = { version = "0.34" }
+rocksdb = { version = "0.22", features = ["snappy", "zstd"] }
 clap = { version = "4.4", features = ["derive"] }

@@ -15,3 +15,7 @@ blake3 = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 raft = { workspace = true }
+rocksdb = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

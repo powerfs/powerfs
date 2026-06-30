@@ -228,7 +228,10 @@ powerfs mount -d /mnt/powerfs -m localhost:9333
 powerfs master
 
 # Start with custom port and directory
-powerfs master -p 9333 -d ./data/master
+powerfs master -p 9333 -d /data/master
+
+# Separate raft and meta directories (for production)
+powerfs master -d /data/master -r /fast-ssd/raft -m /fast-ssd/meta
 
 # Bind to specific IP
 powerfs master -p 9333 -i 192.168.1.100
@@ -241,10 +244,17 @@ powerfs master -p 9333 -i 192.168.1.100
 powerfs volume -m localhost:9333
 
 # Start with custom settings
-powerfs volume -p 8080 -d ./data/volume -m localhost:9333
+powerfs volume -p 8080 -d /data/volume -m localhost:9333
+
+# Separate meta and data directories (for production)
+# Meta on fast SSD, data on large capacity disk
+powerfs volume -d /data/vol1 \
+    -m /fast-ssd/vol1/meta \
+    -d /big-disk/vol1/data \
+    -m localhost:9333
 
 # Bind to specific IP with custom max volume size
-powerfs volume -p 8080 -i 192.168.1.101 -d ./data/volume -m localhost:9333 -s 2147483648
+powerfs volume -p 8080 -i 192.168.1.101 -d /data/volume -m localhost:9333 -s 2147483648
 ```
 
 #### Start Filer
@@ -273,6 +283,34 @@ powerfs mount -d /mnt/powerfs -m localhost:9333
 powerfs fuse -d /mnt/powerfs -m localhost:9333
 ```
 
+### Directory Structure
+
+PowerFS uses a hierarchical directory structure to separate different types of data:
+
+```
+# Master Node Directory Structure
+/data/master/
+├── raft/           # Raft consensus log (can be on fast SSD)
+│   ├── wal/        # Write-Ahead Log
+│   └── snapshot/   # State snapshots
+└── meta/           # RocksDB metadata (cluster topology, volume mapping)
+    └── *.sst        # RocksDB SST files
+
+# Volume Node Directory Structure
+/data/volume/
+├── meta/           # RocksDB metadata (volume info, needle index)
+│   └── *.sst       # RocksDB SST files
+└── data/           # Actual file data (can be on large capacity disk)
+    └── volume_{id}/
+        ├── data    # Volume data file
+        └── index   # Volume index
+```
+
+**Directory Separation Benefits:**
+- Place raft logs on fast SSD for better consensus performance
+- Place metadata on fast SSD for quick lookups
+- Place data files on large capacity disks
+
 ### Command Line Options
 
 ```bash
@@ -296,23 +334,27 @@ Options:
 Master Options:
   -p, --port <PORT>    Master port [default: 9333]
   -d, --dir <DIR>      Data directory [default: ./data/master]
+  -r, --raft-dir       Raft log directory [default: <dir>/raft]
+  -m, --meta-dir       Meta storage directory [default: <dir>/meta]
   -i, --ip <IP>        Bind IP address
 
 Volume Options:
   -p, --port <PORT>           Volume port [default: 8080]
   -d, --dir <DIR>             Data directory [default: ./data/volume]
-  -m, --master <MASTER>       Master address
+  -m, --meta-dir              Meta storage directory [default: <dir>/meta]
+  -d, --data-dir              Data storage directory [default: <dir>/data]
+      --master <MASTER>       Master address
   -i, --ip <IP>               Bind IP address
   -s, --max-volume-size <MAX_VOLUME_SIZE>  Max volume size in bytes [default: 1073741824]
 
 Filer Options:
   -p, --port <PORT>    Filer port [default: 8888]
-  -m, --master <MASTER>  Master address
+      --master <MASTER>  Master address
   -i, --ip <IP>        Bind IP address
 
 Mount/Fuse Options:
   -d, --dir <DIR>      Mount directory
-  -m, --master <MASTER>  Master address
+      --master <MASTER>  Master address
 ```
 
 ### Run Tests

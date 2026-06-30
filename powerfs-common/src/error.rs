@@ -86,6 +86,9 @@ pub enum PowerFsError {
 
     #[error("invalid path: {0}")]
     InvalidPath(String),
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 pub type Result<T> = std::result::Result<T, PowerFsError>;
