@@ -1,12 +1,12 @@
-use powerfs_common::{
-    types::{NeedleId, NeedleInfo},
-    error::{PowerFsError, Result},
-};
 use lru::LruCache;
+use powerfs_common::{
+    error::{PowerFsError, Result},
+    types::{NeedleId, NeedleInfo},
+};
 use serde_json;
+use sled::Db;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use sled::Db;
 
 pub trait NeedleIndex: Send + Sync {
     fn get(&self, needle_id: &NeedleId) -> Option<NeedleInfo>;
@@ -28,7 +28,9 @@ impl MemoryIndex {
     pub fn new(capacity: usize) -> Self {
         MemoryIndex {
             cache: RwLock::new(HashMap::new()),
-            lru: RwLock::new(LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap())),
+            lru: RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(capacity).unwrap(),
+            )),
         }
     }
 }
@@ -44,7 +46,10 @@ impl NeedleIndex for MemoryIndex {
     }
 
     fn insert(&self, needle_id: NeedleId, info: NeedleInfo) {
-        self.cache.write().unwrap().insert(needle_id.clone(), info.clone());
+        self.cache
+            .write()
+            .unwrap()
+            .insert(needle_id.clone(), info.clone());
         self.lru.write().unwrap().put(needle_id, info);
     }
 
@@ -71,7 +76,8 @@ pub struct PersistentIndex {
 #[allow(clippy::result_large_err)]
 impl PersistentIndex {
     pub fn new(path: &str) -> Result<Self> {
-        let db = sled::open(path).map_err(|e| PowerFsError::Internal(format!("sled error: {}", e)))?;
+        let db =
+            sled::open(path).map_err(|e| PowerFsError::Internal(format!("sled error: {}", e)))?;
         Ok(PersistentIndex {
             db,
             lru: RwLock::new(LruCache::new(std::num::NonZeroUsize::new(10000).unwrap())),
@@ -86,11 +92,11 @@ impl PersistentIndex {
 impl NeedleIndex for PersistentIndex {
     fn get(&self, needle_id: &NeedleId) -> Option<NeedleInfo> {
         let mut lru = self.lru.write().unwrap();
-        
+
         if let Some(info) = lru.get(needle_id) {
             return Some(info.clone());
         }
-        
+
         let key = Self::key_from_id(needle_id);
         if let Ok(Some(data)) = self.db.get(&key) {
             match serde_json::from_slice::<NeedleInfo>(&data) {

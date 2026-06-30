@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package powerfs;
+
+service MasterService {
+    rpc SendHeartbeat(stream Heartbeat) returns (stream HeartbeatResponse);
+    rpc LookupVolume(LookupVolumeRequest) returns (LookupVolumeResponse);
+    rpc Assign(AssignRequest) returns (AssignResponse);
+    rpc VolumeList(VolumeListRequest) returns (VolumeListResponse);
+    rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message Heartbeat {
+    string ip = 1;
+    uint32 port = 2;
+    string public_url = 3;
+    string data_center = 4;
+    string rack = 5;
+    uint32 grpc_port = 6;
+    string id = 7;
+    repeated VolumeShortInfo volumes = 8;
+}
+
+message HeartbeatResponse {
+    uint64 volume_size_limit = 1;
+    string leader = 2;
+}
+
+message VolumeShortInfo {
+    string volume_id = 1;
+    uint64 size = 2;
+    bool read_only = 3;
+}
+
+message Location {
+    string url = 1;
+    string public_url = 2;
+    uint32 grpc_port = 3;
+    string data_center = 4;
+}
+
+message LookupVolumeRequest {
+    repeated string volume_or_file_ids = 1;
+}
+
+message LookupVolumeResponse {
+    message VolumeIdLocation {
+        string volume_or_file_id = 1;
+        repeated Location locations = 2;
+        string error = 3;
+    }
+    repeated VolumeIdLocation volume_id_locations = 1;
+}
+
+message AssignRequest {
+    uint64 count = 1;
+    string replication = 2;
+    string collection = 3;
+    string data_center = 4;
+    string rack = 5;
+}
+
+message AssignResponse {
+    string fid = 1;
+    uint64 count = 2;
+    string error = 3;
+    repeated Location replicas = 4;
+}
+
+message VolumeListRequest {}
+
+message VolumeListResponse {
+    message DataNodeInfo {
+        string id = 1;
+        string address = 2;
+        uint32 grpc_port = 3;
+        string data_center = 4;
+        string rack = 5;
+        repeated VolumeShortInfo volumes = 6;
+    }
+    repeated DataNodeInfo data_nodes = 1;
+    uint64 volume_size_limit = 2;
+}
+
+message PingRequest {
+    string target = 1;
+}
+
+message PingResponse {
+    int64 start_time_ns = 1;
+    int64 stop_time_ns = 2;
+}

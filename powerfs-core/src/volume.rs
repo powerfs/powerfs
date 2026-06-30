@@ -1,13 +1,13 @@
-use powerfs_common::{
-    types::{VolumeId, VolumeInfo, VolumeState, NeedleId, NeedleInfo},
-    constants::{VOLUME_DATA_OFFSET},
-    utils::{generate_needle_id},
-    error::{PowerFsError, Result},
-};
+use crate::index::{MemoryIndex, NeedleIndex, PersistentIndex};
 use crate::needle::Needle;
-use crate::index::{NeedleIndex, MemoryIndex, PersistentIndex};
 use bytes::Bytes;
 use chrono::Utc;
+use powerfs_common::{
+    constants::VOLUME_DATA_OFFSET,
+    error::{PowerFsError, Result},
+    types::{NeedleId, NeedleInfo, VolumeId, VolumeInfo, VolumeState},
+    utils::generate_needle_id,
+};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::RwLock;
@@ -24,21 +24,21 @@ pub struct Volume {
 impl Volume {
     pub fn new(id: VolumeId, node_id: &str, path: &str, size: u64) -> Result<Self> {
         let volume_path = Path::new(path).join(format!("volume_{}", id.0));
-        
+
         if !volume_path.exists() {
             std::fs::create_dir_all(&volume_path)?;
         }
-        
+
         let data_file_path = volume_path.join("data");
         let index_path = volume_path.join("index");
-        
+
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(&data_file_path)?;
-        
+
         let file_size = file.metadata()?.len();
         if file_size < size {
             std::fs::OpenOptions::new()
@@ -46,13 +46,13 @@ impl Volume {
                 .open(&data_file_path)?
                 .set_len(size)?;
         }
-        
+
         let index: Box<dyn NeedleIndex> = if index_path.exists() {
             Box::new(PersistentIndex::new(index_path.to_str().unwrap())?)
         } else {
             Box::new(MemoryIndex::new(10000))
         };
-        
+
         let info = VolumeInfo {
             id: id.clone(),
             node_id: powerfs_common::types::NodeId(node_id.to_string()),
@@ -63,7 +63,7 @@ impl Volume {
             created_at: Utc::now(),
             modified_at: Utc::now(),
         };
-        
+
         Ok(Volume {
             info: RwLock::new(info),
             file: RwLock::new(file),
@@ -100,33 +100,35 @@ impl Volume {
     pub fn write_needle(&self, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
-            return Err(PowerFsError::InvalidVolumeState("volume not available".to_string()));
+            return Err(PowerFsError::InvalidVolumeState(
+                "volume not available".to_string(),
+            ));
         }
-        
+
         let needle_id = generate_needle_id();
         let needle = Needle::new(needle_id.clone(), self.id(), data);
-        
+
         let required_space = needle.size() as u64;
         let mut free_space_guard = self.free_space.write().unwrap();
         if *free_space_guard < required_space {
             info_guard.state = VolumeState::Full;
             return Err(PowerFsError::OutOfSpace);
         }
-        
+
         let mut next_offset_guard = self.next_offset.write().unwrap();
         let offset = *next_offset_guard;
-        
+
         let mut file_guard = self.file.write().unwrap();
         needle.write_to(&mut *file_guard, offset)?;
-        
+
         *next_offset_guard += required_space;
         *free_space_guard -= required_space;
         info_guard.used += required_space;
         info_guard.modified_at = Utc::now();
-        
+
         let needle_info = needle.to_info();
         self.index.insert(needle_id, needle_info.clone());
-        
+
         Ok(needle_info)
     }
 
@@ -144,11 +146,11 @@ impl Volume {
         if let Some(info) = self.index.remove(needle_id) {
             let mut info_guard = self.info.write().unwrap();
             let mut free_space_guard = self.free_space.write().unwrap();
-            
+
             info_guard.used -= info.data_size as u64 + 24;
             *free_space_guard += info.data_size as u64 + 24;
             info_guard.modified_at = Utc::now();
-            
+
             Ok(())
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))

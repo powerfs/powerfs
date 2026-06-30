@@ -1,6 +1,6 @@
-use crate::types::{VolumeId, NeedleId, FileId, NodeId};
-use uuid::Uuid;
+use crate::types::{FileId, NeedleId, NodeId, VolumeId};
 use std::net::SocketAddr;
+use uuid::Uuid;
 
 pub fn generate_volume_id() -> VolumeId {
     VolumeId(Uuid::new_v4())
@@ -39,9 +39,9 @@ pub fn extract_filename(path: &str) -> &str {
 }
 
 pub fn extract_parent(path: &str) -> &str {
-    path.rsplit('/').nth(1).map_or("/", |p| {
-        if p.is_empty() { "/" } else { p }
-    })
+    path.rsplit('/')
+        .nth(1)
+        .map_or("/", |p| if p.is_empty() { "/" } else { p })
 }
 
 pub fn calculate_checksum(data: &[u8]) -> u64 {
@@ -58,7 +58,10 @@ pub fn calculate_checksum(data: &[u8]) -> u64 {
 
 pub fn parse_address(addr: &str) -> Result<SocketAddr, std::io::Error> {
     addr.parse().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid address: {}", e))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid address: {}", e),
+        )
     })
 }
 

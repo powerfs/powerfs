@@ -1,6 +1,6 @@
-use thiserror::Error;
-use crate::types::{VolumeId, NeedleId};
+use crate::types::{NeedleId, VolumeId};
 use raft;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum PowerFsError {

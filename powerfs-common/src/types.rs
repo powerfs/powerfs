@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct VolumeId(pub Uuid);
@@ -82,6 +82,7 @@ pub struct NodeInfo {
     pub volume_count: u32,
     pub state: NodeState,
     pub last_heartbeat: DateTime<Utc>,
+    pub grpc_port: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

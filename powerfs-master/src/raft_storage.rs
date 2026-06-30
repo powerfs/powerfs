@@ -1,6 +1,6 @@
+use log::debug;
 use std::collections::VecDeque;
 use std::sync::RwLock;
-use log::debug;
 
 pub struct MasterRaftStorage {
     entries: RwLock<VecDeque<Vec<u8>>>,

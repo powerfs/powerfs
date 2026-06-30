@@ -1,22 +1,22 @@
+use bytes::Bytes;
+use chrono::Utc;
+use fuse_backend_rs::api::filesystem::{
+    Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
+};
+use libc;
+use log::{debug, info};
+use nix::mount;
 use powerfs_common::{
+    error::Result,
     types::{FileId, FileMetadata},
-    utils::{generate_file_id},
-    error::{Result},
+    utils::generate_file_id,
 };
 use powerfs_core::storage::StorageManager;
-use fuse_backend_rs::{
-    api::{filesystem::{FileSystem, Context, Entry, DirEntry, ZeroCopyReader, ZeroCopyWriter}},
-};
-use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{RwLock, Arc};
-use std::ffi::{CStr};
+use std::ffi::CStr;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use chrono::Utc;
-use libc;
-use nix::mount;
-use log::{info, debug};
 
 struct PowerFsFs {
     storage_manager: Arc<StorageManager>,
@@ -45,9 +45,12 @@ impl PowerFsFs {
     fn path_to_inode(&self, path: &str) -> Option<u64> {
         let path_map = self.path_map.read().unwrap();
         let inode_map = self.inode_map.read().unwrap();
-        
+
         path_map.get(path).and_then(|file_id| {
-            inode_map.iter().find(|(_, meta)| &meta.file_id == file_id).map(|(inode, _)| *inode)
+            inode_map
+                .iter()
+                .find(|(_, meta)| &meta.file_id == file_id)
+                .map(|(inode, _)| *inode)
         })
     }
 
@@ -116,7 +119,7 @@ impl FileSystem for PowerFsFs {
     fn lookup(&self, _ctx: &Context, _parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {
         let name_str = name.to_str().unwrap_or("");
         let path = format!("/{}", name_str);
-        
+
         if let Some(inode) = self.path_to_inode(&path) {
             debug!("Lookup path: {} -> inode: {}", path, inode);
             Ok(Entry {
@@ -132,7 +135,12 @@ impl FileSystem for PowerFsFs {
         }
     }
 
-    fn getattr(&self, _ctx: &Context, inode: Self::Inode, _handle: Option<Self::Handle>) -> std::io::Result<(libc::stat64, Duration)> {
+    fn getattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Option<Self::Handle>,
+    ) -> std::io::Result<(libc::stat64, Duration)> {
         if inode == 1 {
             Ok((create_dir_attr(1), Duration::from_secs(1)))
         } else if let Some(meta) = self.inode_to_metadata(inode) {
@@ -142,18 +150,29 @@ impl FileSystem for PowerFsFs {
         }
     }
 
-    fn create(&self, _ctx: &Context, _parent: Self::Inode, name: &CStr, _args: fuse_backend_rs::abi::fuse_abi::CreateIn) -> std::io::Result<(Entry, Option<Self::Handle>, fuse_backend_rs::abi::fuse_abi::OpenOptions, Option<u32>)> {
+    fn create(
+        &self,
+        _ctx: &Context,
+        _parent: Self::Inode,
+        name: &CStr,
+        _args: fuse_backend_rs::abi::fuse_abi::CreateIn,
+    ) -> std::io::Result<(
+        Entry,
+        Option<Self::Handle>,
+        fuse_backend_rs::abi::fuse_abi::OpenOptions,
+        Option<u32>,
+    )> {
         let name_str = name.to_str().unwrap_or("");
         let path = format!("/{}", name_str);
-        
+
         let mut path_map = self.path_map.write().unwrap();
         if path_map.contains_key(&path) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        
+
         let inode = self.allocate_inode();
         let file_id = generate_file_id();
-        
+
         let metadata = FileMetadata {
             file_id: file_id.clone(),
             name: name_str.to_string(),
@@ -167,34 +186,63 @@ impl FileSystem for PowerFsFs {
             volume_ids: vec![],
             needle_ids: vec![],
         };
-        
+
         path_map.insert(path, file_id);
-        
+
         let mut inode_map = self.inode_map.write().unwrap();
         inode_map.insert(inode, metadata);
-        
+
         debug!("Created file: {} with inode: {}", name_str, inode);
-        
-        Ok((Entry {
-            inode,
-            generation: 0,
-            attr: create_new_file_attr(inode),
-            attr_flags: 0,
-            attr_timeout: Duration::from_secs(1),
-            entry_timeout: Duration::from_secs(1),
-        }, None, fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(), None))
+
+        Ok((
+            Entry {
+                inode,
+                generation: 0,
+                attr: create_new_file_attr(inode),
+                attr_flags: 0,
+                attr_timeout: Duration::from_secs(1),
+                entry_timeout: Duration::from_secs(1),
+            },
+            None,
+            fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
+            None,
+        ))
     }
 
-    fn open(&self, _ctx: &Context, inode: Self::Inode, _flags: u32, _fuse_flags: u32) -> std::io::Result<(Option<Self::Handle>, fuse_backend_rs::abi::fuse_abi::OpenOptions, Option<u32>)> {
+    fn open(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _flags: u32,
+        _fuse_flags: u32,
+    ) -> std::io::Result<(
+        Option<Self::Handle>,
+        fuse_backend_rs::abi::fuse_abi::OpenOptions,
+        Option<u32>,
+    )> {
         if self.inode_to_metadata(inode).is_some() || inode == 1 {
             debug!("Opened inode: {}", inode);
-            Ok((Some(inode), fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(), None))
+            Ok((
+                Some(inode),
+                fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
+                None,
+            ))
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ENOENT))
         }
     }
 
-    fn read(&self, _ctx: &Context, inode: Self::Inode, _handle: Self::Handle, w: &mut dyn ZeroCopyWriter, size: u32, offset: u64, _lock_owner: Option<u64>, _flags: u32) -> std::io::Result<usize> {
+    fn read(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        w: &mut dyn ZeroCopyWriter,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> std::io::Result<usize> {
         if let Some(meta) = self.inode_to_metadata(inode) {
             if !meta.needle_ids.is_empty() {
                 if let Some(volume_id) = meta.volume_ids.first() {
@@ -217,19 +265,33 @@ impl FileSystem for PowerFsFs {
         }
     }
 
-    fn write(&self, _ctx: &Context, inode: Self::Inode, _handle: Self::Handle, _r: &mut dyn ZeroCopyReader, size: u32, offset: u64, _lock_owner: Option<u64>, _delayed_write: bool, _flags: u32, _fuse_flags: u32) -> std::io::Result<usize> {
+    fn write(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        _r: &mut dyn ZeroCopyReader,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _flags: u32,
+        _fuse_flags: u32,
+    ) -> std::io::Result<usize> {
         let mut inode_map = self.inode_map.write().unwrap();
-        
+
         if let Some(meta) = inode_map.get_mut(&inode) {
             let data_len = size as u64;
-            
+
             if meta.needle_ids.is_empty() {
                 if let Some(volume_id) = self.storage_manager.find_available_volume() {
                     if let Some(volume) = self.storage_manager.get_volume(&volume_id) {
                         let mut buf = vec![0u8; size as usize];
                         let read_len = _r.read(&mut buf).unwrap_or(0);
                         if read_len > 0 {
-                            if let Ok(needle_info) = volume.write_needle(Bytes::from(buf[..read_len].to_vec())) {
+                            if let Ok(needle_info) =
+                                volume.write_needle(Bytes::from(buf[..read_len].to_vec()))
+                            {
                                 meta.volume_ids.push(volume_id);
                                 meta.needle_ids.push(needle_info.id);
                                 meta.size = data_len;
@@ -240,24 +302,33 @@ impl FileSystem for PowerFsFs {
                     }
                 }
             }
-            
+
             meta.size = std::cmp::max(meta.size, offset + data_len);
             meta.mtime = Utc::now();
-            
+
             Ok(size as usize)
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ENOENT))
         }
     }
 
-    fn release(&self, _ctx: &Context, _inode: Self::Inode, _flags: u32, _handle: Self::Handle, _flush: bool, _flock_release: bool, _lock_owner: Option<u64>) -> std::io::Result<()> {
+    fn release(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        _handle: Self::Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 
     fn unlink(&self, _ctx: &Context, _parent: Self::Inode, name: &CStr) -> std::io::Result<()> {
         let name_str = name.to_str().unwrap_or("");
         let path = format!("/{}", name_str);
-        
+
         let mut path_map = self.path_map.write().unwrap();
         if let Some(file_id) = path_map.remove(&path) {
             let mut inode_map = self.inode_map.write().unwrap();
@@ -268,7 +339,15 @@ impl FileSystem for PowerFsFs {
         }
     }
 
-    fn readdir(&self, _ctx: &Context, inode: Self::Inode, _handle: Self::Handle, _size: u32, _offset: u64, _add_entry: &mut dyn FnMut(DirEntry) -> std::io::Result<usize>) -> std::io::Result<()> {
+    fn readdir(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        _size: u32,
+        _offset: u64,
+        _add_entry: &mut dyn FnMut(DirEntry) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
         if inode != 1 {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
         }
@@ -295,9 +374,9 @@ impl FuseClient {
         if !path.exists() {
             std::fs::create_dir_all(path)?;
         }
-        
+
         info!("Mounting PowerFS at: {}", self.mount_point);
-        
+
         Ok(())
     }
 
