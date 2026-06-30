@@ -85,7 +85,7 @@ impl PersistentIndex {
     }
 
     fn key_from_id(needle_id: &NeedleId) -> Vec<u8> {
-        needle_id.0.as_bytes().to_vec()
+        needle_id.0.to_be_bytes().to_vec()
     }
 }
 

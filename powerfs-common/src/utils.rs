@@ -1,17 +1,18 @@
 use crate::types::{FileId, NeedleId, NodeId, VolumeId};
+use rand::Rng;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
 pub fn generate_volume_id() -> VolumeId {
-    VolumeId(Uuid::new_v4())
+    VolumeId(rand::thread_rng().gen::<u32>())
 }
 
 pub fn generate_needle_id() -> NeedleId {
-    NeedleId(Uuid::new_v4())
+    NeedleId(rand::thread_rng().gen::<u64>())
 }
 
 pub fn generate_file_id() -> FileId {
-    FileId(Uuid::new_v4())
+    FileId(Uuid::new_v4().to_string())
 }
 
 pub fn generate_node_id() -> NodeId {

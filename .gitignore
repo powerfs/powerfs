@@ -5,3 +5,6 @@ beegfs/
 seaweedfs/
 log
 *.log
+setp.sh
+unsetp.sh
+docs/

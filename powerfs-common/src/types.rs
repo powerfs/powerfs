@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
-use uuid::Uuid;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub struct VolumeId(pub Uuid);
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct VolumeId(pub u32);
 
 impl fmt::Display for VolumeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -12,8 +13,21 @@ impl fmt::Display for VolumeId {
     }
 }
 
+impl From<u32> for VolumeId {
+    fn from(v: u32) -> Self {
+        VolumeId(v)
+    }
+}
+
+impl FromStr for VolumeId {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(VolumeId(u32::from_str(s)?))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub struct NeedleId(pub Uuid);
+pub struct NeedleId(pub u64);
 
 impl fmt::Display for NeedleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -22,7 +36,7 @@ impl fmt::Display for NeedleId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub struct FileId(pub Uuid);
+pub struct FileId(pub String);
 
 impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,13 +53,146 @@ impl fmt::Display for NodeId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+pub struct DataCenterId(pub String);
+
+impl fmt::Display for DataCenterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+pub struct RackId(pub String);
+
+impl fmt::Display for RackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+pub struct Collection(pub String);
+
+impl fmt::Display for Collection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Default for Collection {
+    fn default() -> Self {
+        Collection("default".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+pub struct DiskType(pub String);
+
+impl fmt::Display for DiskType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Default for DiskType {
+    fn default() -> Self {
+        DiskType("".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ttl(pub i32);
+
+impl fmt::Display for Ttl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 == 0 {
+            write!(f, "")
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+impl Default for Ttl {
+    fn default() -> Self {
+        Ttl(0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+pub struct ReplicaPlacement {
+    pub copies: u32,
+    pub same_rack: bool,
+}
+
+impl Default for ReplicaPlacement {
+    fn default() -> Self {
+        ReplicaPlacement {
+            copies: 3,
+            same_rack: false,
+        }
+    }
+}
+
+impl ReplicaPlacement {
+    pub fn from_string(s: &str) -> Result<Self, String> {
+        let s = s.to_string();
+        if s.is_empty() {
+            return Ok(Self::default());
+        }
+        let copies: u32 = s.parse().map_err(|_| format!("invalid replica placement: {}", s))?;
+        Ok(ReplicaPlacement {
+            copies,
+            same_rack: false,
+        })
+    }
+
+    pub fn get_copy_count(&self) -> u32 {
+        self.copies
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fid {
+    pub volume_id: VolumeId,
+    pub cookie: u64,
+    pub file_key: u64,
+}
+
+impl fmt::Display for Fid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{},{},{}", self.volume_id.0, self.cookie, self.file_key)
+    }
+}
+
+impl Fid {
+    pub fn from_string(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() != 3 {
+            return Err(format!("invalid fid format: {}", s));
+        }
+        let volume_id = VolumeId::from_str(parts[0]).map_err(|e| e.to_string())?;
+        let cookie = parts[1].parse::<u64>().map_err(|e| e.to_string())?;
+        let file_key = parts[2].parse::<u64>().map_err(|e| e.to_string())?;
+        Ok(Fid {
+            volume_id,
+            cookie,
+            file_key,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeInfo {
     pub id: VolumeId,
     pub node_id: NodeId,
+    pub collection: Collection,
     pub size: u64,
     pub used: u64,
     pub replica_count: u32,
+    pub ttl: Ttl,
+    pub disk_type: DiskType,
     pub state: VolumeState,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
@@ -72,17 +219,139 @@ pub struct NeedleInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeInfo {
+pub struct DataNodeInfo {
     pub id: NodeId,
     pub address: String,
-    pub rack: String,
-    pub data_center: String,
+    pub rack_id: RackId,
+    pub data_center_id: DataCenterId,
     pub total_space: u64,
     pub used_space: u64,
     pub volume_count: u32,
     pub state: NodeState,
     pub last_heartbeat: DateTime<Utc>,
     pub grpc_port: u32,
+    pub http_port: u32,
+    pub public_url: String,
+    pub maintenance_mode: bool,
+}
+
+impl DataNodeInfo {
+    pub fn url(&self) -> String {
+        format!("{}:{}", self.address, self.http_port)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RackInfo {
+    pub id: RackId,
+    pub data_center_id: DataCenterId,
+    pub nodes: HashMap<NodeId, DataNodeInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataCenterInfo {
+    pub id: DataCenterId,
+    pub racks: HashMap<RackId, RackInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Topology {
+    pub data_centers: HashMap<DataCenterId, DataCenterInfo>,
+}
+
+impl Topology {
+    pub fn new() -> Self {
+        Topology {
+            data_centers: HashMap::new(),
+        }
+    }
+
+    pub fn get_or_create_data_center(&mut self, id: DataCenterId) -> &mut DataCenterInfo {
+        self.data_centers.entry(id.clone()).or_insert_with(|| DataCenterInfo {
+            id,
+            racks: HashMap::new(),
+        })
+    }
+
+    pub fn get_or_create_rack(&mut self, dc_id: DataCenterId, rack_id: RackId) -> &mut RackInfo {
+        let dc = self.get_or_create_data_center(dc_id);
+        dc.racks.entry(rack_id.clone()).or_insert_with(|| RackInfo {
+            id: rack_id,
+            data_center_id: dc.id.clone(),
+            nodes: HashMap::new(),
+        })
+    }
+
+    pub fn get_or_create_node(
+        &mut self,
+        dc_id: DataCenterId,
+        rack_id: RackId,
+        node_id: NodeId,
+        address: String,
+        http_port: u32,
+        grpc_port: u32,
+        public_url: String,
+    ) -> &mut DataNodeInfo {
+        let rack = self.get_or_create_rack(dc_id, rack_id);
+        rack.nodes.entry(node_id.clone()).or_insert_with(|| DataNodeInfo {
+            id: node_id,
+            address,
+            rack_id: rack.id.clone(),
+            data_center_id: rack.data_center_id.clone(),
+            total_space: 0,
+            used_space: 0,
+            volume_count: 0,
+            state: NodeState::Healthy,
+            last_heartbeat: Utc::now(),
+            grpc_port,
+            http_port,
+            public_url,
+            maintenance_mode: false,
+        })
+    }
+
+    pub fn get_node(&self, node_id: &NodeId) -> Option<&DataNodeInfo> {
+        for dc in self.data_centers.values() {
+            for rack in dc.racks.values() {
+                if let Some(node) = rack.nodes.get(node_id) {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_node_mut(&mut self, node_id: &NodeId) -> Option<&mut DataNodeInfo> {
+        for dc in self.data_centers.values_mut() {
+            for rack in dc.racks.values_mut() {
+                if let Some(node) = rack.nodes.get_mut(node_id) {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn remove_node(&mut self, node_id: &NodeId) -> Option<DataNodeInfo> {
+        for dc in self.data_centers.values_mut() {
+            for rack in dc.racks.values_mut() {
+                if let Some(node) = rack.nodes.remove(node_id) {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn list_all_nodes(&self) -> Vec<DataNodeInfo> {
+        let mut nodes = Vec::new();
+        for dc in self.data_centers.values() {
+            for rack in dc.racks.values() {
+                nodes.extend(rack.nodes.values().cloned());
+            }
+        }
+        nodes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

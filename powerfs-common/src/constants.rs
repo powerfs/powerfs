@@ -1,7 +1,7 @@
-pub const NEEDLE_HEADER_SIZE: usize = 16;
+pub const NEEDLE_HEADER_SIZE: usize = NEEDLE_ID_SIZE + 4;
 pub const NEEDLE_FOOTER_SIZE: usize = 8;
 pub const NEEDLE_MIN_SIZE: usize = NEEDLE_HEADER_SIZE + NEEDLE_FOOTER_SIZE;
-pub const NEEDLE_ID_SIZE: usize = 16;
+pub const NEEDLE_ID_SIZE: usize = 8;
 pub const NEEDLE_CHECKSUM_SIZE: usize = 8;
 
 pub const VOLUME_INDEX_SIZE: usize = 64;

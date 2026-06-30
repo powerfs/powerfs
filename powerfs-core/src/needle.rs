@@ -7,7 +7,6 @@ use powerfs_common::{
     utils::calculate_checksum,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Needle {
@@ -43,7 +42,7 @@ impl Needle {
         let total_size = self.size();
         let mut buf = Vec::with_capacity(total_size);
 
-        buf.extend_from_slice(self.id.0.as_bytes());
+        buf.extend_from_slice(&self.id.0.to_be_bytes());
 
         let data_size = self.data.len() as u32;
         buf.extend_from_slice(&data_size.to_be_bytes());
@@ -64,7 +63,7 @@ impl Needle {
 
         let mut id_bytes = [0u8; NEEDLE_ID_SIZE];
         id_bytes.copy_from_slice(&bytes[0..NEEDLE_ID_SIZE]);
-        let id = NeedleId(Uuid::from_bytes(id_bytes));
+        let id = NeedleId(u64::from_be_bytes(id_bytes));
 
         let mut data_size_bytes = [0u8; 4];
         data_size_bytes.copy_from_slice(&bytes[NEEDLE_ID_SIZE..NEEDLE_ID_SIZE + 4]);
@@ -110,7 +109,7 @@ impl Needle {
 
         let mut id_bytes = [0u8; NEEDLE_ID_SIZE];
         reader.read_exact(&mut id_bytes)?;
-        let id = NeedleId(Uuid::from_bytes(id_bytes));
+        let id = NeedleId(u64::from_be_bytes(id_bytes));
 
         let mut data_size_bytes = [0u8; 4];
         reader.read_exact(&mut data_size_bytes)?;
@@ -140,7 +139,7 @@ impl Needle {
     pub fn write_to<W: Write + Seek>(&self, writer: &mut W, offset: u64) -> Result<()> {
         writer.seek(SeekFrom::Start(offset))?;
 
-        writer.write_all(self.id.0.as_bytes())?;
+        writer.write_all(&self.id.0.to_be_bytes())?;
 
         let data_size = self.data.len() as u32;
         writer.write_all(&data_size.to_be_bytes())?;

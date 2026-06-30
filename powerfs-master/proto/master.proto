@@ -4,6 +4,7 @@ package powerfs;
 
 service MasterService {
     rpc SendHeartbeat(stream Heartbeat) returns (stream HeartbeatResponse);
+    rpc KeepConnected(stream KeepConnectedRequest) returns (stream KeepConnectedResponse);
     rpc LookupVolume(LookupVolumeRequest) returns (LookupVolumeResponse);
     rpc Assign(AssignRequest) returns (AssignResponse);
     rpc VolumeList(VolumeListRequest) returns (VolumeListResponse);
@@ -14,22 +15,34 @@ message Heartbeat {
     string ip = 1;
     uint32 port = 2;
     string public_url = 3;
-    string data_center = 4;
-    string rack = 5;
-    uint32 grpc_port = 6;
-    string id = 7;
-    repeated VolumeShortInfo volumes = 8;
+    uint64 max_file_key = 5;
+    string data_center = 6;
+    string rack = 7;
+    uint32 admin_port = 8;
+    repeated VolumeShortInfo volumes = 9;
+    repeated VolumeShortInfo new_volumes = 10;
+    repeated VolumeShortInfo deleted_volumes = 11;
+    bool has_no_volumes = 12;
+    uint32 grpc_port = 20;
+    string id = 22;
 }
 
 message HeartbeatResponse {
     uint64 volume_size_limit = 1;
     string leader = 2;
+    string metrics_address = 3;
+    uint32 metrics_interval_seconds = 4;
+    bool preallocate = 7;
 }
 
 message VolumeShortInfo {
-    string volume_id = 1;
+    uint32 volume_id = 1;
     uint64 size = 2;
     bool read_only = 3;
+    string collection = 4;
+    uint32 replica_placement = 5;
+    uint32 ttl = 6;
+    string disk_type = 7;
 }
 
 message Location {
@@ -41,6 +54,7 @@ message Location {
 
 message LookupVolumeRequest {
     repeated string volume_or_file_ids = 1;
+    string collection = 2;
 }
 
 message LookupVolumeResponse {
@@ -48,6 +62,7 @@ message LookupVolumeResponse {
         string volume_or_file_id = 1;
         repeated Location locations = 2;
         string error = 3;
+        string auth = 4;
     }
     repeated VolumeIdLocation volume_id_locations = 1;
 }
@@ -56,15 +71,43 @@ message AssignRequest {
     uint64 count = 1;
     string replication = 2;
     string collection = 3;
-    string data_center = 4;
-    string rack = 5;
+    string ttl = 4;
+    string data_center = 5;
+    string rack = 6;
+    string data_node = 7;
+    string disk_type = 10;
 }
 
 message AssignResponse {
     string fid = 1;
-    uint64 count = 2;
-    string error = 3;
-    repeated Location replicas = 4;
+    uint64 count = 4;
+    string error = 5;
+    string auth = 6;
+    repeated Location replicas = 7;
+    Location location = 8;
+}
+
+message KeepConnectedRequest {
+    string client_type = 1;
+    string client_address = 3;
+    string version = 4;
+    string filer_group = 5;
+    string data_center = 6;
+    string rack = 7;
+}
+
+message VolumeLocation {
+    string url = 1;
+    string public_url = 2;
+    repeated uint32 new_vids = 3;
+    repeated uint32 deleted_vids = 4;
+    string leader = 5;
+    string data_center = 6;
+    uint32 grpc_port = 7;
+}
+
+message KeepConnectedResponse {
+    VolumeLocation volume_location = 1;
 }
 
 message VolumeListRequest {}
@@ -84,9 +127,11 @@ message VolumeListResponse {
 
 message PingRequest {
     string target = 1;
+    string target_type = 2;
 }
 
 message PingResponse {
     int64 start_time_ns = 1;
-    int64 stop_time_ns = 2;
+    int64 remote_time_ns = 2;
+    int64 stop_time_ns = 3;
 }

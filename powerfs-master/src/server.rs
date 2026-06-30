@@ -5,7 +5,9 @@ use log::debug;
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
@@ -32,6 +34,9 @@ impl MasterService for MasterGrpcServer {
     type SendHeartbeatStream =
         Pin<Box<dyn Stream<Item = Result<HeartbeatResponse, Status>> + Send + 'static>>;
 
+    type KeepConnectedStream =
+        Pin<Box<dyn Stream<Item = Result<KeepConnectedResponse, Status>> + Send + 'static>>;
+
     async fn send_heartbeat(
         &self,
         request: Request<Streaming<Heartbeat>>,
@@ -39,18 +44,23 @@ impl MasterService for MasterGrpcServer {
         let mut stream = request.into_inner();
         let master = self.master.clone();
 
-        let output = async_stream::stream! {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
             while let Some(heartbeat) = stream.message().await.unwrap_or(None) {
                 debug!("Received heartbeat from: {}", heartbeat.id);
 
-                let node_id = NodeId(heartbeat.id.clone());
+                let node_id = powerfs_common::types::NodeId(heartbeat.id.clone());
 
-                if heartbeat.volumes.is_empty() {
+                if heartbeat.volumes.is_empty() && heartbeat.new_volumes.is_empty() && heartbeat.deleted_volumes.is_empty() {
                     if let Err(e) = master.add_node(
                         node_id,
                         heartbeat.ip.clone(),
                         heartbeat.rack.clone(),
                         heartbeat.data_center.clone(),
+                        heartbeat.port,
+                        heartbeat.grpc_port,
+                        heartbeat.public_url.clone(),
                     ).await {
                         debug!("Failed to add node: {}", e);
                     }
@@ -58,21 +68,33 @@ impl MasterService for MasterGrpcServer {
                     if let Err(e) = master.update_node_volumes(
                         &node_id,
                         &heartbeat.volumes,
+                        &heartbeat.new_volumes,
+                        &heartbeat.deleted_volumes,
                         &heartbeat.ip,
                         heartbeat.grpc_port,
+                        heartbeat.port,
                     ).await {
                         debug!("Failed to update node volumes: {}", e);
                     }
                 }
 
-                let leader = format!("{}", master.id());
+                let leader = master.get_leader().await;
 
-                yield Ok(HeartbeatResponse {
+                if tx.send(Ok(HeartbeatResponse {
                     volume_size_limit: DEFAULT_VOLUME_SIZE,
                     leader,
-                });
+                    metrics_address: String::new(),
+                    metrics_interval_seconds: 0,
+                    preallocate: false,
+                })).await.is_err() {
+                    break;
+                }
             }
-        };
+        });
+
+        use tokio_stream::wrappers::ReceiverStream;
+        use futures::StreamExt;
+        let output = ReceiverStream::new(rx).boxed();
 
         Ok(Response::new(Box::pin(output)))
     }
@@ -85,27 +107,32 @@ impl MasterService for MasterGrpcServer {
         let mut locations = Vec::new();
 
         for volume_id_str in req.volume_or_file_ids {
-            if let Ok(volume_id) = Uuid::parse_str(&volume_id_str) {
-                let volume_id = VolumeId(volume_id);
+            let parts: Vec<&str> = volume_id_str.split(',').collect();
+            let vid_str = if parts.len() > 1 { parts[0] } else { &volume_id_str };
+
+            if let Ok(vid) = u32::from_str(vid_str) {
+                let volume_id = VolumeId(vid);
                 match self.master.get_volume(&volume_id).await {
                     Ok(info) => {
                         if let Some(node) = self.master.get_node(&info.node_id) {
                             let location = Location {
-                                url: format!("{}:{}", node.address, node.grpc_port),
-                                public_url: node.address.clone(),
+                                url: node.url(),
+                                public_url: node.public_url.clone(),
                                 grpc_port: node.grpc_port,
-                                data_center: node.data_center.clone(),
+                                data_center: node.data_center_id.to_string(),
                             };
                             locations.push(VolumeIdLocation {
                                 volume_or_file_id: volume_id_str,
                                 locations: vec![location],
-                                error: "".to_string(),
+                                error: String::new(),
+                                auth: String::new(),
                             });
                         } else {
                             locations.push(VolumeIdLocation {
                                 volume_or_file_id: volume_id_str,
                                 locations: vec![],
                                 error: "node not found".to_string(),
+                                auth: String::new(),
                             });
                         }
                     }
@@ -114,6 +141,7 @@ impl MasterService for MasterGrpcServer {
                             volume_or_file_id: volume_id_str,
                             locations: vec![],
                             error: "volume not found".to_string(),
+                            auth: String::new(),
                         });
                     }
                 }
@@ -122,6 +150,7 @@ impl MasterService for MasterGrpcServer {
                     volume_or_file_id: volume_id_str,
                     locations: vec![],
                     error: "invalid volume id".to_string(),
+                    auth: String::new(),
                 });
             }
         }
@@ -142,19 +171,30 @@ impl MasterService for MasterGrpcServer {
             .assign_volume(&req.replication, &req.collection)
             .await
         {
-            Ok((volume_id, node_info)) => {
-                let location = Location {
-                    url: format!("{}:{}", node_info.address, node_info.grpc_port),
-                    public_url: node_info.address.clone(),
-                    grpc_port: node_info.grpc_port,
-                    data_center: node_info.data_center.clone(),
-                };
+            Ok((fid, nodes)) => {
+                let mut replicas = Vec::new();
+                let mut primary_location: Option<Location> = None;
+
+                for (i, node) in nodes.iter().enumerate() {
+                    let location = Location {
+                        url: node.url(),
+                        public_url: node.public_url.clone(),
+                        grpc_port: node.grpc_port,
+                        data_center: node.data_center_id.to_string(),
+                    };
+                    if i == 0 {
+                        primary_location = Some(location.clone());
+                    }
+                    replicas.push(location);
+                }
 
                 Ok(Response::new(AssignResponse {
-                    fid: format!("{},{}", volume_id.0, 0),
+                    fid: fid.to_string(),
                     count: req.count,
-                    error: "".to_string(),
-                    replicas: vec![location],
+                    error: String::new(),
+                    auth: String::new(),
+                    replicas,
+                    location: primary_location,
                 }))
             }
             Err(e) => Err(Status::internal(format!("{}", e))),
@@ -174,9 +214,13 @@ impl MasterService for MasterGrpcServer {
 
             for volume in volumes {
                 volume_infos.push(VolumeShortInfo {
-                    volume_id: volume.id.0.to_string(),
+                    volume_id: volume.id.0,
                     size: volume.size,
-                    read_only: volume.state == VolumeState::ReadOnly,
+                    read_only: volume.state == powerfs_common::types::VolumeState::ReadOnly,
+                    collection: volume.collection.0.clone(),
+                    replica_placement: volume.replica_count,
+                    ttl: volume.ttl.0 as u32,
+                    disk_type: volume.disk_type.0.clone(),
                 });
             }
 
@@ -184,8 +228,8 @@ impl MasterService for MasterGrpcServer {
                 id: node.id.0.clone(),
                 address: node.address.clone(),
                 grpc_port: node.grpc_port,
-                data_center: node.data_center.clone(),
-                rack: node.rack.clone(),
+                data_center: node.data_center_id.to_string(),
+                rack: node.rack_id.to_string(),
                 volumes: volume_infos,
             });
         }
@@ -196,6 +240,70 @@ impl MasterService for MasterGrpcServer {
         }))
     }
 
+    async fn keep_connected(
+        &self,
+        request: Request<Streaming<KeepConnectedRequest>>,
+    ) -> Result<Response<Self::KeepConnectedStream>, Status> {
+        let mut stream = request.into_inner();
+        let master = self.master.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let client_id = format!("client_{}", Uuid::new_v4());
+
+        master.add_client(client_id.clone(), tx);
+
+        let output = async_stream::stream! {
+            let mut rx = rx;
+
+            loop {
+                tokio::select! {
+                    Some(update) = rx.recv() => {
+                        let mut new_vids = Vec::new();
+                        let mut deleted_vids = Vec::new();
+
+                        for vid in update.new_vids {
+                            new_vids.push(vid);
+                        }
+                        for vid in update.deleted_vids {
+                            deleted_vids.push(vid);
+                        }
+
+                        yield Ok(KeepConnectedResponse {
+                            volume_location: Some(VolumeLocation {
+                                url: String::new(),
+                                public_url: String::new(),
+                                new_vids,
+                                deleted_vids,
+                                leader: update.leader,
+                                data_center: String::new(),
+                                grpc_port: 0,
+                            }),
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        let leader = master.get_leader().await;
+                        yield Ok(KeepConnectedResponse {
+                            volume_location: Some(VolumeLocation {
+                                url: String::new(),
+                                public_url: String::new(),
+                                new_vids: vec![],
+                                deleted_vids: vec![],
+                                leader,
+                                data_center: String::new(),
+                                grpc_port: 0,
+                            }),
+                        });
+                    }
+                    _ = stream.message() => {
+                        continue;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(output)))
+    }
+
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         let start = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -204,9 +312,8 @@ impl MasterService for MasterGrpcServer {
 
         Ok(Response::new(PingResponse {
             start_time_ns: start,
+            remote_time_ns: 0,
             stop_time_ns: start,
         }))
     }
 }
-
-use powerfs_common::types::VolumeState;

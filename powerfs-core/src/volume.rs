@@ -5,7 +5,7 @@ use chrono::Utc;
 use powerfs_common::{
     constants::VOLUME_DATA_OFFSET,
     error::{PowerFsError, Result},
-    types::{NeedleId, NeedleInfo, VolumeId, VolumeInfo, VolumeState},
+    types::{Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo, VolumeState},
     utils::generate_needle_id,
 };
 use std::fs::{File, OpenOptions};
@@ -56,9 +56,12 @@ impl Volume {
         let info = VolumeInfo {
             id: id.clone(),
             node_id: powerfs_common::types::NodeId(node_id.to_string()),
+            collection: Collection::default(),
             size,
             used: 0,
             replica_count: 3,
+            ttl: Ttl::default(),
+            disk_type: DiskType::default(),
             state: VolumeState::Available,
             created_at: Utc::now(),
             modified_at: Utc::now(),

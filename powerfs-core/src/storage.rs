@@ -5,7 +5,6 @@ use powerfs_common::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use uuid::Uuid;
 
 pub struct StorageManager {
     volumes: RwLock<HashMap<VolumeId, Arc<Volume>>>,
@@ -136,8 +135,8 @@ impl StorageManager {
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                     if let Some(stripped) = dir_name.strip_prefix("volume_") {
-                        if let Ok(uuid) = Uuid::parse_str(stripped) {
-                            let volume_id = VolumeId(uuid);
+                        if let Ok(vid) = stripped.parse::<u32>() {
+                            let volume_id = VolumeId(vid);
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 volumes.entry(volume_id.clone())
                             {
