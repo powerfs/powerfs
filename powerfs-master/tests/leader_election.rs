@@ -11,11 +11,8 @@ use tokio::time::sleep;
 /// Test that a single leader is elected in a new cluster
 #[tokio::test]
 async fn test_single_leader_election() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -32,11 +29,8 @@ async fn test_single_leader_election() {
 /// Test that a new leader is elected when the current leader fails
 #[tokio::test]
 async fn test_leader_reelection_after_failure() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -62,11 +56,8 @@ async fn test_leader_reelection_after_failure() {
 /// Test that cluster can still elect a leader with minority nodes down
 #[tokio::test]
 async fn test_election_with_quorum() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 
     let cluster = RaftTestCluster::new(5).await;
     cluster.start_all().await;
@@ -92,11 +83,8 @@ async fn test_election_with_quorum() {
 /// Test that no leader is elected when majority is unavailable
 #[tokio::test]
 async fn test_no_leader_without_quorum() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -128,11 +116,8 @@ async fn test_no_leader_without_quorum() {
 /// Test that the same leader is maintained when the cluster is stable
 #[tokio::test]
 async fn test_leader_stability() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;

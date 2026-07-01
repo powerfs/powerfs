@@ -24,6 +24,7 @@ pub struct NodeInfo {
 }
 
 /// A Raft test cluster
+#[derive(Clone)]
 pub struct RaftTestCluster {
     /// All nodes in the cluster
     pub nodes: Arc<RwLock<HashMap<u64, RaftTestNode>>>,

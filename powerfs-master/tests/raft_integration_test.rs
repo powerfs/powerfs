@@ -13,8 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, timeout};
 
-use powerfs_master::raft_node::{Peer, RaftNode};
-use powerfs_master::raft_storage::{self, RaftCommand};
+use powerfs_master::raft_storage::RaftCommand;
 use powerfs_common::types::{NodeId, VolumeId, VolumeInfo, VolumeState};
 
 mod cluster;
@@ -29,10 +28,6 @@ pub use fault_tolerance::*;
 
 #[tokio::test]
 async fn test_cluster_startup() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
-
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
 
@@ -48,10 +43,6 @@ async fn test_cluster_startup() {
 
 #[tokio::test]
 async fn test_propose_command() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
-
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
 
@@ -79,9 +70,6 @@ async fn test_propose_command() {
 
 #[tokio::test]
 async fn test_log_replication() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -115,9 +103,6 @@ async fn test_log_replication() {
 
 #[tokio::test]
 async fn test_follower_forwarding() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -147,9 +132,6 @@ async fn test_follower_forwarding() {
 
 #[tokio::test]
 async fn test_leader_election_on_leader_failure() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -174,9 +156,6 @@ async fn test_leader_election_on_leader_failure() {
 
 #[tokio::test]
 async fn test_read_after_write_consistency() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -204,9 +183,6 @@ async fn test_read_after_write_consistency() {
 
 #[tokio::test]
 async fn test_cluster_survives_multiple_failures() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(5).await;
     cluster.start_all().await;
@@ -235,9 +211,6 @@ async fn test_cluster_survives_multiple_failures() {
 
 #[tokio::test]
 async fn test_snapshot_and_recovery() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -266,9 +239,6 @@ async fn test_snapshot_and_recovery() {
 
 #[tokio::test]
 async fn test_concurrent_proposals() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     let cluster = RaftTestCluster::new(3).await;
     cluster.start_all().await;
@@ -300,9 +270,6 @@ async fn test_concurrent_proposals() {
 
 #[tokio::test]
 async fn test_cluster_with_adjusted_timing() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     // Create a 3-node cluster
     let cluster = RaftTestCluster::builder()

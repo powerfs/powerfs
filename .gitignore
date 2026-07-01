@@ -10,3 +10,5 @@ unsetp.sh
 proxy.sh
 *.sh
 docs/
+.cargo
+vendor/

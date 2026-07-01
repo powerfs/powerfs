@@ -12,11 +12,8 @@ use tokio::time::sleep;
 /// Test that commands are replicated to all nodes
 #[tokio::test]
 async fn test_basic_log_replication() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -53,11 +50,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that commands are committed and applied
 #[tokio::test]
 async fn test_command_application() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -90,11 +84,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test concurrent proposals from multiple clients
 #[tokio::test]
 async fn test_concurrent_log_replication() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
     use tokio::task::JoinSet;
 
@@ -148,11 +139,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that a follower can catch up after being behind
 #[tokio::test]
 async fn test_follower_catch_up() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -199,11 +187,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test log compaction (snapshot)
 #[tokio::test]
 async fn test_log_compaction() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::builder()

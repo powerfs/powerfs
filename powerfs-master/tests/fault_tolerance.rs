@@ -11,11 +11,8 @@ use tokio::time::sleep;
 /// Test that the cluster continues to work after a follower failure
 #[tokio::test]
 async fn test_follower_failure() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -55,11 +52,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that the cluster continues to work after the leader fails
 #[tokio::test]
 async fn test_leader_failure() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -104,9 +98,6 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that a new leader is elected after partition heals
 #[tokio::test]
 async fn test_partition_recovery() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
     use crate::cluster::RaftTestCluster;
 
@@ -142,11 +133,8 @@ async fn test_partition_recovery() {
 /// Test that cluster survives multiple failures
 #[tokio::test]
 async fn test_multiple_failures() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(5).await;
@@ -182,11 +170,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that cluster cannot proceed when majority is lost
 #[tokio::test]
 async fn test_majority_loss() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -218,11 +203,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that previously committed commands are not lost after leader change
 #[tokio::test]
 async fn test_commit_persistence_after_leader_change() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
@@ -270,11 +252,8 @@ use powerfs_master::raft_storage::RaftCommand;
 /// Test that the cluster handles rapid leader changes
 #[tokio::test]
 async fn test_rapid_leader_changes() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init();
 
-    use powerfs_master::tests::cluster::RaftTestCluster;
+    use crate::cluster::RaftTestCluster;
 use powerfs_master::raft_storage::RaftCommand;
 
     let cluster = RaftTestCluster::new(3).await;
