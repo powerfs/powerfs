@@ -165,6 +165,10 @@ service RaftService {
     rpc GetClusterInfo (ClusterInfoRequest) returns (ClusterInfoResponse);
     // Add node to cluster
     rpc AddNode (AddNodeRequest) returns (AddNodeResponse);
+    // Remove node from cluster
+    rpc RemoveNode (RemoveNodeRequest) returns (RemoveNodeResponse);
+    // Transfer leadership to another node
+    rpc TransferLeader (TransferLeaderRequest) returns (TransferLeaderResponse);
 }
 
 message ProposeRequest {
@@ -199,6 +203,24 @@ message AddNodeRequest {
 }
 
 message AddNodeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RemoveNodeRequest {
+    uint64 node_id = 1;
+}
+
+message RemoveNodeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message TransferLeaderRequest {
+    uint64 target_node_id = 1;
+}
+
+message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
 }

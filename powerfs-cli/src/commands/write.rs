@@ -17,17 +17,23 @@ pub struct WriteArgs {
 }
 
 pub async fn write(args: WriteArgs) -> super::CommandResult {
-    println!("Writing file {} to volume {} with file_key {}", args.file, args.volume_id, args.file_key);
-    
-    let data = std::fs::read(&args.file)
-        .map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
-    
+    println!(
+        "Writing file {} to volume {} with file_key {}",
+        args.file, args.volume_id, args.file_key
+    );
+
+    let data = std::fs::read(&args.file).map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
+
     println!("File size: {} bytes", data.len());
-    
+
     let mut client = VolumeServerClient::new(&args.volume_server);
-    client.write_needle(args.volume_id, args.file_key, &data).await
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Write failed: {}", e)))?;
-    
+    client
+        .write_needle(args.volume_id, args.file_key, &data)
+        .await
+        .map_err(|e| {
+            powerfs_common::error::PowerFsError::Internal(format!("Write failed: {}", e))
+        })?;
+
     println!("Successfully written!");
     Ok(())
 }

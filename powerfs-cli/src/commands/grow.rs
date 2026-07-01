@@ -17,11 +17,15 @@ pub struct GrowArgs {
 }
 
 pub async fn grow(mut client: MasterClient, args: GrowArgs) -> super::CommandResult {
-    println!("Requesting volume growth: {} volumes with replication {}", args.count, args.replication);
-    
-    let mut service = client.service().await
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
-    
+    println!(
+        "Requesting volume growth: {} volumes with replication {}",
+        args.count, args.replication
+    );
+
+    let mut service = client.service().await.map_err(|e| {
+        powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e))
+    })?;
+
     let request = powerfs_master::proto::VolumeGrowRequest {
         replication: args.replication,
         collection: args.collection,
@@ -32,13 +36,14 @@ pub async fn grow(mut client: MasterClient, args: GrowArgs) -> super::CommandRes
         disk_type: String::new(),
         count: args.count,
     };
-    
-    let response = service.volume_grow(tonic::Request::new(request))
+
+    let response = service
+        .volume_grow(tonic::Request::new(request))
         .await
         .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
-    
+
     let result = response.into_inner();
-    
+
     if !result.error.is_empty() {
         println!("Error: {}", result.error);
     } else {
@@ -48,9 +53,12 @@ pub async fn grow(mut client: MasterClient, args: GrowArgs) -> super::CommandRes
         }
         println!("\nLocations:");
         for loc in &result.locations {
-            println!("  - URL: {}, Public URL: {}, DC: {}", loc.url, loc.public_url, loc.data_center);
+            println!(
+                "  - URL: {}, Public URL: {}, DC: {}",
+                loc.url, loc.public_url, loc.data_center
+            );
         }
     }
-    
+
     Ok(())
 }

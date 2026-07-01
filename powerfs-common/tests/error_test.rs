@@ -54,7 +54,10 @@ fn test_error_timeout_display() {
 
 #[test]
 fn test_error_connection_refused_display() {
-    assert_eq!(PowerFsError::ConnectionRefused.to_string(), "connection refused");
+    assert_eq!(
+        PowerFsError::ConnectionRefused.to_string(),
+        "connection refused"
+    );
 }
 
 #[test]
@@ -64,12 +67,18 @@ fn test_error_not_leader_display() {
 
 #[test]
 fn test_error_quorum_not_reached_display() {
-    assert_eq!(PowerFsError::QuorumNotReached.to_string(), "quorum not reached");
+    assert_eq!(
+        PowerFsError::QuorumNotReached.to_string(),
+        "quorum not reached"
+    );
 }
 
 #[test]
 fn test_error_checksum_mismatch_display() {
-    assert_eq!(PowerFsError::ChecksumMismatch.to_string(), "checksum mismatch");
+    assert_eq!(
+        PowerFsError::ChecksumMismatch.to_string(),
+        "checksum mismatch"
+    );
 }
 
 #[test]
@@ -79,7 +88,10 @@ fn test_error_out_of_space_display() {
 
 #[test]
 fn test_error_permission_denied_display() {
-    assert_eq!(PowerFsError::PermissionDenied.to_string(), "permission denied");
+    assert_eq!(
+        PowerFsError::PermissionDenied.to_string(),
+        "permission denied"
+    );
 }
 
 #[test]

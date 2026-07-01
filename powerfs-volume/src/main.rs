@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            
+
             let volumes = storage_manager.list_volumes();
             let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                 .into_iter()
@@ -99,16 +99,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
-            
+
             info!("Requesting initial volumes from master...");
             match master_client.grow("001", "default", 2).await {
                 Ok(response) => {
                     if !response.new_volume_ids.is_empty() {
-                        info!("Received {} new volume IDs from master", response.new_volume_ids.len());
+                        info!(
+                            "Received {} new volume IDs from master",
+                            response.new_volume_ids.len()
+                        );
                         for &vid in &response.new_volume_ids {
                             if let Ok(_) = storage_manager.create_volume(
-                                powerfs_common::types::VolumeId(vid), 
-                                args.volume_size
+                                powerfs_common::types::VolumeId(vid),
+                                args.volume_size,
                             ) {
                                 info!("Created volume {}", vid);
                             } else {

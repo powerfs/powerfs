@@ -4,13 +4,13 @@ main:
     - runner:
         cpus: 16
       docker:
-        image: rust:1.95-slim
+        image: rust:1.96-slim
         volumes:
           - cargo_registry:copy-on-write
           - target:copy-on-write
       stages:
         - name: Install git & system libs
-          script: apt update && apt install -y git libssl-dev gcc g++
+          script: apt update && apt install -y git libssl-dev gcc g++ pkg-config libclang-dev libfuse-dev libsnappy-dev libzstd-dev protobuf-compiler
         - name: Config crates mirror
           script:
             - mkdir -p ~/.cargo
@@ -22,8 +22,11 @@ main:
           script:
             - cargo clippy --all-targets --all-features -- -D warnings
             - cargo build --release
+        - name: Test
+          script:
+            - cargo test --all --verbose
 
-# 云端VSCode开发环境
+# 云端VSCode开发环境（tests分支）
 $:
   vscode:
     - runner:
@@ -31,13 +34,15 @@ $:
       services:
         - vscode
       docker:
-        image: rust:1.82-slim
-        volumes:
-          - cargo_registry:copy-on-write
-          - target:copy-on-write
+        image: rust:1.96-slim
+      branches: tests
       stages:
         - name: Install git + 编译系统依赖
-          script: apt update && apt install -y git libssl-dev gcc g++ protobuf-compiler
+          script: apt update && apt install -y curl git libssl-dev gcc g++ protobuf-compiler pkg-config libclang-dev libfuse-dev libsnappy-dev libzstd-dev
+        - name: Add components
+          script: rustup component add rustfmt clippy rust-src
+        - name: checkout
+          script: git checkout tests && git pull origin tests
         - name: 国内crates镜像
           script:
             - mkdir -p ~/.cargo
@@ -45,7 +50,5 @@ $:
             - echo 'replace-with = "rsproxy"' >> ~/.cargo/config.toml
             - echo '[source.rsproxy]' >> ~/.cargo/config.toml
             - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
-        - name: Rust工具组件
-          script: rustup component add rustfmt clippy rust-src
         - name: 预拉取依赖
           script: cargo fetch

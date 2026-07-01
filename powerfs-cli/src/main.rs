@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
 use log::info;
 
-mod commands;
 mod client;
+mod commands;
 mod volume_client;
 
-use commands::{StatusArgs, AssignArgs, LookupArgs, VolumeListArgs, HeartbeatArgs, GrowArgs, WriteArgs, ReadArgs};
+use commands::{
+    AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterTransferArgs, GrowArgs, HeartbeatArgs,
+    LookupArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+};
 
 /// PowerFS CLI tool for testing and administration
 #[derive(Parser)]
@@ -51,6 +54,15 @@ enum Commands {
 
     /// Read data from volume server
     Read(ReadArgs),
+
+    /// Add node to cluster
+    ClusterAdd(ClusterAddArgs),
+
+    /// Remove node from cluster
+    ClusterRemove(ClusterRemoveArgs),
+
+    /// Transfer leadership to another node
+    ClusterTransfer(ClusterTransferArgs),
 }
 
 #[tokio::main]
@@ -81,6 +93,9 @@ async fn main() {
         Commands::Grow(args) => commands::grow(client, args).await,
         Commands::Write(args) => commands::write(args).await,
         Commands::Read(args) => commands::read(args).await,
+        Commands::ClusterAdd(args) => commands::cluster_add(client, args).await,
+        Commands::ClusterRemove(args) => commands::cluster_remove(client, args).await,
+        Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
     };
 
     if let Err(e) = result {

@@ -28,13 +28,16 @@ impl MasterGrpcServer {
         Ok(())
     }
 
-    async fn get_leader_client(&self) -> Option<crate::proto::powerfs::master_service_client::MasterServiceClient<Channel>> {
+    async fn get_leader_client(
+        &self,
+    ) -> Option<crate::proto::powerfs::master_service_client::MasterServiceClient<Channel>> {
         let leader = self.master.get_leader().await;
         if leader.is_empty() {
             return None;
         }
         let addr = format!("http://{}", leader);
-        match crate::proto::powerfs::master_service_client::MasterServiceClient::connect(addr).await {
+        match crate::proto::powerfs::master_service_client::MasterServiceClient::connect(addr).await
+        {
             Ok(client) => Some(client),
             Err(e) => {
                 warn!("Failed to connect to leader {}: {}", leader, e);
@@ -67,48 +70,61 @@ impl MasterService for MasterGrpcServer {
 
                 let node_id = powerfs_common::types::NodeId(heartbeat.id.clone());
 
-                if heartbeat.volumes.is_empty() && heartbeat.new_volumes.is_empty() && heartbeat.deleted_volumes.is_empty() {
-                    if let Err(e) = master.add_node(
-                        node_id,
-                        heartbeat.ip.clone(),
-                        heartbeat.rack.clone(),
-                        heartbeat.data_center.clone(),
-                        heartbeat.port,
-                        heartbeat.grpc_port,
-                        heartbeat.public_url.clone(),
-                    ).await {
+                if heartbeat.volumes.is_empty()
+                    && heartbeat.new_volumes.is_empty()
+                    && heartbeat.deleted_volumes.is_empty()
+                {
+                    if let Err(e) = master
+                        .add_node(
+                            node_id,
+                            heartbeat.ip.clone(),
+                            heartbeat.rack.clone(),
+                            heartbeat.data_center.clone(),
+                            heartbeat.port,
+                            heartbeat.grpc_port,
+                            heartbeat.public_url.clone(),
+                        )
+                        .await
+                    {
                         debug!("Failed to add node: {}", e);
                     }
                 } else {
-                    if let Err(e) = master.update_node_volumes(
-                        &node_id,
-                        &heartbeat.volumes,
-                        &heartbeat.new_volumes,
-                        &heartbeat.deleted_volumes,
-                        &heartbeat.ip,
-                        heartbeat.grpc_port,
-                        heartbeat.port,
-                    ).await {
+                    if let Err(e) = master
+                        .update_node_volumes(
+                            &node_id,
+                            &heartbeat.volumes,
+                            &heartbeat.new_volumes,
+                            &heartbeat.deleted_volumes,
+                            &heartbeat.ip,
+                            heartbeat.grpc_port,
+                            heartbeat.port,
+                        )
+                        .await
+                    {
                         debug!("Failed to update node volumes: {}", e);
                     }
                 }
 
                 let leader = master.get_leader().await;
 
-                if tx.send(Ok(HeartbeatResponse {
-                    volume_size_limit: DEFAULT_VOLUME_SIZE,
-                    leader,
-                    metrics_address: String::new(),
-                    metrics_interval_seconds: 0,
-                    preallocate: false,
-                })).await.is_err() {
+                if tx
+                    .send(Ok(HeartbeatResponse {
+                        volume_size_limit: DEFAULT_VOLUME_SIZE,
+                        leader,
+                        metrics_address: String::new(),
+                        metrics_interval_seconds: 0,
+                        preallocate: false,
+                    }))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         });
 
-        use tokio_stream::wrappers::ReceiverStream;
         use futures::StreamExt;
+        use tokio_stream::wrappers::ReceiverStream;
         let output = ReceiverStream::new(rx).boxed();
 
         Ok(Response::new(Box::pin(output)))
@@ -123,7 +139,11 @@ impl MasterService for MasterGrpcServer {
 
         for volume_id_str in req.volume_or_file_ids {
             let parts: Vec<&str> = volume_id_str.split(',').collect();
-            let vid_str = if parts.len() > 1 { parts[0] } else { &volume_id_str };
+            let vid_str = if parts.len() > 1 {
+                parts[0]
+            } else {
+                &volume_id_str
+            };
 
             if let Ok(vid) = u32::from_str(vid_str) {
                 let volume_id = VolumeId(vid);
@@ -188,7 +208,9 @@ impl MasterService for MasterGrpcServer {
                     Err(e) => return Err(e),
                 }
             }
-            return Err(Status::unavailable("not leader and no leader client available"));
+            return Err(Status::unavailable(
+                "not leader and no leader client available",
+            ));
         }
 
         let req = request.into_inner();
@@ -357,7 +379,9 @@ impl MasterService for MasterGrpcServer {
                     Err(e) => return Err(e),
                 }
             }
-            return Err(Status::unavailable("not leader and no leader client available"));
+            return Err(Status::unavailable(
+                "not leader and no leader client available",
+            ));
         }
 
         let req = request.into_inner();
@@ -367,7 +391,11 @@ impl MasterService for MasterGrpcServer {
         let mut locations = Vec::new();
 
         for _ in 0..req.count {
-            match self.master.assign_volume(&req.replication, &req.collection).await {
+            match self
+                .master
+                .assign_volume(&req.replication, &req.collection)
+                .await
+            {
                 Ok((fid, nodes)) => {
                     new_volume_ids.push(fid.volume_id.0);
                     for node in nodes {

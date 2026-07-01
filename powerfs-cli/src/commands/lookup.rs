@@ -20,34 +20,36 @@ pub async fn lookup(mut client: MasterClient, args: LookupArgs) -> super::Comman
         fid
     } else {
         return Err(powerfs_common::error::PowerFsError::InvalidRequest(
-            "Either --volume-id or --fid must be specified".to_string()
+            "Either --volume-id or --fid must be specified".to_string(),
         ));
     };
-    
+
     println!("Looking up: {}", volume_or_file_id);
-    
-    let mut service = client.service().await
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
-    
+
+    let mut service = client.service().await.map_err(|e| {
+        powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e))
+    })?;
+
     let request = powerfs_master::proto::LookupVolumeRequest {
         volume_or_file_ids: vec![volume_or_file_id.clone()],
         collection: String::new(),
     };
-    
-    let response = service.lookup_volume(tonic::Request::new(request))
+
+    let response = service
+        .lookup_volume(tonic::Request::new(request))
         .await
         .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
-    
+
     let result = response.into_inner();
-    
+
     for loc in result.volume_id_locations {
         println!("\n=== Volume/File ID: {} ===", loc.volume_or_file_id);
-        
+
         if !loc.error.is_empty() {
             println!("Error: {}", loc.error);
             continue;
         }
-        
+
         if loc.locations.is_empty() {
             println!("No locations found");
         } else {
@@ -59,6 +61,6 @@ pub async fn lookup(mut client: MasterClient, args: LookupArgs) -> super::Comman
             }
         }
     }
-    
+
     Ok(())
 }

@@ -1,20 +1,26 @@
-mod status;
 mod assign;
-mod lookup;
-mod volume_list;
-mod heartbeat;
+mod cluster_add;
+mod cluster_remove;
+mod cluster_transfer;
 mod grow;
-mod write;
+mod heartbeat;
+mod lookup;
 mod read;
+mod status;
+mod volume_list;
+mod write;
 
-pub use status::{status, StatusArgs};
 pub use assign::{assign, AssignArgs};
-pub use lookup::{lookup, LookupArgs};
-pub use volume_list::{volume_list, VolumeListArgs};
-pub use heartbeat::{heartbeat, HeartbeatArgs};
+pub use cluster_add::{cluster_add, ClusterAddArgs};
+pub use cluster_remove::{cluster_remove, ClusterRemoveArgs};
+pub use cluster_transfer::{cluster_transfer, ClusterTransferArgs};
 pub use grow::{grow, GrowArgs};
-pub use write::{write, WriteArgs};
+pub use heartbeat::{heartbeat, HeartbeatArgs};
+pub use lookup::{lookup, LookupArgs};
 pub use read::{read, ReadArgs};
+pub use status::{status, StatusArgs};
+pub use volume_list::{volume_list, VolumeListArgs};
+pub use write::{write, WriteArgs};
 
 use powerfs_common::error::Result;
 

@@ -17,30 +17,39 @@ pub struct ReadArgs {
 }
 
 pub async fn read(args: ReadArgs) -> super::CommandResult {
-    println!("Reading from volume {} file_key {}", args.volume_id, args.file_key);
-    
+    println!(
+        "Reading from volume {} file_key {}",
+        args.volume_id, args.file_key
+    );
+
     let mut client = VolumeServerClient::new(&args.volume_server);
-    let data = client.read_needle(args.volume_id, args.file_key).await
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Read failed: {}", e)))?;
-    
+    let data = client
+        .read_needle(args.volume_id, args.file_key)
+        .await
+        .map_err(|e| {
+            powerfs_common::error::PowerFsError::Internal(format!("Read failed: {}", e))
+        })?;
+
     println!("Read {} bytes", data.len());
-    
+
     if let Some(output) = args.output {
-        std::fs::write(&output, &data)
-            .map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
+        std::fs::write(&output, &data).map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
         println!("Saved to file: {}", output);
     } else {
         if data.len() <= 1024 {
             if let Ok(text) = String::from_utf8(data.clone()) {
                 println!("Content:\n{}", text);
             } else {
-                println!("Binary data (first 100 bytes): {:?}", &data[..std::cmp::min(data.len(), 100)]);
+                println!(
+                    "Binary data (first 100 bytes): {:?}",
+                    &data[..std::cmp::min(data.len(), 100)]
+                );
             }
         } else {
             println!("Binary data (first 100 bytes): {:?}", &data[..100]);
             println!("(Content truncated, use --output to save to file)");
         }
     }
-    
+
     Ok(())
 }

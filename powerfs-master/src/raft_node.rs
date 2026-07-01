@@ -3,12 +3,12 @@
 //! This module provides the RaftNode structure for managing distributed consensus
 //! using the tikv/raft-rs library.
 
-use crate::raft_storage::{RaftCommand, RocksDbStorage};
+use crate::raft_storage::{RaftCommand, RaftSnapshotData, RocksDbStorage};
 use log::{debug, error, info, warn};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeType, Message as RaftMessage};
 use raft::storage::Storage;
-use raft::{Config, StateRole, RawNode};
+use raft::{Config, RawNode, StateRole};
 use slog::{Discard, Logger};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -26,7 +26,7 @@ pub struct Peer {
 /// RaftNode manages the Raft state machine for a single master node
 pub struct RaftNode {
     /// The underlying Raft RawNode
-    node: RawNode<RocksDbStorage>,
+    pub node: RawNode<RocksDbStorage>,
     /// This node's ID
     id: u64,
     /// This node's address
@@ -37,10 +37,14 @@ pub struct RaftNode {
     propose_tx: mpsc::Sender<ProposeRequest>,
     /// Receiver for propose requests
     propose_rx: mpsc::Receiver<ProposeRequest>,
-    /// Channel for sending raft messages to peers
+    /// Channel for sending raft messages to peers (fixed, never replaced)
     message_tx: mpsc::Sender<OutgoingMessage>,
     /// Receiver for outgoing messages
     message_rx: mpsc::Receiver<OutgoingMessage>,
+    /// Channel for receiving incoming Raft messages from peers
+    step_tx: mpsc::Sender<RaftMessage>,
+    /// Receiver for incoming Raft messages
+    step_rx: mpsc::Receiver<RaftMessage>,
     /// Sender for committed entries to apply
     apply_tx: mpsc::Sender<ApplyEntry>,
     /// Receiver for committed entries to apply
@@ -80,25 +84,46 @@ impl RaftNode {
         peers: Vec<Peer>,
         storage_path: &str,
     ) -> Result<Self, String> {
-        let storage = RocksDbStorage::new(storage_path)
-            .map_err(|e| format!("failed to create storage: {}", e))?;
+        Self::new_with_config(id, address, peers, storage_path, 10, 3)
+    }
 
-        // Get initial state from storage
+    /// Create a new RaftNode with custom election/heartbeat ticks
+    pub fn new_with_config(
+        id: u64,
+        address: String,
+        peers: Vec<Peer>,
+        storage_path: &str,
+        election_tick: usize,
+        heartbeat_tick: usize,
+    ) -> Result<Self, String> {
+        let storage = if peers.is_empty() {
+            RocksDbStorage::new_with_single_node(storage_path, id)
+                .map_err(|e| format!("failed to create storage: {}", e))?
+        } else {
+            let mut peer_ids = vec![id];
+            for peer in &peers {
+                peer_ids.push(peer.id);
+            }
+            RocksDbStorage::new_with_peers(storage_path, &peer_ids)
+                .map_err(|e| format!("failed to create storage: {}", e))?
+        };
+
         let _initial_state = storage
             .initial_state()
             .map_err(|e| format!("failed to get initial state: {}", e))?;
 
         let mut cfg = Config {
             id,
-            election_tick: 10,
-            heartbeat_tick: 3,
+            election_tick,
+            heartbeat_tick,
             max_size_per_msg: 1 << 20, // 1MB
             max_inflight_msgs: 256,
-            check_quorum: true,
-            pre_vote: true,
+            check_quorum: !peers.is_empty(),
+            pre_vote: false,
             ..Default::default()
         };
-        cfg.validate().map_err(|e| format!("invalid raft config: {}", e))?;
+        cfg.validate()
+            .map_err(|e| format!("invalid raft config: {}", e))?;
 
         // Set applied to last index from storage
         if let Ok(last_idx) = storage.last_index() {
@@ -107,12 +132,12 @@ impl RaftNode {
 
         let logger = Logger::root(Discard, slog::o!());
 
-        let node =
-            RawNode::new(&cfg, storage.clone(), &logger)
-                .map_err(|e| format!("failed to create raft node: {}", e))?;
+        let node = RawNode::new(&cfg, storage.clone(), &logger)
+            .map_err(|e| format!("failed to create raft node: {}", e))?;
 
         let (propose_tx, propose_rx) = mpsc::channel(1000);
         let (message_tx, message_rx) = mpsc::channel(1000);
+        let (step_tx, step_rx) = mpsc::channel(1000);
         let (apply_tx, apply_rx) = mpsc::channel(1000);
 
         let mut peer_map = HashMap::new();
@@ -136,6 +161,8 @@ impl RaftNode {
             propose_rx,
             message_tx,
             message_rx,
+            step_tx,
+            step_rx,
             apply_tx,
             _apply_rx: apply_rx,
             running: Arc::new(RwLock::new(true)),
@@ -164,12 +191,10 @@ impl RaftNode {
                     }
                 }
 
-                // Handle outgoing messages (send to peers via external handler)
-                msg = self.message_rx.recv() => {
+                // Handle incoming Raft messages from peers
+                msg = self.step_rx.recv() => {
                     if let Some(msg) = msg {
-                        // Emit message for external handler
-                        // The external code will take message_rx and handle sending
-                        debug!("Outgoing message to peer {}", msg.to_id);
+                        self.handle_step(msg);
                     }
                 }
             }
@@ -180,7 +205,7 @@ impl RaftNode {
     }
 
     /// Process ready state from Raft
-    fn process_ready(&mut self) {
+    pub fn process_ready(&mut self) {
         if !self.node.has_ready() {
             return;
         }
@@ -244,7 +269,10 @@ impl RaftNode {
                         });
                     }
                     Err(e) => {
-                        error!("Failed to deserialize command at index {}: {}", entry.index, e);
+                        error!(
+                            "Failed to deserialize command at index {}: {}",
+                            entry.index, e
+                        );
                     }
                 }
 
@@ -278,13 +306,10 @@ impl RaftNode {
             message: buf,
         };
 
-        // Try to send, but don't block if channel is full
         let tx = self.message_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tx.try_send(outgoing) {
-                warn!("Failed to send message to {}: {}", to_id, e);
-            }
-        });
+        if tx.try_send(outgoing).is_err() {
+            warn!("Failed to send message to {}", to_id);
+        }
     }
 
     /// Handle a propose request
@@ -319,10 +344,7 @@ impl RaftNode {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         self.propose_tx
-            .send(ProposeRequest {
-                data,
-                response_tx,
-            })
+            .send(ProposeRequest { data, response_tx })
             .await
             .map_err(|e| format!("failed to send propose: {}", e))?;
 
@@ -338,10 +360,8 @@ impl RaftNode {
 
     /// Get the message receiver for sending messages to peers
     pub fn take_message_rx(&mut self) -> mpsc::Receiver<OutgoingMessage> {
-        let (tx, rx) = mpsc::channel(1000);
-        let old_rx = std::mem::replace(&mut self.message_rx, rx);
-        // Keep the sender so existing code doesn't break
-        self.message_tx = tx;
+        let (_, new_rx) = mpsc::channel(1000);
+        let old_rx = std::mem::replace(&mut self.message_rx, new_rx);
         old_rx
     }
 
@@ -454,13 +474,76 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Handle an incoming Raft message from another node
+    /// Transfer leadership to another node
+    pub fn transfer_leader(&mut self, target_id: u64) -> Result<(), String> {
+        info!("Transferring leadership to node: {}", target_id);
+
+        if !self.is_leader() {
+            return Err("not the leader".to_string());
+        }
+
+        if target_id == self.id {
+            return Err("cannot transfer leadership to self".to_string());
+        }
+
+        if !self.peers.contains_key(&target_id) {
+            return Err(format!("target node {} is not a peer", target_id));
+        }
+
+        self.node.transfer_leader(target_id);
+
+        info!("Leadership transfer initiated to node: {}", target_id);
+        Ok(())
+    }
+
+    /// Handle an incoming Raft message from another node (internal)
+    fn handle_step(&mut self, msg: RaftMessage) {
+        if let Err(e) = self.node.step(msg) {
+            error!("step failed: {}", e);
+        }
+        self.process_ready();
+    }
+
+    /// Get a clone of the step sender for sending incoming messages
+    pub fn get_step_tx(&self) -> mpsc::Sender<RaftMessage> {
+        self.step_tx.clone()
+    }
+
+    /// Handle an incoming Raft message from another node (deprecated - use get_step_tx)
     pub fn step(&mut self, msg: RaftMessage) -> Result<(), String> {
         self.node
             .step(msg)
             .map_err(|e| format!("step failed: {}", e))?;
         self.process_ready();
         Ok(())
+    }
+
+    /// Trigger snapshot creation
+    pub fn trigger_snapshot(&mut self, data: &RaftSnapshotData) -> Result<(), String> {
+        if !self.is_leader() {
+            return Err("only leader can create snapshot".to_string());
+        }
+
+        let index = self.commit_index();
+        let term = self.term();
+
+        info!("Creating snapshot at index {}, term {}", index, term);
+
+        if let Err(e) = self.node.mut_store().create_snapshot(index, term, data) {
+            return Err(format!("failed to create snapshot: {}", e));
+        }
+
+        if let Err(e) = self.node.mut_store().compact_log(index) {
+            warn!("Failed to compact log: {}", e);
+        }
+
+        info!("Snapshot created successfully");
+        Ok(())
+    }
+
+    /// Get snapshot data from storage
+    pub fn get_snapshot_data(&self) -> Option<RaftSnapshotData> {
+        self.node.store().get_snapshot_data()
     }
 
     /// Get cluster information

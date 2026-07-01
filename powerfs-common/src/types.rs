@@ -139,12 +139,12 @@ impl Default for ReplicaPlacement {
 
 impl ReplicaPlacement {
     /// Parse SeaweedFS replica placement string format.
-    /// 
+    ///
     /// Format: Three-digit string like "001", "010", "100", "002"
     /// - First digit: copies in same data center (can be on different racks)
     /// - Second digit: copies in same rack but different data centers (if possible)
     /// - Third digit: copies in different data centers
-    /// 
+    ///
     /// Examples:
     /// - "001": 1 copy, different rack, different data center
     /// - "010": 1 copy, same rack, different data center  
@@ -170,11 +170,11 @@ impl ReplicaPlacement {
                 .map_err(|_| format!("invalid replica placement: {}", s))?;
 
             let total = same_dc + same_rack_diff_dc + diff_rack_dc;
-            
+
             // same_rack is true if we have copies that should stay in same rack
             // (either same_rack_diff_dc > 0 or same_dc > 0 with implicit same rack)
             let same_rack = same_rack_diff_dc > 0;
-            
+
             // same_data_center is true if any copies should stay in same dc
             let same_data_center = same_dc > 0 || same_rack_diff_dc > 0;
 
@@ -329,10 +329,12 @@ impl Topology {
     }
 
     pub fn get_or_create_data_center(&mut self, id: DataCenterId) -> &mut DataCenterInfo {
-        self.data_centers.entry(id.clone()).or_insert_with(|| DataCenterInfo {
-            id,
-            racks: HashMap::new(),
-        })
+        self.data_centers
+            .entry(id.clone())
+            .or_insert_with(|| DataCenterInfo {
+                id,
+                racks: HashMap::new(),
+            })
     }
 
     pub fn get_or_create_rack(&mut self, dc_id: DataCenterId, rack_id: RackId) -> &mut RackInfo {
@@ -355,21 +357,23 @@ impl Topology {
         public_url: String,
     ) -> &mut DataNodeInfo {
         let rack = self.get_or_create_rack(dc_id, rack_id);
-        rack.nodes.entry(node_id.clone()).or_insert_with(|| DataNodeInfo {
-            id: node_id,
-            address,
-            rack_id: rack.id.clone(),
-            data_center_id: rack.data_center_id.clone(),
-            total_space: 0,
-            used_space: 0,
-            volume_count: 0,
-            state: NodeState::Healthy,
-            last_heartbeat: Utc::now(),
-            grpc_port,
-            http_port,
-            public_url,
-            maintenance_mode: false,
-        })
+        rack.nodes
+            .entry(node_id.clone())
+            .or_insert_with(|| DataNodeInfo {
+                id: node_id,
+                address,
+                rack_id: rack.id.clone(),
+                data_center_id: rack.data_center_id.clone(),
+                total_space: 0,
+                used_space: 0,
+                volume_count: 0,
+                state: NodeState::Healthy,
+                last_heartbeat: Utc::now(),
+                grpc_port,
+                http_port,
+                public_url,
+                maintenance_mode: false,
+            })
     }
 
     pub fn get_node(&self, node_id: &NodeId) -> Option<&DataNodeInfo> {

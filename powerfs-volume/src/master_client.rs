@@ -1,9 +1,9 @@
 use log::{debug, error, warn};
-use powerfs_master::proto::{
-    powerfs::master_service_client::MasterServiceClient, Heartbeat,
-    VolumeGrowRequest, VolumeGrowResponse, VolumeShortInfo,
-};
 use powerfs_common::types::NodeId;
+use powerfs_master::proto::{
+    powerfs::master_service_client::MasterServiceClient, Heartbeat, VolumeGrowRequest,
+    VolumeGrowResponse, VolumeShortInfo,
+};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tonic::transport::Channel;
@@ -58,7 +58,10 @@ impl MasterClient {
             while let Some(response) = responses.next().await {
                 match response {
                     Ok(resp) => {
-                        debug!("Heartbeat response: leader={}, volume_size_limit={}", resp.leader, resp.volume_size_limit);
+                        debug!(
+                            "Heartbeat response: leader={}, volume_size_limit={}",
+                            resp.leader, resp.volume_size_limit
+                        );
                     }
                     Err(e) => {
                         warn!("Heartbeat error: {}", e);
@@ -72,7 +75,10 @@ impl MasterClient {
         Ok(())
     }
 
-    pub async fn send_heartbeat(&self, volumes: Vec<VolumeShortInfo>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn send_heartbeat(
+        &self,
+        volumes: Vec<VolumeShortInfo>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(sender) = &self.sender {
             let heartbeat = Heartbeat {
                 ip: "127.0.0.1".to_string(),

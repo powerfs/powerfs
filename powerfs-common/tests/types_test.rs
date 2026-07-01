@@ -416,7 +416,11 @@ fn test_node_state_default() {
 
 #[test]
 fn test_node_state_all_variants() {
-    let states = vec![NodeState::Healthy, NodeState::Degraded, NodeState::Unavailable];
+    let states = vec![
+        NodeState::Healthy,
+        NodeState::Degraded,
+        NodeState::Unavailable,
+    ];
     for i in 0..states.len() {
         for j in i + 1..states.len() {
             assert_ne!(states[i], states[j]);
@@ -479,10 +483,8 @@ fn test_topology_get_or_create_data_center_idempotent() {
 #[test]
 fn test_topology_get_or_create_rack() {
     let mut topology = Topology::new();
-    let rack = topology.get_or_create_rack(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
-    );
+    let rack =
+        topology.get_or_create_rack(DataCenterId("dc1".to_string()), RackId("r1".to_string()));
     assert_eq!(rack.id, RackId("r1".to_string()));
     assert_eq!(rack.data_center_id, DataCenterId("dc1".to_string()));
     assert!(rack.nodes.is_empty());

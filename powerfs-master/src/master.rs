@@ -6,7 +6,7 @@ use powerfs_common::{
     error::{PowerFsError, Result},
     types::{
         ClusterConfig, Collection, DataCenterId, DataNodeInfo, DiskType, Fid, NodeId, NodeState,
-        RackId, RaftConfig, ReplicaPlacement, Ttl, Topology, VolumeId, VolumeInfo, VolumeState,
+        RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId, VolumeInfo, VolumeState,
     },
 };
 use std::collections::HashMap;
@@ -133,7 +133,11 @@ impl MasterNode {
         let master_clone = master.clone();
         tokio::spawn(async move {
             while let Some(update) = notify_rx.recv().await {
-                master_clone.client_manager.read().unwrap().broadcast(&update);
+                master_clone
+                    .client_manager
+                    .read()
+                    .unwrap()
+                    .broadcast(&update);
             }
         });
 
@@ -205,7 +209,10 @@ impl MasterNode {
 
     /// Apply a committed Raft command to the state machine
     pub async fn apply_command(&self, entry: ApplyEntry) -> Result<()> {
-        debug!("Applying command at index {}: {:?}", entry.index, entry.command);
+        debug!(
+            "Applying command at index {}: {:?}",
+            entry.index, entry.command
+        );
 
         match entry.command {
             RaftCommand::AddNode {
@@ -217,7 +224,15 @@ impl MasterNode {
                 grpc_port,
                 public_url,
             } => {
-                self.apply_add_node(&node_id, &address, &rack, &data_center, http_port, grpc_port, &public_url)?;
+                self.apply_add_node(
+                    &node_id,
+                    &address,
+                    &rack,
+                    &data_center,
+                    http_port,
+                    grpc_port,
+                    &public_url,
+                )?;
             }
             RaftCommand::RemoveNode { node_id } => {
                 self.apply_remove_node(&node_id)?;
@@ -231,7 +246,15 @@ impl MasterNode {
                 disk_type,
                 size,
             } => {
-                self.apply_assign_volume(&node_id, volume_id, &collection, replica_count, ttl, &disk_type, size)?;
+                self.apply_assign_volume(
+                    &node_id,
+                    volume_id,
+                    &collection,
+                    replica_count,
+                    ttl,
+                    &disk_type,
+                    size,
+                )?;
             }
             RaftCommand::UpdateVolumeState { volume_id, state } => {
                 let vol_state = match state.as_str() {
@@ -250,7 +273,8 @@ impl MasterNode {
                 ip,
                 grpc_port,
             } => {
-                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port).await?;
+                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port)
+                    .await?;
             }
             RaftCommand::Heartbeat { node_id } => {
                 self.apply_heartbeat(&node_id).await?;
@@ -548,7 +572,9 @@ impl MasterNode {
 
         let nodes = self.topology.read().unwrap().list_all_nodes();
         if nodes.is_empty() {
-            return Err(PowerFsError::InvalidRequest("no nodes available".to_string()));
+            return Err(PowerFsError::InvalidRequest(
+                "no nodes available".to_string(),
+            ));
         }
 
         let (volume_size_limit, rack_awareness_enabled) = {
@@ -647,8 +673,13 @@ impl MasterNode {
         info!(
             "Assigned volume: {} to nodes: {:?}, fid: {},{},{}",
             volume_id,
-            selected_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
-            volume_id.0, cookie, file_key
+            selected_nodes
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>(),
+            volume_id.0,
+            cookie,
+            file_key
         );
 
         // Propose to Raft for replication
@@ -731,14 +762,23 @@ impl MasterNode {
     }
 
     pub fn add_client(&self, client_id: String, tx: mpsc::Sender<VolumeLocationUpdate>) {
-        self.client_manager.write().unwrap().add_client(client_id, tx);
+        self.client_manager
+            .write()
+            .unwrap()
+            .add_client(client_id, tx);
     }
 
     pub fn remove_client(&self, client_id: &str) {
-        self.client_manager.write().unwrap().remove_client(client_id);
+        self.client_manager
+            .write()
+            .unwrap()
+            .remove_client(client_id);
     }
 
-    pub async fn lookup_volume(&self, volume_ids: &[String]) -> HashMap<VolumeId, Vec<DataNodeInfo>> {
+    pub async fn lookup_volume(
+        &self,
+        volume_ids: &[String],
+    ) -> HashMap<VolumeId, Vec<DataNodeInfo>> {
         let mut result = HashMap::new();
         let volumes = self.volumes.read().unwrap();
         let topology = self.topology.read().unwrap();
@@ -748,7 +788,10 @@ impl MasterNode {
                 let volume_id = VolumeId(vid);
                 if let Some(vol) = volumes.get(&volume_id) {
                     if let Some(node) = topology.get_node(&vol.node_id) {
-                        result.entry(volume_id).or_insert_with(Vec::new).push(node.clone());
+                        result
+                            .entry(volume_id)
+                            .or_insert_with(Vec::new)
+                            .push(node.clone());
                     }
                 }
             }

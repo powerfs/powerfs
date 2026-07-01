@@ -188,7 +188,10 @@ fn test_memory_index_thread_safe() {
         let handle = thread::spawn(move || {
             for i in 0..100 {
                 let id = t * 100 + i;
-                idx.insert(NeedleId(id as u64), make_info(id as u64, 1, 10, id as u64 * 10));
+                idx.insert(
+                    NeedleId(id as u64),
+                    make_info(id as u64, 1, 10, id as u64 * 10),
+                );
             }
         });
         handles.push(handle);

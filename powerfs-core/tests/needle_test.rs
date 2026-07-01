@@ -78,7 +78,11 @@ fn test_needle_data_size() {
 
 #[test]
 fn test_needle_to_bytes_and_from_bytes_roundtrip() {
-    let needle = Needle::new(NeedleId(42), VolumeId(7), Bytes::from("round-trip test data"));
+    let needle = Needle::new(
+        NeedleId(42),
+        VolumeId(7),
+        Bytes::from("round-trip test data"),
+    );
     let bytes = needle.to_bytes();
 
     let restored = Needle::from_bytes(&bytes, VolumeId(7), 1024).unwrap();
@@ -154,7 +158,7 @@ fn test_needle_from_bytes_exactly_min_size() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&1u64.to_be_bytes()); // id=1
     bytes.extend_from_slice(&0u32.to_be_bytes()); // data_size=0
-    // no data
+                                                  // no data
     bytes.extend_from_slice(&calculate_test_checksum(b"").to_be_bytes()); // checksum
 
     let result = Needle::from_bytes(&bytes, VolumeId(1), 0);

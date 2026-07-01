@@ -138,12 +138,12 @@ impl Volume {
             checksum: needle.checksum,
             created_at: Utc::now(),
         };
-        
+
         drop(file_guard);
         drop(next_offset_guard);
         drop(free_space_guard);
         drop(info_guard);
-        
+
         self.index.insert(needle_id, needle_info.clone());
 
         Ok(needle_info)

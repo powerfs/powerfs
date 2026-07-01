@@ -3,10 +3,12 @@
 //! This module provides the RaftService implementation for inter-node communication.
 
 use crate::proto::powerfs::raft_service_server::RaftService;
-use crate::proto::{
+use crate::proto::powerfs::{
     AddNodeRequest, AddNodeResponse, ClusterInfoRequest, ClusterInfoResponse, ProposeRequest,
-    ProposeResponse, RaftMessage, RaftServiceClient,
+    ProposeResponse, RaftMessage, RemoveNodeRequest, RemoveNodeResponse, TransferLeaderRequest,
+    TransferLeaderResponse,
 };
+use crate::proto::RaftServiceClient;
 use crate::raft_node::RaftNode;
 use futures::StreamExt;
 use log::{error, info, warn};
@@ -84,12 +86,7 @@ impl RaftService for RaftServiceServer {
         }
 
         // Propose the command
-        match timeout(
-            Duration::from_secs(5),
-            raft_node.propose(req.command),
-        )
-        .await
-        {
+        match timeout(Duration::from_secs(5), raft_node.propose(req.command)).await {
             Ok(Ok(index)) => Ok(Response::new(ProposeResponse {
                 success: true,
                 error: String::new(),
@@ -127,9 +124,8 @@ impl RaftService for RaftServiceServer {
                     Ok(raft_msg) => {
                         // Parse the Raft message
                         if let Ok(internal_msg) =
-                            <raft::eraftpb::Message as Message>::parse_from_bytes(
-                                &raft_msg.message,
-                            ) {
+                            <raft::eraftpb::Message as Message>::parse_from_bytes(&raft_msg.message)
+                        {
                             let mut node = raft_node.write().await;
                             if let Err(e) = node.step(internal_msg) {
                                 error!("Failed to step message: {}", e);
@@ -200,6 +196,70 @@ impl RaftService for RaftServiceServer {
             })),
         }
     }
+
+    /// Remove a node from the cluster
+    async fn remove_node(
+        &self,
+        request: Request<RemoveNodeRequest>,
+    ) -> Result<Response<RemoveNodeResponse>, Status> {
+        let req = request.into_inner();
+
+        let is_leader = self.raft_node.read().await.is_leader();
+
+        if !is_leader {
+            return Ok(Response::new(RemoveNodeResponse {
+                success: false,
+                error: "not the leader".to_string(),
+            }));
+        }
+
+        let mut node = self.raft_node.write().await;
+        match node.remove_peer(req.node_id) {
+            Ok(()) => {
+                info!("Removed peer: {}", req.node_id);
+                Ok(Response::new(RemoveNodeResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(RemoveNodeResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    /// Transfer leadership to another node
+    async fn transfer_leader(
+        &self,
+        request: Request<TransferLeaderRequest>,
+    ) -> Result<Response<TransferLeaderResponse>, Status> {
+        let req = request.into_inner();
+
+        let is_leader = self.raft_node.read().await.is_leader();
+
+        if !is_leader {
+            return Ok(Response::new(TransferLeaderResponse {
+                success: false,
+                error: "not the leader".to_string(),
+            }));
+        }
+
+        let mut node = self.raft_node.write().await;
+        match node.transfer_leader(req.target_node_id) {
+            Ok(()) => {
+                info!("Initiated leader transfer to node: {}", req.target_node_id);
+                Ok(Response::new(TransferLeaderResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(TransferLeaderResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
 }
 
 /// Client for connecting to other Raft nodes
@@ -226,9 +286,7 @@ impl RaftGrpcClient {
     pub async fn send_message(&self, msg: RaftMessage) -> Result<(), String> {
         if let Some(ref client) = self.client {
             let mut client = client.clone();
-            let request = Request::new(
-                tokio_stream::once(msg)
-            );
+            let request = Request::new(tokio_stream::once(msg));
 
             // Use the bidirectional streaming RPC
             let _response = client

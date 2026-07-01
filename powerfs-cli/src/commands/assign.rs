@@ -18,11 +18,15 @@ pub struct AssignArgs {
 }
 
 pub async fn assign(mut client: MasterClient, args: AssignArgs) -> super::CommandResult {
-    println!("Assigning FID with replication={}, collection={}", args.replication, args.collection);
-    
-    let mut service = client.service().await
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
-    
+    println!(
+        "Assigning FID with replication={}, collection={}",
+        args.replication, args.collection
+    );
+
+    let mut service = client.service().await.map_err(|e| {
+        powerfs_common::error::PowerFsError::Internal(format!("Failed to connect: {}", e))
+    })?;
+
     let request = powerfs_master::proto::AssignRequest {
         count: args.count,
         replication: args.replication,
@@ -33,34 +37,37 @@ pub async fn assign(mut client: MasterClient, args: AssignArgs) -> super::Comman
         data_node: String::new(),
         disk_type: String::new(),
     };
-    
-    let response = service.assign(tonic::Request::new(request))
+
+    let response = service
+        .assign(tonic::Request::new(request))
         .await
         .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
-    
+
     let result = response.into_inner();
-    
+
     if !result.error.is_empty() {
         println!("Error: {}", result.error);
-        return Err(powerfs_common::error::PowerFsError::InvalidRequest(result.error));
+        return Err(powerfs_common::error::PowerFsError::InvalidRequest(
+            result.error,
+        ));
     }
-    
+
     println!("\n=== Assigned FID ===");
     println!("FID: {}", result.fid);
     println!("Count: {}", result.count);
-    
+
     if let Some(location) = result.location {
         println!("Primary location: {}", location.url);
         println!("  Public URL: {}", location.public_url);
         println!("  Data Center: {}", location.data_center);
     }
-    
+
     if !result.replicas.is_empty() {
         println!("\nReplicas:");
         for (i, replica) in result.replicas.iter().enumerate() {
             println!("  {}: {} (dc: {})", i + 1, replica.url, replica.data_center);
         }
     }
-    
+
     Ok(())
 }
