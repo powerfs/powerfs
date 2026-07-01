@@ -27,8 +27,7 @@ main:
 $:
   vscode:
     - runner:
-        cpus: 16
-        memory: 32G
+        cpus: 16 
       services:
         - vscode
       docker:

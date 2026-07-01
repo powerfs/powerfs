@@ -1,6 +1,6 @@
 use tonic::transport::Channel;
 use powerfs_volume::proto::{
-    powerfs::volume_service_client::VolumeServiceClient, CreateVolumeRequest, DeleteVolumeRequest,
+    powerfs::volume_service_client::VolumeServiceClient, CreateVolumeRequest,
     DeleteNeedleRequest, ReadNeedleRequest, WriteNeedleRequest,
 };
 
@@ -37,6 +37,7 @@ impl VolumeServerClient {
         Ok(VolumeServiceClient::new(channel))
     }
 
+    #[allow(dead_code)]
     pub async fn create_volume(&mut self, volume_id: u32, size: u64) -> Result<(), Box<dyn std::error::Error>> {
         let mut service = self.service().await?;
         let request = CreateVolumeRequest { volume_id, size };
@@ -78,6 +79,7 @@ impl VolumeServerClient {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn delete_needle(&mut self, volume_id: u32, file_key: u64) -> Result<(), Box<dyn std::error::Error>> {
         let mut service = self.service().await?;
         let request = DeleteNeedleRequest { volume_id, file_key };
