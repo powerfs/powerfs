@@ -154,3 +154,51 @@ message VolumeGrowResponse {
     repeated Location locations = 2;
     string error = 3;
 }
+
+// Raft service for multi-node communication
+service RaftService {
+    // Propose a command to the Raft cluster
+    rpc Propose (ProposeRequest) returns (ProposeResponse);
+    // Bidirectional streaming for Raft messages
+    rpc RaftMessageStream (stream RaftMessage) returns (stream RaftMessage);
+    // Get cluster membership
+    rpc GetClusterInfo (ClusterInfoRequest) returns (ClusterInfoResponse);
+    // Add node to cluster
+    rpc AddNode (AddNodeRequest) returns (AddNodeResponse);
+}
+
+message ProposeRequest {
+    bytes command = 1;  // Serialized RaftCommand
+}
+
+message ProposeResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 index = 3;  // Log index after commit
+}
+
+message RaftMessage {
+    uint64 from_id = 1;
+    uint64 to_id = 2;
+    bytes message = 3;  // Serialized raft::eraftpb::Message
+}
+
+message ClusterInfoRequest {}
+
+message ClusterInfoResponse {
+    uint64 node_id = 1;
+    string address = 2;
+    bool is_leader = 3;
+    uint64 term = 4;
+    repeated string peers = 5;
+}
+
+message AddNodeRequest {
+    uint64 node_id = 1;
+    string address = 2;
+}
+
+message AddNodeResponse {
+    bool success = 1;
+    string error = 2;
+}

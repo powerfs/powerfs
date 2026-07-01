@@ -1,144 +1,23 @@
+//! Raft storage implementation using RocksDB
+//!
+//! This module provides RocksDbStorage which implements the raft::Storage trait
+//! for persistent storage of Raft state and logs.
+
 use log::info;
 use powerfs_common::types::{VolumeId, VolumeInfo};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use protobuf::Message;
+use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
+use raft::storage::{Storage, RaftState};
+use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
-const CF_LOG: &str = "raft_log";
-const CF_STATE: &str = "raft_state";
-const CF_META: &str = "raft_meta";
+const CF_RAFT_LOG: &str = "raft_log";
+const CF_RAFT_STATE: &str = "raft_state";
+const CF_SNAPSHOT: &str = "raft_snapshot";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftSnapshotData {
-    pub topology: HashMap<String, String>,
-    pub volumes: HashMap<VolumeId, VolumeInfo>,
-    pub next_volume_id: u32,
-    pub max_file_key: u64,
-}
-
-pub struct MasterRaftStorage {
-    db: Arc<DB>,
-    entries: RwLock<VecDeque<Vec<u8>>>,
-    applied_index: RwLock<u64>,
-    last_index: RwLock<u64>,
-    last_term: RwLock<u64>,
-}
-
-impl Clone for MasterRaftStorage {
-    fn clone(&self) -> Self {
-        MasterRaftStorage {
-            db: self.db.clone(),
-            entries: RwLock::new(self.entries.read().unwrap().clone()),
-            applied_index: RwLock::new(*self.applied_index.read().unwrap()),
-            last_index: RwLock::new(*self.last_index.read().unwrap()),
-            last_term: RwLock::new(*self.last_term.read().unwrap()),
-        }
-    }
-}
-
-impl MasterRaftStorage {
-    pub fn new(path: &str) -> Result<Self, String> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-
-        let cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(CF_LOG, Options::default()),
-            ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
-            ColumnFamilyDescriptor::new(CF_META, Options::default()),
-        ];
-
-        let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
-            .map_err(|e| format!("failed to open rocksdb: {}", e))?;
-
-        Ok(MasterRaftStorage {
-            db: Arc::new(db),
-            entries: RwLock::new(VecDeque::new()),
-            applied_index: RwLock::new(0),
-            last_index: RwLock::new(0),
-            last_term: RwLock::new(0),
-        })
-    }
-
-    pub fn append_entry(&self, entry_data: Vec<u8>) {
-        let mut entries = self.entries.write().unwrap();
-        entries.push_back(entry_data);
-        let idx = entries.len() as u64;
-        drop(entries);
-
-        let mut last_index = self.last_index.write().unwrap();
-        *last_index = idx;
-    }
-
-    pub fn set_applied_index(&self, index: u64) {
-        *self.applied_index.write().unwrap() = index;
-    }
-
-    pub fn get_applied_index(&self) -> u64 {
-        *self.applied_index.read().unwrap()
-    }
-
-    pub fn last_index(&self) -> u64 {
-        *self.last_index.read().unwrap()
-    }
-
-    pub fn last_term(&self) -> u64 {
-        *self.last_term.read().unwrap()
-    }
-
-    pub fn get_entry(&self, index: u64) -> Option<Vec<u8>> {
-        let entries = self.entries.read().unwrap();
-        if index == 0 || index > entries.len() as u64 {
-            None
-        } else {
-            entries.get(index as usize - 1).cloned()
-        }
-    }
-
-    pub fn entries(&self, low: u64, high: u64) -> Vec<Vec<u8>> {
-        let entries = self.entries.read().unwrap();
-        let start = if low == 0 { 0 } else { low as usize - 1 };
-        let end = high as usize;
-
-        if start >= entries.len() {
-            return Vec::new();
-        }
-
-        let end = std::cmp::min(end, entries.len());
-        entries.range(start..end).cloned().collect()
-    }
-
-    pub fn create_snapshot(
-        &self,
-        index: u64,
-        _term: u64,
-        topology: &HashMap<String, String>,
-        volumes: &HashMap<VolumeId, VolumeInfo>,
-        next_volume_id: u32,
-        max_file_key: u64,
-    ) -> Result<(), String> {
-        let data = RaftSnapshotData {
-            topology: topology.clone(),
-            volumes: volumes.clone(),
-            next_volume_id,
-            max_file_key,
-        };
-
-        let data_bytes = serde_json::to_vec(&data)
-            .map_err(|e| format!("failed to serialize snapshot: {}", e))?;
-
-        let cf = self.db.cf_handle(CF_META).unwrap();
-        let key = format!("snapshot_{}", index);
-        self.db
-            .put_cf(cf, key, &data_bytes)
-            .map_err(|e| format!("Failed to write snapshot: {}", e))?;
-
-        info!("Created snapshot at index {}", index);
-        Ok(())
-    }
-}
-
+/// Raft commands that can be proposed to the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftCommand {
     AddNode {
@@ -168,7 +47,7 @@ pub enum RaftCommand {
     },
     UpdateNodeVolumes {
         node_id: String,
-        volumes: Vec<VolumeShortInfo>,
+        volumes: Vec<RaftVolumeShortInfo>,
         ip: String,
         grpc_port: u32,
     },
@@ -177,16 +56,337 @@ pub enum RaftCommand {
     },
 }
 
+/// Volume info for Raft serialization (serde-compatible)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeShortInfo {
+pub struct RaftVolumeShortInfo {
     pub volume_id: u32,
     pub size: u64,
     pub read_only: bool,
 }
 
+impl From<&crate::proto::VolumeShortInfo> for RaftVolumeShortInfo {
+    fn from(v: &crate::proto::VolumeShortInfo) -> Self {
+        RaftVolumeShortInfo {
+            volume_id: v.volume_id,
+            size: v.size,
+            read_only: v.read_only,
+        }
+    }
+}
+
+/// Snapshot data stored in RocksDB
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftSnapshotData {
+    pub topology: HashMap<String, String>,
+    pub volumes: HashMap<VolumeId, VolumeInfo>,
+    pub next_volume_id: u32,
+    pub max_file_key: u64,
+}
+
+/// RocksDB-based storage for Raft
+pub struct RocksDbStorage {
+    db: Arc<DB>,
+    /// In-memory cache of log entries
+    entries: RwLock<VecDeque<Entry>>,
+    /// Last applied index
+    applied_index: RwLock<u64>,
+    /// Hard state cache
+    hard_state: RwLock<HardState>,
+    /// Conf state cache
+    conf_state: RwLock<ConfState>,
+}
+
+impl Clone for RocksDbStorage {
+    fn clone(&self) -> Self {
+        RocksDbStorage {
+            db: self.db.clone(),
+            entries: RwLock::new(self.entries.read().unwrap().clone()),
+            applied_index: RwLock::new(*self.applied_index.read().unwrap()),
+            hard_state: RwLock::new(self.hard_state.read().unwrap().clone()),
+            conf_state: RwLock::new(self.conf_state.read().unwrap().clone()),
+        }
+    }
+}
+
+impl RocksDbStorage {
+    /// Create a new RocksDbStorage
+    pub fn new(path: &str) -> Result<Self, String> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let cf_descriptors = vec![
+            ColumnFamilyDescriptor::new(CF_RAFT_LOG, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_RAFT_STATE, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_SNAPSHOT, rocksdb::Options::default()),
+        ];
+
+        let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
+            .map_err(|e| format!("failed to open rocksdb: {}", e))?;
+
+        let storage = Self {
+            db: Arc::new(db),
+            entries: RwLock::new(VecDeque::new()),
+            applied_index: RwLock::new(0),
+            hard_state: RwLock::new(HardState::default()),
+            conf_state: RwLock::new(ConfState::default()),
+        };
+
+        // Load existing state from RocksDB
+        storage.load_state()?;
+
+        info!("RocksDbStorage initialized at {}", path);
+        Ok(storage)
+    }
+
+    /// Load hard state and conf state from RocksDB
+    fn load_state(&self) -> Result<(), String> {
+        // Load hard state
+        let cf = self
+            .db
+            .cf_handle(CF_RAFT_STATE)
+            .ok_or("column family not found")?;
+        if let Ok(Some(data)) = self.db.get_cf(cf, b"hard_state") {
+            if let Ok(hs) = <HardState as Message>::parse_from_bytes(&data) {
+                *self.hard_state.write().unwrap() = hs.clone();
+                info!("Loaded hard state: term={}, commit={}", hs.term, hs.commit);
+            }
+        }
+
+        // Load conf state
+        if let Ok(Some(data)) = self.db.get_cf(cf, b"conf_state") {
+            if let Ok(cs) = <ConfState as Message>::parse_from_bytes(&data) {
+                *self.conf_state.write().unwrap() = cs.clone();
+                info!("Loaded conf state: voters={:?}", cs.voters);
+            }
+        }
+
+        // Load applied index
+        if let Ok(Some(data)) = self.db.get_cf(cf, b"applied_index") {
+            if let Ok(s) = String::from_utf8(data) {
+                if let Ok(idx) = s.parse::<u64>() {
+                    *self.applied_index.write().unwrap() = idx;
+                }
+            }
+        }
+
+        // Load log entries
+        let log_cf = self
+            .db
+            .cf_handle(CF_RAFT_LOG)
+            .ok_or("column family not found")?;
+        let mut entries = self.entries.write().unwrap();
+
+        // Use iterator to load all entries
+        let mut it = self.db.raw_iterator_cf(log_cf);
+        it.seek_to_first();
+
+        while it.valid() {
+            if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                if let Ok(entry) = <Entry as Message>::parse_from_bytes(value) {
+                    // Verify index matches key
+                    let key_str = String::from_utf8(key.to_vec()).map_err(|e| e.to_string())?;
+                    if let Ok(idx) = key_str.parse::<u64>() {
+                        if idx == entry.index {
+                            entries.push_back(entry);
+                        }
+                    }
+                }
+            }
+            it.next();
+        }
+
+        info!("Loaded {} log entries", entries.len());
+        Ok(())
+    }
+
+    /// Append entries to the storage
+    pub fn append(&mut self, ents: &[Entry]) -> Result<(), raft::Error> {
+        if ents.is_empty() {
+            return Ok(());
+        }
+
+        let first = self.first_index().unwrap_or(1);
+        if first > ents[0].index {
+            return Err(raft::Error::Store(raft::StorageError::Compacted));
+        }
+
+        let mut entries = self.entries.write().unwrap();
+
+        // Remove overlapping entries
+        let diff = (ents[0].index - first) as usize;
+        if diff <= entries.len() {
+            entries.truncate(diff);
+        }
+
+        // Append new entries and persist to RocksDB
+        let log_cf = self
+            .db
+            .cf_handle(CF_RAFT_LOG)
+            .ok_or_else(|| raft::Error::Store(raft::StorageError::Other("column family not found".into())))?;
+
+        for entry in ents {
+            // Persist to RocksDB
+            let key = entry.index.to_string();
+            let mut buf = Vec::new();
+            if let Ok(()) = entry.write_to_vec(&mut buf) {
+                let _ = self.db.put_cf(log_cf, key.as_bytes(), &buf);
+            }
+            entries.push_back(entry.clone());
+        }
+
+        Ok(())
+    }
+
+    /// Set hard state
+    pub fn set_hardstate(&mut self, hs: HardState) {
+        *self.hard_state.write().unwrap() = hs.clone();
+
+        // Persist to RocksDB
+        if let Some(cf) = self.db.cf_handle(CF_RAFT_STATE) {
+            let mut buf = Vec::new();
+            if let Ok(()) = hs.write_to_vec(&mut buf) {
+                let _ = self.db.put_cf(cf, b"hard_state", &buf);
+            }
+        }
+    }
+
+    /// Apply snapshot
+    pub fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), raft::Error> {
+        let meta = snapshot.get_metadata();
+        let index = meta.index;
+
+        let first = self.first_index().unwrap_or(1);
+        if first > index {
+            return Err(raft::Error::Store(raft::StorageError::SnapshotOutOfDate));
+        }
+
+        // Clear entries
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
+
+        // Update hard state
+        let mut hs = self.hard_state.write().unwrap();
+        hs.term = meta.term;
+        hs.commit = index;
+
+        // Update conf state
+        *self.conf_state.write().unwrap() = meta.get_conf_state().clone();
+
+        // Persist snapshot to RocksDB
+        if let Some(cf) = self.db.cf_handle(CF_SNAPSHOT) {
+            let mut buf = Vec::new();
+            if let Ok(()) = snapshot.write_to_vec(&mut buf) {
+                let _ = self.db.put_cf(cf, b"latest_snapshot", &buf);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Storage for RocksDbStorage {
+    fn initial_state(&self) -> Result<RaftState, raft::Error> {
+        Ok(RaftState {
+            hard_state: self.hard_state.read().unwrap().clone(),
+            conf_state: self.conf_state.read().unwrap().clone(),
+        })
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_size: impl Into<Option<u64>>,
+        _context: raft::storage::GetEntriesContext,
+    ) -> Result<Vec<Entry>, raft::Error> {
+        let max_size = max_size.into().unwrap_or(u64::MAX);
+        let entries = self.entries.read().unwrap();
+        let mut result = Vec::new();
+        let mut size = 0u64;
+
+        for entry in entries.iter() {
+            if entry.index < low {
+                continue;
+            }
+            if entry.index >= high {
+                break;
+            }
+            // Calculate size by serializing
+            let entry_size = {
+                let mut buf = Vec::new();
+                if entry.write_to_vec(&mut buf).is_ok() {
+                    buf.len() as u64
+                } else {
+                    0
+                }
+            };
+            size += entry_size;
+            if size > max_size {
+                break;
+            }
+            result.push(entry.clone());
+        }
+
+        Ok(result)
+    }
+
+    fn term(&self, idx: u64) -> Result<u64, raft::Error> {
+        let hs = self.hard_state.read().unwrap();
+
+        // Committed index has the term
+        if idx == hs.commit {
+            return Ok(hs.term);
+        }
+
+        let entries = self.entries.read().unwrap();
+        for entry in entries.iter() {
+            if entry.index == idx {
+                return Ok(entry.term);
+            }
+        }
+
+        Err(raft::Error::Store(raft::StorageError::Unavailable))
+    }
+
+    fn first_index(&self) -> Result<u64, raft::Error> {
+        let entries = self.entries.read().unwrap();
+        Ok(entries.front().map_or(1, |e| e.index + 1))
+    }
+
+    fn last_index(&self) -> Result<u64, raft::Error> {
+        let entries = self.entries.read().unwrap();
+        let hs = self.hard_state.read().unwrap();
+        Ok(entries.back().map_or(hs.commit, |e| e.index))
+    }
+
+    fn snapshot(&self, request_index: u64, _request_from_log_id: u64) -> Result<Snapshot, raft::Error> {
+        // Try to load from RocksDB first
+        let snapshot_cf = self.db.cf_handle(CF_SNAPSHOT);
+        if let Some(cf) = snapshot_cf {
+            if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
+                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                    if snap.get_metadata().get_index() >= request_index {
+                        return Ok(snap);
+                    }
+                }
+            }
+        }
+
+        // Return empty snapshot
+        let hs = self.hard_state.read().unwrap();
+        let cs = self.conf_state.read().unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().set_index(request_index);
+        snapshot.mut_metadata().set_term(hs.term);
+        snapshot.mut_metadata().set_conf_state(cs.clone());
+        Ok(snapshot)
+    }
+}
+
 impl RaftCommand {
     pub fn serialize(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap()
+        serde_json::to_vec(self).unwrap_or_default()
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {

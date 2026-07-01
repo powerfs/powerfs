@@ -1,6 +1,7 @@
-use crate::raft_storage::MasterRaftStorage;
+use crate::raft_node::{ApplyEntry, RaftNode};
+use crate::raft_storage::RaftCommand;
 use chrono::Utc;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
     types::{
@@ -24,8 +25,9 @@ pub struct MasterNode {
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
-    raft_storage: MasterRaftStorage,
+    raft_node: Arc<RwLock<RaftNode>>,
     is_leader: RwLock<bool>,
+    leader_address: RwLock<String>,
     next_volume_id: RwLock<u32>,
     max_file_key: RwLock<u64>,
     heartbeat_tx: mpsc::Sender<NodeId>,
@@ -94,11 +96,14 @@ impl MasterNode {
         let config = cluster_config.unwrap_or_default();
         let raft_config = RaftConfig::default();
 
-        let raft_storage = MasterRaftStorage::new(raft_path)
-            .map_err(|e| PowerFsError::Internal(format!("Failed to create raft storage: {}", e)))?;
+        // Create Raft node (single node for now, will add peers later)
+        let raft_node = RaftNode::new(1, address.to_string(), vec![], raft_path)
+            .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(100);
         let (notify_tx, mut notify_rx) = mpsc::channel(1000);
+
+        let raft_node_arc = Arc::new(RwLock::new(raft_node));
 
         let master = MasterNode {
             id: node_id.clone(),
@@ -108,8 +113,9 @@ impl MasterNode {
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
             raft_config,
-            raft_storage,
+            raft_node: raft_node_arc.clone(),
             is_leader: RwLock::new(true),
+            leader_address: RwLock::new(address.to_string()),
             next_volume_id: RwLock::new(1),
             max_file_key: RwLock::new(0),
             heartbeat_tx,
@@ -131,6 +137,20 @@ impl MasterNode {
             }
         });
 
+        // Start apply loop
+        let master_clone = master.clone();
+        let mut apply_rx = {
+            let mut node = raft_node_arc.write().unwrap();
+            node.take_apply_rx()
+        };
+        tokio::spawn(async move {
+            while let Some(entry) = apply_rx.recv().await {
+                if let Err(e) = master_clone.apply_command(entry).await {
+                    error!("Failed to apply command: {}", e);
+                }
+            }
+        });
+
         Ok(master)
     }
 
@@ -147,11 +167,248 @@ impl MasterNode {
     }
 
     pub async fn get_leader(&self) -> String {
-        if *self.is_leader.read().unwrap() {
-            format!("{}", self.address)
-        } else {
-            String::new()
+        self.leader_address.read().unwrap().clone()
+    }
+
+    pub fn set_leader(&self, leader_addr: String) {
+        *self.leader_address.write().unwrap() = leader_addr;
+    }
+
+    /// Propose a command to the Raft cluster
+    pub async fn propose_command(&self, cmd: RaftCommand) -> Result<u64> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
         }
+
+        let data = cmd.serialize();
+        let propose_tx = {
+            let node = self.raft_node.read().unwrap();
+            node.get_propose_tx()
+        };
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let req = crate::raft_node::ProposeRequest {
+            data,
+            response_tx: resp_tx,
+        };
+
+        propose_tx
+            .send(req)
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("propose send failed: {}", e)))?;
+
+        resp_rx
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("propose recv failed: {}", e)))?
+            .map_err(|e| PowerFsError::Internal(e))
+    }
+
+    /// Apply a committed Raft command to the state machine
+    pub async fn apply_command(&self, entry: ApplyEntry) -> Result<()> {
+        debug!("Applying command at index {}: {:?}", entry.index, entry.command);
+
+        match entry.command {
+            RaftCommand::AddNode {
+                node_id,
+                address,
+                rack,
+                data_center,
+                http_port,
+                grpc_port,
+                public_url,
+            } => {
+                self.apply_add_node(&node_id, &address, &rack, &data_center, http_port, grpc_port, &public_url)?;
+            }
+            RaftCommand::RemoveNode { node_id } => {
+                self.apply_remove_node(&node_id)?;
+            }
+            RaftCommand::AssignVolume {
+                node_id,
+                volume_id,
+                collection,
+                replica_count,
+                ttl,
+                disk_type,
+                size,
+            } => {
+                self.apply_assign_volume(&node_id, volume_id, &collection, replica_count, ttl, &disk_type, size)?;
+            }
+            RaftCommand::UpdateVolumeState { volume_id, state } => {
+                let vol_state = match state.as_str() {
+                    "Creating" => VolumeState::Creating,
+                    "Available" => VolumeState::Available,
+                    "Full" => VolumeState::Full,
+                    "ReadOnly" => VolumeState::ReadOnly,
+                    "Deleting" => VolumeState::Deleting,
+                    _ => VolumeState::Available,
+                };
+                self.apply_update_volume_state(volume_id, vol_state)?;
+            }
+            RaftCommand::UpdateNodeVolumes {
+                node_id,
+                volumes,
+                ip,
+                grpc_port,
+            } => {
+                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port).await?;
+            }
+            RaftCommand::Heartbeat { node_id } => {
+                self.apply_heartbeat(&node_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_add_node(
+        &self,
+        node_id: &str,
+        address: &str,
+        rack: &str,
+        data_center: &str,
+        http_port: u32,
+        grpc_port: u32,
+        public_url: &str,
+    ) -> Result<()> {
+        let dc_id = DataCenterId(data_center.to_string());
+        let rack_id = RackId(rack.to_string());
+        let nid = NodeId(node_id.to_string());
+
+        let mut topology = self.topology.write().unwrap();
+        topology.get_or_create_node(
+            dc_id,
+            rack_id,
+            nid.clone(),
+            address.to_string(),
+            http_port,
+            grpc_port,
+            public_url.to_string(),
+        );
+
+        info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
+        Ok(())
+    }
+
+    fn apply_remove_node(&self, node_id: &str) -> Result<()> {
+        let nid = NodeId(node_id.to_string());
+        let mut topology = self.topology.write().unwrap();
+        if topology.remove_node(&nid).is_none() {
+            return Err(PowerFsError::InvalidRequest("node not found".to_string()));
+        }
+        info!("Applied RemoveNode: {}", node_id);
+        Ok(())
+    }
+
+    fn apply_assign_volume(
+        &self,
+        node_id: &str,
+        volume_id: u32,
+        collection: &str,
+        replica_count: u32,
+        ttl: i32,
+        disk_type: &str,
+        size: u64,
+    ) -> Result<()> {
+        let vid = VolumeId(volume_id);
+        let nid = NodeId(node_id.to_string());
+        let coll = Collection(collection.to_string());
+        let t = Ttl(ttl);
+        let dt = DiskType(disk_type.to_string());
+
+        let mut volumes = self.volumes.write().unwrap();
+        volumes.insert(
+            vid,
+            VolumeInfo {
+                id: vid,
+                node_id: nid,
+                collection: coll,
+                size,
+                used: 0,
+                replica_count,
+                ttl: t,
+                disk_type: dt,
+                state: VolumeState::Creating,
+                created_at: Utc::now(),
+                modified_at: Utc::now(),
+                next_file_key: 1,
+            },
+        );
+
+        info!("Applied AssignVolume: vid={}, node={}", volume_id, node_id);
+        Ok(())
+    }
+
+    fn apply_update_volume_state(&self, volume_id: u32, state: VolumeState) -> Result<()> {
+        let vid = VolumeId(volume_id);
+        let mut volumes = self.volumes.write().unwrap();
+        if let Some(info) = volumes.get_mut(&vid) {
+            info.state = state;
+            info.modified_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn apply_update_node_volumes(
+        &self,
+        node_id: &str,
+        volumes: &[crate::raft_storage::RaftVolumeShortInfo],
+        ip: &str,
+        grpc_port: u32,
+    ) -> Result<()> {
+        let nid = NodeId(node_id.to_string());
+
+        // Update topology
+        {
+            let mut topology = self.topology.write().unwrap();
+            if let Some(node) = topology.get_node_mut(&nid) {
+                node.address = ip.to_string();
+                node.grpc_port = grpc_port;
+                node.last_heartbeat = Utc::now();
+                node.state = NodeState::Healthy;
+                node.volume_count = volumes.len() as u32;
+            }
+        }
+
+        // Update volumes
+        let mut volumes_map = self.volumes.write().unwrap();
+        for vol in volumes {
+            let vid = VolumeId(vol.volume_id);
+            let state = if vol.read_only {
+                VolumeState::ReadOnly
+            } else {
+                VolumeState::Available
+            };
+
+            volumes_map.insert(
+                vid,
+                VolumeInfo {
+                    id: vid,
+                    node_id: nid.clone(),
+                    collection: Collection::default(),
+                    size: vol.size,
+                    used: 0,
+                    replica_count: 1,
+                    ttl: Ttl::default(),
+                    disk_type: DiskType::default(),
+                    state,
+                    created_at: Utc::now(),
+                    modified_at: Utc::now(),
+                    next_file_key: 1,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn apply_heartbeat(&self, node_id: &str) -> Result<()> {
+        let nid = NodeId(node_id.to_string());
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(&nid) {
+            node.last_heartbeat = Utc::now();
+            node.state = NodeState::Healthy;
+        }
+        Ok(())
     }
 
     pub async fn add_node(
@@ -168,21 +425,18 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let dc_id = DataCenterId(data_center);
-        let rack_id = RackId(rack);
-
-        let mut topology = self.topology.write().unwrap();
-        topology.get_or_create_node(
-            dc_id,
-            rack_id,
-            node_id.clone(),
-            address.clone(),
+        let cmd = RaftCommand::AddNode {
+            node_id: node_id.0.clone(),
+            address: address.clone(),
+            rack: rack.clone(),
+            data_center: data_center.clone(),
             http_port,
             grpc_port,
-            public_url,
-        );
+            public_url: public_url.clone(),
+        };
 
-        info!("Added node: {} at {}:{}", node_id, address, http_port);
+        self.propose_command(cmd).await?;
+        info!("Proposed AddNode: {} at {}:{}", node_id, address, http_port);
 
         Ok(())
     }
@@ -192,12 +446,12 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let mut topology = self.topology.write().unwrap();
-        if topology.remove_node(node_id).is_none() {
-            return Err(PowerFsError::InvalidRequest("node not found".to_string()));
-        }
+        let cmd = RaftCommand::RemoveNode {
+            node_id: node_id.0.clone(),
+        };
 
-        info!("Removed node: {:?}", node_id);
+        self.propose_command(cmd).await?;
+        info!("Proposed RemoveNode: {:?}", node_id);
 
         Ok(())
     }
@@ -219,24 +473,22 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let mut volumes = self.volumes.write().unwrap();
-        if let Some(info) = volumes.get_mut(volume_id) {
-            info.state = state;
-            info.modified_at = Utc::now();
-
-            if state == VolumeState::Available {
-                let mut layouts = self.volume_layouts.write().unwrap();
-                let key =
-                    Self::get_volume_layout_key(&info.collection, info.replica_count, &info.ttl, &info.disk_type);
-                if let Some(layout) = layouts.get_mut(&key) {
-                    layout.volumes.push(info.id);
-                }
-            }
-
-            Ok(())
-        } else {
-            Err(PowerFsError::VolumeNotFound(volume_id.clone()))
+        let state_str = match state {
+            VolumeState::Creating => "Creating",
+            VolumeState::Available => "Available",
+            VolumeState::Full => "Full",
+            VolumeState::ReadOnly => "ReadOnly",
+            VolumeState::Deleting => "Deleting",
         }
+        .to_string();
+
+        let cmd = RaftCommand::UpdateVolumeState {
+            volume_id: volume_id.0,
+            state: state_str,
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
     }
 
     pub async fn list_volumes(&self) -> Vec<VolumeInfo> {
@@ -255,110 +507,33 @@ impl MasterNode {
         &self,
         node_id: &NodeId,
         volumes: &[VolumeShortInfo],
-        new_volumes: &[VolumeShortInfo],
-        deleted_volumes: &[VolumeShortInfo],
+        _new_volumes: &[VolumeShortInfo],
+        _deleted_volumes: &[VolumeShortInfo],
         ip: &str,
         grpc_port: u32,
-        http_port: u32,
+        _http_port: u32,
     ) -> Result<()> {
-        {
-            let mut topology = self.topology.write().unwrap();
-            let node = topology.get_node_mut(node_id);
-
-            if let Some(node) = node {
-                node.address = ip.to_string();
-                node.grpc_port = grpc_port;
-                node.http_port = http_port;
-                node.last_heartbeat = Utc::now();
-                node.state = NodeState::Healthy;
-                node.volume_count = volumes.len() as u32;
-            }
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
         }
 
-        let (new_vids, deleted_vids) = {
-            let mut volumes_map = self.volumes.write().unwrap();
-            let mut new_vids = Vec::new();
-            let mut deleted_vids = Vec::new();
+        let short_volumes: Vec<crate::raft_storage::RaftVolumeShortInfo> = volumes
+            .iter()
+            .map(|v| crate::raft_storage::RaftVolumeShortInfo {
+                volume_id: v.volume_id,
+                size: v.size,
+                read_only: v.read_only,
+            })
+            .collect();
 
-            for vol in new_volumes {
-                let volume_id = VolumeId(vol.volume_id);
-                let state = if vol.read_only {
-                    VolumeState::ReadOnly
-                } else {
-                    VolumeState::Available
-                };
-
-                let is_new = !volumes_map.contains_key(&volume_id);
-
-                volumes_map.insert(
-                    volume_id,
-                    VolumeInfo {
-                        id: volume_id,
-                        node_id: node_id.clone(),
-                        collection: Collection::default(),
-                        size: vol.size,
-                        used: 0,
-                        replica_count: 1,
-                        ttl: Ttl::default(),
-                        disk_type: DiskType::default(),
-                        state,
-                        created_at: Utc::now(),
-                        modified_at: Utc::now(),
-                        next_file_key: 1,
-                    },
-                );
-
-                if is_new && state == VolumeState::Available {
-                    new_vids.push(vol.volume_id);
-                }
-            }
-
-            for vol in volumes {
-                let volume_id = VolumeId(vol.volume_id);
-                let state = if vol.read_only {
-                    VolumeState::ReadOnly
-                } else {
-                    VolumeState::Available
-                };
-
-                volumes_map.insert(
-                    volume_id,
-                    VolumeInfo {
-                        id: volume_id,
-                        node_id: node_id.clone(),
-                        collection: Collection::default(),
-                        size: vol.size,
-                        used: 0,
-                        replica_count: 1,
-                        ttl: Ttl::default(),
-                        disk_type: DiskType::default(),
-                        state,
-                        created_at: Utc::now(),
-                        modified_at: Utc::now(),
-                        next_file_key: 1,
-                    },
-                );
-            }
-
-            for vol in deleted_volumes {
-                let volume_id = VolumeId(vol.volume_id);
-                if volumes_map.remove(&volume_id).is_some() {
-                    deleted_vids.push(vol.volume_id);
-                }
-            }
-
-            (new_vids, deleted_vids)
+        let cmd = RaftCommand::UpdateNodeVolumes {
+            node_id: node_id.0.clone(),
+            volumes: short_volumes,
+            ip: ip.to_string(),
+            grpc_port,
         };
 
-        if !new_vids.is_empty() || !deleted_vids.is_empty() {
-            let leader = self.get_leader().await;
-            let _ = self.notify_tx.try_send(VolumeLocationUpdate {
-                new_vids,
-                deleted_vids,
-                leader,
-            });
-        }
-
+        self.propose_command(cmd).await?;
         Ok(())
     }
 
@@ -376,7 +551,11 @@ impl MasterNode {
             return Err(PowerFsError::InvalidRequest("no nodes available".to_string()));
         }
 
-        let config = self.cluster_config.read().unwrap();
+        let (volume_size_limit, rack_awareness_enabled) = {
+            let config = self.cluster_config.read().unwrap();
+            (config.volume_size_limit, config.rack_awareness_enabled)
+        };
+
         let replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
 
         let collection = Collection(collection.to_string());
@@ -386,7 +565,7 @@ impl MasterNode {
         let replica_count = replica_placement.get_copy_count();
         let selected_nodes: Vec<DataNodeInfo>;
 
-        if config.rack_awareness_enabled && nodes.len() > 1 {
+        if rack_awareness_enabled && nodes.len() > 1 {
             selected_nodes = Self::select_nodes_by_rack(&nodes, replica_count);
         } else {
             selected_nodes = nodes.into_iter().take(replica_count as usize).collect();
@@ -398,10 +577,12 @@ impl MasterNode {
             ));
         }
 
-        let mut next_id = self.next_volume_id.write().unwrap();
-        let volume_id = VolumeId(*next_id);
-        *next_id += 1;
-        drop(next_id);
+        let volume_id = {
+            let mut next_id = self.next_volume_id.write().unwrap();
+            let vid = VolumeId(*next_id);
+            *next_id += 1;
+            vid
+        };
 
         for (i, node) in selected_nodes.iter().enumerate() {
             let state = if i == 0 {
@@ -417,7 +598,7 @@ impl MasterNode {
                     id: volume_id,
                     node_id: node.id.clone(),
                     collection: collection.clone(),
-                    size: config.volume_size_limit,
+                    size: volume_size_limit,
                     used: 0,
                     replica_count,
                     ttl: ttl.clone(),
@@ -430,27 +611,29 @@ impl MasterNode {
             );
         }
 
-        let mut layouts = self.volume_layouts.write().unwrap();
-        let key = Self::get_volume_layout_key(&collection, replica_count, &ttl, &disk_type);
-        layouts.entry(key).or_insert_with(|| VolumeLayout {
-            collection,
-            replica_placement,
-            ttl,
-            disk_type,
-            volumes: Vec::new(),
-        });
+        {
+            let mut layouts = self.volume_layouts.write().unwrap();
+            let key = Self::get_volume_layout_key(&collection, replica_count, &ttl, &disk_type);
+            layouts.entry(key).or_insert_with(|| VolumeLayout {
+                collection: collection.clone(),
+                replica_placement: replica_placement.clone(),
+                ttl: ttl.clone(),
+                disk_type: disk_type.clone(),
+                volumes: Vec::new(),
+            });
+        }
 
         // Get file_key from this volume's next_file_key counter
-        let mut volumes = self.volumes.write().unwrap();
-        let file_key = if let Some(vol_info) = volumes.get_mut(&volume_id) {
-            let key = vol_info.next_file_key;
-            vol_info.next_file_key += 1;
-            key
-        } else {
-            // If volume not found, start from 1
-            1
+        let file_key = {
+            let mut volumes = self.volumes.write().unwrap();
+            if let Some(vol_info) = volumes.get_mut(&volume_id) {
+                let key = vol_info.next_file_key;
+                vol_info.next_file_key += 1;
+                key
+            } else {
+                1
+            }
         };
-        drop(volumes);
 
         // Generate random cookie to prevent FID collision
         let cookie = rand::random::<u32>() as u64;
@@ -467,6 +650,21 @@ impl MasterNode {
             selected_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
             volume_id.0, cookie, file_key
         );
+
+        // Propose to Raft for replication
+        if let Some(first_node) = selected_nodes.first() {
+            let cmd = RaftCommand::AssignVolume {
+                node_id: first_node.id.0.clone(),
+                volume_id: volume_id.0,
+                collection: collection.0.clone(),
+                replica_count,
+                ttl: ttl.0,
+                disk_type: disk_type.0.clone(),
+                size: volume_size_limit,
+            };
+            // Best effort - don't fail the request if propose fails in single-node mode
+            let _ = self.propose_command(cmd).await;
+        }
 
         Ok((fid, selected_nodes))
     }
@@ -590,8 +788,9 @@ impl Clone for MasterNode {
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),
-            raft_storage: self.raft_storage.clone(),
+            raft_node: self.raft_node.clone(),
             is_leader: RwLock::new(*self.is_leader.read().unwrap()),
+            leader_address: RwLock::new(self.leader_address.read().unwrap().clone()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),
             max_file_key: RwLock::new(*self.max_file_key.read().unwrap()),
             heartbeat_tx: self.heartbeat_tx.clone(),

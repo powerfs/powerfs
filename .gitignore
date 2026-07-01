@@ -7,4 +7,6 @@ log
 *.log
 setp.sh
 unsetp.sh
+proxy.sh
+*.sh
 docs/

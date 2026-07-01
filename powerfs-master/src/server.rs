@@ -1,14 +1,14 @@
 use super::master::MasterNode;
 use super::proto::*;
 use futures::Stream;
-use log::debug;
+use log::{debug, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tonic::{transport::Channel, transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 pub struct MasterGrpcServer {
@@ -26,6 +26,21 @@ impl MasterGrpcServer {
             .serve(addr)
             .await?;
         Ok(())
+    }
+
+    async fn get_leader_client(&self) -> Option<crate::proto::powerfs::master_service_client::MasterServiceClient<Channel>> {
+        let leader = self.master.get_leader().await;
+        if leader.is_empty() {
+            return None;
+        }
+        let addr = format!("http://{}", leader);
+        match crate::proto::powerfs::master_service_client::MasterServiceClient::connect(addr).await {
+            Ok(client) => Some(client),
+            Err(e) => {
+                warn!("Failed to connect to leader {}: {}", leader, e);
+                None
+            }
+        }
     }
 }
 
@@ -164,6 +179,18 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<AssignRequest>,
     ) -> Result<Response<AssignResponse>, Status> {
+        // Forward to leader if not leader
+        if !self.master.is_leader().await {
+            if let Some(mut client) = self.get_leader_client().await {
+                let req = request.into_inner();
+                match client.assign(Request::new(req)).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(Status::unavailable("not leader and no leader client available"));
+        }
+
         let req = request.into_inner();
 
         match self
@@ -321,6 +348,18 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<VolumeGrowRequest>,
     ) -> Result<Response<VolumeGrowResponse>, Status> {
+        // Forward to leader if not leader
+        if !self.master.is_leader().await {
+            if let Some(mut client) = self.get_leader_client().await {
+                let req = request.into_inner();
+                match client.volume_grow(Request::new(req)).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(Status::unavailable("not leader and no leader client available"));
+        }
+
         let req = request.into_inner();
 
         // Use assign_volume logic to allocate new volumes
