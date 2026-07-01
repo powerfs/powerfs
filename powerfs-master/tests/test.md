@@ -549,8 +549,49 @@
 
 ### 3.3 E2E 测试基础设施设计
 
+> **E2E 测试方式调整**：Phase 1 优先使用 in-process 集成测试（如当前 `raft_integration_test.rs` 的方式），真实进程启动的 E2E 测试推到 Phase 4 之后。
+
+#### 3.3.1 Phase 1：in-process 集成测试（推荐）
+
+基于现有 `raft_integration_test.rs` 模式，使用 `tokio::test` 在同一进程内启动多个节点：
+
 ```rust
-// tests/common/mod.rs — E2E 测试工具类
+// tests/in_process_cluster.rs — in-process 集成测试工具类
+use tokio::sync::mpsc;
+use powerfs_master::raft_node::RaftNode;
+use powerfs_master::master::MasterNode;
+
+pub struct InProcessCluster {
+    nodes: Vec<RaftNode>,
+    master: MasterNode,
+    message_channels: Vec<mpsc::Sender<OutgoingMessage>>,
+}
+
+impl InProcessCluster {
+    /// 创建 in-process 集群（同一进程内）
+    pub async fn new(num_nodes: u8) -> Self;
+
+    /// 等待 Leader 选出
+    pub async fn wait_for_leader(&self) -> u64;
+
+    /// 通过 MasterNode 直接调用 API
+    pub fn master(&self) -> &MasterNode;
+
+    /// 模拟节点故障（停止消息处理）
+    pub async fn pause_node(&mut self, node_id: u64);
+
+    /// 恢复节点
+    pub async fn resume_node(&mut self, node_id: u64);
+
+    /// 清理
+    pub async fn shutdown(&mut self);
+}
+```
+
+#### 3.3.2 Phase 4+：真实进程 E2E 测试（环境依赖强）
+
+```rust
+// tests/e2e_cluster.rs — 真实进程 E2E 测试工具类
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -564,40 +605,16 @@ pub struct E2ECluster {
 }
 
 impl E2ECluster {
-    /// 启动完整集群
-    /// - num_masters: Master 节点数（Raft 集群，奇数）
-    /// - num_volumes: Volume 节点数
-    /// - with_fuse: 是否挂载 FUSE
     pub fn new(num_masters: u8, num_volumes: u8, with_fuse: bool) -> Self;
-
-    /// 等待集群就绪（Leader 选出、至少一个 Volume 注册）
     pub fn wait_ready(&self, timeout: Duration) -> Result<()>;
-
-    /// 通过 FUSE 挂载点写文件
     pub fn write_file(&self, path: &str, data: &[u8]) -> Result<()>;
-
-    /// 通过 FUSE 挂载点读文件
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>>;
-
-    /// 通过 CLI 调用 Master API
     pub fn cli(&self, args: &[&str]) -> Result<String>;
-
-    /// 故障注入：杀死指定 Master
     pub fn kill_master(&mut self, index: usize);
-
-    /// 故障注入：杀死指定 Volume
     pub fn kill_volume(&mut self, index: usize);
-
-    /// 故障注入：网络分区（iptables DROP）
     pub fn partition(&self, group_a: &[usize], group_b: &[usize]);
-
-    /// 故障注入：恢复网络分区
     pub fn heal_partition(&self);
-
-    /// 重启被杀死的节点
     pub fn restart_master(&mut self, index: usize) -> Result<()>;
-
-    /// 清理所有进程
     pub fn shutdown(&mut self);
 }
 
@@ -614,22 +631,33 @@ impl Drop for E2ECluster {
 
 ### 4.1 微基准测试（criterion）
 
-| # | Benchmark | 被测组件 | 指标 | 目标值 |
-|---|-----------|----------|------|--------|
-| 1 | `bench_needle_serialize` | Needle | 序列化吞吐 | > 500 MB/s |
-| 2 | `bench_needle_deserialize` | Needle | 反序列化吞吐 | > 500 MB/s |
-| 3 | `bench_needle_checksum` | BLAKE3 | 校验和吞吐 | > 2 GB/s |
-| 4 | `bench_memory_index_insert` | MemoryIndex | 插入 ops/s | > 1M ops/s |
-| 5 | `bench_memory_index_lookup` | MemoryIndex | 查询 ops/s | > 5M ops/s |
-| 6 | `bench_persistent_index_insert` | PersistentIndex | 持久化插入 ops/s | > 10K ops/s |
-| 7 | `bench_persistent_index_lookup` | PersistentIndex | 持久化查询 ops/s | > 50K ops/s |
-| 8 | `bench_rocksdb_put` | RocksDbBackend | 写入 ops/s | > 50K ops/s |
-| 9 | `bench_rocksdb_get` | RocksDbBackend | 读取 ops/s | > 200K ops/s |
-| 10 | `bench_volume_write_4k` | Volume | 4KB IOPS | > 10K IOPS |
-| 11 | `bench_volume_read_4k` | Volume | 4KB 读取 IOPS | > 50K IOPS |
-| 12 | `bench_volume_write_1m` | Volume | 1MB 写入带宽 | > 500 MB/s |
-| 13 | `bench_volume_read_1m` | Volume | 1MB 读取带宽 | > 1 GB/s |
-| 14 | `bench_raft_propose` | RaftNode | 提案吞吐 | > 5K ops/s |
+> **Benchmark 目标值策略调整**：当前目标值为经验值，建议先跑一轮基线测试，再根据实际结果设定合理目标值。
+
+| # | Benchmark | 被测组件 | 指标 | 基线值（待填充） | 目标值 |
+|---|-----------|----------|------|------------------|--------|
+| 1 | `bench_needle_serialize` | Needle | 序列化吞吐 | - | > 500 MB/s |
+| 2 | `bench_needle_deserialize` | Needle | 反序列化吞吐 | - | > 500 MB/s |
+| 3 | `bench_needle_checksum` | BLAKE3 | 校验和吞吐 | - | > 2 GB/s |
+| 4 | `bench_memory_index_insert` | MemoryIndex | 插入 ops/s | - | > 1M ops/s |
+| 5 | `bench_memory_index_lookup` | MemoryIndex | 查询 ops/s | - | > 5M ops/s |
+| 6 | `bench_persistent_index_insert` | PersistentIndex | 持久化插入 ops/s | - | > 10K ops/s |
+| 7 | `bench_persistent_index_lookup` | PersistentIndex | 持久化查询 ops/s | - | > 50K ops/s |
+| 8 | `bench_rocksdb_put` | RocksDbBackend | 写入 ops/s | - | > 50K ops/s |
+| 9 | `bench_rocksdb_get` | RocksDbBackend | 读取 ops/s | - | > 200K ops/s |
+| 10 | `bench_volume_write_4k` | Volume | 4KB IOPS | - | > 10K IOPS |
+| 11 | `bench_volume_read_4k` | Volume | 4KB 读取 IOPS | - | > 50K IOPS |
+| 12 | `bench_volume_write_1m` | Volume | 1MB 写入带宽 | - | > 500 MB/s |
+| 13 | `bench_volume_read_1m` | Volume | 1MB 读取带宽 | - | > 1 GB/s |
+| 14 | `bench_raft_propose` | RaftNode | 提案吞吐 | - | > 5K ops/s |
+
+#### 4.1.1 基线测试流程
+
+1. 在基准环境（Ubuntu 22.04, 32GB RAM, NVMe SSD）上运行：
+   ```bash
+   cargo bench -p powerfs-core -- --save-baseline main
+   ```
+2. 将结果填入上表「基线值」列
+3. 根据基线值调整目标值，确保目标具有挑战性但可实现
 
 ### 4.2 系统级性能测试
 
@@ -713,16 +741,18 @@ impl Drop for E2ECluster {
 
 ### 8.1 测试工具链
 
-| 工具 | 用途 | 状态 |
-|------|------|------|
-| `cargo test` | 单元测试 + 集成测试 | 已使用 |
-| `criterion` | 微基准测试 | 待添加 |
-| `proptest` | 属性模糊测试（Needle 序列化往返、路径解析） | 待添加 |
-| `mockall` | Mock 框架（Mock gRPC service、Raft Storage） | 待添加 |
-| `tempfile` | 临时目录管理 | 已使用 |
-| `tokio::test` | 异步测试 | 已使用 |
-| `rstest` | 参数化测试 | 待添加 |
-| `tracing-test` | 测试中结构化日志 | 待添加 |
+> **工具链引入策略调整**：不要一次性引入所有工具，按阶段逐步引入，避免复杂度爆炸。
+
+| 工具 | 用途 | 状态 | 引入阶段 | 说明 |
+|------|------|------|----------|------|
+| `cargo test` | 单元测试 + 集成测试 | 已使用 | Phase 0 | Rust 内置 |
+| `tempfile` | 临时目录管理 | 已使用 | Phase 0 | 已在项目中使用 |
+| `tokio::test` | 异步测试 | 已使用 | Phase 0 | 已在项目中使用 |
+| `mockall` | Mock 框架（Mock gRPC service、Raft Storage） | **优先引入** | P0 单元测试阶段 | 仅用于 gRPC mock，其他工具按需引入 |
+| `criterion` | 微基准测试 | 待添加 | P2 Benchmark 阶段 | 先跑基线再定目标值 |
+| `proptest` | 属性模糊测试（Needle 序列化往返、路径解析） | 待添加 | P2 安全测试阶段 | 在安全/压力测试阶段引入 |
+| `rstest` | 参数化测试 | 待添加 | 按需引入 | 当测试用例出现大量重复模式时引入 |
+| `tracing-test` | 测试中结构化日志 | 待添加 | 按需引入 | 当调试复杂异步测试时引入 |
 
 ### 8.2 CI/CD 流水线增强
 
@@ -803,35 +833,57 @@ powerfs-test-utils/
 
 ## 十、当前阶段（Phase 1）测试执行计划
 
-### P0：立即执行（核心模块，覆盖盲区）
+> **执行策略调整**：本方案框架和用例设计优秀，但需按「先修阻塞 → 补齐可测模块 → 随功能推进逐步测试」的节奏执行。不可测模块（FUSE mount 未实现、Volume gRPC 未启动）的测试推到对应功能实现阶段再做。
 
-| 优先级 | 任务 | 用例数 | 工时估算 |
-|--------|------|--------|----------|
-| 1 | powerfs-master 单元测试 — MasterNode 全部 37 方法 | 41 | 3d |
-| 2 | powerfs-master 单元测试 — RaftNode 缺失方法（16 个） | 16 | 1.5d |
-| 3 | powerfs-master 单元测试 — RocksDbStorage 缺失方法（11 个） | 11 | 1d |
-| 4 | powerfs-master 集成测试 — gRPC 服务层（20 个） | 20 | 2d |
-| 5 | powerfs-core — PersistentIndex 全部 7 方法 | 10 | 1d |
-| 6 | powerfs-volume — VolumeServer gRPC 全部 9 RPC | 28 | 2d |
-| 7 | powerfs-master — Raft 共识层扩展（21 个） | 21 | 2d |
+### P0 前置：阻塞项修复（必须先行）
 
-### P1：本周内
+以下问题是测试的前提条件，必须先修复，否则大量测试写出来也跑不通：
 
-| 优先级 | 任务 | 用例数 | 工时估算 |
-|--------|------|--------|----------|
-| 8 | powerfs-common — 补齐 8 个 From 实现 + 4 个 RocksDB 方法 | 16 | 0.5d |
-| 9 | powerfs-fuse — 修复 mount() 实现 | - | 0.5d |
-| 10 | powerfs-fuse — 全部 19 方法测试 | 34 | 2d |
-| 11 | powerfs-server — CLI 参数解析与启动测试 | 13 | 1d |
-| 12 | powerfs-cli — gRPC 客户端 + 11 命令测试 | 28 | 2d |
+| 优先级 | 任务 | 文件 | 工时估算 | 状态 |
+|--------|------|------|----------|------|
+| P0-1 | 修复 `write_needle` 中 `spawn_blocking().unwrap()` 吞错误 | `powerfs-volume/src/server.rs:98` | 0.5d | ⏳ |
+| P0-2 | 修复 `read_needle` 中 `spawn_blocking().unwrap()` 吞错误 | `powerfs-volume/src/server.rs:133` | 0.5d | ⏳ |
+| P0-3 | 修复 `delete_needle` 中 `spawn_blocking().unwrap()` 吞错误 | `powerfs-volume/src/server.rs:163` | 0.5d | ⏳ |
+| P0-4 | 启动 Volume gRPC 服务器 | `powerfs-volume/src/main.rs` | 1d | ⏳ |
+| P0-5 | 实现 FUSE mount/unmount | `powerfs-fuse/src/fuse.rs:374` | 1d | ⏳ |
+| P0-6 | 实现 Filer 子命令 | `powerfs-server/src/main.rs` | 1d | ⏳ |
 
-### P2：下周
+### P0：立即执行（当前可测模块）
 
-| 优先级 | 任务 | 用例数 | 工时估算 |
-|--------|------|--------|----------|
-| 13 | E2E 测试框架搭建 + 首轮测试 | 13 | 2d |
-| 14 | Benchmark 框架搭建（criterion） | 14 | 1.5d |
-| 15 | 压力测试 + 安全测试 | 14 | 1.5d |
+| 优先级 | 任务 | 用例数 | 工时估算 | 状态 |
+|--------|------|--------|----------|------|
+| 1 | powerfs-core — PersistentIndex 全部 7 方法 | 10 | 1d | ⏳ |
+| 2 | powerfs-master 单元测试 — MasterNode 全部 37 方法 | 41 | 3d | ⏳ |
+| 3 | powerfs-master 单元测试 — RaftNode 缺失方法（16 个） | 16 | 1.5d | ⏳ |
+| 4 | powerfs-master 单元测试 — RocksDbStorage 缺失方法（11 个） | 11 | 1d | ⏳ |
+| 5 | powerfs-common — 补齐 8 个 From 实现 + 4 个 RocksDB 方法 | 16 | 0.5d | ⏳ |
+| 6 | powerfs-master — Raft 共识层扩展（21 个） | 21 | 2d | ⏳ |
+
+### P1：功能实现后跟进（依赖 P0 前置修复）
+
+| 优先级 | 任务 | 用例数 | 工时估算 | 依赖项 |
+|--------|------|--------|----------|--------|
+| 7 | powerfs-volume — VolumeServer gRPC 全部 9 RPC | 28 | 2d | P0-1~P0-4 |
+| 8 | powerfs-volume — MasterClient 测试 | 5 | 0.5d | P0-4 |
+| 9 | powerfs-fuse — 全部 19 方法测试 | 34 | 2d | P0-5 |
+| 10 | powerfs-master 集成测试 — gRPC 服务层（20 个） | 20 | 2d | P0-1~P0-4 |
+| 11 | powerfs-server — CLI 参数解析与启动测试 | 13 | 1d | P0-4~P0-6 |
+| 12 | powerfs-cli — gRPC 客户端 + 11 命令测试 | 28 | 2d | P0-4 |
+
+### P2：进阶测试（Phase 1 后期 / Phase 2 前期）
+
+| 优先级 | 任务 | 用例数 | 工时估算 | 说明 |
+|--------|------|--------|----------|------|
+| 13 | in-process 集成测试框架扩展 | - | 1d | 基于现有 `raft_integration_test.rs` 模式 |
+| 14 | Benchmark 框架搭建（criterion）+ 基线测试 | 14 | 1.5d | 先跑基线再定目标值 |
+| 15 | 压力测试 + 安全测试 | 14 | 1.5d | 需要 FUSE/Volume 功能完整 |
+
+### P3：E2E 全链路测试（Phase 4 之后）
+
+| 优先级 | 任务 | 用例数 | 工时估算 | 说明 |
+|--------|------|--------|----------|------|
+| 16 | E2E 测试框架搭建（真实进程启动） | 13 | 2d | 环境依赖强，延后到功能稳定后 |
+| 17 | E2E 全链路测试 | 13 | 2d | 需要所有核心功能完整 |
 
 ---
 
@@ -887,16 +939,18 @@ stress_<workload>                       # stress_concurrent_writes
 soak_<duration>_<workload>              # soak_24h_baseline
 ```
 
-### B. 当前代码中已知待修复问题
+### B. 当前代码中已知待修复问题（P0 前置任务）
 
-| # | 文件 | 行号 | 问题 | 影响测试 |
-|---|------|------|------|----------|
-| 1 | `powerfs-fuse/src/fuse.rs` | 374 | `mount()` 只创建目录，未启动 FUSE 会话 | FUSE 测试阻塞 |
-| 2 | `powerfs-volume/src/main.rs` | - | `run_volume()` 未启动 gRPC 服务器 | Volume E2E 测试阻塞 |
-| 3 | `powerfs-server/src/main.rs` | - | `Filer` 子命令仅占位（只打印日志） | Filer 测试阻塞 |
-| 4 | `powerfs-volume/src/server.rs` | 98 | `write_needle` 使用 `spawn_blocking().unwrap()` 吞错误 | 错误路径不可测 |
-| 5 | `powerfs-volume/src/server.rs` | 133 | `read_needle` 同上 | 错误路径不可测 |
-| 6 | `powerfs-volume/src/server.rs` | 163 | `delete_needle` 同上 | 错误路径不可测 |
+> 以下问题是测试的前提条件，必须先修复。详细修复任务见「十、当前阶段（Phase 1）测试执行计划」中的「P0 前置」部分。
+
+| # | 文件 | 行号 | 问题 | 影响测试 | 修复方案 |
+|---|------|------|------|----------|----------|
+| 1 | `powerfs-fuse/src/fuse.rs` | 374 | `mount()` 只创建目录，未启动 FUSE 会话 | FUSE 测试阻塞 | 调用 `fuse_backend_rs` 的实际挂载 API：`FuseSession::new().mount(mount_point)` |
+| 2 | `powerfs-volume/src/main.rs` | - | `run_volume()` 未启动 gRPC 服务器 | Volume E2E 测试阻塞 | 启动 tonic gRPC 服务器，注册 VolumeServer 服务 |
+| 3 | `powerfs-server/src/main.rs` | - | `Filer` 子命令仅占位（只打印日志） | Filer 测试阻塞 | 实现 Filer HTTP 服务器，支持文件上传/下载/列表 API |
+| 4 | `powerfs-volume/src/server.rs` | 98 | `write_needle` 使用 `spawn_blocking().unwrap()` 吞错误 | 错误路径不可测 | 将 `spawn_blocking().unwrap()` 改为 `spawn_blocking().await`，正确传播错误 |
+| 5 | `powerfs-volume/src/server.rs` | 133 | `read_needle` 同上 | 错误路径不可测 | 同上 |
+| 6 | `powerfs-volume/src/server.rs` | 163 | `delete_needle` 同上 | 错误路径不可测 | 同上 |
 
 ### C. 运行测试命令
 

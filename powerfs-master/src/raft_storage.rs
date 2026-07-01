@@ -53,6 +53,19 @@ pub enum RaftCommand {
     Heartbeat {
         node_id: String,
     },
+    CreateCollection {
+        name: String,
+        replication: String,
+        ttl: i32,
+        disk_type: String,
+        max_volume_count: u64,
+    },
+    DeleteCollection {
+        name: String,
+    },
+    DeleteVolume {
+        volume_id: u32,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)

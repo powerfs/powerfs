@@ -1,4 +1,5 @@
 use super::master::{AddNodeParams, MasterNode, UpdateNodeVolumesParams};
+use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::*;
 use futures::Stream;
 use log::{debug, warn};
@@ -134,6 +135,9 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<LookupVolumeRequest>,
     ) -> Result<Response<LookupVolumeResponse>, Status> {
+        REQUEST_COUNT.inc();
+        LOOKUP_REQUEST_COUNT.inc();
+
         let req = request.into_inner();
         let mut locations = Vec::new();
 
@@ -199,7 +203,9 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<AssignRequest>,
     ) -> Result<Response<AssignResponse>, Status> {
-        // Forward to leader if not leader
+        REQUEST_COUNT.inc();
+        ASSIGN_REQUEST_COUNT.inc();
+
         if !self.master.is_leader().await {
             if let Some(mut client) = self.get_leader_client().await {
                 let req = request.into_inner();
@@ -422,5 +428,185 @@ impl MasterService for MasterGrpcServer {
             locations,
             error: String::new(),
         }))
+    }
+
+    async fn create_collection(
+        &self,
+        request: Request<CreateCollectionRequest>,
+    ) -> Result<Response<CreateCollectionResponse>, Status> {
+        if !self.master.is_leader().await {
+            if let Some(mut client) = self.get_leader_client().await {
+                let req = request.into_inner();
+                match client.create_collection(Request::new(req)).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(Status::unavailable(
+                "not leader and no leader client available",
+            ));
+        }
+
+        let req = request.into_inner();
+
+        let ttl: i32 = req.ttl.parse().unwrap_or(0);
+
+        match self
+            .master
+            .create_collection(
+                &req.name,
+                &req.replication,
+                ttl,
+                &req.disk_type,
+                req.max_volume_count,
+            )
+            .await
+        {
+            Ok(config) => Ok(Response::new(CreateCollectionResponse {
+                success: true,
+                error: String::new(),
+                collection: Some(CollectionInfo {
+                    name: config.name.0,
+                    replication: config.replication.to_string_format(),
+                    ttl: config.ttl.to_string(),
+                    disk_type: config.disk_type.0,
+                    max_volume_count: config.max_volume_count,
+                    volume_count: config.volume_count,
+                    created_at: config.created_at.timestamp() as u64,
+                    modified_at: config.modified_at.timestamp() as u64,
+                }),
+            })),
+            Err(e) => Ok(Response::new(CreateCollectionResponse {
+                success: false,
+                error: e.to_string(),
+                collection: None,
+            })),
+        }
+    }
+
+    async fn delete_collection(
+        &self,
+        request: Request<DeleteCollectionRequest>,
+    ) -> Result<Response<DeleteCollectionResponse>, Status> {
+        if !self.master.is_leader().await {
+            if let Some(mut client) = self.get_leader_client().await {
+                let req = request.into_inner();
+                match client.delete_collection(Request::new(req)).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(Status::unavailable(
+                "not leader and no leader client available",
+            ));
+        }
+
+        let req = request.into_inner();
+
+        match self.master.delete_collection(&req.name).await {
+            Ok(_) => Ok(Response::new(DeleteCollectionResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteCollectionResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn get_collection(
+        &self,
+        request: Request<GetCollectionRequest>,
+    ) -> Result<Response<GetCollectionResponse>, Status> {
+        let req = request.into_inner();
+
+        match self.master.get_collection(&req.name).await {
+            Some(config) => Ok(Response::new(GetCollectionResponse {
+                success: true,
+                error: String::new(),
+                collection: Some(CollectionInfo {
+                    name: config.name.0,
+                    replication: config.replication.to_string_format(),
+                    ttl: config.ttl.to_string(),
+                    disk_type: config.disk_type.0,
+                    max_volume_count: config.max_volume_count,
+                    volume_count: config.volume_count,
+                    created_at: config.created_at.timestamp() as u64,
+                    modified_at: config.modified_at.timestamp() as u64,
+                }),
+            })),
+            None => Ok(Response::new(GetCollectionResponse {
+                success: false,
+                error: "collection not found".to_string(),
+                collection: None,
+            })),
+        }
+    }
+
+    async fn list_collections(
+        &self,
+        _request: Request<ListCollectionsRequest>,
+    ) -> Result<Response<ListCollectionsResponse>, Status> {
+        let collections = self.master.list_collections().await;
+
+        let mut collection_infos = Vec::new();
+        for config in collections {
+            collection_infos.push(CollectionInfo {
+                name: config.name.0,
+                replication: config.replication.to_string_format(),
+                ttl: config.ttl.to_string(),
+                disk_type: config.disk_type.0,
+                max_volume_count: config.max_volume_count,
+                volume_count: config.volume_count,
+                created_at: config.created_at.timestamp() as u64,
+                modified_at: config.modified_at.timestamp() as u64,
+            });
+        }
+
+        Ok(Response::new(ListCollectionsResponse {
+            collections: collection_infos,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_statistics(
+        &self,
+        _request: Request<StatisticsRequest>,
+    ) -> Result<Response<StatisticsResponse>, Status> {
+        let stats = self.master.get_statistics().await;
+        Ok(Response::new(stats))
+    }
+
+    async fn delete_volume(
+        &self,
+        request: Request<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        if !self.master.is_leader().await {
+            if let Some(mut client) = self.get_leader_client().await {
+                let req = request.into_inner();
+                match client.delete_volume(Request::new(req)).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(Status::unavailable(
+                "not leader and no leader client available",
+            ));
+        }
+
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        match self.master.delete_volume(&volume_id).await {
+            Ok(_) => Ok(Response::new(DeleteVolumeResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteVolumeResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
     }
 }

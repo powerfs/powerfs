@@ -5,8 +5,9 @@ use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
     types::{
-        ClusterConfig, Collection, DataCenterId, DataNodeInfo, DiskType, Fid, NodeId, NodeState,
-        RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId, VolumeInfo, VolumeState,
+        ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
+        NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
+        VolumeInfo, VolumeState,
     },
 };
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ pub struct MasterNode {
     address: SocketAddr,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
+    collections: RwLock<HashMap<String, CollectionConfig>>,
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
@@ -138,11 +140,27 @@ impl MasterNode {
 
         let raft_node_arc = Arc::new(RwLock::new(raft_node));
 
+        let mut collections = HashMap::new();
+        collections.insert(
+            "default".to_string(),
+            CollectionConfig {
+                name: Collection::default(),
+                replication: ReplicaPlacement::default(),
+                ttl: Ttl::default(),
+                disk_type: DiskType::default(),
+                max_volume_count: 0,
+                volume_count: 0,
+                created_at: Utc::now(),
+                modified_at: Utc::now(),
+            },
+        );
+
         let master = MasterNode {
             id: node_id.clone(),
             address: addr,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
+            collections: RwLock::new(collections),
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
             raft_config,
@@ -312,6 +330,28 @@ impl MasterNode {
             RaftCommand::Heartbeat { node_id } => {
                 self.apply_heartbeat(&node_id).await?;
             }
+            RaftCommand::CreateCollection {
+                name,
+                replication,
+                ttl,
+                disk_type,
+                max_volume_count,
+            } => {
+                self.apply_create_collection(
+                    &name,
+                    &replication,
+                    ttl,
+                    &disk_type,
+                    max_volume_count,
+                )
+                .await?;
+            }
+            RaftCommand::DeleteCollection { name } => {
+                self.apply_delete_collection(&name).await?;
+            }
+            RaftCommand::DeleteVolume { volume_id } => {
+                self.apply_delete_volume(volume_id).await?;
+            }
         }
 
         Ok(())
@@ -453,6 +493,136 @@ impl MasterNode {
             node.last_heartbeat = Utc::now();
             node.state = NodeState::Healthy;
         }
+        Ok(())
+    }
+
+    async fn apply_create_collection(
+        &self,
+        name: &str,
+        replication: &str,
+        ttl: i32,
+        disk_type: &str,
+        max_volume_count: u64,
+    ) -> Result<()> {
+        let rep = ReplicaPlacement::from_string(replication).unwrap_or_default();
+        let coll = Collection(name.to_string());
+        let t = Ttl(ttl);
+        let dt = DiskType(disk_type.to_string());
+
+        let mut collections = self.collections.write().unwrap();
+        if collections.contains_key(name) {
+            return Err(PowerFsError::InvalidRequest(format!(
+                "collection {} already exists",
+                name
+            )));
+        }
+
+        collections.insert(
+            name.to_string(),
+            CollectionConfig {
+                name: coll,
+                replication: rep,
+                ttl: t,
+                disk_type: dt,
+                max_volume_count,
+                volume_count: 0,
+                created_at: Utc::now(),
+                modified_at: Utc::now(),
+            },
+        );
+
+        info!("Applied CreateCollection: {}", name);
+        Ok(())
+    }
+
+    async fn apply_delete_collection(&self, name: &str) -> Result<()> {
+        if name == "default" {
+            return Err(PowerFsError::InvalidRequest(
+                "cannot delete default collection".to_string(),
+            ));
+        }
+
+        let mut collections = self.collections.write().unwrap();
+        if collections.remove(name).is_none() {
+            return Err(PowerFsError::InvalidRequest(format!(
+                "collection {} not found",
+                name
+            )));
+        }
+
+        info!("Applied DeleteCollection: {}", name);
+        Ok(())
+    }
+
+    pub async fn create_collection(
+        &self,
+        name: &str,
+        replication: &str,
+        ttl: i32,
+        disk_type: &str,
+        max_volume_count: u64,
+    ) -> Result<CollectionConfig> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::CreateCollection {
+            name: name.to_string(),
+            replication: replication.to_string(),
+            ttl,
+            disk_type: disk_type.to_string(),
+            max_volume_count,
+        };
+
+        self.propose_command(cmd).await?;
+
+        let collections = self.collections.read().unwrap();
+        collections.get(name).cloned().ok_or(PowerFsError::Internal(
+            "collection not found after creation".to_string(),
+        ))
+    }
+
+    pub async fn delete_collection(&self, name: &str) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::DeleteCollection {
+            name: name.to_string(),
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    pub async fn get_collection(&self, name: &str) -> Option<CollectionConfig> {
+        self.collections.read().unwrap().get(name).cloned()
+    }
+
+    pub async fn list_collections(&self) -> Vec<CollectionConfig> {
+        self.collections.read().unwrap().values().cloned().collect()
+    }
+
+    async fn apply_delete_volume(&self, volume_id: u32) -> Result<()> {
+        let vid = VolumeId(volume_id);
+        let mut volumes = self.volumes.write().unwrap();
+        if volumes.remove(&vid).is_none() {
+            return Err(PowerFsError::VolumeNotFound(vid));
+        }
+        info!("Applied DeleteVolume: {}", volume_id);
+        Ok(())
+    }
+
+    pub async fn delete_volume(&self, volume_id: &VolumeId) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::DeleteVolume {
+            volume_id: volume_id.0,
+        };
+
+        self.propose_command(cmd).await?;
         Ok(())
     }
 
@@ -805,6 +975,139 @@ impl MasterNode {
         result
     }
 
+    pub async fn get_statistics(&self) -> crate::proto::StatisticsResponse {
+        let volumes = self.volumes.read().unwrap();
+        let topology = self.topology.read().unwrap();
+
+        let mut total_volume_count = 0;
+        let mut total_volume_size = 0;
+        let mut total_used_size = 0;
+        let mut available_volume_count = 0;
+        let mut full_volume_count = 0;
+        let mut read_only_volume_count = 0;
+
+        let mut collection_stats: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        let mut dc_stats: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        let mut rack_stats: HashMap<String, (u64, u64, u64)> = HashMap::new();
+
+        for vol in volumes.values() {
+            total_volume_count += 1;
+            total_volume_size += vol.size;
+            total_used_size += vol.used;
+
+            match vol.state {
+                VolumeState::Available => available_volume_count += 1,
+                VolumeState::Full => full_volume_count += 1,
+                VolumeState::ReadOnly => read_only_volume_count += 1,
+                _ => {}
+            }
+
+            let coll_name = vol.collection.0.clone();
+            let (count, size, used) = collection_stats.entry(coll_name).or_insert((0, 0, 0));
+            *count += 1;
+            *size += vol.size;
+            *used += vol.used;
+
+            if let Some(node) = topology.get_node(&vol.node_id) {
+                let dc_name = node.data_center_id.0.clone();
+                let (dc_count, dc_size, dc_used) =
+                    dc_stats.entry(dc_name.clone()).or_insert((0, 0, 0));
+                *dc_count += 1;
+                *dc_size += vol.size;
+                *dc_used += vol.used;
+
+                let rack_name = format!("{}:{}", dc_name, node.rack_id.0);
+                let (rack_count, rack_size, rack_used) =
+                    rack_stats.entry(rack_name).or_insert((0, 0, 0));
+                *rack_count += 1;
+                *rack_size += vol.size;
+                *rack_used += vol.used;
+            }
+        }
+
+        let mut collection_stats_list = Vec::new();
+        for (name, (count, size, used)) in collection_stats {
+            collection_stats_list.push(crate::proto::CollectionStats {
+                name,
+                volume_count: count,
+                total_size: size,
+                used_size: used,
+            });
+        }
+
+        let mut dc_stats_list = Vec::new();
+        for (name, (count, _size, _used)) in dc_stats {
+            dc_stats_list.push(crate::proto::DataCenterStats {
+                name,
+                node_count: 0,
+                volume_count: count,
+                total_size: 0,
+                used_size: 0,
+            });
+        }
+
+        let mut rack_stats_list = Vec::new();
+        for (name, (count, _size, _used)) in rack_stats {
+            let parts: Vec<&str> = name.split(':').collect();
+            let dc_name = if parts.len() > 1 { parts[0] } else { "" };
+            let rack_name = if parts.len() > 1 { parts[1] } else { &name };
+            rack_stats_list.push(crate::proto::RackStats {
+                name: rack_name.to_string(),
+                data_center: dc_name.to_string(),
+                node_count: 0,
+                volume_count: count,
+                total_size: 0,
+                used_size: 0,
+            });
+        }
+
+        let nodes = topology.list_all_nodes();
+        let node_count = nodes.len();
+        let mut dc_node_counts: HashMap<String, u64> = HashMap::new();
+        let mut rack_node_counts: HashMap<String, u64> = HashMap::new();
+
+        for node in nodes {
+            let dc_name = node.data_center_id.0.clone();
+            *dc_node_counts.entry(dc_name.clone()).or_insert(0) += 1;
+
+            let rack_name = format!("{}:{}", dc_name, node.rack_id.0);
+            *rack_node_counts.entry(rack_name).or_insert(0) += 1;
+        }
+
+        for dc_stat in dc_stats_list.iter_mut() {
+            if let Some(count) = dc_node_counts.get(&dc_stat.name) {
+                dc_stat.node_count = *count;
+            }
+        }
+
+        for rack_stat in rack_stats_list.iter_mut() {
+            let rack_name = format!("{}:{}", rack_stat.data_center, rack_stat.name);
+            if let Some(count) = rack_node_counts.get(&rack_name) {
+                rack_stat.node_count = *count;
+            }
+        }
+
+        crate::proto::StatisticsResponse {
+            total_volume_count,
+            total_node_count: node_count as u64,
+            total_data_center_count: topology.data_centers.len() as u64,
+            total_rack_count: topology
+                .data_centers
+                .values()
+                .map(|dc| dc.racks.len())
+                .sum::<usize>() as u64,
+            total_volume_size,
+            total_used_size,
+            available_volume_count,
+            full_volume_count,
+            read_only_volume_count,
+            collection_stats: collection_stats_list,
+            data_center_stats: dc_stats_list,
+            rack_stats: rack_stats_list,
+            error: String::new(),
+        }
+    }
+
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
         info!("Starting Raft (single node mode, always leader)");
         *self.is_leader.write().unwrap() = true;
@@ -833,6 +1136,7 @@ impl Clone for MasterNode {
             address: self.address,
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
+            collections: RwLock::new(self.collections.read().unwrap().clone()),
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),

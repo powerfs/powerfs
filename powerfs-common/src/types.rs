@@ -86,6 +86,18 @@ impl Default for Collection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionConfig {
+    pub name: Collection,
+    pub replication: ReplicaPlacement,
+    pub ttl: Ttl,
+    pub disk_type: DiskType,
+    pub max_volume_count: u64,
+    pub volume_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub modified_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct DiskType(pub String);
 

@@ -1,4 +1,5 @@
 pub mod master;
+pub mod metrics;
 pub mod proto;
 pub mod raft_node;
 pub mod raft_server;

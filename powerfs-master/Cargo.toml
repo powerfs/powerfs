@@ -31,3 +31,7 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 protobuf = "2"
 slog = "2"
+prometheus = "0.13"
+hyper = { version = "1", features = ["full"] }
+lazy_static = "1.4"
+axum = "0.6"

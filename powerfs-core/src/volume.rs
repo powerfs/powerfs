@@ -46,7 +46,8 @@ impl Volume {
                 .set_len(size)?;
         }
 
-        let index: Box<dyn NeedleIndex> = Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
+        let index: Box<dyn NeedleIndex> =
+            Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
 
         let info = VolumeInfo {
             id,
@@ -160,7 +161,8 @@ impl Volume {
             let mut info_guard = self.info.write().unwrap();
             let mut free_space_guard = self.free_space.write().unwrap();
 
-            let needle_size = (NEEDLE_HEADER_SIZE + info.data_size as usize + NEEDLE_FOOTER_SIZE) as u64;
+            let needle_size =
+                (NEEDLE_HEADER_SIZE + info.data_size as usize + NEEDLE_FOOTER_SIZE) as u64;
             info_guard.used -= needle_size;
             *free_space_guard += needle_size;
             info_guard.modified_at = Utc::now();

@@ -10,6 +10,18 @@ service MasterService {
     rpc VolumeList(VolumeListRequest) returns (VolumeListResponse);
     rpc VolumeGrow(VolumeGrowRequest) returns (VolumeGrowResponse);
     rpc Ping(PingRequest) returns (PingResponse);
+    
+    // Collection management
+    rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+    rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+    rpc GetCollection(GetCollectionRequest) returns (GetCollectionResponse);
+    rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+    
+    // Statistics
+    rpc GetStatistics(StatisticsRequest) returns (StatisticsResponse);
+    
+    // Volume management
+    rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
 }
 
 message Heartbeat {
@@ -153,6 +165,125 @@ message VolumeGrowResponse {
     repeated uint32 new_volume_ids = 1;
     repeated Location locations = 2;
     string error = 3;
+}
+
+// Collection management messages
+message CollectionInfo {
+    string name = 1;
+    string replication = 2;
+    string ttl = 3;
+    string disk_type = 4;
+    uint64 max_volume_count = 5;
+    uint64 volume_count = 6;
+    uint64 created_at = 7;
+    uint64 modified_at = 8;
+}
+
+message CreateCollectionRequest {
+    string name = 1;
+    string replication = 2;
+    string ttl = 3;
+    string disk_type = 4;
+    uint64 max_volume_count = 5;
+}
+
+message CreateCollectionResponse {
+    bool success = 1;
+    string error = 2;
+    CollectionInfo collection = 3;
+}
+
+message DeleteCollectionRequest {
+    string name = 1;
+}
+
+message DeleteCollectionResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetCollectionRequest {
+    string name = 1;
+}
+
+message GetCollectionResponse {
+    bool success = 1;
+    string error = 2;
+    CollectionInfo collection = 3;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+    repeated CollectionInfo collections = 1;
+    string error = 2;
+}
+
+// Volume management messages
+message DeleteVolumeRequest {
+    uint32 volume_id = 1;
+}
+
+message DeleteVolumeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Statistics messages
+message StatisticsRequest {
+    string collection = 1;
+    string data_center = 2;
+    string rack = 3;
+}
+
+message StatisticsResponse {
+    // Cluster level
+    uint64 total_volume_count = 1;
+    uint64 total_node_count = 2;
+    uint64 total_data_center_count = 3;
+    uint64 total_rack_count = 4;
+    
+    // Volume level
+    uint64 total_volume_size = 5;
+    uint64 total_used_size = 6;
+    uint64 available_volume_count = 7;
+    uint64 full_volume_count = 8;
+    uint64 read_only_volume_count = 9;
+    
+    // Collection level
+    repeated CollectionStats collection_stats = 10;
+    
+    // Data center level
+    repeated DataCenterStats data_center_stats = 11;
+    
+    // Rack level
+    repeated RackStats rack_stats = 12;
+    
+    string error = 13;
+}
+
+message CollectionStats {
+    string name = 1;
+    uint64 volume_count = 2;
+    uint64 total_size = 3;
+    uint64 used_size = 4;
+}
+
+message DataCenterStats {
+    string name = 1;
+    uint64 node_count = 2;
+    uint64 volume_count = 3;
+    uint64 total_size = 4;
+    uint64 used_size = 5;
+}
+
+message RackStats {
+    string name = 1;
+    string data_center = 2;
+    uint64 node_count = 3;
+    uint64 volume_count = 4;
+    uint64 total_size = 5;
+    uint64 used_size = 6;
 }
 
 // Raft service for multi-node communication
