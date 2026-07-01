@@ -2,10 +2,12 @@ $:
   vscode:
     - runner:
         cpus: 16
+        memory: 32G
       services:
         - vscode
       docker:
-        image: rust:1.80-slim
+        # 替换为1.82及以上版本，支持edition2024
+        image: rust:1.82-slim
         volumes:
           - cargo_registry:copy-on-write
           - target:copy-on-write
@@ -17,7 +19,5 @@ $:
             - echo 'replace-with = "rsproxy"' >> ~/.cargo/config.toml
             - echo '[source.rsproxy]' >> ~/.cargo/config.toml
             - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
-        - name: 预装Rust工具组件
+        - name: 预装Rust组件
           script: rustup component add rustfmt clippy rust-src
-        - name: 预拉取项目依赖
-          script: cargo fetch
