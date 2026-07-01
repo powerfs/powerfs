@@ -1,6 +1,7 @@
 mod assign;
 mod cluster_add;
 mod cluster_remove;
+mod cluster_status;
 mod cluster_transfer;
 mod grow;
 mod heartbeat;
@@ -13,6 +14,7 @@ mod write;
 pub use assign::{assign, AssignArgs};
 pub use cluster_add::{cluster_add, ClusterAddArgs};
 pub use cluster_remove::{cluster_remove, ClusterRemoveArgs};
+pub use cluster_status::{cluster_status, ClusterStatusArgs};
 pub use cluster_transfer::{cluster_transfer, ClusterTransferArgs};
 pub use grow::{grow, GrowArgs};
 pub use heartbeat::{heartbeat, HeartbeatArgs};

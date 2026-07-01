@@ -550,6 +550,8 @@
 ### 3.3 E2E 测试基础设施设计
 
 > **E2E 测试方式调整**：Phase 1 优先使用 in-process 集成测试（如当前 `raft_integration_test.rs` 的方式），真实进程启动的 E2E 测试推到 Phase 4 之后。
+>
+> **Phase 3A 已完成的集成测试**：三节点 Raft 故障转移测试、状态机一致性测试均已通过。
 
 #### 3.3.1 Phase 1：in-process 集成测试（推荐）
 

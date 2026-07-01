@@ -22,6 +22,9 @@ service MasterService {
     
     // Volume management
     rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+    
+    // Cluster management
+    rpc GetClusterInfo(ClusterInfoRequest) returns (ClusterInfoResponse);
 }
 
 message Heartbeat {

@@ -609,4 +609,12 @@ impl MasterService for MasterGrpcServer {
             })),
         }
     }
+
+    async fn get_cluster_info(
+        &self,
+        _request: Request<ClusterInfoRequest>,
+    ) -> Result<Response<ClusterInfoResponse>, Status> {
+        let cluster_info = self.master.get_cluster_info().await;
+        Ok(Response::new(cluster_info))
+    }
 }

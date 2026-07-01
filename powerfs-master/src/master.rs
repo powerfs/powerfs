@@ -1108,6 +1108,19 @@ impl MasterNode {
         }
     }
 
+    pub async fn get_cluster_info(&self) -> crate::proto::ClusterInfoResponse {
+        let raft_node = self.raft_node.read().unwrap();
+        let cluster_info = raft_node.get_cluster_info();
+
+        crate::proto::ClusterInfoResponse {
+            node_id: cluster_info.node_id,
+            address: cluster_info.address,
+            is_leader: cluster_info.is_leader,
+            term: cluster_info.term,
+            peers: cluster_info.peers,
+        }
+    }
+
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
         info!("Starting Raft (single node mode, always leader)");
         *self.is_leader.write().unwrap() = true;

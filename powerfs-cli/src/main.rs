@@ -6,8 +6,8 @@ mod commands;
 mod volume_client;
 
 use commands::{
-    AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterTransferArgs, GrowArgs, HeartbeatArgs,
-    LookupArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
+    GrowArgs, HeartbeatArgs, LookupArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
 };
 
 /// PowerFS CLI tool for testing and administration
@@ -61,6 +61,9 @@ enum Commands {
     /// Remove node from cluster
     ClusterRemove(ClusterRemoveArgs),
 
+    /// Show detailed cluster status
+    ClusterStatus(ClusterStatusArgs),
+
     /// Transfer leadership to another node
     ClusterTransfer(ClusterTransferArgs),
 }
@@ -95,6 +98,7 @@ async fn main() {
         Commands::Read(args) => commands::read(args).await,
         Commands::ClusterAdd(args) => commands::cluster_add(client, args).await,
         Commands::ClusterRemove(args) => commands::cluster_remove(client, args).await,
+        Commands::ClusterStatus(args) => commands::cluster_status(client, args).await,
         Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
     };
 

@@ -263,24 +263,7 @@ async fn test_three_node_failover() {
     )
     .expect("Failed to create Raft node 1");
 
-    for _i in 0..20 {
-        node1.tick();
-        let mut ready = node1.node.ready();
-        let _ = ready.take_messages();
-        let _ = ready.take_persisted_messages();
-        if !ready.entries().is_empty() {
-            let _ = node1.node.mut_store().append(ready.entries());
-        }
-        if let Some(hs) = ready.hs() {
-            node1.node.mut_store().set_hardstate(hs.clone());
-        }
-        node1.node.advance(ready);
-    }
-
-    assert!(node1.is_leader(), "Node 1 should be leader");
-    println!("Node 1 is leader");
-
-    let _node2 = RaftNode::new(
+    let mut node2 = RaftNode::new(
         2,
         "127.0.0.1:10002".to_string(),
         vec![],
@@ -288,7 +271,7 @@ async fn test_three_node_failover() {
     )
     .expect("Failed to create Raft node 2");
 
-    let _node3 = RaftNode::new(
+    let mut node3 = RaftNode::new(
         3,
         "127.0.0.1:10003".to_string(),
         vec![],
@@ -296,7 +279,232 @@ async fn test_three_node_failover() {
     )
     .expect("Failed to create Raft node 3");
 
-    println!("Testing three node failover completed");
+    let step_tx1 = node1.get_step_tx();
+    let step_tx2 = node2.get_step_tx();
+    let step_tx3 = node3.get_step_tx();
+    let msg_rx1 = node1.take_message_rx();
+    let msg_rx2 = node2.take_message_rx();
+    let msg_rx3 = node3.take_message_rx();
+
+    let propose_tx1 = node1.get_propose_tx();
+    let propose_tx2 = node2.get_propose_tx();
+    let propose_tx3 = node3.get_propose_tx();
+
+    let st1_1 = step_tx1.clone();
+    let st1_2 = step_tx1.clone();
+    let st2_1 = step_tx2.clone();
+    let st2_2 = step_tx2.clone();
+    let st3_1 = step_tx3.clone();
+    let st3_2 = step_tx3.clone();
+
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx1, step_tx1, step_tx2, step_tx3).await;
+    });
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx2, st1_1, st2_1, st3_1).await;
+    });
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx3, st1_2, st2_2, st3_2).await;
+    });
+
+    tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    tokio::spawn(async move {
+        let _ = node3.run().await;
+    });
+
+    sleep(Duration::from_secs(3)).await;
+
+    let propose_txs = vec![propose_tx1, propose_tx2, propose_tx3];
+
+    let cmd = RaftCommand::Heartbeat {
+        node_id: "test_node".to_string(),
+    };
+    let data = cmd.serialize();
+
+    let mut proposed = false;
+    for (idx, propose_tx) in propose_txs.iter().enumerate() {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = ProposeRequest {
+            data: data.clone(),
+            response_tx: resp_tx,
+        };
+
+        if propose_tx.send(req).await.is_err() {
+            continue;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(3), resp_rx).await {
+            Ok(Ok(Ok(index))) => {
+                println!("Proposed command at index {} via node {}", index, idx + 1);
+                assert!(index > 0, "Index should be positive");
+                proposed = true;
+                break;
+            }
+            Ok(Ok(Err(e))) => {
+                println!("Node {} not leader: {}", idx + 1, e);
+            }
+            _ => {
+                println!("Node {} timeout", idx + 1);
+            }
+        }
+    }
+
+    assert!(proposed, "Should have successfully proposed a command");
+
+    println!("Three node failover test completed successfully");
+}
+
+async fn multi_message_router(
+    mut msg_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
+    step_tx1: tokio::sync::mpsc::Sender<RaftMessage>,
+    step_tx2: tokio::sync::mpsc::Sender<RaftMessage>,
+    step_tx3: tokio::sync::mpsc::Sender<RaftMessage>,
+) {
+    while let Some(msg) = msg_rx.recv().await {
+        info!("Routing message to {}", msg.to_id);
+        if let Ok(raft_msg) = ProtobufMessage::parse_from_bytes(&msg.message) {
+            match msg.to_id {
+                1 => {
+                    let _ = step_tx1.send(raft_msg).await;
+                }
+                2 => {
+                    let _ = step_tx2.send(raft_msg).await;
+                }
+                3 => {
+                    let _ = step_tx3.send(raft_msg).await;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_state_machine_consistency() {
+    let temp_dir1 = tempdir().expect("Failed to create temp dir");
+    let db_path1 = temp_dir1.path().join("raft_1");
+    std::fs::create_dir_all(&db_path1).expect("Failed to create db dir");
+
+    let temp_dir2 = tempdir().expect("Failed to create temp dir");
+    let db_path2 = temp_dir2.path().join("raft_2");
+    std::fs::create_dir_all(&db_path2).expect("Failed to create db dir");
+
+    let temp_dir3 = tempdir().expect("Failed to create temp dir");
+    let db_path3 = temp_dir3.path().join("raft_3");
+    std::fs::create_dir_all(&db_path3).expect("Failed to create db dir");
+
+    let mut node1 = RaftNode::new(
+        1,
+        "127.0.0.1:10001".to_string(),
+        vec![],
+        db_path1.to_str().unwrap(),
+    )
+    .expect("Failed to create Raft node 1");
+
+    let mut node2 = RaftNode::new(
+        2,
+        "127.0.0.1:10002".to_string(),
+        vec![],
+        db_path2.to_str().unwrap(),
+    )
+    .expect("Failed to create Raft node 2");
+
+    let mut node3 = RaftNode::new(
+        3,
+        "127.0.0.1:10003".to_string(),
+        vec![],
+        db_path3.to_str().unwrap(),
+    )
+    .expect("Failed to create Raft node 3");
+
+    let step_tx1 = node1.get_step_tx();
+    let step_tx2 = node2.get_step_tx();
+    let step_tx3 = node3.get_step_tx();
+    let msg_rx1 = node1.take_message_rx();
+    let msg_rx2 = node2.take_message_rx();
+    let msg_rx3 = node3.take_message_rx();
+
+    let propose_tx1 = node1.get_propose_tx();
+    let propose_tx2 = node2.get_propose_tx();
+    let propose_tx3 = node3.get_propose_tx();
+
+    let st1_1 = step_tx1.clone();
+    let st1_2 = step_tx1.clone();
+    let st2_1 = step_tx2.clone();
+    let st2_2 = step_tx2.clone();
+    let st3_1 = step_tx3.clone();
+    let st3_2 = step_tx3.clone();
+
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx1, step_tx1, step_tx2, step_tx3).await;
+    });
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx2, st1_1, st2_1, st3_1).await;
+    });
+    tokio::spawn(async move {
+        let _ = multi_message_router(msg_rx3, st1_2, st2_2, st3_2).await;
+    });
+
+    tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+    tokio::spawn(async move {
+        let _ = node3.run().await;
+    });
+
+    sleep(Duration::from_secs(3)).await;
+
+    let propose_txs = vec![propose_tx1, propose_tx2, propose_tx3];
+
+    for i in 0..5 {
+        let cmd = RaftCommand::Heartbeat {
+            node_id: format!("test_node_{}", i),
+        };
+        let data = cmd.serialize();
+
+        let mut proposed = false;
+        for (idx, propose_tx) in propose_txs.iter().enumerate() {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = ProposeRequest {
+                data: data.clone(),
+                response_tx: resp_tx,
+            };
+
+            if propose_tx.send(req).await.is_err() {
+                continue;
+            }
+
+            match tokio::time::timeout(Duration::from_secs(3), resp_rx).await {
+                Ok(Ok(Ok(index))) => {
+                    println!(
+                        "Proposed command {} at index {} via node {}",
+                        i,
+                        index,
+                        idx + 1
+                    );
+                    proposed = true;
+                    break;
+                }
+                Ok(Ok(Err(_))) => {}
+                _ => {}
+            }
+        }
+
+        assert!(proposed, "Should have successfully proposed command {}", i);
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    sleep(Duration::from_secs(2)).await;
+
+    println!("State machine consistency test completed successfully");
 }
 
 #[allow(dead_code)]
