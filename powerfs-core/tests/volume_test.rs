@@ -284,10 +284,12 @@ fn test_volume_reopen_persists_data() {
     let path = dir.path().to_str().unwrap();
 
     // Write data
-    let volume = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024).unwrap();
-    volume
-        .write_needle(1, Bytes::from("persistent data"))
-        .unwrap();
+    {
+        let volume = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024).unwrap();
+        volume
+            .write_needle(1, Bytes::from("persistent data"))
+            .unwrap();
+    }
 
     // Reopen
     let volume2 = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024).unwrap();

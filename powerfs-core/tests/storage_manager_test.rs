@@ -205,8 +205,10 @@ fn test_load_volumes_with_existing() {
     let path = dir.path().to_str().unwrap().to_string();
 
     // Create a volume manually
-    let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone());
-    mgr1.create_volume(VolumeId(5), 1024 * 1024).unwrap();
+    {
+        let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone());
+        mgr1.create_volume(VolumeId(5), 1024 * 1024).unwrap();
+    }
 
     // Load with a new manager
     let mgr2 = StorageManager::new(NodeId("node".to_string()), path);

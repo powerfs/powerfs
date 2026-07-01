@@ -39,8 +39,9 @@ fn test_memory_index_insert_and_get() {
 
     let retrieved = index.get(&NeedleId(1));
     assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().id, NeedleId(1));
-    assert_eq!(retrieved.unwrap().data_size, 100);
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.id, NeedleId(1));
+    assert_eq!(retrieved.data_size, 100);
 }
 
 #[test]
@@ -100,8 +101,9 @@ fn test_memory_index_remove_then_reinsert() {
 
     let retrieved = index.get(&NeedleId(1));
     assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().data_size, 20);
-    assert_eq!(retrieved.unwrap().offset, 100);
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.data_size, 20);
+    assert_eq!(retrieved.offset, 100);
 }
 
 #[test]
@@ -112,8 +114,9 @@ fn test_memory_index_insert_overwrite() {
 
     let retrieved = index.get(&NeedleId(1));
     assert!(retrieved.is_some());
-    assert_eq!(retrieved.unwrap().data_size, 50);
-    assert_eq!(retrieved.unwrap().offset, 500);
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.data_size, 50);
+    assert_eq!(retrieved.offset, 500);
     assert_eq!(index.len(), 1);
 }
 

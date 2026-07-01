@@ -621,6 +621,7 @@ fn test_topology_list_all_nodes() {
         9090,
         "".to_string(),
     );
+    topology.get_or_create_node(node3);
     let nodes = topology.list_all_nodes();
     assert_eq!(nodes.len(), 3);
 }

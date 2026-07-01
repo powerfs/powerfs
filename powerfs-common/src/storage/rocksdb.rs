@@ -2,7 +2,7 @@
 
 use crate::error::{PowerFsError, Result};
 use crate::storage::StorageBackend;
-use rocksdb::{IteratorMode, Options, ReadOptions, DB};
+use rocksdb::{Direction, IteratorMode, Options, DB};
 use std::path::Path;
 
 /// RocksDB storage backend
@@ -85,11 +85,8 @@ impl StorageBackend for RocksDbBackend {
     }
 
     fn list(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let mode = IteratorMode::Start;
-        let iter = self.db.iterator_opt(mode, read_opts);
+        let mode = IteratorMode::From(prefix, Direction::Forward);
+        let iter = self.db.iterator(mode);
 
         let mut keys = Vec::new();
         for item in iter {

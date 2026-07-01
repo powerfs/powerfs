@@ -1,9 +1,9 @@
-use crate::index::{MemoryIndex, NeedleIndex, PersistentIndex};
+use crate::index::{NeedleIndex, PersistentIndex};
 use crate::needle::Needle;
 use bytes::Bytes;
 use chrono::Utc;
 use powerfs_common::{
-    constants::VOLUME_DATA_OFFSET,
+    constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET},
     error::{PowerFsError, Result},
     types::{Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo, VolumeState},
 };
@@ -46,11 +46,7 @@ impl Volume {
                 .set_len(size)?;
         }
 
-        let index: Box<dyn NeedleIndex> = if index_path.exists() {
-            Box::new(PersistentIndex::new(index_path.to_str().unwrap())?)
-        } else {
-            Box::new(MemoryIndex::new(10000))
-        };
+        let index: Box<dyn NeedleIndex> = Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
 
         let info = VolumeInfo {
             id,
@@ -164,8 +160,9 @@ impl Volume {
             let mut info_guard = self.info.write().unwrap();
             let mut free_space_guard = self.free_space.write().unwrap();
 
-            info_guard.used -= info.data_size as u64 + 24;
-            *free_space_guard += info.data_size as u64 + 24;
+            let needle_size = (NEEDLE_HEADER_SIZE + info.data_size as usize + NEEDLE_FOOTER_SIZE) as u64;
+            info_guard.used -= needle_size;
+            *free_space_guard += needle_size;
             info_guard.modified_at = Utc::now();
 
             Ok(())

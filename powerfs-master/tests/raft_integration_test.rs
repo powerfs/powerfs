@@ -5,7 +5,7 @@ use std::time::Duration;
 use log::info;
 use tempfile::tempdir;
 use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 use powerfs_master::raft_node::{OutgoingMessage, Peer, ProposeRequest, RaftNode};
 use powerfs_master::raft_storage::{
@@ -299,6 +299,7 @@ async fn test_three_node_failover() {
     println!("Testing three node failover completed");
 }
 
+#[allow(dead_code)]
 fn process_node(from_node: &mut RaftNode, to_node1: &mut RaftNode, to_node2: &mut RaftNode) {
     let mut ready = from_node.node.ready();
 

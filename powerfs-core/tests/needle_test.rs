@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use powerfs_common::types::{NeedleId, VolumeId};
 use powerfs_core::needle::Needle;
-use std::io::{Cursor, Seek, SeekFrom};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 
 // ============================================================================
 // Needle::new tests

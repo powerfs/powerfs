@@ -24,6 +24,7 @@ pub struct NodeInfo {
 pub struct RaftTestCluster {
     pub nodes: Arc<Mutex<HashMap<u64, RaftTestNode>>>,
     node_infos: HashMap<u64, NodeInfo>,
+    #[allow(dead_code)]
     temp_dirs: Vec<Arc<TempDir>>,
 }
 
@@ -229,6 +230,7 @@ impl RaftTestNode {
         });
     }
 
+    #[allow(dead_code)]
     async fn message_router(
         mut msg_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
         msg_routes: HashMap<u64, tokio::sync::mpsc::Sender<RaftMessage>>,
