@@ -1,259 +1,214 @@
-//! Raft gRPC service implementation
-//!
-//! This module provides the RaftService implementation for inter-node communication.
-
-use crate::proto::powerfs::raft_service_server::RaftService;
-use crate::proto::powerfs::{
-    AddNodeRequest, AddNodeResponse, ClusterInfoRequest, ClusterInfoResponse, ProposeRequest,
-    ProposeResponse, RaftMessage, RemoveNodeRequest, RemoveNodeResponse, TransferLeaderRequest,
-    TransferLeaderResponse,
-};
-use crate::proto::RaftServiceClient;
-use crate::raft_node::RaftNode;
-use futures::StreamExt;
-use log::{error, info, warn};
-use protobuf::Message;
+use crate::master::{AddNodeParams, MasterNode};
+use crate::proto::*;
+use log::{info, warn};
+use powerfs_common::types::NodeId;
+use protobuf::Message as ProtobufMessage;
+use raft::eraftpb::Message as EraftpbMessage;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time::timeout;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-/// RaftServiceServer handles Raft communication between master nodes
-pub struct RaftServiceServer {
-    /// The RaftNode managed by this server
-    raft_node: Arc<RwLock<RaftNode>>,
-    /// Client for sending messages to other peers
-    peer_clients: Arc<RwLock<Vec<RaftGrpcClient>>>,
+pub struct RaftGrpcServer {
+    master: Arc<MasterNode>,
 }
 
-impl RaftServiceServer {
-    pub fn new(raft_node: RaftNode) -> Self {
-        Self {
-            raft_node: Arc::new(RwLock::new(raft_node)),
-            peer_clients: Arc::new(RwLock::new(Vec::new())),
-        }
+impl RaftGrpcServer {
+    pub fn new(master: Arc<MasterNode>) -> Self {
+        RaftGrpcServer { master }
     }
 
-    /// Add a peer client for sending messages
-    pub async fn add_peer(&self, address: String) -> Result<(), String> {
-        let client = RaftGrpcClient::connect(address)
-            .await
-            .map_err(|e| format!("failed to connect to peer: {}", e))?;
-
-        self.peer_clients.write().await.push(client);
-        Ok(())
-    }
-
-    /// Get the raft node
-    pub fn get_raft_node(&self) -> Arc<RwLock<RaftNode>> {
-        self.raft_node.clone()
-    }
-
-    /// Broadcast a message to all peers
-    pub async fn broadcast_message(&self, msg: RaftMessage) -> Result<(), String> {
-        let clients = self.peer_clients.read().await;
-        for client in clients.iter() {
-            if let Err(e) = client.send_message(msg.clone()).await {
-                warn!("Failed to send message to peer: {}", e);
-            }
-        }
+    pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+        tonic::transport::Server::builder()
+            .add_service(RaftServiceServer::new(self))
+            .serve(addr)
+            .await?;
         Ok(())
     }
 }
 
 #[tonic::async_trait]
-impl RaftService for RaftServiceServer {
-    /// Propose a command to the Raft cluster
+impl RaftService for RaftGrpcServer {
     async fn propose(
         &self,
         request: Request<ProposeRequest>,
     ) -> Result<Response<ProposeResponse>, Status> {
         let req = request.into_inner();
+        let command = req.command;
 
-        info!("Received propose request: {} bytes", req.command.len());
-
-        let raft_node = self.raft_node.read().await;
-
-        // Check if leader
-        if !raft_node.is_leader() {
-            return Ok(Response::new(ProposeResponse {
-                success: false,
-                error: "not the leader".to_string(),
-                index: 0,
-            }));
-        }
-
-        // Propose the command
-        match timeout(Duration::from_secs(5), raft_node.propose(req.command)).await {
-            Ok(Ok(index)) => Ok(Response::new(ProposeResponse {
+        match self.master.raft_propose(command).await {
+            Ok(index) => Ok(Response::new(ProposeResponse {
                 success: true,
                 error: String::new(),
                 index,
             })),
-            Ok(Err(e)) => Ok(Response::new(ProposeResponse {
+            Err(e) => Ok(Response::new(ProposeResponse {
                 success: false,
                 error: e,
-                index: 0,
-            })),
-            Err(_) => Ok(Response::new(ProposeResponse {
-                success: false,
-                error: "timeout".to_string(),
                 index: 0,
             })),
         }
     }
 
-    /// Bidirectional streaming for Raft messages
-    type RaftMessageStreamStream = ReceiverStream<Result<RaftMessage, Status>>;
+    type RaftMessageStreamStream =
+        Pin<Box<dyn Stream<Item = Result<RaftMessage, Status>> + Send + 'static>>;
 
     async fn raft_message_stream(
         &self,
         request: Request<Streaming<RaftMessage>>,
     ) -> Result<Response<Self::RaftMessageStreamStream>, Status> {
-        let mut stream = request.into_inner();
-        let raft_node = self.raft_node.clone();
+        let mut incoming_stream = request.into_inner();
+        let step_tx = self.master.raft_step_tx();
+        let message_tx = self.master.raft_message_tx();
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
-        // Spawn a task to handle incoming messages
         tokio::spawn(async move {
-            while let Some(msg) = stream.next().await {
-                match msg {
-                    Ok(raft_msg) => {
-                        // Parse the Raft message
-                        if let Ok(internal_msg) =
-                            <raft::eraftpb::Message as Message>::parse_from_bytes(&raft_msg.message)
-                        {
-                            let mut node = raft_node.write().await;
-                            if let Err(e) = node.step(internal_msg) {
-                                error!("Failed to step message: {}", e);
-                            }
-                        }
-                    }
+            while let Ok(Some(msg)) = incoming_stream.message().await {
+                let raft_msg = match EraftpbMessage::parse_from_bytes(&msg.message) {
+                    Ok(m) => m,
                     Err(e) => {
-                        error!("Error receiving message: {}", e);
-                        break;
+                        warn!("Failed to parse raft message: {}", e);
+                        continue;
                     }
+                };
+                if step_tx.send(raft_msg).await.is_err() {
+                    warn!("Failed to send raft message to step channel");
                 }
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let master_clone = self.master.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let mut message_rx = message_tx.subscribe();
+            while let Ok(msg) = message_rx.recv().await {
+                let raft_msg = RaftMessage {
+                    from_id: master_clone.id().to_string().parse().unwrap_or(0),
+                    to_id: msg.to_id,
+                    message: msg.message,
+                };
+                if tx_clone.send(Ok(raft_msg)).await.is_err() {
+                    warn!("Failed to send raft message to stream");
+                    break;
+                }
+            }
+        });
+
+        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(output_stream)))
     }
 
-    /// Get cluster information
+    async fn send_raft_message(
+        &self,
+        request: Request<RaftMessage>,
+    ) -> Result<Response<RaftMessageResponse>, Status> {
+        let req = request.into_inner();
+
+        let raft_msg = match EraftpbMessage::parse_from_bytes(&req.message) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to parse raft message: {}", e);
+                return Ok(Response::new(RaftMessageResponse {
+                    success: false,
+                    error: format!("failed to parse raft message: {}", e),
+                }));
+            }
+        };
+
+        let step_tx = self.master.raft_step_tx();
+        if step_tx.send(raft_msg).await.is_err() {
+            return Ok(Response::new(RaftMessageResponse {
+                success: false,
+                error: "failed to send message to step channel".to_string(),
+            }));
+        }
+
+        Ok(Response::new(RaftMessageResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
     async fn get_cluster_info(
         &self,
         _request: Request<ClusterInfoRequest>,
     ) -> Result<Response<ClusterInfoResponse>, Status> {
-        let raft_node = self.raft_node.read().await;
-        let info = raft_node.get_cluster_info();
-
-        Ok(Response::new(ClusterInfoResponse {
-            node_id: info.node_id,
-            address: info.address,
-            is_leader: info.is_leader,
-            term: info.term,
-            peers: info.peers,
-        }))
+        let cluster_info = self.master.get_cluster_info().await;
+        Ok(Response::new(cluster_info))
     }
 
-    /// Add a new node to the cluster
     async fn add_node(
         &self,
         request: Request<AddNodeRequest>,
     ) -> Result<Response<AddNodeResponse>, Status> {
         let req = request.into_inner();
+        let node_id = req.node_id;
+        let address = req.address;
 
-        let is_leader = self.raft_node.read().await.is_leader();
+        info!("Adding node: id={}, address={}", node_id, address);
 
-        if !is_leader {
-            return Ok(Response::new(AddNodeResponse {
-                success: false,
-                error: "not the leader".to_string(),
-            }));
-        }
-
-        let peer = crate::raft_node::Peer {
-            id: req.node_id,
-            address: req.address.clone(),
+        let params = AddNodeParams {
+            node_id: NodeId(node_id.to_string()),
+            address: address.clone(),
+            rack: String::new(),
+            data_center: String::new(),
+            http_port: 8080,
+            grpc_port: 9090,
+            public_url: format!("http://{}:8080", address),
         };
 
-        let mut node = self.raft_node.write().await;
-        match node.add_peer(peer) {
-            Ok(()) => {
-                info!("Added peer: {} at {}", req.node_id, req.address);
-                Ok(Response::new(AddNodeResponse {
-                    success: true,
-                    error: String::new(),
-                }))
-            }
+        let result = self.master.add_node(params).await;
+
+        match result {
+            Ok(_) => Ok(Response::new(AddNodeResponse {
+                success: true,
+                error: String::new(),
+            })),
             Err(e) => Ok(Response::new(AddNodeResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
             })),
         }
     }
 
-    /// Remove a node from the cluster
     async fn remove_node(
         &self,
         request: Request<RemoveNodeRequest>,
     ) -> Result<Response<RemoveNodeResponse>, Status> {
         let req = request.into_inner();
+        let node_id = NodeId(req.node_id.to_string());
 
-        let is_leader = self.raft_node.read().await.is_leader();
+        info!("Removing node: id={}", node_id);
 
-        if !is_leader {
-            return Ok(Response::new(RemoveNodeResponse {
-                success: false,
-                error: "not the leader".to_string(),
-            }));
-        }
+        let result = self.master.remove_node(&node_id).await;
 
-        let mut node = self.raft_node.write().await;
-        match node.remove_peer(req.node_id) {
-            Ok(()) => {
-                info!("Removed peer: {}", req.node_id);
-                Ok(Response::new(RemoveNodeResponse {
-                    success: true,
-                    error: String::new(),
-                }))
-            }
+        match result {
+            Ok(_) => Ok(Response::new(RemoveNodeResponse {
+                success: true,
+                error: String::new(),
+            })),
             Err(e) => Ok(Response::new(RemoveNodeResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
             })),
         }
     }
 
-    /// Transfer leadership to another node
     async fn transfer_leader(
         &self,
         request: Request<TransferLeaderRequest>,
     ) -> Result<Response<TransferLeaderResponse>, Status> {
         let req = request.into_inner();
+        let target_id = req.target_node_id;
 
-        let is_leader = self.raft_node.read().await.is_leader();
+        info!("Transferring leadership to: id={}", target_id);
 
-        if !is_leader {
-            return Ok(Response::new(TransferLeaderResponse {
-                success: false,
-                error: "not the leader".to_string(),
-            }));
-        }
+        let result = self.master.raft_transfer_leader(target_id);
 
-        let mut node = self.raft_node.write().await;
-        match node.transfer_leader(req.target_node_id) {
-            Ok(()) => {
-                info!("Initiated leader transfer to node: {}", req.target_node_id);
-                Ok(Response::new(TransferLeaderResponse {
-                    success: true,
-                    error: String::new(),
-                }))
-            }
+        match result {
+            Ok(_) => Ok(Response::new(TransferLeaderResponse {
+                success: true,
+                error: String::new(),
+            })),
             Err(e) => Ok(Response::new(TransferLeaderResponse {
                 success: false,
                 error: e,
@@ -262,46 +217,5 @@ impl RaftService for RaftServiceServer {
     }
 }
 
-/// Client for connecting to other Raft nodes
-pub struct RaftGrpcClient {
-    address: String,
-    client: Option<RaftServiceClient<tonic::transport::Channel>>,
-}
-
-impl RaftGrpcClient {
-    /// Connect to a Raft peer
-    pub async fn connect(address: String) -> Result<Self, String> {
-        let addr = format!("http://{}", address);
-        let client = RaftServiceClient::connect(addr.clone())
-            .await
-            .map_err(|e| format!("failed to connect to peer {}: {}", address, e))?;
-
-        Ok(Self {
-            address,
-            client: Some(client),
-        })
-    }
-
-    /// Send a Raft message to this peer
-    pub async fn send_message(&self, msg: RaftMessage) -> Result<(), String> {
-        if let Some(ref client) = self.client {
-            let mut client = client.clone();
-            let request = Request::new(tokio_stream::once(msg));
-
-            // Use the bidirectional streaming RPC
-            let _response = client
-                .raft_message_stream(request)
-                .await
-                .map_err(|e| format!("failed to send raft message: {}", e))?;
-
-            Ok(())
-        } else {
-            Err("client not connected".to_string())
-        }
-    }
-
-    /// Get the peer address
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-}
+use futures::Stream;
+use std::pin::Pin;

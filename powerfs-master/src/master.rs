@@ -1121,6 +1121,34 @@ impl MasterNode {
         }
     }
 
+    pub async fn raft_propose(&self, data: Vec<u8>) -> std::result::Result<u64, String> {
+        let tx = {
+            let raft_node = self.raft_node.read().unwrap();
+            raft_node.get_propose_tx()
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(crate::raft_node::ProposeRequest { data, response_tx })
+            .await
+            .map_err(|e| format!("failed to send propose: {}", e))?;
+        response_rx
+            .await
+            .map_err(|e| format!("propose response error: {}", e))?
+    }
+
+    pub fn raft_step_tx(&self) -> tokio::sync::mpsc::Sender<raft::eraftpb::Message> {
+        self.raft_node.read().unwrap().get_step_tx()
+    }
+
+    pub fn raft_transfer_leader(&self, target_id: u64) -> std::result::Result<(), String> {
+        self.raft_node.write().unwrap().transfer_leader(target_id)
+    }
+
+    pub fn raft_message_tx(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<crate::raft_node::OutgoingMessage> {
+        self.raft_node.read().unwrap().get_message_tx()
+    }
+
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
         info!("Starting Raft (single node mode, always leader)");
         *self.is_leader.write().unwrap() = true;

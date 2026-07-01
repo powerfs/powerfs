@@ -37,10 +37,11 @@ pub struct RaftNode {
     propose_tx: mpsc::Sender<ProposeRequest>,
     /// Receiver for propose requests
     propose_rx: mpsc::Receiver<ProposeRequest>,
-    /// Channel for sending raft messages to peers (fixed, never replaced)
-    message_tx: mpsc::Sender<OutgoingMessage>,
-    /// Receiver for outgoing messages
-    message_rx: mpsc::Receiver<OutgoingMessage>,
+    /// Broadcast channel for sending raft messages to peers
+    message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
+    /// Receiver for outgoing messages (unused, broadcast subscribers are created via subscribe())
+    #[allow(dead_code)]
+    message_rx: tokio::sync::broadcast::Receiver<OutgoingMessage>,
     /// Channel for receiving incoming Raft messages from peers
     step_tx: mpsc::Sender<RaftMessage>,
     /// Receiver for incoming Raft messages
@@ -56,7 +57,7 @@ pub struct RaftNode {
 }
 
 /// Outgoing Raft message to a peer
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OutgoingMessage {
     pub to_id: u64,
     pub message: Vec<u8>,
@@ -136,7 +137,7 @@ impl RaftNode {
             .map_err(|e| format!("failed to create raft node: {}", e))?;
 
         let (propose_tx, propose_rx) = mpsc::channel(1000);
-        let (message_tx, message_rx) = mpsc::channel(1000);
+        let (message_tx, message_rx) = tokio::sync::broadcast::channel(1000);
         let (step_tx, step_rx) = mpsc::channel(1000);
         let (apply_tx, apply_rx) = mpsc::channel(1000);
 
@@ -306,8 +307,7 @@ impl RaftNode {
             message: buf,
         };
 
-        let tx = self.message_tx.clone();
-        if tx.try_send(outgoing).is_err() {
+        if self.message_tx.send(outgoing).is_err() {
             warn!("Failed to send message to {}", to_id);
         }
     }
@@ -358,15 +358,19 @@ impl RaftNode {
         self.node.tick();
     }
 
-    /// Get the message receiver for sending messages to peers
-    pub fn take_message_rx(&mut self) -> mpsc::Receiver<OutgoingMessage> {
-        let (_, new_rx) = mpsc::channel(1000);
-        std::mem::replace(&mut self.message_rx, new_rx)
-    }
-
     /// Get a clone of the peers
     pub fn get_peers(&self) -> Vec<Peer> {
         self.peers.values().cloned().collect()
+    }
+
+    /// Get a clone of the message broadcast sender
+    pub fn get_message_tx(&self) -> tokio::sync::broadcast::Sender<OutgoingMessage> {
+        self.message_tx.clone()
+    }
+
+    /// Get a new receiver for outgoing messages (for testing)
+    pub fn take_message_rx(&self) -> tokio::sync::broadcast::Receiver<OutgoingMessage> {
+        self.message_tx.subscribe()
     }
 
     /// Take the apply receiver (only call once)
@@ -405,6 +409,11 @@ impl RaftNode {
     /// Get the node id
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Get the node address
+    pub fn address(&self) -> &str {
+        &self.address
     }
 
     /// Get the leader id (0 if no leader)

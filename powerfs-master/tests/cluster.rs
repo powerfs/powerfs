@@ -208,7 +208,7 @@ impl RaftTestNode {
             let peer_routes_clone = self.peer_routes.clone();
             tokio::spawn(async move {
                 if let Some(peer_routes) = peer_routes_clone {
-                    while let Some(msg) = msg_rx.recv().await {
+                    while let Ok(msg) = msg_rx.recv().await {
                         if let Some(sender) = peer_routes.get(&msg.to_id) {
                             if let Ok(raft_msg) = RaftMessage::parse_from_bytes(&msg.message) {
                                 let _ = sender.send(raft_msg).await;

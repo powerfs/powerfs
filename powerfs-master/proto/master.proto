@@ -295,6 +295,8 @@ service RaftService {
     rpc Propose (ProposeRequest) returns (ProposeResponse);
     // Bidirectional streaming for Raft messages
     rpc RaftMessageStream (stream RaftMessage) returns (stream RaftMessage);
+    // Send a single Raft message to a peer
+    rpc SendRaftMessage (RaftMessage) returns (RaftMessageResponse);
     // Get cluster membership
     rpc GetClusterInfo (ClusterInfoRequest) returns (ClusterInfoResponse);
     // Add node to cluster
@@ -319,6 +321,11 @@ message RaftMessage {
     uint64 from_id = 1;
     uint64 to_id = 2;
     bytes message = 3;  // Serialized raft::eraftpb::Message
+}
+
+message RaftMessageResponse {
+    bool success = 1;
+    string error = 2;
 }
 
 message ClusterInfoRequest {}

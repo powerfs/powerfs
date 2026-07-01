@@ -121,10 +121,10 @@ async fn test_two_node_election() {
 }
 
 async fn message_router(
-    mut msg_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
+    mut msg_rx: tokio::sync::broadcast::Receiver<OutgoingMessage>,
     step_tx: tokio::sync::mpsc::Sender<RaftMessage>,
 ) {
-    while let Some(msg) = msg_rx.recv().await {
+    while let Ok(msg) = msg_rx.recv().await {
         info!("Routing message to {}", msg.to_id);
         if let Ok(raft_msg) = ProtobufMessage::parse_from_bytes(&msg.message) {
             let _ = step_tx.send(raft_msg).await;
@@ -360,12 +360,12 @@ async fn test_three_node_failover() {
 }
 
 async fn multi_message_router(
-    mut msg_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
+    mut msg_rx: tokio::sync::broadcast::Receiver<OutgoingMessage>,
     step_tx1: tokio::sync::mpsc::Sender<RaftMessage>,
     step_tx2: tokio::sync::mpsc::Sender<RaftMessage>,
     step_tx3: tokio::sync::mpsc::Sender<RaftMessage>,
 ) {
-    while let Some(msg) = msg_rx.recv().await {
+    while let Ok(msg) = msg_rx.recv().await {
         info!("Routing message to {}", msg.to_id);
         if let Ok(raft_msg) = ProtobufMessage::parse_from_bytes(&msg.message) {
             match msg.to_id {

@@ -15,6 +15,7 @@ pub use powerfs::{
     Heartbeat, HeartbeatResponse, KeepConnectedRequest, KeepConnectedResponse,
     ListCollectionsRequest, ListCollectionsResponse, Location, LookupVolumeRequest,
     LookupVolumeResponse, PingRequest, PingResponse, ProposeRequest, ProposeResponse, RackStats,
-    RaftMessage, StatisticsRequest, StatisticsResponse, VolumeGrowRequest, VolumeGrowResponse,
-    VolumeListRequest, VolumeListResponse, VolumeLocation, VolumeShortInfo,
+    RaftMessage, RaftMessageResponse, RemoveNodeRequest, RemoveNodeResponse, StatisticsRequest,
+    StatisticsResponse, TransferLeaderRequest, TransferLeaderResponse, VolumeGrowRequest,
+    VolumeGrowResponse, VolumeListRequest, VolumeListResponse, VolumeLocation, VolumeShortInfo,
 };
