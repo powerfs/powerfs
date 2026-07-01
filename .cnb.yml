@@ -4,7 +4,7 @@ main:
     - runner:
         cpus: 16
       docker:
-        image: rust:1.82-slim
+        image: rust:1.95-slim
         volumes:
           - cargo_registry:copy-on-write
           - target:copy-on-write
