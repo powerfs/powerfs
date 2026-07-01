@@ -1,3 +1,29 @@
+# CI流水线（推送自动构建）
+main:
+  push:
+    - runner:
+        cpus: 16
+      docker:
+        image: rust:1.82-slim
+        volumes:
+          - cargo_registry:copy-on-write
+          - target:copy-on-write
+      stages:
+        - name: Install git & system libs
+          script: apt update && apt install -y git libssl-dev gcc g++
+        - name: Config crates mirror
+          script:
+            - mkdir -p ~/.cargo
+            - echo '[source.crates-io]' >> ~/.cargo/config.toml
+            - echo 'replace-with = "rsproxy"' >> ~/.cargo/config.toml
+            - echo '[source.rsproxy]' >> ~/.cargo/config.toml
+            - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
+        - name: Lint & Build
+          script:
+            - cargo clippy --all-targets --all-features -- -D warnings
+            - cargo build --release
+
+# 云端VSCode开发环境
 $:
   vscode:
     - runner:
@@ -6,18 +32,21 @@ $:
       services:
         - vscode
       docker:
-        # 替换为1.82及以上版本，支持edition2024
         image: rust:1.82-slim
         volumes:
           - cargo_registry:copy-on-write
           - target:copy-on-write
       stages:
-        - name: 配置国内Crates镜像
+        - name: Install git + 编译系统依赖
+          script: apt update && apt install -y git libssl-dev gcc g++ protobuf-compiler
+        - name: 国内crates镜像
           script:
             - mkdir -p ~/.cargo
             - echo '[source.crates-io]' >> ~/.cargo/config.toml
             - echo 'replace-with = "rsproxy"' >> ~/.cargo/config.toml
             - echo '[source.rsproxy]' >> ~/.cargo/config.toml
             - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
-        - name: 预装Rust组件
+        - name: Rust工具组件
           script: rustup component add rustfmt clippy rust-src
+        - name: 预拉取依赖
+          script: cargo fetch
