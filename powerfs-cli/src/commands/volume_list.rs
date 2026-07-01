@@ -19,7 +19,7 @@ pub async fn volume_list(mut client: MasterClient, args: VolumeListArgs) -> supe
             powerfs_master::proto::VolumeListRequest {},
         ))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result = response.into_inner();
 

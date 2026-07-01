@@ -493,35 +493,37 @@ fn test_topology_get_or_create_rack() {
 #[test]
 fn test_topology_get_or_create_node() {
     let mut topology = Topology::new();
-    let node = topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
+    let node = DataNodeInfo::new(
         NodeId("n1".to_string()),
         "192.168.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "http://n1.local".to_string(),
     );
-    assert_eq!(node.id, NodeId("n1".to_string()));
-    assert_eq!(node.address, "192.168.1.1");
-    assert_eq!(node.http_port, 8080);
-    assert_eq!(node.grpc_port, 9090);
-    assert_eq!(node.public_url, "http://n1.local");
-    assert_eq!(node.state, NodeState::Healthy);
+    let node_ref = topology.get_or_create_node(node);
+    assert_eq!(node_ref.id, NodeId("n1".to_string()));
+    assert_eq!(node_ref.address, "192.168.1.1");
+    assert_eq!(node_ref.http_port, 8080);
+    assert_eq!(node_ref.grpc_port, 9090);
+    assert_eq!(node_ref.public_url, "http://n1.local");
+    assert_eq!(node_ref.state, NodeState::Healthy);
 }
 
 #[test]
 fn test_topology_get_node_existing() {
     let mut topology = Topology::new();
-    topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
+    let node = DataNodeInfo::new(
         NodeId("n1".to_string()),
         "192.168.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "".to_string(),
     );
+    topology.get_or_create_node(node);
     let found = topology.get_node(&NodeId("n1".to_string()));
     assert!(found.is_some());
     assert_eq!(found.unwrap().address, "192.168.1.1");
@@ -537,15 +539,16 @@ fn test_topology_get_node_nonexistent() {
 #[test]
 fn test_topology_get_node_mut_existing() {
     let mut topology = Topology::new();
-    topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
+    let node = DataNodeInfo::new(
         NodeId("n1".to_string()),
         "192.168.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "".to_string(),
     );
+    topology.get_or_create_node(node);
     let node = topology.get_node_mut(&NodeId("n1".to_string()));
     assert!(node.is_some());
     node.unwrap().used_space = 500;
@@ -564,15 +567,16 @@ fn test_topology_get_node_mut_nonexistent() {
 #[test]
 fn test_topology_remove_node_existing() {
     let mut topology = Topology::new();
-    topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
+    let node = DataNodeInfo::new(
         NodeId("n1".to_string()),
         "192.168.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "".to_string(),
     );
+    topology.get_or_create_node(node);
     let removed = topology.remove_node(&NodeId("n1".to_string()));
     assert!(removed.is_some());
     assert!(topology.get_node(&NodeId("n1".to_string())).is_none());
@@ -588,29 +592,31 @@ fn test_topology_remove_node_nonexistent() {
 #[test]
 fn test_topology_list_all_nodes() {
     let mut topology = Topology::new();
-    topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r1".to_string()),
+    let node1 = DataNodeInfo::new(
         NodeId("n1".to_string()),
         "10.0.0.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "".to_string(),
     );
-    topology.get_or_create_node(
-        DataCenterId("dc1".to_string()),
-        RackId("r2".to_string()),
+    topology.get_or_create_node(node1);
+    let node2 = DataNodeInfo::new(
         NodeId("n2".to_string()),
         "10.0.0.2".to_string(),
+        RackId("r2".to_string()),
+        DataCenterId("dc1".to_string()),
         8080,
         9090,
         "".to_string(),
     );
-    topology.get_or_create_node(
-        DataCenterId("dc2".to_string()),
-        RackId("r1".to_string()),
+    topology.get_or_create_node(node2);
+    let node3 = DataNodeInfo::new(
         NodeId("n3".to_string()),
         "10.0.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc2".to_string()),
         8080,
         9090,
         "".to_string(),

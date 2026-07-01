@@ -22,7 +22,7 @@ pub async fn write(args: WriteArgs) -> super::CommandResult {
         args.file, args.volume_id, args.file_key
     );
 
-    let data = std::fs::read(&args.file).map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
+    let data = std::fs::read(&args.file).map_err(powerfs_common::error::PowerFsError::Io)?;
 
     println!("File size: {} bytes", data.len());
 

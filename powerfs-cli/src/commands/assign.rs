@@ -41,7 +41,7 @@ pub async fn assign(mut client: MasterClient, args: AssignArgs) -> super::Comman
     let response = service
         .assign(tonic::Request::new(request))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result = response.into_inner();
 

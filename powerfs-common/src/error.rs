@@ -14,7 +14,7 @@ pub enum PowerFsError {
     TonicTransport(#[from] tonic::transport::Error),
 
     #[error("tonic status error: {0}")]
-    TonicStatus(#[from] tonic::Status),
+    TonicStatus(Box<tonic::Status>),
 
     #[error("protobuf decode error: {0}")]
     ProstDecode(#[from] prost::DecodeError),
@@ -29,7 +29,7 @@ pub enum PowerFsError {
     AddrParse(#[from] std::net::AddrParseError),
 
     #[error("raft error: {0}")]
-    Raft(#[from] raft::Error),
+    Raft(Box<raft::Error>),
 
     #[error("volume not found: {0}")]
     VolumeNotFound(VolumeId),

@@ -24,7 +24,7 @@ pub async fn cluster_remove(
     let response = service
         .remove_node(tonic::Request::new(request))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result: RemoveNodeResponse = response.into_inner();
 

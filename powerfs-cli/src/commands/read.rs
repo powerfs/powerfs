@@ -33,7 +33,7 @@ pub async fn read(args: ReadArgs) -> super::CommandResult {
     println!("Read {} bytes", data.len());
 
     if let Some(output) = args.output {
-        std::fs::write(&output, &data).map_err(|e| powerfs_common::error::PowerFsError::Io(e))?;
+        std::fs::write(&output, &data).map_err(powerfs_common::error::PowerFsError::Io)?;
         println!("Saved to file: {}", output);
     } else {
         if data.len() <= 1024 {

@@ -38,7 +38,7 @@ pub async fn lookup(mut client: MasterClient, args: LookupArgs) -> super::Comman
     let response = service
         .lookup_volume(tonic::Request::new(request))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result = response.into_inner();
 

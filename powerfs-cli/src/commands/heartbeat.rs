@@ -113,7 +113,7 @@ pub async fn heartbeat(mut client: MasterClient, args: HeartbeatArgs) -> super::
     let response_stream = service
         .send_heartbeat(tonic::Request::new(stream))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     // Read responses
     let mut responses = response_stream.into_inner();

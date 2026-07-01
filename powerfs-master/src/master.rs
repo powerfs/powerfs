@@ -49,6 +49,39 @@ pub struct VolumeLayout {
     volumes: Vec<VolumeId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AddNodeParams {
+    pub node_id: NodeId,
+    pub address: String,
+    pub rack: String,
+    pub data_center: String,
+    pub http_port: u32,
+    pub grpc_port: u32,
+    pub public_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignVolumeParams {
+    pub node_id: String,
+    pub volume_id: u32,
+    pub collection: String,
+    pub replica_count: u32,
+    pub ttl: i32,
+    pub disk_type: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateNodeVolumesParams {
+    pub node_id: NodeId,
+    pub volumes: Vec<VolumeShortInfo>,
+    pub new_volumes: Vec<VolumeShortInfo>,
+    pub deleted_volumes: Vec<VolumeShortInfo>,
+    pub ip: String,
+    pub grpc_port: u32,
+    pub http_port: u32,
+}
+
 pub struct ClientManager {
     clients: HashMap<String, mpsc::Sender<VolumeLocationUpdate>>,
 }
@@ -204,7 +237,7 @@ impl MasterNode {
         resp_rx
             .await
             .map_err(|e| PowerFsError::Internal(format!("propose recv failed: {}", e)))?
-            .map_err(|e| PowerFsError::Internal(e))
+            .map_err(PowerFsError::Internal)
     }
 
     /// Apply a committed Raft command to the state machine
@@ -224,15 +257,15 @@ impl MasterNode {
                 grpc_port,
                 public_url,
             } => {
-                self.apply_add_node(
-                    &node_id,
-                    &address,
-                    &rack,
-                    &data_center,
+                self.apply_add_node(AddNodeParams {
+                    node_id: NodeId(node_id),
+                    address,
+                    rack,
+                    data_center,
                     http_port,
                     grpc_port,
-                    &public_url,
-                )?;
+                    public_url,
+                })?;
             }
             RaftCommand::RemoveNode { node_id } => {
                 self.apply_remove_node(&node_id)?;
@@ -246,15 +279,15 @@ impl MasterNode {
                 disk_type,
                 size,
             } => {
-                self.apply_assign_volume(
-                    &node_id,
+                self.apply_assign_volume(AssignVolumeParams {
+                    node_id,
                     volume_id,
-                    &collection,
+                    collection,
                     replica_count,
                     ttl,
-                    &disk_type,
+                    disk_type,
                     size,
-                )?;
+                })?;
             }
             RaftCommand::UpdateVolumeState { volume_id, state } => {
                 let vol_state = match state.as_str() {
@@ -284,30 +317,24 @@ impl MasterNode {
         Ok(())
     }
 
-    fn apply_add_node(
-        &self,
-        node_id: &str,
-        address: &str,
-        rack: &str,
-        data_center: &str,
-        http_port: u32,
-        grpc_port: u32,
-        public_url: &str,
-    ) -> Result<()> {
-        let dc_id = DataCenterId(data_center.to_string());
-        let rack_id = RackId(rack.to_string());
-        let nid = NodeId(node_id.to_string());
+    fn apply_add_node(&self, params: AddNodeParams) -> Result<()> {
+        let dc_id = DataCenterId(params.data_center);
+        let rack_id = RackId(params.rack);
+        let node_id = params.node_id.clone();
+        let address = params.address.clone();
+        let http_port = params.http_port;
 
         let mut topology = self.topology.write().unwrap();
-        topology.get_or_create_node(
-            dc_id,
+        let node = DataNodeInfo::new(
+            params.node_id,
+            params.address,
             rack_id,
-            nid.clone(),
-            address.to_string(),
-            http_port,
-            grpc_port,
-            public_url.to_string(),
+            dc_id,
+            params.http_port,
+            params.grpc_port,
+            params.public_url,
         );
+        topology.get_or_create_node(node);
 
         info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
         Ok(())
@@ -323,21 +350,15 @@ impl MasterNode {
         Ok(())
     }
 
-    fn apply_assign_volume(
-        &self,
-        node_id: &str,
-        volume_id: u32,
-        collection: &str,
-        replica_count: u32,
-        ttl: i32,
-        disk_type: &str,
-        size: u64,
-    ) -> Result<()> {
-        let vid = VolumeId(volume_id);
-        let nid = NodeId(node_id.to_string());
-        let coll = Collection(collection.to_string());
-        let t = Ttl(ttl);
-        let dt = DiskType(disk_type.to_string());
+    fn apply_assign_volume(&self, params: AssignVolumeParams) -> Result<()> {
+        let vid = VolumeId(params.volume_id);
+        let nid = NodeId(params.node_id);
+        let nid_clone = nid.clone();
+        let coll = Collection(params.collection);
+        let t = Ttl(params.ttl);
+        let dt = DiskType(params.disk_type);
+        let size = params.size;
+        let replica_count = params.replica_count;
 
         let mut volumes = self.volumes.write().unwrap();
         volumes.insert(
@@ -358,7 +379,7 @@ impl MasterNode {
             },
         );
 
-        info!("Applied AssignVolume: vid={}, node={}", volume_id, node_id);
+        info!("Applied AssignVolume: vid={}, node={}", vid, nid_clone);
         Ok(())
     }
 
@@ -435,32 +456,26 @@ impl MasterNode {
         Ok(())
     }
 
-    pub async fn add_node(
-        &self,
-        node_id: NodeId,
-        address: String,
-        rack: String,
-        data_center: String,
-        http_port: u32,
-        grpc_port: u32,
-        public_url: String,
-    ) -> Result<()> {
+    pub async fn add_node(&self, params: AddNodeParams) -> Result<()> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
         let cmd = RaftCommand::AddNode {
-            node_id: node_id.0.clone(),
-            address: address.clone(),
-            rack: rack.clone(),
-            data_center: data_center.clone(),
-            http_port,
-            grpc_port,
-            public_url: public_url.clone(),
+            node_id: params.node_id.0.clone(),
+            address: params.address.clone(),
+            rack: params.rack.clone(),
+            data_center: params.data_center.clone(),
+            http_port: params.http_port,
+            grpc_port: params.grpc_port,
+            public_url: params.public_url.clone(),
         };
 
         self.propose_command(cmd).await?;
-        info!("Proposed AddNode: {} at {}:{}", node_id, address, http_port);
+        info!(
+            "Proposed AddNode: {} at {}:{}",
+            params.node_id, params.address, params.http_port
+        );
 
         Ok(())
     }
@@ -485,7 +500,7 @@ impl MasterNode {
         volumes
             .get(volume_id)
             .cloned()
-            .ok_or(PowerFsError::VolumeNotFound(volume_id.clone()))
+            .ok_or(PowerFsError::VolumeNotFound(*volume_id))
     }
 
     pub async fn update_volume_state(
@@ -527,21 +542,13 @@ impl MasterNode {
         self.topology.read().unwrap().get_node(node_id).cloned()
     }
 
-    pub async fn update_node_volumes(
-        &self,
-        node_id: &NodeId,
-        volumes: &[VolumeShortInfo],
-        _new_volumes: &[VolumeShortInfo],
-        _deleted_volumes: &[VolumeShortInfo],
-        ip: &str,
-        grpc_port: u32,
-        _http_port: u32,
-    ) -> Result<()> {
+    pub async fn update_node_volumes(&self, params: UpdateNodeVolumesParams) -> Result<()> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
-        let short_volumes: Vec<crate::raft_storage::RaftVolumeShortInfo> = volumes
+        let short_volumes: Vec<crate::raft_storage::RaftVolumeShortInfo> = params
+            .volumes
             .iter()
             .map(|v| crate::raft_storage::RaftVolumeShortInfo {
                 volume_id: v.volume_id,
@@ -551,10 +558,10 @@ impl MasterNode {
             .collect();
 
         let cmd = RaftCommand::UpdateNodeVolumes {
-            node_id: node_id.0.clone(),
+            node_id: params.node_id.0.clone(),
             volumes: short_volumes,
-            ip: ip.to_string(),
-            grpc_port,
+            ip: params.ip,
+            grpc_port: params.grpc_port,
         };
 
         self.propose_command(cmd).await?;
@@ -589,13 +596,11 @@ impl MasterNode {
         let disk_type = DiskType::default();
 
         let replica_count = replica_placement.get_copy_count();
-        let selected_nodes: Vec<DataNodeInfo>;
-
-        if rack_awareness_enabled && nodes.len() > 1 {
-            selected_nodes = Self::select_nodes_by_rack(&nodes, replica_count);
+        let selected_nodes = if rack_awareness_enabled && nodes.len() > 1 {
+            Self::select_nodes_by_rack(&nodes, replica_count)
         } else {
-            selected_nodes = nodes.into_iter().take(replica_count as usize).collect();
-        }
+            nodes.into_iter().take(replica_count as usize).collect()
+        };
 
         if selected_nodes.len() < replica_count as usize {
             return Err(PowerFsError::InvalidRequest(

@@ -159,10 +159,12 @@ impl RocksDbStorage {
             conf_state.voters.extend_from_slice(peers);
         }
 
-        let mut hard_state = HardState::default();
-        hard_state.term = 1;
-        hard_state.commit = 0;
-        hard_state.vote = 0;
+        let hard_state = HardState {
+            term: 1,
+            commit: 0,
+            vote: 0,
+            ..Default::default()
+        };
 
         let storage = Self {
             db: Arc::new(db),
@@ -199,10 +201,12 @@ impl RocksDbStorage {
         let mut conf_state = ConfState::default();
         conf_state.voters.push(node_id);
 
-        let mut hard_state = HardState::default();
-        hard_state.term = 1;
-        hard_state.commit = 0;
-        hard_state.vote = node_id;
+        let hard_state = HardState {
+            term: 1,
+            commit: 0,
+            vote: node_id,
+            ..Default::default()
+        };
 
         let storage = Self {
             db: Arc::new(db),
@@ -390,7 +394,7 @@ impl RocksDbStorage {
             ))
         })?;
 
-        let mut snapshot = Snapshot::default();
+        let mut snapshot = Snapshot::new();
         let meta = snapshot.mut_metadata();
         meta.set_index(index);
         meta.set_term(term);
@@ -448,7 +452,7 @@ impl RocksDbStorage {
         if let Some(cf) = self.db.cf_handle(CF_SNAPSHOT) {
             if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
                 if let Ok(snapshot) = <Snapshot as Message>::parse_from_bytes(&data) {
-                    if let Ok(data) = serde_json::from_slice(&snapshot.get_data()) {
+                    if let Ok(data) = serde_json::from_slice(snapshot.get_data()) {
                         return Some(data);
                     }
                 }
@@ -553,10 +557,11 @@ impl Storage for RocksDbStorage {
         // Return empty snapshot
         let hs = self.hard_state.read().unwrap();
         let cs = self.conf_state.read().unwrap();
-        let mut snapshot = Snapshot::default();
-        snapshot.mut_metadata().set_index(request_index);
-        snapshot.mut_metadata().set_term(hs.term);
-        snapshot.mut_metadata().set_conf_state(cs.clone());
+        let mut snapshot = Snapshot::new();
+        let meta = snapshot.mut_metadata();
+        meta.set_index(request_index);
+        meta.set_term(hs.term);
+        meta.set_conf_state(cs.clone());
         Ok(snapshot)
     }
 }

@@ -28,7 +28,7 @@ pub async fn cluster_add(mut client: MasterClient, args: ClusterAddArgs) -> supe
     let response = service
         .add_node(tonic::Request::new(request))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result: AddNodeResponse = response.into_inner();
 

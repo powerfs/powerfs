@@ -109,10 +109,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             response.new_volume_ids.len()
                         );
                         for &vid in &response.new_volume_ids {
-                            if let Ok(_) = storage_manager.create_volume(
-                                powerfs_common::types::VolumeId(vid),
-                                args.volume_size,
-                            ) {
+                            if storage_manager
+                                .create_volume(
+                                    powerfs_common::types::VolumeId(vid),
+                                    args.volume_size,
+                                )
+                                .is_ok()
+                            {
                                 info!("Created volume {}", vid);
                             } else {
                                 warn!("Failed to create volume {}", vid);

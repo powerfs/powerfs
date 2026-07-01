@@ -34,7 +34,7 @@ impl StorageManager {
         }
 
         let volume = Arc::new(Volume::new(
-            volume_id.clone(),
+            volume_id,
             &self.node_id.0,
             &self.data_path,
             size,
@@ -65,7 +65,7 @@ impl StorageManager {
 
             Ok(())
         } else {
-            Err(PowerFsError::VolumeNotFound(volume_id.clone()))
+            Err(PowerFsError::VolumeNotFound(*volume_id))
         }
     }
 
@@ -138,7 +138,7 @@ impl StorageManager {
                         if let Ok(vid) = stripped.parse::<u32>() {
                             let volume_id = VolumeId(vid);
                             if let std::collections::hash_map::Entry::Vacant(e) =
-                                volumes.entry(volume_id.clone())
+                                volumes.entry(volume_id)
                             {
                                 let volume = Arc::new(Volume::new(
                                     volume_id,

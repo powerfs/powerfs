@@ -101,7 +101,7 @@ impl Default for DiskType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Ttl(pub i32);
 
 impl fmt::Display for Ttl {
@@ -111,12 +111,6 @@ impl fmt::Display for Ttl {
         } else {
             write!(f, "{}", self.0)
         }
-    }
-}
-
-impl Default for Ttl {
-    fn default() -> Self {
-        Ttl(0)
     }
 }
 
@@ -301,6 +295,32 @@ impl DataNodeInfo {
     pub fn url(&self) -> String {
         format!("{}:{}", self.address, self.http_port)
     }
+
+    pub fn new(
+        id: NodeId,
+        address: String,
+        rack_id: RackId,
+        data_center_id: DataCenterId,
+        http_port: u32,
+        grpc_port: u32,
+        public_url: String,
+    ) -> Self {
+        DataNodeInfo {
+            id,
+            address,
+            rack_id,
+            data_center_id,
+            total_space: 0,
+            used_space: 0,
+            volume_count: 0,
+            state: NodeState::Healthy,
+            last_heartbeat: Utc::now(),
+            grpc_port,
+            http_port,
+            public_url,
+            maintenance_mode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,16 +336,14 @@ pub struct DataCenterInfo {
     pub racks: HashMap<RackId, RackInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Topology {
     pub data_centers: HashMap<DataCenterId, DataCenterInfo>,
 }
 
 impl Topology {
     pub fn new() -> Self {
-        Topology {
-            data_centers: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn get_or_create_data_center(&mut self, id: DataCenterId) -> &mut DataCenterInfo {
@@ -346,34 +364,9 @@ impl Topology {
         })
     }
 
-    pub fn get_or_create_node(
-        &mut self,
-        dc_id: DataCenterId,
-        rack_id: RackId,
-        node_id: NodeId,
-        address: String,
-        http_port: u32,
-        grpc_port: u32,
-        public_url: String,
-    ) -> &mut DataNodeInfo {
-        let rack = self.get_or_create_rack(dc_id, rack_id);
-        rack.nodes
-            .entry(node_id.clone())
-            .or_insert_with(|| DataNodeInfo {
-                id: node_id,
-                address,
-                rack_id: rack.id.clone(),
-                data_center_id: rack.data_center_id.clone(),
-                total_space: 0,
-                used_space: 0,
-                volume_count: 0,
-                state: NodeState::Healthy,
-                last_heartbeat: Utc::now(),
-                grpc_port,
-                http_port,
-                public_url,
-                maintenance_mode: false,
-            })
+    pub fn get_or_create_node(&mut self, node: DataNodeInfo) -> &mut DataNodeInfo {
+        let rack = self.get_or_create_rack(node.data_center_id.clone(), node.rack_id.clone());
+        rack.nodes.entry(node.id.clone()).or_insert_with(|| node)
     }
 
     pub fn get_node(&self, node_id: &NodeId) -> Option<&DataNodeInfo> {

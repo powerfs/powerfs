@@ -47,9 +47,7 @@ impl VolumeService for VolumeServer {
 
         let volume_id = VolumeId(req.volume_id);
 
-        let result = self
-            .storage_manager
-            .create_volume(volume_id.clone(), req.size);
+        let result = self.storage_manager.create_volume(volume_id, req.size);
 
         match result {
             Ok(info) => {

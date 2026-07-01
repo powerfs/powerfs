@@ -24,7 +24,7 @@ pub async fn cluster_transfer(
     let response = service
         .transfer_leader(tonic::Request::new(request))
         .await
-        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(e))?;
+        .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?;
 
     let result: TransferLeaderResponse = response.into_inner();
 

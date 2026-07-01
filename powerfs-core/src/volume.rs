@@ -53,7 +53,7 @@ impl Volume {
         };
 
         let info = VolumeInfo {
-            id: id.clone(),
+            id,
             node_id: powerfs_common::types::NodeId(node_id.to_string()),
             collection: Collection::default(),
             size,
@@ -77,7 +77,7 @@ impl Volume {
     }
 
     pub fn id(&self) -> VolumeId {
-        self.info.read().unwrap().id.clone()
+        self.info.read().unwrap().id
     }
 
     pub fn info(&self) -> VolumeInfo {
@@ -109,7 +109,7 @@ impl Volume {
         }
 
         let needle_id = NeedleId(file_key);
-        let volume_id = info_guard.id.clone();
+        let volume_id = info_guard.id;
         let needle = Needle::new(needle_id.clone(), volume_id, data);
 
         let required_space = needle.size() as u64;
@@ -132,7 +132,7 @@ impl Volume {
 
         let needle_info = NeedleInfo {
             id: needle_id.clone(),
-            volume_id: info_guard.id.clone(),
+            volume_id: info_guard.id,
             data_size: needle.data.len() as u32,
             offset,
             checksum: needle.checksum,

@@ -1,4 +1,4 @@
-use super::master::MasterNode;
+use super::master::{AddNodeParams, MasterNode, UpdateNodeVolumesParams};
 use super::proto::*;
 use futures::Stream;
 use log::{debug, warn};
@@ -75,30 +75,30 @@ impl MasterService for MasterGrpcServer {
                     && heartbeat.deleted_volumes.is_empty()
                 {
                     if let Err(e) = master
-                        .add_node(
+                        .add_node(AddNodeParams {
                             node_id,
-                            heartbeat.ip.clone(),
-                            heartbeat.rack.clone(),
-                            heartbeat.data_center.clone(),
-                            heartbeat.port,
-                            heartbeat.grpc_port,
-                            heartbeat.public_url.clone(),
-                        )
+                            address: heartbeat.ip.clone(),
+                            rack: heartbeat.rack.clone(),
+                            data_center: heartbeat.data_center.clone(),
+                            http_port: heartbeat.port,
+                            grpc_port: heartbeat.grpc_port,
+                            public_url: heartbeat.public_url.clone(),
+                        })
                         .await
                     {
                         debug!("Failed to add node: {}", e);
                     }
                 } else {
                     if let Err(e) = master
-                        .update_node_volumes(
-                            &node_id,
-                            &heartbeat.volumes,
-                            &heartbeat.new_volumes,
-                            &heartbeat.deleted_volumes,
-                            &heartbeat.ip,
-                            heartbeat.grpc_port,
-                            heartbeat.port,
-                        )
+                        .update_node_volumes(UpdateNodeVolumesParams {
+                            node_id,
+                            volumes: heartbeat.volumes.clone(),
+                            new_volumes: heartbeat.new_volumes.clone(),
+                            deleted_volumes: heartbeat.deleted_volumes.clone(),
+                            ip: heartbeat.ip.clone(),
+                            grpc_port: heartbeat.grpc_port,
+                            http_port: heartbeat.port,
+                        })
                         .await
                     {
                         debug!("Failed to update node volumes: {}", e);

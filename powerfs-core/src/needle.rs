@@ -154,7 +154,7 @@ impl Needle {
     pub fn to_info(&self) -> NeedleInfo {
         NeedleInfo {
             id: self.id.clone(),
-            volume_id: self.volume_id.clone(),
+            volume_id: self.volume_id,
             data_size: self.data.len() as u32,
             offset: self.offset,
             checksum: self.checksum,

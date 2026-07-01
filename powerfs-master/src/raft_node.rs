@@ -361,8 +361,7 @@ impl RaftNode {
     /// Get the message receiver for sending messages to peers
     pub fn take_message_rx(&mut self) -> mpsc::Receiver<OutgoingMessage> {
         let (_, new_rx) = mpsc::channel(1000);
-        let old_rx = std::mem::replace(&mut self.message_rx, new_rx);
-        old_rx
+        std::mem::replace(&mut self.message_rx, new_rx)
     }
 
     /// Get a clone of the peers
@@ -442,9 +441,11 @@ impl RaftNode {
     pub fn add_peer(&mut self, peer: Peer) -> Result<(), String> {
         info!("Adding peer: id={}, address={}", peer.id, peer.address);
 
-        let mut cc = ConfChange::default();
-        cc.node_id = peer.id;
-        cc.change_type = ConfChangeType::AddNode;
+        let cc = ConfChange {
+            node_id: peer.id,
+            change_type: ConfChangeType::AddNode,
+            ..Default::default()
+        };
 
         self.node
             .propose_conf_change(vec![], cc)
@@ -460,9 +461,11 @@ impl RaftNode {
     pub fn remove_peer(&mut self, peer_id: u64) -> Result<(), String> {
         info!("Removing peer: id={}", peer_id);
 
-        let mut cc = ConfChange::default();
-        cc.node_id = peer_id;
-        cc.change_type = ConfChangeType::RemoveNode;
+        let cc = ConfChange {
+            node_id: peer_id,
+            change_type: ConfChangeType::RemoveNode,
+            ..Default::default()
+        };
 
         self.node
             .propose_conf_change(vec![], cc)
