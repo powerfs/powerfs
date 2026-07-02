@@ -10,6 +10,7 @@ use powerfs_common::{
         VolumeInfo, VolumeState,
     },
 };
+use powerfs_core::kv_cache::KVCacheEngine;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -35,6 +36,7 @@ pub struct MasterNode {
     heartbeat_tx: mpsc::Sender<NodeId>,
     client_manager: RwLock<ClientManager>,
     notify_tx: mpsc::Sender<VolumeLocationUpdate>,
+    pub kv_cache: Arc<KVCacheEngine>,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,11 @@ impl MasterNode {
             },
         );
 
+        let kv_cache = Arc::new(KVCacheEngine::new(
+            1024 * 1024 * 1024, // 1GB default
+            2 * 1024 * 1024,    // 2MB block
+        ));
+
         let master = MasterNode {
             id: node_id.clone(),
             address: addr,
@@ -172,6 +179,7 @@ impl MasterNode {
             heartbeat_tx,
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx,
+            kv_cache,
         };
 
         let master_clone = master.clone();
@@ -1160,7 +1168,7 @@ impl MasterNode {
         info!("Starting PowerFS Master node: {:?}", self.id);
         info!("Listening on: {}", self.address);
 
-        let server = crate::server::MasterGrpcServer::new(self.clone());
+        let server = crate::server::MasterGrpcServer::new(self.clone(), self.kv_cache.clone());
         server
             .start(self.address)
             .await
@@ -1189,6 +1197,7 @@ impl Clone for MasterNode {
             heartbeat_tx: self.heartbeat_tx.clone(),
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx: self.notify_tx.clone(),
+            kv_cache: self.kv_cache.clone(),
         }
     }
 }

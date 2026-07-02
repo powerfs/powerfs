@@ -365,3 +365,119 @@ message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
 }
+
+// KV Cache service for LLM inference KV cache management
+service KVCacheService {
+    rpc CreateSession (CreateSessionRequest) returns (CreateSessionResponse);
+    rpc DeleteSession (DeleteSessionRequest) returns (DeleteSessionResponse);
+    rpc GetSession (GetSessionRequest) returns (GetSessionResponse);
+    rpc PutBlock (PutBlockRequest) returns (PutBlockResponse);
+    rpc GetBlock (GetBlockRequest) returns (GetBlockResponse);
+    rpc BatchPut (BatchPutRequest) returns (BatchPutResponse);
+    rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
+    rpc ListSessions (ListSessionsRequest) returns (ListSessionsResponse);
+    rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
+}
+
+message CreateSessionRequest {
+    string session_id = 1;
+    string model_name = 2;
+    uint32 num_layers = 3;
+    uint32 num_heads = 4;
+    uint32 head_dim = 5;
+    string dtype = 6;
+    uint64 ttl_seconds = 7;
+}
+
+message CreateSessionResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message DeleteSessionRequest {
+    string session_id = 1;
+}
+
+message DeleteSessionResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetSessionRequest {
+    string session_id = 1;
+}
+
+message GetSessionResponse {
+    bool exists = 1;
+    string session_id = 2;
+    string model_name = 3;
+    uint32 num_layers = 4;
+    uint64 num_blocks = 5;
+    uint64 total_tokens = 6;
+    uint64 used_bytes = 7;
+}
+
+message PutBlockRequest {
+    string session_id = 1;
+    uint32 layer_id = 2;
+    uint32 num_tokens = 3;
+    bytes data = 4;
+}
+
+message PutBlockResponse {
+    bool success = 1;
+    uint64 block_id = 2;
+    string error = 3;
+}
+
+message GetBlockRequest {
+    uint64 block_id = 1;
+}
+
+message GetBlockResponse {
+    bool found = 1;
+    uint64 block_id = 2;
+    uint32 layer_id = 3;
+    uint32 num_tokens = 4;
+    bytes data = 5;
+    string error = 6;
+}
+
+message BatchPutRequest {
+    repeated PutBlockRequest blocks = 1;
+}
+
+message BatchPutResponse {
+    repeated PutBlockResponse results = 1;
+}
+
+message BatchGetRequest {
+    repeated uint64 block_ids = 1;
+}
+
+message BatchGetResponse {
+    repeated GetBlockResponse blocks = 1;
+}
+
+message ListSessionsRequest {
+    uint32 limit = 1;
+    string prefix = 2;
+}
+
+message ListSessionsResponse {
+    repeated string session_ids = 1;
+    uint64 total = 2;
+}
+
+message GetStatsRequest {
+}
+
+message GetStatsResponse {
+    uint64 total_blocks = 1;
+    uint64 total_sessions = 2;
+    uint64 used_memory_bytes = 3;
+    uint64 max_memory_bytes = 4;
+    uint64 cache_hits = 5;
+    uint64 cache_misses = 6;
+    uint64 evictions = 7;
+}

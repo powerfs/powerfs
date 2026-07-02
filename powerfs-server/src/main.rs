@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
-use log::{error, info};
+use log::info;
 use powerfs_common::{error::Result, utils::generate_node_id};
 use powerfs_core::storage::StorageManager;
-use powerfs_fuse::fuse::FuseClient;
+use powerfs_fuse::FuseApp;
 use powerfs_master::master::MasterNode;
 use std::sync::Arc;
 
@@ -251,54 +251,25 @@ async fn run_filer(port: u16, master: &str, ip: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run_fuse(dir: &str, master: Option<String>, volume_port: u16) -> Result<()> {
+async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Result<()> {
     info!("Starting PowerFS FUSE client");
 
-    let node_id = generate_node_id();
-    let data_dir = format!("./data/fuse_{}", volume_port);
-    std::fs::create_dir_all(&data_dir)?;
-
-    let storage_manager = Arc::new(StorageManager::new(node_id, data_dir));
-
-    storage_manager.load_volumes()?;
-
-    let fuse_client = FuseClient::new(storage_manager, dir);
+    let master_addr = master.as_deref().unwrap_or("localhost:9334");
+    let fuse_app = FuseApp::new(master_addr, dir, "default", "000").await?;
 
     info!("Mounting PowerFS at: {}", dir);
+    info!("Connected to master: {}", master_addr);
 
-    if let Some(m) = &master {
-        info!("Connected to master: {}", m);
-    }
-
-    if let Err(e) = fuse_client.mount().await {
-        error!("Failed to mount FUSE: {}", e);
-        return Err(e);
-    }
-
-    tokio::signal::ctrl_c().await?;
-
-    fuse_client.unmount().await?;
-
-    Ok(())
+    fuse_app.run().await
 }
 
 async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Mounting PowerFS at: {}", dir);
 
-    if let Some(m) = &master {
-        info!("Connected to master: {}", m);
-    }
+    let master_addr = master.as_deref().unwrap_or("localhost:9334");
+    let fuse_app = FuseApp::new(master_addr, dir, "default", "000").await?;
 
-    let node_id = generate_node_id();
-    let storage_manager = Arc::new(StorageManager::new(node_id, "./data/mount".to_string()));
-    storage_manager.load_volumes()?;
+    info!("Connected to master: {}", master_addr);
 
-    let fuse_client = FuseClient::new(storage_manager, dir);
-    fuse_client.mount().await?;
-
-    tokio::signal::ctrl_c().await?;
-
-    fuse_client.unmount().await?;
-
-    Ok(())
+    fuse_app.run().await
 }

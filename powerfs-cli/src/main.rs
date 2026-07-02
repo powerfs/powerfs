@@ -7,7 +7,8 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    GrowArgs, HeartbeatArgs, LookupArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    GrowArgs, HeartbeatArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
+    WriteArgs,
 };
 
 /// PowerFS CLI tool for testing and administration
@@ -66,6 +67,9 @@ enum Commands {
 
     /// Transfer leadership to another node
     ClusterTransfer(ClusterTransferArgs),
+
+    /// Mount PowerFS as a FUSE filesystem
+    Mount(MountArgs),
 }
 
 #[tokio::main]
@@ -100,6 +104,7 @@ async fn main() {
         Commands::ClusterRemove(args) => commands::cluster_remove(client, args).await,
         Commands::ClusterStatus(args) => commands::cluster_status(client, args).await,
         Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
+        Commands::Mount(args) => commands::mount(args),
     };
 
     if let Err(e) = result {

@@ -1,0 +1,635 @@
+use lru::LruCache;
+use powerfs_common::types::Fid;
+use std::collections::HashMap;
+use std::num::NonZero;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
+pub const ROOT_INODE: u64 = 1;
+
+/// Cached metadata for a file or directory
+#[derive(Debug, Clone)]
+pub struct CachedEntry {
+    pub inode: u64,
+    pub parent: u64,
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub symlink_target: Option<String>,
+    pub nlink: u32,
+    pub fid: Option<Fid>,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+/// Directory listing cache entry with TTL
+struct DirCacheEntry {
+    entries: Vec<(u64, String, bool)>, // (inode, name, is_dir)
+    cached_at: Instant,
+}
+
+/// Metadata cache for FUSE filesystem
+pub struct MetadataCache {
+    /// inode -> entry mapping (LRU, capacity 10000)
+    inode_cache: RwLock<LruCache<u64, CachedEntry>>,
+    /// path -> inode mapping
+    path_map: RwLock<HashMap<String, u64>>,
+    /// parent inode -> directory listing cache (TTL 5s)
+    dir_cache: RwLock<HashMap<u64, DirCacheEntry>>,
+    /// next inode number (starts at 2, 1 is root)
+    next_inode: AtomicU64,
+    /// TTL for directory cache
+    dir_cache_ttl: Duration,
+}
+
+impl MetadataCache {
+    pub fn new() -> Self {
+        Self::with_capacity(10000)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let cache = MetadataCache {
+            inode_cache: RwLock::new(LruCache::new(
+                NonZero::new(capacity).unwrap_or(NonZero::new(10000).unwrap()),
+            )),
+            path_map: RwLock::new(HashMap::new()),
+            dir_cache: RwLock::new(HashMap::new()),
+            next_inode: AtomicU64::new(2),
+            dir_cache_ttl: Duration::from_secs(5),
+        };
+        // Initialize root directory (inode 1)
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode: 1,
+            parent: 1,
+            name: String::new(),
+            is_dir: true,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 2,
+            fid: None,
+            size: 0,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+        cache
+    }
+
+    /// Allocate a new inode number
+    pub fn allocate_inode(&self) -> u64 {
+        self.next_inode.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Get an entry by inode
+    pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
+        let mut cache = self.inode_cache.write().unwrap();
+        cache.get(&inode).cloned()
+    }
+
+    /// Get inode by full path
+    pub fn get_path(&self, path: &str) -> Option<u64> {
+        let path_map = self.path_map.read().unwrap();
+        path_map.get(path).copied()
+    }
+
+    /// Insert an entry into the cache
+    pub fn insert(&self, entry: CachedEntry) {
+        let parent = entry.parent;
+        let inode = entry.inode;
+        // Build path from parent
+        let path = if inode == 1 {
+            String::from("/")
+        } else {
+            let parent_entry = self.get_inode(parent);
+            match parent_entry {
+                Some(p) if p.inode == 1 => format!("/{}", entry.name),
+                Some(p) => format!(
+                    "{}/{}",
+                    self.inode_to_path(p.inode).unwrap_or_default(),
+                    entry.name
+                ),
+                None => format!("/{}", entry.name),
+            }
+        };
+
+        {
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.insert(path, inode);
+        }
+        {
+            let mut cache = self.inode_cache.write().unwrap();
+            cache.put(inode, entry);
+        }
+        // Invalidate parent's dir cache
+        self.invalidate_dir(parent);
+    }
+
+    /// Remove an entry by inode
+    pub fn remove(&self, inode: u64) {
+        let entry = {
+            let mut cache = self.inode_cache.write().unwrap();
+            cache.pop(&inode)
+        };
+        if let Some(entry) = entry {
+            let path = self.inode_to_path(inode).unwrap_or_default();
+            {
+                let mut path_map = self.path_map.write().unwrap();
+                path_map.remove(&path);
+            }
+            self.invalidate_dir(entry.parent);
+        }
+    }
+
+    /// Invalidate directory listing cache for a parent inode
+    pub fn invalidate_dir(&self, parent_inode: u64) {
+        let mut dir_cache = self.dir_cache.write().unwrap();
+        dir_cache.remove(&parent_inode);
+    }
+
+    /// Get directory listing (returns cached if fresh, None if needs refresh)
+    pub fn get_dir_listing(&self, parent_inode: u64) -> Option<Vec<(u64, String, bool)>> {
+        let dir_cache = self.dir_cache.read().unwrap();
+        if let Some(entry) = dir_cache.get(&parent_inode) {
+            if entry.cached_at.elapsed() < self.dir_cache_ttl {
+                return Some(entry.entries.clone());
+            }
+        }
+        None
+    }
+
+    /// Set directory listing cache
+    pub fn set_dir_listing(&self, parent_inode: u64, entries: Vec<(u64, String, bool)>) {
+        let mut dir_cache = self.dir_cache.write().unwrap();
+        dir_cache.insert(
+            parent_inode,
+            DirCacheEntry {
+                entries,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Get path for an inode by walking up the tree
+    fn inode_to_path(&self, inode: u64) -> Option<String> {
+        let path_map = self.path_map.read().unwrap();
+        for (path, ino) in path_map.iter() {
+            if *ino == inode {
+                return Some(path.clone());
+            }
+        }
+        None
+    }
+
+    /// Update file size
+    pub fn update_size(&self, inode: u64, size: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.size = size;
+            entry.mtime = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// Update attributes
+    pub fn update_attr(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        size: Option<u64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            if let Some(m) = mode {
+                entry.mode = m;
+            }
+            if let Some(s) = size {
+                entry.size = s;
+            }
+            if let Some(u) = uid {
+                entry.uid = u;
+            }
+            if let Some(g) = gid {
+                entry.gid = g;
+            }
+            let now = chrono::Utc::now().timestamp();
+            entry.ctime = now;
+            entry.mtime = now;
+        }
+    }
+
+    /// List children of a directory from cache
+    pub fn list_children(&self, parent_inode: u64) -> Vec<(u64, String, bool)> {
+        let cache = self.inode_cache.read().unwrap();
+        let mut children = Vec::new();
+        for (_, entry) in cache.iter() {
+            if entry.parent == parent_inode && entry.inode != parent_inode {
+                children.push((entry.inode, entry.name.clone(), entry.is_dir));
+            }
+        }
+        children
+    }
+
+    /// Rename an entry
+    pub fn rename(
+        &self,
+        olddir: u64,
+        oldname: &str,
+        newdir: u64,
+        newname: &str,
+    ) -> Result<(), String> {
+        // Find the entry
+        let entry = {
+            let children = self.list_children(olddir);
+            let mut found = None;
+            for (ino, name, _) in children {
+                if name == oldname {
+                    found = self.get_inode(ino);
+                    break;
+                }
+            }
+            found.ok_or_else(|| "source not found".to_string())?
+        };
+
+        // Check if target exists
+        let target_exists = {
+            let children = self.list_children(newdir);
+            children.iter().any(|(_, name, _)| name == newname)
+        };
+
+        // Remove old entry from cache temporarily, update, and re-insert
+        let inode = entry.inode;
+        let old_parent = entry.parent;
+
+        // Remove from old path
+        let old_path = self.inode_to_path(inode).unwrap_or_default();
+        {
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.remove(&old_path);
+        }
+
+        // Update entry
+        {
+            let mut cache = self.inode_cache.write().unwrap();
+            if let Some(e) = cache.get_mut(&inode) {
+                e.parent = newdir;
+                e.name = newname.to_string();
+                let now = chrono::Utc::now().timestamp();
+                e.ctime = now;
+                e.mtime = now;
+            }
+        }
+
+        // If target exists, remove it first
+        if target_exists {
+            let children = self.list_children(newdir);
+            for (ino, name, _) in children {
+                if name == newname {
+                    // Don't actually delete data here, just remove from cache
+                    // The caller should handle data deletion
+                    let _ = self.remove_entry_only(ino);
+                    break;
+                }
+            }
+        }
+
+        // Insert new path
+        let new_entry = self.get_inode(inode).unwrap();
+        let new_path = if newdir == 1 {
+            format!("/{}", new_entry.name)
+        } else {
+            let parent_path = self.inode_to_path(newdir).unwrap_or_default();
+            format!("{}/{}", parent_path, new_entry.name)
+        };
+        {
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.insert(new_path, inode);
+        }
+
+        // Invalidate old and new directory caches
+        self.invalidate_dir(old_parent);
+        if old_parent != newdir {
+            self.invalidate_dir(newdir);
+        }
+
+        Ok(())
+    }
+
+    /// Remove entry from cache only (without deleting data)
+    fn remove_entry_only(&self, inode: u64) -> Option<CachedEntry> {
+        let entry = {
+            let mut cache = self.inode_cache.write().unwrap();
+            cache.pop(&inode)
+        };
+        if let Some(ref e) = entry {
+            let path = self.inode_to_path(inode).unwrap_or_default();
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.remove(&path);
+            self.invalidate_dir(e.parent);
+        }
+        entry
+    }
+
+    /// Increment nlink count
+    pub fn inc_nlink(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.nlink += 1;
+        }
+    }
+
+    /// Decrement nlink count, returns true if nlink reaches 0
+    pub fn dec_nlink(&self, inode: u64) -> bool {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            if entry.nlink > 0 {
+                entry.nlink -= 1;
+            }
+            return entry.nlink == 0;
+        }
+        false
+    }
+
+    /// Get nlink count
+    pub fn get_nlink(&self, inode: u64) -> u32 {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).map(|e| e.nlink).unwrap_or(0)
+    }
+
+    /// Update symlink target
+    pub fn set_symlink_target(&self, inode: u64, target: String) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.is_symlink = true;
+            entry.size = target.len() as u64;
+            entry.symlink_target = Some(target);
+        }
+    }
+
+    /// Get symlink target
+    pub fn get_symlink_target(&self, inode: u64) -> Option<String> {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).and_then(|e| e.symlink_target.clone())
+    }
+
+    /// Lookup an entry by parent inode and name
+    pub fn lookup_in_cache(&self, parent: u64, name: &str) -> Option<CachedEntry> {
+        let children = self.list_children(parent);
+        for (inode, child_name, _) in children {
+            if child_name == name {
+                return self.get_inode(inode);
+            }
+        }
+        None
+    }
+}
+
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_inode() {
+        let cache = MetadataCache::new();
+        let root = cache.get_inode(1).unwrap();
+        assert!(root.is_dir);
+        assert_eq!(root.inode, 1);
+    }
+
+    #[test]
+    fn test_allocate_inode() {
+        let cache = MetadataCache::new();
+        let ino1 = cache.allocate_inode();
+        let ino2 = cache.allocate_inode();
+        assert_eq!(ino1, 2);
+        assert_eq!(ino2, 3);
+    }
+
+    #[test]
+    fn test_insert_and_get() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 100,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        let entry = cache.get_inode(inode).unwrap();
+        assert_eq!(entry.name, "test.txt");
+        assert!(!entry.is_dir);
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.nlink, 1);
+    }
+
+    #[test]
+    fn test_remove() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "temp.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        assert!(cache.get_inode(inode).is_some());
+        cache.remove(inode);
+        assert!(cache.get_inode(inode).is_none());
+    }
+
+    #[test]
+    fn test_list_children() {
+        let cache = MetadataCache::new();
+        let now = chrono::Utc::now().timestamp();
+
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            let ino = cache.allocate_inode();
+            cache.insert(CachedEntry {
+                inode: ino,
+                parent: 1,
+                name: name.to_string(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                nlink: 1,
+                fid: None,
+                size: 0,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            });
+        }
+
+        let children = cache.list_children(1);
+        assert_eq!(children.len(), 3);
+    }
+
+    #[test]
+    fn test_update_size() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "file.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        cache.update_size(inode, 1024);
+        let entry = cache.get_inode(inode).unwrap();
+        assert_eq!(entry.size, 1024);
+    }
+
+    #[test]
+    fn test_rename_file() {
+        let cache = MetadataCache::new();
+        let now = chrono::Utc::now().timestamp();
+        let ino = cache.allocate_inode();
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "old.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 100,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        cache.rename(1, "old.txt", 1, "new.txt").unwrap();
+
+        assert!(cache.lookup_in_cache(1, "old.txt").is_none());
+        let entry = cache.lookup_in_cache(1, "new.txt").unwrap();
+        assert_eq!(entry.inode, ino);
+        assert_eq!(entry.name, "new.txt");
+    }
+
+    #[test]
+    fn test_nlink() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "file.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        assert_eq!(cache.get_nlink(inode), 1);
+        cache.inc_nlink(inode);
+        assert_eq!(cache.get_nlink(inode), 2);
+        assert!(!cache.dec_nlink(inode));
+        assert_eq!(cache.get_nlink(inode), 1);
+        assert!(cache.dec_nlink(inode));
+        assert_eq!(cache.get_nlink(inode), 0);
+    }
+
+    #[test]
+    fn test_symlink() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "link".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        });
+
+        cache.set_symlink_target(inode, "/target/path".to_string());
+        let entry = cache.get_inode(inode).unwrap();
+        assert!(entry.is_symlink);
+        assert_eq!(entry.size, 12);
+        assert_eq!(
+            cache.get_symlink_target(inode),
+            Some("/target/path".to_string())
+        );
+    }
+}

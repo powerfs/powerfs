@@ -1,3 +1,4 @@
+use super::kv_cache_service::KvCacheServiceImpl;
 use super::master::{AddNodeParams, MasterNode, UpdateNodeVolumesParams};
 use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::*;
@@ -5,6 +6,7 @@ use futures::Stream;
 use log::{debug, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
+use powerfs_core::kv_cache::KVCacheEngine;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,16 +16,22 @@ use uuid::Uuid;
 
 pub struct MasterGrpcServer {
     master: Arc<MasterNode>,
+    kv_cache: Arc<KVCacheEngine>,
 }
 
 impl MasterGrpcServer {
-    pub fn new(master: Arc<MasterNode>) -> Self {
-        MasterGrpcServer { master }
+    pub fn new(master: Arc<MasterNode>, kv_cache: Arc<KVCacheEngine>) -> Self {
+        MasterGrpcServer { master, kv_cache }
     }
 
     pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+        let kv_svc = KvCacheServiceImpl {
+            engine: self.kv_cache.clone(),
+        };
+
         Server::builder()
             .add_service(MasterServiceServer::new(self))
+            .add_service(KvCacheServiceServer::new(kv_svc))
             .serve(addr)
             .await?;
         Ok(())
