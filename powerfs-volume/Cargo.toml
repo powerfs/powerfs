@@ -14,8 +14,9 @@ tonic-build = { version = "0.11" }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
-tokio = { workspace = true }
-tokio-stream = "0.1"
+tokio = { workspace = true, features = ["time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
 tonic = { workspace = true }
 prost = { workspace = true }
 log = { workspace = true }

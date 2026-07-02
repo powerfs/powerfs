@@ -343,3 +343,63 @@ fn calculate_test_checksum(data: &[u8]) -> u64 {
     }
     result
 }
+
+// ============================================================================
+// Boundary tests
+// ============================================================================
+
+#[test]
+fn test_needle_boundary_large_data() {
+    let data_size = 10 * 1024 * 1024;
+    let data = Bytes::from(vec![0xAAu8; data_size]);
+    let needle = Needle::new(NeedleId(1), VolumeId(1), data.clone());
+
+    assert_eq!(needle.data_size(), data_size);
+    assert_eq!(needle.size(), 12 + data_size + 8);
+
+    let bytes = needle.to_bytes();
+    assert_eq!(bytes.len(), needle.size());
+
+    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    assert_eq!(restored.data, data);
+}
+
+#[test]
+fn test_needle_boundary_special_chars() {
+    let data = vec![
+        0x00, 0x01, 0x7F, 0xFF, 0x80, 0x9F, 0xEF, 0xBF, 0xBD, b'\n', b'\r', b'\t', b'\0', b'"',
+        b'\'', b'\\', b'/',
+    ];
+    let needle = Needle::new(NeedleId(1), VolumeId(1), Bytes::from(data.clone()));
+    let bytes = needle.to_bytes();
+    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    assert_eq!(restored.data, Bytes::from(data));
+}
+
+#[test]
+fn test_needle_boundary_empty_id() {
+    let needle = Needle::new(NeedleId(0), VolumeId(1), Bytes::from("empty id"));
+    let bytes = needle.to_bytes();
+    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    assert_eq!(restored.id, NeedleId(0));
+}
+
+#[test]
+fn test_needle_boundary_max_volume_id() {
+    let needle = Needle::new(NeedleId(1), VolumeId(u32::MAX), Bytes::from("max volume"));
+    assert_eq!(needle.volume_id, VolumeId(u32::MAX));
+}
+
+#[test]
+fn test_needle_boundary_large_offset() {
+    let needle = Needle::new(NeedleId(1), VolumeId(1), Bytes::from("test"));
+    let info = needle.to_info();
+    assert_eq!(info.offset, 0);
+
+    let large_offset = 1024 * 1024 * 1024;
+    let mut cursor = Cursor::new(vec![0u8; large_offset as usize + needle.size()]);
+    needle.write_to(&mut cursor, large_offset).unwrap();
+
+    let restored = Needle::read_from(&mut cursor, large_offset, VolumeId(1)).unwrap();
+    assert_eq!(restored.offset, large_offset);
+}

@@ -262,7 +262,7 @@ impl KVCacheEngine {
 
         let size_bytes = data.len() as u64;
 
-        // Check memory and evict if needed
+        // Check memory and evict if needed - must not hold any locks while evicting
         self.ensure_memory(size_bytes)?;
 
         let block_id = self.next_block_id.fetch_add(1, Ordering::SeqCst);
@@ -272,10 +272,14 @@ impl KVCacheEngine {
         let copy_len = data.len().min(buf.len());
         buf[..copy_len].copy_from_slice(&data[..copy_len]);
 
-        let sessions = self.sessions.read().unwrap();
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("session {} not found", session_id))?;
+        // Get session info without holding lock during eviction
+        let session = {
+            let sessions = self.sessions.read().unwrap();
+            sessions
+                .get(session_id)
+                .ok_or_else(|| format!("session {} not found", session_id))?
+                .clone()
+        };
 
         let meta = KVBlockMeta {
             block_id,
@@ -296,7 +300,6 @@ impl KVCacheEngine {
         let mut blocks = self.blocks.write().unwrap();
         blocks.insert(block_id, block);
 
-        drop(sessions);
         let mut sessions = self.sessions.write().unwrap();
         if let Some(sess) = sessions.get_mut(session_id) {
             sess.block_ids.push(block_id);

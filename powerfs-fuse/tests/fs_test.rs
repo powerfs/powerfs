@@ -1,6 +1,8 @@
 use powerfs_fuse::cache::{CachedEntry, MetadataCache, UpdateAttrParams, ROOT_INODE};
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread;
 
 fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
     CachedEntry {
@@ -416,4 +418,104 @@ fn test_xattr_preserved_on_copy() {
 
     let found = cache.get_inode(100).unwrap();
     assert_eq!(found.xattrs.get("user.test"), Some(&b"value".to_vec()));
+}
+
+#[test]
+fn test_concurrent_inserts() {
+    let cache = Arc::new(MetadataCache::new());
+    let mut handles = Vec::new();
+
+    for i in 0..10 {
+        let cache_clone = Arc::clone(&cache);
+        let handle = thread::spawn(move || {
+            let entry = make_file_entry(1000 + i as u64, ROOT_INODE, &format!("file{}.txt", i));
+            cache_clone.insert(entry);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for i in 0..10 {
+        let found = cache.lookup_in_cache(ROOT_INODE, &format!("file{}.txt", i));
+        assert!(found.is_some(), "file{}.txt should exist", i);
+    }
+}
+
+#[test]
+fn test_concurrent_read_write() {
+    let cache = Arc::new(MetadataCache::new());
+    let entry = make_file_entry(100, ROOT_INODE, "shared.txt");
+    cache.insert(entry);
+
+    let mut handles = Vec::new();
+
+    for _ in 0..5 {
+        let cache_clone = Arc::clone(&cache);
+        let handle = thread::spawn(move || {
+            for i in 0..100 {
+                cache_clone.update_attr(
+                    100,
+                    UpdateAttrParams {
+                        mode: None,
+                        size: Some(i as u64),
+                        uid: None,
+                        gid: None,
+                        atime: None,
+                        mtime: None,
+                    },
+                );
+            }
+        });
+        handles.push(handle);
+    }
+
+    for _ in 0..5 {
+        let cache_clone = Arc::clone(&cache);
+        let handle = thread::spawn(move || {
+            for _ in 0..100 {
+                let _ = cache_clone.get_inode(100);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let found = cache.get_inode(100).unwrap();
+    assert_eq!(found.name, "shared.txt");
+}
+
+#[test]
+fn test_concurrent_lookups() {
+    let cache = Arc::new(MetadataCache::new());
+    for i in 0..100 {
+        let entry = make_file_entry(1000 + i as u64, ROOT_INODE, &format!("item{}.dat", i));
+        cache.insert(entry);
+    }
+
+    let mut handles = Vec::new();
+
+    for _ in 0..8 {
+        let cache_clone = Arc::clone(&cache);
+        let handle = thread::spawn(move || {
+            for i in 0..100 {
+                let _ = cache_clone.lookup_in_cache(ROOT_INODE, &format!("item{}.dat", i));
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for i in 0..100 {
+        let found = cache.lookup_in_cache(ROOT_INODE, &format!("item{}.dat", i));
+        assert!(found.is_some(), "item{}.dat should exist", i);
+    }
 }
