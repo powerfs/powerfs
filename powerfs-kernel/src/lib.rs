@@ -1,5 +1,5 @@
-pub mod client;
-pub mod io_uring;
+pub mod netlink;
 pub mod protocol;
 
-pub use client::KernelClient;
+pub use netlink::PowerFSNetlink;
+pub use protocol::{KernelRequest, KernelResponse, PowerFSOpcode};

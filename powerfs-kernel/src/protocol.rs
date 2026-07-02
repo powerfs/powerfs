@@ -1,31 +1,31 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelOp {
-    Lookup,
-    Getattr,
-    Setattr,
-    Readlink,
-    Symlink,
-    Link,
-    Unlink,
-    Rmdir,
-    Mkdir,
-    Rename,
-    Open,
-    Read,
-    Write,
-    Release,
-    Fsync,
-    Readdir,
-    Statfs,
-    Access,
-    Create,
-    Ioctl,
-    Getlk,
-    Setlk,
-    Setlkw,
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum PowerFSOpcode {
+    Lookup = 1,
+    Getattr = 2,
+    Setattr = 3,
+    Readlink = 4,
+    Symlink = 5,
+    Link = 6,
+    Unlink = 7,
+    Rmdir = 8,
+    Mkdir = 9,
+    Rename = 10,
+    Open = 11,
+    Read = 12,
+    Write = 13,
+    Release = 14,
+    Fsync = 15,
+    Readdir = 16,
+    Statfs = 17,
+    Access = 18,
+    Create = 19,
+    Ioctl = 20,
 }
 
-impl KernelOp {
+impl PowerFSOpcode {
     pub fn from_u32(op: u32) -> Option<Self> {
         match op {
             1 => Some(Self::Lookup),
@@ -48,75 +48,54 @@ impl KernelOp {
             18 => Some(Self::Access),
             19 => Some(Self::Create),
             20 => Some(Self::Ioctl),
-            21 => Some(Self::Getlk),
-            22 => Some(Self::Setlk),
-            23 => Some(Self::Setlkw),
             _ => None,
-        }
-    }
-
-    pub fn as_u32(&self) -> u32 {
-        match self {
-            Self::Lookup => 1,
-            Self::Getattr => 2,
-            Self::Setattr => 3,
-            Self::Readlink => 4,
-            Self::Symlink => 5,
-            Self::Link => 6,
-            Self::Unlink => 7,
-            Self::Rmdir => 8,
-            Self::Mkdir => 9,
-            Self::Rename => 10,
-            Self::Open => 11,
-            Self::Read => 12,
-            Self::Write => 13,
-            Self::Release => 14,
-            Self::Fsync => 15,
-            Self::Readdir => 16,
-            Self::Statfs => 17,
-            Self::Access => 18,
-            Self::Create => 19,
-            Self::Ioctl => 20,
-            Self::Getlk => 21,
-            Self::Setlk => 22,
-            Self::Setlkw => 23,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelRequest {
     pub unique: u64,
-    pub opcode: KernelOp,
+    pub opcode: u32,
     pub inode: u64,
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelResponse {
     pub unique: u64,
     pub error: i32,
     pub data: Vec<u8>,
 }
 
-pub trait KernelBackend {
-    fn submit_request(&self, req: KernelRequest) -> Result<(), String>;
-    fn poll_response(&self) -> Result<Option<KernelResponse>, String>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InodeAttr {
+    pub inode: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct DAXConfig {
-    pub enabled: bool,
-    pub mapping_size: u64,
-    pub hugepages: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub inode: u64,
+    pub name: String,
+    pub type_: u8,
 }
 
-impl Default for DAXConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mapping_size: 2 * 1024 * 1024 * 1024,
-            hugepages: false,
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatFS {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
 }

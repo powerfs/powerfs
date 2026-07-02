@@ -3,15 +3,15 @@ name = "powerfs-kernel"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "PowerFS kernel module userspace helper - protocol definitions and utilities"
 license.workspace = true
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
-tokio = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
