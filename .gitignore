@@ -5,10 +5,18 @@ beegfs/
 seaweedfs/
 log
 *.log
-setp.sh
-unsetp.sh
-proxy.sh
 *.sh
+!kernel/**/test_*.sh
 docs/
 .cargo
 vendor/
+
+# Kernel module build artifacts
+kernel/**/*.o
+kernel/**/*.ko
+kernel/**/*.mod.c
+kernel/**/*.mod
+kernel/**/Module.symvers
+kernel/**/modules.order
+kernel/**/.*.cmd
+kernel/**/.*.o
