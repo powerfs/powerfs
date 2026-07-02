@@ -1,11 +1,13 @@
 use log::{debug, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
-    master_service_client::MasterServiceClient, AssignRequest, LookupVolumeRequest,
+    master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
+    DeleteEntryRequest, Entry, GetEntryRequest, ListEntriesRequest, LookupDirectoryEntryRequest,
+    LookupVolumeRequest, UpdateEntryRequest,
 };
 use powerfs_volume::proto::powerfs::{
-    volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleRequest,
-    WriteNeedleRequest,
+    volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
+    ReadNeedleRequest, WriteNeedleBlobRequest, WriteNeedleRequest,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +16,16 @@ use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
 use powerfs_master::proto::powerfs::Location;
+
+#[derive(Debug)]
+pub struct WriteBlobParams {
+    pub volume_id: u32,
+    pub file_key: u64,
+    pub offset: i64,
+    pub size: i32,
+    pub data: Vec<u8>,
+    pub cookie: u32,
+}
 
 /// gRPC client for communicating with Master and Volume servers
 pub struct PowerFuseClient {
@@ -142,6 +154,8 @@ impl PowerFuseClient {
             volume_id,
             file_key,
             data,
+            cookie: 0,
+            ttl: "".to_string(),
         };
         let response = client
             .write_needle(tonic::Request::new(request))
@@ -170,6 +184,7 @@ impl PowerFuseClient {
         let request = ReadNeedleRequest {
             volume_id,
             file_key,
+            cookie: 0,
         };
         let response = client
             .read_needle(tonic::Request::new(request))
@@ -198,6 +213,7 @@ impl PowerFuseClient {
         let request = DeleteNeedleRequest {
             volume_id,
             file_key,
+            cookie: 0,
         };
         let response = client
             .delete_needle(tonic::Request::new(request))
@@ -232,6 +248,160 @@ impl PowerFuseClient {
         let mut channels = self.volume_channels.write().await;
         channels.remove(addr);
         warn!("Invalidated volume channel: {}", addr);
+    }
+
+    pub async fn lookup_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = LookupDirectoryEntryRequest {
+            directory: directory.to_string(),
+            name: name.to_string(),
+        };
+        let response = client
+            .lookup_directory_entry(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("lookup_directory_entry failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.found {
+            return Ok(None);
+        }
+        Ok(resp.entry)
+    }
+
+    pub async fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = GetEntryRequest {
+            path: path.to_string(),
+        };
+        let response = client
+            .get_entry(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("get_entry failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.found {
+            return Ok(None);
+        }
+        Ok(resp.entry)
+    }
+
+    pub async fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = CreateEntryRequest { entry: Some(entry) };
+        let response = client
+            .create_entry(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("create_entry failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err(resp.error);
+        }
+        Ok(resp.inode)
+    }
+
+    pub async fn update_entry(&self, entry: Entry) -> Result<(), String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = UpdateEntryRequest { entry: Some(entry) };
+        let response = client
+            .update_entry(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("update_entry failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err(resp.error);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_entry(&self, path: &str, is_directory: bool) -> Result<(), String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = DeleteEntryRequest {
+            path: path.to_string(),
+            is_directory,
+        };
+        let response = client
+            .delete_entry(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("delete_entry failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err(resp.error);
+        }
+        Ok(())
+    }
+
+    pub async fn list_entries(
+        &self,
+        directory: &str,
+        limit: u64,
+        last_name: &str,
+    ) -> Result<Vec<Entry>, String> {
+        let channel = self.ensure_master_channel().await?;
+        let mut client = MasterServiceClient::new(channel);
+        let request = ListEntriesRequest {
+            directory: directory.to_string(),
+            limit,
+            last_name: last_name.to_string(),
+        };
+        let response = client
+            .list_entries(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("list_entries failed: {}", e))?;
+        let resp = response.into_inner();
+        Ok(resp.entries)
+    }
+
+    pub async fn write_blob(
+        &self,
+        volume_addr: &str,
+        params: WriteBlobParams,
+    ) -> Result<(), String> {
+        let channel = self.get_volume_channel(volume_addr).await?;
+        let mut client = VolumeServiceClient::new(channel);
+        let request = WriteNeedleBlobRequest {
+            volume_id: params.volume_id,
+            file_key: params.file_key,
+            offset: params.offset,
+            size: params.size,
+            needle_blob: params.data,
+            cookie: params.cookie,
+        };
+        let response = client
+            .write_needle_blob(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("write_needle_blob failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err("write_blob failed".to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn read_blob(
+        &self,
+        volume_addr: &str,
+        offset: i64,
+        size: i32,
+    ) -> Result<Vec<u8>, String> {
+        let channel = self.get_volume_channel(volume_addr).await?;
+        let mut client = VolumeServiceClient::new(channel);
+        let request = ReadNeedleBlobRequest {
+            volume_id: 0,
+            offset,
+            size,
+        };
+        let response = client
+            .read_needle_blob(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("read_needle_blob failed: {}", e))?;
+        let resp = response.into_inner();
+        if !resp.success {
+            return Err("read_blob failed".to_string());
+        }
+        Ok(resp.needle_blob)
     }
 }
 
@@ -300,5 +470,58 @@ impl SyncFuseClient {
             volume_id,
             file_key,
         ))
+    }
+
+    pub fn lookup_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.lookup_entry(directory, name))
+    }
+
+    pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.get_entry(path))
+    }
+
+    pub fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.create_entry(entry))
+    }
+
+    pub fn update_entry(&self, entry: Entry) -> Result<(), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.update_entry(entry))
+    }
+
+    pub fn delete_entry(&self, path: &str, is_directory: bool) -> Result<(), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.delete_entry(path, is_directory))
+    }
+
+    pub fn list_entries(
+        &self,
+        directory: &str,
+        limit: u64,
+        last_name: &str,
+    ) -> Result<Vec<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.list_entries(directory, limit, last_name))
+    }
+
+    pub fn write_blob(&self, volume_addr: &str, params: WriteBlobParams) -> Result<(), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.write_blob(volume_addr, params))
+    }
+
+    pub fn read_blob(&self, volume_addr: &str, offset: i64, size: i32) -> Result<Vec<u8>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.read_blob(volume_addr, offset, size))
     }
 }

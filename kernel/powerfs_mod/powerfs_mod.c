@@ -12,6 +12,7 @@
 #include <linux/inet.h>
 #include <linux/list.h>
 #include <linux/string.h>
+#include <linux/time64.h>
 
 #include "powerfs.h"
 
@@ -62,7 +63,6 @@ static struct inode *powerfs_alloc_inode(struct super_block *sb)
 static void powerfs_evict_inode(struct inode *inode)
 {
 	truncate_inode_pages_final(&inode->i_data);
-	clear_inode(inode);
 }
 
 static void powerfs_destroy_inode(struct inode *inode)
@@ -92,13 +92,14 @@ struct inode *powerfs_get_inode(struct super_block *sb, umode_t mode)
 
 	pi = powerfs_i(inode);
 
+	struct timespec64 now = current_time(inode);
+
 	inode->i_mode = mode;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
-	inode->i_atime_sec = inode->i_mtime_sec = inode->i_ctime_sec =
-		current_time(inode).tv_sec;
-	inode->i_atime_nsec = inode->i_mtime_nsec = inode->i_ctime_nsec =
-		current_time(inode).tv_nsec;
+	inode_set_atime(inode, now.tv_sec, now.tv_nsec);
+	inode_set_mtime(inode, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
 	inode->i_blkbits = PAGE_SHIFT;
 	inode->i_blocks = 0;
 
@@ -132,12 +133,9 @@ static struct dentry *powerfs_get_root(struct super_block *sb)
 	pi->name[0] = '/';
 	pi->name[1] = '\0';
 
-	root_inode->i_op = &powerfs_dir_inode_operations;
-	root_inode->i_fop = &powerfs_dir_fops;
-
 	root_dentry = d_make_root(root_inode);
 	if (!root_dentry) {
-		kfree(pi);
+		iput(root_inode);
 		return ERR_PTR(-ENOMEM);
 	}
 

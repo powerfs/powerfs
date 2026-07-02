@@ -1,7 +1,20 @@
 #include <linux/module.h>
+#define INCLUDE_VERMAGIC
+#include <linux/build-salt.h>
+#include <linux/elfnote-lto.h>
 #include <linux/export-internal.h>
+#include <linux/vermagic.h>
 #include <linux/compiler.h>
 
+#ifdef CONFIG_UNWINDER_ORC
+#include <asm/orc_header.h>
+ORC_HEADER;
+#endif
+
+BUILD_SALT;
+BUILD_LTO_INFO;
+
+MODULE_INFO(vermagic, VERMAGIC_STRING);
 MODULE_INFO(name, KBUILD_MODNAME);
 
 __visible struct module __this_module
@@ -14,170 +27,109 @@ __section(".gnu.linkonce.this_module") = {
 	.arch = MODULE_ARCH_INIT,
 };
 
+#ifdef CONFIG_RETPOLINE
+MODULE_INFO(retpoline, "Y");
+#endif
 
 
-static const struct modversion_info ____versions[]
-__used __section("__versions") = {
-	{ 0x6e8d34d0, "generic_fillattr" },
-	{ 0x74895968, "iget_locked" },
-	{ 0xa61fd7aa, "__check_object_size" },
-	{ 0x4c5d2323, "clear_inode" },
-	{ 0x471d23f5, "__nlmsg_put" },
-	{ 0x092a35a2, "_copy_from_user" },
-	{ 0xd186bac3, "new_inode" },
-	{ 0xe53d4a79, "unregister_filesystem" },
-	{ 0x1d52ec49, "d_make_root" },
-	{ 0xfcf02643, "current_time" },
-	{ 0xa53f4e29, "memcpy" },
-	{ 0xcb8b6ec6, "kfree" },
-	{ 0x4c5d2323, "iput" },
-	{ 0xb22889f3, "__netlink_kernel_create" },
-	{ 0xe53d4a79, "register_filesystem" },
-	{ 0xd272d446, "__fentry__" },
-	{ 0x5a844b26, "__x86_indirect_thunk_rax" },
-	{ 0x4c5d2323, "unlock_new_inode" },
-	{ 0xe8213e80, "_printk" },
-	{ 0x21bfdf43, "truncate_inode_pages_final" },
-	{ 0xd710adbf, "__kmalloc_large_noprof" },
-	{ 0x9479a1e8, "strnlen" },
-	{ 0x80cced5e, "__alloc_skb" },
-	{ 0xb1172073, "init_net" },
-	{ 0xbb653e95, "sk_skb_reason_drop" },
-	{ 0x1b261533, "netlink_unicast" },
-	{ 0xbd03ed67, "random_kmalloc_seed" },
-	{ 0xc4cc9b40, "set_nlink" },
-	{ 0xd94efd11, "const_current_task" },
-	{ 0xc609ff70, "strncpy" },
-	{ 0x09289ea7, "netlink_kernel_release" },
-	{ 0xe54e0a6b, "__fortify_panic" },
-	{ 0x811995cf, "kill_litter_super" },
-	{ 0x27683a56, "memset" },
-	{ 0x5a844b26, "__x86_indirect_thunk_r10" },
-	{ 0xd272d446, "__x86_return_thunk" },
-	{ 0x092a35a2, "_copy_to_user" },
-	{ 0x888b8f57, "strcmp" },
-	{ 0xe95df651, "mount_nodev" },
-	{ 0xb38562b7, "generic_read_dir" },
-	{ 0xa853c451, "d_add" },
-	{ 0x4c5d2323, "inc_nlink" },
-	{ 0xecd17989, "__kmalloc_cache_noprof" },
-	{ 0x546c19d9, "validate_usercopy_range" },
-	{ 0x43a349ca, "strlen" },
-	{ 0x7ddf7992, "__mark_inode_dirty" },
-	{ 0xc0112974, "generic_file_llseek" },
-	{ 0x4c5d2323, "drop_nlink" },
-	{ 0x08bfc903, "kmalloc_caches" },
-	{ 0x814e12e5, "module_layout" },
-};
 
-static const u32 ____version_ext_crcs[]
-__used __section("__version_ext_crcs") = {
-	0x6e8d34d0,
-	0x74895968,
-	0xa61fd7aa,
-	0x4c5d2323,
-	0x471d23f5,
-	0x092a35a2,
-	0xd186bac3,
-	0xe53d4a79,
-	0x1d52ec49,
-	0xfcf02643,
-	0xa53f4e29,
-	0xcb8b6ec6,
-	0x4c5d2323,
-	0xb22889f3,
-	0xe53d4a79,
-	0xd272d446,
-	0x5a844b26,
-	0x4c5d2323,
-	0xe8213e80,
-	0x21bfdf43,
-	0xd710adbf,
-	0x9479a1e8,
-	0x80cced5e,
-	0xb1172073,
-	0xbb653e95,
-	0x1b261533,
-	0xbd03ed67,
-	0xc4cc9b40,
-	0xd94efd11,
-	0xc609ff70,
-	0x09289ea7,
-	0xe54e0a6b,
-	0x811995cf,
-	0x27683a56,
-	0x5a844b26,
-	0xd272d446,
-	0x092a35a2,
-	0x888b8f57,
-	0xe95df651,
-	0xb38562b7,
-	0xa853c451,
-	0x4c5d2323,
-	0xecd17989,
-	0x546c19d9,
-	0x43a349ca,
-	0x7ddf7992,
-	0xc0112974,
-	0x4c5d2323,
-	0x08bfc903,
-	0x814e12e5,
-};
-static const char ____version_ext_names[]
-__used __section("__version_ext_names") =
-	"generic_fillattr\0"
-	"iget_locked\0"
+static const char ____versions[]
+__used __section("__versions") =
+	"\x1c\x00\x00\x00\xd3\x4f\x19\x84"
+	"generic_fillattr\0\0\0\0"
+	"\x1c\x00\x00\x00\x48\x9f\xdb\x88"
 	"__check_object_size\0"
-	"clear_inode\0"
+	"\x14\x00\x00\x00\xc8\x39\xce\xb2"
 	"__nlmsg_put\0"
+	"\x18\x00\x00\x00\xc2\x9c\xc4\x13"
 	"_copy_from_user\0"
-	"new_inode\0"
-	"unregister_filesystem\0"
+	"\x14\x00\x00\x00\x56\x27\xcf\xd2"
+	"new_inode\0\0\0"
+	"\x20\x00\x00\x00\xea\x5c\xcc\x19"
+	"unregister_filesystem\0\0\0"
+	"\x14\x00\x00\x00\x67\xa4\x47\xa1"
 	"d_make_root\0"
-	"current_time\0"
-	"memcpy\0"
-	"kfree\0"
-	"iput\0"
+	"\x18\x00\x00\x00\x06\x53\x67\xc6"
+	"current_time\0\0\0\0"
+	"\x10\x00\x00\x00\x38\xdf\xac\x69"
+	"memcpy\0\0"
+	"\x10\x00\x00\x00\xba\x0c\x7a\x03"
+	"kfree\0\0\0"
+	"\x10\x00\x00\x00\xd2\x11\x7d\xc3"
+	"iput\0\0\0\0"
+	"\x14\x00\x00\x00\x1e\x27\xb6\x79"
+	"pcpu_hot\0\0\0\0"
+	"\x20\x00\x00\x00\x83\x85\x96\x2b"
 	"__netlink_kernel_create\0"
+	"\x1c\x00\x00\x00\x92\x73\xfc\x7a"
 	"register_filesystem\0"
-	"__fentry__\0"
-	"__x86_indirect_thunk_rax\0"
-	"unlock_new_inode\0"
+	"\x1c\x00\x00\x00\xca\xed\xe5\xa2"
+	"kmem_cache_create\0\0\0"
+	"\x18\x00\x00\x00\x8c\x89\xd4\xcb"
+	"fortify_panic\0\0\0"
+	"\x14\x00\x00\x00\xbb\x6d\xfb\xbd"
+	"__fentry__\0\0"
+	"\x24\x00\x00\x00\x97\x70\x48\x65"
+	"__x86_indirect_thunk_rax\0\0\0\0"
+	"\x10\x00\x00\x00\x7e\x3a\x2c\x12"
 	"_printk\0"
-	"truncate_inode_pages_final\0"
-	"__kmalloc_large_noprof\0"
+	"\x10\x00\x00\x00\x94\xb6\x16\xa9"
 	"strnlen\0"
+	"\x14\x00\x00\x00\x40\xf6\x36\x8b"
 	"__alloc_skb\0"
-	"init_net\0"
-	"sk_skb_reason_drop\0"
+	"\x1c\x00\x00\x00\x51\x6c\x21\x89"
+	"kmem_cache_alloc\0\0\0\0"
+	"\x14\x00\x00\x00\xf3\x16\x1b\x8b"
+	"init_net\0\0\0\0"
+	"\x18\x00\x00\x00\xb6\x4a\xc6\x5f"
 	"netlink_unicast\0"
-	"random_kmalloc_seed\0"
-	"set_nlink\0"
-	"const_current_task\0"
+	"\x1c\x00\x00\x00\x6d\x74\x4b\x51"
+	"kfree_skb_reason\0\0\0\0"
+	"\x14\x00\x00\x00\x2a\xf8\x2e\x40"
+	"set_nlink\0\0\0"
+	"\x18\x00\x00\x00\xf3\xe4\xa5\x3c"
+	"kmem_cache_free\0"
+	"\x10\x00\x00\x00\xda\xfa\x66\x91"
 	"strncpy\0"
-	"netlink_kernel_release\0"
-	"__fortify_panic\0"
-	"kill_litter_super\0"
-	"memset\0"
-	"__x86_indirect_thunk_r10\0"
-	"__x86_return_thunk\0"
-	"_copy_to_user\0"
-	"strcmp\0"
+	"\x20\x00\x00\x00\x90\x3c\x4e\x0b"
+	"netlink_kernel_release\0\0"
+	"\x18\x00\x00\x00\x20\x2e\xd1\x9e"
+	"kmalloc_large\0\0\0"
+	"\x1c\x00\x00\x00\xa4\xcc\x53\x8c"
+	"kill_litter_super\0\0\0"
+	"\x10\x00\x00\x00\xc5\x8f\x57\xfb"
+	"memset\0\0"
+	"\x24\x00\x00\x00\x2a\x9b\x54\x31"
+	"__x86_indirect_thunk_r10\0\0\0\0"
+	"\x1c\x00\x00\x00\xca\x39\x82\x5b"
+	"__x86_return_thunk\0\0"
+	"\x18\x00\x00\x00\xe1\xbe\x10\x6b"
+	"_copy_to_user\0\0\0"
+	"\x10\x00\x00\x00\x5a\x25\xd5\xe2"
+	"strcmp\0\0"
+	"\x14\x00\x00\x00\xdd\x9e\xb0\x85"
 	"mount_nodev\0"
-	"generic_read_dir\0"
-	"d_add\0"
-	"inc_nlink\0"
-	"__kmalloc_cache_noprof\0"
-	"validate_usercopy_range\0"
-	"strlen\0"
-	"__mark_inode_dirty\0"
+	"\x1c\x00\x00\x00\x67\xf2\x8f\x8e"
+	"generic_read_dir\0\0\0\0"
+	"\x10\x00\x00\x00\xae\xd8\x50\x38"
+	"d_add\0\0\0"
+	"\x14\x00\x00\x00\xb8\x03\xd6\x04"
+	"inc_nlink\0\0\0"
+	"\x10\x00\x00\x00\x9c\x53\x4d\x75"
+	"strlen\0\0"
+	"\x1c\x00\x00\x00\x66\x0e\x67\xc9"
+	"__mark_inode_dirty\0\0"
+	"\x1c\x00\x00\x00\xb7\x06\x8d\x3d"
 	"generic_file_llseek\0"
-	"drop_nlink\0"
-	"kmalloc_caches\0"
-	"module_layout\0"
-;
+	"\x14\x00\x00\x00\x19\x48\x4c\xe1"
+	"drop_nlink\0\0"
+	"\x1c\x00\x00\x00\x46\xfa\x89\x1f"
+	"kmem_cache_destroy\0\0"
+	"\x18\x00\x00\x00\x72\x3f\x86\xba"
+	"module_layout\0\0\0"
+	"\x00\x00\x00\x00\x00\x00\x00\x00";
 
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "43BC971D635B899FC30B42C");
+MODULE_INFO(srcversion, "36164BAC83AD16A4FADCB06");

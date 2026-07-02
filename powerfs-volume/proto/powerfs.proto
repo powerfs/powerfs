@@ -10,6 +10,12 @@ service VolumeService {
     rpc DeleteNeedle(DeleteNeedleRequest) returns (DeleteNeedleResponse);
     rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
     rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+
+    rpc WriteNeedleBlob(WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse);
+    rpc ReadNeedleBlob(ReadNeedleBlobRequest) returns (ReadNeedleBlobResponse);
+    rpc ReadNeedleMeta(ReadNeedleMetaRequest) returns (ReadNeedleMetaResponse);
+    rpc BatchDelete(BatchDeleteRequest) returns (BatchDeleteResponse);
+    rpc VolumeStatus(VolumeStatusRequest) returns (VolumeStatusResponse);
 }
 
 message CreateVolumeRequest {
@@ -34,6 +40,8 @@ message WriteNeedleRequest {
     uint32 volume_id = 1;
     uint64 file_key = 2;
     bytes data = 3;
+    uint32 cookie = 4;
+    string ttl = 5;
 }
 
 message WriteNeedleResponse {
@@ -41,21 +49,26 @@ message WriteNeedleResponse {
     uint32 volume_id = 2;
     uint64 file_key = 3;
     uint64 offset = 4;
+    uint32 cookie = 5;
 }
 
 message ReadNeedleRequest {
     uint32 volume_id = 1;
     uint64 file_key = 2;
+    uint32 cookie = 3;
 }
 
 message ReadNeedleResponse {
     bool success = 1;
     bytes data = 2;
+    uint32 cookie = 3;
+    uint64 last_modified = 4;
 }
 
 message DeleteNeedleRequest {
     uint32 volume_id = 1;
     uint64 file_key = 2;
+    uint32 cookie = 3;
 }
 
 message DeleteNeedleResponse {
@@ -76,6 +89,10 @@ message VolumeInfo {
     uint32 replica_count = 5;
     int32 state = 6;
     uint64 next_file_key = 7;
+    bool read_only = 8;
+    string collection = 9;
+    string replication = 10;
+    string ttl = 11;
 }
 
 message GetNodeInfoRequest {}
@@ -85,4 +102,70 @@ message GetNodeInfoResponse {
     uint64 total_space = 2;
     uint64 used_space = 3;
     uint32 volume_count = 4;
+}
+
+message WriteNeedleBlobRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    int64 offset = 3;
+    int32 size = 4;
+    bytes needle_blob = 5;
+    uint32 cookie = 6;
+}
+
+message WriteNeedleBlobResponse {
+    bool success = 1;
+}
+
+message ReadNeedleBlobRequest {
+    uint32 volume_id = 1;
+    int64 offset = 2;
+    int32 size = 3;
+}
+
+message ReadNeedleBlobResponse {
+    bool success = 1;
+    bytes needle_blob = 2;
+}
+
+message ReadNeedleMetaRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+}
+
+message ReadNeedleMetaResponse {
+    bool success = 1;
+    uint32 cookie = 2;
+    uint64 last_modified = 3;
+    uint32 crc = 4;
+    string ttl = 5;
+    uint64 append_at_ns = 6;
+}
+
+message BatchDeleteRequest {
+    repeated string file_ids = 1;
+    bool skip_cookie_check = 2;
+}
+
+message BatchDeleteResponse {
+    repeated DeleteResult results = 1;
+}
+
+message DeleteResult {
+    string file_id = 1;
+    int32 status = 2;
+    string error = 3;
+    uint32 size = 4;
+}
+
+message VolumeStatusRequest {
+    uint32 volume_id = 1;
+}
+
+message VolumeStatusResponse {
+    bool success = 1;
+    bool is_read_only = 2;
+    uint64 volume_size = 3;
+    uint64 file_count = 4;
+    uint64 file_deleted_count = 5;
 }

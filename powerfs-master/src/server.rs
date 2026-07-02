@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_stream::StreamExt;
 use tonic::{transport::Channel, transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
@@ -624,5 +625,204 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<ClusterInfoResponse>, Status> {
         let cluster_info = self.master.get_cluster_info().await;
         Ok(Response::new(cluster_info))
+    }
+
+    type StreamMutateEntryStream =
+        Pin<Box<dyn Stream<Item = Result<MutateEntryResponse, Status>> + Send + 'static>>;
+
+    type SubscribeMetadataStream =
+        Pin<Box<dyn Stream<Item = Result<MetadataNotification, Status>> + Send + 'static>>;
+
+    async fn lookup_directory_entry(
+        &self,
+        request: Request<LookupDirectoryEntryRequest>,
+    ) -> Result<Response<LookupDirectoryEntryResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        if let Some(entry) = dir_tree.lookup(&req.directory, &req.name) {
+            Ok(Response::new(LookupDirectoryEntryResponse {
+                found: true,
+                entry: Some(entry),
+                error: String::new(),
+            }))
+        } else {
+            Ok(Response::new(LookupDirectoryEntryResponse {
+                found: false,
+                entry: None,
+                error: String::new(),
+            }))
+        }
+    }
+
+    async fn get_entry(
+        &self,
+        request: Request<GetEntryRequest>,
+    ) -> Result<Response<GetEntryResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        if let Some(entry) = dir_tree.get_entry(&req.path) {
+            Ok(Response::new(GetEntryResponse {
+                found: true,
+                entry: Some(entry),
+                error: String::new(),
+            }))
+        } else {
+            Ok(Response::new(GetEntryResponse {
+                found: false,
+                entry: None,
+                error: String::new(),
+            }))
+        }
+    }
+
+    async fn create_entry(
+        &self,
+        request: Request<CreateEntryRequest>,
+    ) -> Result<Response<CreateEntryResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.create_entry(req.entry.unwrap_or_default()) {
+            Ok(inode) => Ok(Response::new(CreateEntryResponse {
+                success: true,
+                error: String::new(),
+                inode,
+            })),
+            Err(e) => Ok(Response::new(CreateEntryResponse {
+                success: false,
+                error: e.to_string(),
+                inode: 0,
+            })),
+        }
+    }
+
+    async fn update_entry(
+        &self,
+        request: Request<UpdateEntryRequest>,
+    ) -> Result<Response<UpdateEntryResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.update_entry(&req.entry.unwrap_or_default()) {
+            Ok(_) => Ok(Response::new(UpdateEntryResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(UpdateEntryResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn delete_entry(
+        &self,
+        request: Request<DeleteEntryRequest>,
+    ) -> Result<Response<DeleteEntryResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.delete_entry(&req.path) {
+            Ok(_) => Ok(Response::new(DeleteEntryResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteEntryResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn list_entries(
+        &self,
+        request: Request<ListEntriesRequest>,
+    ) -> Result<Response<ListEntriesResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let entries = dir_tree.list_entries(&req.directory, req.limit, &req.last_name);
+
+        Ok(Response::new(ListEntriesResponse {
+            entries,
+            has_more: false,
+            error: String::new(),
+        }))
+    }
+
+    async fn stream_mutate_entry(
+        &self,
+        request: Request<Streaming<MutateEntryRequest>>,
+    ) -> Result<Response<Self::StreamMutateEntryStream>, Status> {
+        let mut stream = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
+            while let Some(req) = stream.message().await.unwrap_or(None) {
+                let result = match req.mutation {
+                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Create(
+                        create_req,
+                    )) => dir_tree
+                        .create_entry(create_req.entry.unwrap_or_default())
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
+                        update_req,
+                    )) => dir_tree
+                        .update_entry(&update_req.entry.unwrap_or_default())
+                        .map_err(|e| e.to_string()),
+                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
+                        delete_req,
+                    )) => dir_tree
+                        .delete_entry(&delete_req.path)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    None => Ok(()),
+                };
+
+                let _ = tx
+                    .send(MutateEntryResponse {
+                        success: result.is_ok(),
+                        error: result.err().unwrap_or_default(),
+                    })
+                    .await;
+            }
+        });
+
+        #[allow(clippy::result_large_err)]
+        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+        Ok(Response::new(Box::pin(output_stream)))
+    }
+
+    async fn subscribe_metadata(
+        &self,
+        request: Request<SubscribeMetadataRequest>,
+    ) -> Result<Response<Self::SubscribeMetadataStream>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let path_prefix = if req.path_prefix.is_empty() {
+            "/".to_string()
+        } else {
+            req.path_prefix
+        };
+
+        dir_tree.add_subscriber(&path_prefix);
+
+        let mut rx = dir_tree.subscribe();
+
+        let output_stream = async_stream::stream! {
+            while let Ok(notification) = rx.recv().await {
+                if notification.path.starts_with(&path_prefix) || path_prefix == "/" {
+                    yield Ok(notification);
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(output_stream)))
     }
 }

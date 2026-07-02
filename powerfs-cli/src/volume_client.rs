@@ -67,6 +67,8 @@ impl VolumeServerClient {
             volume_id,
             file_key,
             data: data.to_vec(),
+            cookie: 0,
+            ttl: "".to_string(),
         };
         let response = service.write_needle(tonic::Request::new(request)).await?;
         let result = response.into_inner();
@@ -90,6 +92,7 @@ impl VolumeServerClient {
         let request = ReadNeedleRequest {
             volume_id,
             file_key,
+            cookie: 0,
         };
         let response = service.read_needle(tonic::Request::new(request)).await?;
         let result = response.into_inner();
@@ -110,6 +113,7 @@ impl VolumeServerClient {
         let request = DeleteNeedleRequest {
             volume_id,
             file_key,
+            cookie: 0,
         };
         let response = service.delete_needle(tonic::Request::new(request)).await?;
         let result = response.into_inner();

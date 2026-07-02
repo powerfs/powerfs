@@ -10,6 +10,7 @@ log
 docs/
 .cargo
 vendor/
+qemu/
 
 # Kernel module build artifacts
 kernel/**/*.o

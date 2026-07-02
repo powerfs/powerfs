@@ -1,5 +1,6 @@
 use lru::LruCache;
 use powerfs_common::types::Fid;
+use powerfs_master::proto::FileChunk;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,8 +8,31 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const ROOT_INODE: u64 = 1;
+pub const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Cached metadata for a file or directory
+#[derive(Debug, Clone)]
+pub struct CachedFileChunk {
+    pub offset: u64,
+    pub size: u64,
+    pub mtime: u64,
+    pub fid: String,
+    pub cookie: u32,
+    pub crc32: u32,
+}
+
+impl From<FileChunk> for CachedFileChunk {
+    fn from(chunk: FileChunk) -> Self {
+        CachedFileChunk {
+            offset: chunk.offset,
+            size: chunk.size,
+            mtime: chunk.mtime,
+            fid: chunk.fid,
+            cookie: chunk.cookie,
+            crc32: chunk.crc32,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub inode: u64,
@@ -26,6 +50,22 @@ pub struct CachedEntry {
     pub atime: i64,
     pub mtime: i64,
     pub ctime: i64,
+    pub xattrs: HashMap<String, Vec<u8>>,
+    pub chunks: Vec<CachedFileChunk>,
+    pub hard_link_id: String,
+    pub hard_link_counter: u32,
+    pub content_size: u64,
+    pub disk_size: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct UpdateAttrParams {
+    pub mode: Option<u32>,
+    pub size: Option<u64>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: Option<i64>,
+    pub mtime: Option<i64>,
 }
 
 /// Directory listing cache entry with TTL
@@ -74,13 +114,19 @@ impl MetadataCache {
             symlink_target: None,
             nlink: 2,
             fid: None,
-            size: 0,
+            size: 4096,
             mode: 0o755,
             uid: 0,
             gid: 0,
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 4096,
+            disk_size: 4096,
         });
         cache
     }
@@ -180,7 +226,7 @@ impl MetadataCache {
     }
 
     /// Get path for an inode by walking up the tree
-    fn inode_to_path(&self, inode: u64) -> Option<String> {
+    pub fn inode_to_path(&self, inode: u64) -> Option<String> {
         let path_map = self.path_map.read().unwrap();
         for (path, ino) in path_map.iter() {
             if *ino == inode {
@@ -199,32 +245,37 @@ impl MetadataCache {
         }
     }
 
-    /// Update attributes
-    pub fn update_attr(
-        &self,
-        inode: u64,
-        mode: Option<u32>,
-        size: Option<u64>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-    ) {
+    /// Update FID (file ID)
+    pub fn update_fid(&self, inode: u64, fid: Fid) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
-            if let Some(m) = mode {
+            entry.fid = Some(fid);
+        }
+    }
+
+    pub fn update_attr(&self, inode: u64, params: UpdateAttrParams) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            if let Some(m) = params.mode {
                 entry.mode = m;
             }
-            if let Some(s) = size {
+            if let Some(s) = params.size {
                 entry.size = s;
             }
-            if let Some(u) = uid {
+            if let Some(u) = params.uid {
                 entry.uid = u;
             }
-            if let Some(g) = gid {
+            if let Some(g) = params.gid {
                 entry.gid = g;
+            }
+            if let Some(a) = params.atime {
+                entry.atime = a;
+            }
+            if let Some(mt) = params.mtime {
+                entry.mtime = mt;
             }
             let now = chrono::Utc::now().timestamp();
             entry.ctime = now;
-            entry.mtime = now;
         }
     }
 
@@ -382,6 +433,40 @@ impl MetadataCache {
         cache.peek(&inode).and_then(|e| e.symlink_target.clone())
     }
 
+    /// Set extended attribute
+    pub fn set_xattr(&self, inode: u64, name: &str, value: &[u8]) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.xattrs.insert(name.to_string(), value.to_vec());
+        }
+    }
+
+    /// Get extended attribute
+    pub fn get_xattr(&self, inode: u64, name: &str) -> Option<Vec<u8>> {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).and_then(|e| e.xattrs.get(name).cloned())
+    }
+
+    /// Remove extended attribute
+    pub fn remove_xattr(&self, inode: u64, name: &str) -> bool {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.xattrs.remove(name)
+        } else {
+            None
+        }
+        .is_some()
+    }
+
+    /// List extended attributes
+    pub fn list_xattrs(&self, inode: u64) -> Vec<String> {
+        let cache = self.inode_cache.read().unwrap();
+        cache
+            .peek(&inode)
+            .map(|e| e.xattrs.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Lookup an entry by parent inode and name
     pub fn lookup_in_cache(&self, parent: u64, name: &str) -> Option<CachedEntry> {
         let children = self.list_children(parent);
@@ -442,6 +527,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -472,6 +563,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -502,6 +599,12 @@ mod tests {
                 atime: now,
                 mtime: now,
                 ctime: now,
+                xattrs: HashMap::new(),
+                chunks: Vec::new(),
+                hard_link_id: String::new(),
+                hard_link_counter: 0,
+                content_size: 0,
+                disk_size: 0,
             });
         }
 
@@ -530,6 +633,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         cache.update_size(inode, 1024);
@@ -558,6 +667,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -589,6 +704,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -621,6 +742,12 @@ mod tests {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -631,5 +758,192 @@ mod tests {
             cache.get_symlink_target(inode),
             Some("/target/path".to_string())
         );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkData {
+    pub data: Vec<u8>,
+    pub offset: u64,
+    pub size: u64,
+    pub mtime: u64,
+    pub crc32: u32,
+}
+
+pub struct ChunkCache {
+    cache: RwLock<LruCache<(u64, u64), ChunkData>>,
+    chunk_size: u64,
+}
+
+impl ChunkCache {
+    pub fn new(chunk_size: u64, max_chunks: usize) -> Self {
+        ChunkCache {
+            cache: RwLock::new(LruCache::new(
+                NonZero::new(max_chunks).unwrap_or(NonZero::new(100).unwrap()),
+            )),
+            chunk_size,
+        }
+    }
+
+    pub fn with_defaults() -> Self {
+        ChunkCache::new(DEFAULT_CHUNK_SIZE, 100)
+    }
+
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
+    pub fn get_chunk_index(&self, offset: u64) -> u64 {
+        offset / self.chunk_size
+    }
+
+    pub fn get_chunk_offset(&self, offset: u64) -> u64 {
+        offset % self.chunk_size
+    }
+
+    pub fn get(&self, inode: u64, offset: u64) -> Option<ChunkData> {
+        let chunk_index = self.get_chunk_index(offset);
+        let mut cache = self.cache.write().unwrap();
+        cache.get(&(inode, chunk_index)).cloned()
+    }
+
+    pub fn put(&self, inode: u64, offset: u64, data: Vec<u8>, mtime: u64, crc32: u32) {
+        let chunk_index = self.get_chunk_index(offset);
+        let mut cache = self.cache.write().unwrap();
+        cache.put(
+            (inode, chunk_index),
+            ChunkData {
+                data,
+                offset: chunk_index * self.chunk_size,
+                size: self.chunk_size,
+                mtime,
+                crc32,
+            },
+        );
+    }
+
+    pub fn remove(&self, inode: u64) {
+        let mut cache = self.cache.write().unwrap();
+        let keys_to_remove: Vec<_> = cache
+            .iter()
+            .filter(|((ino, _), _)| *ino == inode)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in keys_to_remove {
+            cache.pop(&key);
+        }
+    }
+
+    pub fn remove_chunk(&self, inode: u64, offset: u64) {
+        let chunk_index = self.get_chunk_index(offset);
+        let mut cache = self.cache.write().unwrap();
+        cache.pop(&(inode, chunk_index));
+    }
+
+    pub fn clear(&self) {
+        let mut cache = self.cache.write().unwrap();
+        cache.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        let cache = self.cache.read().unwrap();
+        cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let cache = self.cache.read().unwrap();
+        cache.is_empty()
+    }
+
+    pub fn prefetch(&self, inode: u64, start_offset: u64, end_offset: u64) -> Vec<(u64, u64)> {
+        let start_chunk = self.get_chunk_index(start_offset);
+        let end_chunk = if end_offset == 0 {
+            0
+        } else {
+            self.get_chunk_index(end_offset - 1)
+        };
+        let mut missing = Vec::new();
+
+        {
+            let cache = self.cache.read().unwrap();
+            for chunk_index in start_chunk..=end_chunk {
+                if !cache.contains(&(inode, chunk_index)) {
+                    missing.push((chunk_index * self.chunk_size, self.chunk_size));
+                }
+            }
+        }
+
+        missing
+    }
+}
+
+impl Default for ChunkCache {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
+
+#[cfg(test)]
+mod chunk_cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_chunk_cache_basic() {
+        let cache = ChunkCache::new(1024, 10);
+        let inode = 100;
+
+        assert!(cache.get(inode, 0).is_none());
+
+        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
+        let chunk = cache.get(inode, 0).unwrap();
+        assert_eq!(chunk.data.len(), 1024);
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.mtime, 1234567890);
+    }
+
+    #[test]
+    fn test_chunk_cache_remove() {
+        let cache = ChunkCache::new(1024, 10);
+        let inode = 100;
+
+        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
+        cache.put(inode, 1024, vec![1u8; 1024], 1234567891, 1);
+
+        assert!(cache.get(inode, 0).is_some());
+        assert!(cache.get(inode, 1024).is_some());
+
+        cache.remove(inode);
+
+        assert!(cache.get(inode, 0).is_none());
+        assert!(cache.get(inode, 1024).is_none());
+    }
+
+    #[test]
+    fn test_chunk_cache_prefetch() {
+        let cache = ChunkCache::new(1024, 10);
+        let inode = 100;
+
+        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
+
+        let missing = cache.prefetch(inode, 0, 3072);
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0], (1024, 1024));
+        assert_eq!(missing[1], (2048, 1024));
+    }
+
+    #[test]
+    fn test_chunk_index() {
+        let cache = ChunkCache::new(1024, 10);
+
+        assert_eq!(cache.get_chunk_index(0), 0);
+        assert_eq!(cache.get_chunk_index(512), 0);
+        assert_eq!(cache.get_chunk_index(1024), 1);
+        assert_eq!(cache.get_chunk_index(1536), 1);
+        assert_eq!(cache.get_chunk_index(2048), 2);
+
+        assert_eq!(cache.get_chunk_offset(0), 0);
+        assert_eq!(cache.get_chunk_offset(512), 512);
+        assert_eq!(cache.get_chunk_offset(1024), 0);
+        assert_eq!(cache.get_chunk_offset(1536), 512);
     }
 }

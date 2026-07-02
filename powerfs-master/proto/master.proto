@@ -25,6 +25,16 @@ service MasterService {
     
     // Cluster management
     rpc GetClusterInfo(ClusterInfoRequest) returns (ClusterInfoResponse);
+    
+    // Filer metadata API
+    rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
+    rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
+    rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
+    rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse);
+    rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
+    rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+    rpc StreamMutateEntry(stream MutateEntryRequest) returns (stream MutateEntryResponse);
+    rpc SubscribeMetadata(SubscribeMetadataRequest) returns (stream MetadataNotification);
 }
 
 message Heartbeat {
@@ -364,6 +374,137 @@ message TransferLeaderRequest {
 message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
+}
+
+// Filer metadata types
+message FileChunk {
+    uint64 offset = 1;
+    uint64 size = 2;
+    uint64 mtime = 3;
+    string fid = 4;
+    uint32 cookie = 5;
+    uint32 crc32 = 6;
+}
+
+message FuseAttributes {
+    uint64 ino = 1;
+    uint32 mode = 2;
+    uint32 nlink = 3;
+    uint32 uid = 4;
+    uint32 gid = 5;
+    uint64 rdev = 6;
+    uint64 size = 7;
+    uint64 blksize = 8;
+    uint64 blocks = 9;
+    uint64 atime = 10;
+    uint64 mtime = 11;
+    uint64 ctime = 12;
+    uint64 crtime = 13;
+    uint32 perm = 14;
+}
+
+message Entry {
+    string name = 1;
+    string directory = 2;
+    FuseAttributes attributes = 3;
+    repeated FileChunk chunks = 4;
+    string hard_link_id = 5;
+    uint32 hard_link_counter = 6;
+    map<string, bytes> extended = 7;
+    uint64 content_size = 8;
+    uint64 disk_size = 9;
+    string ttl = 10;
+}
+
+message LookupDirectoryEntryRequest {
+    string directory = 1;
+    string name = 2;
+}
+
+message LookupDirectoryEntryResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+}
+
+message GetEntryRequest {
+    string path = 1;
+}
+
+message GetEntryResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+}
+
+message CreateEntryRequest {
+    Entry entry = 1;
+}
+
+message CreateEntryResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 inode = 3;
+}
+
+message UpdateEntryRequest {
+    Entry entry = 1;
+}
+
+message UpdateEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message DeleteEntryRequest {
+    string path = 1;
+    bool is_directory = 2;
+}
+
+message DeleteEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListEntriesRequest {
+    string directory = 1;
+    uint64 limit = 2;
+    string last_name = 3;
+}
+
+message ListEntriesResponse {
+    repeated Entry entries = 1;
+    bool has_more = 2;
+    string error = 3;
+}
+
+message MutateEntryRequest {
+    oneof mutation {
+        CreateEntryRequest create = 1;
+        UpdateEntryRequest update = 2;
+        DeleteEntryRequest delete = 3;
+    }
+}
+
+message MutateEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message SubscribeMetadataRequest {
+    string path_prefix = 1;
+}
+
+message MetadataNotification {
+    enum EventType {
+        CREATE = 0;
+        UPDATE = 1;
+        DELETE = 2;
+    }
+    EventType event_type = 1;
+    string path = 2;
+    Entry entry = 3;
+    uint64 timestamp = 4;
 }
 
 // KV Cache service for LLM inference KV cache management

@@ -106,6 +106,7 @@ impl VolumeService for VolumeServer {
                         volume_id: volume_id.0,
                         file_key: info.id.0,
                         offset: info.offset,
+                        cookie: 0,
                     })),
                     Err(e) => Err(Status::internal(format!("{}", e))),
                 }
@@ -138,6 +139,8 @@ impl VolumeService for VolumeServer {
                     Ok(data) => Ok(Response::new(crate::proto::ReadNeedleResponse {
                         success: true,
                         data: data.to_vec(),
+                        cookie: 0,
+                        last_modified: 0,
                     })),
                     Err(e) => Err(Status::internal(format!("{}", e))),
                 }
@@ -199,6 +202,10 @@ impl VolumeService for VolumeServer {
                 replica_count: v.replica_count,
                 state: v.state as i32,
                 next_file_key: v.next_file_key,
+                read_only: false,
+                collection: "".to_string(),
+                replication: "".to_string(),
+                ttl: "".to_string(),
             })
             .collect();
 
@@ -219,5 +226,189 @@ impl VolumeService for VolumeServer {
         };
 
         Ok(Response::new(info))
+    }
+
+    async fn write_needle_blob(
+        &self,
+        request: Request<crate::proto::WriteNeedleBlobRequest>,
+    ) -> std::result::Result<Response<crate::proto::WriteNeedleBlobResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
+        let offset = req.offset;
+        let size = req.size;
+        let cookie = req.cookie;
+
+        let storage_manager = self.storage_manager.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let result = volume.write_needle_blob(
+                    file_key,
+                    offset,
+                    size,
+                    Bytes::from(req.needle_blob),
+                    cookie,
+                );
+                match result {
+                    Ok(_) => Ok(Response::new(crate::proto::WriteNeedleBlobResponse {
+                        success: true,
+                    })),
+                    Err(e) => Err(Status::internal(format!("{}", e))),
+                }
+            } else {
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn read_needle_blob(
+        &self,
+        request: Request<crate::proto::ReadNeedleBlobRequest>,
+    ) -> std::result::Result<Response<crate::proto::ReadNeedleBlobResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let offset = req.offset;
+        let size = req.size;
+
+        let storage_manager = self.storage_manager.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let result = volume.read_needle_blob(offset, size);
+                match result {
+                    Ok(data) => Ok(Response::new(crate::proto::ReadNeedleBlobResponse {
+                        success: true,
+                        needle_blob: data.to_vec(),
+                    })),
+                    Err(e) => Err(Status::internal(format!("{}", e))),
+                }
+            } else {
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn read_needle_meta(
+        &self,
+        request: Request<crate::proto::ReadNeedleMetaRequest>,
+    ) -> std::result::Result<Response<crate::proto::ReadNeedleMetaResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
+
+        let storage_manager = self.storage_manager.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                if let Some(info) = volume.read_needle_meta(file_key) {
+                    Ok(Response::new(crate::proto::ReadNeedleMetaResponse {
+                        success: true,
+                        cookie: 0,
+                        last_modified: info.created_at.timestamp_nanos_opt().unwrap_or(0) as u64,
+                        crc: info.checksum as u32,
+                        ttl: "".to_string(),
+                        append_at_ns: info.created_at.timestamp_nanos_opt().unwrap_or(0) as u64,
+                    }))
+                } else {
+                    Err(Status::not_found(format!("needle not found: {}", file_key)))
+                }
+            } else {
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn batch_delete(
+        &self,
+        request: Request<crate::proto::BatchDeleteRequest>,
+    ) -> std::result::Result<Response<crate::proto::BatchDeleteResponse>, Status> {
+        let req = request.into_inner();
+
+        let mut results = Vec::new();
+
+        for file_id in req.file_ids {
+            let parts: Vec<&str> = file_id.split(',').collect();
+            if parts.len() >= 3 {
+                if let (Ok(volume_id), Ok(file_key)) =
+                    (parts[0].parse::<u32>(), parts[1].parse::<u64>())
+                {
+                    let volume_id = VolumeId(volume_id);
+                    let needle_id = NeedleId(file_key);
+
+                    let storage_manager = self.storage_manager.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                            volume.delete_needle(&needle_id)
+                        } else {
+                            Err(PowerFsError::VolumeNotFound(volume_id))
+                        }
+                    })
+                    .await
+                    .unwrap();
+
+                    match result {
+                        Ok(_) => results.push(crate::proto::DeleteResult {
+                            file_id: file_id.clone(),
+                            status: 0,
+                            error: "".to_string(),
+                            size: 0,
+                        }),
+                        Err(e) => results.push(crate::proto::DeleteResult {
+                            file_id: file_id.clone(),
+                            status: -1,
+                            error: format!("{}", e),
+                            size: 0,
+                        }),
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(crate::proto::BatchDeleteResponse { results }))
+    }
+
+    async fn volume_status(
+        &self,
+        request: Request<crate::proto::VolumeStatusRequest>,
+    ) -> std::result::Result<Response<crate::proto::VolumeStatusResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        let storage_manager = self.storage_manager.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                Ok(Response::new(crate::proto::VolumeStatusResponse {
+                    success: true,
+                    is_read_only: volume.is_read_only(),
+                    volume_size: volume.size(),
+                    file_count: volume.count() as u64,
+                    file_deleted_count: volume.deleted_count() as u64,
+                }))
+            } else {
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        .unwrap()
     }
 }

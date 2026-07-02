@@ -8,6 +8,7 @@
 #include <linux/rwsem.h>
 #include <linux/string.h>
 #include <linux/statfs.h>
+#include <linux/version.h>
 
 #include "powerfs.h"
 
@@ -19,7 +20,11 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct de
 static int powerfs_link(struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
 static int powerfs_unlink(struct inode *dir, struct dentry *dentry);
 static int powerfs_rmdir(struct inode *dir, struct dentry *dentry);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 static struct dentry *powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+#else
+static int powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+#endif
 static int powerfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags);
@@ -97,20 +102,14 @@ static struct dentry *powerfs_lookup(struct inode *dir, struct dentry *dentry, u
 {
 	struct powerfs_inode_info *parent = powerfs_i(dir);
 	struct powerfs_inode_info *child;
-	struct inode *inode;
 
 	if (dentry->d_name.len > POWERFS_MAX_FILENAME - 1)
 		return ERR_PTR(-ENAMETOOLONG);
 
 	child = powerfs_lookup_child(parent, dentry->d_name.name);
 	if (child) {
-		inode = iget_locked(dir->i_sb, child->vfs_inode.i_ino);
-		if (inode) {
-			unlock_new_inode(inode);
-			d_add(dentry, inode);
-			return NULL;
-		}
-		return ERR_PTR(-ENOMEM);
+		d_add(dentry, &child->vfs_inode);
+		return NULL;
 	}
 
 	return NULL;
@@ -164,7 +163,7 @@ static int powerfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct de
 	child->size = strlen(symname);
 	strncpy(child->name, dentry->d_name.name, POWERFS_MAX_FILENAME - 1);
 	child->name[POWERFS_MAX_FILENAME - 1] = '\0';
-	child->parent = parent;
+	child->parent = powerfs_i(dir);
 	child->nlink = 1;
 
 	powerfs_add_child(parent, child);
@@ -177,22 +176,16 @@ static int powerfs_link(struct dentry *old_dentry, struct inode *new_dir, struct
 {
 	struct powerfs_inode_info *old_pi = powerfs_i(d_inode(old_dentry));
 	struct powerfs_inode_info *new_parent = powerfs_i(new_dir);
-	struct powerfs_inode_info *new_pi;
 	struct inode *inode = d_inode(old_dentry);
 
-	new_pi = kzalloc(sizeof(struct powerfs_inode_info), GFP_KERNEL);
-	if (!new_pi)
-		return -ENOMEM;
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
 
-	new_pi->data = old_pi->data;
-	new_pi->size = old_pi->size;
-	new_pi->capacity = old_pi->capacity;
-	strncpy(new_pi->name, new_dentry->d_name.name, POWERFS_MAX_FILENAME - 1);
-	new_pi->name[POWERFS_MAX_FILENAME - 1] = '\0';
-	new_pi->parent = new_parent;
-	INIT_LIST_HEAD(&new_pi->children);
+	strncpy(old_pi->name, new_dentry->d_name.name, POWERFS_MAX_FILENAME - 1);
+	old_pi->name[POWERFS_MAX_FILENAME - 1] = '\0';
+	old_pi->parent = new_parent;
 
-	powerfs_add_child(new_parent, new_pi);
+	powerfs_add_child(new_parent, old_pi);
 
 	d_add(new_dentry, inode);
 	inode_inc_link_count(inode);
@@ -221,11 +214,11 @@ static int powerfs_rmdir(struct inode *dir, struct dentry *dentry)
 
 	powerfs_remove_child(parent, child);
 	drop_nlink(d_inode(dentry));
-	drop_nlink(dir);
 
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 static struct dentry *powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	struct powerfs_inode_info *parent = powerfs_i(dir);
@@ -240,7 +233,7 @@ static struct dentry *powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, 
 	INIT_LIST_HEAD(&child->children);
 	strncpy(child->name, dentry->d_name.name, POWERFS_MAX_FILENAME - 1);
 	child->name[POWERFS_MAX_FILENAME - 1] = '\0';
-	child->parent = parent;
+	child->parent = powerfs_i(dir);
 	child->nlink = 2;
 
 	powerfs_add_child(parent, child);
@@ -248,6 +241,30 @@ static struct dentry *powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, 
 	d_add(dentry, inode);
 	return NULL;
 }
+#else
+static int powerfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct powerfs_inode_info *parent = powerfs_i(dir);
+	struct powerfs_inode_info *child;
+	struct inode *inode;
+
+	inode = powerfs_get_inode(dir->i_sb, S_IFDIR | mode);
+	if (!inode)
+		return -ENOMEM;
+
+	child = powerfs_i(inode);
+	INIT_LIST_HEAD(&child->children);
+	strncpy(child->name, dentry->d_name.name, POWERFS_MAX_FILENAME - 1);
+	child->name[POWERFS_MAX_FILENAME - 1] = '\0';
+	child->parent = powerfs_i(dir);
+	child->nlink = 2;
+
+	powerfs_add_child(parent, child);
+
+	d_add(dentry, inode);
+	return 0;
+}
+#endif
 
 static int powerfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
@@ -356,6 +373,7 @@ static int powerfs_readdir(struct file *file, struct dir_context *ctx)
 	struct powerfs_inode_info *parent = powerfs_i(inode);
 	struct powerfs_inode_info *child;
 	unsigned long pos = ctx->pos;
+	unsigned long idx = 0;
 
 	if (!S_ISDIR(inode->i_mode))
 		return -ENOTDIR;
@@ -363,25 +381,23 @@ static int powerfs_readdir(struct file *file, struct dir_context *ctx)
 	if (pos == 0) {
 		if (!dir_emit(ctx, ".", 1, inode->i_ino, DT_DIR))
 			return 0;
-		ctx->pos++;
-		pos++;
+		ctx->pos = 1;
 	}
 
 	if (pos == 1) {
 		if (!dir_emit(ctx, "..", 2, parent->parent ? parent->parent->vfs_inode.i_ino : inode->i_ino, DT_DIR))
 			return 0;
-		ctx->pos++;
-		pos++;
+		ctx->pos = 2;
 	}
 
 	list_for_each_entry(child, &parent->children, sibling) {
-		if (pos > 2) {
+		if (pos == 2 + idx) {
 			if (!dir_emit(ctx, child->name, strlen(child->name), child->vfs_inode.i_ino,
 				      S_ISDIR(child->vfs_inode.i_mode) ? DT_DIR : DT_REG))
 				return 0;
 			ctx->pos++;
 		}
-		pos++;
+		idx++;
 	}
 
 	return 0;
@@ -425,6 +441,7 @@ static int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struc
 	if (attr->ia_valid & ATTR_GID)
 		inode->i_gid = attr->ia_gid;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 	if (attr->ia_valid & ATTR_ATIME) {
 		inode->i_atime_sec = attr->ia_atime.tv_sec;
 		inode->i_atime_nsec = attr->ia_atime.tv_nsec;
@@ -439,6 +456,16 @@ static int powerfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struc
 		inode->i_ctime_sec = attr->ia_ctime.tv_sec;
 		inode->i_ctime_nsec = attr->ia_ctime.tv_nsec;
 	}
+#else
+	if (attr->ia_valid & ATTR_ATIME)
+		inode_set_atime(inode, attr->ia_atime.tv_sec, attr->ia_atime.tv_nsec);
+
+	if (attr->ia_valid & ATTR_MTIME)
+		inode_set_mtime(inode, attr->ia_mtime.tv_sec, attr->ia_mtime.tv_nsec);
+
+	if (attr->ia_valid & ATTR_CTIME)
+		inode_set_ctime(inode, attr->ia_ctime.tv_sec, attr->ia_ctime.tv_nsec);
+#endif
 
 	mark_inode_dirty(inode);
 	return 0;

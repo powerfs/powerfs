@@ -37,6 +37,7 @@ pub struct MasterNode {
     client_manager: RwLock<ClientManager>,
     notify_tx: mpsc::Sender<VolumeLocationUpdate>,
     pub kv_cache: Arc<KVCacheEngine>,
+    pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,19 @@ impl MasterNode {
             2 * 1024 * 1024,    // 2MB block
         ));
 
+        let dir_tree_path = std::path::Path::new(raft_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let dir_tree = Arc::new(
+            crate::directory_tree::DirectoryTree::new(&dir_tree_path.join("directory_tree"))
+                .map_err(|e| {
+                    PowerFsError::Internal(format!("Failed to create directory tree: {}", e))
+                })?,
+        );
+        dir_tree
+            .init_root()
+            .map_err(|e| PowerFsError::Internal(format!("Failed to init root: {}", e)))?;
+
         let master = MasterNode {
             id: node_id.clone(),
             address: addr,
@@ -180,6 +194,7 @@ impl MasterNode {
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx,
             kv_cache,
+            directory_tree: dir_tree,
         };
 
         let master_clone = master.clone();
@@ -1198,6 +1213,7 @@ impl Clone for MasterNode {
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx: self.notify_tx.clone(),
             kv_cache: self.kv_cache.clone(),
+            directory_tree: self.directory_tree.clone(),
         }
     }
 }

@@ -4,8 +4,11 @@ pub mod powerfs {
 
 pub use powerfs::volume_service_server::{VolumeService, VolumeServiceServer};
 pub use powerfs::{
-    CreateVolumeRequest, CreateVolumeResponse, DeleteNeedleRequest, DeleteNeedleResponse,
-    DeleteVolumeRequest, DeleteVolumeResponse, GetNodeInfoRequest, GetNodeInfoResponse,
-    ListVolumesRequest, ListVolumesResponse, ReadNeedleRequest, ReadNeedleResponse, VolumeInfo,
-    WriteNeedleRequest, WriteNeedleResponse,
+    BatchDeleteRequest, BatchDeleteResponse, CreateVolumeRequest, CreateVolumeResponse,
+    DeleteNeedleRequest, DeleteNeedleResponse, DeleteResult, DeleteVolumeRequest,
+    DeleteVolumeResponse, GetNodeInfoRequest, GetNodeInfoResponse, ListVolumesRequest,
+    ListVolumesResponse, ReadNeedleBlobRequest, ReadNeedleBlobResponse, ReadNeedleMetaRequest,
+    ReadNeedleMetaResponse, ReadNeedleRequest, ReadNeedleResponse, VolumeInfo, VolumeStatusRequest,
+    VolumeStatusResponse, WriteNeedleBlobRequest, WriteNeedleBlobResponse, WriteNeedleRequest,
+    WriteNeedleResponse,
 };

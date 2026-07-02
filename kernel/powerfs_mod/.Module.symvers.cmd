@@ -1,1 +1,1 @@
-savedcmd_Module.symvers :=  /usr/src/linux-headers-6.17.0-35-generic/scripts/mod/modpost -M -m -b -x -a      -o Module.symvers -T modules.order -i /usr/src/linux-headers-6.17.0-35-generic/Module.symvers -e 
+savedcmd_/home/portion/powerfs/kernel/powerfs_mod/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/portion/powerfs/kernel/powerfs_mod/Module.symvers -T /home/portion/powerfs/kernel/powerfs_mod/modules.order -i Module.symvers -e 

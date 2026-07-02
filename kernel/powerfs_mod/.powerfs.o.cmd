@@ -1,1 +1,1 @@
-savedcmd_powerfs.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o powerfs.o @powerfs.mod 
+savedcmd_/home/portion/powerfs/kernel/powerfs_mod/powerfs.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o /home/portion/powerfs/kernel/powerfs_mod/powerfs.o @/home/portion/powerfs/kernel/powerfs_mod/powerfs.mod 

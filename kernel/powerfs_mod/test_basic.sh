@@ -1,7 +1,7 @@
 #!/bin/bash
 
 MOUNT_POINT="/mnt/powerfs_test"
-MODULE_PATH="/home/portion/powerfs/kernel/powerfs_mod/powerfs.ko"
+MODULE_PATH="/mnt/share/powerfs.ko"
 
 set -e
 

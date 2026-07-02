@@ -1,3 +1,4 @@
+pub mod directory_tree;
 pub mod kv_cache_service;
 pub mod master;
 pub mod metrics;

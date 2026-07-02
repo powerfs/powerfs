@@ -1,12 +1,15 @@
-use crate::cache::{CachedEntry, MetadataCache, ROOT_INODE};
+use crate::cache::{CachedEntry, CachedFileChunk, MetadataCache, ROOT_INODE};
 use crate::client::{PowerFuseClient, SyncFuseClient};
 use fuse_backend_rs::api::filesystem::{
-    Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
+use powerfs_master::proto::powerfs::Entry as FilerEntry;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,22 +52,19 @@ impl FuseApp {
             self.mount_point, self.master_addr
         );
 
-        // Create gRPC client
         let grpc_client = PowerFuseClient::new(&self.master_addr, self.runtime_handle.clone());
         let sync_client = Arc::new(SyncFuseClient::new(grpc_client));
 
-        // Create metadata cache
         let cache = Arc::new(MetadataCache::new());
 
-        // Create FUSE filesystem
         let fs = PowerFsFs {
             client: sync_client,
             cache,
             collection: self.collection.clone(),
             replication: self.replication.clone(),
+            locks: Arc::new(RwLock::new(HashMap::new())),
         };
 
-        // Create FUSE session
         let mut session =
             FuseSession::new(Path::new(&self.mount_point), "powerfs", "powerfs", false).map_err(
                 |e| PowerFsError::Internal(format!("failed to create fuse session: {}", e)),
@@ -76,7 +76,6 @@ impl FuseApp {
 
         info!("FUSE mounted at: {}", self.mount_point);
 
-        // Create server and serve
         let server = Arc::new(Server::new(fs));
 
         let mut fuse_server = FuseServer {
@@ -86,7 +85,6 @@ impl FuseApp {
             })?,
         };
 
-        // Spawn service loop in a separate thread
         let handle = std::thread::Builder::new()
             .name("fuse_server".to_string())
             .spawn(move || {
@@ -96,7 +94,6 @@ impl FuseApp {
             })
             .map_err(|e| PowerFsError::Internal(format!("failed to spawn fuse thread: {}", e)))?;
 
-        // Wait for Ctrl+C
         tokio::signal::ctrl_c()
             .await
             .map_err(|e| PowerFsError::Internal(format!("signal error: {}", e)))?;
@@ -149,12 +146,16 @@ impl FuseServer {
     }
 }
 
-/// FUSE filesystem implementation backed by PowerFS Master/Volume servers
+use std::sync::RwLock;
+
+type FileLocks = HashMap<u64, Vec<FileLock>>;
+
 struct PowerFsFs {
     client: Arc<SyncFuseClient>,
     cache: Arc<MetadataCache>,
     collection: String,
     replication: String,
+    locks: Arc<RwLock<FileLocks>>,
 }
 
 impl PowerFsFs {
@@ -180,7 +181,7 @@ impl PowerFsFs {
         attr
     }
 
-    fn create_entry(&self, cached: &CachedEntry) -> Entry {
+    fn create_fuse_entry(&self, cached: &CachedEntry) -> Entry {
         Entry {
             inode: cached.inode,
             generation: 0,
@@ -194,6 +195,46 @@ impl PowerFsFs {
     fn lookup_in_cache(&self, parent: u64, name: &str) -> Option<CachedEntry> {
         self.cache.lookup_in_cache(parent, name)
     }
+
+    fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
+        let attrs = entry.attributes.as_ref();
+        let chunks = entry
+            .chunks
+            .iter()
+            .map(|chunk| CachedFileChunk {
+                offset: chunk.offset,
+                size: chunk.size,
+                mtime: chunk.mtime,
+                fid: chunk.fid.clone(),
+                cookie: chunk.cookie,
+                crc32: chunk.crc32,
+            })
+            .collect();
+
+        CachedEntry {
+            inode: attrs.map(|a| a.ino).unwrap_or(0),
+            parent,
+            name: entry.name.clone(),
+            is_dir: attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false),
+            is_symlink: attrs.map(|a| (a.mode & 0o120000) != 0).unwrap_or(false),
+            symlink_target: None,
+            nlink: attrs.map(|a| a.nlink).unwrap_or(1),
+            fid: None,
+            size: attrs.map(|a| a.size).unwrap_or(0),
+            mode: attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644),
+            uid: attrs.map(|a| a.uid).unwrap_or(0),
+            gid: attrs.map(|a| a.gid).unwrap_or(0),
+            atime: attrs.map(|a| a.atime as i64).unwrap_or(0),
+            mtime: attrs.map(|a| a.mtime as i64).unwrap_or(0),
+            ctime: attrs.map(|a| a.ctime as i64).unwrap_or(0),
+            xattrs: HashMap::new(),
+            chunks,
+            hard_link_id: entry.hard_link_id.clone(),
+            hard_link_counter: entry.hard_link_counter,
+            content_size: entry.content_size,
+            disk_size: entry.disk_size,
+        }
+    }
 }
 
 impl FileSystem for PowerFsFs {
@@ -205,9 +246,30 @@ impl FileSystem for PowerFsFs {
         debug!("lookup: parent={}, name={}", parent, name_str);
 
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
-            Ok(self.create_entry(&entry))
+            return Ok(self.create_fuse_entry(&entry));
+        }
+
+        let parent_path = self
+            .cache
+            .inode_to_path(parent)
+            .unwrap_or_else(|| "/".to_string());
+        let lookup_path = if parent_path == "/" {
+            format!("/{}", name_str)
         } else {
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            format!("{}/{}", parent_path, name_str)
+        };
+
+        match self.client.get_entry(&lookup_path) {
+            Ok(Some(entry)) => {
+                let cached = self.entry_to_cached(parent, &entry);
+                self.cache.insert(cached.clone());
+                Ok(self.create_fuse_entry(&cached))
+            }
+            Ok(None) => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            Err(e) => {
+                warn!("lookup entry failed: {}", e);
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
         }
     }
 
@@ -261,7 +323,33 @@ impl FileSystem for PowerFsFs {
             None
         };
 
-        self.cache.update_attr(inode, mode, size, uid, gid);
+        let now = chrono::Utc::now().timestamp();
+        let atime = if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::ATIME_NOW) {
+            Some(now)
+        } else if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::ATIME) {
+            Some(attr.st_atime)
+        } else {
+            None
+        };
+        let mtime = if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::MTIME_NOW) {
+            Some(now)
+        } else if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::MTIME) {
+            Some(attr.st_mtime)
+        } else {
+            None
+        };
+
+        self.cache.update_attr(
+            inode,
+            crate::cache::UpdateAttrParams {
+                mode,
+                size,
+                uid,
+                gid,
+                atime,
+                mtime,
+            },
+        );
 
         if let Some(updated) = self.cache.get_inode(inode) {
             Ok((self.create_stat(&updated), TTL))
@@ -306,9 +394,55 @@ impl FileSystem for PowerFsFs {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         };
         self.cache.insert(entry.clone());
-        Ok(self.create_entry(&entry))
+
+        let parent_path = self
+            .cache
+            .inode_to_path(parent)
+            .unwrap_or_else(|| "/".to_string());
+        let filer_entry = FilerEntry {
+            name: name_str.to_string(),
+            directory: parent_path,
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: inode,
+                mode: mode | 0o040000,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: now as u64,
+                mtime: now as u64,
+                ctime: now as u64,
+                crtime: now as u64,
+                perm: 0,
+            }),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            extended: HashMap::new(),
+            content_size: 0,
+            disk_size: 0,
+            ttl: String::new(),
+        };
+
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to create directory entry on master: {}", e);
+            }
+        }
+
+        Ok(self.create_fuse_entry(&entry))
     }
 
     fn rmdir(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<()> {
@@ -327,6 +461,17 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
+        let entry_path = self
+            .cache
+            .inode_to_path(entry.inode)
+            .unwrap_or_else(|| "/".to_string());
+        match self.client.delete_entry(&entry_path, true) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to delete directory entry on master: {}", e);
+            }
+        }
+
         self.cache.remove(entry.inode);
         Ok(())
     }
@@ -339,11 +484,9 @@ impl FileSystem for PowerFsFs {
             .lookup_in_cache(parent, name_str)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        // Decrement nlink
         let should_delete = self.cache.dec_nlink(entry.inode);
 
         if should_delete {
-            // Delete remote data if file has a FID
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
                 match self.client.lookup_volume(fid.volume_id) {
@@ -361,6 +504,18 @@ impl FileSystem for PowerFsFs {
                     }
                 }
             }
+
+            let entry_path = self
+                .cache
+                .inode_to_path(entry.inode)
+                .unwrap_or_else(|| "/".to_string());
+            match self.client.delete_entry(&entry_path, false) {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to delete file entry on master: {}", e);
+                }
+            }
+
             self.cache.remove(entry.inode);
         }
 
@@ -407,11 +562,56 @@ impl FileSystem for PowerFsFs {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         };
         self.cache.insert(entry.clone());
 
+        let parent_path = self
+            .cache
+            .inode_to_path(parent)
+            .unwrap_or_else(|| "/".to_string());
+        let filer_entry = FilerEntry {
+            name: name_str.to_string(),
+            directory: parent_path,
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: inode,
+                mode: args.mode | 0o100000,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: now as u64,
+                mtime: now as u64,
+                ctime: now as u64,
+                crtime: now as u64,
+                perm: 0,
+            }),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            extended: HashMap::new(),
+            content_size: 0,
+            disk_size: 0,
+            ttl: String::new(),
+        };
+
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to create file entry on master: {}", e);
+            }
+        }
+
         Ok((
-            self.create_entry(&entry),
+            self.create_fuse_entry(&entry),
             Some(inode),
             fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
             None,
@@ -504,12 +704,11 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<usize> {
         debug!("write: inode={}, size={}, offset={}", inode, size, offset);
 
-        let mut entry = self
+        let entry = self
             .cache
             .get_inode(inode)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        // Read data from the FUSE reader
         let mut buf = vec![0u8; size as usize];
         let read_len = r.read(&mut buf).unwrap_or(0);
         if read_len == 0 {
@@ -517,7 +716,6 @@ impl FileSystem for PowerFsFs {
         }
         buf.truncate(read_len);
 
-        // If file doesn't have a FID yet, assign one and write data
         if entry.fid.is_none() {
             let (fid, location) = self
                 .client
@@ -527,11 +725,9 @@ impl FileSystem for PowerFsFs {
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
-            // Get volume server address
             let addr = if let Some(loc) = location {
                 PowerFuseClient::location_to_grpc_addr(&loc)
             } else {
-                // Lookup volume location
                 let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
                     error!("lookup_volume failed: {}", e);
                     std::io::Error::from_raw_os_error(libc::EIO)
@@ -543,19 +739,27 @@ impl FileSystem for PowerFsFs {
             };
 
             self.client
-                .write_data(&addr, fid.volume_id.0, fid.file_key, buf)
+                .write_data(&addr, fid.volume_id.0, fid.file_key, buf.clone())
                 .map_err(|e| {
                     error!("write_data failed: {}", e);
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
-            entry.fid = Some(fid);
-            entry.size = read_len as u64;
-            self.cache.update_size(inode, read_len as u64);
-            self.cache
-                .update_attr(inode, None, Some(read_len as u64), None, None);
+            self.cache.update_fid(inode, fid);
+            let new_size = offset + read_len as u64;
+            self.cache.update_size(inode, new_size);
+            self.cache.update_attr(
+                inode,
+                crate::cache::UpdateAttrParams {
+                    mode: None,
+                    size: Some(new_size),
+                    uid: None,
+                    gid: None,
+                    atime: None,
+                    mtime: None,
+                },
+            );
         } else if let Some(fid) = &entry.fid {
-            // File already has a FID, append/overwrite
             let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
                 error!("lookup_volume failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
@@ -566,9 +770,19 @@ impl FileSystem for PowerFsFs {
             let addr = PowerFuseClient::location_to_grpc_addr(loc);
 
             self.client
-                .write_data(&addr, fid.volume_id.0, fid.file_key, buf)
+                .write_blob(
+                    &addr,
+                    crate::client::WriteBlobParams {
+                        volume_id: fid.volume_id.0,
+                        file_key: fid.file_key,
+                        offset: offset as i64,
+                        size: read_len as i32,
+                        data: buf.clone(),
+                        cookie: 0,
+                    },
+                )
                 .map_err(|e| {
-                    error!("write_data failed: {}", e);
+                    error!("write_blob failed: {}", e);
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
@@ -614,7 +828,6 @@ impl FileSystem for PowerFsFs {
 
         let mut idx = 0u64;
 
-        // Add "." entry
         if offset <= idx
             && add_entry(DirEntry {
                 ino: inode,
@@ -628,7 +841,6 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        // Add ".." entry
         if offset <= idx {
             let parent = if inode == ROOT_INODE {
                 ROOT_INODE
@@ -648,7 +860,6 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        // List children
         let children = self.cache.list_children(inode);
         for (child_ino, child_name, is_dir) in children {
             idx += 1;
@@ -697,12 +908,83 @@ impl FileSystem for PowerFsFs {
             }
         }
 
+        let entry = self
+            .lookup_in_cache(olddir, old_str)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let old_path = self
+            .cache
+            .inode_to_path(entry.inode)
+            .unwrap_or_else(|| "/".to_string());
+
         self.cache
             .rename(olddir, old_str, newdir, new_str)
             .map_err(|e| {
                 error!("rename failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
+
+        let new_parent_path = self
+            .cache
+            .inode_to_path(newdir)
+            .unwrap_or_else(|| "/".to_string());
+
+        let filer_entry = FilerEntry {
+            name: new_str.to_string(),
+            directory: new_parent_path,
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: entry.inode,
+                mode: if entry.is_dir {
+                    entry.mode | 0o040000
+                } else {
+                    entry.mode | 0o100000
+                },
+                nlink: entry.nlink,
+                uid: entry.uid,
+                gid: entry.gid,
+                rdev: 0,
+                size: entry.size,
+                blksize: 4096,
+                blocks: entry.size.div_ceil(512),
+                atime: entry.atime as u64,
+                mtime: entry.mtime as u64,
+                ctime: chrono::Utc::now().timestamp() as u64,
+                crtime: entry.atime as u64,
+                perm: 0,
+            }),
+            chunks: entry
+                .chunks
+                .iter()
+                .map(|chunk| powerfs_master::proto::powerfs::FileChunk {
+                    offset: chunk.offset,
+                    size: chunk.size,
+                    mtime: chunk.mtime,
+                    fid: chunk.fid.clone(),
+                    cookie: chunk.cookie,
+                    crc32: chunk.crc32,
+                })
+                .collect(),
+            hard_link_id: entry.hard_link_id.clone(),
+            hard_link_counter: entry.hard_link_counter,
+            extended: HashMap::new(),
+            content_size: entry.content_size,
+            disk_size: entry.disk_size,
+            ttl: String::new(),
+        };
+
+        match self.client.delete_entry(&old_path, entry.is_dir) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to delete old entry on master during rename: {}", e);
+            }
+        }
+
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to create new entry on master during rename: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -743,9 +1025,15 @@ impl FileSystem for PowerFsFs {
             atime: now,
             mtime: now,
             ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
         };
         self.cache.insert(entry.clone());
-        Ok(self.create_entry(&entry))
+        Ok(self.create_fuse_entry(&entry))
     }
 
     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> std::io::Result<Vec<u8>> {
@@ -803,11 +1091,17 @@ impl FileSystem for PowerFsFs {
             atime: entry.atime,
             mtime: entry.mtime,
             ctime: chrono::Utc::now().timestamp(),
+            xattrs: entry.xattrs.clone(),
+            chunks: entry.chunks.clone(),
+            hard_link_id: entry.hard_link_id.clone(),
+            hard_link_counter: entry.hard_link_counter,
+            content_size: entry.content_size,
+            disk_size: entry.disk_size,
         };
 
         self.cache.insert(new_entry.clone());
 
-        Ok(self.create_entry(&new_entry))
+        Ok(self.create_fuse_entry(&new_entry))
     }
 
     fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> std::io::Result<libc::statvfs64> {
@@ -863,6 +1157,222 @@ impl FileSystem for PowerFsFs {
         _handle: Self::Handle,
     ) -> std::io::Result<()> {
         debug!("fsync: inode={}", _inode);
+        Ok(())
+    }
+
+    fn fallocate(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> std::io::Result<()> {
+        debug!(
+            "fallocate: inode={}, mode={}, offset={}, length={}",
+            inode, mode, offset, length
+        );
+
+        let entry = self
+            .cache
+            .get_inode(inode)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        if entry.is_dir {
+            return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        }
+
+        let new_size = offset + length;
+        if new_size > entry.size {
+            self.cache.update_size(inode, new_size);
+        }
+
+        Ok(())
+    }
+
+    fn getlk(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        lock: FileLock,
+        _flags: u32,
+    ) -> std::io::Result<FileLock> {
+        debug!(
+            "getlk: inode={}, start={}, end={}, type={}",
+            inode, lock.start, lock.end, lock.lock_type
+        );
+
+        let locks = self.locks.read().unwrap();
+        if let Some(inode_locks) = locks.get(&inode) {
+            for existing_lock in inode_locks {
+                if existing_lock.start < lock.end
+                    && existing_lock.end > lock.start
+                    && existing_lock.lock_type != lock.lock_type
+                {
+                    return Ok(FileLock {
+                        start: existing_lock.start,
+                        end: existing_lock.end,
+                        lock_type: existing_lock.lock_type,
+                        pid: existing_lock.pid,
+                    });
+                }
+            }
+        }
+
+        Ok(FileLock {
+            start: lock.start,
+            end: lock.end,
+            lock_type: lock.lock_type,
+            pid: 0,
+        })
+    }
+
+    fn setlk(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        _flags: u32,
+    ) -> std::io::Result<()> {
+        debug!(
+            "setlk: inode={}, owner={}, start={}, end={}, type={}",
+            inode, owner, lock.start, lock.end, lock.lock_type
+        );
+
+        let mut locks = self.locks.write().unwrap();
+        let inode_locks = locks.entry(inode).or_default();
+
+        if lock.lock_type == 0 {
+            inode_locks.retain(|l| l.start != lock.start || l.end != lock.end);
+            return Ok(());
+        }
+
+        for existing_lock in &*inode_locks {
+            if existing_lock.start < lock.end
+                && existing_lock.end > lock.start
+                && existing_lock.lock_type != lock.lock_type
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+        }
+
+        inode_locks.push(FileLock {
+            start: lock.start,
+            end: lock.end,
+            lock_type: lock.lock_type,
+            pid: lock.pid,
+        });
+
+        Ok(())
+    }
+
+    fn setlkw(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        _flags: u32,
+    ) -> std::io::Result<()> {
+        debug!(
+            "setlkw: inode={}, owner={}, start={}, end={}, type={}",
+            inode, owner, lock.start, lock.end, lock.lock_type
+        );
+        self.setlk(_ctx, inode, _handle, owner, lock, _flags)
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        name: &CStr,
+        value: &[u8],
+        _flags: u32,
+    ) -> std::io::Result<()> {
+        let name_str = name.to_str().unwrap_or("");
+        debug!("setxattr: inode={}, name={}", inode, name_str);
+
+        if self.cache.get_inode(inode).is_none() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        self.cache.set_xattr(inode, name_str, value);
+        Ok(())
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> std::io::Result<GetxattrReply> {
+        let name_str = name.to_str().unwrap_or("");
+        debug!("getxattr: inode={}, name={}", inode, name_str);
+
+        if self.cache.get_inode(inode).is_none() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if let Some(value) = self.cache.get_xattr(inode, name_str) {
+            if size == 0 {
+                Ok(GetxattrReply::Count(value.len() as u32))
+            } else if value.len() > size as usize {
+                Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+            } else {
+                Ok(GetxattrReply::Value(value))
+            }
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+        }
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> std::io::Result<ListxattrReply> {
+        debug!("listxattr: inode={}", inode);
+
+        if self.cache.get_inode(inode).is_none() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        let xattrs = self.cache.list_xattrs(inode);
+        let mut buf = Vec::new();
+        for name in xattrs {
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(0);
+        }
+
+        if size == 0 {
+            Ok(ListxattrReply::Count(buf.len() as u32))
+        } else if buf.len() > size as usize {
+            Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+        } else {
+            Ok(ListxattrReply::Names(buf))
+        }
+    }
+
+    fn removexattr(&self, _ctx: &Context, inode: Self::Inode, name: &CStr) -> std::io::Result<()> {
+        let name_str = name.to_str().unwrap_or("");
+        debug!("removexattr: inode={}, name={}", inode, name_str);
+
+        if self.cache.get_inode(inode).is_none() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if !self.cache.remove_xattr(inode, name_str) {
+            return Err(std::io::Error::from_raw_os_error(libc::ENODATA));
+        }
+
         Ok(())
     }
 

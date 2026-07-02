@@ -6,8 +6,10 @@ use powerfs_common::{
     constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET},
     error::{PowerFsError, Result},
     types::{Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo, VolumeState},
+    utils::calculate_checksum,
 };
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -207,5 +209,78 @@ impl Volume {
 
     pub fn is_available(&self) -> bool {
         self.state() == VolumeState::Available
+    }
+
+    pub fn write_needle_blob(
+        &self,
+        file_key: u64,
+        offset: i64,
+        size: i32,
+        data: Bytes,
+        _cookie: u32,
+    ) -> Result<()> {
+        let needle_id = NeedleId(file_key);
+        if let Some(existing_info) = self.index.get(&needle_id) {
+            let mut file_guard = self.file.write().unwrap();
+            let needle = Needle::read_from(&mut *file_guard, existing_info.offset, self.id())?;
+            let data_offset = offset as usize;
+            let data_end = data_offset + size as usize;
+            let mut data_vec = needle.data.to_vec();
+            if data_end > data_vec.len() {
+                data_vec.resize(data_end, 0);
+            }
+            data_vec[data_offset..data_end].copy_from_slice(&data);
+            let checksum = calculate_checksum(&data_vec);
+            let updated_needle = Needle {
+                id: needle.id,
+                volume_id: needle.volume_id,
+                data: Bytes::from(data_vec),
+                offset: needle.offset,
+                checksum,
+            };
+            updated_needle.write_to(&mut *file_guard, existing_info.offset)?;
+            let mut info_guard = self.info.write().unwrap();
+            info_guard.modified_at = Utc::now();
+            drop(file_guard);
+            let updated_info = NeedleInfo {
+                id: needle_id,
+                volume_id: info_guard.id,
+                data_size: updated_needle.data.len() as u32,
+                offset: existing_info.offset,
+                checksum: updated_needle.checksum,
+                created_at: existing_info.created_at,
+            };
+            drop(info_guard);
+            self.index.insert(NeedleId(file_key), updated_info);
+        } else {
+            let data_size = size as usize;
+            let mut full_data = vec![0u8; data_size];
+            let write_offset = offset as usize;
+            if write_offset < data_size {
+                let copy_len = std::cmp::min(data.len(), data_size - write_offset);
+                full_data[write_offset..write_offset + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            self.write_needle(file_key, Bytes::from(full_data))?;
+        }
+        Ok(())
+    }
+
+    pub fn read_needle_blob(&self, offset: i64, size: i32) -> Result<Bytes> {
+        let file_guard = self.file.read().unwrap();
+        let data_offset = offset as u64;
+        let data_size = size as usize;
+        let mut buffer = vec![0u8; data_size];
+        let mut file = &*file_guard;
+        file.seek(SeekFrom::Start(data_offset))?;
+        file.read_exact(&mut buffer)?;
+        Ok(Bytes::from(buffer))
+    }
+
+    pub fn read_needle_meta(&self, file_key: u64) -> Option<NeedleInfo> {
+        self.index.get(&NeedleId(file_key))
+    }
+
+    pub fn deleted_count(&self) -> usize {
+        0
     }
 }

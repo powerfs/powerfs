@@ -1,4 +1,6 @@
-use powerfs_fuse::cache::{CachedEntry, MetadataCache, ROOT_INODE};
+use powerfs_fuse::cache::{CachedEntry, MetadataCache, UpdateAttrParams, ROOT_INODE};
+
+use std::collections::HashMap;
 
 fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
     CachedEntry {
@@ -17,6 +19,12 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        xattrs: HashMap::new(),
+        chunks: Vec::new(),
+        hard_link_id: String::new(),
+        hard_link_counter: 0,
+        content_size: 0,
+        disk_size: 0,
     }
 }
 
@@ -37,6 +45,12 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        xattrs: HashMap::new(),
+        chunks: Vec::new(),
+        hard_link_id: String::new(),
+        hard_link_counter: 0,
+        content_size: 0,
+        disk_size: 0,
     }
 }
 
@@ -131,7 +145,17 @@ fn test_update_attr() {
     let entry = make_file_entry(100, ROOT_INODE, "attr.txt");
     cache.insert(entry);
 
-    cache.update_attr(100, Some(0o755), Some(1024), Some(1000), Some(100));
+    cache.update_attr(
+        100,
+        UpdateAttrParams {
+            mode: Some(0o755),
+            size: Some(1024),
+            uid: Some(1000),
+            gid: Some(100),
+            atime: None,
+            mtime: None,
+        },
+    );
     let found = cache.get_inode(100).unwrap();
     assert_eq!(found.mode, 0o755);
     assert_eq!(found.size, 1024);
@@ -283,4 +307,113 @@ fn test_directory_nlink() {
     let found = cache.get_inode(10).unwrap();
     assert!(found.is_dir);
     assert_eq!(found.nlink, 2);
+}
+
+#[test]
+fn test_xattr_set_and_get() {
+    let cache = MetadataCache::new();
+    let entry = make_file_entry(100, ROOT_INODE, "xattr.txt");
+    cache.insert(entry);
+
+    cache.set_xattr(100, "user.test", b"test value");
+    let value = cache.get_xattr(100, "user.test");
+    assert_eq!(value, Some(b"test value".to_vec()));
+}
+
+#[test]
+fn test_xattr_get_nonexistent() {
+    let cache = MetadataCache::new();
+    let entry = make_file_entry(100, ROOT_INODE, "xattr.txt");
+    cache.insert(entry);
+
+    let value = cache.get_xattr(100, "user.nonexistent");
+    assert_eq!(value, None);
+}
+
+#[test]
+fn test_xattr_remove() {
+    let cache = MetadataCache::new();
+    let entry = make_file_entry(100, ROOT_INODE, "xattr.txt");
+    cache.insert(entry);
+
+    cache.set_xattr(100, "user.test", b"value");
+    assert!(cache.remove_xattr(100, "user.test"));
+    assert_eq!(cache.get_xattr(100, "user.test"), None);
+    assert!(!cache.remove_xattr(100, "user.nonexistent"));
+}
+
+#[test]
+fn test_xattr_list() {
+    let cache = MetadataCache::new();
+    let entry = make_file_entry(100, ROOT_INODE, "xattr.txt");
+    cache.insert(entry);
+
+    cache.set_xattr(100, "user.attr1", b"value1");
+    cache.set_xattr(100, "user.attr2", b"value2");
+
+    let attrs = cache.list_xattrs(100);
+    assert!(attrs.contains(&"user.attr1".to_string()));
+    assert!(attrs.contains(&"user.attr2".to_string()));
+    assert_eq!(attrs.len(), 2);
+}
+
+#[test]
+fn test_update_attr_with_timestamps() {
+    let cache = MetadataCache::new();
+    let entry = make_file_entry(100, ROOT_INODE, "time.txt");
+    cache.insert(entry);
+
+    let atime = 1620000000;
+    let mtime = 1630000000;
+    cache.update_attr(
+        100,
+        UpdateAttrParams {
+            mode: None,
+            size: None,
+            uid: None,
+            gid: None,
+            atime: Some(atime),
+            mtime: Some(mtime),
+        },
+    );
+
+    let found = cache.get_inode(100).unwrap();
+    assert_eq!(found.atime, atime);
+    assert_eq!(found.mtime, mtime);
+}
+
+#[test]
+fn test_update_attr_ctime_updated() {
+    let cache = MetadataCache::new();
+    let mut entry = make_file_entry(100, ROOT_INODE, "ctime.txt");
+    entry.ctime = 1000;
+    cache.insert(entry);
+
+    cache.update_attr(
+        100,
+        UpdateAttrParams {
+            mode: None,
+            size: None,
+            uid: None,
+            gid: None,
+            atime: None,
+            mtime: None,
+        },
+    );
+
+    let found = cache.get_inode(100).unwrap();
+    assert!(found.ctime > 1000);
+}
+
+#[test]
+fn test_xattr_preserved_on_copy() {
+    let cache = MetadataCache::new();
+    let mut entry = make_file_entry(100, ROOT_INODE, "orig.txt");
+    entry
+        .xattrs
+        .insert("user.test".to_string(), b"value".to_vec());
+    cache.insert(entry);
+
+    let found = cache.get_inode(100).unwrap();
+    assert_eq!(found.xattrs.get("user.test"), Some(&b"value".to_vec()));
 }
