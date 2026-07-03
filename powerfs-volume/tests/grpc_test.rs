@@ -259,6 +259,7 @@ async fn test_volume_read_blob() {
     let response = client
         .read_needle_blob(ReadNeedleBlobRequest {
             volume_id: 7,
+            file_key: 500,
             offset: 0,
             size: data.len() as i32,
         })

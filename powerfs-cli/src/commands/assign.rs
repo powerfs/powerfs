@@ -36,6 +36,8 @@ pub async fn assign(mut client: MasterClient, args: AssignArgs) -> super::Comman
         rack: String::new(),
         data_node: String::new(),
         disk_type: String::new(),
+        stripe_count: 1,
+        stripe_size: 64 * 1024 * 1024,
     };
 
     let response = service

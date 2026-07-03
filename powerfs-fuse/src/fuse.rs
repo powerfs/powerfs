@@ -944,7 +944,7 @@ impl FileSystem for PowerFsFs {
         let chunk_size = self.chunk_cache.chunk_size();
 
         if entry.fid.is_none() {
-            let (fid, location) = self
+            let (fid, location, _stripe_fids, _stripe_locations) = self
                 .client
                 .assign_fid(&self.collection, &self.replication)
                 .map_err(|e| {

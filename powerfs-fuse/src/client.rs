@@ -86,7 +86,7 @@ impl PowerFuseClient {
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<(Fid, Option<Location>), String> {
+    ) -> Result<(Fid, Option<Location>, Vec<String>, Vec<Location>), String> {
         let channel = self.ensure_master_channel().await?;
         let mut client = MasterServiceClient::new(channel);
         let request = AssignRequest {
@@ -98,6 +98,8 @@ impl PowerFuseClient {
             rack: String::new(),
             data_node: String::new(),
             disk_type: String::new(),
+            stripe_count: 1,
+            stripe_size: 64 * 1024 * 1024,
         };
         let response = client
             .assign(tonic::Request::new(request))
@@ -108,7 +110,7 @@ impl PowerFuseClient {
             return Err(resp.error);
         }
         let fid = Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
-        Ok((fid, resp.location))
+        Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations))
     }
 
     /// Lookup volume locations from Master
@@ -434,7 +436,7 @@ impl SyncFuseClient {
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<(Fid, Option<Location>), String> {
+    ) -> Result<(Fid, Option<Location>, Vec<String>, Vec<Location>), String> {
         self.client
             .runtime_handle
             .block_on(self.client.assign_fid(collection, replication))

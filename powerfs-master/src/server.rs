@@ -230,39 +230,53 @@ impl MasterService for MasterGrpcServer {
 
         let req = request.into_inner();
 
-        match self
-            .master
-            .assign_volume(&req.replication, &req.collection)
-            .await
-        {
-            Ok((fid, nodes)) => {
-                let mut replicas = Vec::new();
-                let mut primary_location: Option<Location> = None;
+        let stripe_count = if req.stripe_count > 1 {
+            req.stripe_count
+        } else {
+            1
+        };
 
-                for (i, node) in nodes.iter().enumerate() {
-                    let location = Location {
-                        url: node.url(),
-                        public_url: node.public_url.clone(),
-                        grpc_port: node.grpc_port,
-                        data_center: node.data_center_id.to_string(),
-                    };
-                    if i == 0 {
-                        primary_location = Some(location.clone());
+        let mut stripe_fids = Vec::new();
+        let mut stripe_locations = Vec::new();
+
+        for _ in 0..stripe_count {
+            match self
+                .master
+                .assign_volume(&req.replication, &req.collection)
+                .await
+            {
+                Ok((fid, nodes)) => {
+                    stripe_fids.push(fid.to_string());
+                    for (i, node) in nodes.iter().enumerate() {
+                        let location = Location {
+                            url: node.url(),
+                            public_url: node.public_url.clone(),
+                            grpc_port: node.grpc_port,
+                            data_center: node.data_center_id.to_string(),
+                        };
+                        if i == 0 {
+                            stripe_locations.push(location);
+                        }
                     }
-                    replicas.push(location);
                 }
-
-                Ok(Response::new(AssignResponse {
-                    fid: fid.to_string(),
-                    count: req.count,
-                    error: String::new(),
-                    auth: String::new(),
-                    replicas,
-                    location: primary_location,
-                }))
+                Err(e) => return Err(Status::internal(format!("{}", e))),
             }
-            Err(e) => Err(Status::internal(format!("{}", e))),
         }
+
+        let primary_fid = stripe_fids.first().cloned().unwrap_or_default();
+        let primary_location = stripe_locations.first().cloned();
+        let replicas = stripe_locations.clone();
+
+        Ok(Response::new(AssignResponse {
+            fid: primary_fid,
+            count: req.count,
+            error: String::new(),
+            auth: String::new(),
+            replicas,
+            location: primary_location,
+            stripe_fids,
+            stripe_locations,
+        }))
     }
 
     async fn volume_list(
