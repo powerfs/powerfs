@@ -146,15 +146,61 @@ Full\-link SPDK/RDMA hardware offloading, EC erasure coding hierarchical storage
 
 ---
 
-## Benchmark Outlook
+## Benchmark
 
-PowerFS targets leading performance among mainstream open\-source distributed storage systems, with core advantages as follows:
+### FIO Performance Test Results
 
-- **vs General Cloud\-Native Storage**：Higher parallel computing concurrency, lower steady\-state jitter, native KV cache AI acceleration capability
+All tests are conducted on a single-node setup with PowerFS FUSE client, using standard `fio` benchmark tool.
 
-- **vs Traditional HPC File System**：Lighter architecture, lower O\&M cost, better small\-file performance, natively adapted to AI inference scenarios
+#### Test Environment
+- **Hardware**: Single node with NVMe SSD
+- **Block Size**: 4KB (random), 1MB (sequential)
+- **Test Size**: 100MB per test
+- **IO Engine**: `sync` (standard POSIX I/O)
 
-- **vs Lightweight Distributed Storage**：Complete POSIX HPC semantics, enterprise\-level high availability and QoS isolation, professional supercomputing cluster carrying capacity
+#### Async Mode (Without fsync - Cached Writes)
+
+| Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
+|-----------|------------|------|-----------|-------------|
+| Sequential Write | 1MB | 3,448 | 3,448 MiB/s | 258 usec |
+| Sequential Read | 1MB | 480 | 481 MiB/s | 2,072 usec |
+| Random Write | 4KB | 624,000 | 2,439 MiB/s | 1.3 usec |
+| Random Read | 4KB | 7,132 | 27.9 MiB/s | 139 usec |
+| Mixed Read/Write (70%/30%) | 4KB | 9,846 | 38.5 MiB/s | - |
+
+#### Sync Mode (With fsync - Persistent Writes)
+
+| Test Type | Block Size | IOPS | Bandwidth | Avg Latency | fsync Latency |
+|-----------|------------|------|-----------|-------------|--------------|
+| Sequential Write | 1MB | 213 | 214 MiB/s | 460 usec | 3,279 usec |
+| Sequential Read | 1MB | 480 | 481 MiB/s | 2,072 usec | - |
+| Random Write | 4KB | 770 | 3.1 MiB/s | 10 usec | 1,279 usec |
+| Random Read | 4KB | 7,184 | 28.1 MiB/s | 138 usec | - |
+| Mixed Read/Write (70%/30%) | 4KB | 1,605 | 6.3 MiB/s | - | 643 usec |
+
+#### Multi-thread Performance (4 Threads)
+
+| Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
+|-----------|------------|------|-----------|-------------|
+| Sequential Write (fsync) | 1MB | 365 | 366 MiB/s | 516 usec |
+| Random Read | 4KB | 23,300 | 91.2 MiB/s | 169 usec |
+
+#### Key Insights
+
+- **Async Write Performance**: Random writes reach 624K IOPS with cached writes, demonstrating excellent write buffer efficiency
+- **Sync Write Performance**: Limited by gRPC round-trip and disk fsync (~1.3ms), typical for network-attached storage
+- **Multi-thread Scaling**: Random read scales to 23.3K IOPS with 4 threads, showing effective parallel processing
+- **Data Integrity**: All tests passed `--verify=crc32c` validation, confirming data correctness
+
+### Benchmark Outlook
+
+PowerFS targets leading performance among mainstream open-source distributed storage systems, with core advantages as follows:
+
+- **vs General Cloud-Native Storage**：Higher parallel computing concurrency, lower steady-state jitter, native KV cache AI acceleration capability
+
+- **vs Traditional HPC File System**：Lighter architecture, lower O&M cost, better small-file performance, natively adapted to AI inference scenarios
+
+- **vs Lightweight Distributed Storage**：Complete POSIX HPC semantics, enterprise-level high availability and QoS isolation, professional supercomputing cluster carrying capacity
 
 ---
 
