@@ -414,6 +414,7 @@ message Entry {
     uint64 content_size = 8;
     uint64 disk_size = 9;
     string ttl = 10;
+    string symlink_target = 11;
 }
 
 message LookupDirectoryEntryRequest {

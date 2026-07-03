@@ -61,7 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let volume_server = VolumeServer::new(storage_manager.clone(), node_id.clone());
 
-    let grpc_port = args.grpc_address
+    let grpc_port = args
+        .grpc_address
         .split(':')
         .last()
         .and_then(|p| p.parse().ok())

@@ -43,6 +43,8 @@ fn main() {
     if !mount_path.exists() {
         std::fs::create_dir_all(mount_path).expect("Failed to create mount point directory");
         info!("Created mount point: {}", args.mount_point);
+    } else if mount_path.is_file() {
+        panic!("Mount point path is a file, not a directory");
     }
 
     // Create tokio runtime

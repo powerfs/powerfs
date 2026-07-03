@@ -8,6 +8,7 @@ use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
+use powerfs_common::types::Fid;
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -196,6 +197,8 @@ impl PowerFsFs {
         let addr = PowerFuseClient::location_to_grpc_addr(loc);
         let chunk_size = self.chunk_cache.chunk_size();
 
+        let mut chunks = Vec::new();
+
         for (_, chunk_idx) in &dirty {
             let chunk_offset = chunk_idx * chunk_size;
             if let Some(chunk_data) = self.chunk_cache.get(inode, chunk_offset) {
@@ -215,11 +218,63 @@ impl PowerFsFs {
                         error!("write_blob failed: {}", e);
                         std::io::Error::from_raw_os_error(libc::EIO)
                     })?;
+
+                chunks.push(powerfs_master::proto::powerfs::FileChunk {
+                    offset: chunk_offset,
+                    size: chunk_data.data.len() as u64,
+                    mtime: chunk_data.mtime,
+                    fid: fid.to_string(),
+                    cookie: 0,
+                    crc32: chunk_data.crc32,
+                });
             }
         }
 
         let mut dirty_set = self.dirty_chunks.write().unwrap();
         dirty_set.retain(|(ino, _)| *ino != inode);
+
+        let path = self.cache.inode_to_path(inode).unwrap_or_default();
+        if !path.is_empty() && !chunks.is_empty() {
+            let filer_entry = powerfs_master::proto::powerfs::Entry {
+                name: entry.name.clone(),
+                directory: {
+                    let p = self.cache.inode_to_path(entry.parent).unwrap_or_default();
+                    if p == "/" {
+                        p
+                    } else {
+                        p
+                    }
+                },
+                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                    ino: entry.inode,
+                    mode: entry.mode | 0o100000,
+                    nlink: entry.nlink,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    rdev: 0,
+                    size: entry.size,
+                    blksize: 4096,
+                    blocks: entry.size.div_ceil(512) as u64,
+                    atime: entry.atime as u64,
+                    mtime: entry.mtime as u64,
+                    ctime: entry.ctime as u64,
+                    crtime: entry.ctime as u64,
+                    perm: 0,
+                }),
+                chunks,
+                hard_link_id: entry.hard_link_id.clone(),
+                hard_link_counter: entry.hard_link_counter,
+                extended: HashMap::new(),
+                content_size: entry.content_size,
+                disk_size: entry.disk_size,
+                ttl: String::new(),
+                symlink_target: String::new(),
+            };
+
+            if let Err(e) = self.client.update_entry(filer_entry) {
+                warn!("Failed to update entry on master: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -276,15 +331,41 @@ impl PowerFsFs {
             })
             .collect();
 
+        let fid = entry.chunks.first().and_then(|chunk| {
+            info!("Parsing fid from chunk: {}", chunk.fid);
+            let result = Fid::from_string(&chunk.fid);
+            info!("Fid parse result: {:?}", result);
+            result.ok()
+        });
+        info!(
+            "entry_to_cached: name={}, fid={:?}, chunks={}",
+            entry.name,
+            fid,
+            entry.chunks.len()
+        );
+
+        let mode_val = attrs.map(|a| a.mode).unwrap_or(0);
+        let file_type = mode_val & 0o170000;
+        let is_dir = file_type == 0o040000;
+        let is_symlink = file_type == 0o120000;
+        info!(
+            "entry_to_cached: name={}, mode={:o}, file_type={:o}, is_dir={}, is_symlink={}",
+            entry.name, mode_val, file_type, is_dir, is_symlink
+        );
+
         CachedEntry {
             inode: attrs.map(|a| a.ino).unwrap_or(0),
             parent,
             name: entry.name.clone(),
-            is_dir: attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false),
-            is_symlink: attrs.map(|a| (a.mode & 0o120000) != 0).unwrap_or(false),
-            symlink_target: None,
+            is_dir,
+            is_symlink,
+            symlink_target: if is_symlink {
+                Some(entry.symlink_target.clone())
+            } else {
+                None
+            },
             nlink: attrs.map(|a| a.nlink).unwrap_or(1),
-            fid: None,
+            fid,
             size: attrs.map(|a| a.size).unwrap_or(0),
             mode: attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644),
             uid: attrs.map(|a| a.uid).unwrap_or(0),
@@ -297,6 +378,7 @@ impl PowerFsFs {
             hard_link_id: entry.hard_link_id.clone(),
             hard_link_counter: entry.hard_link_counter,
             content_size: entry.content_size,
+
             disk_size: entry.disk_size,
         }
     }
@@ -306,7 +388,10 @@ impl FileSystem for PowerFsFs {
     type Inode = u64;
     type Handle = u64;
 
-    fn init(&self, _capable: fuse_backend_rs::api::filesystem::FsOptions) -> std::io::Result<fuse_backend_rs::api::filesystem::FsOptions> {
+    fn init(
+        &self,
+        _capable: fuse_backend_rs::api::filesystem::FsOptions,
+    ) -> std::io::Result<fuse_backend_rs::api::filesystem::FsOptions> {
         Ok(fuse_backend_rs::api::filesystem::FsOptions::WRITEBACK_CACHE)
     }
 
@@ -330,7 +415,18 @@ impl FileSystem for PowerFsFs {
 
         match self.client.get_entry(&lookup_path) {
             Ok(Some(entry)) => {
+                info!(
+                    "lookup found entry: path={}, chunks={}, content_size={}",
+                    lookup_path,
+                    entry.chunks.len(),
+                    entry.content_size
+                );
                 let cached = self.entry_to_cached(parent, &entry);
+                info!(
+                    "cached entry: fid={:?}, chunks={}",
+                    cached.fid.is_some(),
+                    cached.chunks.len()
+                );
                 self.cache.insert(cached.clone());
                 Ok(self.create_fuse_entry(&cached))
             }
@@ -502,6 +598,7 @@ impl FileSystem for PowerFsFs {
             content_size: 0,
             disk_size: 0,
             ttl: String::new(),
+            symlink_target: String::new(),
         };
 
         match self.client.create_entry(filer_entry) {
@@ -670,6 +767,7 @@ impl FileSystem for PowerFsFs {
             content_size: 0,
             disk_size: 0,
             ttl: String::new(),
+            symlink_target: String::new(),
         };
 
         match self.client.create_entry(filer_entry) {
@@ -753,8 +851,15 @@ impl FileSystem for PowerFsFs {
             self.chunk_cache.get_chunk_index(prefetch_end - 1)
         };
 
+        info!(
+            "read: inode={}, fid={:?}, volume_id={}",
+            inode, fid, fid.volume_id
+        );
         let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-            error!("lookup_volume failed: {}", e);
+            error!(
+                "lookup_volume failed: volume_id={}, error={}",
+                fid.volume_id, e
+            );
             std::io::Error::from_raw_os_error(libc::EIO)
         })?;
 
@@ -767,10 +872,13 @@ impl FileSystem for PowerFsFs {
             let chunk_offset = chunk_idx * chunk_size;
             if self.chunk_cache.get(inode, chunk_offset).is_none() {
                 let read_size = std::cmp::min(chunk_size, file_size - chunk_offset);
-                match self
-                    .client
-                    .read_blob(&addr, chunk_offset as i64, read_size as i32)
-                {
+                match self.client.read_blob(
+                    &addr,
+                    fid.volume_id.0,
+                    fid.file_key,
+                    chunk_offset as i64,
+                    read_size as i32,
+                ) {
                     Ok(data) => {
                         let mtime = entry.mtime as u64;
                         self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
@@ -864,7 +972,7 @@ impl FileSystem for PowerFsFs {
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
-            self.cache.update_fid(inode, fid);
+            self.cache.update_fid(inode, fid.clone());
             let new_size = offset + read_len as u64;
             self.cache.update_size(inode, new_size);
             self.cache.update_attr(
@@ -880,7 +988,48 @@ impl FileSystem for PowerFsFs {
             );
 
             let mtime = entry.mtime as u64;
-            self.chunk_cache.put(inode, 0, buf, mtime, 0);
+            self.chunk_cache.put(inode, 0, buf.clone(), mtime, 0);
+
+            let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
+            let filer_entry = powerfs_master::proto::powerfs::Entry {
+                name: entry.name.clone(),
+                directory: parent_path,
+                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                    ino: entry.inode,
+                    mode: entry.mode | 0o100000,
+                    nlink: entry.nlink,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    rdev: 0,
+                    size: new_size,
+                    blksize: 4096,
+                    blocks: new_size.div_ceil(512) as u64,
+                    atime: entry.atime as u64,
+                    mtime: entry.mtime as u64,
+                    ctime: entry.ctime as u64,
+                    crtime: entry.ctime as u64,
+                    perm: 0,
+                }),
+                chunks: vec![powerfs_master::proto::powerfs::FileChunk {
+                    offset: 0,
+                    size: buf.len() as u64,
+                    mtime,
+                    fid: fid.to_string(),
+                    cookie: 0,
+                    crc32: 0,
+                }],
+                hard_link_id: entry.hard_link_id.clone(),
+                hard_link_counter: entry.hard_link_counter,
+                extended: HashMap::new(),
+                content_size: entry.content_size,
+                disk_size: entry.disk_size,
+                ttl: String::new(),
+                symlink_target: String::new(),
+            };
+
+            if let Err(e) = self.client.update_entry(filer_entry) {
+                warn!("Failed to update entry on master: {}", e);
+            }
         } else if let Some(fid) = &entry.fid {
             let end_offset = offset + read_len as u64;
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
@@ -913,7 +1062,13 @@ impl FileSystem for PowerFsFs {
                         std::cmp::min(chunk_size, entry.size.saturating_sub(chunk_start_offset));
                     if read_size > 0 {
                         self.client
-                            .read_blob(&addr, chunk_start_offset as i64, read_size as i32)
+                            .read_blob(
+                                &addr,
+                                fid.volume_id.0,
+                                fid.file_key,
+                                chunk_start_offset as i64,
+                                read_size as i32,
+                            )
                             .unwrap_or_default()
                     } else {
                         Vec::new()
@@ -1022,7 +1177,21 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        let children = self.cache.list_children(inode);
+        let mut children = self.cache.list_children(inode);
+        if children.is_empty() {
+            let dir_path = self
+                .cache
+                .inode_to_path(inode)
+                .unwrap_or_else(|| "/".to_string());
+            if let Ok(entries) = self.client.list_entries(&dir_path, 1000, "") {
+                for child_entry in entries {
+                    let cached = self.entry_to_cached(inode, &child_entry);
+                    self.cache.insert(cached);
+                }
+                children = self.cache.list_children(inode);
+            }
+        }
+
         for (child_ino, child_name, is_dir) in children {
             idx += 1;
             if offset < idx {
@@ -1132,6 +1301,7 @@ impl FileSystem for PowerFsFs {
             content_size: entry.content_size,
             disk_size: entry.disk_size,
             ttl: String::new(),
+            symlink_target: entry.symlink_target.clone().unwrap_or_default(),
         };
 
         match self.client.delete_entry(&old_path, entry.is_dir) {
@@ -1169,9 +1339,50 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let inode = self.cache.allocate_inode();
-        let now = chrono::Utc::now().timestamp();
-        let entry = CachedEntry {
+        let parent_path = self
+            .cache
+            .inode_to_path(parent)
+            .unwrap_or_else(|| "/".to_string());
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let entry = FilerEntry {
+            name: name_str.to_string(),
+            directory: parent_path,
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: 0,
+                mode: 0o120777,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size: link_str.len() as u64,
+                blksize: 4096,
+                blocks: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                perm: 0o777,
+            }),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            extended: HashMap::new(),
+            content_size: link_str.len() as u64,
+            disk_size: 0,
+            ttl: String::new(),
+            symlink_target: link_str.to_string(),
+        };
+
+        let inode = match self.client.create_entry(entry) {
+            Ok(ino) => ino,
+            Err(e) => {
+                error!("create_entry failed for symlink: {}", e);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        };
+
+        let cached_entry = CachedEntry {
             inode,
             parent,
             name: name_str.to_string(),
@@ -1184,18 +1395,18 @@ impl FileSystem for PowerFsFs {
             mode: 0o777,
             uid: 0,
             gid: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
+            atime: now as i64,
+            mtime: now as i64,
+            ctime: now as i64,
             xattrs: HashMap::new(),
             chunks: Vec::new(),
             hard_link_id: String::new(),
             hard_link_counter: 0,
-            content_size: 0,
+            content_size: link_str.len() as u64,
             disk_size: 0,
         };
-        self.cache.insert(entry.clone());
-        Ok(self.create_fuse_entry(&entry))
+        self.cache.insert(cached_entry.clone());
+        Ok(self.create_fuse_entry(&cached_entry))
     }
 
     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> std::io::Result<Vec<u8>> {

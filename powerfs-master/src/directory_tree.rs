@@ -198,6 +198,7 @@ impl DirectoryTree {
                 content_size: 4096,
                 disk_size: 4096,
                 ttl: "".to_string(),
+                symlink_target: "".to_string(),
             };
 
             let mut data = Vec::new();

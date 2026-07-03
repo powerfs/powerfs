@@ -9,7 +9,6 @@ use powerfs_common::{
     utils::calculate_checksum,
 };
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -265,15 +264,25 @@ impl Volume {
         Ok(())
     }
 
-    pub fn read_needle_blob(&self, offset: i64, size: i32) -> Result<Bytes> {
-        let file_guard = self.file.read().unwrap();
-        let data_offset = offset as u64;
-        let data_size = size as usize;
-        let mut buffer = vec![0u8; data_size];
-        let mut file = &*file_guard;
-        file.seek(SeekFrom::Start(data_offset))?;
-        file.read_exact(&mut buffer)?;
-        Ok(Bytes::from(buffer))
+    pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
+        let needle_id = NeedleId(file_key);
+        if let Some(info) = self.index.get(&needle_id) {
+            let mut file_guard = self.file.write().unwrap();
+            let needle = Needle::read_from(&mut *file_guard, info.offset, self.id())?;
+            let data_offset = offset as usize;
+            let data_size = size as usize;
+            if data_offset + data_size <= needle.data.len() {
+                Ok(Bytes::from(
+                    needle.data[data_offset..data_offset + data_size].to_vec(),
+                ))
+            } else {
+                Err(PowerFsError::InvalidRequest(
+                    "invalid offset or size".to_string(),
+                ))
+            }
+        } else {
+            Err(PowerFsError::NeedleNotFound(needle_id))
+        }
     }
 
     pub fn read_needle_meta(&self, file_key: u64) -> Option<NeedleInfo> {

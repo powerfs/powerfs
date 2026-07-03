@@ -119,8 +119,9 @@ message WriteNeedleBlobResponse {
 
 message ReadNeedleBlobRequest {
     uint32 volume_id = 1;
-    int64 offset = 2;
-    int32 size = 3;
+    uint64 file_key = 2;
+    int64 offset = 3;
+    int32 size = 4;
 }
 
 message ReadNeedleBlobResponse {

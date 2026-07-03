@@ -277,6 +277,7 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::ReadNeedleBlobResponse>, Status> {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
         let offset = req.offset;
         let size = req.size;
 
@@ -284,7 +285,7 @@ impl VolumeService for VolumeServer {
 
         tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                let result = volume.read_needle_blob(offset, size);
+                let result = volume.read_needle_blob(file_key, offset, size);
                 match result {
                     Ok(data) => Ok(Response::new(crate::proto::ReadNeedleBlobResponse {
                         success: true,

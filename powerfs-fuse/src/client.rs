@@ -391,6 +391,8 @@ impl PowerFuseClient {
     pub async fn read_blob(
         &self,
         volume_addr: &str,
+        volume_id: u32,
+        file_key: u64,
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
@@ -399,7 +401,8 @@ impl PowerFuseClient {
             .max_decoding_message_size(256 * 1024 * 1024)
             .max_encoding_message_size(256 * 1024 * 1024);
         let request = ReadNeedleBlobRequest {
-            volume_id: 0,
+            volume_id,
+            file_key,
             offset,
             size,
         };
@@ -529,9 +532,20 @@ impl SyncFuseClient {
             .block_on(self.client.write_blob(volume_addr, params))
     }
 
-    pub fn read_blob(&self, volume_addr: &str, offset: i64, size: i32) -> Result<Vec<u8>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.read_blob(volume_addr, offset, size))
+    pub fn read_blob(
+        &self,
+        volume_addr: &str,
+        volume_id: u32,
+        file_key: u64,
+        offset: i64,
+        size: i32,
+    ) -> Result<Vec<u8>, String> {
+        self.client.runtime_handle.block_on(self.client.read_blob(
+            volume_addr,
+            volume_id,
+            file_key,
+            offset,
+            size,
+        ))
     }
 }

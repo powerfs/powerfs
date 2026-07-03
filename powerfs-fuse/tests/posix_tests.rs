@@ -88,7 +88,6 @@ fn test_open_multiple_writers_append() {
     assert!(buf.contains("third"));
     assert!(buf.contains("fourth"));
     assert_eq!(buf.lines().count(), 4);
-
 }
 
 #[test]
@@ -101,13 +100,9 @@ fn test_open_exclusive_create() {
         .open(&path)
         .unwrap();
 
-    let result = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path);
+    let result = OpenOptions::new().create_new(true).write(true).open(&path);
 
     assert!(result.is_err());
-
 }
 
 #[test]
@@ -127,7 +122,6 @@ fn test_write_at_offset() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "00AAA00000");
-
 }
 
 #[test]
@@ -176,7 +170,6 @@ fn test_write_concurrent_offset() {
 
     assert_eq!(&buf[10..15], b"AAAAA");
     assert_eq!(&buf[20..25], b"BBBBB");
-
 }
 
 #[test]
@@ -192,7 +185,6 @@ fn test_read_write_roundtrip() {
     let mut buf = vec![0u8; data.len()];
     f.read(&mut buf).unwrap();
     assert_eq!(&buf, data);
-
 }
 
 #[test]
@@ -211,7 +203,6 @@ fn test_read_partial() {
     let mut buf2 = vec![0u8; 4];
     f.read(&mut buf2).unwrap();
     assert_eq!(&buf2, b"4567");
-
 }
 
 #[test]
@@ -235,7 +226,6 @@ fn test_seek_read() {
     f.seek(SeekFrom::Current(-10)).unwrap();
     f.read(&mut buf).unwrap();
     assert_eq!(&buf, b"qrstu");
-
 }
 
 #[test]
@@ -248,7 +238,6 @@ fn test_mkdir_rmdir() {
 
     fs::remove_dir(&dir).unwrap();
     assert!(!dir.exists());
-
 }
 
 #[test]
@@ -265,7 +254,6 @@ fn test_mkdir_nested() {
 
     fs::remove_dir_all(test_path!("test_nested")).unwrap();
     assert!(!test_path!("test_nested").exists());
-
 }
 
 #[test]
@@ -287,7 +275,6 @@ fn test_readdir() {
     for i in 0..5 {
         assert!(entries.contains(&format!("file{}.txt", i)));
     }
-
 }
 
 #[test]
@@ -308,7 +295,6 @@ fn test_rename() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "rename test");
-
 }
 
 #[test]
@@ -326,7 +312,6 @@ fn test_rename_dir() {
     assert!(!old_dir.exists());
     assert!(new_dir.exists());
     assert!(new_dir.join("file.txt").exists());
-
 }
 
 #[test]
@@ -347,7 +332,6 @@ fn test_symlink() {
 
     let read_link = fs::read_link(&link).unwrap();
     assert!(read_link.ends_with("test_symlink_target.txt"));
-
 }
 
 #[test]
@@ -373,7 +357,6 @@ fn test_truncate() {
 
     let metadata = fs::metadata(&path).unwrap();
     assert_eq!(metadata.len(), 0);
-
 }
 
 #[test]
@@ -388,7 +371,6 @@ fn test_file_metadata() {
     assert_eq!(metadata.len(), 4);
     assert!(!metadata.is_dir());
     assert!(metadata.is_file());
-
 }
 
 #[test]
@@ -407,7 +389,6 @@ fn test_chmod() {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(permissions.mode(), 0o100600);
     }
-
 }
 
 #[test]
@@ -421,7 +402,6 @@ fn test_remove_file() {
     assert!(path.exists());
     fs::remove_file(&path).unwrap();
     assert!(!path.exists());
-
 }
 
 #[test]
@@ -454,7 +434,6 @@ fn test_concurrent_create() {
         f.read(&mut buf).unwrap();
         assert_eq!(buf[0], i as u8);
     }
-
 }
 
 #[test]
@@ -489,7 +468,6 @@ fn test_concurrent_read() {
     for r in all_results.iter() {
         assert_eq!(*r, "concurrent read test content");
     }
-
 }
 
 #[test]
@@ -514,15 +492,9 @@ fn test_pread_pwrite() {
     let fd = File::open(&path).unwrap();
     let mut buf = [0u8; 6];
     unsafe {
-        libc::pread(
-            fd.as_raw_fd(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            6,
-            10,
-        );
+        libc::pread(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 6, 10);
     }
     assert_eq!(&buf, b"PWRITE");
-
 }
 
 #[test]
@@ -545,7 +517,6 @@ fn test_dup() {
     let mut buf2 = [0u8; 3];
     f2.read(&mut buf2).unwrap();
     assert_eq!(&buf2, b"dup");
-
 }
 
 #[test]
@@ -561,7 +532,6 @@ fn test_fsync() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "fsync test");
-
 }
 
 #[test]
@@ -579,7 +549,6 @@ fn test_ftruncate() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "12345");
-
 }
 
 #[test]
@@ -604,7 +573,6 @@ fn test_file_rename_overwrite() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "source");
-
 }
 
 #[test]
@@ -620,7 +588,6 @@ fn test_empty_file() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "");
-
 }
 
 #[test]
@@ -639,7 +606,6 @@ fn test_large_write() {
     let mut buf = vec![0u8; 1024 * 1024];
     f.read(&mut buf).unwrap();
     assert_eq!(buf, data);
-
 }
 
 #[test]
@@ -657,7 +623,6 @@ fn test_multiple_writes() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "Hello World!");
-
 }
 
 #[test]
@@ -676,7 +641,6 @@ fn test_append_mode() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "firstsecond");
-
 }
 
 #[test]
@@ -687,7 +651,11 @@ fn test_truncate_on_open() {
     f.write_all(b"original content").unwrap();
     drop(f);
 
-    let mut f = OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+    let mut f = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
     f.write_all(b"new content").unwrap();
     drop(f);
 
@@ -695,7 +663,6 @@ fn test_truncate_on_open() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "new content");
-
 }
 
 #[test]
@@ -711,7 +678,6 @@ fn test_directory_permissions() {
     drop(f);
 
     assert!(file.exists());
-
 }
 
 #[test]
@@ -722,7 +688,6 @@ fn test_readdir_empty() {
 
     let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
     assert_eq!(entries.len(), 0);
-
 }
 
 #[test]
@@ -740,7 +705,6 @@ fn test_path_traversal() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "traversal test");
-
 }
 
 #[test]
@@ -756,7 +720,6 @@ fn test_fdatasync() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "fdatasync test");
-
 }
 
 #[test]
@@ -778,5 +741,4 @@ fn test_file_sync_rename() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "atomic write");
-
 }
