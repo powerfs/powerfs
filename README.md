@@ -155,20 +155,20 @@ All tests are conducted on a single-node setup with PowerFS FUSE client, using s
 #### Test Environment
 - **Hardware**: Single node with NVMe SSD
 - **Block Size**: 4KB (random), 1MB (sequential)
-- **Test Size**: 100MB per test
+- **Test Size**: 100MB per test (50MB per thread for multi-thread tests)
 - **IO Engine**: `sync` (standard POSIX I/O)
 
-#### Async Mode (Without fsync - Cached Writes)
+#### Maximum Performance (Async Mode - Cached Writes)
 
 | Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
 |-----------|------------|------|-----------|-------------|
-| Sequential Write | 1MB | 3,448 | 3,448 MiB/s | 258 usec |
-| Sequential Read | 1MB | 480 | 481 MiB/s | 2,072 usec |
-| Random Write | 4KB | 624,000 | 2,439 MiB/s | 1.3 usec |
-| Random Read | 4KB | 7,132 | 27.9 MiB/s | 139 usec |
-| Mixed Read/Write (70%/30%) | 4KB | 9,846 | 38.5 MiB/s | - |
+| Sequential Write | 1MB | 5,556 | 5.4 GiB/s | 161 usec |
+| Sequential Read | 1MB | 492 | 493 MiB/s | 2,019 usec |
+| Random Write | 4KB | 610,000 | 2.3 GiB/s | 1.3 usec |
+| Random Read | 4KB | 7,178 | 28.0 MiB/s | 138 usec |
+| Mixed Read/Write (70%/30%) | 4KB | 13,472 | 52.6 MiB/s | - |
 
-#### Sync Mode (With fsync - Persistent Writes)
+#### Persistent Performance (Sync Mode - With fsync)
 
 | Test Type | Block Size | IOPS | Bandwidth | Avg Latency | fsync Latency |
 |-----------|------------|------|-----------|-------------|--------------|
@@ -182,15 +182,44 @@ All tests are conducted on a single-node setup with PowerFS FUSE client, using s
 
 | Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
 |-----------|------------|------|-----------|-------------|
+| Sequential Write (async) | 1MB | 12,500 | 12.2 GiB/s | 251 usec |
 | Sequential Write (fsync) | 1MB | 365 | 366 MiB/s | 516 usec |
-| Random Read | 4KB | 23,300 | 91.2 MiB/s | 169 usec |
+| Random Read | 4KB | 23,300 | 91.1 MiB/s | 169 usec |
+
+#### Test Commands
+
+```bash
+# Run full benchmark suite with default settings (async mode)
+bash scripts/run_fio_test.sh
+
+# Run with persistent writes (fsync=1)
+bash scripts/run_fio_test.sh --force-fsync
+
+# Run with custom IO engine
+bash scripts/run_fio_test.sh --engine=libaio
+bash scripts/run_fio_test.sh --engine=io_uring
+
+# Custom fsync interval (every 1000 I/Os)
+bash scripts/run_fio_test.sh --engine=libaio --fsync=1000
+```
+
+#### Test Script Options
+
+| Option | Description |
+|--------|-------------|
+| `--engine=ENGINE` | IO engine: `sync` (default), `libaio`, `io_uring` |
+| `--fsync=N` | Number of I/Os between fsync (0=disabled, 1=every IO) |
+| `--no-fsync` | Shortcut for `--fsync=0` (cached writes) |
+| `--force-fsync` | Shortcut for `--fsync=1` (persistent writes) |
+| `--no-build` | Skip building release binaries |
 
 #### Key Insights
 
-- **Async Write Performance**: Random writes reach 624K IOPS with cached writes, demonstrating excellent write buffer efficiency
-- **Sync Write Performance**: Limited by gRPC round-trip and disk fsync (~1.3ms), typical for network-attached storage
-- **Multi-thread Scaling**: Random read scales to 23.3K IOPS with 4 threads, showing effective parallel processing
-- **Data Integrity**: All tests passed `--verify=crc32c` validation, confirming data correctness
+- **Maximum Write Performance**: Random writes reach 610K IOPS (2.3 GiB/s) with cached writes, demonstrating excellent write buffer efficiency
+- **Multi-thread Scaling**: 4-thread sequential write reaches 12.5K IOPS (12.2 GiB/s), showing effective parallel processing
+- **Persistent Performance**: Limited by gRPC round-trip and disk fsync (~1.3ms), typical for network-attached storage
+- **Read Performance**: Random reads reach 23.3K IOPS with 4 threads, primarily limited by disk I/O
+- **Performance Gap**: Async mode shows ~800x faster random write throughput compared to sync mode (610K vs 770 IOPS)
 
 ### Benchmark Outlook
 

@@ -18,6 +18,8 @@ use tonic::transport::Channel;
 
 use powerfs_master::proto::powerfs::Location;
 
+type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
+
 struct ConnectionPool {
     channels: RwLock<Vec<Channel>>,
     addr: String,
@@ -153,7 +155,7 @@ impl PowerFuseClient {
         let pool = Arc::new(ConnectionPool::new(
             self.master_addr.clone(),
             self.pool_max_size,
-            self.config.clone(),
+            self.config,
         ));
 
         {
@@ -181,7 +183,7 @@ impl PowerFuseClient {
         let pool = Arc::new(ConnectionPool::new(
             addr.to_string(),
             self.pool_max_size,
-            self.config.clone(),
+            self.config,
         ));
 
         {
@@ -220,8 +222,11 @@ impl PowerFuseClient {
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<(Fid, Option<Location>, Vec<String>, Vec<Location>), String> {
-        debug!("assign_fid: collection={}, replication={}", collection, replication);
+    ) -> Result<AssignFidResult, String> {
+        debug!(
+            "assign_fid: collection={}, replication={}",
+            collection, replication
+        );
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -257,7 +262,8 @@ impl PowerFuseClient {
                         self.return_master_channel(channel).await;
                         return Err(resp.error);
                     }
-                    let fid = Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
+                    let fid =
+                        Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
                     debug!("assign_fid succeeded: fid={}", fid);
                     self.return_master_channel(channel).await;
                     return Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations));
@@ -335,7 +341,10 @@ impl PowerFuseClient {
     ) -> Result<(), String> {
         debug!(
             "write_data: addr={}, volume_id={}, file_key={}, size={}",
-            volume_addr, volume_id, file_key, data.len()
+            volume_addr,
+            volume_id,
+            file_key,
+            data.len()
         );
 
         for attempt in 1..=self.config.max_retry_count {
@@ -369,7 +378,10 @@ impl PowerFuseClient {
                         self.return_volume_channel(volume_addr, channel).await;
                         return Err("write failed: volume server returned failure".to_string());
                     }
-                    debug!("write_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    debug!(
+                        "write_data succeeded: volume_id={}, file_key={}",
+                        volume_id, file_key
+                    );
                     self.return_volume_channel(volume_addr, channel).await;
                     return Ok(());
                 }
@@ -428,7 +440,12 @@ impl PowerFuseClient {
                         self.return_volume_channel(volume_addr, channel).await;
                         return Err("read failed: volume server returned failure".to_string());
                     }
-                    debug!("read_data succeeded: volume_id={}, file_key={}, size={}", volume_id, file_key, resp.data.len());
+                    debug!(
+                        "read_data succeeded: volume_id={}, file_key={}, size={}",
+                        volume_id,
+                        file_key,
+                        resp.data.len()
+                    );
                     self.return_volume_channel(volume_addr, channel).await;
                     return Ok(resp.data);
                 }
@@ -487,7 +504,10 @@ impl PowerFuseClient {
                         self.return_volume_channel(volume_addr, channel).await;
                         return Err("delete failed: volume server returned failure".to_string());
                     }
-                    debug!("delete_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    debug!(
+                        "delete_data succeeded: volume_id={}, file_key={}",
+                        volume_id, file_key
+                    );
                     self.return_volume_channel(volume_addr, channel).await;
                     return Ok(());
                 }
@@ -515,6 +535,7 @@ impl PowerFuseClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_blob(
         &self,
         volume_addr: &str,
@@ -561,7 +582,10 @@ impl PowerFuseClient {
                     if !resp.success {
                         return Err("write_blob failed: volume server returned failure".to_string());
                     }
-                    debug!("write_blob succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    debug!(
+                        "write_blob succeeded: volume_id={}, file_key={}",
+                        volume_id, file_key
+                    );
                     return Ok(());
                 }
                 Err(e) => {
@@ -621,7 +645,12 @@ impl PowerFuseClient {
                     if !resp.success {
                         return Err("read_blob failed: volume server returned failure".to_string());
                     }
-                    debug!("read_blob succeeded: volume_id={}, file_key={}, size={}", volume_id, file_key, resp.needle_blob.len());
+                    debug!(
+                        "read_blob succeeded: volume_id={}, file_key={}, size={}",
+                        volume_id,
+                        file_key,
+                        resp.needle_blob.len()
+                    );
                     return Ok(resp.needle_blob);
                 }
                 Err(e) => {
@@ -640,7 +669,10 @@ impl PowerFuseClient {
     }
 
     pub async fn create_entry(&self, entry: Entry) -> Result<u64, String> {
-        debug!("create_entry: name={}, directory={}", entry.name, entry.directory);
+        debug!(
+            "create_entry: name={}, directory={}",
+            entry.name, entry.directory
+        );
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -656,7 +688,9 @@ impl PowerFuseClient {
             };
 
             let mut client = MasterServiceClient::new(channel);
-            let request = CreateEntryRequest { entry: Some(entry.clone()) };
+            let request = CreateEntryRequest {
+                entry: Some(entry.clone()),
+            };
 
             match client.create_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
@@ -683,7 +717,10 @@ impl PowerFuseClient {
     }
 
     pub async fn update_entry(&self, entry: &Entry) -> Result<(), String> {
-        debug!("update_entry: name={}, directory={}", entry.name, entry.directory);
+        debug!(
+            "update_entry: name={}, directory={}",
+            entry.name, entry.directory
+        );
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -699,13 +736,17 @@ impl PowerFuseClient {
             };
 
             let mut client = MasterServiceClient::new(channel);
-            let request = UpdateEntryRequest { entry: Some(entry.clone()) };
+            let request = UpdateEntryRequest {
+                entry: Some(entry.clone()),
+            };
 
             match client.update_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.success {
-                        return Err("update_entry failed: master server returned failure".to_string());
+                        return Err(
+                            "update_entry failed: master server returned failure".to_string()
+                        );
                     }
                     debug!("update_entry succeeded");
                     return Ok(());
@@ -742,7 +783,9 @@ impl PowerFuseClient {
             };
 
             let mut client = MasterServiceClient::new(channel);
-            let request = GetEntryRequest { path: path.to_string() };
+            let request = GetEntryRequest {
+                path: path.to_string(),
+            };
 
             match client.get_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
@@ -785,7 +828,7 @@ impl PowerFuseClient {
             };
 
             let mut client = MasterServiceClient::new(channel);
-            let request = DeleteEntryRequest { 
+            let request = DeleteEntryRequest {
                 path: path.to_string(),
                 is_directory,
             };
@@ -814,8 +857,16 @@ impl PowerFuseClient {
         Err("delete_entry failed after max retries".to_string())
     }
 
-    pub async fn list_entries(&self, path: &str, limit: u64, start_after: &str) -> Result<Vec<Entry>, String> {
-        debug!("list_entries: path={}, limit={}, start_after={}", path, limit, start_after);
+    pub async fn list_entries(
+        &self,
+        path: &str,
+        limit: u64,
+        start_after: &str,
+    ) -> Result<Vec<Entry>, String> {
+        debug!(
+            "list_entries: path={}, limit={}, start_after={}",
+            path, limit, start_after
+        );
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -861,8 +912,15 @@ impl PowerFuseClient {
         Err("list_entries failed after max retries".to_string())
     }
 
-    pub async fn lookup_directory_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
-        debug!("lookup_directory_entry: directory={}, name={}", directory, name);
+    pub async fn lookup_directory_entry(
+        &self,
+        directory: &str,
+        name: &str,
+    ) -> Result<Option<Entry>, String> {
+        debug!(
+            "lookup_directory_entry: directory={}, name={}",
+            directory, name
+        );
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -883,13 +941,19 @@ impl PowerFuseClient {
                 name: name.to_string(),
             };
 
-            match client.lookup_directory_entry(tonic::Request::new(request)).await {
+            match client
+                .lookup_directory_entry(tonic::Request::new(request))
+                .await
+            {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
                     }
-                    debug!("lookup_directory_entry succeeded: found={}", resp.entry.is_some());
+                    debug!(
+                        "lookup_directory_entry succeeded: found={}",
+                        resp.entry.is_some()
+                    );
                     return Ok(resp.entry);
                 }
                 Err(e) => {
@@ -921,7 +985,7 @@ impl SyncFuseClient {
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<(Fid, Option<Location>, Vec<String>, Vec<Location>), String> {
+    ) -> Result<AssignFidResult, String> {
         self.client
             .runtime_handle
             .block_on(self.client.assign_fid(collection, replication))
@@ -940,9 +1004,12 @@ impl SyncFuseClient {
         file_key: u64,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.write_data(volume_addr, volume_id, file_key, data))
+        self.client.runtime_handle.block_on(self.client.write_data(
+            volume_addr,
+            volume_id,
+            file_key,
+            data,
+        ))
     }
 
     pub fn read_data(
@@ -962,11 +1029,14 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.delete_data(volume_addr, volume_id, file_key))
+        self.client.runtime_handle.block_on(self.client.delete_data(
+            volume_addr,
+            volume_id,
+            file_key,
+        ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_blob(
         &self,
         volume_addr: &str,
@@ -977,9 +1047,15 @@ impl SyncFuseClient {
         data: Vec<u8>,
         cookie: u32,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(
-            self.client.write_blob(volume_addr, volume_id, file_key, offset, size, data, cookie),
-        )
+        self.client.runtime_handle.block_on(self.client.write_blob(
+            volume_addr,
+            volume_id,
+            file_key,
+            offset,
+            size,
+            data,
+            cookie,
+        ))
     }
 
     pub fn read_blob(
@@ -990,9 +1066,13 @@ impl SyncFuseClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.read_blob(volume_addr, volume_id, file_key, offset, size))
+        self.client.runtime_handle.block_on(self.client.read_blob(
+            volume_addr,
+            volume_id,
+            file_key,
+            offset,
+            size,
+        ))
     }
 
     pub fn create_entry(&self, entry: Entry) -> Result<u64, String> {
@@ -1019,13 +1099,22 @@ impl SyncFuseClient {
             .block_on(self.client.delete_entry(path, is_directory))
     }
 
-    pub fn list_entries(&self, path: &str, limit: u64, start_after: &str) -> Result<Vec<Entry>, String> {
+    pub fn list_entries(
+        &self,
+        path: &str,
+        limit: u64,
+        start_after: &str,
+    ) -> Result<Vec<Entry>, String> {
         self.client
             .runtime_handle
             .block_on(self.client.list_entries(path, limit, start_after))
     }
 
-    pub fn lookup_directory_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
+    pub fn lookup_directory_entry(
+        &self,
+        directory: &str,
+        name: &str,
+    ) -> Result<Option<Entry>, String> {
         self.client
             .runtime_handle
             .block_on(self.client.lookup_directory_entry(directory, name))

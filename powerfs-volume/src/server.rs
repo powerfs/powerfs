@@ -60,7 +60,10 @@ impl VolumeService for VolumeServer {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
 
-        info!("create_volume: volume_id={}, size={}", volume_id.0, req.size);
+        info!(
+            "create_volume: volume_id={}, size={}",
+            volume_id.0, req.size
+        );
 
         let start = time::Instant::now();
         let result = self.storage_manager.create_volume(volume_id, req.size);
@@ -147,10 +150,7 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
-                debug!(
-                    "write_needle completed in {:?}",
-                    start.elapsed()
-                );
+                debug!("write_needle completed in {:?}", start.elapsed());
                 r
             }
             Err(e) => {
@@ -202,10 +202,7 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
-                debug!(
-                    "read_needle completed in {:?}",
-                    start.elapsed()
-                );
+                debug!("read_needle completed in {:?}", start.elapsed());
                 r
             }
             Err(e) => {
@@ -362,10 +359,7 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
-                debug!(
-                    "write_needle_blob completed in {:?}",
-                    start.elapsed()
-                );
+                debug!("write_needle_blob completed in {:?}", start.elapsed());
                 r
             }
             Err(e) => {
@@ -417,10 +411,7 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
-                debug!(
-                    "read_needle_blob completed in {:?}",
-                    start.elapsed()
-                );
+                debug!("read_needle_blob completed in {:?}", start.elapsed());
                 r
             }
             Err(e) => {
@@ -454,14 +445,11 @@ impl VolumeService for VolumeServer {
                         last_modified: info.created_at.timestamp() as u64,
                         crc: info.checksum as u32,
                         ttl: "".to_string(),
-                        append_at_ns: info.created_at.timestamp_nanos() as u64,
+                        append_at_ns: info.created_at.timestamp_nanos_opt().unwrap_or(0) as u64,
                     }))
                 } else {
                     warn!("read_needle_meta: needle not found: {}", file_key);
-                    Err(Status::not_found(format!(
-                        "needle not found: {}",
-                        file_key
-                    )))
+                    Err(Status::not_found(format!("needle not found: {}", file_key)))
                 }
             } else {
                 warn!("read_needle_meta: volume not found: {}", volume_id.0);

@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_port = args
         .grpc_address
         .split(':')
-        .last()
+        .next_back()
         .and_then(|p| p.parse().ok())
         .unwrap_or(args.http_port + 1);
 

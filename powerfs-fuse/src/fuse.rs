@@ -73,14 +73,14 @@ impl FuseApp {
 
         let fs_arc = Arc::new(fs);
         let bg_fs = fs_arc.clone();
-        thread::spawn(move || {
-            loop {
-                if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = bg_fs.flush_all_dirty_chunks();
-                    bg_fs.has_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
-                thread::sleep(Duration::from_millis(100));
+        thread::spawn(move || loop {
+            if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = bg_fs.flush_all_dirty_chunks();
+                bg_fs
+                    .has_dirty
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
+            thread::sleep(Duration::from_millis(100));
         });
 
         let mut session =
@@ -216,8 +216,8 @@ impl PowerFsFs {
 
         for (_, chunk_idx) in &dirty {
             let chunk_offset = chunk_idx * chunk_size;
-            let chunk_data = self.chunk_cache.get_with_write_lock(inode, chunk_offset);
-            
+            let chunk_data = self.chunk_cache.get(inode, chunk_offset);
+
             if let Some(chunk_data) = chunk_data {
                 let data_len = chunk_data.data.len();
                 self.client
@@ -253,14 +253,7 @@ impl PowerFsFs {
         if !path.is_empty() && !chunks.is_empty() {
             let filer_entry = powerfs_master::proto::powerfs::Entry {
                 name: entry.name.clone(),
-                directory: {
-                    let p = self.cache.inode_to_path(entry.parent).unwrap_or_default();
-                    if p == "/" {
-                        p
-                    } else {
-                        p
-                    }
-                },
+                directory: self.cache.inode_to_path(entry.parent).unwrap_or_default(),
                 attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                     ino: entry.inode,
                     mode: entry.mode | 0o100000,
@@ -270,7 +263,7 @@ impl PowerFsFs {
                     rdev: 0,
                     size: entry.size,
                     blksize: 4096,
-                    blocks: entry.size.div_ceil(512) as u64,
+                    blocks: entry.size.div_ceil(512),
                     atime: entry.atime as u64,
                     mtime: entry.mtime as u64,
                     ctime: entry.ctime as u64,
@@ -306,7 +299,7 @@ impl PowerFsFs {
         }
 
         let inodes: HashSet<u64> = dirty.iter().map(|(ino, _)| *ino).collect();
-        
+
         for inode in inodes {
             let _ = self.flush_dirty_chunks(inode);
         }
@@ -963,9 +956,18 @@ impl FileSystem for PowerFsFs {
                                     }
                                 }
                             } else {
-                                info!("read_blob: chunk {} not in dirty chunks, filling with zeros", chunk_idx);
+                                info!(
+                                    "read_blob: chunk {} not in dirty chunks, filling with zeros",
+                                    chunk_idx
+                                );
                                 let mtime = entry.mtime as u64;
-                                self.chunk_cache.put(inode, chunk_offset, vec![0; read_size as usize], mtime, 0);
+                                self.chunk_cache.put(
+                                    inode,
+                                    chunk_offset,
+                                    vec![0; read_size as usize],
+                                    mtime,
+                                    0,
+                                );
                             }
                         } else {
                             error!("read_blob failed: {}", e);
@@ -1054,21 +1056,25 @@ impl FileSystem for PowerFsFs {
                     if chunk.data.len() < needed_len {
                         chunk.data.resize(needed_len, 0);
                     }
-                    chunk.data[in_chunk_start..in_chunk_start + bytes_to_write]
-                        .copy_from_slice(&buf[data_offset as usize..data_offset as usize + bytes_to_write]);
+                    chunk.data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                        &buf[data_offset as usize..data_offset as usize + bytes_to_write],
+                    );
                     chunk.mtime = mtime;
                 });
 
                 if !modified {
                     let mut new_data = vec![0u8; in_chunk_start + bytes_to_write];
-                    new_data[in_chunk_start..in_chunk_start + bytes_to_write]
-                        .copy_from_slice(&buf[data_offset as usize..data_offset as usize + bytes_to_write]);
-                    self.chunk_cache.put(inode, chunk_start_offset, new_data, mtime, 0);
+                    new_data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                        &buf[data_offset as usize..data_offset as usize + bytes_to_write],
+                    );
+                    self.chunk_cache
+                        .put(inode, chunk_start_offset, new_data, mtime, 0);
                 }
 
                 let mut dirty = self.dirty_chunks.write().unwrap();
                 dirty.insert((inode, chunk_idx));
-                self.has_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.has_dirty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
                 data_offset += bytes_to_write as u64;
                 current_offset += bytes_to_write as u64;
@@ -1096,7 +1102,8 @@ impl FileSystem for PowerFsFs {
 
             let mut dirty = self.dirty_chunks.write().unwrap();
             dirty.insert((inode, 0));
-            self.has_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.has_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
 
             let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
             let filer_entry = powerfs_master::proto::powerfs::Entry {

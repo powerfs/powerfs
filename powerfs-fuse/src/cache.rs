@@ -809,12 +809,6 @@ impl ChunkCache {
         cache.get(&(inode, chunk_index)).cloned()
     }
 
-    pub fn get_with_write_lock(&self, inode: u64, offset: u64) -> Option<ChunkData> {
-        let chunk_index = self.get_chunk_index(offset);
-        let cache = self.cache.write().unwrap();
-        cache.get(&(inode, chunk_index)).cloned()
-    }
-
     pub fn modify<F>(&self, inode: u64, offset: u64, f: F) -> bool
     where
         F: FnOnce(&mut ChunkData),
