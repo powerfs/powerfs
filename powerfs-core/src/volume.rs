@@ -252,13 +252,11 @@ impl Volume {
             drop(info_guard);
             self.index.insert(NeedleId(file_key), updated_info);
         } else {
-            let data_size = size as usize;
+            let data_size = (offset as u64 + size as u64) as usize;
             let mut full_data = vec![0u8; data_size];
             let write_offset = offset as usize;
-            if write_offset < data_size {
-                let copy_len = std::cmp::min(data.len(), data_size - write_offset);
-                full_data[write_offset..write_offset + copy_len].copy_from_slice(&data[..copy_len]);
-            }
+            let copy_len = std::cmp::min(data.len(), size as usize);
+            full_data[write_offset..write_offset + copy_len].copy_from_slice(&data[..copy_len]);
             self.write_needle(file_key, Bytes::from(full_data))?;
         }
         Ok(())

@@ -18,6 +18,7 @@ powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-volume = { path = "../powerfs-volume" }
 fuse-backend-rs = { workspace = true }
+fuser = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }

@@ -21,6 +21,10 @@ struct Args {
     #[arg(long, default_value = "000")]
     replication: String,
 
+    /// Number of FUSE worker threads
+    #[arg(long, default_value = "8")]
+    threads: usize,
+
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -37,6 +41,7 @@ fn main() {
     info!("  Mount point: {}", args.mount_point);
     info!("  Collection: {}", args.collection);
     info!("  Replication: {}", args.replication);
+    info!("  Worker threads: {}", args.threads);
 
     // Create mount point directory if it doesn't exist
     let mount_path = std::path::Path::new(&args.mount_point);
@@ -51,27 +56,17 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     runtime.block_on(async {
-        let fuse_client = powerfs_fuse::FuseApp::new(
+        let fuse_client = powerfs_fuse::FuserApp::new(
             &args.master,
             &args.mount_point,
             &args.collection,
             &args.replication,
+            args.threads,
         )
         .await
         .expect("Failed to create FUSE client");
 
         info!("Mounting PowerFS at: {}", args.mount_point);
-
-        // Setup signal handler for clean unmount
-        let mount_point = args.mount_point.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for Ctrl+C");
-            info!("Received Ctrl+C, unmounting...");
-            let _ = nix::mount::umount(mount_point.as_str());
-            std::process::exit(0);
-        });
 
         fuse_client.run().await.expect("FUSE session error");
     });

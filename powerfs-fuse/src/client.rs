@@ -13,10 +13,69 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tonic::transport::Channel;
 
 use powerfs_master::proto::powerfs::Location;
+
+struct ConnectionPool {
+    channels: RwLock<Vec<Channel>>,
+    addr: String,
+    max_size: usize,
+    semaphore: Arc<Semaphore>,
+    config: GrpcConfig,
+}
+
+impl ConnectionPool {
+    fn new(addr: String, max_size: usize, config: GrpcConfig) -> Self {
+        Self {
+            channels: RwLock::new(Vec::new()),
+            addr,
+            max_size,
+            semaphore: Arc::new(Semaphore::new(max_size)),
+            config,
+        }
+    }
+
+    async fn get(&self) -> Result<Channel, String> {
+        let _permit = self.semaphore.acquire().await.unwrap();
+
+        let mut channels = self.channels.write().await;
+        if let Some(ch) = channels.pop() {
+            return Ok(ch);
+        }
+
+        info!("Creating new connection to: {}", self.addr);
+        let grpc_addr = format!("http://{}", self.addr);
+        let ch = Channel::from_shared(grpc_addr)
+            .map_err(|e| format!("invalid address: {}", e))?
+            .http2_keep_alive_interval(self.config.keepalive_interval)
+            .keep_alive_timeout(self.config.keepalive_timeout)
+            .connect_timeout(self.config.connect_timeout)
+            .connect()
+            .await
+            .map_err(|e| {
+                let msg = format!("failed to connect to {}: {}", self.addr, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        info!("Connected to: {}", self.addr);
+        Ok(ch)
+    }
+
+    async fn put(&self, ch: Channel) {
+        let mut channels = self.channels.write().await;
+        if channels.len() < self.max_size {
+            channels.push(ch);
+        }
+    }
+
+    async fn clear(&self) {
+        let mut channels = self.channels.write().await;
+        channels.clear();
+    }
+}
 
 #[derive(Debug)]
 pub struct WriteBlobParams {
@@ -53,100 +112,107 @@ impl Default for GrpcConfig {
 
 pub struct PowerFuseClient {
     master_addr: String,
-    master_channel: RwLock<Option<Channel>>,
-    volume_channels: RwLock<HashMap<String, Channel>>,
+    master_pool: RwLock<Option<Arc<ConnectionPool>>>,
+    volume_pools: RwLock<HashMap<String, Arc<ConnectionPool>>>,
     runtime_handle: Handle,
     config: GrpcConfig,
+    pool_max_size: usize,
 }
 
 impl PowerFuseClient {
     pub fn new(master_addr: &str, runtime_handle: Handle) -> Arc<Self> {
         Arc::new(PowerFuseClient {
             master_addr: master_addr.to_string(),
-            master_channel: RwLock::new(None),
-            volume_channels: RwLock::new(HashMap::new()),
+            master_pool: RwLock::new(None),
+            volume_pools: RwLock::new(HashMap::new()),
             runtime_handle,
             config: GrpcConfig::default(),
+            pool_max_size: 8,
         })
     }
 
     pub fn with_config(master_addr: &str, runtime_handle: Handle, config: GrpcConfig) -> Arc<Self> {
         Arc::new(PowerFuseClient {
             master_addr: master_addr.to_string(),
-            master_channel: RwLock::new(None),
-            volume_channels: RwLock::new(HashMap::new()),
+            master_pool: RwLock::new(None),
+            volume_pools: RwLock::new(HashMap::new()),
             runtime_handle,
             config,
+            pool_max_size: 8,
         })
     }
 
     async fn ensure_master_channel(&self) -> Result<Channel, String> {
         {
-            let channel = self.master_channel.read().await;
-            if let Some(ch) = &*channel {
-                return Ok(ch.clone());
+            let pool = self.master_pool.read().await;
+            if let Some(p) = &*pool {
+                return p.get().await;
             }
         }
 
-        info!("Connecting to master server: {}", self.master_addr);
-        let addr = format!("http://{}", self.master_addr);
-        let ch = Channel::from_shared(addr)
-            .map_err(|e| format!("invalid master address: {}", e))?
-            .http2_keep_alive_interval(self.config.keepalive_interval)
-            .keep_alive_timeout(self.config.keepalive_timeout)
-            .connect_timeout(self.config.connect_timeout)
-            .connect()
-            .await
-            .map_err(|e| {
-                let msg = format!("failed to connect to master {}: {}", self.master_addr, e);
-                error!("{}", msg);
-                msg
-            })?;
+        let pool = Arc::new(ConnectionPool::new(
+            self.master_addr.clone(),
+            self.pool_max_size,
+            self.config.clone(),
+        ));
 
-        info!("Connected to master server: {}", self.master_addr);
-        let mut channel = self.master_channel.write().await;
-        *channel = Some(ch.clone());
-        Ok(ch)
+        {
+            let mut master_pool = self.master_pool.write().await;
+            *master_pool = Some(pool.clone());
+        }
+
+        pool.get().await
+    }
+
+    async fn return_master_channel(&self, ch: Channel) {
+        if let Some(pool) = &*self.master_pool.read().await {
+            pool.put(ch).await;
+        }
     }
 
     async fn get_volume_channel(&self, addr: &str) -> Result<Channel, String> {
         {
-            let channels = self.volume_channels.read().await;
-            if let Some(ch) = channels.get(addr) {
-                return Ok(ch.clone());
+            let pools = self.volume_pools.read().await;
+            if let Some(pool) = pools.get(addr) {
+                return pool.get().await;
             }
         }
 
-        info!("Connecting to volume server: {}", addr);
-        let grpc_addr = format!("http://{}", addr);
-        let ch = Channel::from_shared(grpc_addr)
-            .map_err(|e| format!("invalid volume address: {}", e))?
-            .http2_keep_alive_interval(self.config.keepalive_interval)
-            .keep_alive_timeout(self.config.keepalive_timeout)
-            .connect_timeout(self.config.connect_timeout)
-            .connect()
-            .await
-            .map_err(|e| {
-                let msg = format!("failed to connect to volume server {}: {}", addr, e);
-                error!("{}", msg);
-                msg
-            })?;
+        let pool = Arc::new(ConnectionPool::new(
+            addr.to_string(),
+            self.pool_max_size,
+            self.config.clone(),
+        ));
 
-        info!("Connected to volume server: {}", addr);
-        let mut channels = self.volume_channels.write().await;
-        channels.insert(addr.to_string(), ch.clone());
-        Ok(ch)
+        {
+            let mut pools = self.volume_pools.write().await;
+            pools.insert(addr.to_string(), pool.clone());
+        }
+
+        pool.get().await
+    }
+
+    async fn return_volume_channel(&self, addr: &str, ch: Channel) {
+        if let Some(pool) = self.volume_pools.read().await.get(addr) {
+            pool.put(ch).await;
+        }
     }
 
     pub async fn invalidate_master_channel(&self) {
-        let mut channel = self.master_channel.write().await;
-        *channel = None;
+        let mut pool = self.master_pool.write().await;
+        if let Some(p) = &*pool {
+            p.clear().await;
+        }
+        *pool = None;
         warn!("Invalidated master channel");
     }
 
     pub async fn invalidate_volume_channel(&self, addr: &str) {
-        let mut channels = self.volume_channels.write().await;
-        channels.remove(addr);
+        let mut pools = self.volume_pools.write().await;
+        if let Some(pool) = pools.get(addr) {
+            pool.clear().await;
+        }
+        pools.remove(addr);
         warn!("Invalidated volume channel: {}", addr);
     }
 
@@ -170,7 +236,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = MasterServiceClient::new(channel);
+            let mut client = MasterServiceClient::new(channel.clone());
             let request = AssignRequest {
                 count: 1,
                 replication: replication.to_string(),
@@ -188,10 +254,12 @@ impl PowerFuseClient {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
+                        self.return_master_channel(channel).await;
                         return Err(resp.error);
                     }
                     let fid = Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
                     debug!("assign_fid succeeded: fid={}", fid);
+                    self.return_master_channel(channel).await;
                     return Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations));
                 }
                 Err(e) => {
@@ -225,7 +293,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = MasterServiceClient::new(channel);
+            let mut client = MasterServiceClient::new(channel.clone());
             let request = LookupVolumeRequest {
                 volume_or_file_ids: vec![volume_id.to_string()],
                 collection: String::new(),
@@ -240,6 +308,7 @@ impl PowerFuseClient {
                         .flat_map(|vil| vil.locations)
                         .collect();
                     debug!("lookup_volume succeeded: {} locations", locations.len());
+                    self.return_master_channel(channel).await;
                     return Ok(locations);
                 }
                 Err(e) => {
@@ -282,7 +351,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = VolumeServiceClient::new(channel)
+            let mut client = VolumeServiceClient::new(channel.clone())
                 .max_decoding_message_size(256 * 1024 * 1024)
                 .max_encoding_message_size(256 * 1024 * 1024);
             let request = WriteNeedleRequest {
@@ -297,9 +366,11 @@ impl PowerFuseClient {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.success {
+                        self.return_volume_channel(volume_addr, channel).await;
                         return Err("write failed: volume server returned failure".to_string());
                     }
                     debug!("write_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    self.return_volume_channel(volume_addr, channel).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -341,7 +412,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = VolumeServiceClient::new(channel)
+            let mut client = VolumeServiceClient::new(channel.clone())
                 .max_decoding_message_size(256 * 1024 * 1024)
                 .max_encoding_message_size(256 * 1024 * 1024);
             let request = ReadNeedleRequest {
@@ -354,9 +425,11 @@ impl PowerFuseClient {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.success {
+                        self.return_volume_channel(volume_addr, channel).await;
                         return Err("read failed: volume server returned failure".to_string());
                     }
                     debug!("read_data succeeded: volume_id={}, file_key={}, size={}", volume_id, file_key, resp.data.len());
+                    self.return_volume_channel(volume_addr, channel).await;
                     return Ok(resp.data);
                 }
                 Err(e) => {
@@ -398,7 +471,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = VolumeServiceClient::new(channel)
+            let mut client = VolumeServiceClient::new(channel.clone())
                 .max_decoding_message_size(256 * 1024 * 1024)
                 .max_encoding_message_size(256 * 1024 * 1024);
             let request = DeleteNeedleRequest {
@@ -411,9 +484,11 @@ impl PowerFuseClient {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.success {
+                        self.return_volume_channel(volume_addr, channel).await;
                         return Err("delete failed: volume server returned failure".to_string());
                     }
                     debug!("delete_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    self.return_volume_channel(volume_addr, channel).await;
                     return Ok(());
                 }
                 Err(e) => {

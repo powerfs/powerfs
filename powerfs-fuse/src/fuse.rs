@@ -216,15 +216,18 @@ impl PowerFsFs {
 
         for (_, chunk_idx) in &dirty {
             let chunk_offset = chunk_idx * chunk_size;
-            if let Some(chunk_data) = self.chunk_cache.get(inode, chunk_offset) {
+            let chunk_data = self.chunk_cache.get_with_write_lock(inode, chunk_offset);
+            
+            if let Some(chunk_data) = chunk_data {
+                let data_len = chunk_data.data.len();
                 self.client
                     .write_blob(
                         &addr,
                         fid.volume_id.0,
                         fid.file_key,
                         chunk_offset as i64,
-                        chunk_data.data.len() as i32,
-                        chunk_data.data.to_vec(),
+                        data_len as i32,
+                        chunk_data.data,
                         0,
                     )
                     .map_err(|e| {
@@ -234,7 +237,7 @@ impl PowerFsFs {
 
                 chunks.push(powerfs_master::proto::powerfs::FileChunk {
                     offset: chunk_offset,
-                    size: chunk_data.data.len() as u64,
+                    size: data_len as u64,
                     mtime: chunk_data.mtime,
                     fid: fid.to_string(),
                     cookie: 0,

@@ -40,6 +40,7 @@ tonic = { version = "0.11" }
 prost = { version = "0.12" }
 raft = { version = "0.7", features = ["default", "protobuf-codec"] }
 fuse-backend-rs = { version = "0.14" }
+fuser = { version = "0.14" }
 libc = { version = "0.2" }
 nix = { version = "0.28", features = ["mount"] }
 rand = { version = "0.8" }

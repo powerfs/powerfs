@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use log::info;
 use powerfs_common::{error::Result, utils::generate_node_id};
 use powerfs_core::storage::StorageManager;
-use powerfs_fuse::FuseApp;
+use powerfs_fuse::FuserApp;
 use powerfs_master::master::MasterNode;
 use std::sync::Arc;
 
@@ -250,7 +250,7 @@ async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Resul
     info!("Starting PowerFS FUSE client");
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuseApp::new(master_addr, dir, "default", "000").await?;
+    let fuse_app = FuserApp::new(master_addr, dir, "default", "000", 8).await?;
 
     info!("Mounting PowerFS at: {}", dir);
     info!("Connected to master: {}", master_addr);
@@ -262,7 +262,7 @@ async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Mounting PowerFS at: {}", dir);
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuseApp::new(master_addr, dir, "default", "000").await?;
+    let fuse_app = FuserApp::new(master_addr, dir, "default", "000", 8).await?;
 
     info!("Connected to master: {}", master_addr);
 
