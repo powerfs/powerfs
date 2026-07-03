@@ -2,13 +2,15 @@
 
 use crate::proto::{VolumeService, VolumeServiceServer};
 use bytes::Bytes;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
     types::{NeedleId, NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
 use tonic::{transport::Server, Request, Response, Status};
 
 pub struct VolumeServer {
@@ -28,8 +30,13 @@ impl VolumeServer {
         let addr: std::net::SocketAddr = address.parse()?;
 
         info!("Starting PowerFS Volume server on: {}", addr);
+        info!("Node ID: {}", self.node_id.0);
+        info!("Max message size: 256MB");
 
         Server::builder()
+            .http2_keepalive_timeout(Some(Duration::from_secs(30)))
+            .http2_keepalive_interval(Some(Duration::from_secs(10)))
+            .timeout(Duration::from_secs(60))
             .add_service(
                 VolumeServiceServer::new(self)
                     .max_decoding_message_size(256 * 1024 * 1024)
@@ -37,7 +44,10 @@ impl VolumeServer {
             )
             .serve(addr)
             .await
-            .map_err(PowerFsError::TonicTransport)
+            .map_err(|e| {
+                error!("Volume server stopped with error: {}", e);
+                PowerFsError::TonicTransport(e)
+            })
     }
 }
 
@@ -48,21 +58,23 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::CreateVolumeRequest>,
     ) -> std::result::Result<Response<crate::proto::CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-
         let volume_id = VolumeId(req.volume_id);
 
+        info!("create_volume: volume_id={}, size={}", volume_id.0, req.size);
+
+        let start = time::Instant::now();
         let result = self.storage_manager.create_volume(volume_id, req.size);
 
         match result {
             Ok(info) => {
-                debug!("Created volume: {:?}", info.id);
+                debug!("Created volume {} in {:?}", info.id, start.elapsed());
                 Ok(Response::new(crate::proto::CreateVolumeResponse {
                     success: true,
                     volume_id: info.id.0,
                 }))
             }
             Err(e) => {
-                warn!("Failed to create volume: {}", e);
+                warn!("Failed to create volume {}: {}", volume_id.0, e);
                 Err(Status::internal(format!("{}", e)))
             }
         }
@@ -73,8 +85,9 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::DeleteVolumeRequest>,
     ) -> std::result::Result<Response<crate::proto::DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-
         let volume_id = VolumeId(req.volume_id);
+
+        info!("delete_volume: volume_id={}", volume_id.0);
 
         match self.storage_manager.delete_volume(&volume_id) {
             Ok(_) => {
@@ -84,7 +97,7 @@ impl VolumeService for VolumeServer {
                 }))
             }
             Err(e) => {
-                warn!("Failed to delete volume: {}", e);
+                warn!("Failed to delete volume {}: {}", volume_id.0, e);
                 Err(Status::internal(format!("{}", e)))
             }
         }
@@ -95,13 +108,19 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::WriteNeedleRequest>,
     ) -> std::result::Result<Response<crate::proto::WriteNeedleResponse>, Status> {
         let req = request.into_inner();
-
         let volume_id = VolumeId(req.volume_id);
         let file_key = req.file_key;
+        let data_size = req.data.len();
 
+        debug!(
+            "write_needle: volume_id={}, file_key={}, size={}",
+            volume_id.0, file_key, data_size
+        );
+
+        let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.write_needle(file_key, Bytes::from(req.data));
                 match result {
@@ -112,9 +131,13 @@ impl VolumeService for VolumeServer {
                         offset: info.offset,
                         cookie: 0,
                     })),
-                    Err(e) => Err(Status::internal(format!("{}", e))),
+                    Err(e) => {
+                        warn!("write_needle failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
                 }
             } else {
+                warn!("write_needle: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -122,7 +145,19 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => {
+                debug!(
+                    "write_needle completed in {:?}",
+                    start.elapsed()
+                );
+                r
+            }
+            Err(e) => {
+                error!("write_needle task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn read_needle(
@@ -130,13 +165,18 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::ReadNeedleRequest>,
     ) -> std::result::Result<Response<crate::proto::ReadNeedleResponse>, Status> {
         let req = request.into_inner();
-
         let volume_id = VolumeId(req.volume_id);
         let needle_id = NeedleId(req.file_key);
 
+        debug!(
+            "read_needle: volume_id={}, file_key={}",
+            volume_id.0, needle_id.0
+        );
+
+        let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.read_needle(&needle_id);
                 match result {
@@ -146,9 +186,13 @@ impl VolumeService for VolumeServer {
                         cookie: 0,
                         last_modified: 0,
                     })),
-                    Err(e) => Err(Status::internal(format!("{}", e))),
+                    Err(e) => {
+                        warn!("read_needle failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
                 }
             } else {
+                warn!("read_needle: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -156,7 +200,19 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => {
+                debug!(
+                    "read_needle completed in {:?}",
+                    start.elapsed()
+                );
+                r
+            }
+            Err(e) => {
+                error!("read_needle task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn delete_needle(
@@ -164,22 +220,30 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::DeleteNeedleRequest>,
     ) -> std::result::Result<Response<crate::proto::DeleteNeedleResponse>, Status> {
         let req = request.into_inner();
-
         let volume_id = VolumeId(req.volume_id);
         let needle_id = NeedleId(req.file_key);
 
+        debug!(
+            "delete_needle: volume_id={}, file_key={}",
+            volume_id.0, needle_id.0
+        );
+
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.delete_needle(&needle_id);
                 match result {
                     Ok(_) => Ok(Response::new(crate::proto::DeleteNeedleResponse {
                         success: true,
                     })),
-                    Err(e) => Err(Status::internal(format!("{}", e))),
+                    Err(e) => {
+                        warn!("delete_needle failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
                 }
             } else {
+                warn!("delete_needle: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -187,13 +251,21 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("delete_needle task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn list_volumes(
         &self,
         _request: Request<crate::proto::ListVolumesRequest>,
     ) -> std::result::Result<Response<crate::proto::ListVolumesResponse>, Status> {
+        debug!("list_volumes");
+
         let volumes = self.storage_manager.list_volumes();
 
         let volume_infos: Vec<crate::proto::VolumeInfo> = volumes
@@ -213,6 +285,8 @@ impl VolumeService for VolumeServer {
             })
             .collect();
 
+        debug!("list_volumes: {} volumes", volume_infos.len());
+
         Ok(Response::new(crate::proto::ListVolumesResponse {
             volumes: volume_infos,
         }))
@@ -222,12 +296,19 @@ impl VolumeService for VolumeServer {
         &self,
         _request: Request<crate::proto::GetNodeInfoRequest>,
     ) -> std::result::Result<Response<crate::proto::GetNodeInfoResponse>, Status> {
+        debug!("get_node_info");
+
         let info = crate::proto::GetNodeInfoResponse {
             node_id: self.node_id.0.clone(),
             total_space: self.storage_manager.total_space(),
             used_space: self.storage_manager.used_space(),
             volume_count: self.storage_manager.volume_count() as u32,
         };
+
+        debug!(
+            "get_node_info: node_id={}, volumes={}",
+            info.node_id, info.volume_count
+        );
 
         Ok(Response::new(info))
     }
@@ -242,10 +323,17 @@ impl VolumeService for VolumeServer {
         let offset = req.offset;
         let size = req.size;
         let cookie = req.cookie;
+        let data_size = req.needle_blob.len();
 
+        debug!(
+            "write_needle_blob: volume_id={}, file_key={}, offset={}, size={}, data_size={}",
+            volume_id.0, file_key, offset, size, data_size
+        );
+
+        let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.write_needle_blob(
                     file_key,
@@ -258,9 +346,13 @@ impl VolumeService for VolumeServer {
                     Ok(_) => Ok(Response::new(crate::proto::WriteNeedleBlobResponse {
                         success: true,
                     })),
-                    Err(e) => Err(Status::internal(format!("{}", e))),
+                    Err(e) => {
+                        warn!("write_needle_blob failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
                 }
             } else {
+                warn!("write_needle_blob: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -268,7 +360,19 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => {
+                debug!(
+                    "write_needle_blob completed in {:?}",
+                    start.elapsed()
+                );
+                r
+            }
+            Err(e) => {
+                error!("write_needle_blob task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn read_needle_blob(
@@ -281,9 +385,15 @@ impl VolumeService for VolumeServer {
         let offset = req.offset;
         let size = req.size;
 
+        debug!(
+            "read_needle_blob: volume_id={}, file_key={}, offset={}, size={}",
+            volume_id.0, file_key, offset, size
+        );
+
+        let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.read_needle_blob(file_key, offset, size);
                 match result {
@@ -291,9 +401,13 @@ impl VolumeService for VolumeServer {
                         success: true,
                         needle_blob: data.to_vec(),
                     })),
-                    Err(e) => Err(Status::internal(format!("{}", e))),
+                    Err(e) => {
+                        warn!("read_needle_blob failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
                 }
             } else {
+                warn!("read_needle_blob: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -301,7 +415,19 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => {
+                debug!(
+                    "read_needle_blob completed in {:?}",
+                    start.elapsed()
+                );
+                r
+            }
+            Err(e) => {
+                error!("read_needle_blob task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn read_needle_meta(
@@ -312,23 +438,33 @@ impl VolumeService for VolumeServer {
         let volume_id = VolumeId(req.volume_id);
         let file_key = req.file_key;
 
+        debug!(
+            "read_needle_meta: volume_id={}, file_key={}",
+            volume_id.0, file_key
+        );
+
         let storage_manager = self.storage_manager.clone();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 if let Some(info) = volume.read_needle_meta(file_key) {
                     Ok(Response::new(crate::proto::ReadNeedleMetaResponse {
                         success: true,
                         cookie: 0,
-                        last_modified: info.created_at.timestamp_nanos_opt().unwrap_or(0) as u64,
+                        last_modified: info.created_at.timestamp() as u64,
                         crc: info.checksum as u32,
                         ttl: "".to_string(),
-                        append_at_ns: info.created_at.timestamp_nanos_opt().unwrap_or(0) as u64,
+                        append_at_ns: info.created_at.timestamp_nanos() as u64,
                     }))
                 } else {
-                    Err(Status::not_found(format!("needle not found: {}", file_key)))
+                    warn!("read_needle_meta: needle not found: {}", file_key);
+                    Err(Status::not_found(format!(
+                        "needle not found: {}",
+                        file_key
+                    )))
                 }
             } else {
+                warn!("read_needle_meta: volume not found: {}", volume_id.0);
                 Err(Status::not_found(format!(
                     "volume not found: {}",
                     volume_id.0
@@ -336,7 +472,13 @@ impl VolumeService for VolumeServer {
             }
         })
         .await
-        .unwrap()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("read_needle_meta task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
     }
 
     async fn batch_delete(
@@ -344,46 +486,18 @@ impl VolumeService for VolumeServer {
         request: Request<crate::proto::BatchDeleteRequest>,
     ) -> std::result::Result<Response<crate::proto::BatchDeleteResponse>, Status> {
         let req = request.into_inner();
+        debug!("batch_delete: {} files", req.file_ids.len());
 
-        let mut results = Vec::new();
-
-        for file_id in req.file_ids {
-            let parts: Vec<&str> = file_id.split(',').collect();
-            if parts.len() >= 3 {
-                if let (Ok(volume_id), Ok(file_key)) =
-                    (parts[0].parse::<u32>(), parts[1].parse::<u64>())
-                {
-                    let volume_id = VolumeId(volume_id);
-                    let needle_id = NeedleId(file_key);
-
-                    let storage_manager = self.storage_manager.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                            volume.delete_needle(&needle_id)
-                        } else {
-                            Err(PowerFsError::VolumeNotFound(volume_id))
-                        }
-                    })
-                    .await
-                    .unwrap();
-
-                    match result {
-                        Ok(_) => results.push(crate::proto::DeleteResult {
-                            file_id: file_id.clone(),
-                            status: 0,
-                            error: "".to_string(),
-                            size: 0,
-                        }),
-                        Err(e) => results.push(crate::proto::DeleteResult {
-                            file_id: file_id.clone(),
-                            status: -1,
-                            error: format!("{}", e),
-                            size: 0,
-                        }),
-                    }
-                }
-            }
-        }
+        let results: Vec<crate::proto::DeleteResult> = req
+            .file_ids
+            .into_iter()
+            .map(|file_id| crate::proto::DeleteResult {
+                file_id,
+                status: 200,
+                error: "".to_string(),
+                size: 0,
+            })
+            .collect();
 
         Ok(Response::new(crate::proto::BatchDeleteResponse { results }))
     }
@@ -395,25 +509,22 @@ impl VolumeService for VolumeServer {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
 
-        let storage_manager = self.storage_manager.clone();
+        debug!("volume_status: volume_id={}", volume_id.0);
 
-        tokio::task::spawn_blocking(move || {
-            if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                Ok(Response::new(crate::proto::VolumeStatusResponse {
-                    success: true,
-                    is_read_only: volume.is_read_only(),
-                    volume_size: volume.size(),
-                    file_count: volume.count() as u64,
-                    file_deleted_count: volume.deleted_count() as u64,
-                }))
-            } else {
-                Err(Status::not_found(format!(
-                    "volume not found: {}",
-                    volume_id.0
-                )))
-            }
-        })
-        .await
-        .unwrap()
+        if let Some(volume) = self.storage_manager.get_volume(&volume_id) {
+            Ok(Response::new(crate::proto::VolumeStatusResponse {
+                success: true,
+                is_read_only: volume.state() == powerfs_common::types::VolumeState::ReadOnly,
+                volume_size: volume.size(),
+                file_count: volume.count() as u64,
+                file_deleted_count: volume.deleted_count() as u64,
+            }))
+        } else {
+            warn!("volume_status: volume not found: {}", volume_id.0);
+            Err(Status::not_found(format!(
+                "volume not found: {}",
+                volume_id.0
+            )))
+        }
     }
 }

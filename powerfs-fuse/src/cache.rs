@@ -775,16 +775,14 @@ pub struct ChunkData {
 }
 
 pub struct ChunkCache {
-    cache: RwLock<LruCache<(u64, u64), ChunkData>>,
+    cache: RwLock<HashMap<(u64, u64), ChunkData>>,
     chunk_size: u64,
 }
 
 impl ChunkCache {
-    pub fn new(chunk_size: u64, max_chunks: usize) -> Self {
+    pub fn new(chunk_size: u64, _max_chunks: usize) -> Self {
         ChunkCache {
-            cache: RwLock::new(LruCache::new(
-                NonZero::new(max_chunks).unwrap_or(NonZero::new(100).unwrap()),
-            )),
+            cache: RwLock::new(HashMap::new()),
             chunk_size,
         }
     }
@@ -807,14 +805,28 @@ impl ChunkCache {
 
     pub fn get(&self, inode: u64, offset: u64) -> Option<ChunkData> {
         let chunk_index = self.get_chunk_index(offset);
-        let mut cache = self.cache.write().unwrap();
+        let cache = self.cache.read().unwrap();
         cache.get(&(inode, chunk_index)).cloned()
+    }
+
+    pub fn modify<F>(&self, inode: u64, offset: u64, f: F) -> bool
+    where
+        F: FnOnce(&mut ChunkData),
+    {
+        let chunk_index = self.get_chunk_index(offset);
+        let mut cache = self.cache.write().unwrap();
+        if let Some(chunk) = cache.get_mut(&(inode, chunk_index)) {
+            f(chunk);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn put(&self, inode: u64, offset: u64, data: Vec<u8>, mtime: u64, crc32: u32) {
         let chunk_index = self.get_chunk_index(offset);
         let mut cache = self.cache.write().unwrap();
-        cache.put(
+        cache.insert(
             (inode, chunk_index),
             ChunkData {
                 data,
@@ -834,14 +846,14 @@ impl ChunkCache {
             .map(|(k, _)| *k)
             .collect();
         for key in keys_to_remove {
-            cache.pop(&key);
+            cache.remove(&key);
         }
     }
 
     pub fn remove_chunk(&self, inode: u64, offset: u64) {
         let chunk_index = self.get_chunk_index(offset);
         let mut cache = self.cache.write().unwrap();
-        cache.pop(&(inode, chunk_index));
+        cache.remove(&(inode, chunk_index));
     }
 
     pub fn clear(&self) {
@@ -871,7 +883,7 @@ impl ChunkCache {
         {
             let cache = self.cache.read().unwrap();
             for chunk_index in start_chunk..=end_chunk {
-                if !cache.contains(&(inode, chunk_index)) {
+                if !cache.contains_key(&(inode, chunk_index)) {
                     missing.push((chunk_index * self.chunk_size, self.chunk_size));
                 }
             }

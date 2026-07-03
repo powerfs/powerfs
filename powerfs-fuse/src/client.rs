@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
@@ -11,6 +11,7 @@ use powerfs_volume::proto::powerfs::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
@@ -27,12 +28,35 @@ pub struct WriteBlobParams {
     pub cookie: u32,
 }
 
-/// gRPC client for communicating with Master and Volume servers
+#[derive(Debug, Clone, Copy)]
+pub struct GrpcConfig {
+    pub keepalive_interval: Duration,
+    pub keepalive_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_retry_count: usize,
+    pub retry_delay: Duration,
+}
+
+impl Default for GrpcConfig {
+    fn default() -> Self {
+        GrpcConfig {
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(60),
+            max_retry_count: 3,
+            retry_delay: Duration::from_millis(500),
+        }
+    }
+}
+
 pub struct PowerFuseClient {
     master_addr: String,
     master_channel: RwLock<Option<Channel>>,
     volume_channels: RwLock<HashMap<String, Channel>>,
     runtime_handle: Handle,
+    config: GrpcConfig,
 }
 
 impl PowerFuseClient {
@@ -42,6 +66,17 @@ impl PowerFuseClient {
             master_channel: RwLock::new(None),
             volume_channels: RwLock::new(HashMap::new()),
             runtime_handle,
+            config: GrpcConfig::default(),
+        })
+    }
+
+    pub fn with_config(master_addr: &str, runtime_handle: Handle, config: GrpcConfig) -> Arc<Self> {
+        Arc::new(PowerFuseClient {
+            master_addr: master_addr.to_string(),
+            master_channel: RwLock::new(None),
+            volume_channels: RwLock::new(HashMap::new()),
+            runtime_handle,
+            config,
         })
     }
 
@@ -52,12 +87,23 @@ impl PowerFuseClient {
                 return Ok(ch.clone());
             }
         }
+
+        info!("Connecting to master server: {}", self.master_addr);
         let addr = format!("http://{}", self.master_addr);
         let ch = Channel::from_shared(addr)
             .map_err(|e| format!("invalid master address: {}", e))?
+            .http2_keep_alive_interval(self.config.keepalive_interval)
+            .keep_alive_timeout(self.config.keepalive_timeout)
+            .connect_timeout(self.config.connect_timeout)
             .connect()
             .await
-            .map_err(|e| format!("failed to connect to master: {}", e))?;
+            .map_err(|e| {
+                let msg = format!("failed to connect to master {}: {}", self.master_addr, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        info!("Connected to master server: {}", self.master_addr);
         let mut channel = self.master_channel.write().await;
         *channel = Some(ch.clone());
         Ok(ch)
@@ -70,72 +116,147 @@ impl PowerFuseClient {
                 return Ok(ch.clone());
             }
         }
+
+        info!("Connecting to volume server: {}", addr);
         let grpc_addr = format!("http://{}", addr);
         let ch = Channel::from_shared(grpc_addr)
             .map_err(|e| format!("invalid volume address: {}", e))?
+            .http2_keep_alive_interval(self.config.keepalive_interval)
+            .keep_alive_timeout(self.config.keepalive_timeout)
+            .connect_timeout(self.config.connect_timeout)
             .connect()
             .await
-            .map_err(|e| format!("failed to connect to volume server {}: {}", addr, e))?;
+            .map_err(|e| {
+                let msg = format!("failed to connect to volume server {}: {}", addr, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        info!("Connected to volume server: {}", addr);
         let mut channels = self.volume_channels.write().await;
         channels.insert(addr.to_string(), ch.clone());
         Ok(ch)
     }
 
-    /// Assign a new FID from Master
+    pub async fn invalidate_master_channel(&self) {
+        let mut channel = self.master_channel.write().await;
+        *channel = None;
+        warn!("Invalidated master channel");
+    }
+
+    pub async fn invalidate_volume_channel(&self, addr: &str) {
+        let mut channels = self.volume_channels.write().await;
+        channels.remove(addr);
+        warn!("Invalidated volume channel: {}", addr);
+    }
+
     pub async fn assign_fid(
         &self,
         collection: &str,
         replication: &str,
     ) -> Result<(Fid, Option<Location>, Vec<String>, Vec<Location>), String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = AssignRequest {
-            count: 1,
-            replication: replication.to_string(),
-            collection: collection.to_string(),
-            ttl: String::new(),
-            data_center: String::new(),
-            rack: String::new(),
-            data_node: String::new(),
-            disk_type: String::new(),
-            stripe_count: 1,
-            stripe_size: 64 * 1024 * 1024,
-        };
-        let response = client
-            .assign(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("assign failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.error.is_empty() {
-            return Err(resp.error);
-        }
-        let fid = Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
-        Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations))
-    }
+        debug!("assign_fid: collection={}, replication={}", collection, replication);
 
-    /// Lookup volume locations from Master
-    pub async fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = LookupVolumeRequest {
-            volume_or_file_ids: vec![volume_id.to_string()],
-            collection: String::new(),
-        };
-        let response = client
-            .lookup_volume(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("lookup_volume failed: {}", e))?;
-        let resp = response.into_inner();
-        if let Some(loc) = resp.volume_id_locations.first() {
-            if !loc.error.is_empty() {
-                return Err(loc.error.clone());
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = AssignRequest {
+                count: 1,
+                replication: replication.to_string(),
+                collection: collection.to_string(),
+                ttl: String::new(),
+                data_center: String::new(),
+                rack: String::new(),
+                data_node: String::new(),
+                disk_type: String::new(),
+                stripe_count: 1,
+                stripe_size: 64 * 1024 * 1024,
+            };
+
+            match client.assign(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    let fid = Fid::from_string(&resp.fid).map_err(|e| format!("invalid fid: {}", e))?;
+                    debug!("assign_fid succeeded: fid={}", fid);
+                    return Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations));
+                }
+                Err(e) => {
+                    let msg = format!("assign_fid failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
             }
-            return Ok(loc.locations.clone());
         }
-        Err("volume not found".to_string())
+
+        Err("assign_fid failed after max retries".to_string())
     }
 
-    /// Write data to a Volume Server
+    pub async fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
+        debug!("lookup_volume: volume_id={}", volume_id.0);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = LookupVolumeRequest {
+                volume_or_file_ids: vec![volume_id.to_string()],
+                collection: String::new(),
+            };
+
+            match client.lookup_volume(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    let locations: Vec<Location> = resp
+                        .volume_id_locations
+                        .into_iter()
+                        .flat_map(|vil| vil.locations)
+                        .collect();
+                    debug!("lookup_volume succeeded: {} locations", locations.len());
+                    return Ok(locations);
+                }
+                Err(e) => {
+                    let msg = format!("lookup_volume failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("lookup_volume failed after max retries".to_string())
+    }
+
     pub async fn write_data(
         &self,
         volume_addr: &str,
@@ -145,34 +266,57 @@ impl PowerFuseClient {
     ) -> Result<(), String> {
         debug!(
             "write_data: addr={}, volume_id={}, file_key={}, size={}",
-            volume_addr,
-            volume_id,
-            file_key,
-            data.len()
+            volume_addr, volume_id, file_key, data.len()
         );
-        let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
-        let request = WriteNeedleRequest {
-            volume_id,
-            file_key,
-            data,
-            cookie: 0,
-            ttl: "".to_string(),
-        };
-        let response = client
-            .write_needle(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("write_needle failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err("write failed: volume server returned failure".to_string());
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+            let request = WriteNeedleRequest {
+                volume_id,
+                file_key,
+                data: data.clone(),
+                cookie: 0,
+                ttl: "".to_string(),
+            };
+
+            match client.write_needle(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("write failed: volume server returned failure".to_string());
+                    }
+                    debug!("write_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("write_data failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
         }
-        Ok(())
+
+        Err("write_data failed after max retries".to_string())
     }
 
-    /// Read data from a Volume Server
     pub async fn read_data(
         &self,
         volume_addr: &str,
@@ -183,27 +327,53 @@ impl PowerFuseClient {
             "read_data: addr={}, volume_id={}, file_key={}",
             volume_addr, volume_id, file_key
         );
-        let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
-        let request = ReadNeedleRequest {
-            volume_id,
-            file_key,
-            cookie: 0,
-        };
-        let response = client
-            .read_needle(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("read_needle failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err("read failed: volume server returned failure".to_string());
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+            let request = ReadNeedleRequest {
+                volume_id,
+                file_key,
+                cookie: 0,
+            };
+
+            match client.read_needle(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("read failed: volume server returned failure".to_string());
+                    }
+                    debug!("read_data succeeded: volume_id={}, file_key={}, size={}", volume_id, file_key, resp.data.len());
+                    return Ok(resp.data);
+                }
+                Err(e) => {
+                    let msg = format!("read_data failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
         }
-        Ok(resp.data)
+
+        Err("read_data failed after max retries".to_string())
     }
 
-    /// Delete data from a Volume Server
     pub async fn delete_data(
         &self,
         volume_addr: &str,
@@ -214,180 +384,124 @@ impl PowerFuseClient {
             "delete_data: addr={}, volume_id={}, file_key={}",
             volume_addr, volume_id, file_key
         );
-        let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
-        let request = DeleteNeedleRequest {
-            volume_id,
-            file_key,
-            cookie: 0,
-        };
-        let response = client
-            .delete_needle(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("delete_needle failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err("delete failed: volume server returned failure".to_string());
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+            let request = DeleteNeedleRequest {
+                volume_id,
+                file_key,
+                cookie: 0,
+            };
+
+            match client.delete_needle(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("delete failed: volume server returned failure".to_string());
+                    }
+                    debug!("delete_data succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("delete_data failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
         }
-        Ok(())
+
+        Err("delete_data failed after max retries".to_string())
     }
 
-    /// Get the gRPC address from a Location
     pub fn location_to_grpc_addr(location: &Location) -> String {
         if location.grpc_port > 0 {
-            // Extract host from url (format: "ip:http_port")
             let host = location.url.split(':').next().unwrap_or(&location.url);
             format!("{}:{}", host, location.grpc_port)
         } else {
-            // Fall back to url if grpc_port is not set
-            location.url.clone()
+            format!("{}:{}", location.url, location.grpc_port)
         }
-    }
-
-    /// Get the tokio runtime handle for block_on calls from sync context
-    pub fn runtime_handle(&self) -> &Handle {
-        &self.runtime_handle
-    }
-
-    /// Invalidate a cached volume channel (on connection error)
-    pub async fn invalidate_volume_channel(&self, addr: &str) {
-        let mut channels = self.volume_channels.write().await;
-        channels.remove(addr);
-        warn!("Invalidated volume channel: {}", addr);
-    }
-
-    pub async fn lookup_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = LookupDirectoryEntryRequest {
-            directory: directory.to_string(),
-            name: name.to_string(),
-        };
-        let response = client
-            .lookup_directory_entry(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("lookup_directory_entry failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.found {
-            return Ok(None);
-        }
-        Ok(resp.entry)
-    }
-
-    pub async fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = GetEntryRequest {
-            path: path.to_string(),
-        };
-        let response = client
-            .get_entry(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("get_entry failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.found {
-            return Ok(None);
-        }
-        Ok(resp.entry)
-    }
-
-    pub async fn create_entry(&self, entry: Entry) -> Result<u64, String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = CreateEntryRequest { entry: Some(entry) };
-        let response = client
-            .create_entry(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("create_entry failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err(resp.error);
-        }
-        Ok(resp.inode)
-    }
-
-    pub async fn update_entry(&self, entry: Entry) -> Result<(), String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = UpdateEntryRequest { entry: Some(entry) };
-        let response = client
-            .update_entry(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("update_entry failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err(resp.error);
-        }
-        Ok(())
-    }
-
-    pub async fn delete_entry(&self, path: &str, is_directory: bool) -> Result<(), String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = DeleteEntryRequest {
-            path: path.to_string(),
-            is_directory,
-        };
-        let response = client
-            .delete_entry(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("delete_entry failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err(resp.error);
-        }
-        Ok(())
-    }
-
-    pub async fn list_entries(
-        &self,
-        directory: &str,
-        limit: u64,
-        last_name: &str,
-    ) -> Result<Vec<Entry>, String> {
-        let channel = self.ensure_master_channel().await?;
-        let mut client = MasterServiceClient::new(channel);
-        let request = ListEntriesRequest {
-            directory: directory.to_string(),
-            limit,
-            last_name: last_name.to_string(),
-        };
-        let response = client
-            .list_entries(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("list_entries failed: {}", e))?;
-        let resp = response.into_inner();
-        Ok(resp.entries)
     }
 
     pub async fn write_blob(
         &self,
         volume_addr: &str,
-        params: WriteBlobParams,
+        volume_id: u32,
+        file_key: u64,
+        offset: i64,
+        size: i32,
+        data: Vec<u8>,
+        cookie: u32,
     ) -> Result<(), String> {
-        let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
-        let request = WriteNeedleBlobRequest {
-            volume_id: params.volume_id,
-            file_key: params.file_key,
-            offset: params.offset,
-            size: params.size,
-            needle_blob: params.data,
-            cookie: params.cookie,
-        };
-        let response = client
-            .write_needle_blob(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("write_needle_blob failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err("write_blob failed".to_string());
+        debug!(
+            "write_blob: addr={}, volume_id={}, file_key={}, offset={}, size={}",
+            volume_addr, volume_id, file_key, offset, size
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+            let request = WriteNeedleBlobRequest {
+                volume_id,
+                file_key,
+                offset,
+                size,
+                needle_blob: data.clone(),
+                cookie,
+            };
+
+            match client.write_needle_blob(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("write_blob failed: volume server returned failure".to_string());
+                    }
+                    debug!("write_blob succeeded: volume_id={}, file_key={}", volume_id, file_key);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("write_blob failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
         }
-        Ok(())
+
+        Err("write_blob failed after max retries".to_string())
     }
 
     pub async fn read_blob(
@@ -398,31 +512,327 @@ impl PowerFuseClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel)
-            .max_decoding_message_size(256 * 1024 * 1024)
-            .max_encoding_message_size(256 * 1024 * 1024);
-        let request = ReadNeedleBlobRequest {
-            volume_id,
-            file_key,
-            offset,
-            size,
-        };
-        let response = client
-            .read_needle_blob(tonic::Request::new(request))
-            .await
-            .map_err(|e| format!("read_needle_blob failed: {}", e))?;
-        let resp = response.into_inner();
-        if !resp.success {
-            return Err("read_blob failed".to_string());
+        debug!(
+            "read_blob: addr={}, volume_id={}, file_key={}, offset={}, size={}",
+            volume_addr, volume_id, file_key, offset, size
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+            let request = ReadNeedleBlobRequest {
+                volume_id,
+                file_key,
+                offset,
+                size,
+            };
+
+            match client.read_needle_blob(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("read_blob failed: volume server returned failure".to_string());
+                    }
+                    debug!("read_blob succeeded: volume_id={}, file_key={}, size={}", volume_id, file_key, resp.needle_blob.len());
+                    return Ok(resp.needle_blob);
+                }
+                Err(e) => {
+                    let msg = format!("read_blob failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
         }
-        Ok(resp.needle_blob)
+
+        Err("read_blob failed after max retries".to_string())
+    }
+
+    pub async fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+        debug!("create_entry: name={}, directory={}", entry.name, entry.directory);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = CreateEntryRequest { entry: Some(entry.clone()) };
+
+            match client.create_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("create_entry succeeded: inode={}", resp.inode);
+                    return Ok(resp.inode);
+                }
+                Err(e) => {
+                    let msg = format!("create_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("create_entry failed after max retries".to_string())
+    }
+
+    pub async fn update_entry(&self, entry: &Entry) -> Result<(), String> {
+        debug!("update_entry: name={}, directory={}", entry.name, entry.directory);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = UpdateEntryRequest { entry: Some(entry.clone()) };
+
+            match client.update_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err("update_entry failed: master server returned failure".to_string());
+                    }
+                    debug!("update_entry succeeded");
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("update_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("update_entry failed after max retries".to_string())
+    }
+
+    pub async fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
+        debug!("get_entry: path={}", path);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = GetEntryRequest { path: path.to_string() };
+
+            match client.get_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("get_entry succeeded: found={}", resp.entry.is_some());
+                    return Ok(resp.entry);
+                }
+                Err(e) => {
+                    let msg = format!("get_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("get_entry failed after max retries".to_string())
+    }
+
+    pub async fn delete_entry(&self, path: &str, is_directory: bool) -> Result<bool, String> {
+        debug!("delete_entry: path={}, is_directory={}", path, is_directory);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = DeleteEntryRequest { 
+                path: path.to_string(),
+                is_directory,
+            };
+
+            match client.delete_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("delete_entry succeeded: success={}", resp.success);
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("delete_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("delete_entry failed after max retries".to_string())
+    }
+
+    pub async fn list_entries(&self, path: &str, limit: u64, start_after: &str) -> Result<Vec<Entry>, String> {
+        debug!("list_entries: path={}, limit={}, start_after={}", path, limit, start_after);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = ListEntriesRequest {
+                directory: path.to_string(),
+                limit,
+                last_name: start_after.to_string(),
+            };
+
+            match client.list_entries(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("list_entries succeeded: {} entries", resp.entries.len());
+                    return Ok(resp.entries);
+                }
+                Err(e) => {
+                    let msg = format!("list_entries failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("list_entries failed after max retries".to_string())
+    }
+
+    pub async fn lookup_directory_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
+        debug!("lookup_directory_entry: directory={}, name={}", directory, name);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = LookupDirectoryEntryRequest {
+                directory: directory.to_string(),
+                name: name.to_string(),
+            };
+
+            match client.lookup_directory_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("lookup_directory_entry succeeded: found={}", resp.entry.is_some());
+                    return Ok(resp.entry);
+                }
+                Err(e) => {
+                    let msg = format!("lookup_directory_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("lookup_directory_entry failed after max retries".to_string())
     }
 }
 
-// ============ Synchronous wrappers for FUSE ============
-
-/// Wrapper to call async methods from sync FUSE context
 pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
@@ -455,12 +865,9 @@ impl SyncFuseClient {
         file_key: u64,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(self.client.write_data(
-            volume_addr,
-            volume_id,
-            file_key,
-            data,
-        ))
+        self.client
+            .runtime_handle
+            .block_on(self.client.write_data(volume_addr, volume_id, file_key, data))
     }
 
     pub fn read_data(
@@ -480,58 +887,24 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(self.client.delete_data(
-            volume_addr,
-            volume_id,
-            file_key,
-        ))
-    }
-
-    pub fn lookup_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.lookup_entry(directory, name))
+            .block_on(self.client.delete_data(volume_addr, volume_id, file_key))
     }
 
-    pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.get_entry(path))
-    }
-
-    pub fn create_entry(&self, entry: Entry) -> Result<u64, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.create_entry(entry))
-    }
-
-    pub fn update_entry(&self, entry: Entry) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.update_entry(entry))
-    }
-
-    pub fn delete_entry(&self, path: &str, is_directory: bool) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.delete_entry(path, is_directory))
-    }
-
-    pub fn list_entries(
+    pub fn write_blob(
         &self,
-        directory: &str,
-        limit: u64,
-        last_name: &str,
-    ) -> Result<Vec<Entry>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.list_entries(directory, limit, last_name))
-    }
-
-    pub fn write_blob(&self, volume_addr: &str, params: WriteBlobParams) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.write_blob(volume_addr, params))
+        volume_addr: &str,
+        volume_id: u32,
+        file_key: u64,
+        offset: i64,
+        size: i32,
+        data: Vec<u8>,
+        cookie: u32,
+    ) -> Result<(), String> {
+        self.client.runtime_handle.block_on(
+            self.client.write_blob(volume_addr, volume_id, file_key, offset, size, data, cookie),
+        )
     }
 
     pub fn read_blob(
@@ -542,12 +915,50 @@ impl SyncFuseClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        self.client.runtime_handle.block_on(self.client.read_blob(
-            volume_addr,
-            volume_id,
-            file_key,
-            offset,
-            size,
-        ))
+        self.client
+            .runtime_handle
+            .block_on(self.client.read_blob(volume_addr, volume_id, file_key, offset, size))
+    }
+
+    pub fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.create_entry(entry))
+    }
+
+    pub fn update_entry(&self, entry: &Entry) -> Result<(), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.update_entry(entry))
+    }
+
+    pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.get_entry(path))
+    }
+
+    pub fn delete_entry(&self, path: &str, is_directory: bool) -> Result<bool, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.delete_entry(path, is_directory))
+    }
+
+    pub fn list_entries(&self, path: &str, limit: u64, start_after: &str) -> Result<Vec<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.list_entries(path, limit, start_after))
+    }
+
+    pub fn lookup_directory_entry(&self, directory: &str, name: &str) -> Result<Option<Entry>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.lookup_directory_entry(directory, name))
+    }
+
+    pub fn invalidate_volume_channel(&self, addr: &str) {
+        self.client
+            .runtime_handle
+            .block_on(self.client.invalidate_volume_channel(addr));
     }
 }

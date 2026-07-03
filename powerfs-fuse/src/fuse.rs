@@ -1,5 +1,5 @@
 use crate::cache::{CachedEntry, CachedFileChunk, ChunkCache, MetadataCache, ROOT_INODE};
-use crate::client::{PowerFuseClient, SyncFuseClient, WriteBlobParams};
+use crate::client::{PowerFuseClient, SyncFuseClient};
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
@@ -60,14 +61,27 @@ impl FuseApp {
         let cache = Arc::new(MetadataCache::new());
 
         let fs = PowerFsFs {
-            client: sync_client,
-            cache,
+            client: sync_client.clone(),
+            cache: cache.clone(),
             chunk_cache: Arc::new(ChunkCache::with_defaults()),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
             dirty_chunks: Arc::new(RwLock::new(HashSet::new())),
+            has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+
+        let fs_arc = Arc::new(fs);
+        let bg_fs = fs_arc.clone();
+        thread::spawn(move || {
+            loop {
+                if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = bg_fs.flush_all_dirty_chunks();
+                    bg_fs.has_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
 
         let mut session =
             FuseSession::new(Path::new(&self.mount_point), "powerfs", "powerfs", false).map_err(
@@ -80,7 +94,7 @@ impl FuseApp {
 
         info!("FUSE mounted at: {}", self.mount_point);
 
-        let server = Arc::new(Server::new(fs));
+        let server = Arc::new(Server::new(fs_arc));
 
         let mut fuse_server = FuseServer {
             server: server.clone(),
@@ -113,7 +127,7 @@ impl FuseApp {
 }
 
 struct FuseServer {
-    server: Arc<Server<PowerFsFs>>,
+    server: Arc<Server<Arc<PowerFsFs>>>,
     ch: FuseChannel,
 }
 
@@ -160,6 +174,7 @@ struct PowerFsFs {
     replication: String,
     locks: Arc<RwLock<FileLocks>>,
     dirty_chunks: Arc<RwLock<HashSet<(u64, u64)>>>,
+    has_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PowerFsFs {
@@ -205,14 +220,12 @@ impl PowerFsFs {
                 self.client
                     .write_blob(
                         &addr,
-                        WriteBlobParams {
-                            volume_id: fid.volume_id.0,
-                            file_key: fid.file_key,
-                            offset: chunk_offset as i64,
-                            size: chunk_data.data.len() as i32,
-                            data: chunk_data.data.to_vec(),
-                            cookie: 0,
-                        },
+                        fid.volume_id.0,
+                        fid.file_key,
+                        chunk_offset as i64,
+                        chunk_data.data.len() as i32,
+                        chunk_data.data.to_vec(),
+                        0,
                     )
                     .map_err(|e| {
                         error!("write_blob failed: {}", e);
@@ -271,9 +284,28 @@ impl PowerFsFs {
                 symlink_target: String::new(),
             };
 
-            if let Err(e) = self.client.update_entry(filer_entry) {
+            if let Err(e) = self.client.update_entry(&filer_entry) {
                 warn!("Failed to update entry on master: {}", e);
             }
+        }
+
+        Ok(())
+    }
+
+    fn flush_all_dirty_chunks(&self) -> std::io::Result<()> {
+        let dirty: Vec<(u64, u64)> = {
+            let dirty_set = self.dirty_chunks.read().unwrap();
+            dirty_set.iter().cloned().collect()
+        };
+
+        if dirty.is_empty() {
+            return Ok(());
+        }
+
+        let inodes: HashSet<u64> = dirty.iter().map(|(ino, _)| *ino).collect();
+        
+        for inode in inodes {
+            let _ = self.flush_dirty_chunks(inode);
         }
 
         Ok(())
@@ -712,6 +744,17 @@ impl FileSystem for PowerFsFs {
 
         let inode = self.cache.allocate_inode();
         let now = chrono::Utc::now().timestamp();
+
+        let (fid, _location, _stripe_fids, _stripe_locations) = self
+            .client
+            .assign_fid(&self.collection, &self.replication)
+            .map_err(|e| {
+                error!("assign_fid failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let fid_str = fid.to_string();
+
         let entry = CachedEntry {
             inode,
             parent,
@@ -720,7 +763,7 @@ impl FileSystem for PowerFsFs {
             is_symlink: false,
             symlink_target: None,
             nlink: 1,
-            fid: None,
+            fid: Some(fid),
             size: 0,
             mode: args.mode & 0o7777,
             uid: ctx.uid,
@@ -729,7 +772,14 @@ impl FileSystem for PowerFsFs {
             mtime: now,
             ctime: now,
             xattrs: HashMap::new(),
-            chunks: Vec::new(),
+            chunks: vec![crate::cache::CachedFileChunk {
+                offset: 0,
+                size: 0,
+                mtime: now as u64,
+                fid: fid_str,
+                cookie: 0,
+                crc32: 0,
+            }],
             hard_link_id: String::new(),
             hard_link_counter: 0,
             content_size: 0,
@@ -884,8 +934,40 @@ impl FileSystem for PowerFsFs {
                         self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
                     }
                     Err(e) => {
-                        error!("read_blob failed: {}", e);
-                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                        if e.contains("needle not found") {
+                            info!("read_blob: needle not found in volume, checking dirty chunks");
+                            let is_dirty = {
+                                let dirty_set = self.dirty_chunks.read().unwrap();
+                                dirty_set.contains(&(inode, chunk_idx))
+                            };
+                            if is_dirty {
+                                info!("read_blob: chunk {} is dirty, flushing first", chunk_idx);
+                                let _ = self.flush_dirty_chunks(inode);
+                                match self.client.read_blob(
+                                    &addr,
+                                    fid.volume_id.0,
+                                    fid.file_key,
+                                    chunk_offset as i64,
+                                    read_size as i32,
+                                ) {
+                                    Ok(data) => {
+                                        let mtime = entry.mtime as u64;
+                                        self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
+                                    }
+                                    Err(e2) => {
+                                        error!("read_blob failed after flush: {}", e2);
+                                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                    }
+                                }
+                            } else {
+                                info!("read_blob: chunk {} not in dirty chunks, filling with zeros", chunk_idx);
+                                let mtime = entry.mtime as u64;
+                                self.chunk_cache.put(inode, chunk_offset, vec![0; read_size as usize], mtime, 0);
+                            }
+                        } else {
+                            error!("read_blob failed: {}", e);
+                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
                     }
                 }
             }
@@ -943,8 +1025,58 @@ impl FileSystem for PowerFsFs {
 
         let chunk_size = self.chunk_cache.chunk_size();
 
-        if entry.fid.is_none() {
-            let (fid, location, _stripe_fids, _stripe_locations) = self
+        if let Some(_fid) = &entry.fid {
+            let end_offset = offset + read_len as u64;
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
+            let end_chunk = if end_offset == 0 {
+                0
+            } else {
+                self.chunk_cache.get_chunk_index(end_offset - 1)
+            };
+
+            let mut data_offset = 0u64;
+            let mut current_offset = offset;
+
+            for chunk_idx in start_chunk..=end_chunk {
+                let chunk_start_offset = chunk_idx * chunk_size;
+                let in_chunk_start = current_offset.saturating_sub(chunk_start_offset) as usize;
+                let bytes_to_write = std::cmp::min(
+                    read_len as u64 - data_offset,
+                    chunk_size - in_chunk_start as u64,
+                ) as usize;
+
+                let mtime = entry.mtime as u64;
+                let modified = self.chunk_cache.modify(inode, chunk_start_offset, |chunk| {
+                    let needed_len = in_chunk_start + bytes_to_write;
+                    if chunk.data.len() < needed_len {
+                        chunk.data.resize(needed_len, 0);
+                    }
+                    chunk.data[in_chunk_start..in_chunk_start + bytes_to_write]
+                        .copy_from_slice(&buf[data_offset as usize..data_offset as usize + bytes_to_write]);
+                    chunk.mtime = mtime;
+                });
+
+                if !modified {
+                    let mut new_data = vec![0u8; in_chunk_start + bytes_to_write];
+                    new_data[in_chunk_start..in_chunk_start + bytes_to_write]
+                        .copy_from_slice(&buf[data_offset as usize..data_offset as usize + bytes_to_write]);
+                    self.chunk_cache.put(inode, chunk_start_offset, new_data, mtime, 0);
+                }
+
+                let mut dirty = self.dirty_chunks.write().unwrap();
+                dirty.insert((inode, chunk_idx));
+                self.has_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                data_offset += bytes_to_write as u64;
+                current_offset += bytes_to_write as u64;
+            }
+
+            let new_size = offset + read_len as u64;
+            if new_size > entry.size {
+                self.cache.update_size(inode, new_size);
+            }
+        } else {
+            let (fid, _location, _stripe_fids, _stripe_locations) = self
                 .client
                 .assign_fid(&self.collection, &self.replication)
                 .map_err(|e| {
@@ -952,43 +1084,16 @@ impl FileSystem for PowerFsFs {
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
 
-            let addr = if let Some(loc) = location {
-                PowerFuseClient::location_to_grpc_addr(&loc)
-            } else {
-                let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-                    error!("lookup_volume failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
-                })?;
-                let loc = locations
-                    .first()
-                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-                PowerFuseClient::location_to_grpc_addr(loc)
-            };
-
-            self.client
-                .write_data(&addr, fid.volume_id.0, fid.file_key, buf.clone())
-                .map_err(|e| {
-                    error!("write_data failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
-                })?;
-
             self.cache.update_fid(inode, fid.clone());
             let new_size = offset + read_len as u64;
             self.cache.update_size(inode, new_size);
-            self.cache.update_attr(
-                inode,
-                crate::cache::UpdateAttrParams {
-                    mode: None,
-                    size: Some(new_size),
-                    uid: None,
-                    gid: None,
-                    atime: None,
-                    mtime: None,
-                },
-            );
 
             let mtime = entry.mtime as u64;
-            self.chunk_cache.put(inode, 0, buf.clone(), mtime, 0);
+            self.chunk_cache.put(inode, 0, buf, mtime, 0);
+
+            let mut dirty = self.dirty_chunks.write().unwrap();
+            dirty.insert((inode, 0));
+            self.has_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
 
             let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
             let filer_entry = powerfs_master::proto::powerfs::Entry {
@@ -1012,7 +1117,7 @@ impl FileSystem for PowerFsFs {
                 }),
                 chunks: vec![powerfs_master::proto::powerfs::FileChunk {
                     offset: 0,
-                    size: buf.len() as u64,
+                    size: new_size,
                     mtime,
                     fid: fid.to_string(),
                     cookie: 0,
@@ -1027,83 +1132,9 @@ impl FileSystem for PowerFsFs {
                 symlink_target: String::new(),
             };
 
-            if let Err(e) = self.client.update_entry(filer_entry) {
+            if let Err(e) = self.client.update_entry(&filer_entry) {
                 warn!("Failed to update entry on master: {}", e);
             }
-        } else if let Some(fid) = &entry.fid {
-            let end_offset = offset + read_len as u64;
-            let start_chunk = self.chunk_cache.get_chunk_index(offset);
-            let end_chunk = if end_offset == 0 {
-                0
-            } else {
-                self.chunk_cache.get_chunk_index(end_offset - 1)
-            };
-
-            let mut data_offset = 0u64;
-            let mut current_offset = offset;
-
-            for chunk_idx in start_chunk..=end_chunk {
-                let chunk_start_offset = chunk_idx * chunk_size;
-                let chunk_data = if let Some(cached) =
-                    self.chunk_cache.get(inode, chunk_start_offset)
-                {
-                    cached.data.to_vec()
-                } else {
-                    let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-                        error!("lookup_volume failed: {}", e);
-                        std::io::Error::from_raw_os_error(libc::EIO)
-                    })?;
-                    let loc = locations
-                        .first()
-                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-                    let addr = PowerFuseClient::location_to_grpc_addr(loc);
-
-                    let read_size =
-                        std::cmp::min(chunk_size, entry.size.saturating_sub(chunk_start_offset));
-                    if read_size > 0 {
-                        self.client
-                            .read_blob(
-                                &addr,
-                                fid.volume_id.0,
-                                fid.file_key,
-                                chunk_start_offset as i64,
-                                read_size as i32,
-                            )
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                let mut chunk_vec = chunk_data;
-                let in_chunk_start = current_offset.saturating_sub(chunk_start_offset) as usize;
-                let bytes_to_write = std::cmp::min(
-                    read_len as u64 - data_offset,
-                    chunk_size - in_chunk_start as u64,
-                ) as usize;
-
-                let needed_len = in_chunk_start + bytes_to_write;
-                if chunk_vec.len() < needed_len {
-                    chunk_vec.resize(needed_len, 0);
-                }
-
-                chunk_vec[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
-                    &buf[data_offset as usize..data_offset as usize + bytes_to_write],
-                );
-
-                let mtime = entry.mtime as u64;
-                self.chunk_cache
-                    .put(inode, chunk_start_offset, chunk_vec, mtime, 0);
-
-                let mut dirty = self.dirty_chunks.write().unwrap();
-                dirty.insert((inode, chunk_idx));
-
-                data_offset += bytes_to_write as u64;
-                current_offset += bytes_to_write as u64;
-            }
-
-            let new_size = std::cmp::max(entry.size, offset + read_len as u64);
-            self.cache.update_size(inode, new_size);
         }
 
         Ok(read_len)
