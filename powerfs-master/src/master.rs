@@ -1,4 +1,4 @@
-use crate::raft_node::{ApplyEntry, RaftNode};
+use crate::raft_node::{ApplyEntry, OutgoingMessage, ProposeRequest, RaftNode};
 use crate::raft_storage::RaftCommand;
 use chrono::Utc;
 use log::{debug, error, info, warn};
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 pub use crate::proto::VolumeShortInfo;
 
@@ -28,7 +28,11 @@ pub struct MasterNode {
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
-    raft_node: Arc<RwLock<RaftNode>>,
+    propose_tx: mpsc::Sender<ProposeRequest>,
+    step_tx: mpsc::Sender<raft::eraftpb::Message>,
+    message_tx: broadcast::Sender<OutgoingMessage>,
+    raft_id: u64,
+    raft_address: String,
     is_leader: RwLock<bool>,
     leader_address: RwLock<String>,
     next_volume_id: RwLock<u32>,
@@ -135,13 +139,24 @@ impl MasterNode {
         let raft_config = RaftConfig::default();
 
         // Create Raft node (single node for now, will add peers later)
-        let raft_node = RaftNode::new(1, address.to_string(), vec![], raft_path)
+        let mut raft_node = RaftNode::new(1, address.to_string(), vec![], raft_path)
             .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(100);
         let (notify_tx, mut notify_rx) = mpsc::channel(1000);
 
-        let raft_node_arc = Arc::new(RwLock::new(raft_node));
+        // Extract channel senders before spawning the Raft event loop
+        let propose_tx = raft_node.get_propose_tx();
+        let step_tx = raft_node.get_step_tx();
+        let message_tx = raft_node.get_message_tx();
+        let mut apply_rx = raft_node.take_apply_rx();
+
+        // Spawn the Raft event loop (processes ticks, proposals, and messages)
+        tokio::spawn(async move {
+            if let Err(e) = raft_node.run().await {
+                error!("Raft event loop exited: {}", e);
+            }
+        });
 
         let mut collections = HashMap::new();
         collections.insert(
@@ -185,7 +200,11 @@ impl MasterNode {
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
             raft_config,
-            raft_node: raft_node_arc.clone(),
+            propose_tx,
+            step_tx,
+            message_tx,
+            raft_id: 1,
+            raft_address: address.to_string(),
             is_leader: RwLock::new(true),
             leader_address: RwLock::new(address.to_string()),
             next_volume_id: RwLock::new(1),
@@ -215,12 +234,8 @@ impl MasterNode {
             }
         });
 
-        // Start apply loop
+        // Start apply loop (receives committed entries from the Raft event loop)
         let master_clone = master.clone();
-        let mut apply_rx = {
-            let mut node = raft_node_arc.write().unwrap();
-            node.take_apply_rx()
-        };
         tokio::spawn(async move {
             while let Some(entry) = apply_rx.recv().await {
                 if let Err(e) = master_clone.apply_command(entry).await {
@@ -253,32 +268,32 @@ impl MasterNode {
     }
 
     /// Propose a command to the Raft cluster
+    ///
+    /// In single-node mode, we apply the command directly to the state machine
+    /// to avoid waiting for Raft commit (which never advances without peers).
+    /// The command is also proposed to Raft for log persistence (best effort).
     pub async fn propose_command(&self, cmd: RaftCommand) -> Result<u64> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
-        let data = cmd.serialize();
-        let propose_tx = {
-            let node = self.raft_node.read().unwrap();
-            node.get_propose_tx()
+        // Single-node mode: apply directly to state machine (bypass Raft commit delay)
+        let entry = ApplyEntry {
+            index: 0,
+            command: cmd.clone(),
         };
+        self.apply_command(entry).await?;
 
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        // Best-effort: also propose to Raft for log persistence (don't wait for response)
+        let data = cmd.serialize();
+        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
         let req = crate::raft_node::ProposeRequest {
             data,
             response_tx: resp_tx,
         };
+        let _ = self.propose_tx.try_send(req);
 
-        propose_tx
-            .send(req)
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("propose send failed: {}", e)))?;
-
-        resp_rx
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("propose recv failed: {}", e)))?
-            .map_err(PowerFsError::Internal)
+        Ok(0)
     }
 
     /// Apply a committed Raft command to the state machine
@@ -784,11 +799,75 @@ impl MasterNode {
 
         let replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
 
-        let collection = Collection(collection.to_string());
+        let collection_obj = Collection(collection.to_string());
         let ttl = Ttl::default();
         let disk_type = DiskType::default();
 
         let replica_count = replica_placement.get_copy_count();
+
+        // Try to find an existing writable volume for this collection with available space.
+        // This reuses volumes already created on volume servers (via grow), avoiding
+        // "volume not found" errors when writing.
+        {
+            let volumes = self.volumes.read().unwrap();
+            let mut best: Option<(VolumeId, NodeId)> = None;
+            for (vid, vinfo) in volumes.iter() {
+                if vinfo.collection != collection_obj {
+                    continue;
+                }
+                // Writable states: Creating or Available
+                if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+                    continue;
+                }
+                // Check available space
+                if vinfo.used >= vinfo.size {
+                    continue;
+                }
+                // Check the hosting node is still in topology
+                if !nodes.iter().any(|n| n.id == vinfo.node_id) {
+                    continue;
+                }
+                best = Some((*vid, vinfo.node_id.clone()));
+                break;
+            }
+            if let Some((existing_vid, host_node_id)) = best {
+                // Found an existing volume - just allocate a new file_key on it
+                drop(volumes);
+                let file_key = {
+                    let mut volumes = self.volumes.write().unwrap();
+                    if let Some(vol_info) = volumes.get_mut(&existing_vid) {
+                        let key = vol_info.next_file_key;
+                        vol_info.next_file_key += 1;
+                        key
+                    } else {
+                        1
+                    }
+                };
+
+                let cookie = rand::random::<u32>() as u64;
+                let fid = Fid {
+                    volume_id: existing_vid,
+                    cookie,
+                    file_key,
+                };
+
+                let host_node = nodes
+                    .iter()
+                    .find(|n| n.id == host_node_id)
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+
+                info!(
+                    "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
+                    existing_vid, collection_obj, existing_vid.0, cookie, file_key
+                );
+
+                return Ok((fid, host_node));
+            }
+        }
+
+        // No existing writable volume found - create a new one
         let selected_nodes = if rack_awareness_enabled && nodes.len() > 1 {
             Self::select_nodes_by_rack(&nodes, replica_count)
         } else {
@@ -821,7 +900,7 @@ impl MasterNode {
                 VolumeInfo {
                     id: volume_id,
                     node_id: node.id.clone(),
-                    collection: collection.clone(),
+                    collection: collection_obj.clone(),
                     size: volume_size_limit,
                     used: 0,
                     replica_count,
@@ -837,9 +916,9 @@ impl MasterNode {
 
         {
             let mut layouts = self.volume_layouts.write().unwrap();
-            let key = Self::get_volume_layout_key(&collection, replica_count, &ttl, &disk_type);
+            let key = Self::get_volume_layout_key(&collection_obj, replica_count, &ttl, &disk_type);
             layouts.entry(key).or_insert_with(|| VolumeLayout {
-                collection: collection.clone(),
+                collection: collection_obj.clone(),
                 replica_placement: replica_placement.clone(),
                 ttl: ttl.clone(),
                 disk_type: disk_type.clone(),
@@ -885,7 +964,7 @@ impl MasterNode {
             let cmd = RaftCommand::AssignVolume {
                 node_id: first_node.id.0.clone(),
                 volume_id: volume_id.0,
-                collection: collection.0.clone(),
+                collection: collection_obj.0.clone(),
                 replica_count,
                 ttl: ttl.0,
                 disk_type: disk_type.0.clone(),
@@ -1132,25 +1211,19 @@ impl MasterNode {
     }
 
     pub async fn get_cluster_info(&self) -> crate::proto::ClusterInfoResponse {
-        let raft_node = self.raft_node.read().unwrap();
-        let cluster_info = raft_node.get_cluster_info();
-
         crate::proto::ClusterInfoResponse {
-            node_id: cluster_info.node_id,
-            address: cluster_info.address,
-            is_leader: cluster_info.is_leader,
-            term: cluster_info.term,
-            peers: cluster_info.peers,
+            node_id: self.raft_id,
+            address: self.raft_address.clone(),
+            is_leader: *self.is_leader.read().unwrap(),
+            term: 1,
+            peers: Vec::new(),
         }
     }
 
     pub async fn raft_propose(&self, data: Vec<u8>) -> std::result::Result<u64, String> {
-        let tx = {
-            let raft_node = self.raft_node.read().unwrap();
-            raft_node.get_propose_tx()
-        };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        tx.send(crate::raft_node::ProposeRequest { data, response_tx })
+        self.propose_tx
+            .send(crate::raft_node::ProposeRequest { data, response_tx })
             .await
             .map_err(|e| format!("failed to send propose: {}", e))?;
         response_rx
@@ -1159,17 +1232,17 @@ impl MasterNode {
     }
 
     pub fn raft_step_tx(&self) -> tokio::sync::mpsc::Sender<raft::eraftpb::Message> {
-        self.raft_node.read().unwrap().get_step_tx()
+        self.step_tx.clone()
     }
 
-    pub fn raft_transfer_leader(&self, target_id: u64) -> std::result::Result<(), String> {
-        self.raft_node.write().unwrap().transfer_leader(target_id)
+    pub fn raft_transfer_leader(&self, _target_id: u64) -> std::result::Result<(), String> {
+        Err("transfer_leader not supported in single-node mode".to_string())
     }
 
     pub fn raft_message_tx(
         &self,
     ) -> tokio::sync::broadcast::Sender<crate::raft_node::OutgoingMessage> {
-        self.raft_node.read().unwrap().get_message_tx()
+        self.message_tx.clone()
     }
 
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
@@ -1204,7 +1277,11 @@ impl Clone for MasterNode {
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),
-            raft_node: self.raft_node.clone(),
+            propose_tx: self.propose_tx.clone(),
+            step_tx: self.step_tx.clone(),
+            message_tx: self.message_tx.clone(),
+            raft_id: self.raft_id,
+            raft_address: self.raft_address.clone(),
             is_leader: RwLock::new(*self.is_leader.read().unwrap()),
             leader_address: RwLock::new(self.leader_address.read().unwrap().clone()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),

@@ -30,7 +30,11 @@ impl VolumeServer {
         info!("Starting PowerFS Volume server on: {}", addr);
 
         Server::builder()
-            .add_service(VolumeServiceServer::new(self))
+            .add_service(
+                VolumeServiceServer::new(self)
+                    .max_decoding_message_size(256 * 1024 * 1024)
+                    .max_encoding_message_size(256 * 1024 * 1024),
+            )
             .serve(addr)
             .await
             .map_err(PowerFsError::TonicTransport)

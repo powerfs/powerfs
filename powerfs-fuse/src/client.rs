@@ -149,7 +149,9 @@ impl PowerFuseClient {
             data.len()
         );
         let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel);
+        let mut client = VolumeServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
         let request = WriteNeedleRequest {
             volume_id,
             file_key,
@@ -180,7 +182,9 @@ impl PowerFuseClient {
             volume_addr, volume_id, file_key
         );
         let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel);
+        let mut client = VolumeServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
         let request = ReadNeedleRequest {
             volume_id,
             file_key,
@@ -209,7 +213,9 @@ impl PowerFuseClient {
             volume_addr, volume_id, file_key
         );
         let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel);
+        let mut client = VolumeServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
         let request = DeleteNeedleRequest {
             volume_id,
             file_key,
@@ -360,7 +366,9 @@ impl PowerFuseClient {
         params: WriteBlobParams,
     ) -> Result<(), String> {
         let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel);
+        let mut client = VolumeServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
         let request = WriteNeedleBlobRequest {
             volume_id: params.volume_id,
             file_key: params.file_key,
@@ -387,7 +395,9 @@ impl PowerFuseClient {
         size: i32,
     ) -> Result<Vec<u8>, String> {
         let channel = self.get_volume_channel(volume_addr).await?;
-        let mut client = VolumeServiceClient::new(channel);
+        let mut client = VolumeServiceClient::new(channel)
+            .max_decoding_message_size(256 * 1024 * 1024)
+            .max_encoding_message_size(256 * 1024 * 1024);
         let request = ReadNeedleBlobRequest {
             volume_id: 0,
             offset,

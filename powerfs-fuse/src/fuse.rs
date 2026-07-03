@@ -1,5 +1,5 @@
-use crate::cache::{CachedEntry, CachedFileChunk, MetadataCache, ROOT_INODE};
-use crate::client::{PowerFuseClient, SyncFuseClient};
+use crate::cache::{CachedEntry, CachedFileChunk, ChunkCache, MetadataCache, ROOT_INODE};
+use crate::client::{PowerFuseClient, SyncFuseClient, WriteBlobParams};
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -9,14 +9,15 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
+const PREFETCH_CHUNKS: u64 = 2;
 
 /// FUSE application that manages the mount lifecycle
 pub struct FuseApp {
@@ -60,9 +61,11 @@ impl FuseApp {
         let fs = PowerFsFs {
             client: sync_client,
             cache,
+            chunk_cache: Arc::new(ChunkCache::with_defaults()),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
+            dirty_chunks: Arc::new(RwLock::new(HashSet::new())),
         };
 
         let mut session =
@@ -146,19 +149,81 @@ impl FuseServer {
     }
 }
 
-use std::sync::RwLock;
-
 type FileLocks = HashMap<u64, Vec<FileLock>>;
 
 struct PowerFsFs {
     client: Arc<SyncFuseClient>,
     cache: Arc<MetadataCache>,
+    chunk_cache: Arc<ChunkCache>,
     collection: String,
     replication: String,
     locks: Arc<RwLock<FileLocks>>,
+    dirty_chunks: Arc<RwLock<HashSet<(u64, u64)>>>,
 }
 
 impl PowerFsFs {
+    fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
+        let dirty: Vec<(u64, u64)> = {
+            let dirty_set = self.dirty_chunks.read().unwrap();
+            dirty_set
+                .iter()
+                .filter(|(ino, _)| *ino == inode)
+                .cloned()
+                .collect()
+        };
+
+        if dirty.is_empty() {
+            return Ok(());
+        }
+
+        let entry = self
+            .cache
+            .get_inode(inode)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let fid = entry
+            .fid
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+
+        let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
+            error!("lookup_volume failed: {}", e);
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })?;
+
+        let loc = locations
+            .first()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+        let addr = PowerFuseClient::location_to_grpc_addr(loc);
+        let chunk_size = self.chunk_cache.chunk_size();
+
+        for (_, chunk_idx) in &dirty {
+            let chunk_offset = chunk_idx * chunk_size;
+            if let Some(chunk_data) = self.chunk_cache.get(inode, chunk_offset) {
+                self.client
+                    .write_blob(
+                        &addr,
+                        WriteBlobParams {
+                            volume_id: fid.volume_id.0,
+                            file_key: fid.file_key,
+                            offset: chunk_offset as i64,
+                            size: chunk_data.data.len() as i32,
+                            data: chunk_data.data.to_vec(),
+                            cookie: 0,
+                        },
+                    )
+                    .map_err(|e| {
+                        error!("write_blob failed: {}", e);
+                        std::io::Error::from_raw_os_error(libc::EIO)
+                    })?;
+            }
+        }
+
+        let mut dirty_set = self.dirty_chunks.write().unwrap();
+        dirty_set.retain(|(ino, _)| *ino != inode);
+
+        Ok(())
+    }
+
     fn create_stat(&self, entry: &CachedEntry) -> libc::stat64 {
         let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
         attr.st_ino = entry.inode;
@@ -240,6 +305,10 @@ impl PowerFsFs {
 impl FileSystem for PowerFsFs {
     type Inode = u64;
     type Handle = u64;
+
+    fn init(&self, _capable: fuse_backend_rs::api::filesystem::FsOptions) -> std::io::Result<fuse_backend_rs::api::filesystem::FsOptions> {
+        Ok(fuse_backend_rs::api::filesystem::FsOptions::WRITEBACK_CACHE)
+    }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {
         let name_str = name.to_str().unwrap_or("");
@@ -360,7 +429,7 @@ impl FileSystem for PowerFsFs {
 
     fn mkdir(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -389,8 +458,8 @@ impl FileSystem for PowerFsFs {
             fid: None,
             size: 0,
             mode: mode & 0o7777,
-            uid: 0,
-            gid: 0,
+            uid: ctx.uid,
+            gid: ctx.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -414,8 +483,8 @@ impl FileSystem for PowerFsFs {
                 ino: inode,
                 mode: mode | 0o040000,
                 nlink: 2,
-                uid: 0,
-                gid: 0,
+                uid: ctx.uid,
+                gid: ctx.gid,
                 rdev: 0,
                 size: 0,
                 blksize: 4096,
@@ -524,7 +593,7 @@ impl FileSystem for PowerFsFs {
 
     fn create(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: fuse_backend_rs::abi::fuse_abi::CreateIn,
@@ -557,8 +626,8 @@ impl FileSystem for PowerFsFs {
             fid: None,
             size: 0,
             mode: args.mode & 0o7777,
-            uid: 0,
-            gid: 0,
+            uid: ctx.uid,
+            gid: ctx.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -582,8 +651,8 @@ impl FileSystem for PowerFsFs {
                 ino: inode,
                 mode: args.mode | 0o100000,
                 nlink: 1,
-                uid: 0,
-                gid: 0,
+                uid: ctx.uid,
+                gid: ctx.gid,
                 rdev: 0,
                 size: 0,
                 blksize: 4096,
@@ -664,6 +733,26 @@ impl FileSystem for PowerFsFs {
             .fid
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
 
+        let file_size = entry.size;
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        let end_offset = std::cmp::min(offset + size as u64, file_size);
+        let chunk_size = self.chunk_cache.chunk_size();
+
+        let start_chunk = self.chunk_cache.get_chunk_index(offset);
+        let _end_chunk = self
+            .chunk_cache
+            .get_chunk_index(end_offset.saturating_sub(1));
+
+        let prefetch_end = std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
+        let prefetch_end_chunk = if prefetch_end == 0 {
+            0
+        } else {
+            self.chunk_cache.get_chunk_index(prefetch_end - 1)
+        };
+
         let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
             error!("lookup_volume failed: {}", e);
             std::io::Error::from_raw_os_error(libc::EIO)
@@ -674,19 +763,47 @@ impl FileSystem for PowerFsFs {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
         let addr = PowerFuseClient::location_to_grpc_addr(loc);
 
-        let data = self
-            .client
-            .read_data(&addr, fid.volume_id.0, fid.file_key)
-            .map_err(|e| {
-                error!("read_data failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
-            })?;
+        for chunk_idx in start_chunk..=prefetch_end_chunk {
+            let chunk_offset = chunk_idx * chunk_size;
+            if self.chunk_cache.get(inode, chunk_offset).is_none() {
+                let read_size = std::cmp::min(chunk_size, file_size - chunk_offset);
+                match self
+                    .client
+                    .read_blob(&addr, chunk_offset as i64, read_size as i32)
+                {
+                    Ok(data) => {
+                        let mtime = entry.mtime as u64;
+                        self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
+                    }
+                    Err(e) => {
+                        error!("read_blob failed: {}", e);
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+            }
+        }
 
-        let start = std::cmp::min(offset as usize, data.len());
-        let end = std::cmp::min(start + size as usize, data.len());
-        let slice = &data[start..end];
-        w.write_all(slice)?;
-        Ok(slice.len())
+        let mut total_written = 0usize;
+        let mut current_offset = offset;
+        let end = end_offset;
+
+        while current_offset < end {
+            let chunk_data = self
+                .chunk_cache
+                .get(inode, current_offset)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+
+            let chunk_start = self.chunk_cache.get_chunk_offset(current_offset) as usize;
+            let bytes_left_in_chunk =
+                (chunk_data.data.len() - chunk_start).min((end - current_offset) as usize);
+
+            let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
+            w.write_all(slice)?;
+            total_written += bytes_left_in_chunk;
+            current_offset += bytes_left_in_chunk as u64;
+        }
+
+        Ok(total_written)
     }
 
     fn write(
@@ -715,6 +832,8 @@ impl FileSystem for PowerFsFs {
             return Ok(0);
         }
         buf.truncate(read_len);
+
+        let chunk_size = self.chunk_cache.chunk_size();
 
         if entry.fid.is_none() {
             let (fid, location) = self
@@ -759,32 +878,74 @@ impl FileSystem for PowerFsFs {
                     mtime: None,
                 },
             );
-        } else if let Some(fid) = &entry.fid {
-            let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-                error!("lookup_volume failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
-            })?;
-            let loc = locations
-                .first()
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-            let addr = PowerFuseClient::location_to_grpc_addr(loc);
 
-            self.client
-                .write_blob(
-                    &addr,
-                    crate::client::WriteBlobParams {
-                        volume_id: fid.volume_id.0,
-                        file_key: fid.file_key,
-                        offset: offset as i64,
-                        size: read_len as i32,
-                        data: buf.clone(),
-                        cookie: 0,
-                    },
-                )
-                .map_err(|e| {
-                    error!("write_blob failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
-                })?;
+            let mtime = entry.mtime as u64;
+            self.chunk_cache.put(inode, 0, buf, mtime, 0);
+        } else if let Some(fid) = &entry.fid {
+            let end_offset = offset + read_len as u64;
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
+            let end_chunk = if end_offset == 0 {
+                0
+            } else {
+                self.chunk_cache.get_chunk_index(end_offset - 1)
+            };
+
+            let mut data_offset = 0u64;
+            let mut current_offset = offset;
+
+            for chunk_idx in start_chunk..=end_chunk {
+                let chunk_start_offset = chunk_idx * chunk_size;
+                let chunk_data = if let Some(cached) =
+                    self.chunk_cache.get(inode, chunk_start_offset)
+                {
+                    cached.data.to_vec()
+                } else {
+                    let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
+                        error!("lookup_volume failed: {}", e);
+                        std::io::Error::from_raw_os_error(libc::EIO)
+                    })?;
+                    let loc = locations
+                        .first()
+                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+                    let addr = PowerFuseClient::location_to_grpc_addr(loc);
+
+                    let read_size =
+                        std::cmp::min(chunk_size, entry.size.saturating_sub(chunk_start_offset));
+                    if read_size > 0 {
+                        self.client
+                            .read_blob(&addr, chunk_start_offset as i64, read_size as i32)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                let mut chunk_vec = chunk_data;
+                let in_chunk_start = current_offset.saturating_sub(chunk_start_offset) as usize;
+                let bytes_to_write = std::cmp::min(
+                    read_len as u64 - data_offset,
+                    chunk_size - in_chunk_start as u64,
+                ) as usize;
+
+                let needed_len = in_chunk_start + bytes_to_write;
+                if chunk_vec.len() < needed_len {
+                    chunk_vec.resize(needed_len, 0);
+                }
+
+                chunk_vec[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                    &buf[data_offset as usize..data_offset as usize + bytes_to_write],
+                );
+
+                let mtime = entry.mtime as u64;
+                self.chunk_cache
+                    .put(inode, chunk_start_offset, chunk_vec, mtime, 0);
+
+                let mut dirty = self.dirty_chunks.write().unwrap();
+                dirty.insert((inode, chunk_idx));
+
+                data_offset += bytes_to_write as u64;
+                current_offset += bytes_to_write as u64;
+            }
 
             let new_size = std::cmp::max(entry.size, offset + read_len as u64);
             self.cache.update_size(inode, new_size);
@@ -796,13 +957,14 @@ impl FileSystem for PowerFsFs {
     fn release(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
+        inode: Self::Inode,
         _flags: u32,
         _handle: Self::Handle,
         _flush: bool,
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
+        let _ = self.flush_dirty_chunks(inode);
         Ok(())
     }
 
@@ -1152,12 +1314,12 @@ impl FileSystem for PowerFsFs {
     fn fsync(
         &self,
         _ctx: &Context,
-        _inode: Self::Inode,
+        inode: Self::Inode,
         _datasync: bool,
         _handle: Self::Handle,
     ) -> std::io::Result<()> {
-        debug!("fsync: inode={}", _inode);
-        Ok(())
+        debug!("fsync: inode={}", inode);
+        self.flush_dirty_chunks(inode)
     }
 
     fn fallocate(

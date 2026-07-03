@@ -309,7 +309,9 @@ fn test_replica_placement_to_string_format_neither() {
 #[test]
 fn test_replica_placement_from_string_all_zeros() {
     let rp = ReplicaPlacement::from_string("000").unwrap();
-    assert_eq!(rp.copies, 0);
+    // "000" means no additional replicas = 1 copy (the original)
+    assert_eq!(rp.copies, 1);
+    assert_eq!(rp.get_copy_count(), 1);
     assert!(!rp.same_rack);
     assert!(!rp.same_data_center);
 }

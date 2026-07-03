@@ -61,10 +61,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let volume_server = VolumeServer::new(storage_manager.clone(), node_id.clone());
 
+    let grpc_port = args.grpc_address
+        .split(':')
+        .last()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(args.http_port + 1);
+
     let mut master_client = MasterClient::new(
         &args.master_address,
         node_id,
-        args.http_port + 1,
+        grpc_port,
         args.http_port,
         &args.data_center,
         &args.rack,

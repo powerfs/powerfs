@@ -7,6 +7,11 @@ edition = "2021"
 name = "powerfs-fuse"
 path = "src/main.rs"
 
+[[bench]]
+name = "fs_bench"
+path = "benches/fs_bench.rs"
+harness = false
+
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }

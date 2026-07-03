@@ -105,6 +105,8 @@ impl MetadataCache {
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
         cache.insert(CachedEntry {
             inode: 1,
             parent: 1,
@@ -116,8 +118,8 @@ impl MetadataCache {
             fid: None,
             size: 4096,
             mode: 0o755,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -355,7 +357,9 @@ impl MetadataCache {
         }
 
         // Insert new path
-        let new_entry = self.get_inode(inode).unwrap();
+        let new_entry = self
+            .get_inode(inode)
+            .ok_or_else(|| "inode not found in cache after update".to_string())?;
         let new_path = if newdir == 1 {
             format!("/{}", new_entry.name)
         } else {

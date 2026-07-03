@@ -177,6 +177,9 @@ impl ReplicaPlacement {
 
             let total = same_dc + same_rack_diff_dc + diff_rack_dc;
 
+            // "000" means no additional replicas = 1 copy (the original)
+            let copies = total.max(1);
+
             // same_rack is true if we have copies that should stay in same rack
             // (either same_rack_diff_dc > 0 or same_dc > 0 with implicit same rack)
             let same_rack = same_rack_diff_dc > 0;
@@ -185,7 +188,7 @@ impl ReplicaPlacement {
             let same_data_center = same_dc > 0 || same_rack_diff_dc > 0;
 
             return Ok(ReplicaPlacement {
-                copies: total,
+                copies,
                 same_rack,
                 same_data_center,
             });

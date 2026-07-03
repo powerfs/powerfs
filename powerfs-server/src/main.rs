@@ -115,15 +115,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    env_logger::Builder::new()
-        .filter_level(match cli.log_level.as_str() {
-            "debug" => log::LevelFilter::Debug,
-            "info" => log::LevelFilter::Info,
-            "warn" => log::LevelFilter::Warn,
-            "error" => log::LevelFilter::Error,
-            _ => log::LevelFilter::Info,
-        })
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(cli.log_level.as_str()),
+    )
+    .init();
 
     match cli.command {
         Commands::Master {
