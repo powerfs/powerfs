@@ -117,6 +117,7 @@ xfstests 是 Linux 内核社区维护的文件系统测试套件，包含 1000+ 
 ```bash
 # Ubuntu/Debian
 sudo apt-get install xfstests
+
 # 或从源码编译
 git clone https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
 cd xfstests-dev
