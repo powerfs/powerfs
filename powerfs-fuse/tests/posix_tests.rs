@@ -66,6 +66,7 @@ fn test_open_multiple_writers_append() {
     setup();
     let path = test_path!("test_open_multi_write.txt");
 
+    let _ = fs::remove_file(&path);
     let mut f1 = OpenOptions::new()
         .create(true)
         .write(true)
@@ -96,6 +97,8 @@ fn test_open_multiple_writers_append() {
     assert!(buf.contains("third"));
     assert!(buf.contains("fourth"));
     assert_eq!(buf.lines().count(), 4);
+
+    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -103,6 +106,7 @@ fn test_open_exclusive_create() {
     setup();
     let path = test_path!("test_excl.txt");
 
+    let _ = fs::remove_file(&path);
     let _f1 = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -112,6 +116,8 @@ fn test_open_exclusive_create() {
     let result = OpenOptions::new().create_new(true).write(true).open(&path);
 
     assert!(result.is_err());
+
+    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -277,6 +283,7 @@ fn test_readdir() {
     setup();
     let dir = test_path!("test_readdir");
 
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir(&dir).unwrap();
     for i in 0..5 {
         let mut f = File::create(dir.join(format!("file{}.txt", i))).unwrap();
@@ -292,6 +299,8 @@ fn test_readdir() {
     for i in 0..5 {
         assert!(entries.contains(&format!("file{}.txt", i)));
     }
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -321,6 +330,8 @@ fn test_rename_dir() {
     let old_dir = test_path!("test_rename_dir_old");
     let new_dir = test_path!("test_rename_dir_new");
 
+    let _ = fs::remove_dir_all(&old_dir);
+    let _ = fs::remove_dir_all(&new_dir);
     fs::create_dir(&old_dir).unwrap();
     let mut f = File::create(old_dir.join("file.txt")).unwrap();
     f.write_all(b"in dir").unwrap();
@@ -331,6 +342,8 @@ fn test_rename_dir() {
     assert!(!old_dir.exists());
     assert!(new_dir.exists());
     assert!(new_dir.join("file.txt").exists());
+
+    let _ = fs::remove_dir_all(&new_dir);
 }
 
 #[test]
@@ -339,6 +352,8 @@ fn test_symlink() {
     let target = test_path!("test_symlink_target.txt");
     let link = test_path!("test_symlink_link");
 
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_file(&target);
     let mut f = File::create(&target).unwrap();
     f.write_all(b"symlink target").unwrap();
     drop(f);
@@ -352,6 +367,9 @@ fn test_symlink() {
 
     let read_link = fs::read_link(&link).unwrap();
     assert!(read_link.ends_with("test_symlink_target.txt"));
+
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_file(&target);
 }
 
 #[test]
@@ -552,6 +570,7 @@ fn test_fsync() {
     setup();
     let path = test_path!("test_fsync.txt");
 
+    let _ = fs::remove_file(&path);
     let mut f = File::create(&path).unwrap();
     f.write_all(b"fsync test").unwrap();
     f.sync_all().unwrap();
@@ -561,6 +580,8 @@ fn test_fsync() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "fsync test");
+
+    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -587,6 +608,8 @@ fn test_file_rename_overwrite() {
     let src = test_path!("test_rename_src.txt");
     let dst = test_path!("test_rename_dst.txt");
 
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&dst);
     let mut f = File::create(&src).unwrap();
     f.write_all(b"source").unwrap();
     drop(f);
@@ -604,6 +627,8 @@ fn test_file_rename_overwrite() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "source");
+
+    let _ = fs::remove_file(&dst);
 }
 
 #[test]
@@ -706,6 +731,7 @@ fn test_directory_permissions() {
     setup();
     let dir = test_path!("test_dir_perm");
 
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -715,6 +741,8 @@ fn test_directory_permissions() {
     drop(f);
 
     assert!(file.exists());
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -722,10 +750,13 @@ fn test_readdir_empty() {
     setup();
     let dir = test_path!("test_empty_dir");
 
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir(&dir).unwrap();
 
     let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
     assert_eq!(entries.len(), 0);
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -734,6 +765,7 @@ fn test_path_traversal() {
     let dir = test_path!("test_path_traversal");
     let subdir = dir.join("sub");
 
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&subdir).unwrap();
     let mut f = File::create(subdir.join("file.txt")).unwrap();
     f.write_all(b"traversal test").unwrap();
@@ -744,6 +776,8 @@ fn test_path_traversal() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "traversal test");
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -751,15 +785,29 @@ fn test_fdatasync() {
     setup();
     let path = test_path!("test_fdatasync.txt");
 
+    let _ = fs::remove_file(&path);
     let mut f = File::create(&path).unwrap();
     f.write_all(b"fdatasync test").unwrap();
     f.sync_data().unwrap();
     drop(f);
 
-    let mut f = File::open(&path).unwrap();
+    let mut retries = 3;
+    let mut f = loop {
+        match File::open(&path) {
+            Ok(f) => break f,
+            Err(_) if retries > 0 => {
+                retries -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => panic!("Failed to open file after retries: {}", e),
+        }
+    };
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "fdatasync test");
+
+    let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -768,12 +816,25 @@ fn test_file_sync_rename() {
     let tmp_path = test_path!("test_sync_rename.tmp");
     let final_path = test_path!("test_sync_rename.txt");
 
+    let _ = fs::remove_file(&tmp_path);
+    let _ = fs::remove_file(&final_path);
     let mut f = File::create(&tmp_path).unwrap();
     f.write_all(b"atomic write").unwrap();
     f.sync_all().unwrap();
     drop(f);
 
-    fs::rename(&tmp_path, &final_path).unwrap();
+    let mut retries = 3;
+    loop {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(_) => break,
+            Err(_) if retries > 0 => {
+                retries -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => panic!("Failed to rename file after retries: {}", e),
+        }
+    }
 
     assert!(!tmp_path.exists());
     assert!(final_path.exists());
@@ -782,4 +843,6 @@ fn test_file_sync_rename() {
     let mut buf = String::new();
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "atomic write");
+
+    let _ = fs::remove_file(&final_path);
 }

@@ -11,6 +11,7 @@ use std::time::Duration;
 const FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
 const TEST_DATA_DIR: &str = "/tmp/powerfs-test-data";
 
+#[allow(dead_code)]
 struct TestEnvironment {
     master_process: Child,
     volume_process: Child,
@@ -61,12 +62,24 @@ fn register_cleanup_handler() {}
 
 fn find_target_dir() -> Option<String> {
     if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
+        let debug_dir = Path::new(&target_dir).join("debug");
+        if debug_dir.exists() {
+            return debug_dir.to_str().map(|s| s.to_string());
+        }
         return Some(target_dir);
     }
     if let Ok(pwd) = env::current_dir() {
-        let target = pwd.join("target").join("debug");
-        if target.exists() {
-            return target.to_str().map(|s| s.to_string());
+        let target_debug = pwd.join("target").join("debug");
+        if target_debug.exists() {
+            return target_debug.to_str().map(|s| s.to_string());
+        }
+        let workspace_target = pwd
+            .parent()
+            .and_then(|p| Some(p.join("target").join("debug")));
+        if let Some(workspace_target) = workspace_target {
+            if workspace_target.exists() {
+                return workspace_target.to_str().map(|s| s.to_string());
+            }
         }
     }
     None
@@ -120,27 +133,6 @@ fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
         thread::sleep(Duration::from_millis(100));
     }
     false
-}
-
-fn cleanup_existing_processes() {
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg("powerfs master")
-        .status();
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg("powerfs-volume")
-        .status();
-    let _ = Command::new("pkill").arg("-f").arg("powerfs fuse").status();
-    let _ = Command::new("fusermount3")
-        .arg("-u")
-        .arg(FUSE_MOUNT)
-        .status();
-
-    thread::sleep(Duration::from_secs(1));
-
-    let _ = fs::remove_dir_all(TEST_DATA_DIR);
-    let _ = fs::remove_dir_all(FUSE_MOUNT);
 }
 
 fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {

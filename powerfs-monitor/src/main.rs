@@ -356,8 +356,11 @@ async fn start_event_processor(
                                     source: "nodes".to_string(),
                                     payload: serde_json::to_value(node).unwrap(),
                                 };
-                                broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
-                                    .await;
+                                broadcast_message(
+                                    app_state.clone(),
+                                    serde_json::to_value(msg).unwrap(),
+                                )
+                                .await;
                             }
                         }
                         Event::VolumeStatus(e) => {
@@ -369,8 +372,11 @@ async fn start_event_processor(
                                     source: "volumes".to_string(),
                                     payload: serde_json::to_value(volume).unwrap(),
                                 };
-                                broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
-                                    .await;
+                                broadcast_message(
+                                    app_state.clone(),
+                                    serde_json::to_value(msg).unwrap(),
+                                )
+                                .await;
                             }
                         }
                         Event::KVSession(e) => {
@@ -381,8 +387,11 @@ async fn start_event_processor(
                                 source: "kv".to_string(),
                                 payload: serde_json::to_value(kv_metrics).unwrap(),
                             };
-                            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
-                                .await;
+                            broadcast_message(
+                                app_state.clone(),
+                                serde_json::to_value(msg).unwrap(),
+                            )
+                            .await;
                         }
                         Event::KVBlock(e) => {
                             if e.event_type == "write" {
@@ -399,8 +408,11 @@ async fn start_event_processor(
                                 message_type: "alert_trigger".to_string(),
                                 payload: serde_json::to_value(e).unwrap(),
                             };
-                            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
-                                .await;
+                            broadcast_message(
+                                app_state.clone(),
+                                serde_json::to_value(msg).unwrap(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -424,8 +436,7 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
                 message_type: "alert_trigger".to_string(),
                 payload: serde_json::to_value(alert).unwrap(),
             };
-            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
-                .await;
+            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap()).await;
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
     }
@@ -441,8 +452,11 @@ async fn start_metric_broadcaster(metric_store: Arc<MetricStore>, app_state: Arc
             source: "cluster".to_string(),
             payload: serde_json::to_value(cluster_metrics).unwrap(),
         };
-        broadcast_message(app_state.clone(), serde_json::to_value(cluster_msg).unwrap())
-            .await;
+        broadcast_message(
+            app_state.clone(),
+            serde_json::to_value(cluster_msg).unwrap(),
+        )
+        .await;
 
         let kv_metrics = metric_store.get_kv_metrics().await;
         let kv_msg = WsMetricUpdate {
