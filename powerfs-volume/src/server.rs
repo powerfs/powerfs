@@ -5,6 +5,7 @@ use bytes::Bytes;
 use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
+    event::{Event, EventPublisher, VolumeStatusEvent},
     types::{NeedleId, NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
@@ -16,13 +17,26 @@ use tonic::{transport::Server, Request, Response, Status};
 pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
     node_id: NodeId,
+    event_publisher: Option<EventPublisher>,
 }
 
 impl VolumeServer {
     pub fn new(storage_manager: Arc<StorageManager>, node_id: NodeId) -> Self {
+        let event_publisher = match std::env::var("REDIS_URL") {
+            Ok(url) => {
+                info!("Event publisher enabled with Redis: {}", url);
+                Some(EventPublisher::new(&url, "powerfs_events", "volume"))
+            }
+            Err(_) => {
+                warn!("REDIS_URL not set, event publishing disabled");
+                None
+            }
+        };
+
         VolumeServer {
             storage_manager,
             node_id,
+            event_publisher,
         }
     }
 
@@ -71,6 +85,28 @@ impl VolumeService for VolumeServer {
         match result {
             Ok(info) => {
                 debug!("Created volume {} in {:?}", info.id, start.elapsed());
+
+                if let Some(publisher) = self.event_publisher.clone() {
+                    let vid_clone = info.id.0;
+                    let nid_str = self.node_id.0.clone();
+                    let size = info.size;
+                    let used = info.used;
+                    tokio::spawn(async move {
+                        let event = Event::VolumeStatus(VolumeStatusEvent {
+                            volume_id: vid_clone,
+                            node_id: nid_str,
+                            size,
+                            used,
+                            file_count: 0,
+                            status: "available".to_string(),
+                            collection: "default".to_string(),
+                        });
+                        if let Err(e) = publisher.publish(event, &format!("{}", vid_clone)).await {
+                            warn!("Failed to publish volume_status event: {}", e);
+                        }
+                    });
+                }
+
                 Ok(Response::new(crate::proto::CreateVolumeResponse {
                     success: true,
                     volume_id: info.id.0,

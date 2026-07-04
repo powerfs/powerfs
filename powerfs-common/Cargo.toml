@@ -18,6 +18,7 @@ raft = { workspace = true }
 rocksdb = { workspace = true }
 rand = { workspace = true }
 toml = "0.8"
+redis = { version = "0.24", features = ["tokio-comp"] }
 
 [dev-dependencies]
 tempfile = "3.10"

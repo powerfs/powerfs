@@ -87,6 +87,54 @@ impl DirectoryTree {
         None
     }
 
+    pub fn create_directory(&self, path: &str) -> Result<u64, rocksdb::Error> {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut current_path = "/".to_string();
+
+        for part in parts {
+            let parent_path = current_path.clone();
+            current_path = if current_path == "/" {
+                format!("/{}", part)
+            } else {
+                format!("{}/{}", current_path, part)
+            };
+
+            if self.get_entry(&current_path).is_none() {
+                let entry = Entry {
+                    name: part.to_string(),
+                    directory: parent_path,
+                    attributes: Some(crate::proto::FuseAttributes {
+                        ino: 0,
+                        mode: 0o40755,
+                        nlink: 2,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: 4096,
+                        blksize: 4096,
+                        blocks: 1,
+                        atime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                        mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                        ctime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                        crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                        perm: 0o755,
+                    }),
+                    chunks: vec![],
+                    hard_link_id: "".to_string(),
+                    hard_link_counter: 0,
+                    extended: HashMap::new(),
+                    content_size: 4096,
+                    disk_size: 4096,
+                    ttl: "".to_string(),
+                    symlink_target: "".to_string(),
+                };
+                let _ = self.create_entry(entry);
+            }
+        }
+
+        Ok(0)
+    }
+
     pub fn create_entry(&self, mut entry: Entry) -> Result<u64, rocksdb::Error> {
         let inode = self.allocate_inode();
 

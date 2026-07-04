@@ -574,6 +574,7 @@ message PutBlockResponse {
     bool success = 1;
     uint64 block_id = 2;
     string error = 3;
+    string fid = 4;
 }
 
 message GetBlockRequest {
@@ -587,6 +588,8 @@ message GetBlockResponse {
     uint32 num_tokens = 4;
     bytes data = 5;
     string error = 6;
+    string fid = 7;
+    repeated Location volume_locations = 8;
 }
 
 message BatchPutRequest {

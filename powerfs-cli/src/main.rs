@@ -3,11 +3,12 @@ use log::info;
 
 mod client;
 mod commands;
+mod kv_client;
 mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    GrowArgs, HeartbeatArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
+    GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
     WriteArgs,
 };
 
@@ -70,6 +71,9 @@ enum Commands {
 
     /// Mount PowerFS as a FUSE filesystem
     Mount(MountArgs),
+
+    /// KV Cache operations (session/block/list/stats)
+    Kv(KvArgs),
 }
 
 #[tokio::main]
@@ -105,6 +109,10 @@ async fn main() {
         Commands::ClusterStatus(args) => commands::cluster_status(client, args).await,
         Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
         Commands::Mount(args) => commands::mount(args),
+        Commands::Kv(args) => {
+            let kv_client = kv_client::KvCacheClient::new(&cli.master);
+            commands::kv(kv_client, args).await
+        }
     };
 
     if let Err(e) = result {

@@ -15,6 +15,10 @@ fn make_data(size: usize) -> Vec<u8> {
     v
 }
 
+fn put_block_helper(engine: &KVCacheEngine, session_id: &str, layer_id: u32, num_tokens: u32, data: &[u8]) -> u64 {
+    engine.put_block(session_id, layer_id, num_tokens, data, "", layer_id).unwrap()
+}
+
 #[test]
 fn test_create_delete_session() {
     let engine = make_engine(10);
@@ -50,7 +54,7 @@ fn test_put_get_block() {
         .unwrap();
 
     let data = make_data(1024);
-    let block_id = engine.put_block("s1", 0, 128, &data).unwrap();
+    let block_id = put_block_helper(&engine, "s1", 0, 128, &data);
     assert!(block_id > 0);
 
     let (meta, read_data) = engine.get_block_data(block_id).unwrap();
@@ -64,7 +68,7 @@ fn test_put_get_block() {
 fn test_put_block_without_session_fails() {
     let engine = make_engine(10);
     let data = make_data(100);
-    assert!(engine.put_block("nonexist", 0, 10, &data).is_err());
+    assert!(engine.put_block("nonexist", 0, 10, &data, "", 0).is_err());
 }
 
 #[test]
@@ -77,8 +81,8 @@ fn test_batch_put_get() {
     let data1 = make_data(512);
     let data2 = make_data(1024);
     let requests = vec![
-        ("s1".to_string(), 0u32, 64u32, data1.clone()),
-        ("s1".to_string(), 1u32, 128u32, data2.clone()),
+        ("s1".to_string(), 0u32, 64u32, data1.clone(), "".to_string(), 0u32),
+        ("s1".to_string(), 1u32, 128u32, data2.clone(), "".to_string(), 1u32),
     ];
 
     let results = engine.batch_put(&requests);
@@ -109,7 +113,7 @@ fn test_lru_eviction() {
     let data = make_data(1024 * 1024); // 1MB
     let mut ids = Vec::new();
     for i in 0..8 {
-        let id = engine.put_block("s1", i, 128, &data).unwrap();
+        let id = put_block_helper(&engine, "s1", i as u32, 128, &data);
         ids.push(id);
     }
 
@@ -134,7 +138,7 @@ fn test_stats_counter() {
         .unwrap();
 
     let data = make_data(1024);
-    let id = engine.put_block("s1", 0, 128, &data).unwrap();
+    let id = put_block_helper(&engine, "s1", 0, 128, &data);
 
     let stats_before = engine.stats();
     assert_eq!(stats_before.total_sessions, 1);
@@ -157,7 +161,7 @@ fn test_session_block_list() {
 
     let data = make_data(100);
     for i in 0..5 {
-        engine.put_block("s1", i, 10, &data).unwrap();
+        put_block_helper(&engine, "s1", i as u32, 10, &data);
     }
 
     let blocks = engine.get_session_blocks("s1");
@@ -206,7 +210,7 @@ fn test_concurrent_access() {
         handles.push(thread::spawn(move || {
             let mut ids = Vec::new();
             for j in 0..20 {
-                let id = eng.put_block("s1", (i * 20 + j) as u32, 10, &d).unwrap();
+                let id = eng.put_block("s1", (i * 20 + j) as u32, 10, &d, "", (i * 20 + j) as u32).unwrap();
                 ids.push(id);
             }
             for id in &ids {
@@ -244,7 +248,7 @@ fn test_ttl_expiry() {
         .unwrap();
 
     let data = make_data(1024);
-    let _ = engine.put_block("s1", 0, 128, &data).unwrap();
+    let _ = put_block_helper(&engine, "s1", 0, 128, &data);
 
     assert!(engine.get_session("s1").is_some());
 
@@ -254,4 +258,82 @@ fn test_ttl_expiry() {
     assert!(cleaned >= 1);
 
     assert!(engine.get_session("s1").is_none());
+}
+
+#[test]
+fn test_block_meta_fid_field() {
+    let engine = make_engine(10);
+    engine
+        .create_session("s1", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .unwrap();
+
+    let data = make_data(1024);
+    let block_id = engine.put_block("s1", 0, 128, &data, "1,2:3", 5).unwrap();
+
+    let (meta, _) = engine.get_block_data(block_id).unwrap();
+    assert_eq!(meta.fid, "1,2:3");
+    assert_eq!(meta.block_index, 5);
+}
+
+#[test]
+fn test_block_meta_index_field() {
+    let engine = make_engine(10);
+    engine
+        .create_session("s1", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .unwrap();
+
+    let data = make_data(1024);
+    for i in 0..5 {
+        let block_id = engine.put_block("s1", i, 128, &data, &format!("vol1,{}:{}", i, i*100), i*10).unwrap();
+        let (meta, _) = engine.get_block_data(block_id).unwrap();
+        assert_eq!(meta.block_index, i*10);
+        assert_eq!(meta.fid, format!("vol1,{}:{}", i, i*100));
+    }
+}
+
+#[test]
+fn test_block_id_mapping_add_get() {
+    let engine = make_engine(10);
+    engine
+        .create_session("s1", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .unwrap();
+
+    let data = make_data(1024);
+    let block_id = engine.put_block("s1", 0, 128, &data, "1,2:3", 0).unwrap();
+
+    let fid = engine.get_fid_by_block_id(block_id);
+    assert_eq!(fid, Some("1,2:3".to_string()));
+}
+
+#[test]
+fn test_block_id_mapping_remove() {
+    let engine = make_engine(10);
+    engine
+        .create_session("s1", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .unwrap();
+
+    let data = make_data(1024);
+    let block_id = engine.put_block("s1", 0, 128, &data, "1,2:3", 0).unwrap();
+
+    assert!(engine.get_fid_by_block_id(block_id).is_some());
+
+    engine.remove_block_id_mapping(block_id);
+    assert!(engine.get_fid_by_block_id(block_id).is_none());
+}
+
+#[test]
+fn test_block_id_mapping_persistence() {
+    let engine = make_engine(10);
+    engine
+        .create_session("s1", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .unwrap();
+
+    let data = make_data(1024);
+    let block_id = engine.put_block("s1", 0, 128, &data, "1,2:3", 0).unwrap();
+
+    assert!(engine.get_fid_by_block_id(block_id).is_some());
+
+    engine.delete_session("s1").unwrap();
+
+    assert!(engine.get_fid_by_block_id(block_id).is_none());
 }

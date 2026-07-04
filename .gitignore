@@ -12,6 +12,8 @@ docs/
 .cargo
 vendor/
 qemu/
+kvdesign.md
+kvplan.md
 
 note.md
 

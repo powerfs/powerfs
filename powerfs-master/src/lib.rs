@@ -8,3 +8,5 @@ pub mod raft_node;
 pub mod raft_server;
 pub mod raft_storage;
 pub mod server;
+pub mod volume_client;
+pub mod volume_proto;

@@ -9,6 +9,7 @@ members = [
     "powerfs-cli",
     "powerfs-kv-client",
     "powerfs-kernel",
+    "powerfs-monitor",
 ]
 resolver = "2"
 

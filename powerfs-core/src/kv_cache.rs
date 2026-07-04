@@ -48,6 +48,8 @@ pub struct KVBlockMeta {
     pub created_at: Instant,
     pub last_accessed: Instant,
     pub ttl: Option<Duration>,
+    pub fid: String,
+    pub block_index: u32,
 }
 
 pub struct KVBlock {
@@ -135,6 +137,7 @@ pub struct KVCacheEngine {
     sessions: RwLock<HashMap<String, KVSession>>,
     stats: Mutex<KVCacheStats>,
     next_block_id: AtomicU64,
+    block_id_map: RwLock<HashMap<u64, String>>,
 }
 
 impl KVCacheEngine {
@@ -149,6 +152,7 @@ impl KVCacheEngine {
             sessions: RwLock::new(HashMap::new()),
             stats: Mutex::new(KVCacheStats::default()),
             next_block_id: AtomicU64::new(1),
+            block_id_map: RwLock::new(HashMap::new()),
         }
     }
 
@@ -211,6 +215,7 @@ impl KVCacheEngine {
             .ok_or_else(|| format!("session {} not found", session_id))?;
 
         let mut blocks = self.blocks.write().unwrap();
+        let mut block_id_map = self.block_id_map.write().unwrap();
         let mut stats = self.stats.lock().unwrap();
 
         for block_id in &session.block_ids {
@@ -221,6 +226,7 @@ impl KVCacheEngine {
                 stats.total_blocks = stats.total_blocks.saturating_sub(1);
                 self.memory_pool.deallocate(block.data);
             }
+            block_id_map.remove(block_id);
         }
 
         stats.total_sessions = stats.total_sessions.saturating_sub(1);
@@ -252,6 +258,8 @@ impl KVCacheEngine {
         layer_id: u32,
         num_tokens: u32,
         data: &[u8],
+        fid: &str,
+        block_index: u32,
     ) -> Result<u64, String> {
         {
             let sessions = self.sessions.read().unwrap();
@@ -293,6 +301,8 @@ impl KVCacheEngine {
             created_at: now,
             last_accessed: now,
             ttl: session.ttl,
+            fid: fid.to_string(),
+            block_index,
         };
 
         let block = KVBlock { meta, data: buf };
@@ -310,7 +320,56 @@ impl KVCacheEngine {
         stats.total_blocks += 1;
         stats.used_memory_bytes += size_bytes;
 
+        let mut block_id_map = self.block_id_map.write().unwrap();
+        block_id_map.insert(block_id, fid.to_string());
+
         Ok(block_id)
+    }
+
+    pub fn get_fid_by_block_id(&self, block_id: u64) -> Option<String> {
+        let block_id_map = self.block_id_map.read().unwrap();
+        block_id_map.get(&block_id).cloned()
+    }
+
+    pub fn set_fid_by_block_id(&self, block_id: u64, fid: &str) {
+        let mut block_id_map = self.block_id_map.write().unwrap();
+        block_id_map.insert(block_id, fid.to_string());
+    }
+
+    pub fn remove_block_id_mapping(&self, block_id: u64) {
+        let mut block_id_map = self.block_id_map.write().unwrap();
+        block_id_map.remove(&block_id);
+    }
+
+    pub fn restore_block_id_mapping(&self, block_id: u64, fid: &str) {
+        let mut block_id_map = self.block_id_map.write().unwrap();
+        block_id_map.insert(block_id, fid.to_string());
+    }
+
+    pub fn get_block_meta(&self, block_id: u64) -> Option<KVBlockMeta> {
+        let blocks = self.blocks.read().unwrap();
+        blocks.get(&block_id).map(|b| b.meta.clone())
+    }
+
+    pub fn get_session_by_block_id(&self, block_id: u64) -> Option<KVSession> {
+        let blocks = self.blocks.read().unwrap();
+        if let Some(block) = blocks.get(&block_id) {
+            let sessions = self.sessions.read().unwrap();
+            return sessions.get(&block.meta.session_id).cloned();
+        }
+        drop(blocks);
+
+        let block_id_map = self.block_id_map.read().unwrap();
+        if let Some(fid_str) = block_id_map.get(&block_id) {
+            let sessions = self.sessions.read().unwrap();
+            for (_, sess) in sessions.iter() {
+                let expected_fid_prefix = format!("{},", sess.session_id.len() % 1000 + 1);
+                if fid_str.starts_with(&expected_fid_prefix) {
+                    return Some(sess.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn get_block(&self, block_id: u64) -> Option<KVBlockMeta> {
@@ -371,6 +430,7 @@ impl KVCacheEngine {
     pub fn evict_lru(&self, needed_bytes: u64) -> Result<(), String> {
         let mut blocks = self.blocks.write().unwrap();
         let mut sessions = self.sessions.write().unwrap();
+        let mut block_id_map = self.block_id_map.write().unwrap();
         let mut stats = self.stats.lock().unwrap();
 
         let mut evicted_bytes: u64 = 0;
@@ -406,6 +466,7 @@ impl KVCacheEngine {
             stats.evictions += 1;
 
             self.memory_pool.deallocate(block.data);
+            block_id_map.remove(&oldest_id);
 
             // Remove from session
             if let Some(sess) = sessions.get_mut(&sid) {
@@ -460,6 +521,7 @@ impl KVCacheEngine {
 
         let mut blocks = self.blocks.write().unwrap();
         let mut sessions = self.sessions.write().unwrap();
+        let mut block_id_map = self.block_id_map.write().unwrap();
         let mut stats = self.stats.lock().unwrap();
 
         for bid in expired_blocks {
@@ -471,6 +533,7 @@ impl KVCacheEngine {
                 stats.total_blocks = stats.total_blocks.saturating_sub(1);
                 stats.evictions += 1;
                 self.memory_pool.deallocate(block.data);
+                block_id_map.remove(&bid);
 
                 if let Some(sess) = sessions.get_mut(&block.meta.session_id) {
                     sess.block_ids.retain(|&id| id != bid);
@@ -481,10 +544,10 @@ impl KVCacheEngine {
         count
     }
 
-    pub fn batch_put(&self, requests: &[(String, u32, u32, Vec<u8>)]) -> Vec<Result<u64, String>> {
+    pub fn batch_put(&self, requests: &[(String, u32, u32, Vec<u8>, String, u32)]) -> Vec<Result<u64, String>> {
         let mut results = Vec::with_capacity(requests.len());
-        for (session_id, layer_id, num_tokens, data) in requests {
-            results.push(self.put_block(session_id, *layer_id, *num_tokens, data));
+        for (session_id, layer_id, num_tokens, data, fid, block_index) in requests {
+            results.push(self.put_block(session_id, *layer_id, *num_tokens, data, fid, *block_index));
         }
         results
     }

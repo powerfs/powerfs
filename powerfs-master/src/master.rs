@@ -1,16 +1,19 @@
 use crate::raft_node::{ApplyEntry, OutgoingMessage, ProposeRequest, RaftNode};
 use crate::raft_storage::RaftCommand;
+use crate::volume_client::VolumeClientPool;
 use chrono::Utc;
 use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
+    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
     types::{
         ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
         NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
         VolumeInfo, VolumeState,
     },
 };
-use powerfs_core::kv_cache::KVCacheEngine;
+use powerfs_core::kv_cache::{KVCacheEngine, KVDtype};
+use powerfs_core::kv_cache_persist::KVPersistStore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -41,7 +44,10 @@ pub struct MasterNode {
     client_manager: RwLock<ClientManager>,
     notify_tx: mpsc::Sender<VolumeLocationUpdate>,
     pub kv_cache: Arc<KVCacheEngine>,
+    pub kv_persist: Arc<KVPersistStore>,
     pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
+    pub volume_client_pool: Arc<VolumeClientPool>,
+    event_publisher: Option<EventPublisher>,
 }
 
 #[derive(Clone)]
@@ -178,6 +184,17 @@ impl MasterNode {
             2 * 1024 * 1024,    // 2MB block
         ));
 
+        let kv_persist_path = std::path::Path::new(raft_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("kv_persist");
+        let kv_persist = Arc::new(
+            KVPersistStore::new(kv_persist_path.to_str().unwrap_or("kv_persist"))
+                .map_err(|e| PowerFsError::Internal(format!("Failed to create KV persist store: {}", e)))?,
+        );
+
+        Self::restore_kv_sessions(&kv_cache, &kv_persist);
+
         let dir_tree_path = std::path::Path::new(raft_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -190,6 +207,19 @@ impl MasterNode {
         dir_tree
             .init_root()
             .map_err(|e| PowerFsError::Internal(format!("Failed to init root: {}", e)))?;
+
+        let volume_client_pool = Arc::new(VolumeClientPool::new());
+
+        let event_publisher = match std::env::var("REDIS_URL") {
+            Ok(url) => {
+                info!("Event publisher enabled with Redis: {}", url);
+                Some(EventPublisher::new(&url, "powerfs_events", "master"))
+            }
+            Err(_) => {
+                warn!("REDIS_URL not set, event publishing disabled");
+                None
+            }
+        };
 
         let master = MasterNode {
             id: node_id.clone(),
@@ -213,7 +243,10 @@ impl MasterNode {
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx,
             kv_cache,
+            kv_persist,
             directory_tree: dir_tree,
+            volume_client_pool,
+            event_publisher,
         };
 
         let master_clone = master.clone();
@@ -245,6 +278,30 @@ impl MasterNode {
         });
 
         Ok(master)
+    }
+
+    fn restore_kv_sessions(kv_cache: &Arc<KVCacheEngine>, kv_persist: &Arc<KVPersistStore>) {
+        if let Ok(sessions) = kv_persist.list_sessions() {
+            for session_id in sessions {
+                if let Ok(Some(meta)) = kv_persist.load_session(&session_id) {
+                    let dtype = meta.dtype_enum();
+                    let _ = kv_cache.create_session(
+                        &session_id,
+                        &meta.model_name,
+                        meta.num_layers,
+                        meta.num_heads,
+                        meta.head_dim,
+                        dtype,
+                        meta.ttl_seconds,
+                    );
+                    for block_id in &meta.block_ids {
+                        if let Ok(Some(fid)) = kv_persist.load_block_fid(*block_id) {
+                            kv_cache.restore_block_id_mapping(*block_id, &fid);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn id(&self) -> &NodeId {
@@ -401,6 +458,7 @@ impl MasterNode {
         let node_id = params.node_id.clone();
         let address = params.address.clone();
         let http_port = params.http_port;
+        let grpc_port = params.grpc_port;
 
         let mut topology = self.topology.write().unwrap();
         let node = DataNodeInfo::new(
@@ -415,6 +473,31 @@ impl MasterNode {
         topology.get_or_create_node(node);
 
         info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
+
+        if let Some(publisher) = self.event_publisher.clone() {
+            let node_id_str = node_id.0.clone();
+            let addr_clone = address.clone();
+            tokio::spawn(async move {
+                let event = Event::NodeStatus(NodeStatusEvent {
+                    node_id: node_id_str.clone(),
+                    address: addr_clone,
+                    grpc_port,
+                    http_port,
+                    status: "healthy".to_string(),
+                    cpu_usage: 0.0,
+                    mem_usage: 0.0,
+                    disk_usage: 0.0,
+                    network_rx: 0,
+                    network_tx: 0,
+                    uptime: 0,
+                    volume_count: 0,
+                });
+                if let Err(e) = publisher.publish(event, &node_id_str).await {
+                    warn!("Failed to publish node_status event: {}", e);
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -443,8 +526,8 @@ impl MasterNode {
             vid,
             VolumeInfo {
                 id: vid,
-                node_id: nid,
-                collection: coll,
+                node_id: nid.clone(),
+                collection: coll.clone(),
                 size,
                 used: 0,
                 replica_count,
@@ -458,6 +541,27 @@ impl MasterNode {
         );
 
         info!("Applied AssignVolume: vid={}, node={}", vid, nid_clone);
+
+        if let Some(publisher) = self.event_publisher.clone() {
+            let vid_clone = vid.0;
+            let nid_str = nid.0.clone();
+            let coll_str = coll.0.clone();
+            tokio::spawn(async move {
+                let event = Event::VolumeStatus(VolumeStatusEvent {
+                    volume_id: vid_clone,
+                    node_id: nid_str,
+                    size,
+                    used: 0,
+                    file_count: 0,
+                    status: "creating".to_string(),
+                    collection: coll_str,
+                });
+                if let Err(e) = publisher.publish(event, &format!("{}", vid_clone)).await {
+                    warn!("Failed to publish volume_status event: {}", e);
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -1026,6 +1130,14 @@ impl MasterNode {
             .collect()
     }
 
+    pub fn get_volume_info(&self, volume_id: &VolumeId) -> Option<VolumeInfo> {
+        self.volumes.read().unwrap().get(volume_id).cloned()
+    }
+
+    pub fn get_node_info(&self, node_id: &NodeId) -> Option<DataNodeInfo> {
+        self.topology.read().unwrap().get_node(node_id).cloned()
+    }
+
     pub async fn handle_heartbeat(&self, node_id: &NodeId) {
         let mut topology = self.topology.write().unwrap();
 
@@ -1290,7 +1402,10 @@ impl Clone for MasterNode {
             client_manager: RwLock::new(ClientManager::new()),
             notify_tx: self.notify_tx.clone(),
             kv_cache: self.kv_cache.clone(),
+            kv_persist: self.kv_persist.clone(),
             directory_tree: self.directory_tree.clone(),
+            volume_client_pool: self.volume_client_pool.clone(),
+            event_publisher: self.event_publisher.clone(),
         }
     }
 }

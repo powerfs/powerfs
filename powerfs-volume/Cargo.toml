@@ -25,3 +25,4 @@ bytes = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
+redis = { version = "0.22", features = ["tokio-comp"] }

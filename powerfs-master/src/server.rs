@@ -28,6 +28,8 @@ impl MasterGrpcServer {
     pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         let kv_svc = KvCacheServiceImpl {
             engine: self.kv_cache.clone(),
+            volume_client_pool: self.master.volume_client_pool.clone(),
+            master: self.master.clone(),
         };
 
         Server::builder()

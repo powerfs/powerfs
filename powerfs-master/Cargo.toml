@@ -35,3 +35,4 @@ prometheus = "0.13"
 hyper = { version = "1", features = ["full"] }
 lazy_static = "1.4"
 axum = "0.6"
+redis = { version = "0.22", features = ["tokio-comp"] }
