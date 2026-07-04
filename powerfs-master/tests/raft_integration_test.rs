@@ -69,7 +69,7 @@ async fn test_two_node_election() {
     let db_path2 = temp_dir2.path().join("raft_2");
     std::fs::create_dir_all(&db_path2).expect("Failed to create db dir");
 
-    let mut node1 = RaftNode::new(
+    let node1 = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
         vec![Peer {
@@ -80,7 +80,7 @@ async fn test_two_node_election() {
     )
     .expect("Failed to create Raft node 1");
 
-    let mut node2 = RaftNode::new(
+    let node2 = RaftNode::new(
         2,
         "127.0.0.1:10002".to_string(),
         vec![Peer {

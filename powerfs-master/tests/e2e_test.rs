@@ -1,6 +1,4 @@
-use std::time::Duration;
 use tempfile::TempDir;
-use tokio::time::sleep;
 
 #[tokio::test]
 async fn test_raft_grpc_basic() {

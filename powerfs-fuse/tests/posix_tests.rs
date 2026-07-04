@@ -7,7 +7,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::Duration;
+
+mod test_harness;
 
 const FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
 
@@ -17,8 +18,13 @@ macro_rules! test_path {
     };
 }
 
+fn setup() {
+    test_harness::ensure_fuse_mounted();
+}
+
 #[test]
 fn test_open_single() {
+    setup();
     let path = test_path!("test_open_single.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -33,6 +39,7 @@ fn test_open_single() {
 
 #[test]
 fn test_open_multiple_readers() {
+    setup();
     let path = test_path!("test_open_multi.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -56,6 +63,7 @@ fn test_open_multiple_readers() {
 
 #[test]
 fn test_open_multiple_writers_append() {
+    setup();
     let path = test_path!("test_open_multi_write.txt");
 
     let mut f1 = OpenOptions::new()
@@ -92,6 +100,7 @@ fn test_open_multiple_writers_append() {
 
 #[test]
 fn test_open_exclusive_create() {
+    setup();
     let path = test_path!("test_excl.txt");
 
     let _f1 = OpenOptions::new()
@@ -107,6 +116,7 @@ fn test_open_exclusive_create() {
 
 #[test]
 fn test_write_at_offset() {
+    setup();
     let path = test_path!("test_offset_write.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -126,6 +136,7 @@ fn test_write_at_offset() {
 
 #[test]
 fn test_write_concurrent_offset() {
+    setup();
     let path = test_path!("test_concurrent_offset.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -174,6 +185,7 @@ fn test_write_concurrent_offset() {
 
 #[test]
 fn test_read_write_roundtrip() {
+    setup();
     let path = test_path!("test_roundtrip.txt");
 
     let data = b"The quick brown fox jumps over the lazy dog";
@@ -189,6 +201,7 @@ fn test_read_write_roundtrip() {
 
 #[test]
 fn test_read_partial() {
+    setup();
     let path = test_path!("test_partial_read.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -207,6 +220,7 @@ fn test_read_partial() {
 
 #[test]
 fn test_seek_read() {
+    setup();
     let path = test_path!("test_seek.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -230,6 +244,7 @@ fn test_seek_read() {
 
 #[test]
 fn test_mkdir_rmdir() {
+    setup();
     let dir = test_path!("test_dir");
 
     fs::create_dir(&dir).unwrap();
@@ -242,6 +257,7 @@ fn test_mkdir_rmdir() {
 
 #[test]
 fn test_mkdir_nested() {
+    setup();
     let dir = test_path!("test_nested/a/b/c");
 
     fs::create_dir_all(&dir).unwrap();
@@ -258,6 +274,7 @@ fn test_mkdir_nested() {
 
 #[test]
 fn test_readdir() {
+    setup();
     let dir = test_path!("test_readdir");
 
     fs::create_dir(&dir).unwrap();
@@ -279,6 +296,7 @@ fn test_readdir() {
 
 #[test]
 fn test_rename() {
+    setup();
     let old_path = test_path!("test_rename_old.txt");
     let new_path = test_path!("test_rename_new.txt");
 
@@ -299,6 +317,7 @@ fn test_rename() {
 
 #[test]
 fn test_rename_dir() {
+    setup();
     let old_dir = test_path!("test_rename_dir_old");
     let new_dir = test_path!("test_rename_dir_new");
 
@@ -316,6 +335,7 @@ fn test_rename_dir() {
 
 #[test]
 fn test_symlink() {
+    setup();
     let target = test_path!("test_symlink_target.txt");
     let link = test_path!("test_symlink_link");
 
@@ -336,13 +356,14 @@ fn test_symlink() {
 
 #[test]
 fn test_truncate() {
+    setup();
     let path = test_path!("test_truncate.txt");
 
     let mut f = File::create(&path).unwrap();
     f.write_all(b"1234567890").unwrap();
     drop(f);
 
-    let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+    let f = OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(5).unwrap();
     drop(f);
 
@@ -351,7 +372,7 @@ fn test_truncate() {
     f.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, "12345");
 
-    let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+    let f = OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(0).unwrap();
     drop(f);
 
@@ -361,6 +382,7 @@ fn test_truncate() {
 
 #[test]
 fn test_file_metadata() {
+    setup();
     let path = test_path!("test_metadata.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -375,6 +397,7 @@ fn test_file_metadata() {
 
 #[test]
 fn test_chmod() {
+    setup();
     let path = test_path!("test_chmod.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -393,6 +416,7 @@ fn test_chmod() {
 
 #[test]
 fn test_remove_file() {
+    setup();
     let path = test_path!("test_remove.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -406,6 +430,7 @@ fn test_remove_file() {
 
 #[test]
 fn test_concurrent_create() {
+    setup();
     let results = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
 
@@ -438,6 +463,7 @@ fn test_concurrent_create() {
 
 #[test]
 fn test_concurrent_read() {
+    setup();
     let path = test_path!("test_concurrent_read.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -472,6 +498,7 @@ fn test_concurrent_read() {
 
 #[test]
 fn test_pread_pwrite() {
+    setup();
     let path = test_path!("test_pread_pwrite.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -499,6 +526,7 @@ fn test_pread_pwrite() {
 
 #[test]
 fn test_dup() {
+    setup();
     let path = test_path!("test_dup.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -521,6 +549,7 @@ fn test_dup() {
 
 #[test]
 fn test_fsync() {
+    setup();
     let path = test_path!("test_fsync.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -536,6 +565,7 @@ fn test_fsync() {
 
 #[test]
 fn test_ftruncate() {
+    setup();
     let path = test_path!("test_ftruncate.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -553,6 +583,7 @@ fn test_ftruncate() {
 
 #[test]
 fn test_file_rename_overwrite() {
+    setup();
     let src = test_path!("test_rename_src.txt");
     let dst = test_path!("test_rename_dst.txt");
 
@@ -577,6 +608,7 @@ fn test_file_rename_overwrite() {
 
 #[test]
 fn test_empty_file() {
+    setup();
     let path = test_path!("test_empty.txt");
 
     File::create(&path).unwrap();
@@ -592,6 +624,7 @@ fn test_empty_file() {
 
 #[test]
 fn test_large_write() {
+    setup();
     let path = test_path!("test_large.txt");
 
     let data = vec![0xAAu8; 1024 * 1024];
@@ -610,6 +643,7 @@ fn test_large_write() {
 
 #[test]
 fn test_multiple_writes() {
+    setup();
     let path = test_path!("test_multi_write.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -627,6 +661,7 @@ fn test_multiple_writes() {
 
 #[test]
 fn test_append_mode() {
+    setup();
     let path = test_path!("test_append.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -645,6 +680,7 @@ fn test_append_mode() {
 
 #[test]
 fn test_truncate_on_open() {
+    setup();
     let path = test_path!("test_truncate_open.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -667,6 +703,7 @@ fn test_truncate_on_open() {
 
 #[test]
 fn test_directory_permissions() {
+    setup();
     let dir = test_path!("test_dir_perm");
 
     fs::create_dir(&dir).unwrap();
@@ -682,6 +719,7 @@ fn test_directory_permissions() {
 
 #[test]
 fn test_readdir_empty() {
+    setup();
     let dir = test_path!("test_empty_dir");
 
     fs::create_dir(&dir).unwrap();
@@ -692,6 +730,7 @@ fn test_readdir_empty() {
 
 #[test]
 fn test_path_traversal() {
+    setup();
     let dir = test_path!("test_path_traversal");
     let subdir = dir.join("sub");
 
@@ -709,6 +748,7 @@ fn test_path_traversal() {
 
 #[test]
 fn test_fdatasync() {
+    setup();
     let path = test_path!("test_fdatasync.txt");
 
     let mut f = File::create(&path).unwrap();
@@ -724,6 +764,7 @@ fn test_fdatasync() {
 
 #[test]
 fn test_file_sync_rename() {
+    setup();
     let tmp_path = test_path!("test_sync_rename.tmp");
     let final_path = test_path!("test_sync_rename.txt");
 

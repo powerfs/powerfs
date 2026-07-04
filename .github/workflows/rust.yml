@@ -29,8 +29,10 @@ jobs:
         sudo apt-get install -y \
             protobuf-compiler \
             libfuse-dev \
+            fuse3 \
             pkg-config \
             libssl-dev
+        sudo chmod 666 /dev/fuse
     
     - name: Cache cargo registry
       uses: actions/cache@v4

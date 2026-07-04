@@ -1,5 +1,6 @@
 target/
 **/*.rs.bk
+*.state
 Cargo.lock
 beegfs/
 seaweedfs/
@@ -11,6 +12,8 @@ docs/
 .cargo
 vendor/
 qemu/
+
+note.md
 
 # Kernel module build artifacts
 kernel/**/*.o
