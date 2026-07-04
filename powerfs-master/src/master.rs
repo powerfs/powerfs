@@ -12,7 +12,7 @@ use powerfs_common::{
         VolumeInfo, VolumeState,
     },
 };
-use powerfs_core::kv_cache::{KVCacheEngine, KVDtype};
+use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -189,8 +189,9 @@ impl MasterNode {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("kv_persist");
         let kv_persist = Arc::new(
-            KVPersistStore::new(kv_persist_path.to_str().unwrap_or("kv_persist"))
-                .map_err(|e| PowerFsError::Internal(format!("Failed to create KV persist store: {}", e)))?,
+            KVPersistStore::new(kv_persist_path.to_str().unwrap_or("kv_persist")).map_err(|e| {
+                PowerFsError::Internal(format!("Failed to create KV persist store: {}", e))
+            })?,
         );
 
         Self::restore_kv_sessions(&kv_cache, &kv_persist);

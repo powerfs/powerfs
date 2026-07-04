@@ -15,8 +15,16 @@ fn make_data(size: usize) -> Vec<u8> {
     v
 }
 
-fn put_block_helper(engine: &KVCacheEngine, session_id: &str, layer_id: u32, num_tokens: u32, data: &[u8]) -> u64 {
-    engine.put_block(session_id, layer_id, num_tokens, data, "", layer_id).unwrap()
+fn put_block_helper(
+    engine: &KVCacheEngine,
+    session_id: &str,
+    layer_id: u32,
+    num_tokens: u32,
+    data: &[u8],
+) -> u64 {
+    engine
+        .put_block(session_id, layer_id, num_tokens, data, "", layer_id)
+        .unwrap()
 }
 
 #[test]
@@ -81,8 +89,22 @@ fn test_batch_put_get() {
     let data1 = make_data(512);
     let data2 = make_data(1024);
     let requests = vec![
-        ("s1".to_string(), 0u32, 64u32, data1.clone(), "".to_string(), 0u32),
-        ("s1".to_string(), 1u32, 128u32, data2.clone(), "".to_string(), 1u32),
+        (
+            "s1".to_string(),
+            0u32,
+            64u32,
+            data1.clone(),
+            "".to_string(),
+            0u32,
+        ),
+        (
+            "s1".to_string(),
+            1u32,
+            128u32,
+            data2.clone(),
+            "".to_string(),
+            1u32,
+        ),
     ];
 
     let results = engine.batch_put(&requests);
@@ -210,7 +232,9 @@ fn test_concurrent_access() {
         handles.push(thread::spawn(move || {
             let mut ids = Vec::new();
             for j in 0..20 {
-                let id = eng.put_block("s1", (i * 20 + j) as u32, 10, &d, "", (i * 20 + j) as u32).unwrap();
+                let id = eng
+                    .put_block("s1", (i * 20 + j) as u32, 10, &d, "", (i * 20 + j) as u32)
+                    .unwrap();
                 ids.push(id);
             }
             for id in &ids {
@@ -284,10 +308,19 @@ fn test_block_meta_index_field() {
 
     let data = make_data(1024);
     for i in 0..5 {
-        let block_id = engine.put_block("s1", i, 128, &data, &format!("vol1,{}:{}", i, i*100), i*10).unwrap();
+        let block_id = engine
+            .put_block(
+                "s1",
+                i,
+                128,
+                &data,
+                &format!("vol1,{}:{}", i, i * 100),
+                i * 10,
+            )
+            .unwrap();
         let (meta, _) = engine.get_block_data(block_id).unwrap();
-        assert_eq!(meta.block_index, i*10);
-        assert_eq!(meta.fid, format!("vol1,{}:{}", i, i*100));
+        assert_eq!(meta.block_index, i * 10);
+        assert_eq!(meta.fid, format!("vol1,{}:{}", i, i * 100));
     }
 }
 

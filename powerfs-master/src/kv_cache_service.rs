@@ -4,7 +4,7 @@ use crate::proto::powerfs::*;
 use crate::proto::Location;
 use crate::volume_client::VolumeClientPool;
 use powerfs_common::types::{DataNodeInfo, Fid, VolumeId};
-use powerfs_core::kv_cache::{KVCacheEngine, KVDtype, KVBlockMeta};
+use powerfs_core::kv_cache::{KVBlockMeta, KVCacheEngine, KVDtype};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -26,7 +26,9 @@ impl KvCacheServiceImpl {
 
     fn get_volume_address(&self, volume_id: VolumeId) -> Option<String> {
         let nodes = self.get_volume_nodes(volume_id);
-        nodes.first().map(|n| format!("{}:{}", n.address, n.grpc_port))
+        nodes
+            .first()
+            .map(|n| format!("{}:{}", n.address, n.grpc_port))
     }
 
     fn get_fid_locations(&self, fid_str: &str) -> Vec<Location> {
@@ -203,12 +205,11 @@ impl KvCacheService for KvCacheServiceImpl {
                     }
                 };
 
-                match self.volume_client_pool.write_needle(
-                    &volume_address,
-                    fid.volume_id.0,
-                    fid.file_key,
-                    &req.data,
-                ).await {
+                match self
+                    .volume_client_pool
+                    .write_needle(&volume_address, fid.volume_id.0, fid.file_key, &req.data)
+                    .await
+                {
                     Ok(_) => {
                         let _ = self.master.kv_persist.save_block_fid(block_id, &fid_str);
 
@@ -228,11 +229,12 @@ impl KvCacheService for KvCacheServiceImpl {
                                 rdev: 0,
                                 size: req.data.len() as u64,
                                 blksize: 4096,
-                                blocks: ((req.data.len() + 4095) / 4096) as u64,
+                                blocks: req.data.len().div_ceil(4096) as u64,
                                 atime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
                                 mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
                                 ctime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                                crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                                crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                                    as u64,
                                 perm: 0o644,
                             }),
                             chunks: vec![crate::proto::FileChunk {
@@ -325,11 +327,11 @@ impl KvCacheService for KvCacheServiceImpl {
                         }
                     };
 
-                    match self.volume_client_pool.read_needle(
-                        &volume_address,
-                        f.volume_id.0,
-                        f.file_key,
-                    ).await {
+                    match self
+                        .volume_client_pool
+                        .read_needle(&volume_address, f.volume_id.0, f.file_key)
+                        .await
+                    {
                         Ok(data) => {
                             let session = self.engine.get_session_by_block_id(req.block_id);
                             if let Some(sess) = session {
@@ -337,7 +339,10 @@ impl KvCacheService for KvCacheServiceImpl {
                                     block_id: req.block_id,
                                     session_id: sess.session_id,
                                     layer_id: 0,
-                                    num_tokens: (data.len() / (sess.head_dim as usize * sess.num_heads as usize * 2)).try_into().unwrap_or(0),
+                                    num_tokens: (data.len()
+                                        / (sess.head_dim as usize * sess.num_heads as usize * 2))
+                                        .try_into()
+                                        .unwrap_or(0),
                                     dtype: sess.dtype,
                                     head_dim: sess.head_dim,
                                     num_heads: sess.num_heads,
@@ -415,11 +420,20 @@ impl KvCacheService for KvCacheServiceImpl {
         request: Request<BatchPutRequest>,
     ) -> Result<Response<BatchPutResponse>, Status> {
         let req = request.into_inner();
-        let requests: Vec<(String, u32, u32, Vec<u8>, String, u32)> = req
+        let requests: Vec<powerfs_core::kv_cache::BatchPutRequest> = req
             .blocks
             .into_iter()
             .enumerate()
-            .map(|(i, b)| (b.session_id, b.layer_id, b.num_tokens, b.data, "".to_string(), i as u32))
+            .map(|(i, b)| {
+                (
+                    b.session_id,
+                    b.layer_id,
+                    b.num_tokens,
+                    b.data,
+                    "".to_string(),
+                    i as u32,
+                )
+            })
             .collect();
 
         let results = self.engine.batch_put(&requests);
@@ -427,7 +441,10 @@ impl KvCacheService for KvCacheServiceImpl {
             .into_iter()
             .map(|r| match r {
                 Ok(block_id) => {
-                    let fid = self.engine.get_fid_by_block_id(block_id).unwrap_or_default();
+                    let fid = self
+                        .engine
+                        .get_fid_by_block_id(block_id)
+                        .unwrap_or_default();
                     PutBlockResponse {
                         success: true,
                         block_id,

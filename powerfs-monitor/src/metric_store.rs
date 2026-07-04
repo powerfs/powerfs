@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -59,102 +59,83 @@ pub struct MetricStore {
 
 impl MetricStore {
     pub fn new() -> Self {
-        Self {
-            nodes: RwLock::new(HashMap::new()),
-            volumes: RwLock::new(HashMap::new()),
-            kv_sessions: RwLock::new(HashMap::new()),
-            cluster_metrics: RwLock::new(ClusterMetrics {
-                node_count: 0,
-                volume_count: 0,
-                collection_count: 0,
-                is_leader: false,
-                raft_term: 0,
-                uptime: 0,
-                total_storage: 0,
-                used_storage: 0,
-                file_count: 0,
-            }),
-            kv_metrics: RwLock::new(KVMetrics {
-                session_count: 0,
-                block_count: 0,
-                memory_used: 0,
-                hit_ratio: 0.0,
-                eviction_count: 0,
-                put_count: 0,
-                get_count: 0,
-                avg_latency: 0.0,
-            }),
-            collection_names: RwLock::new(HashSet::new()),
-            start_time: Instant::now(),
-        }
+        Self::default()
     }
 
     pub async fn update_node(&self, event: NodeStatusEvent) {
-        let mut nodes = self.nodes.write().await;
-        nodes.insert(
-            event.node_id.clone(),
-            NodeInfo {
-                id: event.node_id,
-                address: event.address,
-                grpc_port: event.grpc_port,
-                http_port: event.http_port,
-                status: event.status,
-                cpu_usage: event.cpu_usage,
-                mem_usage: event.mem_usage,
-                disk_usage: event.disk_usage,
-                network_rx: event.network_rx,
-                network_tx: event.network_tx,
-                uptime: event.uptime,
-                volume_count: event.volume_count,
-            },
-        );
+        {
+            let mut nodes = self.nodes.write().await;
+            nodes.insert(
+                event.node_id.clone(),
+                NodeInfo {
+                    id: event.node_id,
+                    address: event.address,
+                    grpc_port: event.grpc_port,
+                    http_port: event.http_port,
+                    status: event.status,
+                    cpu_usage: event.cpu_usage,
+                    mem_usage: event.mem_usage,
+                    disk_usage: event.disk_usage,
+                    network_rx: event.network_rx,
+                    network_tx: event.network_tx,
+                    uptime: event.uptime,
+                    volume_count: event.volume_count,
+                },
+            );
+        }
         self.update_cluster_metrics().await;
     }
 
     pub async fn update_volume(&self, event: VolumeStatusEvent) {
-        let mut volumes = self.volumes.write().await;
-        volumes.insert(
-            event.volume_id,
-            VolumeInfo {
-                id: event.volume_id,
-                node_id: event.node_id,
-                size: event.size,
-                used: event.used,
-                file_count: event.file_count,
-                status: event.status,
-                collection: event.collection.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
+        {
+            let mut volumes = self.volumes.write().await;
+            volumes.insert(
+                event.volume_id,
+                VolumeInfo {
+                    id: event.volume_id,
+                    node_id: event.node_id,
+                    size: event.size,
+                    used: event.used,
+                    file_count: event.file_count,
+                    status: event.status,
+                    collection: event.collection.clone(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+        }
 
-        let mut collections = self.collection_names.write().await;
-        collections.insert(event.collection);
+        {
+            let mut collections = self.collection_names.write().await;
+            collections.insert(event.collection);
+        }
 
         self.update_cluster_metrics().await;
     }
 
     pub async fn update_kv_session(&self, event: crate::event::KVSessionEvent) {
-        let mut sessions = self.kv_sessions.write().await;
-        match event.event_type.as_str() {
-            "create" | "update" => {
-                sessions.insert(
-                    event.session_id.clone(),
-                    KVSessionInfo {
-                        id: event.session_id,
-                        model_name: event.model_name,
-                        layer_count: event.layer_count,
-                        block_count: event.block_count,
-                        memory_used: event.memory_used,
-                        hit_ratio: event.hit_ratio,
-                        eviction_count: event.eviction_count,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    },
-                );
+        {
+            let mut sessions = self.kv_sessions.write().await;
+            match event.event_type.as_str() {
+                "create" | "update" => {
+                    sessions.insert(
+                        event.session_id.clone(),
+                        KVSessionInfo {
+                            id: event.session_id,
+                            model_name: event.model_name,
+                            layer_count: event.layer_count,
+                            block_count: event.block_count,
+                            memory_used: event.memory_used,
+                            hit_ratio: event.hit_ratio,
+                            eviction_count: event.eviction_count,
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    );
+                }
+                "delete" => {
+                    sessions.remove(&event.session_id);
+                }
+                _ => {}
             }
-            "delete" => {
-                sessions.remove(&event.session_id);
-            }
-            _ => {}
         }
         self.update_kv_metrics().await;
     }
@@ -203,7 +184,11 @@ impl MetricStore {
             eviction_count += session.eviction_count;
         }
 
-        let avg_hit_ratio = if sessions.is_empty() { 0.0 } else { total_hit_ratio / sessions.len() as f64 };
+        let avg_hit_ratio = if sessions.is_empty() {
+            0.0
+        } else {
+            total_hit_ratio / sessions.len() as f64
+        };
 
         let mut metrics = self.kv_metrics.write().await;
         *metrics = KVMetrics {
@@ -264,6 +249,39 @@ impl MetricStore {
     pub async fn increment_kv_get(&self) {
         let mut metrics = self.kv_metrics.write().await;
         metrics.get_count += 1;
+    }
+}
+
+impl Default for MetricStore {
+    fn default() -> Self {
+        Self {
+            nodes: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
+            kv_sessions: RwLock::new(HashMap::new()),
+            cluster_metrics: RwLock::new(ClusterMetrics {
+                node_count: 0,
+                volume_count: 0,
+                collection_count: 0,
+                is_leader: false,
+                raft_term: 0,
+                uptime: 0,
+                total_storage: 0,
+                used_storage: 0,
+                file_count: 0,
+            }),
+            kv_metrics: RwLock::new(KVMetrics {
+                session_count: 0,
+                block_count: 0,
+                memory_used: 0,
+                hit_ratio: 0.0,
+                eviction_count: 0,
+                put_count: 0,
+                get_count: 0,
+                avg_latency: 0.0,
+            }),
+            collection_names: RwLock::new(HashSet::new()),
+            start_time: Instant::now(),
+        }
     }
 }
 

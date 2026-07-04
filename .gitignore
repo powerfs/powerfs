@@ -6,11 +6,15 @@ beegfs/
 seaweedfs/
 log
 *.log
-*.sh
+p*.sh
+u*.sh
+setp.sh
 !kernel/**/test_*.sh
 docs/
 .cargo
 vendor/
+logs/
+data/
 qemu/
 kvdesign.md
 kvplan.md

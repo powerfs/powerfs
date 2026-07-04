@@ -6,5 +6,8 @@ pub mod storage;
 pub mod types;
 pub mod utils;
 
+pub use event::{
+    AlertTriggerEvent, Event, EventEnvelope, EventPublisher, KVBlockEvent, KVSessionEvent,
+    MetricUpdateEvent, NodeStatusEvent, VolumeStatusEvent,
+};
 pub use storage::StorageBackend;
-pub use event::{Event, EventEnvelope, EventPublisher, NodeStatusEvent, VolumeStatusEvent, KVSessionEvent, KVBlockEvent, MetricUpdateEvent, AlertTriggerEvent};

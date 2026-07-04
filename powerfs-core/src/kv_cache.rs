@@ -57,6 +57,8 @@ pub struct KVBlock {
     pub data: Vec<u8>,
 }
 
+pub type BatchPutRequest = (String, u32, u32, Vec<u8>, String, u32);
+
 impl std::fmt::Debug for KVBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KVBlock")
@@ -544,10 +546,17 @@ impl KVCacheEngine {
         count
     }
 
-    pub fn batch_put(&self, requests: &[(String, u32, u32, Vec<u8>, String, u32)]) -> Vec<Result<u64, String>> {
+    pub fn batch_put(&self, requests: &[BatchPutRequest]) -> Vec<Result<u64, String>> {
         let mut results = Vec::with_capacity(requests.len());
         for (session_id, layer_id, num_tokens, data, fid, block_index) in requests {
-            results.push(self.put_block(session_id, *layer_id, *num_tokens, data, fid, *block_index));
+            results.push(self.put_block(
+                session_id,
+                *layer_id,
+                *num_tokens,
+                data,
+                fid,
+                *block_index,
+            ));
         }
         results
     }

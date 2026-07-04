@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 const SESSION_PREFIX: &[u8] = b"s:";
-const BLOCK_FID_PREFIX: &[u8] = b"bf:";
 
 pub struct KVPersistStore {
     db: Arc<rocksdb::DB>,
@@ -215,9 +214,9 @@ impl PersistentKVCache {
         fid: &str,
         block_index: u32,
     ) -> Result<u64, String> {
-        let block_id = self
-            .engine
-            .put_block(session_id, layer_id, num_tokens, data, fid, block_index)?;
+        let block_id =
+            self.engine
+                .put_block(session_id, layer_id, num_tokens, data, fid, block_index)?;
         self.store.save_block(session_id, block_id, data)?;
         self.store.save_block_fid(block_id, fid)?;
         Ok(block_id)

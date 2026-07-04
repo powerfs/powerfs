@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::RwLock;
 
-use crate::event::{AlertCondition, AlertInfo, AlertRule, NotificationConfig};
+use crate::event::{AlertCondition, AlertInfo, AlertRule};
 use crate::metric_store::MetricStoreRef;
 
 pub struct AlertEngine {
@@ -104,22 +104,30 @@ impl AlertEngine {
         match metric_name {
             "powerfs_node_cpu_usage" => {
                 let nodes = self.metric_store.get_nodes().await;
-                if nodes.is_empty() { 0.0 } else { nodes.iter().map(|n| n.cpu_usage).sum::<f64>() / nodes.len() as f64 }
+                if nodes.is_empty() {
+                    0.0
+                } else {
+                    nodes.iter().map(|n| n.cpu_usage).sum::<f64>() / nodes.len() as f64
+                }
             }
             "powerfs_node_mem_usage" => {
                 let nodes = self.metric_store.get_nodes().await;
-                if nodes.is_empty() { 0.0 } else { nodes.iter().map(|n| n.mem_usage).sum::<f64>() / nodes.len() as f64 }
+                if nodes.is_empty() {
+                    0.0
+                } else {
+                    nodes.iter().map(|n| n.mem_usage).sum::<f64>() / nodes.len() as f64
+                }
             }
             "powerfs_node_disk_usage" => {
                 let nodes = self.metric_store.get_nodes().await;
-                if nodes.is_empty() { 0.0 } else { nodes.iter().map(|n| n.disk_usage).sum::<f64>() / nodes.len() as f64 }
+                if nodes.is_empty() {
+                    0.0
+                } else {
+                    nodes.iter().map(|n| n.disk_usage).sum::<f64>() / nodes.len() as f64
+                }
             }
-            "powerfs_kv_hit_ratio" => {
-                self.metric_store.get_kv_metrics().await.hit_ratio
-            }
-            "powerfs_cluster_uptime" => {
-                self.metric_store.get_cluster_metrics().await.uptime as f64
-            }
+            "powerfs_kv_hit_ratio" => self.metric_store.get_kv_metrics().await.hit_ratio,
+            "powerfs_cluster_uptime" => self.metric_store.get_cluster_metrics().await.uptime as f64,
             _ => 0.0,
         }
     }
@@ -138,6 +146,7 @@ impl AlertEngine {
         let alert_id = uuid::Uuid::new_v4().to_string();
         let alert = AlertInfo {
             id: alert_id.clone(),
+            rule_id: rule.id.clone(),
             name: rule.name.clone(),
             severity: rule.severity.clone(),
             status: "firing".to_string(),
@@ -159,7 +168,7 @@ impl AlertEngine {
     async fn resolve_alert_if_exists(&self, rule_id: &str) {
         let mut alerts = self.alerts.write().await;
         for alert in alerts.values_mut() {
-            if alert.status == "firing" {
+            if alert.status == "firing" && alert.rule_id == rule_id {
                 alert.status = "resolved".to_string();
                 alert.resolved_at = Some(chrono::Utc::now());
             }

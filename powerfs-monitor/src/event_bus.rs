@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use redis::{AsyncCommands, Client, RedisResult};
+use redis::streams::{StreamReadOptions, StreamReadReply};
+use redis::{AsyncCommands, Client, RedisResult, Value};
 
 use crate::event::EventEnvelope;
 
@@ -18,17 +19,11 @@ impl EventBus {
         }
     }
 
-    pub async fn publish(&self, event: EventEnvelope) -> RedisResult<()> {
-        let mut conn = self.client.get_async_connection().await?;
-        let payload = serde_json::to_string(&event).unwrap();
-        let _: () = conn.lpush(&self.stream_key, &payload).await?;
-        Ok(())
-    }
-
     pub async fn subscribe(&self) -> EventStream {
         EventStream {
             client: self.client.clone(),
             stream_key: self.stream_key.clone(),
+            last_id: "0".to_string(),
         }
     }
 }
@@ -36,26 +31,60 @@ impl EventBus {
 pub struct EventStream {
     client: Arc<Client>,
     stream_key: String,
+    last_id: String,
 }
 
 impl EventStream {
-    pub async fn read(&self) -> RedisResult<Vec<EventEnvelope>> {
+    pub async fn read(&mut self) -> RedisResult<Vec<EventEnvelope>> {
         let mut conn = self.client.get_async_connection().await?;
-        let payload: Option<String> = conn.brpoplpush(&self.stream_key, &self.stream_key, 1).await?;
-        
-        match payload {
-            Some(p) => {
-                if let Ok(event) = serde_json::from_str(&p) {
-                    Ok(vec![event])
-                } else {
-                    Ok(vec![])
+
+        let opts = StreamReadOptions::default().count(10);
+
+        let reply: StreamReadReply = conn
+            .xread_options(&[&self.stream_key], &[&self.last_id], &opts)
+            .await?;
+
+        let mut events = Vec::new();
+
+        for stream in reply.keys {
+            for entry in stream.ids {
+                self.last_id = entry.id.clone();
+
+                let mut event_id = String::new();
+                let mut source = String::new();
+                let mut source_id = String::new();
+                let mut payload_str = String::new();
+
+                for (key, value) in entry.map {
+                    let value_str = match value {
+                        Value::Data(data) => String::from_utf8_lossy(&data).to_string(),
+                        Value::Status(s) => s,
+                        _ => continue,
+                    };
+                    match key.as_str() {
+                        "event_id" => event_id = value_str,
+                        "source" => source = value_str,
+                        "source_id" => source_id = value_str,
+                        "payload" => payload_str = value_str,
+                        _ => {}
+                    }
+                }
+
+                if !payload_str.is_empty() {
+                    if let Ok(event) = serde_json::from_str(&payload_str) {
+                        events.push(EventEnvelope {
+                            event_id,
+                            source,
+                            source_id,
+                            timestamp: chrono::Utc::now(),
+                            version: "1.0".to_string(),
+                            event,
+                        });
+                    }
                 }
             }
-            None => Ok(vec![]),
         }
-    }
 
-    pub async fn ack(&self, _event_id: &str) -> RedisResult<()> {
-        Ok(())
+        Ok(events)
     }
 }

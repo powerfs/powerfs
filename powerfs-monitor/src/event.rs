@@ -30,6 +30,7 @@ pub struct KVMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertInfo {
     pub id: String,
+    pub rule_id: String,
     pub name: String,
     pub severity: String,
     pub status: String,

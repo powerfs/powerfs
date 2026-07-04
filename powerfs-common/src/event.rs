@@ -137,7 +137,10 @@ impl EventPublisher {
             ("source_id".to_string(), envelope.source_id.clone()),
             ("timestamp".to_string(), envelope.timestamp.to_rfc3339()),
             ("version".to_string(), envelope.version.clone()),
-            ("payload".to_string(), serde_json::to_string(&envelope.event).unwrap()),
+            (
+                "payload".to_string(),
+                serde_json::to_string(&envelope.event).unwrap(),
+            ),
         ];
         let _: () = conn.xadd(&self.stream_key, "*", &payload).await?;
         Ok(())
