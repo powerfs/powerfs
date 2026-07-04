@@ -3,7 +3,7 @@ export interface NodeInfo {
   address: string
   grpc_port: number
   http_port: number
-  status: 'online' | 'offline' | 'warning'
+  status: 'online' | 'offline' | 'warning' | 'healthy'
   cpu_usage: number
   mem_usage: number
   disk_usage: number
@@ -62,7 +62,6 @@ export interface AlertRule {
   enabled: boolean
   severity: 'critical' | 'warning' | 'info'
   condition: {
-    type: string
     metric: string
     operator: string
     value: number

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Card, Table, Tag, Button, Modal, Space, Progress, message } from 'antd'
 import {
   SaveOutlined,
@@ -70,12 +70,13 @@ function Nodes() {
       key: 'status',
       width: 100,
       render: (status: string) => {
-        const config = {
+        const config: Record<string, { color: string; icon: React.ReactNode; text: string }> = {
           online: { color: 'green', icon: <CheckCircleOutlined />, text: '在线' },
           offline: { color: 'red', icon: <CloseCircleOutlined />, text: '离线' },
           warning: { color: 'orange', icon: <LeftCircleOutlined />, text: '告警' },
+          healthy: { color: 'green', icon: <CheckCircleOutlined />, text: '健康' },
         }
-        const { color, icon, text } = config[status as keyof typeof config]
+        const { color, icon, text } = config[status] || { color: 'default', icon: null, text: status }
         return (
           <Tag color={color}>
             {icon} {text}

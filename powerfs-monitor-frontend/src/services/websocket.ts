@@ -17,7 +17,7 @@ export function connectWebSocket(onMetricUpdate?: (data: MetricUpdate) => void, 
   }
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${window.location.host}/ws`
+  const wsUrl = `${protocol}//${window.location.host}/ws/metrics`
   
   ws = new WebSocket(wsUrl)
 

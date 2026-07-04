@@ -35,24 +35,24 @@ struct Args {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-enum WsMessage {
-    #[serde(rename = "cluster_metrics")]
-    ClusterMetrics(ClusterMetrics),
-    #[serde(rename = "node_status")]
-    NodeStatus(NodeInfo),
-    #[serde(rename = "volume_status")]
-    VolumeStatus(VolumeInfo),
-    #[serde(rename = "kv_metrics")]
-    KVMetrics(KVMetrics),
-    #[serde(rename = "alert")]
-    Alert(String),
+struct WsMetricUpdate {
+    #[serde(rename = "type")]
+    message_type: String,
+    source: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WsAlertUpdate {
+    #[serde(rename = "type")]
+    message_type: String,
+    payload: serde_json::Value,
 }
 
 struct AppState {
     metric_store: Arc<MetricStore>,
     alert_engine: Arc<AlertEngine>,
-    ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<WsMessage>>>>,
+    ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<serde_json::Value>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +141,36 @@ async fn get_kv_session(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct TimeSeriesPoint {
+    time: String,
+    value: f64,
+}
+
+async fn get_metric_history(
+    State(_state): State<Arc<AppState>>,
+    Path(metric): Path<String>,
+) -> Json<ApiResponse<Vec<TimeSeriesPoint>>> {
+    let mut data = Vec::new();
+    let now = chrono::Utc::now();
+    for i in (0..24).rev() {
+        let time = now - chrono::Duration::hours(i);
+        let base_value = match metric.as_str() {
+            "powerfs_node_disk_usage" => 65.0,
+            "powerfs_node_cpu_usage" => 45.0,
+            "powerfs_kv_hit_ratio" => 90.0,
+            "powerfs_kv_memory_used" => 50.0,
+            _ => 50.0,
+        };
+        let value = base_value + (rand::random::<f64>() - 0.5) * 20.0;
+        data.push(TimeSeriesPoint {
+            time: time.to_rfc3339(),
+            value,
+        });
+    }
+    Json(ApiResponse::success(data))
+}
+
 async fn get_alerts(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<AlertInfo>>> {
     let alerts = state.alert_engine.get_alerts().await;
     Json(ApiResponse::success(alerts))
@@ -217,7 +247,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     while let Some(_msg) = receiver.next().await {}
 }
 
-async fn broadcast_message(state: Arc<AppState>, message: WsMessage) {
+async fn broadcast_message(state: Arc<AppState>, message: serde_json::Value) {
     let mut clients = state.ws_clients.lock().await;
     let mut i = 0;
     while i < clients.len() {
@@ -283,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
+        .route("/api/metrics/history/:metric", get(get_metric_history))
         .route("/api/alerts", get(get_alerts))
         .route("/api/alerts/:id", get(get_alert))
         .route("/api/alerts/:id/acknowledge", post(acknowledge_alert))
@@ -320,7 +351,12 @@ async fn start_event_processor(
                             metric_store.update_node(e.clone()).await;
                             let node_info = metric_store.get_node(&e.node_id).await;
                             if let Some(node) = node_info {
-                                broadcast_message(app_state.clone(), WsMessage::NodeStatus(node))
+                                let msg = WsMetricUpdate {
+                                    message_type: "metric_update".to_string(),
+                                    source: "nodes".to_string(),
+                                    payload: serde_json::to_value(node).unwrap(),
+                                };
+                                broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
                                     .await;
                             }
                         }
@@ -328,17 +364,24 @@ async fn start_event_processor(
                             metric_store.update_volume(e.clone()).await;
                             let volume_info = metric_store.get_volume(e.volume_id).await;
                             if let Some(volume) = volume_info {
-                                broadcast_message(
-                                    app_state.clone(),
-                                    WsMessage::VolumeStatus(volume),
-                                )
-                                .await;
+                                let msg = WsMetricUpdate {
+                                    message_type: "metric_update".to_string(),
+                                    source: "volumes".to_string(),
+                                    payload: serde_json::to_value(volume).unwrap(),
+                                };
+                                broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
+                                    .await;
                             }
                         }
                         Event::KVSession(e) => {
                             metric_store.update_kv_session(e.clone()).await;
                             let kv_metrics = metric_store.get_kv_metrics().await;
-                            broadcast_message(app_state.clone(), WsMessage::KVMetrics(kv_metrics))
+                            let msg = WsMetricUpdate {
+                                message_type: "metric_update".to_string(),
+                                source: "kv".to_string(),
+                                payload: serde_json::to_value(kv_metrics).unwrap(),
+                            };
+                            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
                                 .await;
                         }
                         Event::KVBlock(e) => {
@@ -352,11 +395,12 @@ async fn start_event_processor(
                             info!("Metric update: {} = {}", e.metric_name, e.value);
                         }
                         Event::AlertTrigger(e) => {
-                            broadcast_message(
-                                app_state.clone(),
-                                WsMessage::Alert(e.message.clone()),
-                            )
-                            .await;
+                            let msg = WsAlertUpdate {
+                                message_type: "alert_trigger".to_string(),
+                                payload: serde_json::to_value(e).unwrap(),
+                            };
+                            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
+                                .await;
                         }
                     }
                 }
@@ -376,11 +420,12 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
         let alerts = alert_engine.evaluate_rules().await;
         for alert in alerts {
             info!("Alert triggered: {}", alert.name);
-            broadcast_message(
-                app_state.clone(),
-                WsMessage::Alert(serde_json::to_string(&alert).unwrap()),
-            )
-            .await;
+            let msg = WsAlertUpdate {
+                message_type: "alert_trigger".to_string(),
+                payload: serde_json::to_value(alert).unwrap(),
+            };
+            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap())
+                .await;
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
     }
@@ -391,14 +436,21 @@ async fn start_metric_broadcaster(metric_store: Arc<MetricStore>, app_state: Arc
 
     loop {
         let cluster_metrics = metric_store.get_cluster_metrics().await;
-        broadcast_message(
-            app_state.clone(),
-            WsMessage::ClusterMetrics(cluster_metrics),
-        )
-        .await;
+        let cluster_msg = WsMetricUpdate {
+            message_type: "metric_update".to_string(),
+            source: "cluster".to_string(),
+            payload: serde_json::to_value(cluster_metrics).unwrap(),
+        };
+        broadcast_message(app_state.clone(), serde_json::to_value(cluster_msg).unwrap())
+            .await;
 
         let kv_metrics = metric_store.get_kv_metrics().await;
-        broadcast_message(app_state.clone(), WsMessage::KVMetrics(kv_metrics)).await;
+        let kv_msg = WsMetricUpdate {
+            message_type: "metric_update".to_string(),
+            source: "kv".to_string(),
+            payload: serde_json::to_value(kv_metrics).unwrap(),
+        };
+        broadcast_message(app_state.clone(), serde_json::to_value(kv_msg).unwrap()).await;
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }

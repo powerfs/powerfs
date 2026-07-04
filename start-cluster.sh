@@ -12,6 +12,44 @@ mkdir -p "$DATA_DIR/volume"
 mkdir -p "$DATA_DIR/monitor"
 mkdir -p "$DATA_DIR/fuse"
 
+cleanup_old_processes() {
+    echo "Cleaning up old processes..."
+    
+    if [ -f "$LOG_DIR/master.pid" ]; then
+        kill -9 "$(cat "$LOG_DIR/master.pid")" 2>/dev/null || true
+        rm -f "$LOG_DIR/master.pid"
+    fi
+    
+    if [ -f "$LOG_DIR/volume.pid" ]; then
+        kill -9 "$(cat "$LOG_DIR/volume.pid")" 2>/dev/null || true
+        rm -f "$LOG_DIR/volume.pid"
+    fi
+    
+    if [ -f "$LOG_DIR/monitor.pid" ]; then
+        kill -9 "$(cat "$LOG_DIR/monitor.pid")" 2>/dev/null || true
+        rm -f "$LOG_DIR/monitor.pid"
+    fi
+    
+    if [ -f "$LOG_DIR/frontend.pid" ]; then
+        kill -9 "$(cat "$LOG_DIR/frontend.pid")" 2>/dev/null || true
+        rm -f "$LOG_DIR/frontend.pid"
+    fi
+    
+    if [ -f "$LOG_DIR/fuse.pid" ]; then
+        kill -9 "$(cat "$LOG_DIR/fuse.pid")" 2>/dev/null || true
+        rm -f "$LOG_DIR/fuse.pid"
+    fi
+    
+    sleep 2
+    
+    lsof -ti:9333 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti:8080 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti:8081 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti:5173 2>/dev/null | xargs kill -9 2>/dev/null || true
+    
+    echo "[OK] Old processes cleaned up"
+}
+
 REDIS_URL="redis://localhost:6379"
 
 echo "========================================"
@@ -232,6 +270,10 @@ check_services() {
     fi
 }
 
+echo "0. Cleaning up old processes..."
+cleanup_old_processes
+
+echo ""
 echo "1. Checking Redis..."
 check_redis
 

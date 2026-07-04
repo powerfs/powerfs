@@ -58,17 +58,21 @@ function Dashboard() {
   }
 
   const loadData = async () => {
-    const [cluster, kv, alertList] = await Promise.all([
-      getClusterMetrics(),
-      getKVMetrics(),
-      getAlerts(),
-    ])
-    setClusterMetrics(cluster)
-    setKVMetrics(kv)
-    setAlerts(alertList)
+    try {
+      const [cluster, kv, alertList] = await Promise.all([
+        getClusterMetrics(),
+        getKVMetrics(),
+        getAlerts(),
+      ])
+      setClusterMetrics(cluster)
+      setKVMetrics(kv)
+      setAlerts(alertList)
+    } catch (error) {
+      console.error('Failed to load dashboard data:', error)
+    }
   }
 
-  const storagePercent = clusterMetrics
+  const storagePercent = clusterMetrics && clusterMetrics.total_storage > 0
     ? (clusterMetrics.used_storage / clusterMetrics.total_storage) * 100
     : 0
 
