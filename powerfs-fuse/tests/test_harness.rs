@@ -51,21 +51,14 @@ fn get_free_port() -> u16 {
 }
 
 fn is_port_open(addr: &str) -> bool {
-    match std::net::TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        Duration::from_millis(100),
-    ) {
+    match std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)) {
         Ok(_) => true,
         Err(_) => false,
     }
 }
 
 fn is_fuse_available() -> bool {
-    Path::new("/dev/fuse").exists()
-        && Command::new("fusermount")
-            .arg("--version")
-            .status()
-            .is_ok()
+    Path::new("/dev/fuse").exists() && Command::new("fusermount").arg("--version").status().is_ok()
 }
 
 fn wait_for_port(addr: &str, timeout_secs: u64) -> bool {
@@ -100,7 +93,7 @@ fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
 fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {
     let master_dir = format!("{}/master", TEST_DATA_DIR);
     let _ = fs::create_dir_all(&master_dir);
-    
+
     Command::new(format!("{}/powerfs", target_dir))
         .arg("master")
         .arg("--port")
@@ -156,7 +149,8 @@ pub fn ensure_fuse_mounted() {
         let _ = fs::remove_dir_all(FUSE_MOUNT);
         let _ = fs::create_dir_all(TEST_DATA_DIR);
 
-        let master_process = spawn_master(&target_dir, master_port).expect("Failed to start master");
+        let master_process =
+            spawn_master(&target_dir, master_port).expect("Failed to start master");
         eprintln!("Started master on {}", master_addr);
 
         eprintln!("Waiting for master to be ready...");
@@ -166,8 +160,8 @@ pub fn ensure_fuse_mounted() {
         );
         eprintln!("Master is ready");
 
-        let volume_process = spawn_volume(&target_dir, volume_port, &master_addr)
-            .expect("Failed to start volume");
+        let volume_process =
+            spawn_volume(&target_dir, volume_port, &master_addr).expect("Failed to start volume");
         eprintln!("Started volume on {}", volume_addr);
 
         thread::sleep(Duration::from_secs(3));
@@ -176,10 +170,7 @@ pub fn ensure_fuse_mounted() {
         eprintln!("Started fuse");
 
         eprintln!("Waiting for FUSE mount...");
-        assert!(
-            wait_for_mount(FUSE_MOUNT, 30),
-            "FUSE did not mount in time"
-        );
+        assert!(wait_for_mount(FUSE_MOUNT, 30), "FUSE did not mount in time");
 
         eprintln!("FUSE mounted at {}", FUSE_MOUNT);
 
@@ -190,4 +181,3 @@ pub fn ensure_fuse_mounted() {
         }
     });
 }
-
