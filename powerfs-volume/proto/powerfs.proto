@@ -13,6 +13,7 @@ service VolumeService {
 
     rpc WriteNeedleBlob(WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse);
     rpc ReadNeedleBlob(ReadNeedleBlobRequest) returns (ReadNeedleBlobResponse);
+    rpc BatchWriteNeedleBlob(BatchWriteNeedleBlobRequest) returns (BatchWriteNeedleBlobResponse);
     rpc ReadNeedleMeta(ReadNeedleMetaRequest) returns (ReadNeedleMetaResponse);
     rpc BatchDelete(BatchDeleteRequest) returns (BatchDeleteResponse);
     rpc VolumeStatus(VolumeStatusRequest) returns (VolumeStatusResponse);
@@ -115,6 +116,24 @@ message WriteNeedleBlobRequest {
 
 message WriteNeedleBlobResponse {
     bool success = 1;
+}
+
+message BatchWriteNeedleBlobRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    repeated NeedleBlobEntry entries = 3;
+}
+
+message NeedleBlobEntry {
+    int64 offset = 1;
+    int32 size = 2;
+    bytes needle_blob = 3;
+    uint32 cookie = 4;
+}
+
+message BatchWriteNeedleBlobResponse {
+    bool success = 1;
+    int32 success_count = 2;
 }
 
 message ReadNeedleBlobRequest {

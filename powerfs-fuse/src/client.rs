@@ -603,6 +603,90 @@ impl PowerFuseClient {
         Err("write_blob failed after max retries".to_string())
     }
 
+    pub async fn batch_write_blob(
+        &self,
+        volume_addr: &str,
+        volume_id: u32,
+        file_key: u64,
+        entries: Vec<(i64, i32, Vec<u8>, u32)>,
+    ) -> Result<(), String> {
+        debug!(
+            "batch_write_blob: addr={}, volume_id={}, file_key={}, entries={}",
+            volume_addr,
+            volume_id,
+            file_key,
+            entries.len()
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get volume channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+
+            let needle_entries: Vec<powerfs_volume::proto::powerfs::NeedleBlobEntry> = entries
+                .iter()
+                .map(|(offset, size, data, cookie)| {
+                    powerfs_volume::proto::powerfs::NeedleBlobEntry {
+                        offset: *offset,
+                        size: *size,
+                        needle_blob: data.clone(),
+                        cookie: *cookie,
+                    }
+                })
+                .collect();
+
+            let request = powerfs_volume::proto::powerfs::BatchWriteNeedleBlobRequest {
+                volume_id,
+                file_key,
+                entries: needle_entries,
+            };
+
+            match client
+                .batch_write_needle_blob(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.success {
+                        return Err(format!(
+                            "batch_write_blob partial failure: {}/{} succeeded",
+                            resp.success_count,
+                            entries.len()
+                        ));
+                    }
+                    debug!(
+                        "batch_write_blob succeeded: volume_id={}, file_key={}",
+                        volume_id, file_key
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("batch_write_blob failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("batch_write_blob failed after max retries".to_string())
+    }
+
     pub async fn read_blob(
         &self,
         volume_addr: &str,
@@ -1056,6 +1140,21 @@ impl SyncFuseClient {
             data,
             cookie,
         ))
+    }
+
+    pub fn batch_write_blob(
+        &self,
+        volume_addr: &str,
+        volume_id: u32,
+        file_key: u64,
+        entries: Vec<(i64, i32, Vec<u8>, u32)>,
+    ) -> Result<(), String> {
+        self.client
+            .runtime_handle
+            .block_on(
+                self.client
+                    .batch_write_blob(volume_addr, volume_id, file_key, entries),
+            )
     }
 
     pub fn read_blob(

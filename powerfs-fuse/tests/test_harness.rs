@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -19,29 +19,57 @@ struct TestEnvironment {
 
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
-        let _ = Command::new("fusermount")
-            .arg("-u")
-            .arg(FUSE_MOUNT)
-            .status();
-
-        let _ = self.fuse_process.kill();
-        let _ = self.volume_process.kill();
-        let _ = self.master_process.kill();
-
-        let _ = fs::remove_dir_all(TEST_DATA_DIR);
-        let _ = fs::remove_dir_all(FUSE_MOUNT);
+        force_cleanup();
     }
 }
 
 static TEST_ENV: OnceLock<TestEnvironment> = OnceLock::new();
 
+fn force_cleanup() {
+    let _ = Command::new("fusermount3")
+        .arg("-u")
+        .arg(FUSE_MOUNT)
+        .status();
+
+    let _ = Command::new("fusermount3")
+        .arg("-zu")
+        .arg(FUSE_MOUNT)
+        .status();
+
+    let _ = Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg("powerfs master")
+        .status();
+    let _ = Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg("powerfs-volume")
+        .status();
+    let _ = Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg("powerfs fuse")
+        .status();
+
+    thread::sleep(Duration::from_secs(2));
+
+    let _ = fs::remove_dir_all(TEST_DATA_DIR);
+}
+
+fn register_cleanup_handler() {}
+
 fn find_target_dir() -> Option<String> {
-    env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_str()
-        .map(|s| s.to_string())
+    if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
+        return Some(target_dir);
+    }
+    if let Ok(pwd) = env::current_dir() {
+        let target = pwd.join("target").join("debug");
+        if target.exists() {
+            return target.to_str().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 fn get_free_port() -> u16 {
@@ -58,7 +86,11 @@ fn is_port_open(addr: &str) -> bool {
 }
 
 fn is_fuse_available() -> bool {
-    Path::new("/dev/fuse").exists() && Command::new("fusermount").arg("--version").status().is_ok()
+    Path::new("/dev/fuse").exists()
+        && Command::new("fusermount3")
+            .arg("--version")
+            .status()
+            .is_ok()
 }
 
 fn wait_for_port(addr: &str, timeout_secs: u64) -> bool {
@@ -90,6 +122,27 @@ fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
     false
 }
 
+fn cleanup_existing_processes() {
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg("powerfs master")
+        .status();
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg("powerfs-volume")
+        .status();
+    let _ = Command::new("pkill").arg("-f").arg("powerfs fuse").status();
+    let _ = Command::new("fusermount3")
+        .arg("-u")
+        .arg(FUSE_MOUNT)
+        .status();
+
+    thread::sleep(Duration::from_secs(1));
+
+    let _ = fs::remove_dir_all(TEST_DATA_DIR);
+    let _ = fs::remove_dir_all(FUSE_MOUNT);
+}
+
 fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {
     let master_dir = format!("{}/master", TEST_DATA_DIR);
     let _ = fs::create_dir_all(&master_dir);
@@ -102,6 +155,8 @@ fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {
         .arg(&master_dir)
         .arg("--ip")
         .arg("127.0.0.1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
 }
 
@@ -116,6 +171,8 @@ fn spawn_volume(target_dir: &str, port: u16, master_addr: &str) -> io::Result<Ch
         .arg(&data_dir)
         .arg("--master-address")
         .arg(master_addr)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
 }
 
@@ -128,6 +185,8 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
         .arg(FUSE_MOUNT)
         .arg("--master")
         .arg(master_addr)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
 }
 
@@ -137,42 +196,35 @@ pub fn ensure_fuse_mounted() {
         std::process::exit(0);
     }
 
+    register_cleanup_handler();
+
     TEST_ENV.get_or_init(|| {
+        force_cleanup();
+
         let target_dir = find_target_dir().expect("Cannot find target directory");
 
         let master_port = get_free_port();
         let volume_port = get_free_port();
         let master_addr = format!("127.0.0.1:{}", master_port);
-        let volume_addr = format!("127.0.0.1:{}", volume_port);
 
-        let _ = fs::remove_dir_all(TEST_DATA_DIR);
-        let _ = fs::remove_dir_all(FUSE_MOUNT);
         let _ = fs::create_dir_all(TEST_DATA_DIR);
 
         let master_process =
             spawn_master(&target_dir, master_port).expect("Failed to start master");
-        eprintln!("Started master on {}", master_addr);
 
-        eprintln!("Waiting for master to be ready...");
         assert!(
             wait_for_port(&master_addr, 30),
             "Master did not start in time"
         );
-        eprintln!("Master is ready");
 
         let volume_process =
             spawn_volume(&target_dir, volume_port, &master_addr).expect("Failed to start volume");
-        eprintln!("Started volume on {}", volume_addr);
 
         thread::sleep(Duration::from_secs(3));
 
         let fuse_process = spawn_fuse(&target_dir, &master_addr).expect("Failed to start fuse");
-        eprintln!("Started fuse");
 
-        eprintln!("Waiting for FUSE mount...");
         assert!(wait_for_mount(FUSE_MOUNT, 30), "FUSE did not mount in time");
-
-        eprintln!("FUSE mounted at {}", FUSE_MOUNT);
 
         TestEnvironment {
             master_process,

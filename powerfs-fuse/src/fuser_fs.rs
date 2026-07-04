@@ -119,6 +119,7 @@ impl PowerFsFuserFs {
         let addr = PowerFuseClient::location_to_grpc_addr(loc);
         let chunk_size = self.chunk_cache.chunk_size();
 
+        let mut entries = Vec::new();
         let mut chunks = Vec::new();
 
         for (_, chunk_idx) in &dirty {
@@ -127,20 +128,7 @@ impl PowerFsFuserFs {
 
             if let Some(chunk_data) = chunk_data {
                 let data_len = chunk_data.data.len();
-                self.client
-                    .write_blob(
-                        &addr,
-                        fid.volume_id.0,
-                        fid.file_key,
-                        chunk_offset as i64,
-                        data_len as i32,
-                        chunk_data.data,
-                        0,
-                    )
-                    .map_err(|e| {
-                        error!("write_blob failed: {}", e);
-                        std::io::Error::from_raw_os_error(libc::EIO)
-                    })?;
+                entries.push((chunk_offset as i64, data_len as i32, chunk_data.data, 0u32));
 
                 chunks.push(powerfs_master::proto::powerfs::FileChunk {
                     offset: chunk_offset,
@@ -151,6 +139,15 @@ impl PowerFsFuserFs {
                     crc32: chunk_data.crc32,
                 });
             }
+        }
+
+        if !entries.is_empty() {
+            self.client
+                .batch_write_blob(&addr, fid.volume_id.0, fid.file_key, entries)
+                .map_err(|e| {
+                    error!("batch_write_blob failed: {}", e);
+                    std::io::Error::from_raw_os_error(libc::EIO)
+                })?;
         }
 
         let mut dirty_set = self.dirty_chunks.write().unwrap();
@@ -826,73 +823,116 @@ impl Filesystem for PowerFsFuserFs {
             let chunk_data = match chunk_data {
                 Some(d) => d,
                 None => {
-                    let is_dirty = {
-                        let dirty_set = self.dirty_chunks.read().unwrap();
-                        dirty_set.contains(&(inode, chunk_idx))
-                    };
-                    if is_dirty {
-                        info!("read: chunk {} is dirty, flushing first", chunk_idx);
-                        if let Err(e) = self.flush_dirty_chunks(inode) {
-                            warn!("Failed to flush dirty chunks: {}", e);
-                            reply.error(libc::EIO);
-                            return;
-                        }
+                    let write_buffer_entries = self.write_buffer.take(inode);
+                    if !write_buffer_entries.is_empty() {
+                        self.flush_write_buffer(inode, &write_buffer_entries);
                         match self.chunk_cache.get(inode, chunk_offset) {
                             Some(d) => d,
                             None => {
-                                warn!("read: chunk {} still not available after flush", chunk_idx);
-                                reply.error(libc::EIO);
-                                return;
+                                let is_dirty = {
+                                    let dirty_set = self.dirty_chunks.read().unwrap();
+                                    dirty_set.contains(&(inode, chunk_idx))
+                                };
+                                if is_dirty {
+                                    info!("read: chunk {} is dirty, flushing first", chunk_idx);
+                                    if let Err(e) = self.flush_dirty_chunks(inode) {
+                                        warn!("Failed to flush dirty chunks: {}", e);
+                                        reply.error(libc::EIO);
+                                        return;
+                                    }
+                                    match self.chunk_cache.get(inode, chunk_offset) {
+                                        Some(d) => d,
+                                        None => {
+                                            warn!(
+                                                "read: chunk {} still not available after flush",
+                                                chunk_idx
+                                            );
+                                            reply.error(libc::EIO);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        "read: chunk {} not available after flush_write_buffer",
+                                        chunk_idx
+                                    );
+                                    reply.error(libc::EIO);
+                                    return;
+                                }
                             }
                         }
                     } else {
-                        match &entry.fid {
-                            Some(fid) => {
-                                let locations = match self.client.lookup_volume(fid.volume_id) {
-                                    Ok(l) => l,
-                                    Err(e) => {
-                                        error!("lookup_volume failed: {}", e);
-                                        reply.error(libc::EIO);
-                                        return;
-                                    }
-                                };
-                                let loc = match locations.first() {
-                                    Some(l) => l,
-                                    None => {
-                                        error!("no volume location available");
-                                        reply.error(libc::EIO);
-                                        return;
-                                    }
-                                };
-                                let addr = PowerFuseClient::location_to_grpc_addr(loc);
-                                match self.client.read_blob(
-                                    &addr,
-                                    fid.volume_id.0,
-                                    fid.file_key,
-                                    chunk_offset as i64,
-                                    chunk_size as i32,
-                                ) {
-                                    Ok(data) => {
-                                        self.chunk_cache.put(inode, chunk_offset, data, 0, 0);
-                                        match self.chunk_cache.get(inode, chunk_offset) {
-                                            Some(d) => d,
-                                            None => {
-                                                warn!(
-                                                    "read: chunk {} not in cache after put",
-                                                    chunk_idx
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("read_blob failed: {}", e);
-                                        continue;
-                                    }
+                        let is_dirty = {
+                            let dirty_set = self.dirty_chunks.read().unwrap();
+                            dirty_set.contains(&(inode, chunk_idx))
+                        };
+                        if is_dirty {
+                            info!("read: chunk {} is dirty, flushing first", chunk_idx);
+                            if let Err(e) = self.flush_dirty_chunks(inode) {
+                                warn!("Failed to flush dirty chunks: {}", e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                            match self.chunk_cache.get(inode, chunk_offset) {
+                                Some(d) => d,
+                                None => {
+                                    warn!(
+                                        "read: chunk {} still not available after flush",
+                                        chunk_idx
+                                    );
+                                    reply.error(libc::EIO);
+                                    return;
                                 }
                             }
-                            None => {
-                                continue;
+                        } else {
+                            match &entry.fid {
+                                Some(fid) => {
+                                    let locations = match self.client.lookup_volume(fid.volume_id) {
+                                        Ok(l) => l,
+                                        Err(e) => {
+                                            error!("lookup_volume failed: {}", e);
+                                            reply.error(libc::EIO);
+                                            return;
+                                        }
+                                    };
+                                    let loc = match locations.first() {
+                                        Some(l) => l,
+                                        None => {
+                                            error!("no volume location available");
+                                            reply.error(libc::EIO);
+                                            return;
+                                        }
+                                    };
+                                    let addr = PowerFuseClient::location_to_grpc_addr(loc);
+                                    match self.client.read_blob(
+                                        &addr,
+                                        fid.volume_id.0,
+                                        fid.file_key,
+                                        chunk_offset as i64,
+                                        chunk_size as i32,
+                                    ) {
+                                        Ok(data) => {
+                                            self.chunk_cache.put(inode, chunk_offset, data, 0, 0);
+                                            match self.chunk_cache.get(inode, chunk_offset) {
+                                                Some(d) => d,
+                                                None => {
+                                                    warn!(
+                                                        "read: chunk {} not in cache after put",
+                                                        chunk_idx
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("read_blob failed: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    continue;
+                                }
                             }
                         }
                     }

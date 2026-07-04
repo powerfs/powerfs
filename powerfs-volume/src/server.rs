@@ -369,6 +369,71 @@ impl VolumeService for VolumeServer {
         }
     }
 
+    async fn batch_write_needle_blob(
+        &self,
+        request: Request<crate::proto::powerfs::BatchWriteNeedleBlobRequest>,
+    ) -> std::result::Result<Response<crate::proto::powerfs::BatchWriteNeedleBlobResponse>, Status>
+    {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
+
+        debug!(
+            "batch_write_needle_blob: volume_id={}, file_key={}, entries={}",
+            volume_id.0,
+            file_key,
+            req.entries.len()
+        );
+
+        let start = time::Instant::now();
+        let storage_manager = self.storage_manager.clone();
+        let entries = req.entries;
+        let total_entries = entries.len();
+
+        match tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let mut success_count = 0;
+                for entry in entries {
+                    let result = volume.write_needle_blob(
+                        file_key,
+                        entry.offset,
+                        entry.size,
+                        Bytes::from(entry.needle_blob),
+                        entry.cookie,
+                    );
+                    if result.is_ok() {
+                        success_count += 1;
+                    } else {
+                        warn!("batch_write_needle_blob entry failed: {:?}", result);
+                    }
+                }
+                Ok(Response::new(
+                    crate::proto::powerfs::BatchWriteNeedleBlobResponse {
+                        success: success_count == total_entries,
+                        success_count: success_count as i32,
+                    },
+                ))
+            } else {
+                warn!("batch_write_needle_blob: volume not found: {}", volume_id.0);
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        {
+            Ok(r) => {
+                debug!("batch_write_needle_blob completed in {:?}", start.elapsed());
+                r
+            }
+            Err(e) => {
+                error!("batch_write_needle_blob task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
+    }
+
     async fn read_needle_blob(
         &self,
         request: Request<crate::proto::ReadNeedleBlobRequest>,
