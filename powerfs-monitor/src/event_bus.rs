@@ -1,8 +1,7 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use redis::streams::{StreamReadOptions, StreamReadReply, StreamRangeReply};
-use redis::{AsyncCommands, Client, RedisConnectionInfo, RedisResult, Value};
+use redis::streams::{StreamRangeReply, StreamReadOptions, StreamReadReply};
+use redis::{AsyncCommands, Client, RedisResult, Value};
 
 use crate::event::EventEnvelope;
 
@@ -31,16 +30,11 @@ impl EventBus {
     pub async fn read_history(&self) -> RedisResult<Vec<EventEnvelope>> {
         let mut conn = self.client.get_async_connection().await?;
 
-        let reply: StreamRangeReply = conn
-            .xrange(&self.stream_key, "-", "+")
-            .await?;
+        let reply: StreamRangeReply = conn.xrange(&self.stream_key, "-", "+").await?;
 
         let mut events = Vec::new();
-        let mut last_id = "0".to_string();
 
         for entry in reply.ids {
-            last_id = entry.id.clone();
-
             let mut event_id = String::new();
             let mut source = String::new();
             let mut source_id = String::new();

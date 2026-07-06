@@ -3,6 +3,7 @@ import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, Cluster
 export const mockNodes: NodeInfo[] = [
   {
     id: 'node-1',
+    node_type: 'master',
     address: '192.168.1.101',
     grpc_port: 8080,
     http_port: 8081,
@@ -17,6 +18,7 @@ export const mockNodes: NodeInfo[] = [
   },
   {
     id: 'node-2',
+    node_type: 'volume',
     address: '192.168.1.102',
     grpc_port: 8080,
     http_port: 8081,
@@ -31,6 +33,7 @@ export const mockNodes: NodeInfo[] = [
   },
   {
     id: 'node-3',
+    node_type: 'volume',
     address: '192.168.1.103',
     grpc_port: 8080,
     http_port: 8081,

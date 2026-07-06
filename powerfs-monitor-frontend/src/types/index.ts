@@ -1,5 +1,6 @@
 export interface NodeInfo {
   id: string
+  node_type: 'master' | 'volume'
   address: string
   grpc_port: number
   http_port: number
@@ -139,4 +140,16 @@ export interface S3Metrics {
   put_requests: number
   get_requests: number
   delete_requests: number
+}
+
+export interface FuseMount {
+  id: string
+  mount_point: string
+  collection: string
+  replication: string
+  master: string
+  threads: number
+  status: 'mounted' | 'unmounted' | 'error'
+  mounted_at: string
+  pid?: number
 }

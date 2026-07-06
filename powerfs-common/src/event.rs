@@ -47,6 +47,8 @@ impl EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatusEvent {
     pub node_id: String,
+    #[serde(default = "default_node_type")]
+    pub node_type: String,
     pub address: String,
     pub grpc_port: u32,
     pub http_port: u32,
@@ -58,6 +60,10 @@ pub struct NodeStatusEvent {
     pub network_tx: u64,
     pub uptime: u64,
     pub volume_count: u32,
+}
+
+fn default_node_type() -> String {
+    "volume".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

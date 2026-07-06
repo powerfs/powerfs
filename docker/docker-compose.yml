@@ -48,7 +48,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.11:9333 --raft-id 1 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
     depends_on:
       redis:
         condition: service_healthy
@@ -73,7 +73,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.12:9333 --raft-id 2 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 5s
@@ -98,12 +98,11 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.13:9333 --raft-id 3 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 3
     depends_on:
       master-2:
         condition: service_healthy

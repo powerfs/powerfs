@@ -10,6 +10,7 @@ use crate::event::{ClusterMetrics, KVMetrics, NodeStatusEvent, VolumeStatusEvent
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeInfo {
     pub id: String,
+    pub node_type: String,
     pub address: String,
     pub grpc_port: u32,
     pub http_port: u32,
@@ -69,6 +70,7 @@ impl MetricStore {
                 event.node_id.clone(),
                 NodeInfo {
                     id: event.node_id,
+                    node_type: event.node_type,
                     address: event.address,
                     grpc_port: event.grpc_port,
                     http_port: event.http_port,

@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
 
 const api = axios.create({
@@ -235,4 +235,38 @@ export async function abortMultipartUpload(bucket: string, key: string, uploadId
     return
   }
   await api.delete(`/s3/buckets/${bucket}/objects/${encodeURIComponent(key)}?uploadId=${uploadId}`)
+}
+
+export async function getFuseMounts(): Promise<FuseMount[]> {
+  if (useMock) {
+    return []
+  }
+  const response = await api.get('/fuse/mounts')
+  return response.data.data
+}
+
+export async function createFuseMount(mount: {
+  mount_point: string
+  collection: string
+  replication: string
+  master: string
+  threads: number
+}): Promise<FuseMount> {
+  if (useMock) {
+    return {
+      id: 'mock-id',
+      ...mount,
+      status: 'mounted',
+      mounted_at: new Date().toISOString(),
+    }
+  }
+  const response = await api.post('/fuse/mounts', mount)
+  return response.data.data
+}
+
+export async function deleteFuseMount(id: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.delete(`/fuse/mounts/${id}`)
 }

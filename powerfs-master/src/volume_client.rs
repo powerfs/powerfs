@@ -1,5 +1,5 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
-use crate::volume_proto::powerfs::{ReadNeedleRequest, WriteNeedleRequest, DeleteNeedleRequest};
+use crate::volume_proto::powerfs::{DeleteNeedleRequest, ReadNeedleRequest, WriteNeedleRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;

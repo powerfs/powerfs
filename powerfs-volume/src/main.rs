@@ -2,7 +2,9 @@ use clap::Parser;
 use log::{info, warn};
 use powerfs_common::types::NodeId;
 use powerfs_core::storage::StorageManager;
-use powerfs_volume::{master_client::MasterClient, server::VolumeServer};
+use powerfs_volume::{
+    master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
+};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -83,16 +85,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &data_dir,
     );
 
-    let mut master_client = MasterClient::new(
-        &args.master_address,
+    let mut master_client = MasterClient::new(NewMasterClientParams {
+        master_address: &args.master_address,
         node_id,
         grpc_port,
-        args.http_port,
-        &args.data_center,
-        &args.rack,
-        &format!("http://{}:{}", ip, args.http_port),
-        &ip,
-    );
+        http_port: args.http_port,
+        data_center: &args.data_center,
+        rack: &args.rack,
+        public_url: &format!("http://{}:{}", ip, args.http_port),
+        ip: &ip,
+    });
 
     if args.register_with_master {
         info!("Registering with master...");

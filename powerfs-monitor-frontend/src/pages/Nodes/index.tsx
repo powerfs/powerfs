@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, message } from 'antd'
+import React, { useEffect, useState, useMemo } from 'react'
+import { Card, Table, Tag, Button, Modal, Space, Progress, message, Tabs } from 'antd'
 import {
   SaveOutlined,
   DeleteOutlined,
@@ -8,6 +8,8 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LeftCircleOutlined,
+  DatabaseOutlined,
+  CloudServerOutlined,
 } from '@ant-design/icons'
 import type { NodeInfo } from '@/types'
 import { getNodes, deleteNode } from '@/services/api'
@@ -171,6 +173,9 @@ function Nodes() {
     },
   ]
 
+  const masterNodes = useMemo(() => nodes.filter(n => n.node_type === 'master'), [nodes])
+  const volumeNodes = useMemo(() => nodes.filter(n => n.node_type === 'volume'), [nodes])
+
   return (
     <div>
       <Card
@@ -182,12 +187,45 @@ function Nodes() {
           </Button>
         }
       >
-        <Table
-          columns={columns}
-          dataSource={nodes}
-          rowKey="id"
-          pagination={{ pageSize: 10 }}
-          scroll={{ x: 1000 }}
+        <Tabs
+          items={[
+            {
+              key: 'master',
+              label: (
+                <span>
+                  <CloudServerOutlined /> Master节点 ({masterNodes.length})
+                </span>
+              ),
+              children: (
+                <Table
+                  columns={columns}
+                  dataSource={masterNodes}
+                  rowKey="id"
+                  pagination={{ pageSize: 10 }}
+                  scroll={{ x: 1000 }}
+                  locale={{ emptyText: '暂无Master节点' }}
+                />
+              ),
+            },
+            {
+              key: 'volume',
+              label: (
+                <span>
+                  <DatabaseOutlined /> Volume节点 ({volumeNodes.length})
+                </span>
+              ),
+              children: (
+                <Table
+                  columns={columns}
+                  dataSource={volumeNodes}
+                  rowKey="id"
+                  pagination={{ pageSize: 10 }}
+                  scroll={{ x: 1000 }}
+                  locale={{ emptyText: '暂无Volume节点' }}
+                />
+              ),
+            },
+          ]}
         />
       </Card>
 

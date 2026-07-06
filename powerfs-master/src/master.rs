@@ -1,11 +1,12 @@
-use crate::raft_node::{ApplyEntry, OutgoingMessage, ProposeRequest, RaftNode};
+use crate::raft_node::{ApplyEntry, OutgoingMessage, Peer, ProposeRequest, RaftNode};
 use crate::raft_storage::RaftCommand;
 use crate::volume_client::VolumeClientPool;
 use chrono::Utc;
 use log::{debug, error, info, warn};
 use powerfs_common::{
+    collect_system_metrics,
     error::{PowerFsError, Result},
-    event::{Event, EventPublisher, VolumeStatusEvent},
+    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
     types::{
         ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
         NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 pub use crate::proto::VolumeShortInfo;
@@ -134,18 +136,30 @@ pub struct VolumeLocationUpdate {
 
 impl MasterNode {
     pub async fn new(
-        address: &str,
+        bind_address: &str,
+        raft_address: &str,
         cluster_config: Option<ClusterConfig>,
         raft_path: &str,
+        raft_id: u64,
+        peers: Vec<String>,
     ) -> Result<Self> {
-        let addr: SocketAddr = address.parse()?;
+        let addr: SocketAddr = bind_address.parse()?;
 
-        let node_id = NodeId(format!("{}", addr));
+        let node_id = NodeId(raft_address.to_string());
         let config = cluster_config.unwrap_or_default();
         let raft_config = RaftConfig::default();
 
-        // Create Raft node (single node for now, will add peers later)
-        let mut raft_node = RaftNode::new(1, address.to_string(), vec![], raft_path)
+        let peer_list: Vec<Peer> = peers
+            .into_iter()
+            .enumerate()
+            .map(|(i, addr)| Peer {
+                id: (i + 1) as u64,
+                address: addr,
+            })
+            .filter(|p| p.id != raft_id)
+            .collect();
+
+        let mut raft_node = RaftNode::new(raft_id, raft_address.to_string(), peer_list, raft_path)
             .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(100);
@@ -234,10 +248,10 @@ impl MasterNode {
             propose_tx,
             step_tx,
             message_tx,
-            raft_id: 1,
-            raft_address: address.to_string(),
+            raft_id,
+            raft_address: raft_address.to_string(),
             is_leader: RwLock::new(true),
-            leader_address: RwLock::new(address.to_string()),
+            leader_address: RwLock::new(raft_address.to_string()),
             next_volume_id: RwLock::new(1),
             max_file_key: RwLock::new(0),
             heartbeat_tx,
@@ -1384,6 +1398,49 @@ impl MasterNode {
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting PowerFS Master node: {:?}", self.id);
         info!("Listening on: {}", self.address);
+
+        let node_id_str = self.raft_address.clone();
+        let _ip_address = self
+            .raft_address
+            .split(':')
+            .next()
+            .unwrap_or("0.0.0.0")
+            .to_string();
+        let grpc_port = self.address.port() as u32;
+        let event_publisher = self.event_publisher.clone();
+        let address = self.address.to_string();
+
+        tokio::spawn(async move {
+            let mut sys = sysinfo::System::new_all();
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                sys.refresh_all();
+
+                let metrics = collect_system_metrics(&mut sys, ".");
+
+                if let Some(publisher) = &event_publisher {
+                    let event = Event::NodeStatus(NodeStatusEvent {
+                        node_id: node_id_str.clone(),
+                        node_type: "master".to_string(),
+                        address: address.clone(),
+                        grpc_port,
+                        http_port: grpc_port,
+                        status: "healthy".to_string(),
+                        cpu_usage: metrics.cpu_usage,
+                        mem_usage: metrics.mem_usage,
+                        disk_usage: metrics.disk_usage,
+                        network_rx: metrics.network_rx,
+                        network_tx: metrics.network_tx,
+                        uptime: metrics.uptime,
+                        volume_count: 0,
+                    });
+
+                    if let Err(e) = publisher.publish(event, &node_id_str).await {
+                        warn!("Failed to publish node_status event: {}", e);
+                    }
+                }
+            }
+        });
 
         let server = crate::server::MasterGrpcServer::new(self.clone(), self.kv_cache.clone());
         server

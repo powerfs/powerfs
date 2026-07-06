@@ -1,10 +1,13 @@
-use chrono::Utc;
 use crate::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, LookupVolumeRequest,
 };
+use chrono::Utc;
 use powerfs_common::{
     error::{PowerFsError, Result},
-    types::{Collection, DataCenterId, DataNodeInfo, DiskType, Fid, NodeId, NodeState, RackId, Ttl, VolumeId, VolumeInfo, VolumeState},
+    types::{
+        Collection, DataCenterId, DataNodeInfo, DiskType, Fid, NodeId, NodeState, RackId, Ttl,
+        VolumeId, VolumeInfo, VolumeState,
+    },
 };
 use std::sync::Arc;
 use tonic::transport::Channel;
@@ -33,7 +36,9 @@ impl S3MasterClient {
                 .map_err(|e| PowerFsError::Internal(format!("Invalid address: {}", e)))?
                 .connect()
                 .await
-                .map_err(|e| PowerFsError::Internal(format!("Failed to connect to master: {}", e)))?;
+                .map_err(|e| {
+                    PowerFsError::Internal(format!("Failed to connect to master: {}", e))
+                })?;
             *channel_guard = Some(ch.clone());
             ch
         };
@@ -66,7 +71,8 @@ impl S3MasterClient {
         if !response.error.is_empty() {
             return Err(PowerFsError::Internal(response.error));
         }
-        let fid = Fid::from_string(&response.fid).map_err(|e| PowerFsError::Internal(format!("Invalid fid format: {}", e)))?;
+        let fid = Fid::from_string(&response.fid)
+            .map_err(|e| PowerFsError::Internal(format!("Invalid fid format: {}", e)))?;
         let nodes: Vec<DataNodeInfo> = response
             .replicas
             .into_iter()

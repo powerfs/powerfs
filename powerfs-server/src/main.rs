@@ -3,7 +3,9 @@ use log::info;
 use powerfs_common::{error::Result, utils::generate_node_id};
 use powerfs_core::storage::StorageManager;
 use powerfs_fuse::FuserApp;
-use powerfs_master::{master::MasterNode, s3::S3Server, s3::MasterApi, s3::master_client::S3MasterClient};
+use powerfs_master::{
+    master::MasterNode, s3::master_client::S3MasterClient, s3::MasterApi, s3::S3Server,
+};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -41,6 +43,18 @@ enum Commands {
         /// Bind IP address
         #[arg(long)]
         ip: Option<String>,
+
+        /// Advertise address for Raft communication (default: same as bind address)
+        #[arg(long)]
+        advertise_addr: Option<String>,
+
+        /// Raft node ID (default: 1)
+        #[arg(long, short = 'i', default_value = "1")]
+        raft_id: u64,
+
+        /// Raft peer addresses (e.g., --peer=172.20.0.11:9333 --peer=172.20.0.12:9333)
+        #[arg(long, short)]
+        peer: Vec<String>,
     },
 
     Volume {
@@ -144,7 +158,22 @@ async fn main() -> Result<()> {
             raft_dir,
             meta_dir,
             ip,
-        } => run_master(port, &dir, raft_dir, meta_dir, ip).await,
+            advertise_addr,
+            raft_id,
+            peer,
+        } => {
+            run_master(RunMasterParams {
+                port,
+                dir: &dir,
+                raft_dir,
+                meta_dir,
+                ip,
+                advertise_addr,
+                raft_id,
+                peers: peer,
+            })
+            .await
+        }
 
         Commands::Volume {
             port,
@@ -166,38 +195,62 @@ async fn main() -> Result<()> {
 
         Commands::Mount { dir, master } => run_mount(&dir, master).await,
 
-        Commands::S3 { port, master, ip, dir } => run_s3(port, &master, ip, &dir).await,
+        Commands::S3 {
+            port,
+            master,
+            ip,
+            dir,
+        } => run_s3(port, &master, ip, &dir).await,
     }
 }
 
-async fn run_master(
+struct RunMasterParams<'a> {
     port: u16,
-    dir: &str,
+    dir: &'a str,
     raft_dir: Option<String>,
     meta_dir: Option<String>,
     ip: Option<String>,
-) -> Result<()> {
+    advertise_addr: Option<String>,
+    raft_id: u64,
+    peers: Vec<String>,
+}
+
+async fn run_master(params: RunMasterParams<'_>) -> Result<()> {
     info!("Starting PowerFS Master node");
 
-    // Calculate subdirectories
-    let raft_dir = raft_dir.unwrap_or_else(|| format!("{}/raft", dir));
-    let meta_dir = meta_dir.unwrap_or_else(|| format!("{}/meta", dir));
+    let raft_dir = params
+        .raft_dir
+        .unwrap_or_else(|| format!("{}/raft", params.dir));
+    let meta_dir = params
+        .meta_dir
+        .unwrap_or_else(|| format!("{}/meta", params.dir));
 
-    // Create directories
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(params.dir)?;
     std::fs::create_dir_all(&raft_dir)?;
     std::fs::create_dir_all(&meta_dir)?;
 
-    let address = match ip {
-        Some(ip) => format!("{}:{}", ip, port),
-        None => format!("0.0.0.0:{}", port),
+    let bind_address = match params.ip {
+        Some(ip) => format!("{}:{}", ip, params.port),
+        None => format!("0.0.0.0:{}", params.port),
     };
 
-    let master = MasterNode::new(&address, None, &raft_dir).await?;
+    let raft_address = params
+        .advertise_addr
+        .unwrap_or_else(|| bind_address.clone());
+
+    let master = MasterNode::new(
+        &bind_address,
+        &raft_address,
+        None,
+        &raft_dir,
+        params.raft_id,
+        params.peers,
+    )
+    .await?;
 
     info!("Master node initialized: {:?}", master.id());
-    info!("Listening on: {}", address);
-    info!("Data directory: {}", dir);
+    info!("Listening on: {}", bind_address);
+    info!("Data directory: {}", params.dir);
     info!("Raft directory: {}", raft_dir);
     info!("Meta directory: {}", meta_dir);
 
@@ -300,8 +353,16 @@ async fn run_s3(port: u16, master: &str, ip: Option<String>, dir: &str) -> Resul
 
     let s3_addr: std::net::SocketAddr = address.parse()?;
 
-    let directory_tree = Arc::new(powerfs_master::directory_tree::DirectoryTree::new(std::path::Path::new(dir))
-        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Failed to create directory tree: {}", e)))?);
+    let directory_tree = Arc::new(
+        powerfs_master::directory_tree::DirectoryTree::new(std::path::Path::new(dir)).map_err(
+            |e| {
+                powerfs_common::error::PowerFsError::Internal(format!(
+                    "Failed to create directory tree: {}",
+                    e
+                ))
+            },
+        )?,
+    );
 
     let master_api = Arc::new(MasterApi::Remote(Arc::new(S3MasterClient::new(master))));
 

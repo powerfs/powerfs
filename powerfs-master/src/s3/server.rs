@@ -75,8 +75,14 @@ impl S3Server {
 
         let router = Router::new()
             .route("/", get(handlers::list_buckets))
-            .route("/_admin/multipart-uploads", get(handlers::list_multipart_uploads))
-            .route("/_admin/multipart-uploads/:upload_id", delete(handlers::admin_abort_multipart_upload))
+            .route(
+                "/_admin/multipart-uploads",
+                get(handlers::list_multipart_uploads),
+            )
+            .route(
+                "/_admin/multipart-uploads/:upload_id",
+                delete(handlers::admin_abort_multipart_upload),
+            )
             .route("/:bucket", put(handlers::create_bucket))
             .route("/:bucket", delete(handlers::delete_bucket))
             .route("/:bucket", get(handlers::list_objects))
@@ -610,7 +616,9 @@ pub mod handlers {
                 if let (Ok(volume_id), Ok(file_key)) =
                     (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
                 {
-                    if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                    if let Some(volume_info) =
+                        state.master.get_volume_info(&VolumeId(volume_id)).await
+                    {
                         if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
                             let node_address = format!("{}:{}", node.address, node.grpc_port);
                             let _ = state
@@ -727,7 +735,11 @@ pub mod handlers {
         let data = body.as_ref();
         let size = data.len() as u64;
 
-        let volume_info = match state.master.get_volume_info(&VolumeId(session.volume_id)).await {
+        let volume_info = match state
+            .master
+            .get_volume_info(&VolumeId(session.volume_id))
+            .await
+        {
             Some(v) => v,
             None => {
                 return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Volume not found")
@@ -962,7 +974,9 @@ pub mod handlers {
                 if let (Ok(volume_id), Ok(file_key)) =
                     (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
                 {
-                    if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                    if let Some(volume_info) =
+                        state.master.get_volume_info(&VolumeId(volume_id)).await
+                    {
                         if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
                             let node_address = format!("{}:{}", node.address, node.grpc_port);
                             let _ = state
@@ -1018,7 +1032,9 @@ pub mod handlers {
                 if let (Ok(volume_id), Ok(file_key)) =
                     (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
                 {
-                    if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                    if let Some(volume_info) =
+                        state.master.get_volume_info(&VolumeId(volume_id)).await
+                    {
                         if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
                             let node_address = format!("{}:{}", node.address, node.grpc_port);
                             let _ = state
@@ -1043,11 +1059,10 @@ pub mod handlers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::HttpBody;
+    use axum::body::{Body, HttpBody};
     use axum::http::{Method, Request, StatusCode};
     use tempfile::tempdir;
     use tower::ServiceExt;
-    use Body;
 
     async fn create_test_state() -> Arc<S3State> {
         let dir = tempdir().unwrap();
@@ -1055,15 +1070,19 @@ mod tests {
         let master = Arc::new(
             crate::master::MasterNode::new(
                 "127.0.0.1:50051",
+                "127.0.0.1:50051",
                 None,
                 dir.path().join("raft").to_str().unwrap(),
+                1,
+                vec![],
             )
             .await
             .unwrap(),
         );
+        let master_api = Arc::new(MasterApi::Direct(master));
         Arc::new(S3State {
             directory_tree: dt,
-            master,
+            master: master_api,
             volume_client_pool: Arc::new(VolumeClientPool::new()),
             lock_manager: Arc::new(LockManager::new()),
             multipart_sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),

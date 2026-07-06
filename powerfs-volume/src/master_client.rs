@@ -21,26 +21,29 @@ pub struct MasterClient {
     sender: Option<mpsc::Sender<Heartbeat>>,
 }
 
+#[derive(Clone)]
+pub struct NewMasterClientParams<'a> {
+    pub master_address: &'a str,
+    pub node_id: NodeId,
+    pub grpc_port: u32,
+    pub http_port: u32,
+    pub data_center: &'a str,
+    pub rack: &'a str,
+    pub public_url: &'a str,
+    pub ip: &'a str,
+}
+
 impl MasterClient {
-    pub fn new(
-        master_address: &str,
-        node_id: NodeId,
-        grpc_port: u32,
-        http_port: u32,
-        data_center: &str,
-        rack: &str,
-        public_url: &str,
-        ip: &str,
-    ) -> Self {
+    pub fn new(params: NewMasterClientParams<'_>) -> Self {
         MasterClient {
-            master_address: master_address.to_string(),
-            node_id,
-            grpc_port,
-            http_port,
-            data_center: data_center.to_string(),
-            rack: rack.to_string(),
-            public_url: public_url.to_string(),
-            ip: ip.to_string(),
+            master_address: params.master_address.to_string(),
+            node_id: params.node_id,
+            grpc_port: params.grpc_port,
+            http_port: params.http_port,
+            data_center: params.data_center.to_string(),
+            rack: params.rack.to_string(),
+            public_url: params.public_url.to_string(),
+            ip: params.ip.to_string(),
             sender: None,
         }
     }

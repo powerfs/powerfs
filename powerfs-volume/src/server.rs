@@ -9,10 +9,10 @@ use powerfs_common::{
     event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
     types::{NeedleId, NodeId, VolumeId},
 };
-use sysinfo::System;
 use powerfs_core::storage::StorageManager;
 use std::sync::Arc;
 use std::time::Duration;
+use sysinfo::System;
 use tokio::time;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -111,6 +111,7 @@ impl VolumeServer {
 
                 let event = Event::NodeStatus(NodeStatusEvent {
                     node_id: node_id_str.clone(),
+                    node_type: "volume".to_string(),
                     address: ip.clone(),
                     grpc_port,
                     http_port,
@@ -142,12 +143,19 @@ impl VolumeServer {
                             powerfs_common::types::VolumeState::Full => "full",
                             powerfs_common::types::VolumeState::ReadOnly => "read_only",
                             powerfs_common::types::VolumeState::Deleting => "deleting",
-                        }.to_string(),
+                        }
+                        .to_string(),
                         collection: volume.collection.0.clone(),
                     });
 
-                    if let Err(e) = publisher.publish(volume_event, &format!("{}", volume.id.0)).await {
-                        warn!("Failed to publish volume_status event for volume {}: {}", volume.id.0, e);
+                    if let Err(e) = publisher
+                        .publish(volume_event, &format!("{}", volume.id.0))
+                        .await
+                    {
+                        warn!(
+                            "Failed to publish volume_status event for volume {}: {}",
+                            volume.id.0, e
+                        );
                     }
                 }
             }

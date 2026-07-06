@@ -57,6 +57,7 @@ struct AppState {
     alert_engine: Arc<AlertEngine>,
     ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<serde_json::Value>>>>,
     s3_endpoint: String,
+    fuse_mounts: Arc<Mutex<Vec<FuseMount>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +97,28 @@ struct MultipartUploadInfo {
     creation_date: String,
     part_count: u64,
     status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct FuseMount {
+    id: String,
+    mount_point: String,
+    collection: String,
+    replication: String,
+    master: String,
+    threads: usize,
+    status: String,
+    mounted_at: String,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateFuseMountRequest {
+    mount_point: String,
+    collection: String,
+    replication: String,
+    master: String,
+    threads: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,7 +393,10 @@ async fn delete_object(
 ) -> Json<ApiResponse<()>> {
     if let Some(upload_id) = params.get("uploadId") {
         let client = reqwest::Client::new();
-        let url = format!("{}/_admin/multipart-uploads/{}", state.s3_endpoint, upload_id);
+        let url = format!(
+            "{}/_admin/multipart-uploads/{}",
+            state.s3_endpoint, upload_id
+        );
 
         match client.delete(&url).send().await {
             Ok(response) => {
@@ -440,7 +466,7 @@ async fn upload_object(
     mut req: axum::extract::Multipart,
 ) -> Json<ApiResponse<()>> {
     info!("Upload object request received for bucket: {}", bucket);
-    
+
     let mut key: Option<String> = None;
     let mut file_data: Option<axum::body::Bytes> = None;
 
@@ -452,7 +478,10 @@ async fn upload_object(
             info!("Got key: {:?}", key);
         } else if name == "file" {
             file_data = Some(field.bytes().await.unwrap());
-            info!("Got file data: {} bytes", file_data.as_ref().map(|b| b.len()).unwrap_or(0));
+            info!(
+                "Got file data: {} bytes",
+                file_data.as_ref().map(|b| b.len()).unwrap_or(0)
+            );
         }
     }
 
@@ -510,11 +539,12 @@ async fn download_object(
                 .map(|h| h.to_str().unwrap_or(""))
                 .unwrap_or("")
                 .to_string();
-            
+
             if status.is_success() {
                 let body = response.bytes().await.unwrap();
 
-                let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from(body));
+                let mut resp: axum::http::Response<axum::body::Body> =
+                    axum::response::Response::new(axum::body::Body::from(body));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
                     content_type.parse().unwrap(),
@@ -524,32 +554,157 @@ async fn download_object(
                     format!("attachment; filename=\"{}\"", key).parse().unwrap(),
                 );
                 if !etag.is_empty() {
-                    resp.headers_mut().insert(
-                        axum::http::header::ETAG,
-                        etag.parse().unwrap(),
-                    );
+                    resp.headers_mut()
+                        .insert(axum::http::header::ETAG, etag.parse().unwrap());
                 }
                 resp
             } else {
                 let body = response.text().await.unwrap_or_default();
-                let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from(body));
+                let mut resp: axum::http::Response<axum::body::Body> =
+                    axum::response::Response::new(axum::body::Body::from(body));
                 *resp.status_mut() = axum::http::StatusCode::NOT_FOUND;
                 resp
             }
         }
         Err(e) => {
             warn!("S3 connection error: {}", e);
-            let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from("S3 connection error"));
+            let mut resp: axum::http::Response<axum::body::Body> =
+                axum::response::Response::new(axum::body::Body::from("S3 connection error"));
             *resp.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
             resp
         }
     }
 }
 
+async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<FuseMount>>> {
+    let mounts = state.fuse_mounts.lock().await;
+    let mut result = mounts.clone();
+
+    for mount in result.iter_mut() {
+        if let Some(pid) = mount.pid {
+            match tokio::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Ok(status) = child.wait().await {
+                        if !status.success() {
+                            mount.status = "unmounted".to_string();
+                        }
+                    } else {
+                        mount.status = "unmounted".to_string();
+                    }
+                }
+                Err(_) => {
+                    mount.status = "unmounted".to_string();
+                }
+            }
+        }
+    }
+
+    Json(ApiResponse::success(result))
+}
+
+async fn create_fuse_mount(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateFuseMountRequest>,
+) -> Json<ApiResponse<FuseMount>> {
+    let mount_id = uuid::Uuid::new_v4().to_string();
+
+    let mount_path = std::path::Path::new(&req.mount_point);
+    if !mount_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(mount_path) {
+            return Json(ApiResponse::error(&format!(
+                "Failed to create mount point: {}",
+                e
+            )));
+        }
+    }
+
+    let cmd = tokio::process::Command::new("/app/powerfs-fuse")
+        .arg("--master")
+        .arg(&req.master)
+        .arg("--mount-point")
+        .arg(&req.mount_point)
+        .arg("--collection")
+        .arg(&req.collection)
+        .arg("--replication")
+        .arg(&req.replication)
+        .arg("--threads")
+        .arg(req.threads.to_string())
+        .spawn();
+
+    match cmd {
+        Ok(mut child) => {
+            let pid = child.id();
+
+            let mount = FuseMount {
+                id: mount_id,
+                mount_point: req.mount_point,
+                collection: req.collection,
+                replication: req.replication,
+                master: req.master,
+                threads: req.threads,
+                status: "mounted".to_string(),
+                mounted_at: chrono::Utc::now().to_rfc3339(),
+                pid,
+            };
+
+            state.fuse_mounts.lock().await.push(mount.clone());
+
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+
+            Json(ApiResponse::success(mount))
+        }
+        Err(e) => Json(ApiResponse::error(&format!(
+            "Failed to start FUSE mount: {}",
+            e
+        ))),
+    }
+}
+
+async fn delete_fuse_mount(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<()>> {
+    let mut mounts = state.fuse_mounts.lock().await;
+
+    if let Some(index) = mounts.iter().position(|m| m.id == id) {
+        let mount = mounts.remove(index);
+
+        if let Some(pid) = mount.pid {
+            if let Ok(mut child) = tokio::process::Command::new("umount")
+                .arg(&mount.mount_point)
+                .spawn()
+            {
+                let _ = child.wait().await;
+            }
+
+            if let Ok(mut child) = tokio::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .spawn()
+            {
+                let _ = child.wait().await;
+            }
+        }
+
+        Json(ApiResponse::success(()))
+    } else {
+        Json(ApiResponse::error("Mount not found"))
+    }
+}
+
 fn parse_list_buckets_xml(xml: &str) -> Vec<BucketInfo> {
     let mut buckets = Vec::new();
-    let re = regex::Regex::new(r"<Bucket>\s*<Name>([^<]+)</Name>\s*<CreationDate>([^<]+)</CreationDate>\s*</Bucket>").unwrap();
-    
+    let re = regex::Regex::new(
+        r"<Bucket>\s*<Name>([^<]+)</Name>\s*<CreationDate>([^<]+)</CreationDate>\s*</Bucket>",
+    )
+    .unwrap();
+
     for cap in re.captures_iter(xml) {
         buckets.push(BucketInfo {
             name: cap[1].to_string(),
@@ -564,7 +719,7 @@ fn parse_list_buckets_xml(xml: &str) -> Vec<BucketInfo> {
 fn parse_list_objects_xml(xml: &str) -> Vec<ObjectInfo> {
     let mut objects = Vec::new();
     let re = regex::Regex::new(r"<Contents>\s*<Key>([^<]+)</Key>\s*<Size>([^<]+)</Size>\s*<LastModified>([^<]+)</LastModified>\s*</Contents>").unwrap();
-    
+
     for cap in re.captures_iter(xml) {
         let size: u64 = cap[2].parse().unwrap_or(0);
         objects.push(ObjectInfo {
@@ -710,6 +865,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         alert_engine: alert_engine.clone(),
         ws_clients,
         s3_endpoint: args.s3_endpoint,
+        fuse_mounts: Arc::new(Mutex::new(Vec::new())),
     });
 
     let event_bus = EventBus::new(&args.redis_url, &args.stream_key);
@@ -753,9 +909,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/s3/buckets/:name", delete(delete_bucket))
         .route("/api/s3/buckets/:bucket/objects", get(get_objects))
         .route("/api/s3/buckets/:bucket/objects", post(upload_object))
-        .route("/api/s3/buckets/:bucket/objects/:key", delete(delete_object))
-        .route("/api/s3/buckets/:bucket/objects/:key/download", get(download_object))
+        .route(
+            "/api/s3/buckets/:bucket/objects/:key",
+            delete(delete_object),
+        )
+        .route(
+            "/api/s3/buckets/:bucket/objects/:key/download",
+            get(download_object),
+        )
         .route("/api/s3/multipart-uploads", get(get_multipart_uploads))
+        .route("/api/fuse/mounts", get(get_fuse_mounts))
+        .route("/api/fuse/mounts", post(create_fuse_mount))
+        .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
         .route("/api/alerts", get(get_alerts))
         .route("/api/alerts/:id", get(get_alert))
         .route("/api/alerts/:id/acknowledge", post(acknowledge_alert))

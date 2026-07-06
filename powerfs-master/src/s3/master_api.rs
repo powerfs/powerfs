@@ -10,7 +10,11 @@ pub enum MasterApi {
 }
 
 impl MasterApi {
-    pub async fn assign_volume(&self, replication: &str, collection: &str) -> Result<(Fid, Vec<DataNodeInfo>)> {
+    pub async fn assign_volume(
+        &self,
+        replication: &str,
+        collection: &str,
+    ) -> Result<(Fid, Vec<DataNodeInfo>)> {
         match self {
             MasterApi::Direct(master) => master.assign_volume(replication, collection).await,
             MasterApi::Remote(client) => client.assign_volume(replication, collection).await,

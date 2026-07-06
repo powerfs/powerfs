@@ -12,6 +12,7 @@ WORKDIR /app
 COPY target/release/powerfs /app/
 COPY target/release/powerfs-volume /app/
 COPY target/release/powerfs-monitor /app/
+COPY target/release/powerfs-fuse /app/
 
 EXPOSE 9333 8080 8081
 
