@@ -1,0 +1,247 @@
+networks:
+  powerfs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+
+volumes:
+  master-1-data:
+  master-2-data:
+  master-3-data:
+  volume-1-data:
+  volume-2-data:
+  volume-3-data:
+  redis-data:
+  s3-data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.50
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+  master-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: master-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.11
+    volumes:
+      - master-1-data:/data
+    ports:
+      - "9333:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  master-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: master-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.12
+    volumes:
+      - master-2-data:/data
+    ports:
+      - "9334:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  master-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: master-3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.13
+    volumes:
+      - master-3-data:/data
+    ports:
+      - "9335:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-2:
+        condition: service_healthy
+
+  volume-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: volume-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.21
+    volumes:
+      - volume-1-data:/data
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs-volume --grpc-address 172.20.0.21:8080 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-1
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.20.0.21 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: volume-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.22
+    volumes:
+      - volume-2-data:/data
+    ports:
+      - "8081:8080"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs-volume --grpc-address 172.20.0.22:8080 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-2
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.20.0.22 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: volume-3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.23
+    volumes:
+      - volume-3-data:/data
+    ports:
+      - "8082:8080"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs-volume --grpc-address 172.20.0.23:8080 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-3
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.20.0.23 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  monitor:
+    image: powerfs:latest
+    container_name: monitor
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.30
+    ports:
+      - "8083:8081"
+    environment:
+      - RUST_LOG=info
+      - REDIS_ADDR=redis:6379
+    command: /app/powerfs-monitor --redis-url redis://172.20.0.50:6379 --s3-endpoint http://172.20.0.32:9000
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
+  frontend:
+    image: powerfs-frontend:latest
+    container_name: frontend
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.31
+    ports:
+      - "8084:5173"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 5173 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      monitor:
+        condition: service_healthy
+
+  s3:
+    image: powerfs:latest
+    container_name: s3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.32
+    volumes:
+      - s3-data:/data
+    ports:
+      - "9000:9000"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs s3 --port 9000 --master 172.20.0.11:9333 --dir /data/s3
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy

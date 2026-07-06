@@ -17,8 +17,8 @@ async fn setup_server_and_client() -> (VolumeServiceClient<Channel>, TempDir) {
     let data_path = temp_dir.path().to_str().unwrap().to_string();
     let node_id = NodeId("test-node".to_string());
 
-    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), data_path));
-    let server = VolumeServer::new(storage_manager, node_id);
+    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), data_path.clone()));
+    let server = VolumeServer::new(storage_manager, node_id, "127.0.0.1", 50051, 8080, &data_path);
 
     let (tx, rx) = oneshot::channel();
 

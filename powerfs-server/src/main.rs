@@ -3,7 +3,7 @@ use log::info;
 use powerfs_common::{error::Result, utils::generate_node_id};
 use powerfs_core::storage::StorageManager;
 use powerfs_fuse::FuserApp;
-use powerfs_master::master::MasterNode;
+use powerfs_master::{master::MasterNode, s3::S3Server, s3::MasterApi, s3::master_client::S3MasterClient};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -108,6 +108,23 @@ enum Commands {
         #[arg(long, short)]
         master: Option<String>,
     },
+
+    S3 {
+        #[arg(long, short, default_value = "9000")]
+        port: u16,
+
+        /// Master address
+        #[arg(long, short)]
+        master: String,
+
+        /// Bind IP address
+        #[arg(long)]
+        ip: Option<String>,
+
+        /// Data directory for DirectoryTree
+        #[arg(long, short, default_value = "./data/s3")]
+        dir: String,
+    },
 }
 
 #[tokio::main]
@@ -148,6 +165,8 @@ async fn main() -> Result<()> {
         } => run_fuse(&dir, master, volume_port).await,
 
         Commands::Mount { dir, master } => run_mount(&dir, master).await,
+
+        Commands::S3 { port, master, ip, dir } => run_s3(port, &master, ip, &dir).await,
     }
 }
 
@@ -267,4 +286,45 @@ async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Connected to master: {}", master_addr);
 
     fuse_app.run().await
+}
+
+async fn run_s3(port: u16, master: &str, ip: Option<String>, dir: &str) -> Result<()> {
+    info!("Starting PowerFS S3 Server");
+
+    std::fs::create_dir_all(dir)?;
+
+    let address = match ip {
+        Some(ip) => format!("{}:{}", ip, port),
+        None => format!("0.0.0.0:{}", port),
+    };
+
+    let s3_addr: std::net::SocketAddr = address.parse()?;
+
+    let directory_tree = Arc::new(powerfs_master::directory_tree::DirectoryTree::new(std::path::Path::new(dir))
+        .map_err(|e| powerfs_common::error::PowerFsError::Internal(format!("Failed to create directory tree: {}", e)))?);
+
+    let master_api = Arc::new(MasterApi::Remote(Arc::new(S3MasterClient::new(master))));
+
+    let volume_client_pool = Arc::new(powerfs_master::volume_client::VolumeClientPool::new());
+
+    let lock_manager = Arc::new(powerfs_master::lock_manager::LockManager::new());
+
+    let s3_server = S3Server::new(
+        s3_addr,
+        directory_tree,
+        master_api,
+        volume_client_pool,
+        lock_manager,
+    );
+
+    info!("S3 Server initialized");
+    info!("Listening on: {}", address);
+    info!("Connected to master: {}", master);
+    info!("Data directory: {}", dir);
+
+    s3_server.serve().await.map_err(|e| {
+        powerfs_common::error::PowerFsError::Internal(format!("S3 server error: {}", e))
+    })?;
+
+    Ok(())
 }

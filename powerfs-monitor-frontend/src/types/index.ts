@@ -105,3 +105,38 @@ export interface TimeSeriesData {
 }
 
 export type MetricType = 'gauge' | 'counter' | 'histogram'
+
+export interface BucketInfo {
+  name: string
+  creation_date: string
+  object_count: number
+  total_size: number
+}
+
+export interface ObjectInfo {
+  key: string
+  etag: string
+  size: number
+  last_modified: string
+  storage_class: string
+}
+
+export interface MultipartUploadInfo {
+  upload_id: string
+  key: string
+  bucket: string
+  initiator: string
+  creation_date: string
+  part_count: number
+  status: 'in_progress' | 'completed' | 'aborted'
+}
+
+export interface S3Metrics {
+  bucket_count: number
+  object_count: number
+  total_size: number
+  active_multipart_uploads: number
+  put_requests: number
+  get_requests: number
+  delete_requests: number
+}

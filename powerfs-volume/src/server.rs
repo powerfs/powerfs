@@ -4,10 +4,12 @@ use crate::proto::{VolumeService, VolumeServiceServer};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use powerfs_common::{
+    collect_system_metrics,
     error::{PowerFsError, Result},
-    event::{Event, EventPublisher, VolumeStatusEvent},
+    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
     types::{NeedleId, NodeId, VolumeId},
 };
+use sysinfo::System;
 use powerfs_core::storage::StorageManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,10 +20,21 @@ pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
     node_id: NodeId,
     event_publisher: Option<EventPublisher>,
+    ip: String,
+    grpc_port: u32,
+    http_port: u32,
+    data_dir: String,
 }
 
 impl VolumeServer {
-    pub fn new(storage_manager: Arc<StorageManager>, node_id: NodeId) -> Self {
+    pub fn new(
+        storage_manager: Arc<StorageManager>,
+        node_id: NodeId,
+        ip: &str,
+        grpc_port: u32,
+        http_port: u32,
+        data_dir: &str,
+    ) -> Self {
         let event_publisher = match std::env::var("REDIS_URL") {
             Ok(url) => {
                 info!("Event publisher enabled with Redis: {}", url);
@@ -37,15 +50,21 @@ impl VolumeServer {
             storage_manager,
             node_id,
             event_publisher,
+            ip: ip.to_string(),
+            grpc_port,
+            http_port,
+            data_dir: data_dir.to_string(),
         }
     }
 
-    pub async fn start(self, address: &str) -> Result<()> {
+    pub async fn start(mut self, address: &str) -> Result<()> {
         let addr: std::net::SocketAddr = address.parse()?;
 
         info!("Starting PowerFS Volume server on: {}", addr);
         info!("Node ID: {}", self.node_id.0);
         info!("Max message size: 256MB");
+
+        self.start_node_status_publisher().await;
 
         Server::builder()
             .http2_keepalive_timeout(Some(Duration::from_secs(30)))
@@ -62,6 +81,77 @@ impl VolumeServer {
                 error!("Volume server stopped with error: {}", e);
                 PowerFsError::TonicTransport(e)
             })
+    }
+
+    async fn start_node_status_publisher(&mut self) {
+        if self.event_publisher.is_none() {
+            return;
+        }
+
+        let publisher = self.event_publisher.clone().unwrap();
+        let node_id_str = self.node_id.0.clone();
+        let ip = self.ip.clone();
+        let grpc_port = self.grpc_port;
+        let http_port = self.http_port;
+        let data_dir = self.data_dir.clone();
+        let storage_manager = self.storage_manager.clone();
+
+        tokio::spawn(async move {
+            info!("Starting node status publisher");
+
+            let mut sys = System::new_all();
+            sys.refresh_all();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sys.refresh_all();
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                let metrics = collect_system_metrics(&mut sys, &data_dir);
+
+                let event = Event::NodeStatus(NodeStatusEvent {
+                    node_id: node_id_str.clone(),
+                    address: ip.clone(),
+                    grpc_port,
+                    http_port,
+                    status: "healthy".to_string(),
+                    cpu_usage: metrics.cpu_usage,
+                    mem_usage: metrics.mem_usage,
+                    disk_usage: metrics.disk_usage,
+                    network_rx: metrics.network_rx,
+                    network_tx: metrics.network_tx,
+                    uptime: metrics.uptime,
+                    volume_count: storage_manager.volume_count() as u32,
+                });
+
+                if let Err(e) = publisher.publish(event, &node_id_str).await {
+                    warn!("Failed to publish node_status event: {}", e);
+                }
+
+                let volumes = storage_manager.list_volumes();
+                for volume in volumes {
+                    let volume_event = Event::VolumeStatus(VolumeStatusEvent {
+                        volume_id: volume.id.0,
+                        node_id: node_id_str.clone(),
+                        size: volume.size,
+                        used: volume.used,
+                        file_count: volume.next_file_key - 1,
+                        status: match volume.state {
+                            powerfs_common::types::VolumeState::Creating => "creating",
+                            powerfs_common::types::VolumeState::Available => "available",
+                            powerfs_common::types::VolumeState::Full => "full",
+                            powerfs_common::types::VolumeState::ReadOnly => "read_only",
+                            powerfs_common::types::VolumeState::Deleting => "deleting",
+                        }.to_string(),
+                        collection: volume.collection.0.clone(),
+                    });
+
+                    if let Err(e) = publisher.publish(volume_event, &format!("{}", volume.id.0)).await {
+                        warn!("Failed to publish volume_status event for volume {}: {}", volume.id.0, e);
+                    }
+                }
+            }
+        });
     }
 }
 

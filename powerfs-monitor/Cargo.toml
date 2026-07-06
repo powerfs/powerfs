@@ -17,7 +17,7 @@ log = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-axum = { version = "0.6", features = ["ws", "json"] }
+axum = { version = "0.6", features = ["ws", "json", "multipart"] }
 redis = { version = "0.24", features = ["tokio-comp"] }
 tower-http = { version = "0.4", features = ["cors"] }
 futures = { workspace = true }
@@ -25,3 +25,5 @@ futures-util = { version = "0.3" }
 clap = { workspace = true }
 env_logger = { workspace = true }
 rand = { version = "0.8" }
+reqwest = { version = "0.11", features = ["json"] }
+regex = { version = "1" }

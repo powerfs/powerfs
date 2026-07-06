@@ -1,5 +1,5 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
-use crate::volume_proto::powerfs::{ReadNeedleRequest, WriteNeedleRequest};
+use crate::volume_proto::powerfs::{ReadNeedleRequest, WriteNeedleRequest, DeleteNeedleRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
@@ -86,6 +86,25 @@ impl VolumeClient {
             Err("read_needle failed".to_string())
         }
     }
+
+    pub async fn delete_needle(&mut self, volume_id: u32, file_key: u64) -> Result<(), String> {
+        let mut service = self.service().await?;
+        let request = DeleteNeedleRequest {
+            volume_id,
+            file_key,
+            cookie: 0,
+        };
+        let response = service
+            .delete_needle(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("delete_needle failed: {}", e))?;
+        let result = response.into_inner();
+        if result.success {
+            Ok(())
+        } else {
+            Err("delete_needle failed".to_string())
+        }
+    }
 }
 
 pub struct VolumeClientPool {
@@ -126,6 +145,17 @@ impl VolumeClientPool {
         let client = self.get_or_create(address);
         let mut guard = client.lock().await;
         guard.read_needle(volume_id, file_key).await
+    }
+
+    pub async fn delete_needle(
+        &self,
+        address: &str,
+        volume_id: u32,
+        file_key: u64,
+    ) -> Result<(), String> {
+        let client = self.get_or_create(address);
+        let mut guard = client.lock().await;
+        guard.delete_needle(volume_id, file_key).await
     }
 }
 

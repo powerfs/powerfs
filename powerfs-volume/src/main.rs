@@ -57,9 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Data Dir: {}", args.data_dir);
 
     let node_id = NodeId(args.node_id.clone());
+    let data_dir = args.data_dir.clone();
     let storage_manager = Arc::new(StorageManager::new(node_id.clone(), args.data_dir));
-
-    let volume_server = VolumeServer::new(storage_manager.clone(), node_id.clone());
 
     let grpc_port = args
         .grpc_address
@@ -68,6 +67,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(args.http_port + 1);
 
+    let ip = args
+        .grpc_address
+        .split(':')
+        .next()
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    let volume_server = VolumeServer::new(
+        storage_manager.clone(),
+        node_id.clone(),
+        &ip,
+        grpc_port,
+        args.http_port,
+        &data_dir,
+    );
+
     let mut master_client = MasterClient::new(
         &args.master_address,
         node_id,
@@ -75,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.http_port,
         &args.data_center,
         &args.rack,
-        &format!("http://127.0.0.1:{}", args.http_port),
+        &format!("http://{}:{}", ip, args.http_port),
+        &ip,
     );
 
     if args.register_with_master {

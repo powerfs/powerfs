@@ -10,6 +10,7 @@ import {
   MenuUnfoldOutlined,
   RocketOutlined,
   SaveOutlined,
+  CloudOutlined,
 } from '@ant-design/icons'
 
 const { Header, Sider, Content } = Layout
@@ -19,6 +20,7 @@ const menuItems = [
   { key: '/nodes', icon: <SaveOutlined />, label: '节点管理' },
   { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume管理' },
   { key: '/kv', icon: <KeyOutlined />, label: 'KV管理' },
+  { key: '/s3', icon: <CloudOutlined />, label: 'S3管理' },
   { key: '/alerts', icon: <BellOutlined />, label: '告警中心' },
 ]
 

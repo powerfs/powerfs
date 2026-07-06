@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use redis::streams::{StreamReadOptions, StreamReadReply};
-use redis::{AsyncCommands, Client, RedisResult, Value};
+use redis::streams::{StreamReadOptions, StreamReadReply, StreamRangeReply};
+use redis::{AsyncCommands, Client, RedisConnectionInfo, RedisResult, Value};
 
 use crate::event::EventEnvelope;
 
@@ -25,6 +26,56 @@ impl EventBus {
             stream_key: self.stream_key.clone(),
             last_id: "0".to_string(),
         }
+    }
+
+    pub async fn read_history(&self) -> RedisResult<Vec<EventEnvelope>> {
+        let mut conn = self.client.get_async_connection().await?;
+
+        let reply: StreamRangeReply = conn
+            .xrange(&self.stream_key, "-", "+")
+            .await?;
+
+        let mut events = Vec::new();
+        let mut last_id = "0".to_string();
+
+        for entry in reply.ids {
+            last_id = entry.id.clone();
+
+            let mut event_id = String::new();
+            let mut source = String::new();
+            let mut source_id = String::new();
+            let mut payload_str = String::new();
+
+            for (key, value) in entry.map {
+                let value_str = match value {
+                    Value::Data(data) => String::from_utf8_lossy(&data).to_string(),
+                    Value::Status(s) => s,
+                    _ => continue,
+                };
+                match key.as_str() {
+                    "event_id" => event_id = value_str,
+                    "source" => source = value_str,
+                    "source_id" => source_id = value_str,
+                    "payload" => payload_str = value_str,
+                    _ => {}
+                }
+            }
+
+            if !payload_str.is_empty() {
+                if let Ok(event) = serde_json::from_str(&payload_str) {
+                    events.push(EventEnvelope {
+                        event_id,
+                        source,
+                        source_id,
+                        timestamp: chrono::Utc::now(),
+                        version: "1.0".to_string(),
+                        event,
+                    });
+                }
+            }
+        }
+
+        Ok(events)
     }
 }
 

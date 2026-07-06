@@ -4,6 +4,7 @@ target/
 Cargo.lock
 beegfs/
 seaweedfs/
+rustfs/
 log
 *.log
 p*.sh

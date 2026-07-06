@@ -27,6 +27,7 @@ function Volumes() {
 
   const loadVolumes = async () => {
     const data = await getVolumes()
+    console.log('Loaded volumes:', data.length, 'unique:', new Set(data.map(v => v.id)).size)
     setVolumes(data)
   }
 
@@ -55,11 +56,18 @@ function Volumes() {
   }
 
   const collections = [...new Set(volumes.map(v => v.collection))]
-  const filteredVolumes = volumes.filter(v => {
-    if (filterStatus && v.status !== filterStatus) return false
-    if (filterCollection && v.collection !== filterCollection) return false
-    return true
-  })
+  const filteredVolumes = volumes
+    .filter(v => {
+      if (filterStatus && v.status !== filterStatus) return false
+      if (filterCollection && v.collection !== filterCollection) return false
+      return true
+    })
+    .reduce((acc, v) => {
+      if (!acc.find(item => item.id === v.id)) {
+        acc.push(v)
+      }
+      return acc
+    }, [] as VolumeInfo[])
 
   const columns = [
     {

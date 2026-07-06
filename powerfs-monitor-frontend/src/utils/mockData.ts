@@ -1,4 +1,4 @@
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics } from '@/types'
 
 export const mockNodes: NodeInfo[] = [
   {
@@ -76,7 +76,7 @@ export const mockAlertRules: AlertRule[] = [
     description: '当节点磁盘使用率超过80%时触发告警',
     enabled: true,
     severity: 'warning',
-    condition: { type: 'threshold', metric: 'powerfs_node_disk_usage', operator: '>', value: 80, duration: 300 },
+    condition: { metric: 'powerfs_node_disk_usage', operator: '>', value: 80, duration: 300 },
     notifications: [{ type: 'webhook', url: 'https://example.com/webhook' }],
     created_at: '2026-07-01T10:00:00Z',
     updated_at: '2026-07-01T10:00:00Z',
@@ -87,7 +87,7 @@ export const mockAlertRules: AlertRule[] = [
     description: '当节点CPU使用率超过85%时触发告警',
     enabled: true,
     severity: 'critical',
-    condition: { type: 'threshold', metric: 'powerfs_node_cpu_usage', operator: '>', value: 85, duration: 120 },
+    condition: { metric: 'powerfs_node_cpu_usage', operator: '>', value: 85, duration: 120 },
     notifications: [{ type: 'webhook', url: 'https://example.com/webhook' }, { type: 'dingtalk', url: 'https://oapi.dingtalk.com/robot/send' }],
     created_at: '2026-07-01T10:00:00Z',
     updated_at: '2026-07-02T14:00:00Z',
@@ -129,4 +129,35 @@ export function generateTimeSeriesData(points: number = 24, baseValue: number = 
     })
   }
   return data
+}
+
+export const mockBuckets: BucketInfo[] = [
+  { name: 'my-bucket', creation_date: '2026-07-01T10:00:00Z', object_count: 1250, total_size: 21474836480 },
+  { name: 'backup-data', creation_date: '2026-07-02T14:00:00Z', object_count: 890, total_size: 16106127360 },
+  { name: 'logs', creation_date: '2026-07-03T08:00:00Z', object_count: 2500, total_size: 8053063680 },
+  { name: 'media', creation_date: '2026-07-03T16:00:00Z', object_count: 450, total_size: 32212254720 },
+]
+
+export const mockObjects: ObjectInfo[] = [
+  { key: 'documents/report.pdf', etag: '"abc123"', size: 5242880, last_modified: '2026-07-04T10:00:00Z', storage_class: 'STANDARD' },
+  { key: 'images/photo.jpg', etag: '"def456"', size: 10485760, last_modified: '2026-07-04T09:30:00Z', storage_class: 'STANDARD' },
+  { key: 'data/file.csv', etag: '"ghi789"', size: 20971520, last_modified: '2026-07-04T08:15:00Z', storage_class: 'STANDARD' },
+  { key: 'backup/archive.zip', etag: '"jkl012"', size: 1073741824, last_modified: '2026-07-03T20:00:00Z', storage_class: 'STANDARD' },
+  { key: 'logs/server.log', etag: '"mno345"', size: 52428800, last_modified: '2026-07-04T11:00:00Z', storage_class: 'STANDARD' },
+]
+
+export const mockMultipartUploads: MultipartUploadInfo[] = [
+  { upload_id: 'upload-1', key: 'large-file.bin', bucket: 'my-bucket', initiator: 'user1', creation_date: '2026-07-04T09:00:00Z', part_count: 5, status: 'in_progress' },
+  { upload_id: 'upload-2', key: 'backup-full.tar', bucket: 'backup-data', initiator: 'user2', creation_date: '2026-07-04T08:30:00Z', part_count: 12, status: 'in_progress' },
+  { upload_id: 'upload-3', key: 'archive-2026.tar', bucket: 'backup-data', initiator: 'user1', creation_date: '2026-07-03T15:00:00Z', part_count: 8, status: 'completed' },
+]
+
+export const mockS3Metrics: S3Metrics = {
+  bucket_count: 4,
+  object_count: 5090,
+  total_size: 77846343680,
+  active_multipart_uploads: 2,
+  put_requests: 15000,
+  get_requests: 45000,
+  delete_requests: 2000,
 }

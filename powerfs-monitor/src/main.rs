@@ -3,16 +3,16 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Json, Path, State,
+        Json, Path, Query, State,
     },
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router, Server,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
@@ -32,6 +32,9 @@ struct Args {
 
     #[arg(long, default_value = "powerfs_events")]
     stream_key: String,
+
+    #[arg(long, default_value = "http://localhost:9000")]
+    s3_endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +56,51 @@ struct AppState {
     metric_store: Arc<MetricStore>,
     alert_engine: Arc<AlertEngine>,
     ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<serde_json::Value>>>>,
+    s3_endpoint: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S3Metrics {
+    bucket_count: u64,
+    object_count: u64,
+    total_size: u64,
+    active_multipart_uploads: u64,
+    put_requests: u64,
+    get_requests: u64,
+    delete_requests: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BucketInfo {
+    name: String,
+    creation_date: String,
+    object_count: u64,
+    total_size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObjectInfo {
+    key: String,
+    etag: String,
+    size: u64,
+    last_modified: String,
+    storage_class: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MultipartUploadInfo {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    initiator: String,
+    creation_date: String,
+    part_count: u64,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBucketRequest {
+    name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +193,389 @@ async fn get_kv_session(
 struct TimeSeriesPoint {
     time: String,
     value: f64,
+}
+
+async fn get_s3_metrics(State(state): State<Arc<AppState>>) -> Json<ApiResponse<S3Metrics>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/", state.s3_endpoint);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(body) = response.text().await {
+                    let bucket_count = body.matches("<Bucket>").count() as u64;
+                    Json(ApiResponse::success(S3Metrics {
+                        bucket_count,
+                        object_count: 0,
+                        total_size: 0,
+                        active_multipart_uploads: 0,
+                        put_requests: 0,
+                        get_requests: 0,
+                        delete_requests: 0,
+                    }))
+                } else {
+                    Json(ApiResponse::error("Failed to parse S3 response"))
+                }
+            } else {
+                Json(ApiResponse::error("Failed to get S3 metrics"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::success(S3Metrics {
+                bucket_count: 0,
+                object_count: 0,
+                total_size: 0,
+                active_multipart_uploads: 0,
+                put_requests: 0,
+                get_requests: 0,
+                delete_requests: 0,
+            }))
+        }
+    }
+}
+
+async fn get_buckets(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<BucketInfo>>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/", state.s3_endpoint);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(body) = response.text().await {
+                    let buckets = parse_list_buckets_xml(&body);
+                    Json(ApiResponse::success(buckets))
+                } else {
+                    Json(ApiResponse::error("Failed to parse S3 response"))
+                }
+            } else {
+                Json(ApiResponse::error("Failed to get buckets"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
+}
+
+async fn get_bucket(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<ApiResponse<BucketInfo>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}", state.s3_endpoint, name);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(body) = response.text().await {
+                    let objects = parse_list_objects_xml(&body);
+                    let total_size: u64 = objects.iter().map(|o| o.size).sum();
+                    Json(ApiResponse::success(BucketInfo {
+                        name,
+                        creation_date: chrono::Utc::now().to_rfc3339(),
+                        object_count: objects.len() as u64,
+                        total_size,
+                    }))
+                } else {
+                    Json(ApiResponse::error("Failed to parse S3 response"))
+                }
+            } else {
+                Json(ApiResponse::error("Bucket not found"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::error("S3 connection error"))
+        }
+    }
+}
+
+async fn create_bucket(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateBucketRequest>,
+) -> Json<ApiResponse<()>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}", state.s3_endpoint, req.name);
+
+    match client.put(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error("Failed to create bucket"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::error("S3 connection error"))
+        }
+    }
+}
+
+async fn delete_bucket(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<ApiResponse<()>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}", state.s3_endpoint, name);
+
+    match client.delete(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error("Failed to delete bucket"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::error("S3 connection error"))
+        }
+    }
+}
+
+async fn get_objects(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+) -> Json<ApiResponse<Vec<ObjectInfo>>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}", state.s3_endpoint, bucket);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(body) = response.text().await {
+                    let objects = parse_list_objects_xml(&body);
+                    Json(ApiResponse::success(objects))
+                } else {
+                    Json(ApiResponse::error("Failed to parse S3 response"))
+                }
+            } else {
+                Json(ApiResponse::error("Bucket not found"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
+}
+
+async fn delete_object(
+    State(state): State<Arc<AppState>>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<ApiResponse<()>> {
+    if let Some(upload_id) = params.get("uploadId") {
+        let client = reqwest::Client::new();
+        let url = format!("{}/_admin/multipart-uploads/{}", state.s3_endpoint, upload_id);
+
+        match client.delete(&url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    Json(ApiResponse::success(()))
+                } else {
+                    Json(ApiResponse::error("Failed to abort multipart upload"))
+                }
+            }
+            Err(e) => {
+                warn!("S3 connection error: {}", e);
+                Json(ApiResponse::error("S3 connection error"))
+            }
+        }
+    } else {
+        let client = reqwest::Client::new();
+        let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
+
+        match client.delete(&url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    Json(ApiResponse::success(()))
+                } else {
+                    Json(ApiResponse::error("Failed to delete object"))
+                }
+            }
+            Err(e) => {
+                warn!("S3 connection error: {}", e);
+                Json(ApiResponse::error("S3 connection error"))
+            }
+        }
+    }
+}
+
+async fn get_multipart_uploads(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<ApiResponse<Vec<MultipartUploadInfo>>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/_admin/multipart-uploads", state.s3_endpoint);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(mut json) = response.json::<Vec<MultipartUploadInfo>>().await {
+                    if let Some(bucket) = params.get("bucket") {
+                        json.retain(|u| u.bucket == *bucket);
+                    }
+                    Json(ApiResponse::success(json))
+                } else {
+                    Json(ApiResponse::error("Failed to parse multipart uploads"))
+                }
+            } else {
+                Json(ApiResponse::error("Failed to get multipart uploads"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
+}
+
+async fn upload_object(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    mut req: axum::extract::Multipart,
+) -> Json<ApiResponse<()>> {
+    info!("Upload object request received for bucket: {}", bucket);
+    
+    let mut key: Option<String> = None;
+    let mut file_data: Option<axum::body::Bytes> = None;
+
+    while let Some(field) = req.next_field().await.unwrap() {
+        let name = field.name().unwrap_or("").to_string();
+        info!("Found field: {}", name);
+        if name == "key" {
+            key = Some(field.text().await.unwrap());
+            info!("Got key: {:?}", key);
+        } else if name == "file" {
+            file_data = Some(field.bytes().await.unwrap());
+            info!("Got file data: {} bytes", file_data.as_ref().map(|b| b.len()).unwrap_or(0));
+        }
+    }
+
+    let key = match key {
+        Some(k) => k,
+        None => return Json(ApiResponse::error("Missing key")),
+    };
+
+    let data = match file_data {
+        Some(d) => d,
+        None => return Json(ApiResponse::error("Missing file")),
+    };
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
+    info!("Sending request to S3: PUT {}", url);
+
+    match client.put(&url).body(data).send().await {
+        Ok(response) => {
+            info!("S3 response status: {}", response.status());
+            if response.status().is_success() {
+                Json(ApiResponse::success(()))
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                warn!("S3 upload failed: {}", body);
+                Json(ApiResponse::error("Failed to upload object"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            Json(ApiResponse::error("S3 connection error"))
+        }
+    }
+}
+
+async fn download_object(
+    State(state): State<Arc<AppState>>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get("Content-Type")
+                .map(|h| h.to_str().unwrap_or("application/octet-stream"))
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let etag = response
+                .headers()
+                .get("ETag")
+                .map(|h| h.to_str().unwrap_or(""))
+                .unwrap_or("")
+                .to_string();
+            
+            if status.is_success() {
+                let body = response.bytes().await.unwrap();
+
+                let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from(body));
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    content_type.parse().unwrap(),
+                );
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", key).parse().unwrap(),
+                );
+                if !etag.is_empty() {
+                    resp.headers_mut().insert(
+                        axum::http::header::ETAG,
+                        etag.parse().unwrap(),
+                    );
+                }
+                resp
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from(body));
+                *resp.status_mut() = axum::http::StatusCode::NOT_FOUND;
+                resp
+            }
+        }
+        Err(e) => {
+            warn!("S3 connection error: {}", e);
+            let mut resp: axum::http::Response<axum::body::Body> = axum::response::Response::new(axum::body::Body::from("S3 connection error"));
+            *resp.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            resp
+        }
+    }
+}
+
+fn parse_list_buckets_xml(xml: &str) -> Vec<BucketInfo> {
+    let mut buckets = Vec::new();
+    let re = regex::Regex::new(r"<Bucket>\s*<Name>([^<]+)</Name>\s*<CreationDate>([^<]+)</CreationDate>\s*</Bucket>").unwrap();
+    
+    for cap in re.captures_iter(xml) {
+        buckets.push(BucketInfo {
+            name: cap[1].to_string(),
+            creation_date: cap[2].to_string(),
+            object_count: 0,
+            total_size: 0,
+        });
+    }
+    buckets
+}
+
+fn parse_list_objects_xml(xml: &str) -> Vec<ObjectInfo> {
+    let mut objects = Vec::new();
+    let re = regex::Regex::new(r"<Contents>\s*<Key>([^<]+)</Key>\s*<Size>([^<]+)</Size>\s*<LastModified>([^<]+)</LastModified>\s*</Contents>").unwrap();
+    
+    for cap in re.captures_iter(xml) {
+        let size: u64 = cap[2].parse().unwrap_or(0);
+        objects.push(ObjectInfo {
+            key: cap[1].to_string(),
+            etag: "".to_string(),
+            size,
+            last_modified: cap[3].to_string(),
+            storage_class: "STANDARD".to_string(),
+        });
+    }
+    objects
 }
 
 async fn get_metric_history(
@@ -278,6 +709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metric_store: metric_store.clone(),
         alert_engine: alert_engine.clone(),
         ws_clients,
+        s3_endpoint: args.s3_endpoint,
     });
 
     let event_bus = EventBus::new(&args.redis_url, &args.stream_key);
@@ -314,6 +746,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
         .route("/api/metrics/history/:metric", get(get_metric_history))
+        .route("/api/metrics/s3", get(get_s3_metrics))
+        .route("/api/s3/buckets", get(get_buckets))
+        .route("/api/s3/buckets/:name", get(get_bucket))
+        .route("/api/s3/buckets", post(create_bucket))
+        .route("/api/s3/buckets/:name", delete(delete_bucket))
+        .route("/api/s3/buckets/:bucket/objects", get(get_objects))
+        .route("/api/s3/buckets/:bucket/objects", post(upload_object))
+        .route("/api/s3/buckets/:bucket/objects/:key", delete(delete_object))
+        .route("/api/s3/buckets/:bucket/objects/:key/download", get(download_object))
+        .route("/api/s3/multipart-uploads", get(get_multipart_uploads))
         .route("/api/alerts", get(get_alerts))
         .route("/api/alerts/:id", get(get_alert))
         .route("/api/alerts/:id/acknowledge", post(acknowledge_alert))
@@ -338,9 +780,32 @@ async fn start_event_processor(
     _alert_engine: Arc<AlertEngine>,
     app_state: Arc<AppState>,
 ) {
-    let mut stream = event_bus.subscribe().await;
-
     info!("Event processor started");
+
+    match event_bus.read_history().await {
+        Ok(events) => {
+            info!("Loaded {} historical events", events.len());
+            for event in events {
+                match &event.event {
+                    Event::NodeStatus(e) => {
+                        metric_store.update_node(e.clone()).await;
+                    }
+                    Event::VolumeStatus(e) => {
+                        metric_store.update_volume(e.clone()).await;
+                    }
+                    Event::KVSession(e) => {
+                        metric_store.update_kv_session(e.clone()).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to load historical events: {}", e);
+        }
+    }
+
+    let mut stream = event_bus.subscribe().await;
 
     loop {
         match stream.read().await {

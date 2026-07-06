@@ -5,7 +5,7 @@ use chrono::Utc;
 use log::{debug, error, info, warn};
 use powerfs_common::{
     error::{PowerFsError, Result},
-    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
+    event::{Event, EventPublisher, VolumeStatusEvent},
     types::{
         ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
         NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
@@ -459,7 +459,7 @@ impl MasterNode {
         let node_id = params.node_id.clone();
         let address = params.address.clone();
         let http_port = params.http_port;
-        let grpc_port = params.grpc_port;
+        let _grpc_port = params.grpc_port;
 
         let mut topology = self.topology.write().unwrap();
         let node = DataNodeInfo::new(
@@ -474,30 +474,6 @@ impl MasterNode {
         topology.get_or_create_node(node);
 
         info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
-
-        if let Some(publisher) = self.event_publisher.clone() {
-            let node_id_str = node_id.0.clone();
-            let addr_clone = address.clone();
-            tokio::spawn(async move {
-                let event = Event::NodeStatus(NodeStatusEvent {
-                    node_id: node_id_str.clone(),
-                    address: addr_clone,
-                    grpc_port,
-                    http_port,
-                    status: "healthy".to_string(),
-                    cpu_usage: 0.0,
-                    mem_usage: 0.0,
-                    disk_usage: 0.0,
-                    network_rx: 0,
-                    network_tx: 0,
-                    uptime: 0,
-                    volume_count: 0,
-                });
-                if let Err(e) = publisher.publish(event, &node_id_str).await {
-                    warn!("Failed to publish node_status event: {}", e);
-                }
-            });
-        }
 
         Ok(())
     }
@@ -897,18 +873,18 @@ impl MasterNode {
             ));
         }
 
-        let (volume_size_limit, rack_awareness_enabled) = {
+        let (_volume_size_limit, _rack_awareness_enabled) = {
             let config = self.cluster_config.read().unwrap();
             (config.volume_size_limit, config.rack_awareness_enabled)
         };
 
-        let replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
+        let _replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
 
         let collection_obj = Collection(collection.to_string());
-        let ttl = Ttl::default();
-        let disk_type = DiskType::default();
+        let _ttl = Ttl::default();
+        let _disk_type = DiskType::default();
 
-        let replica_count = replica_placement.get_copy_count();
+        let _replica_count = _replica_placement.get_copy_count();
 
         // Try to find an existing writable volume for this collection with available space.
         // This reuses volumes already created on volume servers (via grow), avoiding
@@ -972,11 +948,51 @@ impl MasterNode {
             }
         }
 
+        self.create_new_volume(replication, collection).await
+    }
+
+    pub async fn create_new_volume(
+        &self,
+        replication: &str,
+        collection: &str,
+    ) -> Result<(Fid, Vec<DataNodeInfo>)> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let nodes = self.topology.read().unwrap().list_all_nodes();
+        if nodes.is_empty() {
+            return Err(PowerFsError::InvalidRequest(
+                "no nodes available".to_string(),
+            ));
+        }
+
+        let (volume_size_limit, rack_awareness_enabled) = {
+            let config = self.cluster_config.read().unwrap();
+            (config.volume_size_limit, config.rack_awareness_enabled)
+        };
+
+        let replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
+
+        let collection_obj = Collection(collection.to_string());
+        let ttl = Ttl::default();
+        let disk_type = DiskType::default();
+
+        let replica_count = replica_placement.get_copy_count();
+
         // No existing writable volume found - create a new one
         let selected_nodes = if rack_awareness_enabled && nodes.len() > 1 {
             Self::select_nodes_by_rack(&nodes, replica_count)
         } else {
-            nodes.into_iter().take(replica_count as usize).collect()
+            let volumes = self.volumes.read().unwrap();
+            let total_volumes = volumes.len();
+            let start_index = total_volumes % nodes.len();
+            let mut selected = Vec::new();
+            for i in 0..replica_count as usize {
+                let idx = (start_index + i) % nodes.len();
+                selected.push(nodes[idx].clone());
+            }
+            selected
         };
 
         if selected_nodes.len() < replica_count as usize {

@@ -17,6 +17,7 @@ pub struct MasterClient {
     data_center: String,
     rack: String,
     public_url: String,
+    ip: String,
     sender: Option<mpsc::Sender<Heartbeat>>,
 }
 
@@ -29,6 +30,7 @@ impl MasterClient {
         data_center: &str,
         rack: &str,
         public_url: &str,
+        ip: &str,
     ) -> Self {
         MasterClient {
             master_address: master_address.to_string(),
@@ -38,6 +40,7 @@ impl MasterClient {
             data_center: data_center.to_string(),
             rack: rack.to_string(),
             public_url: public_url.to_string(),
+            ip: ip.to_string(),
             sender: None,
         }
     }
@@ -81,7 +84,7 @@ impl MasterClient {
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(sender) = &self.sender {
             let heartbeat = Heartbeat {
-                ip: "127.0.0.1".to_string(),
+                ip: self.ip.clone(),
                 port: self.http_port,
                 public_url: self.public_url.clone(),
                 max_file_key: 0,

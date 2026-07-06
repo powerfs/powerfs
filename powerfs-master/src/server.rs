@@ -424,7 +424,7 @@ impl MasterService for MasterGrpcServer {
         for _ in 0..req.count {
             match self
                 .master
-                .assign_volume(&req.replication, &req.collection)
+                .create_new_volume(&req.replication, &req.collection)
                 .await
             {
                 Ok((fid, nodes)) => {
