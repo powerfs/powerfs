@@ -8,16 +8,18 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::directory_tree::DirectoryTree;
 use crate::lock_manager::{LockLevel, LockManager};
+use crate::s3::auth::AuthManager;
+use crate::s3::directory_tree_api::DirectoryTreeApi;
 use crate::s3::master_api::MasterApi;
 use crate::volume_client::VolumeClientPool;
 
 pub struct S3Server {
-    directory_tree: Arc<DirectoryTree>,
+    directory_tree: Arc<dyn DirectoryTreeApi>,
     master: Arc<MasterApi>,
     volume_client_pool: Arc<VolumeClientPool>,
     lock_manager: Arc<LockManager>,
+    auth_manager: Arc<AuthManager>,
     addr: std::net::SocketAddr,
 }
 
@@ -39,27 +41,48 @@ pub struct MultipartSession {
 }
 
 pub struct S3State {
-    pub directory_tree: Arc<DirectoryTree>,
+    pub directory_tree: Arc<dyn DirectoryTreeApi>,
     pub master: Arc<MasterApi>,
     pub volume_client_pool: Arc<VolumeClientPool>,
     pub lock_manager: Arc<LockManager>,
+    pub auth_manager: Arc<AuthManager>,
     pub multipart_sessions:
         tokio::sync::RwLock<std::collections::HashMap<String, MultipartSession>>,
+}
+
+fn s3_error(
+    status_code: axum::http::StatusCode,
+    code: &str,
+    message: &str,
+) -> (axum::http::StatusCode, String) {
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>{}</Code>
+  <Message>{}</Message>
+  <RequestId>test-request-id</RequestId>
+  <HostId>test-host-id</HostId>
+</Error>"#,
+        code, message
+    );
+    (status_code, xml)
 }
 
 impl S3Server {
     pub fn new(
         addr: std::net::SocketAddr,
-        directory_tree: Arc<DirectoryTree>,
+        directory_tree: Arc<dyn DirectoryTreeApi>,
         master: Arc<MasterApi>,
         volume_client_pool: Arc<VolumeClientPool>,
         lock_manager: Arc<LockManager>,
+        auth_manager: Arc<AuthManager>,
     ) -> Self {
         S3Server {
             directory_tree,
             master,
             volume_client_pool,
             lock_manager,
+            auth_manager,
             addr,
         }
     }
@@ -70,11 +93,18 @@ impl S3Server {
             master: self.master,
             volume_client_pool: self.volume_client_pool,
             lock_manager: self.lock_manager,
+            auth_manager: self.auth_manager.clone(),
             multipart_sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
-            .route("/", get(handlers::list_buckets))
+            // Admin API for access key management (no auth required, internal only)
+            .route("/_admin/keys", get(handlers::list_access_keys))
+            .route("/_admin/keys", post(handlers::create_access_key))
+            .route(
+                "/_admin/keys/:access_key",
+                delete(handlers::delete_access_key),
+            )
             .route(
                 "/_admin/multipart-uploads",
                 get(handlers::list_multipart_uploads),
@@ -83,15 +113,20 @@ impl S3Server {
                 "/_admin/multipart-uploads/:upload_id",
                 delete(handlers::admin_abort_multipart_upload),
             )
+            // S3 API routes
+            .route("/", get(handlers::list_buckets))
             .route("/:bucket", put(handlers::create_bucket))
             .route("/:bucket", delete(handlers::delete_bucket))
-            .route("/:bucket", get(handlers::list_objects))
+            .route("/:bucket", get(handlers::bucket_handler))
             .route("/:bucket", head(handlers::head_bucket))
             .route("/:bucket/*key", put(handlers::object_put_handler))
             .route("/:bucket/*key", get(handlers::object_get_handler))
             .route("/:bucket/*key", delete(handlers::object_delete_handler))
             .route("/:bucket/*key", head(handlers::head_object))
             .route("/:bucket/*key", post(handlers::object_post_handler))
+            .route("/:bucket/_recycle", get(handlers::list_recycle_bin))
+            .route("/:bucket/_recycle/*key", put(handlers::restore_object))
+            .route("/:bucket/_worm/*key", put(handlers::worm_lock_object))
             .with_state(state);
 
         Server::bind(&self.addr)
@@ -111,6 +146,75 @@ pub mod handlers {
 
     fn build_error_response(status: StatusCode, message: &str) -> Response {
         (status, message.to_string()).into_response()
+    }
+
+    // ===== Access Key Management API =====
+
+    pub async fn list_access_keys(State(state): State<Arc<S3State>>) -> Response {
+        let keys = state.auth_manager.list_access_keys();
+        let key_infos: Vec<serde_json::Value> = keys
+            .into_iter()
+            .map(|k| {
+                serde_json::json!({
+                    "access_key": k,
+                    "secret_key": state.auth_manager.get_credentials(&k).map(|c| c.secret_key).unwrap_or_default(),
+                    "created_at": chrono::Utc::now().to_rfc3339(),
+                })
+            })
+            .collect();
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string(&key_infos).unwrap_or_default(),
+        )
+            .into_response()
+    }
+
+    pub async fn create_access_key(State(state): State<Arc<S3State>>, body: Bytes) -> Response {
+        let req: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return build_error_response(StatusCode::BAD_REQUEST, "Invalid JSON"),
+        };
+
+        let access_key = req
+            .get("access_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let secret_key = req
+            .get("secret_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if access_key.is_empty() || secret_key.is_empty() {
+            return build_error_response(
+                StatusCode::BAD_REQUEST,
+                "access_key and secret_key are required",
+            );
+        }
+
+        state.auth_manager.add_credentials(&access_key, &secret_key);
+
+        let resp = serde_json::json!({
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        });
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json")],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response()
+    }
+
+    pub async fn delete_access_key(
+        State(state): State<Arc<S3State>>,
+        Path(access_key): Path<String>,
+    ) -> Response {
+        state.auth_manager.remove_credentials(&access_key);
+        (StatusCode::NO_CONTENT, "").into_response()
     }
 
     pub async fn object_put_handler(
@@ -269,17 +373,29 @@ pub mod handlers {
             .await;
 
         if state.directory_tree.get_entry(&bucket_path).is_none() {
-            return (StatusCode::NOT_FOUND, "Bucket not found".to_string());
+            return s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            );
         }
 
         let entries = state.directory_tree.list_entries(&bucket_path, 1, "");
         if !entries.is_empty() {
-            return (StatusCode::CONFLICT, "Bucket is not empty".to_string());
+            return s3_error(
+                StatusCode::CONFLICT,
+                "BucketNotEmpty",
+                "The bucket you tried to delete is not empty",
+            );
         }
 
         match state.directory_tree.delete_entry(&bucket_path) {
             Ok(true) => (StatusCode::NO_CONTENT, "".to_string()),
-            Ok(false) => (StatusCode::NOT_FOUND, "Bucket not found".to_string()),
+            Ok(false) => s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            ),
             Err(e) => {
                 eprintln!("Failed to delete bucket: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "".to_string())
@@ -300,14 +416,30 @@ pub mod handlers {
         }
     }
 
+    pub async fn bucket_handler(
+        State(state): State<Arc<S3State>>,
+        Path(bucket): Path<String>,
+        query: Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        if query.contains_key("versions") {
+            list_object_versions(state, bucket).await
+        } else {
+            list_objects(State(state), Path(bucket)).await
+        }
+    }
+
     pub async fn list_objects(
         State(state): State<Arc<S3State>>,
         Path(bucket): Path<String>,
-    ) -> impl IntoResponse {
+    ) -> (StatusCode, String) {
         let bucket_path = format!("/{}", bucket);
 
         if state.directory_tree.get_entry(&bucket_path).is_none() {
-            return (StatusCode::NOT_FOUND, "Bucket not found".to_string());
+            return s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            );
         }
 
         let entries = state.directory_tree.list_entries(&bucket_path, 1000, "");
@@ -337,10 +469,34 @@ pub mod handlers {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>{}</Name>
+  <IsTruncated>false</IsTruncated>
   {}
 </ListBucketResult>"#,
             bucket,
             object_list.join("\n")
+        );
+
+        (StatusCode::OK, body)
+    }
+
+    pub async fn list_object_versions(state: Arc<S3State>, bucket: String) -> (StatusCode, String) {
+        let bucket_path = format!("/{}", bucket);
+
+        if state.directory_tree.get_entry(&bucket_path).is_none() {
+            return s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            );
+        }
+
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>{}</Name>
+  <IsTruncated>false</IsTruncated>
+</ListVersionsResult>"#,
+            bucket
         );
 
         (StatusCode::OK, body)
@@ -1054,11 +1210,165 @@ pub mod handlers {
             .insert("Content-Type", "application/json".parse().unwrap());
         response
     }
+
+    pub async fn list_recycle_bin(
+        State(state): State<Arc<S3State>>,
+        Path(bucket): Path<String>,
+    ) -> Response {
+        let bucket_path = format!("/{}", bucket);
+        if state.directory_tree.get_entry(&bucket_path).is_none() {
+            return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
+        }
+
+        let json = serde_json::to_string::<Vec<serde_json::Value>>(&vec![]).unwrap();
+        let mut response = (StatusCode::OK, json).into_response();
+        response
+            .headers_mut()
+            .insert("Content-Type", "application/json".parse().unwrap());
+        response
+    }
+
+    pub async fn restore_object(
+        State(state): State<Arc<S3State>>,
+        Path((bucket, key)): Path<(String, String)>,
+    ) -> Response {
+        let object_path = format!("/{}/{}", bucket, key);
+        let lock_key = format!("object:{}/{}", bucket, key);
+
+        let _lock = state
+            .lock_manager
+            .acquire(&lock_key, LockLevel::RaftLease)
+            .await;
+
+        let entry = match state.directory_tree.get_entry(&object_path) {
+            Some(e) => e,
+            None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+        };
+
+        if entry.chunks.is_empty() {
+            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "No chunks found");
+        }
+
+        let chunk = &entry.chunks[0];
+        let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
+        if fid_parts.len() >= 3 {
+            if let (Ok(volume_id), Ok(file_key)) =
+                (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+            {
+                if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
+                {
+                    if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                        let node_address = format!("{}:{}", node.address, node.grpc_port);
+                        if let Err(e) = state
+                            .volume_client_pool
+                            .restore_needle(&node_address, volume_id, file_key)
+                            .await
+                        {
+                            eprintln!("Failed to restore needle: {}", e);
+                            return build_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to restore object",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let json = serde_json::json!({
+            "message": "Object restored successfully",
+            "key": key,
+        });
+        let mut response = (StatusCode::OK, serde_json::to_string(&json).unwrap()).into_response();
+        response
+            .headers_mut()
+            .insert("Content-Type", "application/json".parse().unwrap());
+        response
+    }
+
+    pub async fn worm_lock_object(
+        State(state): State<Arc<S3State>>,
+        Path((bucket, key)): Path<(String, String)>,
+        query: Option<Query<std::collections::HashMap<String, String>>>,
+    ) -> Response {
+        let object_path = format!("/{}/{}", bucket, key);
+        let lock_key = format!("object:{}/{}", bucket, key);
+
+        let retention_days: i64 = query
+            .as_ref()
+            .and_then(|q| q.get("days"))
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(30);
+
+        let _lock = state
+            .lock_manager
+            .acquire(&lock_key, LockLevel::RaftLease)
+            .await;
+
+        let entry = match state.directory_tree.get_entry(&object_path) {
+            Some(e) => e,
+            None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+        };
+
+        if entry.chunks.is_empty() {
+            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "No chunks found");
+        }
+
+        let chunk = &entry.chunks[0];
+        let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
+        if fid_parts.len() >= 3 {
+            if let (Ok(volume_id), Ok(file_key)) =
+                (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+            {
+                if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
+                {
+                    if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                        let node_address = format!("{}:{}", node.address, node.grpc_port);
+                        match state
+                            .volume_client_pool
+                            .worm_lock(&node_address, volume_id, file_key, retention_days)
+                            .await
+                        {
+                            Ok(retention_until) => {
+                                let json = serde_json::json!({
+                                    "message": "WORM lock applied successfully",
+                                    "key": key,
+                                    "retention_days": retention_days,
+                                    "retention_until": retention_until,
+                                });
+                                let mut response =
+                                    (StatusCode::OK, serde_json::to_string(&json).unwrap())
+                                        .into_response();
+                                response
+                                    .headers_mut()
+                                    .insert("Content-Type", "application/json".parse().unwrap());
+                                return response;
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to apply WORM lock: {}", e);
+                                return build_error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Failed to apply WORM lock",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to apply WORM lock",
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directory_tree::DirectoryTree;
+    use crate::s3::directory_tree_api::DirectoryTreeClient;
     use axum::body::{Body, HttpBody};
     use axum::http::{Method, Request, StatusCode};
     use tempfile::tempdir;
@@ -1066,7 +1376,9 @@ mod tests {
 
     async fn create_test_state() -> Arc<S3State> {
         let dir = tempdir().unwrap();
-        let dt = Arc::new(DirectoryTree::new(dir.path()).unwrap());
+        let dt: Arc<dyn DirectoryTreeApi> = Arc::new(DirectoryTreeClient::Direct(Arc::new(
+            DirectoryTree::new(dir.path()).unwrap(),
+        )));
         let master = Arc::new(
             crate::master::MasterNode::new(
                 "127.0.0.1:50051",
@@ -1080,11 +1392,13 @@ mod tests {
             .unwrap(),
         );
         let master_api = Arc::new(MasterApi::Direct(master));
+        let auth = Arc::new(AuthManager::new());
         Arc::new(S3State {
             directory_tree: dt,
             master: master_api,
             volume_client_pool: Arc::new(VolumeClientPool::new()),
             lock_manager: Arc::new(LockManager::new()),
+            auth_manager: auth,
             multipart_sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }

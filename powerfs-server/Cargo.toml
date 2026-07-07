@@ -11,6 +11,7 @@ path = "src/main.rs"
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-volume = { path = "../powerfs-volume" }
 powerfs-fuse = { path = "../powerfs-fuse" }
 tokio = { workspace = true }
 tonic = { workspace = true }

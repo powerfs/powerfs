@@ -168,11 +168,7 @@ impl RaftTestNode {
     pub async fn register_message_handler(&mut self, nodes: &HashMap<u64, RaftTestNode>) {
         let step_tx = {
             let node_guard = self.node.lock().await;
-            if let Some(node) = node_guard.as_ref() {
-                Some(node.get_step_tx())
-            } else {
-                None
-            }
+            node_guard.as_ref().map(|node| node.get_step_tx())
         };
 
         if let Some(step_tx) = step_tx {
@@ -197,11 +193,7 @@ impl RaftTestNode {
 
         let msg_rx = {
             let mut node_guard = self.node.lock().await;
-            if let Some(node) = node_guard.as_mut() {
-                Some(node.take_message_rx())
-            } else {
-                None
-            }
+            node_guard.as_mut().map(|node| node.take_message_rx())
         };
 
         if let Some(mut msg_rx) = msg_rx {

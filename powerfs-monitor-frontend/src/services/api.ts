@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
 
 const api = axios.create({
@@ -235,6 +235,29 @@ export async function abortMultipartUpload(bucket: string, key: string, uploadId
     return
   }
   await api.delete(`/s3/buckets/${bucket}/objects/${encodeURIComponent(key)}?uploadId=${uploadId}`)
+}
+
+export async function getS3AccessKeys(): Promise<S3AccessKey[]> {
+  if (useMock) {
+    return [{ access_key: 'powerfs', secret_key: 'powerfs123', created_at: new Date().toISOString() }]
+  }
+  const response = await api.get('/s3/keys')
+  return response.data.data
+}
+
+export async function createS3AccessKey(accessKey: string, secretKey: string): Promise<S3AccessKey> {
+  if (useMock) {
+    return { access_key: accessKey, secret_key: secretKey, created_at: new Date().toISOString() }
+  }
+  const response = await api.post('/s3/keys', { access_key: accessKey, secret_key: secretKey })
+  return response.data.data
+}
+
+export async function deleteS3AccessKey(accessKey: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.delete(`/s3/keys/${encodeURIComponent(accessKey)}`)
 }
 
 export async function getFuseMounts(): Promise<FuseMount[]> {

@@ -4,20 +4,31 @@ set -e
 
 DOCKER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
+HOST_IP=$(hostname -I | awk '{print $1}')
 
 echo "========================================"
 echo "    Starting PowerFS Multi-Node Cluster"
 echo "========================================"
 echo ""
+echo "Host IP: $HOST_IP"
+echo ""
 
-echo "[1/4] Building Docker images..."
+echo "[1/7] Building Docker images..."
 cd "$DOCKER_DIR"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+echo "  Building Rust binaries..."
+cd "$PROJECT_DIR"
+cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor 2>&1 | tail -5
+echo "  [OK] Binaries built"
+
+echo "  Building Docker image..."
+cd "$DOCKER_DIR"
 docker compose build 2>&1 | tail -5
 echo "[OK] Images built"
 
 echo ""
-echo "[2/4] Starting Redis..."
+echo "[2/7] Starting Redis..."
 docker compose up -d redis
 
 echo "  Waiting for redis to be ready..."
@@ -37,8 +48,8 @@ if [ $timeout -eq 0 ]; then
 fi
 
 echo ""
-echo "[3/4] Starting Master nodes..."
-docker compose up -d master-1
+echo "[3/7] Starting Master nodes..."
+docker compose up -d --no-deps master-1
 
 echo "  Waiting for master-1 to be ready..."
 timeout=60
@@ -56,7 +67,7 @@ if [ $timeout -eq 0 ]; then
     exit 2
 fi
 
-docker compose up -d master-2
+docker compose up -d --no-deps master-2
 
 echo "  Waiting for master-2 to be ready..."
 timeout=60
@@ -73,7 +84,7 @@ if [ $timeout -eq 0 ]; then
     echo "  [WARNING] master-2 failed to start"
 fi
 
-docker compose up -d master-3
+docker compose up -d --no-deps master-3
 
 echo "  Waiting for master-3 to be ready..."
 timeout=60
@@ -91,15 +102,30 @@ if [ $timeout -eq 0 ]; then
 fi
 
 echo ""
-echo "[4/4] Starting Volume nodes..."
-docker compose up -d volume-1 volume-2 volume-3
+echo "[4/7] Starting Volume nodes..."
+docker compose up -d --no-deps volume-1 volume-2 volume-3
 
 echo "  Waiting for volumes to register..."
 sleep 5
 
 echo ""
-echo "[5/4] Starting Monitor..."
-docker compose up -d monitor
+echo "[5/7] Starting S3 Backend..."
+docker compose up -d --no-deps s3
+
+echo "  Waiting for S3 backend to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if nc -z localhost 9000 >/dev/null 2>&1; then
+        echo "  [OK] S3 backend ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo ""
+echo "[6/7] Starting Monitor..."
+docker compose up -d --no-deps monitor
 
 echo "  Waiting for monitor to be ready..."
 timeout=30
@@ -113,8 +139,8 @@ while [ $timeout -gt 0 ]; do
 done
 
 echo ""
-echo "[6/4] Starting Frontend..."
-docker compose up -d frontend
+echo "[7/7] Starting Frontend..."
+docker compose up -d --no-deps frontend
 
 echo "  Waiting for frontend to be ready..."
 timeout=30
@@ -128,39 +154,26 @@ while [ $timeout -gt 0 ]; do
 done
 
 echo ""
-echo "[7/4] Starting S3 Server..."
-docker compose up -d s3
-
-echo "  Waiting for S3 server to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9000 >/dev/null 2>&1; then
-        echo "  [OK] S3 server ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
 echo "========================================"
 echo "    Cluster Started Successfully!"
 echo "========================================"
 echo ""
-echo "Service Addresses:"
-echo "  Redis:           localhost:6379"
-echo "  Master 1:        localhost:9333"
-echo "  Master 2:        localhost:9334"
-echo "  Master 3:        localhost:9335"
-echo "  Volume 1:        localhost:8080"
-echo "  Volume 2:        localhost:8081"
-echo "  Volume 3:        localhost:8082"
-echo "  Monitor API:     localhost:8083"
-echo "  Monitor UI:      http://localhost:8084"
-echo "  S3 Server:       localhost:9000"
+echo "Service Addresses (accessible from other nodes):"
+echo "  Redis:           $HOST_IP:6379"
+echo "  Master 1:        $HOST_IP:9333"
+echo "  Master 2:        $HOST_IP:9334"
+echo "  Master 3:        $HOST_IP:9335"
+echo "  Volume 1:        $HOST_IP:8080"
+echo "  Volume 2:        $HOST_IP:8081"
+echo "  Volume 3:        $HOST_IP:8082"
+echo "  S3 Backend:      $HOST_IP:9000"
+echo "  Monitor API:     $HOST_IP:8083"
+echo "  Monitor UI:      http://$HOST_IP:8084"
 echo ""
 echo "S3 Compatible Endpoint:"
-echo "  http://localhost:9000"
+echo "  http://$HOST_IP:9000"
+echo "  Access Key: powerfs"
+echo "  Secret Key: powerfs123"
 echo ""
 echo "To stop the cluster, run:"
 echo "  docker/scripts/stop-cluster.sh"

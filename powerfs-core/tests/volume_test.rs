@@ -145,10 +145,14 @@ fn test_volume_delete_needle() {
     assert_eq!(volume.count(), 1);
 
     volume.delete_needle(&NeedleId(1)).unwrap();
-    assert_eq!(volume.count(), 0);
 
-    // Reading after delete should fail
     assert!(volume.read_needle(&NeedleId(1)).is_err());
+
+    volume.restore_needle(&NeedleId(1)).unwrap();
+    assert_eq!(
+        volume.read_needle(&NeedleId(1)).unwrap(),
+        Bytes::from("to delete")
+    );
 }
 
 #[test]

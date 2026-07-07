@@ -58,21 +58,21 @@ else
 fi
 
 echo ""
-echo "[6/6] Checking S3 Server..."
+echo "[6/6] Checking S3 Gateway..."
 if nc -z localhost 9000 >/dev/null 2>&1; then
-    echo "  [OK] S3 Server is healthy"
+    echo "  [OK] S3 Gateway is healthy"
 else
-    echo "  [WARNING] S3 Server is not healthy"
+    echo "  [WARNING] S3 Gateway is not healthy"
 fi
 
 echo ""
-echo "[7/6] Cluster Summary:"
+echo "[7/7] Cluster Summary:"
 echo "  Redis:           1/1 healthy"
 echo "  Master Nodes:    $MASTER_COUNT/3 healthy"
 echo "  Volume Nodes:    $VOLUME_COUNT/3 healthy"
 echo "  Monitor:         1/1 healthy"
 echo "  Frontend:        1/1 healthy"
-echo "  S3 Server:       1/1 healthy"
+echo "  S3 Gateway:      1/1 healthy"
 echo ""
 
 if [ $MASTER_COUNT -ge 2 ] && [ $VOLUME_COUNT -ge 2 ]; then

@@ -1,11 +1,11 @@
-# README\.md
+# README.md
 
 PowerFS
-**Zero\-jitter unified parallel file system for HPC simulation and LLM KV cache**
+**Unified Volume Engine for HPC, AI & Cloud Native Storage**
 
-*Next\-generation high\-performance unified storage for HPC \& AI super clusters*
+*One storage layer, three protocols - Files, KV Cache, S3 Objects*
 
-[Introduction](https://github.com/FudanPPI/powerfs/tree/master#introduction) • [Architecture](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Core Features](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Roadmap](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Scenarios](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [Benchmark](https://github.com/FudanPPI/powerfs/tree/master#architecture) • [License](https://github.com/FudanPPI/powerfs/tree/master#architecture)
+[Introduction](#introduction) • [Architecture](#architecture) • [Core Features](#core-features) • [Roadmap](#roadmap) • [Scenarios](#scenarios) • [Benchmark](#benchmark) • [License](#license)
 
 
 
@@ -13,25 +13,43 @@ PowerFS
 
 ## Introduction
 
-**PowerFS** is a high\-performance, zero\-jitter unified parallel file system built from scratch with Rust\. It is specially designed for converged HPC simulation and LLM AI cluster workloads, delivering ultra\-low latency, stable parallel I/O and native AI cache acceleration capabilities\.
+**PowerFS** is a next-generation unified storage engine built from scratch with Rust, centered around a **unified volume management layer**. Unlike traditional storage solutions that use raw Block devices or OSD (Object Storage Device), PowerFS abstracts storage into logical volumes with a protocol-agnostic Needle-format data engine, enabling a single storage layer to support three access protocols: POSIX files, LLM KV tensor cache, and S3 objects.
 
-Traditional storage solutions face obvious bottlenecks in converged HPC and AI scenarios\. Professional HPC file systems suffer from complex deployment, heavy operation and maintenance, severe I/O jitter and poor small\-file performance, and cannot adapt to AI inference workloads\. Common cloud\-native storage lacks massive parallel computing capability and native LLM KV cache support, resulting in insufficient overall cluster resource utilization\.
+### Why Unified Volume?
 
-PowerFS innovates a **dual\-engine fusion architecture of parallel file storage and native KV cache**\. It unifies traditional HPC scientific computing, large\-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack, solving the fragmentation problem of separated HPC and AI storage systems\. It is the optimal unified storage base for next\-generation super computing and intelligent computing converged clusters\.
+The unified volume approach offers significant advantages over traditional Block and OSD models:
+
+| Feature | Block Storage | OSD (Ceph) | Unified Volume (PowerFS) |
+|---------|--------------|------------|--------------------------|
+| **Data Abstraction** | Raw blocks | Objects | **Logical volumes** |
+| **Indexing** | None | Object ID | **O(1) Needle indexing** |
+| **Multi-Protocol Support** | Requires file system | Object-only | **Files, KV, S3 natively** |
+| **Erasure Coding** | External required | Separate component | **Built-in integration** |
+| **Bitrot Detection** | None | Configurable | **Built-in integration** |
+| **Cross-Protocol Sharing** | Not supported | Requires RGW | **Native support** |
+
+### Architecture Overview
+
+PowerFS innovates a **unified volume engine architecture** that builds three independent services on top of a single data layer:
+- **File Service**: Unified Volume + Directory Service + Distributed Lock
+- **KV Cache Service**: Unified Volume + Session Consistency Management
+- **S3 Object Service**: Unified Volume + S3 Protocol + Object Consistency Management
+
+This approach solves the fragmentation problem of separated HPC and AI storage systems, delivering ultra-low latency, zero-jitter performance for converged HPC simulation and LLM AI cluster workloads.
 
 ---
 
 ## Core Design Philosophy
 
-- **Pure Rust Stack**：Complete user\-state I/O implementation, no GC jitter, memory safety, ultra\-stable latency under long\-time high load
+- **Unified Volume Engine**: A single data layer (Needle format) supporting Files, KV Cache and S3 Objects with O(1) constant-time addressing
 
-- **Unified Converged Architecture**：One cluster supports standard POSIX parallel file access and LLM KV tensor high\-speed cache access
+- **Protocol-Agnostic Storage**: The volume layer is protocol-agnostic; protocol-specific consistency management is added at the service layer
 
-- **Zero\-Jitter Priority**：Foreground computing I/O is prioritized; background balancing, GC and encoding tasks are fully noise\-reduced to ensure steady\-state performance
+- **Zero-Jitter Priority**: Foreground computing I/O is prioritized; background balancing, GC and encoding tasks are fully noise-reduced to ensure steady-state performance
 
-- **Full Hardware Offloading**：Native adaptation to SPDK, RDMA and GPU Direct, end\-to\-end zero\-copy hardware acceleration
+- **Full Hardware Offloading**: Native adaptation to SPDK, RDMA and GPU Direct, end-to-end zero-copy hardware acceleration
 
-- **Lightweight Enterprise\-Grade**：Simplified architecture, linear horizontal scaling, low operation and maintenance costs, enterprise\-level high availability and fault tolerance
+- **Lightweight Enterprise-Grade**: Simplified architecture, linear horizontal scaling, low operation and maintenance costs, enterprise-level high availability and fault tolerance
 
 ---
 
@@ -39,47 +57,59 @@ PowerFS innovates a **dual\-engine fusion architecture of parallel file storage 
 
 ### ⚡ Extreme HPC Parallel Capability
 
-- Distributed sharded metadata architecture, supporting 10,000\+ MPI process concurrent read and write
+- Distributed sharded metadata architecture, supporting 10,000+ MPI process concurrent read and write
 
 - Complete standard POSIX semantics, fully compatible with mainstream HPC simulation software and parallel computing frameworks
 
-- Adaptive file striping and multi\-node aggregated I/O, supporting PB\-level cluster aggregated bandwidth
+- Adaptive file striping and multi-node aggregated I/O, supporting PB-level cluster aggregated bandwidth
 
-- Fine\-grained job\-level QoS and I/O isolation, eliminating resource preemption and ensuring zero\-jitter steady\-state operation
+- Fine-grained job-level QoS and I/O isolation, eliminating resource preemption and ensuring zero-jitter steady-state operation
 
-- Optimized ultra\-large directory and massive small\-file scenarios, solving traditional HPC storage small\-file performance bottlenecks
+- Optimized ultra-large directory and massive small-file scenarios, solving traditional HPC storage small-file performance bottlenecks
 
-### 🧠 Native LLM KV Cache Engine \(Industry Exclusive\)
+### 🧠 Native LLM KV Cache Engine (Industry Exclusive)
 
-- Built\-in dedicated KV tensor storage engine, no third\-party components, deeply optimized for LLM inference characteristics
+- Built-in dedicated KV tensor storage engine, no third-party components, deeply optimized for LLM inference characteristics
 
-- O\(1\) constant\-time KV addressing, microsecond\-level access latency, supporting incremental update and partial overwriting
+- O(1) constant-time KV addressing, microsecond-level access latency, supporting incremental update and partial overwriting
 
-- Dual elimination strategy of LRU hot and cold sorting \+ TTL session expiration, realizing intelligent cache automatic management
+- Dual elimination strategy of LRU hot and cold sorting + TTL session expiration, realizing intelligent cache automatic management
 
-- Session\-level cache isolation and hot data resident mechanism, greatly improving long\-text inference token generation throughput
+- Session-level cache isolation and hot data resident mechanism, greatly improving long-text inference token generation throughput
 
-- Native GPU Direct zero\-copy transmission, extending GPU HBM video memory with NVMe storage to completely solve LLM inference video memory bottlenecks
+- Native GPU Direct zero-copy transmission, extending GPU HBM video memory with NVMe storage to completely solve LLM inference video memory bottlenecks
 
-### 🚀 Ultra\-Low Latency Hardware Acceleration
+### 🗄️ Native S3 Object Storage
 
-- SPDK user\-state NVMe bare disk I/O, bypassing kernel file system and system call overhead, maximizing hardware IOPS and bandwidth
+- Built-in S3-compatible object storage interface, fully compatible with AWS S3 protocol and SDK
 
-- Full\-link RDMA lossless network instead of TCP, eliminating network soft interrupts and kernel protocol stack overhead
+- Unified metadata management by Master node, data stored distributedly on Volume Server nodes
 
-- Dual\-client mode: lightweight FUSE user client \+ high\-performance Linux kernel client
+- Support for bucket operations, object CRUD, multipart upload, versioning and lifecycle management
 
-- No periodic jitter caused by runtime GC, stable p99/p999 latency under full\-load cluster
+- Native integration with PowerFS distributed storage engine, no additional middleware required
 
-### 🛠 Lightweight \& Highly Available OPS
+- Compatible with mainstream S3 tools (AWS CLI, s3cmd, S3 Browser)
+
+### 🚀 Ultra-Low Latency Hardware Acceleration
+
+- SPDK user-state NVMe bare disk I/O, bypassing kernel file system and system call overhead, maximizing hardware IOPS and bandwidth
+
+- Full-link RDMA lossless network instead of TCP, eliminating network soft interrupts and kernel protocol stack overhead
+
+- Dual-client mode: lightweight FUSE user client + high-performance Linux kernel client
+
+- No periodic jitter caused by runtime GC, stable p99/p999 latency under full-load cluster
+
+### 🛠 Lightweight & Highly Available OPS
 
 - Stateless master scheduling cluster based on Raft consensus, no single point of failure, unlimited horizontal scaling
 
-- Rack\-aware topology scheduling, realizing local I/O and intelligent data load balancing
+- Rack-aware topology scheduling, realizing local I/O and intelligent data load balancing
 
-- Dual storage engine of multi\-replica \& EC erasure coding, adaptive hot and cold data hierarchical storage
+- Dual storage engine of multi-replica & EC erasure coding, adaptive hot and cold data hierarchical storage
 
-- Automatic node/disk fault detection, data migration and cluster self\-healing
+- Automatic node/disk fault detection, data migration and cluster self-healing
 
 - Simplified deployment and operation, significantly lower maintenance costs than traditional Lustre/BeeGFS
 
@@ -87,62 +117,122 @@ PowerFS innovates a **dual\-engine fusion architecture of parallel file storage 
 
 ## Architecture
 
-PowerFS adopts a **four\-layer decoupled, dual\-engine coexistence, full hardware acceleration** overall architecture, realizing complete separation of control plane and data plane:
+PowerFS adopts a **unified volume engine architecture** with three-layer decoupling, realizing complete separation of control plane and data plane. The core is the Unified Volume Layer that abstracts storage into logical volumes with a single Needle-format data engine, supporting three access protocols through protocol-specific consistency management:
 
-1. **Global Scheduling Layer**
-High\-availability Raft master cluster, responsible for cluster topology management, resource allocation and task scheduling\. It only maintains global metadata mapping without storing massive business data, completely avoiding metadata bottlenecks\.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Layer 3: Multi-Protocol Access Layer                    │
+│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────┐  │
+│  │     FUSE Client      │  │     S3 Gateway       │  │   KV Cache       │  │
+│  │  (POSIX / FUSE)      │  │  (HTTP/REST)         │  │  (gRPC)          │  │
+│  │  ┌────────────────┐  │  │  ┌────────────────┐  │  │  ┌──────────────┐ │  │
+│  │  │ PowerFsFs      │  │  │  │ HTTP Server    │  │  │  │ Session Mgmt │ │  │
+│  │  │ (FUSE Layer)   │  │  │  │ (9000)         │  │  │  │ LRU Cache   │ │  │
+│  │  └────────┬───────┘  │  │  │ Auth Manager   │  │  │  │ GPU Direct  │ │  │
+│  │  │ MetaCache       │  │  │  │ MultiPart Mgr  │  │  │  └──────────────┘ │  │
+│  │  │ (Metadata Cache)│  │  │  └────────┬───────┘  │  │                   │  │
+│  │  └────────┬───────┘  │  │          │            │  │                   │  │
+│  │  │ ChunkCache      │  │  │          │            │  │                   │  │
+│  │  │ (Chunk Cache)   │  │  │          │            │  │                   │  │
+│  │  └────────┬───────┘  │  │          │            │  │                   │  │
+│  └───────────┼──────────┘  └──────────┼────────────┘  └─────────┬──────────┘  │
+│              │                       │                        │             │
+│              └───────────────────────┼────────────────────────┘             │
+│                                      │                                     │
+└──────────────────────────────────────▼──────────────────────────────────────┘
+                                      │
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│                    Layer 2: Control Plane (Master Layer)                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                    Master Raft Cluster (3 nodes)                     │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐                     │   │
+│  │  │ Master-1   │  │ Master-2   │  │ Master-3   │                     │   │
+│  │  │ (Leader)   │  │(Follower)  │  │(Follower)  │                     │   │
+│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘                     │   │
+│  │        │              │              │                              │   │
+│  │        └──────────────┼──────────────┘                              │   │
+│  │                       ▼                                             │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │   │
+│  │  │              DirectoryTree (Unified Metadata)                │   │   │
+│  │  │  - POSIX File Metadata (inode, dentry, attributes)           │   │   │
+│  │  │  - S3 Bucket/Object Metadata (path→FID mapping)              │   │   │
+│  │  │  - KV Cache Session Metadata                                 │   │   │
+│  │  └──────────────────────────────────────────────────────────────┘   │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │   │
+│  │  │              LockManager (Distributed Lock)                  │   │   │
+│  │  │  - Leader Local Lock (<1μs)                                  │   │   │
+│  │  │  - Raft Lease Lock (~10ms)                                   │   │   │
+│  │  └──────────────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                      │
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│                  Layer 1: Unified Volume Layer                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │  Volume 1    │  │  Volume 2    │  │  Volume 3    │  │  Volume N    │    │
+│  │  (8080)      │  │  (8081)      │  │  (8082)      │  │  (8xxx)      │    │
+│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│    │
+│  │  │ Needle   ││  │  │ Needle   ││  │  │ Needle   ││  │  │ Needle   ││    │
+│  │  │ Engine   ││  │  │ Engine   ││  │  │ Engine   ││  │  │ Engine   ││    │
+│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│    │
+│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│    │
+│  │  │ EC       ││  │  │ EC       ││  │  │ EC       ││  │  │ EC       ││    │
+│  │  │ Coding   ││  │  │ Coding   ││  │  │ Coding   ││  │  │ Coding   ││    │
+│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│    │
+│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│  │  ┌──────────┐│    │
+│  │  │ Bitrot   ││  │  │ Bitrot   ││  │  │ Bitrot   ││  │  │ Bitrot   ││    │
+│  │  │ Detection││  │  │ Detection││  │  │ Detection││  │  │ Detection││    │
+│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│  │  └──────────┘│    │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
-2. **Parallel Metadata Layer**
-Sharded inode and directory metadata management, supporting ultra\-large directories and massive concurrent metadata operations, providing complete standard POSIX semantics for HPC parallel jobs\.
+### Layer 1: Unified Volume Layer (Core)
 
-3. **Dual Data Engine Layer**
+The core of PowerFS - a protocol-agnostic unified data engine:
 
-    - **HPC Parallel File Engine**：Optimized for supercomputing simulation, large\-file parallel reading and writing, and scientific computing batch workloads
+- **Distributed Volume Server nodes** for actual data storage, abstracted as logical volumes
+- **Single Needle-format data engine** supporting Files, KV Cache and S3 Objects with O(1) constant-time addressing
+- **Multi-replica and EC erasure coding** for data reliability
+- **Bitrot detection, recycle bin, WORM locking** and automatic data repair capabilities
+- **Protocol-agnostic design** - the volume layer doesn't know whether data comes from FUSE, KV or S3
 
-    - **AI Native KV Cache Engine**：Dedicatedly optimized for LLM training and inference KV tensor high\-speed cache scenarios
+### Layer 2: Control Plane (Master Layer)
 
-4. **Hardware Acceleration Layer**
-Native integration of SPDK NVMe user\-state I/O, RDMA lossless network and GPU Direct zero\-copy transmission, fully releasing the performance of NVMe SSD, high\-speed network and GPU heterogeneous computing resources\.
+- **High-availability Raft master cluster** for cluster topology management, resource allocation and task scheduling
+- **Unified metadata management (DirectoryTree)** including POSIX file metadata, S3 bucket/object metadata and KV cache session metadata
+- **Volume allocation and mapping**, routing data requests to appropriate Volume Server nodes
+- **Distributed lock service (three-tier lock model)** ensuring data consistency across protocols
+- **Protocol-specific consistency management**: Directory Service + Lock for Files; Session Management for KV; Object Versioning for S3
+
+### Layer 3: Multi-Protocol Access Layer
+
+Three types of access interfaces built on top of the unified volume layer with protocol-specific logic:
+
+| Interface | Protocol | Use Case | Protocol-Specific Logic |
+|-----------|----------|----------|------------------------|
+| **FUSE** | POSIX | HPC parallel computing, traditional file operations | Directory Service + Distributed Lock |
+| **S3** | HTTP/REST | Cloud-native object storage, AI dataset storage | S3 Protocol + Object Consistency |
+| **KV Cache** | gRPC | LLM inference KV tensor cache | Session Isolation + GPU Direct |
 
 ---
 
 ## Roadmap
 
-### Phase 0 · Project Initialization \(1 Week\)
-
-Repository initialization, CI/CD pipeline construction, official document site framework, architecture whitepaper drafting and community environment preparation\.
-
-### Phase 1 · Core Storage Base \(2\-3 Weeks\)
-
-Implement core storage stack including master scheduling, volume management, O\(1\) indexed addressing, basic replica mechanism and FUSE user\-mode client to complete basic file read\-write capabilities\.
-
-### Phase 2 · HPC Parallel Enhancement \(3 Weeks\)
-
-Complete distributed sharded metadata service, file striping parallel I/O, full POSIX semantic compatibility, and implement HPC job\-level QoS isolation and low\-jitter background scheduling\.
-
-### Phase 3 · Linux Kernel Client \(4\-6 Weeks\)
-
-Develop native Linux kernel client, dock with Linux VFS system, completely eliminate FUSE overhead, and reach enterprise\-level HPC ultra\-low latency performance indicators\.
-
-### Phase 4 · Native KV Cache Engine \(3 Weeks\)
-
-Complete LLM dedicated KV cache engine development, implement session isolation, intelligent hot\-cold elimination, incremental update, and dock GPU Direct zero\-copy acceleration pipeline\.
-
-### Phase 5 · Production\-Grade Optimization \(Continuous Iteration\)
-
-Full\-link SPDK/RDMA hardware offloading, EC erasure coding hierarchical storage, multi\-tenant permission management, complete monitoring and operation system, and release full\-standard benchmark performance comparison data\.
 
 ---
 
 ## Application Scenarios
 
-- **HPC Supercomputing Cluster**：Fluid mechanics, meteorological simulation, structural calculation, material simulation and large\-scale MPI parallel computing jobs
+- **HPC Supercomputing Cluster**: Fluid mechanics, meteorological simulation, structural calculation, material simulation and large-scale MPI parallel computing jobs
 
-- **AI Training Cluster**：Massive dataset storage, large model training high\-throughput reading and writing, model file persistent storage
+- **AI Training Cluster**: Massive dataset storage, large model training high-throughput reading and writing, model file persistent storage
 
-- **LLM Inference Cluster**：Long\-text dialogue KV cache acceleration, GPU video memory overflow solution, high\-concurrency inference service optimization
+- **LLM Inference Cluster**: Long-text dialogue KV cache acceleration, GPU video memory overflow solution, high-concurrency inference service optimization
 
-- **HPC \& AI Converged Cluster**：Unified storage resource pooling, isolated coexistence of supercomputing and intelligent computing workloads
+- **Cloud-Native Storage**: S3-compatible object storage for cloud-native applications, containerized workloads
+
+- **HPC & AI Converged Cluster**: Unified storage resource pooling, isolated coexistence of supercomputing and intelligent computing workloads
 
 ---
 
@@ -225,11 +315,11 @@ bash scripts/run_fio_test.sh --engine=libaio --fsync=1000
 
 PowerFS targets leading performance among mainstream open-source distributed storage systems, with core advantages as follows:
 
-- **vs General Cloud-Native Storage**：Higher parallel computing concurrency, lower steady-state jitter, native KV cache AI acceleration capability
+- **vs General Cloud-Native Storage**: Higher parallel computing concurrency, lower steady-state jitter, native KV cache AI acceleration capability
 
-- **vs Traditional HPC File System**：Lighter architecture, lower O&M cost, better small-file performance, natively adapted to AI inference scenarios
+- **vs Traditional HPC File System**: Lighter architecture, lower O&M cost, better small-file performance, natively adapted to AI inference scenarios and S3 object storage
 
-- **vs Lightweight Distributed Storage**：Complete POSIX HPC semantics, enterprise-level high availability and QoS isolation, professional supercomputing cluster carrying capacity
+- **vs Lightweight Distributed Storage**: Complete POSIX HPC semantics, enterprise-level high availability and QoS isolation, professional supercomputing cluster carrying capacity
 
 ---
 
@@ -292,6 +382,9 @@ powerfs filer -m localhost:9333
 
 # Step 4: Mount FUSE filesystem
 powerfs mount -d /mnt/powerfs -m localhost:9333
+
+# Step 5: Start S3 backend (default port 9000)
+powerfs s3 --master localhost:9333
 ```
 
 ### Run
@@ -343,6 +436,23 @@ powerfs filer -p 8888 -m localhost:9333
 
 # Bind to specific IP
 powerfs filer -p 8888 -i 192.168.1.100 -m localhost:9333
+```
+
+#### Start S3 Backend
+
+```bash
+# Start S3 backend with minimal configuration
+powerfs s3 --master localhost:9333
+
+# Start with custom port
+powerfs s3 --port 9000 --master localhost:9333
+
+# Start with custom access keys
+powerfs s3 --port 9000 --master localhost:9333 \
+  --access-key myaccesskey --secret-key mysecretkey
+
+# Bind to specific IP
+powerfs s3 --port 9000 --ip 192.168.1.100 --master localhost:9333
 ```
 
 #### Mount FUSE Filesystem
@@ -397,6 +507,7 @@ Commands:
   master   Start master node (port: 9333, dir: ./data/master)
   volume   Start volume node (port: 8080, dir: ./data/volume)
   filer    Start filer (REST API, port: 8888)
+  s3       Start S3 backend (port: 9000, dir: ./data/s3)
   fuse     Mount FUSE filesystem
   mount    Mount filesystem (alias for fuse)
   help     Print this message or the help of the given subcommand(s)
@@ -427,6 +538,13 @@ Filer Options:
       --master <MASTER>  Master address
   -i, --ip <IP>        Bind IP address
 
+S3 Backend Options:
+  -p, --port <PORT>       S3 port [default: 9000]
+      --master <MASTER>   Master address
+  -i, --ip <IP>           Bind IP address
+      --access-key        S3 access key [default: powerfs]
+      --secret-key        S3 secret key [default: powerfs123]
+
 Mount/Fuse Options:
   -d, --dir <DIR>      Mount directory
       --master <MASTER>  Master address
@@ -445,37 +563,61 @@ cargo test -p powerfs-core
 ### Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Client Layer                           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
-│  │  FUSE    │  │  Filer   │  │      KV Cache Client     │  │
-│  │  Mount   │  │  (HTTP)  │  │  (for LLM Inference)     │  │
-│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
-└───────┼──────────────┼───────────────────┼─────────────────┘
-        │              │                   │
-┌───────▼──────────────▼───────────────────▼─────────────────┐
-│                    Master Layer                            │
-│              (Raft Consensus Cluster)                       │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Cluster Management | Resource Allocation | Metadata │  │
-│  └──────────────────────────────────────────────────────┘  │
-└──────────────────────┬─────────────────────────────────────┘
-                       │
-┌──────────────────────▼─────────────────────────────────────┐
-│                   Volume Layer                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │     │
-│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Multi-Protocol Access Layer                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  ┌─────────────────────┐  │
+│  │  FUSE    │  │  Filer   │  │   KV Cache      │  │   S3 Clients        │  │
+│  │  Mount   │  │  (HTTP)  │  │  (LLM Inference)│  │  (AWS CLI, SDK...)  │  │
+│  └────┬─────┘  └────┬─────┘  └───────┬──────────┘  └───────────┬─────────┘  │
+└───────┼──────────────┼───────────────┼───────────────────────────┼───────────┘
+        │              │               │                           │
+        └──────────────┼───────────────┼───────────────────────────┘
+                       │               │
+┌───────────────────────▼───────────────▼──────────────────────────────────────┐
+│                    Master Layer (Raft Consensus Cluster)                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Cluster Management | Resource Allocation | Metadata Management     │   │
+│  │  - DirectoryTree (POSIX file metadata)                              │   │
+│  │  - S3 Bucket/Object metadata                                        │   │
+│  │  - Volume allocation & mapping                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼──────────────────────────────────────────────┐
+│                         Unified Volume Layer                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │  Volume 1    │  │  Volume 2    │  │  Volume 3    │  │  Volume N    │    │
+│  │  (8080)      │  │  (8081)      │  │  (8082)      │  │  (8xxx)      │    │
+│  │  - File Data │  │  - File Data │  │  - File Data │  │  - File Data │    │
+│  │  - KV Cache  │  │  - KV Cache  │  │  - KV Cache  │  │  - KV Cache  │    │
+│  │  - EC Coding │  │  - EC Coding │  │  - EC Coding │  │  - EC Coding │    │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### S3 Architecture
+
+PowerFS implements a native S3-compatible object storage interface:
+
+| Component | Port | Role |
+|-----------|------|------|
+| **PowerFS Master** | 9333 | Metadata management (buckets, objects), volume allocation |
+| **PowerFS Volume Server** | 8080+ | Actual data storage for S3 objects |
+| **PowerFS S3 Gateway** | 9000 | S3 API frontend, routes requests to Master and Volume Servers |
+
+**Data Flow:**
+1. S3 client sends request to S3 Gateway
+2. S3 Gateway queries Master for metadata (bucket/object info)
+3. Master returns FID (File ID) and Volume Server location
+4. S3 Gateway reads/writes data directly from/to Volume Server
+5. Metadata is stored in Master's DirectoryTree
 
 ---
 
 ## License
 
-Open Source License To Be Determined \(Planned: Apache 2\.0 / MIT\)
+Open Source License To Be Determined (Planned: Apache 2.0 / MIT)
 
 ---
 
-**PowerFS — Build the next\-generation unified storage for HPC \& AI super cluster\.**
+**PowerFS — Build the next-generation unified storage for HPC & AI super cluster.**

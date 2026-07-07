@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+pub use crate::utils::{Checksum, ChecksumAlgorithm};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct VolumeId(pub u32);
 
@@ -292,13 +294,32 @@ pub enum VolumeState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcShardInfo {
+    pub shard_index: usize,
+    pub node_id: NodeId,
+    pub volume_id: VolumeId,
+    pub offset: u64,
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeedleInfo {
     pub id: NeedleId,
     pub volume_id: VolumeId,
     pub data_size: u32,
     pub offset: u64,
     pub checksum: u64,
+    pub checksum_algorithm: ChecksumAlgorithm,
+    pub last_verified_at: Option<DateTime<Utc>>,
+    pub verification_count: u64,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub delete_retention_until: Option<DateTime<Utc>>,
+    pub worm_retention_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub ec_enabled: bool,
+    pub ec_k: Option<usize>,
+    pub ec_m: Option<usize>,
+    pub ec_shards: Vec<EcShardInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,5 +1,6 @@
 use crate::types::{FileId, NeedleId, NodeId, VolumeId};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;
 
@@ -95,4 +96,68 @@ pub fn file_exists(path: &str) -> bool {
 
 pub fn get_file_size(path: &str) -> Result<u64, std::io::Error> {
     std::fs::metadata(path).map(|m| m.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ChecksumAlgorithm {
+    #[default]
+    CRC32C,
+    CRC64,
+    Blake3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checksum {
+    pub algorithm: ChecksumAlgorithm,
+    pub value: Vec<u8>,
+}
+
+impl Checksum {
+    pub fn compute(data: &[u8], algorithm: ChecksumAlgorithm) -> Self {
+        match algorithm {
+            ChecksumAlgorithm::CRC32C => {
+                let crc = crc32c::crc32c(data);
+                Checksum {
+                    algorithm: ChecksumAlgorithm::CRC32C,
+                    value: crc.to_be_bytes().to_vec(),
+                }
+            }
+            ChecksumAlgorithm::CRC64 => {
+                let mut digest = crc64fast::Digest::new();
+                digest.write(data);
+                let crc = digest.sum64();
+                Checksum {
+                    algorithm: ChecksumAlgorithm::CRC64,
+                    value: crc.to_be_bytes().to_vec(),
+                }
+            }
+            ChecksumAlgorithm::Blake3 => {
+                let hash = blake3::hash(data);
+                Checksum {
+                    algorithm: ChecksumAlgorithm::Blake3,
+                    value: hash.as_bytes().to_vec(),
+                }
+            }
+        }
+    }
+
+    pub fn verify(&self, data: &[u8]) -> bool {
+        let computed = Self::compute(data, self.algorithm);
+        computed.value == self.value
+    }
+
+    pub fn from_bytes(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Self {
+        Checksum {
+            algorithm,
+            value: bytes.to_vec(),
+        }
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        let mut result = 0u64;
+        for (i, byte) in self.value.iter().take(8).enumerate() {
+            result |= (*byte as u64) << (8 * i);
+        }
+        result
+    }
 }

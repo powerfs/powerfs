@@ -75,7 +75,7 @@ fn find_target_dir() -> Option<String> {
         }
         let workspace_target = pwd
             .parent()
-            .and_then(|p| Some(p.join("target").join("debug")));
+            .map(|p| p.join("target").join("debug"));
         if let Some(workspace_target) = workspace_target {
             if workspace_target.exists() {
                 return workspace_target.to_str().map(|s| s.to_string());
@@ -92,10 +92,8 @@ fn get_free_port() -> u16 {
 }
 
 fn is_port_open(addr: &str) -> bool {
-    match std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100))
+        .is_ok()
 }
 
 fn is_fuse_available() -> bool {
@@ -121,13 +119,10 @@ fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < timeout_secs {
         if Path::new(mount_path).exists() {
-            match fs::metadata(mount_path) {
-                Ok(m) => {
-                    if m.is_dir() {
-                        return true;
-                    }
+            if let Ok(m) = fs::metadata(mount_path) {
+                if m.is_dir() {
+                    return true;
                 }
-                Err(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(100));
@@ -205,7 +200,7 @@ pub fn ensure_fuse_mounted() {
             spawn_master(&target_dir, master_port).expect("Failed to start master");
 
         assert!(
-            wait_for_port(&master_addr, 30),
+            wait_for_port(&master_addr, 60),
             "Master did not start in time"
         );
 

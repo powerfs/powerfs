@@ -95,6 +95,42 @@ pub struct DeleteNeedleResponse {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestoreNeedleRequest {
+    #[prost(uint32, tag = "1")]
+    pub volume_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub file_key: u64,
+    #[prost(uint32, tag = "3")]
+    pub cookie: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestoreNeedleResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WormLockRequest {
+    #[prost(uint32, tag = "1")]
+    pub volume_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub file_key: u64,
+    #[prost(uint32, tag = "3")]
+    pub cookie: u32,
+    #[prost(int64, tag = "4")]
+    pub retention_days: i64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WormLockResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub retention_until: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListVolumesRequest {}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -288,8 +324,8 @@ pub struct VolumeStatusResponse {
 /// Generated client implementations.
 pub mod volume_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     #[derive(Debug, Clone)]
     pub struct VolumeServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -333,8 +369,9 @@ pub mod volume_service_client {
                     <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::BoxBody>>>::Error:
-                Into<StdError> + Send + Sync,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + Send + Sync,
         {
             VolumeServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -372,16 +409,23 @@ pub mod volume_service_client {
         pub async fn create_volume(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateVolumeRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateVolumeResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateVolumeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/CreateVolume");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/CreateVolume",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "CreateVolume"));
@@ -390,16 +434,23 @@ pub mod volume_service_client {
         pub async fn delete_volume(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteVolumeRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteVolumeResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVolumeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/DeleteVolume");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/DeleteVolume",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "DeleteVolume"));
@@ -408,16 +459,23 @@ pub mod volume_service_client {
         pub async fn write_needle(
             &mut self,
             request: impl tonic::IntoRequest<super::WriteNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::WriteNeedleResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::WriteNeedleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/WriteNeedle");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/WriteNeedle",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "WriteNeedle"));
@@ -426,16 +484,23 @@ pub mod volume_service_client {
         pub async fn read_needle(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/ReadNeedle");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/ReadNeedle",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "ReadNeedle"));
@@ -444,34 +509,98 @@ pub mod volume_service_client {
         pub async fn delete_needle(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteNeedleResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteNeedleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/DeleteNeedle");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/DeleteNeedle",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "DeleteNeedle"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn restore_needle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RestoreNeedleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RestoreNeedleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/RestoreNeedle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.VolumeService", "RestoreNeedle"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn worm_lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WormLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WormLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/WormLock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.VolumeService", "WormLock"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_volumes(
             &mut self,
             request: impl tonic::IntoRequest<super::ListVolumesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListVolumesResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ListVolumesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/ListVolumes");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/ListVolumes",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "ListVolumes"));
@@ -480,16 +609,23 @@ pub mod volume_service_client {
         pub async fn get_node_info(
             &mut self,
             request: impl tonic::IntoRequest<super::GetNodeInfoRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetNodeInfoResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetNodeInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/GetNodeInfo");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/GetNodeInfo",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "GetNodeInfo"));
@@ -498,17 +634,23 @@ pub mod volume_service_client {
         pub async fn write_needle_blob(
             &mut self,
             request: impl tonic::IntoRequest<super::WriteNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::WriteNeedleBlobResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::WriteNeedleBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/WriteNeedleBlob");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/WriteNeedleBlob",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "WriteNeedleBlob"));
@@ -517,17 +659,23 @@ pub mod volume_service_client {
         pub async fn read_needle_blob(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleBlobResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/ReadNeedleBlob");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/ReadNeedleBlob",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "ReadNeedleBlob"));
@@ -536,38 +684,50 @@ pub mod volume_service_client {
         pub async fn batch_write_needle_blob(
             &mut self,
             request: impl tonic::IntoRequest<super::BatchWriteNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::BatchWriteNeedleBlobResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::BatchWriteNeedleBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/BatchWriteNeedleBlob");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/BatchWriteNeedleBlob",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.VolumeService",
-                "BatchWriteNeedleBlob",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("powerfs.VolumeService", "BatchWriteNeedleBlob"),
+                );
             self.inner.unary(req, path, codec).await
         }
         pub async fn read_needle_meta(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadNeedleMetaRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleMetaResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleMetaResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/ReadNeedleMeta");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/ReadNeedleMeta",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "ReadNeedleMeta"));
@@ -576,16 +736,23 @@ pub mod volume_service_client {
         pub async fn batch_delete(
             &mut self,
             request: impl tonic::IntoRequest<super::BatchDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::BatchDeleteResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::BatchDeleteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/BatchDelete");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/BatchDelete",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "BatchDelete"));
@@ -594,16 +761,23 @@ pub mod volume_service_client {
         pub async fn volume_status(
             &mut self,
             request: impl tonic::IntoRequest<super::VolumeStatusRequest>,
-        ) -> std::result::Result<tonic::Response<super::VolumeStatusResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::VolumeStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.VolumeService/VolumeStatus");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.VolumeService/VolumeStatus",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.VolumeService", "VolumeStatus"));
@@ -621,55 +795,108 @@ pub mod volume_service_server {
         async fn create_volume(
             &self,
             request: tonic::Request<super::CreateVolumeRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateVolumeResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateVolumeResponse>,
+            tonic::Status,
+        >;
         async fn delete_volume(
             &self,
             request: tonic::Request<super::DeleteVolumeRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteVolumeResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVolumeResponse>,
+            tonic::Status,
+        >;
         async fn write_needle(
             &self,
             request: tonic::Request<super::WriteNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::WriteNeedleResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::WriteNeedleResponse>,
+            tonic::Status,
+        >;
         async fn read_needle(
             &self,
             request: tonic::Request<super::ReadNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleResponse>,
+            tonic::Status,
+        >;
         async fn delete_needle(
             &self,
             request: tonic::Request<super::DeleteNeedleRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteNeedleResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteNeedleResponse>,
+            tonic::Status,
+        >;
+        async fn restore_needle(
+            &self,
+            request: tonic::Request<super::RestoreNeedleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RestoreNeedleResponse>,
+            tonic::Status,
+        >;
+        async fn worm_lock(
+            &self,
+            request: tonic::Request<super::WormLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WormLockResponse>,
+            tonic::Status,
+        >;
         async fn list_volumes(
             &self,
             request: tonic::Request<super::ListVolumesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListVolumesResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ListVolumesResponse>,
+            tonic::Status,
+        >;
         async fn get_node_info(
             &self,
             request: tonic::Request<super::GetNodeInfoRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetNodeInfoResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetNodeInfoResponse>,
+            tonic::Status,
+        >;
         async fn write_needle_blob(
             &self,
             request: tonic::Request<super::WriteNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::WriteNeedleBlobResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::WriteNeedleBlobResponse>,
+            tonic::Status,
+        >;
         async fn read_needle_blob(
             &self,
             request: tonic::Request<super::ReadNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleBlobResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleBlobResponse>,
+            tonic::Status,
+        >;
         async fn batch_write_needle_blob(
             &self,
             request: tonic::Request<super::BatchWriteNeedleBlobRequest>,
-        ) -> std::result::Result<tonic::Response<super::BatchWriteNeedleBlobResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::BatchWriteNeedleBlobResponse>,
+            tonic::Status,
+        >;
         async fn read_needle_meta(
             &self,
             request: tonic::Request<super::ReadNeedleMetaRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadNeedleMetaResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ReadNeedleMetaResponse>,
+            tonic::Status,
+        >;
         async fn batch_delete(
             &self,
             request: tonic::Request<super::BatchDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::BatchDeleteResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::BatchDeleteResponse>,
+            tonic::Status,
+        >;
         async fn volume_status(
             &self,
             request: tonic::Request<super::VolumeStatusRequest>,
-        ) -> std::result::Result<tonic::Response<super::VolumeStatusResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::VolumeStatusResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct VolumeServiceServer<T: VolumeService> {
@@ -694,7 +921,10 @@ pub mod volume_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -750,11 +980,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/CreateVolume" => {
                     #[allow(non_camel_case_types)]
                     struct CreateVolumeSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::CreateVolumeRequest>
-                        for CreateVolumeSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::CreateVolumeRequest>
+                    for CreateVolumeSvc<T> {
                         type Response = super::CreateVolumeResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::CreateVolumeRequest>,
@@ -792,11 +1026,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/DeleteVolume" => {
                     #[allow(non_camel_case_types)]
                     struct DeleteVolumeSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::DeleteVolumeRequest>
-                        for DeleteVolumeSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::DeleteVolumeRequest>
+                    for DeleteVolumeSvc<T> {
                         type Response = super::DeleteVolumeResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::DeleteVolumeRequest>,
@@ -834,11 +1072,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/WriteNeedle" => {
                     #[allow(non_camel_case_types)]
                     struct WriteNeedleSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::WriteNeedleRequest>
-                        for WriteNeedleSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::WriteNeedleRequest>
+                    for WriteNeedleSvc<T> {
                         type Response = super::WriteNeedleResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::WriteNeedleRequest>,
@@ -876,9 +1118,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/ReadNeedle" => {
                     #[allow(non_camel_case_types)]
                     struct ReadNeedleSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::ReadNeedleRequest> for ReadNeedleSvc<T> {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::ReadNeedleRequest>
+                    for ReadNeedleSvc<T> {
                         type Response = super::ReadNeedleResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ReadNeedleRequest>,
@@ -916,11 +1164,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/DeleteNeedle" => {
                     #[allow(non_camel_case_types)]
                     struct DeleteNeedleSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::DeleteNeedleRequest>
-                        for DeleteNeedleSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::DeleteNeedleRequest>
+                    for DeleteNeedleSvc<T> {
                         type Response = super::DeleteNeedleResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::DeleteNeedleRequest>,
@@ -955,14 +1207,110 @@ pub mod volume_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/powerfs.VolumeService/RestoreNeedle" => {
+                    #[allow(non_camel_case_types)]
+                    struct RestoreNeedleSvc<T: VolumeService>(pub Arc<T>);
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::RestoreNeedleRequest>
+                    for RestoreNeedleSvc<T> {
+                        type Response = super::RestoreNeedleResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RestoreNeedleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as VolumeService>::restore_needle(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = RestoreNeedleSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.VolumeService/WormLock" => {
+                    #[allow(non_camel_case_types)]
+                    struct WormLockSvc<T: VolumeService>(pub Arc<T>);
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::WormLockRequest>
+                    for WormLockSvc<T> {
+                        type Response = super::WormLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WormLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as VolumeService>::worm_lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = WormLockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/powerfs.VolumeService/ListVolumes" => {
                     #[allow(non_camel_case_types)]
                     struct ListVolumesSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::ListVolumesRequest>
-                        for ListVolumesSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::ListVolumesRequest>
+                    for ListVolumesSvc<T> {
                         type Response = super::ListVolumesResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ListVolumesRequest>,
@@ -1000,11 +1348,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/GetNodeInfo" => {
                     #[allow(non_camel_case_types)]
                     struct GetNodeInfoSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::GetNodeInfoRequest>
-                        for GetNodeInfoSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::GetNodeInfoRequest>
+                    for GetNodeInfoSvc<T> {
                         type Response = super::GetNodeInfoResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetNodeInfoRequest>,
@@ -1042,19 +1394,23 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/WriteNeedleBlob" => {
                     #[allow(non_camel_case_types)]
                     struct WriteNeedleBlobSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService>
-                        tonic::server::UnaryService<super::WriteNeedleBlobRequest>
-                        for WriteNeedleBlobSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::WriteNeedleBlobRequest>
+                    for WriteNeedleBlobSvc<T> {
                         type Response = super::WriteNeedleBlobResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::WriteNeedleBlobRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as VolumeService>::write_needle_blob(&inner, request).await
+                                <T as VolumeService>::write_needle_blob(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1085,18 +1441,23 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/ReadNeedleBlob" => {
                     #[allow(non_camel_case_types)]
                     struct ReadNeedleBlobSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::ReadNeedleBlobRequest>
-                        for ReadNeedleBlobSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::ReadNeedleBlobRequest>
+                    for ReadNeedleBlobSvc<T> {
                         type Response = super::ReadNeedleBlobResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ReadNeedleBlobRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as VolumeService>::read_needle_blob(&inner, request).await
+                                <T as VolumeService>::read_needle_blob(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1127,19 +1488,26 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/BatchWriteNeedleBlob" => {
                     #[allow(non_camel_case_types)]
                     struct BatchWriteNeedleBlobSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService>
-                        tonic::server::UnaryService<super::BatchWriteNeedleBlobRequest>
-                        for BatchWriteNeedleBlobSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::BatchWriteNeedleBlobRequest>
+                    for BatchWriteNeedleBlobSvc<T> {
                         type Response = super::BatchWriteNeedleBlobResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::BatchWriteNeedleBlobRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as VolumeService>::batch_write_needle_blob(&inner, request).await
+                                <T as VolumeService>::batch_write_needle_blob(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1170,18 +1538,23 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/ReadNeedleMeta" => {
                     #[allow(non_camel_case_types)]
                     struct ReadNeedleMetaSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::ReadNeedleMetaRequest>
-                        for ReadNeedleMetaSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::ReadNeedleMetaRequest>
+                    for ReadNeedleMetaSvc<T> {
                         type Response = super::ReadNeedleMetaResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ReadNeedleMetaRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as VolumeService>::read_needle_meta(&inner, request).await
+                                <T as VolumeService>::read_needle_meta(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1212,11 +1585,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/BatchDelete" => {
                     #[allow(non_camel_case_types)]
                     struct BatchDeleteSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::BatchDeleteRequest>
-                        for BatchDeleteSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::BatchDeleteRequest>
+                    for BatchDeleteSvc<T> {
                         type Response = super::BatchDeleteResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::BatchDeleteRequest>,
@@ -1254,11 +1631,15 @@ pub mod volume_service_server {
                 "/powerfs.VolumeService/VolumeStatus" => {
                     #[allow(non_camel_case_types)]
                     struct VolumeStatusSvc<T: VolumeService>(pub Arc<T>);
-                    impl<T: VolumeService> tonic::server::UnaryService<super::VolumeStatusRequest>
-                        for VolumeStatusSvc<T>
-                    {
+                    impl<
+                        T: VolumeService,
+                    > tonic::server::UnaryService<super::VolumeStatusRequest>
+                    for VolumeStatusSvc<T> {
                         type Response = super::VolumeStatusResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::VolumeStatusRequest>,
@@ -1293,14 +1674,18 @@ pub mod volume_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => Box::pin(async move {
-                    Ok(http::Response::builder()
-                        .status(200)
-                        .header("grpc-status", "12")
-                        .header("content-type", "application/grpc")
-                        .body(empty_body())
-                        .unwrap())
-                }),
+                _ => {
+                    Box::pin(async move {
+                        Ok(
+                            http::Response::builder()
+                                .status(200)
+                                .header("grpc-status", "12")
+                                .header("content-type", "application/grpc")
+                                .body(empty_body())
+                                .unwrap(),
+                        )
+                    })
+                }
             }
         }
     }

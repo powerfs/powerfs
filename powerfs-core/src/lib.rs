@@ -1,7 +1,11 @@
+pub mod bitrot_scanner;
+pub mod ec_thread;
+pub mod gc_thread;
 pub mod hpc;
 pub mod index;
 pub mod kv_cache;
 pub mod kv_cache_persist;
 pub mod needle;
+pub mod repair_thread;
 pub mod storage;
 pub mod volume;

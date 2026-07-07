@@ -1,7 +1,7 @@
 use crate::volume::Volume;
 use powerfs_common::{
     error::{PowerFsError, Result},
-    types::{NodeId, VolumeId, VolumeInfo},
+    types::{ChecksumAlgorithm, NodeId, VolumeId, VolumeInfo},
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,6 +10,7 @@ pub struct StorageManager {
     volumes: RwLock<HashMap<VolumeId, Arc<Volume>>>,
     node_id: NodeId,
     data_path: String,
+    checksum_algorithm: ChecksumAlgorithm,
 }
 
 #[allow(clippy::result_large_err)]
@@ -19,6 +20,20 @@ impl StorageManager {
             volumes: RwLock::new(HashMap::new()),
             node_id,
             data_path,
+            checksum_algorithm: ChecksumAlgorithm::default(),
+        }
+    }
+
+    pub fn new_with_algorithm(
+        node_id: NodeId,
+        data_path: String,
+        algorithm: ChecksumAlgorithm,
+    ) -> Self {
+        StorageManager {
+            volumes: RwLock::new(HashMap::new()),
+            node_id,
+            data_path,
+            checksum_algorithm: algorithm,
         }
     }
 
@@ -33,11 +48,12 @@ impl StorageManager {
             return Err(PowerFsError::VolumeExists(volume_id));
         }
 
-        let volume = Arc::new(Volume::new(
+        let volume = Arc::new(Volume::new_with_algorithm(
             volume_id,
             &self.node_id.0,
             &self.data_path,
             size,
+            self.checksum_algorithm,
         )?);
 
         let info = volume.info();
@@ -140,11 +156,12 @@ impl StorageManager {
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 volumes.entry(volume_id)
                             {
-                                let volume = Arc::new(Volume::new(
+                                let volume = Arc::new(Volume::new_with_algorithm(
                                     volume_id,
                                     &self.node_id.0,
                                     &self.data_path,
                                     powerfs_common::constants::DEFAULT_VOLUME_SIZE,
+                                    self.checksum_algorithm,
                                 )?);
                                 e.insert(volume);
                             }

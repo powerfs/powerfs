@@ -13,7 +13,17 @@ fn make_info(id: u64, vid: u32, size: u32, offset: u64) -> NeedleInfo {
         data_size: size,
         offset,
         checksum: 0,
+        checksum_algorithm: powerfs_common::types::ChecksumAlgorithm::default(),
+        last_verified_at: None,
+        verification_count: 0,
+        deleted_at: None,
+        delete_retention_until: None,
+        worm_retention_until: None,
         created_at: Utc::now(),
+        ec_enabled: false,
+        ec_k: None,
+        ec_m: None,
+        ec_shards: Vec::new(),
     }
 }
 

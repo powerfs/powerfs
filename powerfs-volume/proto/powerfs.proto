@@ -8,6 +8,8 @@ service VolumeService {
     rpc WriteNeedle(WriteNeedleRequest) returns (WriteNeedleResponse);
     rpc ReadNeedle(ReadNeedleRequest) returns (ReadNeedleResponse);
     rpc DeleteNeedle(DeleteNeedleRequest) returns (DeleteNeedleResponse);
+    rpc RestoreNeedle(RestoreNeedleRequest) returns (RestoreNeedleResponse);
+    rpc WormLock(WormLockRequest) returns (WormLockResponse);
     rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
     rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
 
@@ -74,6 +76,28 @@ message DeleteNeedleRequest {
 
 message DeleteNeedleResponse {
     bool success = 1;
+}
+
+message RestoreNeedleRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    uint32 cookie = 3;
+}
+
+message RestoreNeedleResponse {
+    bool success = 1;
+}
+
+message WormLockRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    uint32 cookie = 3;
+    int64 retention_days = 4;
+}
+
+message WormLockResponse {
+    bool success = 1;
+    string retention_until = 2;
 }
 
 message ListVolumesRequest {}

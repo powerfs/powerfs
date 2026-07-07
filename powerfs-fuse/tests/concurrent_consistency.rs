@@ -55,7 +55,7 @@ fn test_concurrent_write_different_offsets() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; file_size];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
 
     for t in 0..thread_count {
         let offset = t * bytes_per_thread;
@@ -109,12 +109,12 @@ fn test_concurrent_write_same_offset() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; file_size];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
 
     let first_byte = buf[0];
-    for i in 0..file_size {
+    for &byte in buf.iter() {
         assert_eq!(
-            buf[i], first_byte,
+            byte, first_byte,
             "All bytes should be the same value after concurrent writes to same offset"
         );
     }
@@ -139,7 +139,6 @@ fn test_concurrent_append() {
             for i in 0..iterations_per_thread {
                 let mut f = OpenOptions::new()
                     .create(true)
-                    .write(true)
                     .append(true)
                     .open(&path)
                     .unwrap();
@@ -172,9 +171,9 @@ fn test_concurrent_append() {
         }
     }
 
-    for t in 0..thread_count {
+    for (t, &count) in counts.iter().enumerate().take(thread_count) {
         assert_eq!(
-            counts[t], iterations_per_thread,
+            count, iterations_per_thread,
             "Thread {} should have written {} lines",
             t, iterations_per_thread
         );
@@ -220,10 +219,10 @@ fn test_concurrent_read_write_mixed() {
             barrier.wait();
             for _ in 0..100 {
                 let mut f = File::open(&path).unwrap();
-                let offset = rand::random::<usize>() % (file_size - 64) as usize;
+                let offset = rand::random::<usize>() % (file_size - 64);
                 f.seek(SeekFrom::Start(offset as u64)).unwrap();
                 let mut buf = vec![0u8; 64];
-                f.read(&mut buf).unwrap();
+                f.read_exact(&mut buf).unwrap();
                 drop(f);
             }
         });
@@ -236,16 +235,9 @@ fn test_concurrent_read_write_mixed() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; file_size];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
 
-    let mut valid = true;
-    for i in 0..file_size {
-        let b = buf[i];
-        if b != 1 && (b < 2 || b > 5) {
-            valid = false;
-            break;
-        }
-    }
+    let valid = buf.iter().all(|&b| b == 1 || (2..=5).contains(&b));
     assert!(valid, "File should only contain bytes 1-5");
 }
 
@@ -286,20 +278,19 @@ fn test_concurrent_write_flush_consistency() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; file_size];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
 
     for t in 0..thread_count {
         let offset = t * 256 * 1024;
         let expected_byte = (t + 1) as u8;
-        for i in 0..256 * 1024 {
+        for &byte in buf[offset..offset + 256 * 1024].iter() {
             assert_eq!(
-                buf[offset + i],
+                byte,
                 expected_byte,
-                "Thread {} byte at offset {} should be {} but got {}",
+                "Thread {} byte should be {} but got {}",
                 t,
-                offset + i,
                 expected_byte,
-                buf[offset + i]
+                byte
             );
         }
     }

@@ -20,6 +20,8 @@ rand = { workspace = true }
 toml = "0.8"
 redis = { version = "0.24", features = ["tokio-comp"] }
 sysinfo = "0.30"
+crc32c = "0.6"
+crc64fast = "1.1"
 
 [dev-dependencies]
 tempfile = "3.10"

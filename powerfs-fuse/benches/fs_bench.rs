@@ -95,7 +95,7 @@ fn print_result(result: &BenchResult) {
 
 fn main() {
     println!("=== PowerFS FUSE 缓存性能基准测试 ===");
-    println!("");
+    println!();
     println!(
         "{:<40} {:>10}      {:>12}  {:>10}",
         "测试项", "操作数", "耗时", "吞吐量"
@@ -217,6 +217,6 @@ fn main() {
     };
     print_result(&result);
 
-    println!("");
+    println!();
     println!("测试完成！");
 }

@@ -16,18 +16,23 @@ echo "[OK] Containers stopped"
 
 echo ""
 echo "[2/3] Cleaning up unused resources..."
-docker system prune -f 2>&1 | tail -1
+docker compose down --remove-orphans 2>&1 | tail -1
 echo "[OK] Resources cleaned"
 
 echo ""
 echo "[3/3] Removing volumes (optional)..."
-read -p "Remove all persistent volumes? [y/N] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    docker compose down -v 2>&1 | tail -1
-    echo "[OK] Volumes removed"
+if [ -t 0 ]; then
+    read -p "Remove all persistent volumes? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        docker compose down -v 2>&1 | tail -1
+        echo "[OK] Volumes removed"
+    else
+        echo "[SKIP] Volumes preserved"
+    fi
 else
-    echo "[SKIP] Volumes preserved"
+    echo "[SKIP] Running in non-interactive mode, volumes preserved"
+    echo "To remove volumes, run: docker compose down -v"
 fi
 
 echo ""

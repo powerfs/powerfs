@@ -9,7 +9,8 @@ pub use powerfs::{
     DeleteNeedleRequest, DeleteNeedleResponse, DeleteResult, DeleteVolumeRequest,
     DeleteVolumeResponse, GetNodeInfoRequest, GetNodeInfoResponse, ListVolumesRequest,
     ListVolumesResponse, ReadNeedleBlobRequest, ReadNeedleBlobResponse, ReadNeedleMetaRequest,
-    ReadNeedleMetaResponse, ReadNeedleRequest, ReadNeedleResponse, VolumeInfo, VolumeStatusRequest,
-    VolumeStatusResponse, WriteNeedleBlobRequest, WriteNeedleBlobResponse, WriteNeedleRequest,
+    ReadNeedleMetaResponse, ReadNeedleRequest, ReadNeedleResponse, RestoreNeedleRequest,
+    RestoreNeedleResponse, VolumeInfo, VolumeStatusRequest, VolumeStatusResponse, WormLockRequest,
+    WormLockResponse, WriteNeedleBlobRequest, WriteNeedleBlobResponse, WriteNeedleRequest,
     WriteNeedleResponse,
 };

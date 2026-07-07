@@ -153,3 +153,9 @@ export interface FuseMount {
   mounted_at: string
   pid?: number
 }
+
+export interface S3AccessKey {
+  access_key: string
+  secret_key: string
+  created_at: string
+}

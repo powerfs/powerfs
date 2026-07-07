@@ -17,6 +17,7 @@ pub trait NeedleIndex: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    fn iter(&self) -> Vec<(NeedleId, NeedleInfo)>;
 }
 
 pub struct MemoryIndex {
@@ -65,6 +66,10 @@ impl NeedleIndex for MemoryIndex {
 
     fn len(&self) -> usize {
         self.cache.read().unwrap().len()
+    }
+
+    fn iter(&self) -> Vec<(NeedleId, NeedleInfo)> {
+        self.cache.read().unwrap().clone().into_iter().collect()
     }
 }
 
@@ -140,5 +145,18 @@ impl NeedleIndex for PersistentIndex {
 
     fn len(&self) -> usize {
         self.db.len()
+    }
+
+    fn iter(&self) -> Vec<(NeedleId, NeedleInfo)> {
+        let mut result = Vec::new();
+        for (key, data) in self.db.iter().flatten() {
+            if let Ok(info) = serde_json::from_slice::<NeedleInfo>(&data) {
+                let needle_id = NeedleId(u64::from_be_bytes(
+                    key.as_ref().try_into().unwrap_or([0; 8]),
+                ));
+                result.push((needle_id, info));
+            }
+        }
+        result
     }
 }

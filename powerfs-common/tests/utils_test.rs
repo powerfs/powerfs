@@ -277,15 +277,12 @@ fn test_calculate_checksum_different_data_different_result() {
 #[test]
 fn test_calculate_checksum_large_data() {
     let data = vec![0xABu8; 1024 * 1024]; // 1MB of same byte
-    let checksum = calculate_checksum(&data);
-    // Should not panic; just verify it returns something
-    assert!(checksum > 0 || checksum == 0);
+    let _checksum = calculate_checksum(&data);
 }
 
 #[test]
 fn test_calculate_checksum_single_byte() {
-    let c = calculate_checksum(&[0u8]);
-    assert!(c > 0 || c == 0); // any value is valid
+    let _c = calculate_checksum(&[0u8]);
 }
 
 #[test]

@@ -1,4 +1,3 @@
-use libc;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
@@ -69,13 +68,11 @@ fn test_open_multiple_writers_append() {
     let _ = fs::remove_file(&path);
     let mut f1 = OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
         .open(&path)
         .unwrap();
     let mut f2 = OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
         .open(&path)
         .unwrap();
@@ -183,7 +180,7 @@ fn test_write_concurrent_offset() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; 100];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
 
     assert_eq!(&buf[10..15], b"AAAAA");
     assert_eq!(&buf[20..25], b"BBBBB");
@@ -201,7 +198,7 @@ fn test_read_write_roundtrip() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; data.len()];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, data);
 }
 
@@ -216,11 +213,11 @@ fn test_read_partial() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; 3];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"123");
 
     let mut buf2 = vec![0u8; 4];
-    f.read(&mut buf2).unwrap();
+    f.read_exact(&mut buf2).unwrap();
     assert_eq!(&buf2, b"4567");
 }
 
@@ -236,15 +233,15 @@ fn test_seek_read() {
     let mut f = File::open(&path).unwrap();
     f.seek(SeekFrom::Start(10)).unwrap();
     let mut buf = vec![0u8; 5];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"klmno");
 
     f.seek(SeekFrom::End(-5)).unwrap();
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"vwxyz");
 
     f.seek(SeekFrom::Current(-10)).unwrap();
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"qrstu");
 }
 
@@ -474,7 +471,7 @@ fn test_concurrent_create() {
         assert!(path.exists());
         let mut f = File::open(&path).unwrap();
         let mut buf = [0u8; 1];
-        f.read(&mut buf).unwrap();
+        f.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], i as u8);
     }
 }
@@ -556,12 +553,12 @@ fn test_dup() {
 
     f1.seek(SeekFrom::Start(4)).unwrap();
     let mut buf1 = [0u8; 4];
-    f1.read(&mut buf1).unwrap();
+    f1.read_exact(&mut buf1).unwrap();
     assert_eq!(&buf1, b"test");
 
     f2.seek(SeekFrom::Start(0)).unwrap();
     let mut buf2 = [0u8; 3];
-    f2.read(&mut buf2).unwrap();
+    f2.read_exact(&mut buf2).unwrap();
     assert_eq!(&buf2, b"dup");
 }
 
@@ -662,7 +659,7 @@ fn test_large_write() {
 
     let mut f = File::open(&path).unwrap();
     let mut buf = vec![0u8; 1024 * 1024];
-    f.read(&mut buf).unwrap();
+    f.read_exact(&mut buf).unwrap();
     assert_eq!(buf, data);
 }
 

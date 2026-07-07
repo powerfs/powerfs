@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Card, Row, Col, Statistic, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message, Tabs } from 'antd'
+import { Card, Row, Col, Statistic, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message, Tabs, Alert } from 'antd'
 import {
   FolderOpenOutlined,
   FileOutlined,
@@ -9,9 +9,13 @@ import {
   BarChartOutlined,
   InboxOutlined,
   DownloadOutlined,
+  KeyOutlined,
+  LinkOutlined,
+  CloudServerOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons'
-import type { BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics } from '@/types'
-import { getS3Metrics, getBuckets, createBucket, deleteBucket, getObjects, deleteObject, uploadObject, downloadObject, getMultipartUploads, abortMultipartUpload } from '@/services/api'
+import type { BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, S3AccessKey } from '@/types'
+import { getS3Metrics, getBuckets, createBucket, deleteBucket, getObjects, deleteObject, uploadObject, downloadObject, getMultipartUploads, abortMultipartUpload, getS3AccessKeys, createS3AccessKey, deleteS3AccessKey } from '@/services/api'
 import { formatBytes, formatNumber } from '@/utils/format'
 
 function S3() {
@@ -19,12 +23,15 @@ function S3() {
   const [buckets, setBuckets] = useState<BucketInfo[]>([])
   const [objects, setObjects] = useState<ObjectInfo[]>([])
   const [uploads, setUploads] = useState<MultipartUploadInfo[]>([])
+  const [accessKeys, setAccessKeys] = useState<S3AccessKey[]>([])
   const [selectedBucket, setSelectedBucket] = useState<string | null>(null)
   const [createModalVisible, setCreateModalVisible] = useState(false)
   const [uploadModalVisible, setUploadModalVisible] = useState(false)
+  const [keyModalVisible, setKeyModalVisible] = useState(false)
   const [uploadFile, setUploadFile] = useState<File | null>(null)
   const [uploadKey, setUploadKey] = useState('')
   const [form] = Form.useForm()
+  const [keyForm] = Form.useForm()
 
   useEffect(() => {
     loadData()
@@ -66,6 +73,41 @@ function S3() {
     } catch (error) {
       console.error('Failed to load multipart uploads:', error)
       message.error('加载分片上传列表失败')
+    }
+  }
+
+  const loadAccessKeys = async () => {
+    try {
+      const keys = await getS3AccessKeys()
+      setAccessKeys(keys)
+    } catch (error) {
+      console.error('Failed to load access keys:', error)
+      message.error('加载访问密钥失败')
+    }
+  }
+
+  const handleCreateAccessKey = async () => {
+    try {
+      const values = await keyForm.validateFields()
+      await createS3AccessKey(values.access_key, values.secret_key)
+      setKeyModalVisible(false)
+      keyForm.resetFields()
+      loadAccessKeys()
+      message.success('访问密钥创建成功')
+    } catch (error) {
+      console.error('Failed to create access key:', error)
+      message.error('创建访问密钥失败')
+    }
+  }
+
+  const handleDeleteAccessKey = async (accessKey: string) => {
+    try {
+      await deleteS3AccessKey(accessKey)
+      loadAccessKeys()
+      message.success('访问密钥删除成功')
+    } catch (error) {
+      console.error('Failed to delete access key:', error)
+      message.error('删除访问密钥失败')
     }
   }
 
@@ -260,6 +302,43 @@ function S3() {
             </Button>
           </Popconfirm>
         </Space>
+      ),
+    },
+  ]
+
+  const accessKeyColumns = [
+    {
+      title: 'Access Key',
+      dataIndex: 'access_key',
+      key: 'access_key',
+      render: (key: string) => <code style={{ color: '#1890ff' }}>{key}</code>,
+    },
+    {
+      title: 'Secret Key',
+      dataIndex: 'secret_key',
+      key: 'secret_key',
+      render: (key: string) => <code style={{ fontSize: 12 }}>{'•'.repeat(8)}{key.slice(-4)}</code>,
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      render: (date: string) => new Date(date).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      render: (_: unknown, record: S3AccessKey) => (
+        <Popconfirm
+          title={`确定删除访问密钥 "${record.access_key}" 吗？`}
+          onConfirm={() => handleDeleteAccessKey(record.access_key)}
+          okText="确定"
+          cancelText="取消"
+        >
+          <Button size="small" danger>
+            <DeleteOutlined /> 删除
+          </Button>
+        </Popconfirm>
       ),
     },
   ]
@@ -463,7 +542,7 @@ function S3() {
         </Col>
       </Row>
 
-      <Tabs defaultActiveKey="objects" onChange={loadMultipartUploads}>
+      <Tabs defaultActiveKey="objects" onChange={(key) => { if (key === 'uploads') loadMultipartUploads(); if (key === 'keys') loadAccessKeys(); }}>
         <Tabs.TabPane tab="对象浏览" key="objects">
           {selectedBucket ? (
             <Card
@@ -514,6 +593,82 @@ function S3() {
               pagination={{ pageSize: 10 }}
               size="small"
             />
+          </Card>
+        </Tabs.TabPane>
+        <Tabs.TabPane tab="访问密钥管理" key="keys">
+          <Card
+            title="S3访问密钥"
+            style={{ borderRadius: 12 }}
+            bodyStyle={{ padding: '20px' }}
+            extra={
+              <Button type="primary" onClick={() => setKeyModalVisible(true)}>
+                <PlusOutlined /> 创建密钥
+              </Button>
+            }
+          >
+            <Alert
+              message="访问密钥用于S3客户端认证"
+              description="S3客户端使用这些密钥通过PowerFS S3 Gateway访问存储。"
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+            <Table
+              columns={accessKeyColumns}
+              dataSource={accessKeys}
+              rowKey="access_key"
+              pagination={{ pageSize: 10 }}
+              size="small"
+            />
+          </Card>
+        </Tabs.TabPane>
+        <Tabs.TabPane tab="S3网关" key="console">
+          <Card
+            title="PowerFS S3 Gateway"
+            style={{ borderRadius: 12 }}
+            bodyStyle={{ padding: '20px' }}
+          >
+            <Alert
+              message="PowerFS S3网关模式"
+              description="PowerFS内置S3兼容网关，支持AWS S3协议，元数据由Master统一管理，数据存储在分布式Volume Server节点上。"
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+            <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                <Space>
+                  <CloudServerOutlined style={{ fontSize: 32, color: '#1890ff' }} />
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 500 }}>S3 API端点</div>
+                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>http://localhost:9000</div>
+                  </div>
+                </Space>
+                <Tag color="green">运行中</Tag>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                <Space>
+                  <KeyOutlined style={{ fontSize: 32, color: '#52c41a' }} />
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 500 }}>默认凭据</div>
+                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>Access Key: powerfs / Secret Key: powerfs123</div>
+                  </div>
+                </Space>
+                <Button onClick={loadAccessKeys}>
+                  查看所有密钥
+                </Button>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                <Space>
+                  <DatabaseOutlined style={{ fontSize: 32, color: '#fa8c16' }} />
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 500 }}>数据存储</div>
+                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>元数据存储在Master，实际数据存储在Volume Server节点</div>
+                  </div>
+                </Space>
+                <Tag color="blue">分布式</Tag>
+              </div>
+            </Space>
           </Card>
         </Tabs.TabPane>
       </Tabs>
@@ -568,6 +723,36 @@ function S3() {
             <Button type="primary" onClick={handleUploadObject}>上传</Button>
           </Space>
         </Space>
+      </Modal>
+
+      <Modal
+        title="创建访问密钥"
+        visible={keyModalVisible}
+        onCancel={() => setKeyModalVisible(false)}
+        footer={null}
+      >
+        <Form form={keyForm} layout="vertical" onFinish={handleCreateAccessKey}>
+          <Form.Item
+            name="access_key"
+            label="Access Key"
+            rules={[{ required: true, message: '请输入Access Key' }]}
+          >
+            <Input placeholder="例如: AKIAEXAMPLE" />
+          </Form.Item>
+          <Form.Item
+            name="secret_key"
+            label="Secret Key"
+            rules={[{ required: true, message: '请输入Secret Key' }]}
+          >
+            <Input.Password placeholder="请输入Secret Key" />
+          </Form.Item>
+          <Form.Item>
+            <Space>
+              <Button onClick={() => setKeyModalVisible(false)}>取消</Button>
+              <Button type="primary" htmlType="submit">创建</Button>
+            </Space>
+          </Form.Item>
+        </Form>
       </Modal>
     </div>
   )

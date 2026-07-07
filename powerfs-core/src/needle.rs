@@ -3,8 +3,8 @@ use chrono::Utc;
 use powerfs_common::{
     constants::{NEEDLE_CHECKSUM_SIZE, NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, NEEDLE_ID_SIZE},
     error::{PowerFsError, Result},
-    types::{NeedleId, NeedleInfo, VolumeId},
-    utils::calculate_checksum,
+    types::{ChecksumAlgorithm, NeedleId, NeedleInfo, VolumeId},
+    utils::Checksum,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -15,18 +15,29 @@ pub struct Needle {
     pub data: Bytes,
     pub offset: u64,
     pub checksum: u64,
+    pub checksum_algorithm: ChecksumAlgorithm,
 }
 
 #[allow(clippy::result_large_err)]
 impl Needle {
     pub fn new(id: NeedleId, volume_id: VolumeId, data: Bytes) -> Self {
-        let checksum = calculate_checksum(&data);
+        Self::new_with_algorithm(id, volume_id, data, ChecksumAlgorithm::default())
+    }
+
+    pub fn new_with_algorithm(
+        id: NeedleId,
+        volume_id: VolumeId,
+        data: Bytes,
+        algorithm: ChecksumAlgorithm,
+    ) -> Self {
+        let checksum_val = Checksum::compute(&data, algorithm);
         Needle {
             id,
             volume_id,
             data,
             offset: 0,
-            checksum,
+            checksum: checksum_val.as_u64(),
+            checksum_algorithm: algorithm,
         }
     }
 
@@ -86,8 +97,8 @@ impl Needle {
             .copy_from_slice(&bytes[checksum_start..checksum_start + NEEDLE_CHECKSUM_SIZE]);
         let checksum = u64::from_be_bytes(checksum_bytes);
 
-        let calculated_checksum = calculate_checksum(&data);
-        if checksum != calculated_checksum {
+        let calculated_checksum = Checksum::compute(&data, ChecksumAlgorithm::default());
+        if checksum != calculated_checksum.as_u64() {
             return Err(PowerFsError::ChecksumMismatch);
         }
 
@@ -97,6 +108,7 @@ impl Needle {
             data,
             offset,
             checksum,
+            checksum_algorithm: ChecksumAlgorithm::default(),
         })
     }
 
@@ -122,8 +134,8 @@ impl Needle {
         reader.read_exact(&mut checksum_bytes)?;
         let checksum = u64::from_be_bytes(checksum_bytes);
 
-        let calculated_checksum = calculate_checksum(&data);
-        if checksum != calculated_checksum {
+        let calculated_checksum = Checksum::compute(&data, ChecksumAlgorithm::default());
+        if checksum != calculated_checksum.as_u64() {
             return Err(PowerFsError::ChecksumMismatch);
         }
 
@@ -133,6 +145,7 @@ impl Needle {
             data: Bytes::from(data),
             offset,
             checksum,
+            checksum_algorithm: ChecksumAlgorithm::default(),
         })
     }
 
@@ -158,7 +171,17 @@ impl Needle {
             data_size: self.data.len() as u32,
             offset: self.offset,
             checksum: self.checksum,
+            checksum_algorithm: self.checksum_algorithm,
+            last_verified_at: None,
+            verification_count: 0,
+            deleted_at: None,
+            delete_retention_until: None,
+            worm_retention_until: None,
             created_at: Utc::now(),
+            ec_enabled: false,
+            ec_k: None,
+            ec_m: None,
+            ec_shards: Vec::new(),
         }
     }
 }

@@ -35,6 +35,9 @@ struct Args {
 
     #[arg(long, default_value = "http://localhost:9000")]
     s3_endpoint: String,
+
+    #[arg(long, default_value = "http://localhost:9002")]
+    s3_backend_endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +60,7 @@ struct AppState {
     alert_engine: Arc<AlertEngine>,
     ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<serde_json::Value>>>>,
     s3_endpoint: String,
+    s3_backend_endpoint: String,
     fuse_mounts: Arc<Mutex<Vec<FuseMount>>>,
 }
 
@@ -576,6 +580,79 @@ async fn download_object(
     }
 }
 
+// ===== S3 Access Key Management =====
+
+async fn get_s3_access_keys(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<serde_json::Value>>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/_admin/keys", state.s3_backend_endpoint);
+
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<Vec<serde_json::Value>>().await {
+                    Ok(keys) => Json(ApiResponse::success(keys)),
+                    Err(_) => Json(ApiResponse::error("Failed to parse access keys")),
+                }
+            } else {
+                Json(ApiResponse::error("Failed to get access keys"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 backend connection error: {}", e);
+            Json(ApiResponse::error("S3 backend connection error"))
+        }
+    }
+}
+
+async fn create_s3_access_key(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/_admin/keys", state.s3_backend_endpoint);
+
+    match client.post(&url).json(&req).send().await {
+        Ok(response) => {
+            if response.status().is_success() || response.status().as_u16() == 201 {
+                match response.json::<serde_json::Value>().await {
+                    Ok(key) => Json(ApiResponse::success(key)),
+                    Err(_) => Json(ApiResponse::error("Failed to parse response")),
+                }
+            } else {
+                Json(ApiResponse::error("Failed to create access key"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 backend connection error: {}", e);
+            Json(ApiResponse::error("S3 backend connection error"))
+        }
+    }
+}
+
+async fn delete_s3_access_key(
+    State(state): State<Arc<AppState>>,
+    Path(access_key): Path<String>,
+) -> Json<ApiResponse<()>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/_admin/keys/{}", state.s3_backend_endpoint, access_key);
+
+    match client.delete(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error("Failed to delete access key"))
+            }
+        }
+        Err(e) => {
+            warn!("S3 backend connection error: {}", e);
+            Json(ApiResponse::error("S3 backend connection error"))
+        }
+    }
+}
+
 async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<FuseMount>>> {
     let mounts = state.fuse_mounts.lock().await;
     let mut result = mounts.clone();
@@ -865,6 +942,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         alert_engine: alert_engine.clone(),
         ws_clients,
         s3_endpoint: args.s3_endpoint,
+        s3_backend_endpoint: args.s3_backend_endpoint,
         fuse_mounts: Arc::new(Mutex::new(Vec::new())),
     });
 
@@ -918,6 +996,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(download_object),
         )
         .route("/api/s3/multipart-uploads", get(get_multipart_uploads))
+        .route("/api/s3/keys", get(get_s3_access_keys))
+        .route("/api/s3/keys", post(create_s3_access_key))
+        .route("/api/s3/keys/:access_key", delete(delete_s3_access_key))
         .route("/api/fuse/mounts", get(get_fuse_mounts))
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))

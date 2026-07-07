@@ -2,6 +2,7 @@
 
 use crate::proto::{VolumeService, VolumeServiceServer};
 use bytes::Bytes;
+use chrono::{Duration as ChronoDuration, Utc};
 use log::{debug, error, info, warn};
 use powerfs_common::{
     collect_system_metrics,
@@ -386,6 +387,101 @@ impl VolumeService for VolumeServer {
             Ok(r) => r,
             Err(e) => {
                 error!("delete_needle task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
+    }
+
+    async fn restore_needle(
+        &self,
+        request: Request<crate::proto::RestoreNeedleRequest>,
+    ) -> std::result::Result<Response<crate::proto::RestoreNeedleResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let needle_id = NeedleId(req.file_key);
+
+        debug!(
+            "restore_needle: volume_id={}, file_key={}",
+            volume_id.0, needle_id.0
+        );
+
+        let storage_manager = self.storage_manager.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let result = volume.restore_needle(&needle_id);
+                match result {
+                    Ok(_) => Ok(Response::new(crate::proto::RestoreNeedleResponse {
+                        success: true,
+                    })),
+                    Err(e) => {
+                        warn!("restore_needle failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
+                }
+            } else {
+                warn!("restore_needle: volume not found: {}", volume_id.0);
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("restore_needle task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
+    }
+
+    async fn worm_lock(
+        &self,
+        request: Request<crate::proto::WormLockRequest>,
+    ) -> std::result::Result<Response<crate::proto::WormLockResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let needle_id = NeedleId(req.file_key);
+        let retention_days = req.retention_days;
+
+        debug!(
+            "worm_lock: volume_id={}, file_key={}, retention_days={}",
+            volume_id.0, needle_id.0, retention_days
+        );
+
+        let storage_manager = self.storage_manager.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let result = volume.worm_lock(&needle_id, retention_days);
+                match result {
+                    Ok(_) => {
+                        let retention_until = Utc::now() + ChronoDuration::days(retention_days);
+                        Ok(Response::new(crate::proto::WormLockResponse {
+                            success: true,
+                            retention_until: retention_until.to_rfc3339(),
+                        }))
+                    }
+                    Err(e) => {
+                        warn!("worm_lock failed: {}", e);
+                        Err(Status::internal(format!("{}", e)))
+                    }
+                }
+            } else {
+                warn!("worm_lock: volume not found: {}", volume_id.0);
+                Err(Status::not_found(format!(
+                    "volume not found: {}",
+                    volume_id.0
+                )))
+            }
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("worm_lock task failed: {}", e);
                 Err(Status::internal(format!("task failed: {}", e)))
             }
         }

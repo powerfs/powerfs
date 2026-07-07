@@ -1,12 +1,15 @@
 use crate::index::{NeedleIndex, PersistentIndex};
 use crate::needle::Needle;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use powerfs_common::{
     constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET},
     error::{PowerFsError, Result},
-    types::{Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo, VolumeState},
-    utils::calculate_checksum,
+    types::{
+        ChecksumAlgorithm, Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo,
+        VolumeState,
+    },
+    utils::Checksum,
 };
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -18,6 +21,7 @@ pub struct Volume {
     index: Box<dyn NeedleIndex>,
     free_space: RwLock<u64>,
     next_offset: RwLock<u64>,
+    checksum_algorithm: ChecksumAlgorithm,
 }
 
 #[allow(clippy::result_large_err)]
@@ -71,6 +75,66 @@ impl Volume {
             index,
             free_space: RwLock::new(size),
             next_offset: RwLock::new(VOLUME_DATA_OFFSET),
+            checksum_algorithm: ChecksumAlgorithm::default(),
+        })
+    }
+
+    pub fn new_with_algorithm(
+        id: VolumeId,
+        node_id: &str,
+        path: &str,
+        size: u64,
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<Self> {
+        let volume_path = Path::new(path).join(format!("volume_{}", id.0));
+
+        if !volume_path.exists() {
+            std::fs::create_dir_all(&volume_path)?;
+        }
+
+        let data_file_path = volume_path.join("data");
+        let index_path = volume_path.join("index");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&data_file_path)?;
+
+        let file_size = file.metadata()?.len();
+        if file_size < size {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&data_file_path)?
+                .set_len(size)?;
+        }
+
+        let index: Box<dyn NeedleIndex> =
+            Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
+
+        let info = VolumeInfo {
+            id,
+            node_id: powerfs_common::types::NodeId(node_id.to_string()),
+            collection: Collection::default(),
+            size,
+            used: 0,
+            replica_count: 3,
+            ttl: Ttl::default(),
+            disk_type: DiskType::default(),
+            state: VolumeState::Available,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            next_file_key: 1,
+        };
+
+        Ok(Volume {
+            info: RwLock::new(info),
+            file: RwLock::new(file),
+            index,
+            free_space: RwLock::new(size),
+            next_offset: RwLock::new(VOLUME_DATA_OFFSET),
+            checksum_algorithm: algorithm,
         })
     }
 
@@ -108,7 +172,8 @@ impl Volume {
 
         let needle_id = NeedleId(file_key);
         let volume_id = info_guard.id;
-        let needle = Needle::new(needle_id.clone(), volume_id, data);
+        let needle =
+            Needle::new_with_algorithm(needle_id.clone(), volume_id, data, self.checksum_algorithm);
 
         let required_space = needle.size() as u64;
         let mut free_space_guard = self.free_space.write().unwrap();
@@ -134,7 +199,17 @@ impl Volume {
             data_size: needle.data.len() as u32,
             offset,
             checksum: needle.checksum,
+            checksum_algorithm: self.checksum_algorithm,
+            last_verified_at: None,
+            verification_count: 0,
+            deleted_at: None,
+            delete_retention_until: None,
+            worm_retention_until: None,
             created_at: Utc::now(),
+            ec_enabled: false,
+            ec_k: None,
+            ec_m: None,
+            ec_shards: Vec::new(),
         };
 
         drop(file_guard);
@@ -148,9 +223,19 @@ impl Volume {
     }
 
     pub fn read_needle(&self, needle_id: &NeedleId) -> Result<Bytes> {
-        if let Some(info) = self.index.get(needle_id) {
+        if let Some(mut info) = self.index.get(needle_id) {
+            if info.deleted_at.is_some() {
+                return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
+            }
+
             let mut file_guard = self.file.write().unwrap();
             let needle = Needle::read_from(&mut *file_guard, info.offset, self.id())?;
+            drop(file_guard);
+
+            info.last_verified_at = Some(Utc::now());
+            info.verification_count += 1;
+            self.index.insert(needle_id.clone(), info);
+
             Ok(needle.data)
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))
@@ -158,20 +243,109 @@ impl Volume {
     }
 
     pub fn delete_needle(&self, needle_id: &NeedleId) -> Result<()> {
-        if let Some(info) = self.index.remove(needle_id) {
-            let mut info_guard = self.info.write().unwrap();
-            let mut free_space_guard = self.free_space.write().unwrap();
+        if let Some(mut info) = self.index.get(needle_id) {
+            if info.deleted_at.is_some() {
+                return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
+            }
 
-            let needle_size =
-                (NEEDLE_HEADER_SIZE + info.data_size as usize + NEEDLE_FOOTER_SIZE) as u64;
-            info_guard.used -= needle_size;
-            *free_space_guard += needle_size;
+            if info.worm_retention_until.is_some() {
+                if let Some(retention_until) = info.worm_retention_until {
+                    if retention_until > Utc::now() {
+                        return Err(PowerFsError::PermissionDenied);
+                    }
+                }
+            }
+
+            info.deleted_at = Some(Utc::now());
+            info.delete_retention_until = Some(Utc::now() + Duration::days(7));
+
+            self.index.insert(needle_id.clone(), info);
+
+            let mut info_guard = self.info.write().unwrap();
             info_guard.modified_at = Utc::now();
 
             Ok(())
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))
         }
+    }
+
+    pub fn restore_needle(&self, needle_id: &NeedleId) -> Result<()> {
+        if let Some(mut info) = self.index.get(needle_id) {
+            if info.deleted_at.is_none() {
+                return Err(PowerFsError::InvalidRequest(
+                    "needle is not deleted".to_string(),
+                ));
+            }
+
+            if let Some(retention_until) = info.delete_retention_until {
+                if retention_until < Utc::now() {
+                    return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
+                }
+            }
+
+            info.deleted_at = None;
+            info.delete_retention_until = None;
+
+            self.index.insert(needle_id.clone(), info);
+
+            let mut info_guard = self.info.write().unwrap();
+            info_guard.modified_at = Utc::now();
+
+            Ok(())
+        } else {
+            Err(PowerFsError::NeedleNotFound(needle_id.clone()))
+        }
+    }
+
+    pub fn worm_lock(&self, needle_id: &NeedleId, retention_days: i64) -> Result<()> {
+        if let Some(mut info) = self.index.get(needle_id) {
+            if info.deleted_at.is_some() {
+                return Err(PowerFsError::InvalidRequest(
+                    "cannot lock deleted needle".to_string(),
+                ));
+            }
+
+            let retention_until = Utc::now() + Duration::days(retention_days);
+            info.worm_retention_until = Some(retention_until);
+
+            self.index.insert(needle_id.clone(), info);
+
+            let mut info_guard = self.info.write().unwrap();
+            info_guard.modified_at = Utc::now();
+
+            Ok(())
+        } else {
+            Err(PowerFsError::NeedleNotFound(needle_id.clone()))
+        }
+    }
+
+    pub fn gc_cleanup(&self) -> Result<usize> {
+        let mut cleaned_count = 0;
+        let now = Utc::now();
+
+        let needles = self.index.iter();
+        for (needle_id, info) in needles {
+            if let Some(retention_until) = info.delete_retention_until {
+                if retention_until < now {
+                    if let Some(removed_info) = self.index.remove(&needle_id) {
+                        let mut info_guard = self.info.write().unwrap();
+                        let mut free_space_guard = self.free_space.write().unwrap();
+
+                        let needle_size = (NEEDLE_HEADER_SIZE
+                            + removed_info.data_size as usize
+                            + NEEDLE_FOOTER_SIZE) as u64;
+                        info_guard.used -= needle_size;
+                        *free_space_guard += needle_size;
+                        info_guard.modified_at = Utc::now();
+
+                        cleaned_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(cleaned_count)
     }
 
     pub fn get_needle_info(&self, needle_id: &NeedleId) -> Option<NeedleInfo> {
@@ -210,6 +384,10 @@ impl Volume {
         self.state() == VolumeState::Available
     }
 
+    pub fn index(&self) -> &dyn NeedleIndex {
+        self.index.as_ref()
+    }
+
     pub fn write_needle_blob(
         &self,
         file_key: u64,
@@ -229,13 +407,14 @@ impl Volume {
                 data_vec.resize(data_end, 0);
             }
             data_vec[data_offset..data_end].copy_from_slice(&data);
-            let checksum = calculate_checksum(&data_vec);
+            let checksum_val = Checksum::compute(&data_vec, self.checksum_algorithm);
             let updated_needle = Needle {
                 id: needle.id,
                 volume_id: needle.volume_id,
                 data: Bytes::from(data_vec),
                 offset: needle.offset,
-                checksum,
+                checksum: checksum_val.as_u64(),
+                checksum_algorithm: self.checksum_algorithm,
             };
             updated_needle.write_to(&mut *file_guard, existing_info.offset)?;
             let mut info_guard = self.info.write().unwrap();
@@ -247,7 +426,17 @@ impl Volume {
                 data_size: updated_needle.data.len() as u32,
                 offset: existing_info.offset,
                 checksum: updated_needle.checksum,
+                checksum_algorithm: self.checksum_algorithm,
+                last_verified_at: None,
+                verification_count: 0,
+                deleted_at: existing_info.deleted_at,
+                delete_retention_until: existing_info.delete_retention_until,
+                worm_retention_until: existing_info.worm_retention_until,
                 created_at: existing_info.created_at,
+                ec_enabled: existing_info.ec_enabled,
+                ec_k: existing_info.ec_k,
+                ec_m: existing_info.ec_m,
+                ec_shards: existing_info.ec_shards.clone(),
             };
             drop(info_guard);
             self.index.insert(NeedleId(file_key), updated_info);
@@ -264,9 +453,15 @@ impl Volume {
 
     pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
         let needle_id = NeedleId(file_key);
-        if let Some(info) = self.index.get(&needle_id) {
+        if let Some(mut info) = self.index.get(&needle_id) {
             let mut file_guard = self.file.write().unwrap();
             let needle = Needle::read_from(&mut *file_guard, info.offset, self.id())?;
+            drop(file_guard);
+
+            info.last_verified_at = Some(Utc::now());
+            info.verification_count += 1;
+            self.index.insert(needle_id, info);
+
             let data_offset = offset as usize;
             let data_size = size as usize;
             if data_offset + data_size <= needle.data.len() {

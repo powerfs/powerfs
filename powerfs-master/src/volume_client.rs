@@ -1,5 +1,8 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
-use crate::volume_proto::powerfs::{DeleteNeedleRequest, ReadNeedleRequest, WriteNeedleRequest};
+use crate::volume_proto::powerfs::{
+    DeleteNeedleRequest, ReadNeedleRequest, RestoreNeedleRequest, WormLockRequest,
+    WriteNeedleRequest,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
@@ -105,6 +108,50 @@ impl VolumeClient {
             Err("delete_needle failed".to_string())
         }
     }
+
+    pub async fn restore_needle(&mut self, volume_id: u32, file_key: u64) -> Result<(), String> {
+        let mut service = self.service().await?;
+        let request = RestoreNeedleRequest {
+            volume_id,
+            file_key,
+            cookie: 0,
+        };
+        let response = service
+            .restore_needle(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("restore_needle failed: {}", e))?;
+        let result = response.into_inner();
+        if result.success {
+            Ok(())
+        } else {
+            Err("restore_needle failed".to_string())
+        }
+    }
+
+    pub async fn worm_lock(
+        &mut self,
+        volume_id: u32,
+        file_key: u64,
+        retention_days: i64,
+    ) -> Result<String, String> {
+        let mut service = self.service().await?;
+        let request = WormLockRequest {
+            volume_id,
+            file_key,
+            cookie: 0,
+            retention_days,
+        };
+        let response = service
+            .worm_lock(tonic::Request::new(request))
+            .await
+            .map_err(|e| format!("worm_lock failed: {}", e))?;
+        let result = response.into_inner();
+        if result.success {
+            Ok(result.retention_until)
+        } else {
+            Err("worm_lock failed".to_string())
+        }
+    }
 }
 
 pub struct VolumeClientPool {
@@ -156,6 +203,29 @@ impl VolumeClientPool {
         let client = self.get_or_create(address);
         let mut guard = client.lock().await;
         guard.delete_needle(volume_id, file_key).await
+    }
+
+    pub async fn restore_needle(
+        &self,
+        address: &str,
+        volume_id: u32,
+        file_key: u64,
+    ) -> Result<(), String> {
+        let client = self.get_or_create(address);
+        let mut guard = client.lock().await;
+        guard.restore_needle(volume_id, file_key).await
+    }
+
+    pub async fn worm_lock(
+        &self,
+        address: &str,
+        volume_id: u32,
+        file_key: u64,
+        retention_days: i64,
+    ) -> Result<String, String> {
+        let client = self.get_or_create(address);
+        let mut guard = client.lock().await;
+        guard.worm_lock(volume_id, file_key, retention_days).await
     }
 }
 

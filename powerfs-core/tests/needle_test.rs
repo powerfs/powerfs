@@ -12,14 +12,13 @@ fn test_needle_new_basic() {
     let id = NeedleId(1);
     let vid = VolumeId(100);
     let data = Bytes::from("hello world");
-    let needle = Needle::new(id.clone(), vid.clone(), data.clone());
+    let needle = Needle::new(id.clone(), vid, data.clone());
 
     assert_eq!(needle.id, id);
     assert_eq!(needle.volume_id, vid);
     assert_eq!(needle.data, data);
     assert_eq!(needle.offset, 0);
-    // checksum should be set
-    assert!(needle.checksum > 0 || needle.checksum == 0);
+    assert_ne!(needle.checksum, 0);
 }
 
 #[test]
@@ -35,7 +34,7 @@ fn test_needle_new_empty_data() {
     let data = Bytes::from("");
     let needle = Needle::new(NeedleId(0), VolumeId(0), data);
     // Should have a valid checksum even for empty data
-    assert!(needle.size() == 12 + 0 + 8); // header(8+4) + data(0) + footer(8)
+    assert_eq!(needle.size(), 20); // header(12) + data(0) + footer(8)
 }
 
 // ============================================================================
@@ -333,12 +332,10 @@ fn test_needle_to_info_with_offset() {
 // ============================================================================
 
 fn calculate_test_checksum(data: &[u8]) -> u64 {
-    use blake3::Hasher;
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    let hash = hasher.finalize();
+    use crc32c::crc32c;
+    let crc = crc32c(data);
     let mut result = 0u64;
-    for (i, byte) in hash.as_bytes().iter().take(8).enumerate() {
+    for (i, byte) in crc.to_be_bytes().iter().enumerate() {
         result |= (*byte as u64) << (8 * i);
     }
     result

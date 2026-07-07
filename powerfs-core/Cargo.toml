@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
+priority-queue = "1.4"
+reed-solomon-erasure = "6.0"
 bytes = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
@@ -22,3 +24,4 @@ rocksdb = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+crc32c = "0.6"

@@ -319,7 +319,7 @@ async fn test_three_node_failover() {
 
     sleep(Duration::from_secs(3)).await;
 
-    let propose_txs = vec![propose_tx1, propose_tx2, propose_tx3];
+    let propose_txs = [propose_tx1, propose_tx2, propose_tx3];
 
     let cmd = RaftCommand::Heartbeat {
         node_id: "test_node".to_string(),
@@ -462,7 +462,7 @@ async fn test_state_machine_consistency() {
 
     sleep(Duration::from_secs(3)).await;
 
-    let propose_txs = vec![propose_tx1, propose_tx2, propose_tx3];
+    let propose_txs = [propose_tx1, propose_tx2, propose_tx3];
 
     for i in 0..5 {
         let cmd = RaftCommand::Heartbeat {
