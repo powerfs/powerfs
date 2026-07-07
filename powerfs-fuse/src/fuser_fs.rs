@@ -690,16 +690,18 @@ impl Filesystem for PowerFsFuserFs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = name.to_str().unwrap_or("");
         debug!(
-            "create: parent={}, name={}, mode={:o}",
-            parent, name_str, mode
+            "create: parent={}, name={}, mode={:o}, flags={:o}",
+            parent, name_str, mode, flags
         );
 
-        if self.lookup_in_cache(parent, name_str).is_some() {
+        let exists_in_cache = self.lookup_in_cache(parent, name_str).is_some();
+
+        if exists_in_cache && (flags & libc::O_EXCL) != 0 {
             reply.error(libc::EEXIST);
             return;
         }
@@ -1132,7 +1134,11 @@ impl Filesystem for PowerFsFuserFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        debug!("release: inode={}", inode);
+        debug!("release: inode={}, flush={}", inode, _flush);
+        let write_buffer_entries = self.write_buffer.take(inode);
+        if !write_buffer_entries.is_empty() {
+            self.flush_write_buffer(inode, &write_buffer_entries);
+        }
         if let Err(e) = self.flush_dirty_chunks(inode) {
             warn!("release flush failed: {}", e);
         }
@@ -1243,6 +1249,50 @@ impl Filesystem for PowerFsFuserFs {
             .cache
             .inode_to_path(new_parent)
             .unwrap_or_else(|| "/".to_string());
+
+        let target_path = if new_parent_path == "/" {
+            format!("/{}", new_name_str)
+        } else {
+            format!("{}/{}", new_parent_path, new_name_str)
+        };
+
+        let target_entry = self.lookup_in_cache(new_parent, new_name_str);
+
+        if let Some(target) = target_entry {
+            if target.is_dir && !entry.is_dir {
+                reply.error(libc::ENOTDIR);
+                return;
+            }
+
+            let should_delete_target = self.cache.dec_nlink(target.inode);
+
+            if should_delete_target {
+                if let Some(fid) = &target.fid {
+                    match self.client.lookup_volume(fid.volume_id) {
+                        Ok(locations) => {
+                            if let Some(loc) = locations.first() {
+                                let addr = PowerFuseClient::location_to_grpc_addr(loc);
+                                if let Err(e) =
+                                    self.client
+                                        .delete_data(&addr, fid.volume_id.0, fid.file_key)
+                                {
+                                    warn!("Failed to delete target data: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to lookup target volume: {}", e);
+                        }
+                    }
+                }
+
+                if let Err(e) = self.client.delete_entry(&target_path, target.is_dir) {
+                    warn!("Failed to delete target entry: {}", e);
+                }
+            }
+
+            self.cache.remove(target.inode);
+        }
 
         let _ = self
             .cache

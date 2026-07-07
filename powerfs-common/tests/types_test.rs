@@ -418,7 +418,11 @@ fn test_node_state_default() {
 
 #[test]
 fn test_node_state_all_variants() {
-    let states = [NodeState::Healthy, NodeState::Degraded, NodeState::Unavailable];
+    let states = [
+        NodeState::Healthy,
+        NodeState::Degraded,
+        NodeState::Unavailable,
+    ];
     for i in 0..states.len() {
         for j in i + 1..states.len() {
             assert_ne!(states[i], states[j]);

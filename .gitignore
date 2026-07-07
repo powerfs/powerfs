@@ -3,6 +3,7 @@ target/
 *.state
 Cargo.lock
 beegfs/
+articles/
 seaweedfs/
 rustfs/
 log

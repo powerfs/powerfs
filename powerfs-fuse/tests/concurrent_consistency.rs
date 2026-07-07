@@ -285,12 +285,9 @@ fn test_concurrent_write_flush_consistency() {
         let expected_byte = (t + 1) as u8;
         for &byte in buf[offset..offset + 256 * 1024].iter() {
             assert_eq!(
-                byte,
-                expected_byte,
+                byte, expected_byte,
                 "Thread {} byte should be {} but got {}",
-                t,
-                expected_byte,
-                byte
+                t, expected_byte, byte
             );
         }
     }

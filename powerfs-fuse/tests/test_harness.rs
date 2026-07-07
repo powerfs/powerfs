@@ -73,9 +73,7 @@ fn find_target_dir() -> Option<String> {
         if target_debug.exists() {
             return target_debug.to_str().map(|s| s.to_string());
         }
-        let workspace_target = pwd
-            .parent()
-            .map(|p| p.join("target").join("debug"));
+        let workspace_target = pwd.parent().map(|p| p.join("target").join("debug"));
         if let Some(workspace_target) = workspace_target {
             if workspace_target.exists() {
                 return workspace_target.to_str().map(|s| s.to_string());
@@ -92,8 +90,7 @@ fn get_free_port() -> u16 {
 }
 
 fn is_port_open(addr: &str) -> bool {
-    std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100))
-        .is_ok()
+    std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_ok()
 }
 
 fn is_fuse_available() -> bool {
