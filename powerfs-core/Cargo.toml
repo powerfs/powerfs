@@ -28,15 +28,3 @@ regex = "1.10"
 tempfile = "3.10"
 crc32c = "0.6"
 criterion = "0.4"
-
-[[bench]]
-name = "kv_benchmark"
-harness = false
-
-[[bench]]
-name = "storage_benchmark"
-harness = false
-
-[[bench]]
-name = "vllm_benchmark"
-harness = false
