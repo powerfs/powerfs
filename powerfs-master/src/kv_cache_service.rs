@@ -252,6 +252,7 @@ impl KvCacheService for KvCacheServiceImpl {
                             disk_size: req.data.len() as u64,
                             ttl: "".to_string(),
                             symlink_target: "".to_string(),
+                            owner: String::new(),
                         };
                         let _ = self.master.directory_tree.create_entry(file_entry);
 

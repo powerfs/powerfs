@@ -1,11 +1,82 @@
 import axios from 'axios'
 import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
+import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
 const api = axios.create({
   baseURL: '/api',
   timeout: 10000,
 })
+
+export default api
+
+// 请求拦截器：自动注入 Authorization Bearer token
+api.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token && !isPublicUrl(config.url)) {
+    config.headers = config.headers ?? {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// 响应拦截器：401 时尝试刷新 token，刷新失败则登出并跳转登录
+let isRefreshing = false
+let refreshSubscribers: Array<(token: string | null) => void> = []
+
+function subscribeTokenRefresh(cb: (token: string | null) => void) {
+  refreshSubscribers.push(cb)
+}
+
+function onTokenRefreshed(token: string | null) {
+  refreshSubscribers.forEach((cb) => cb(token))
+  refreshSubscribers = []
+}
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      originalRequest._retry = true
+
+      if (isPublicUrl(originalRequest.url)) {
+        return Promise.reject(error)
+      }
+
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          subscribeTokenRefresh((token) => {
+            if (!token) {
+              reject(error)
+              return
+            }
+            originalRequest.headers.Authorization = `Bearer ${token}`
+            resolve(api(originalRequest))
+          })
+        })
+      }
+
+      isRefreshing = true
+      const newToken = await refreshAccessToken()
+      isRefreshing = false
+      onTokenRefreshed(newToken)
+
+      if (!newToken) {
+        // 刷新失败，登出并跳转登录
+        logout()
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
+        return Promise.reject(error)
+      }
+
+      originalRequest.headers.Authorization = `Bearer ${newToken}`
+      return api(originalRequest)
+    }
+    return Promise.reject(error)
+  },
+)
 
 let useMock = false
 

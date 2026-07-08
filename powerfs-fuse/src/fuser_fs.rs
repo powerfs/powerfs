@@ -182,6 +182,7 @@ impl PowerFsFuserFs {
                 disk_size: entry.disk_size,
                 ttl: String::new(),
                 symlink_target: String::new(),
+                owner: String::new(),
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -592,6 +593,7 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: String::new(),
+            owner: String::new(),
         };
 
         if let Err(e) = self.client.create_entry(filer_entry) {
@@ -764,6 +766,7 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: String::new(),
+            owner: String::new(),
         };
 
         if let Err(e) = self.client.create_entry(filer_entry) {
@@ -1340,6 +1343,7 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: entry.disk_size,
             ttl: String::new(),
             symlink_target: entry.symlink_target.unwrap_or_default(),
+            owner: String::new(),
         };
 
         if let Err(e) = self.client.delete_entry(&old_path, entry.is_dir) {
@@ -1425,6 +1429,7 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: link_str.to_string(),
+            owner: String::new(),
         };
 
         if let Err(e) = self.client.create_entry(filer_entry) {
@@ -1555,6 +1560,7 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: entry.disk_size,
             ttl: String::new(),
             symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+            owner: String::new(),
         };
 
         if let Err(e) = self.client.create_entry(filer_entry) {

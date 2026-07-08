@@ -157,6 +157,7 @@ impl AlertEngine {
             ),
             created_at: chrono::Utc::now(),
             resolved_at: None,
+            owner_id: None,
         };
 
         let mut alerts = self.alerts.write().await;

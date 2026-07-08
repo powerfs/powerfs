@@ -419,6 +419,7 @@ message Entry {
     uint64 disk_size = 9;
     string ttl = 10;
     string symlink_target = 11;
+    string owner = 12;  // 资源归属用户ID（空字符串表示无归属/系统资源）
 }
 
 message LookupDirectoryEntryRequest {

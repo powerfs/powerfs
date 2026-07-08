@@ -30,27 +30,37 @@ fn force_cleanup() {
     let _ = Command::new("fusermount3")
         .arg("-u")
         .arg(FUSE_MOUNT)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     let _ = Command::new("fusermount3")
         .arg("-zu")
         .arg(FUSE_MOUNT)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     let _ = Command::new("pkill")
         .arg("-9")
         .arg("-f")
         .arg("powerfs master")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("pkill")
         .arg("-9")
         .arg("-f")
         .arg("powerfs-volume")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("pkill")
         .arg("-9")
         .arg("-f")
         .arg("powerfs fuse")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 
     thread::sleep(Duration::from_secs(2));
@@ -97,6 +107,8 @@ fn is_fuse_available() -> bool {
     Path::new("/dev/fuse").exists()
         && Command::new("fusermount3")
             .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .is_ok()
 }

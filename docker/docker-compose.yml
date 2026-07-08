@@ -246,15 +246,16 @@ services:
         condition: service_healthy
 
   frontend:
-    image: nginx:alpine
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile-frontend
+    image: powerfs-frontend:latest
     container_name: frontend
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.31
     ports:
       - "8084:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -s http://127.0.0.1/ >/dev/null || exit 1"]
       interval: 5s

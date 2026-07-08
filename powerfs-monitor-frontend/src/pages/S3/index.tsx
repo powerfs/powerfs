@@ -10,7 +10,6 @@ import {
   InboxOutlined,
   DownloadOutlined,
   KeyOutlined,
-  LinkOutlined,
   CloudServerOutlined,
   DatabaseOutlined,
 } from '@ant-design/icons'

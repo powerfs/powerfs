@@ -5,6 +5,7 @@ Cargo.lock
 beegfs/
 articles/
 seaweedfs/
+Mooncake/
 rustfs/
 log
 *.log

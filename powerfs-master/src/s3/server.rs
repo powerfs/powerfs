@@ -301,7 +301,7 @@ pub mod handlers {
     }
 
     pub async fn list_buckets(State(state): State<Arc<S3State>>) -> impl IntoResponse {
-        let entries = state.directory_tree.list_entries("/", 1000, "");
+        let entries = state.directory_tree.list_entries("/", 1000, "").await;
 
         let bucket_names: Vec<String> = entries
             .into_iter()
@@ -347,11 +347,11 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).is_some() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_some() {
             return (StatusCode::CONFLICT, "Bucket already exists".to_string());
         }
 
-        match state.directory_tree.create_directory(&bucket_path) {
+        match state.directory_tree.create_directory(&bucket_path).await {
             Ok(_) => (StatusCode::CREATED, "".to_string()),
             Err(e) => {
                 eprintln!("Failed to create bucket: {}", e);
@@ -372,7 +372,7 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
@@ -380,7 +380,7 @@ pub mod handlers {
             );
         }
 
-        let entries = state.directory_tree.list_entries(&bucket_path, 1, "");
+        let entries = state.directory_tree.list_entries(&bucket_path, 1, "").await;
         if !entries.is_empty() {
             return s3_error(
                 StatusCode::CONFLICT,
@@ -389,7 +389,7 @@ pub mod handlers {
             );
         }
 
-        match state.directory_tree.delete_entry(&bucket_path) {
+        match state.directory_tree.delete_entry(&bucket_path).await {
             Ok(true) => (StatusCode::NO_CONTENT, "".to_string()),
             Ok(false) => s3_error(
                 StatusCode::NOT_FOUND,
@@ -409,7 +409,7 @@ pub mod handlers {
     ) -> impl IntoResponse {
         let bucket_path = format!("/{}", bucket);
 
-        if state.directory_tree.get_entry(&bucket_path).is_some() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_some() {
             (StatusCode::OK, "")
         } else {
             (StatusCode::NOT_FOUND, "")
@@ -434,7 +434,7 @@ pub mod handlers {
     ) -> (StatusCode, String) {
         let bucket_path = format!("/{}", bucket);
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
@@ -442,7 +442,10 @@ pub mod handlers {
             );
         }
 
-        let entries = state.directory_tree.list_entries(&bucket_path, 1000, "");
+        let entries = state
+            .directory_tree
+            .list_entries(&bucket_path, 1000, "")
+            .await;
 
         let object_list: Vec<String> = entries
             .into_iter()
@@ -482,7 +485,7 @@ pub mod handlers {
     pub async fn list_object_versions(state: Arc<S3State>, bucket: String) -> (StatusCode, String) {
         let bucket_path = format!("/{}", bucket);
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
@@ -516,7 +519,7 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
@@ -596,9 +599,10 @@ pub mod handlers {
             disk_size: size,
             ttl: "".to_string(),
             symlink_target: "".to_string(),
+            owner: String::new(),
         };
 
-        match state.directory_tree.create_entry(entry) {
+        match state.directory_tree.create_entry(entry).await {
             Ok(_) => {
                 let mut response = (StatusCode::OK, "").into_response();
                 response
@@ -623,11 +627,11 @@ pub mod handlers {
         let bucket_path = format!("/{}", bucket);
         let object_path = format!("/{}/{}", bucket, key);
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
-        let entry = match state.directory_tree.get_entry(&object_path) {
+        let entry = match state.directory_tree.get_entry(&object_path).await {
             Some(e) => e,
             None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
         };
@@ -716,11 +720,11 @@ pub mod handlers {
         let bucket_path = format!("/{}", bucket);
         let object_path = format!("/{}/{}", bucket, key);
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
-        let entry = match state.directory_tree.get_entry(&object_path) {
+        let entry = match state.directory_tree.get_entry(&object_path).await {
             Some(e) => e,
             None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
         };
@@ -757,11 +761,11 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
-        let entry = match state.directory_tree.get_entry(&object_path) {
+        let entry = match state.directory_tree.get_entry(&object_path).await {
             Some(e) => e,
             None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
         };
@@ -787,7 +791,7 @@ pub mod handlers {
             }
         }
 
-        match state.directory_tree.delete_entry(&object_path) {
+        match state.directory_tree.delete_entry(&object_path).await {
             Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
             Ok(false) => build_error_response(StatusCode::NOT_FOUND, "Object not found"),
             Err(e) => {
@@ -809,7 +813,7 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
@@ -1072,9 +1076,10 @@ pub mod handlers {
             disk_size: total_size,
             ttl: "".to_string(),
             symlink_target: "".to_string(),
+            owner: String::new(),
         };
 
-        match state.directory_tree.create_entry(entry) {
+        match state.directory_tree.create_entry(entry).await {
             Ok(_) => {
                 let response_body = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1216,7 +1221,7 @@ pub mod handlers {
         Path(bucket): Path<String>,
     ) -> Response {
         let bucket_path = format!("/{}", bucket);
-        if state.directory_tree.get_entry(&bucket_path).is_none() {
+        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
@@ -1240,7 +1245,7 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        let entry = match state.directory_tree.get_entry(&object_path) {
+        let entry = match state.directory_tree.get_entry(&object_path).await {
             Some(e) => e,
             None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
         };
@@ -1305,7 +1310,7 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        let entry = match state.directory_tree.get_entry(&object_path) {
+        let entry = match state.directory_tree.get_entry(&object_path).await {
             Some(e) => e,
             None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
         };

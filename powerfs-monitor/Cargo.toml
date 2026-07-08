@@ -27,3 +27,13 @@ env_logger = { workspace = true }
 rand = { version = "0.8" }
 reqwest = { version = "0.11", features = ["json"] }
 regex = { version = "1" }
+jsonwebtoken = "9"
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rocksdb = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"

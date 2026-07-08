@@ -278,6 +278,7 @@ impl PowerFsFs {
                 disk_size: entry.disk_size,
                 ttl: String::new(),
                 symlink_target: String::new(),
+                owner: String::new(),
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -627,6 +628,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: String::new(),
+            owner: String::new(),
         };
 
         match self.client.create_entry(filer_entry) {
@@ -814,6 +816,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: String::new(),
+            owner: String::new(),
         };
 
         match self.client.create_entry(filer_entry) {
@@ -1140,6 +1143,7 @@ impl FileSystem for PowerFsFs {
                 disk_size: entry.disk_size,
                 ttl: String::new(),
                 symlink_target: String::new(),
+                owner: String::new(),
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -1343,6 +1347,7 @@ impl FileSystem for PowerFsFs {
             disk_size: entry.disk_size,
             ttl: String::new(),
             symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+            owner: String::new(),
         };
 
         match self.client.delete_entry(&old_path, entry.is_dir) {
@@ -1413,6 +1418,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             ttl: String::new(),
             symlink_target: link_str.to_string(),
+            owner: String::new(),
         };
 
         let inode = match self.client.create_entry(entry) {

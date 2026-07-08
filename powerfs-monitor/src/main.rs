@@ -3,9 +3,10 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Json, Path, Query, State,
+        Extension, Json, Path, Query, State,
     },
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router, Server,
 };
@@ -17,6 +18,11 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
 use powerfs_monitor::alert_engine::AlertEngine;
+use powerfs_monitor::auth::{
+    auth_middleware, generate_access_key, generate_secret_key, hash_secret_key, AuthState,
+    CurrentUser, JwtValidator, RateLimiter, ResourceOwner, ResourceOwnerStore, ResourceType, Role,
+    RoleStore, S3AccessKey, S3AccessKeyInfo, S3AccessKeyStore, UserRole, UserStatus, UserStore,
+};
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
 use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, VolumeInfo};
@@ -38,6 +44,27 @@ struct Args {
 
     #[arg(long, default_value = "http://localhost:9002")]
     s3_backend_endpoint: String,
+
+    #[arg(long, default_value = "powerfs")]
+    s3_access_key: String,
+
+    #[arg(long, default_value = "powerfs123")]
+    s3_secret_key: String,
+
+    #[arg(long, default_value = "/data/master/auth.db")]
+    auth_db_path: String,
+
+    #[arg(long, default_value = "powerfs-secret-key-change-in-production")]
+    jwt_secret: String,
+
+    #[arg(long, default_value = "powerfs-hmac-secret-change-in-production")]
+    hmac_secret: String,
+
+    #[arg(long, default_value = "admin")]
+    admin_username: String,
+
+    #[arg(long, default_value = "admin123")]
+    admin_password: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,8 +87,22 @@ struct AppState {
     alert_engine: Arc<AlertEngine>,
     ws_clients: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<serde_json::Value>>>>,
     s3_endpoint: String,
+    #[allow(dead_code)]
     s3_backend_endpoint: String,
+    s3_access_key: String,
+    s3_secret_key: String,
     fuse_mounts: Arc<Mutex<Vec<FuseMount>>>,
+    auth: Arc<AuthState>,
+    /// 资源归属存储（与 UserStore 共享 auth.db）
+    resource_owners: Arc<ResourceOwnerStore>,
+    /// 角色存储（与 UserStore 共享 auth.db）
+    roles: Arc<RoleStore>,
+    /// S3 AccessKey 存储（与 UserStore 共享 auth.db）
+    s3_keys: Arc<S3AccessKeyStore>,
+    /// 用于 HMAC-SHA256 哈希 secret_key 的密钥
+    hmac_secret: String,
+    /// 登录速率限制器
+    rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,11 +263,27 @@ struct TimeSeriesPoint {
     value: f64,
 }
 
+fn s3_auth_headers(access_key: &str, secret_key: &str) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "Authorization",
+        format!("AWS {}:{}", access_key, secret_key)
+            .parse()
+            .unwrap(),
+    );
+    headers
+}
+
 async fn get_s3_metrics(State(state): State<Arc<AppState>>) -> Json<ApiResponse<S3Metrics>> {
     let client = reqwest::Client::new();
     let url = format!("{}/", state.s3_endpoint);
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
@@ -262,15 +319,33 @@ async fn get_s3_metrics(State(state): State<Arc<AppState>>) -> Json<ApiResponse<
     }
 }
 
-async fn get_buckets(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<BucketInfo>>> {
+async fn get_buckets(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<BucketInfo>>> {
     let client = reqwest::Client::new();
     let url = format!("{}/", state.s3_endpoint);
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
-                    let buckets = parse_list_buckets_xml(&body);
+                    let mut buckets = parse_list_buckets_xml(&body);
+                    // 非 admin 用户仅可见自己拥有的 bucket
+                    if !user.is_admin() {
+                        let owned = state
+                            .resource_owners
+                            .list_user_resources(&user.id, Some(&ResourceType::S3Bucket))
+                            .unwrap_or_default();
+                        let owned_ids: std::collections::HashSet<String> =
+                            owned.into_iter().map(|o| o.resource_id).collect();
+                        buckets.retain(|b| owned_ids.contains(&b.name));
+                    }
                     Json(ApiResponse::success(buckets))
                 } else {
                     Json(ApiResponse::error("Failed to parse S3 response"))
@@ -293,7 +368,12 @@ async fn get_bucket(
     let client = reqwest::Client::new();
     let url = format!("{}/{}", state.s3_endpoint, name);
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
@@ -321,14 +401,34 @@ async fn get_bucket(
 
 async fn create_bucket(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Json(req): Json<CreateBucketRequest>,
 ) -> Json<ApiResponse<()>> {
     let client = reqwest::Client::new();
     let url = format!("{}/{}", state.s3_endpoint, req.name);
 
-    match client.put(&url).send().await {
+    match client
+        .put(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
+                // 记录 bucket 归属权
+                let owner = ResourceOwner::new(
+                    &user.id,
+                    ResourceType::S3Bucket,
+                    &req.name,
+                    vec![
+                        "read".to_string(),
+                        "write".to_string(),
+                        "delete".to_string(),
+                    ],
+                );
+                if let Err(e) = state.resource_owners.set_owner(&owner) {
+                    warn!("Failed to record bucket owner: {}", e);
+                }
                 Json(ApiResponse::success(()))
             } else {
                 Json(ApiResponse::error("Failed to create bucket"))
@@ -343,22 +443,50 @@ async fn create_bucket(
 
 async fn delete_bucket(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Path(name): Path<String>,
-) -> Json<ApiResponse<()>> {
+) -> Response {
+    // 非 admin 用户只能删除自己的 bucket
+    if !user.is_admin() {
+        match state
+            .resource_owners
+            .is_owner(&user.id, &ResourceType::S3Bucket, &name)
+        {
+            Ok(true) => {}
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json::<ApiResponse<()>>(ApiResponse::error("Not bucket owner")),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let client = reqwest::Client::new();
     let url = format!("{}/{}", state.s3_endpoint, name);
 
-    match client.delete(&url).send().await {
+    match client
+        .delete(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
-                Json(ApiResponse::success(()))
+                // 删除归属记录（忽略错误，bucket 已删）
+                let _ = state
+                    .resource_owners
+                    .delete_owner(&ResourceType::S3Bucket, &name);
+                Json::<ApiResponse<()>>(ApiResponse::success(())).into_response()
             } else {
-                Json(ApiResponse::error("Failed to delete bucket"))
+                Json::<ApiResponse<()>>(ApiResponse::error("Failed to delete bucket"))
+                    .into_response()
             }
         }
         Err(e) => {
             warn!("S3 connection error: {}", e);
-            Json(ApiResponse::error("S3 connection error"))
+            Json::<ApiResponse<()>>(ApiResponse::error("S3 connection error")).into_response()
         }
     }
 }
@@ -370,7 +498,12 @@ async fn get_objects(
     let client = reqwest::Client::new();
     let url = format!("{}/{}", state.s3_endpoint, bucket);
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
@@ -402,7 +535,12 @@ async fn delete_object(
             state.s3_endpoint, upload_id
         );
 
-        match client.delete(&url).send().await {
+        match client
+            .delete(&url)
+            .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+            .send()
+            .await
+        {
             Ok(response) => {
                 if response.status().is_success() {
                     Json(ApiResponse::success(()))
@@ -419,7 +557,12 @@ async fn delete_object(
         let client = reqwest::Client::new();
         let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
 
-        match client.delete(&url).send().await {
+        match client
+            .delete(&url)
+            .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+            .send()
+            .await
+        {
             Ok(response) => {
                 if response.status().is_success() {
                     Json(ApiResponse::success(()))
@@ -503,7 +646,13 @@ async fn upload_object(
     let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
     info!("Sending request to S3: PUT {}", url);
 
-    match client.put(&url).body(data).send().await {
+    match client
+        .put(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .body(data)
+        .send()
+        .await
+    {
         Ok(response) => {
             info!("S3 response status: {}", response.status());
             if response.status().is_success() {
@@ -528,7 +677,12 @@ async fn download_object(
     let client = reqwest::Client::new();
     let url = format!("{}/{}/{}", state.s3_endpoint, bucket, key);
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await
+    {
         Ok(response) => {
             let status = response.status();
             let content_type = response
@@ -582,74 +736,79 @@ async fn download_object(
 
 // ===== S3 Access Key Management =====
 
+#[derive(Debug, Serialize)]
+struct CreatedKeyInfo {
+    #[serde(flatten)]
+    info: S3AccessKeyInfo,
+    /// 创建时返回明文 secret_key（仅此一次）
+    secret_key: String,
+}
+
 async fn get_s3_access_keys(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/_admin/keys", state.s3_backend_endpoint);
-
-    match client.get(&url).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<Vec<serde_json::Value>>().await {
-                    Ok(keys) => Json(ApiResponse::success(keys)),
-                    Err(_) => Json(ApiResponse::error("Failed to parse access keys")),
-                }
-            } else {
-                Json(ApiResponse::error("Failed to get access keys"))
-            }
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<S3AccessKeyInfo>>> {
+    // 普通用户只能查看自己的 AccessKey
+    match state.s3_keys.list_user_keys(&user.id) {
+        Ok(keys) => {
+            let infos: Vec<S3AccessKeyInfo> = keys.iter().map(S3AccessKeyInfo::from).collect();
+            Json(ApiResponse::success(infos))
         }
-        Err(e) => {
-            warn!("S3 backend connection error: {}", e);
-            Json(ApiResponse::error("S3 backend connection error"))
-        }
+        Err(e) => Json(ApiResponse::error(&e)),
     }
 }
 
 async fn create_s3_access_key(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<serde_json::Value>,
-) -> Json<ApiResponse<serde_json::Value>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/_admin/keys", state.s3_backend_endpoint);
+    Extension(user): Extension<CurrentUser>,
+) -> impl IntoResponse {
+    // 生成新的 AccessKey/SecretKey 对
+    let access_key = generate_access_key();
+    let secret_key = generate_secret_key();
+    let secret_hash = hash_secret_key(&secret_key, &state.hmac_secret);
 
-    match client.post(&url).json(&req).send().await {
-        Ok(response) => {
-            if response.status().is_success() || response.status().as_u16() == 201 {
-                match response.json::<serde_json::Value>().await {
-                    Ok(key) => Json(ApiResponse::success(key)),
-                    Err(_) => Json(ApiResponse::error("Failed to parse response")),
-                }
-            } else {
-                Json(ApiResponse::error("Failed to create access key"))
-            }
+    let key = S3AccessKey::new(&user.id, &access_key, &secret_hash);
+    match state.s3_keys.create_key(&key) {
+        Ok(()) => {
+            let info = CreatedKeyInfo {
+                info: S3AccessKeyInfo::from(&key),
+                secret_key,
+            };
+            Json(ApiResponse::success(info)).into_response()
         }
-        Err(e) => {
-            warn!("S3 backend connection error: {}", e);
-            Json(ApiResponse::error("S3 backend connection error"))
-        }
+        Err(e) => Json::<ApiResponse<CreatedKeyInfo>>(ApiResponse::error(&e)).into_response(),
     }
 }
 
 async fn delete_s3_access_key(
     State(state): State<Arc<AppState>>,
-    Path(access_key): Path<String>,
-) -> Json<ApiResponse<()>> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/_admin/keys/{}", state.s3_backend_endpoint, access_key);
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // 检查归属：用户只能删除自己的 key，admin 可删除任意
+    let key = match state.s3_keys.get_key_by_id(&id) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return Json::<ApiResponse<()>>(ApiResponse::error("AccessKey not found"))
+                .into_response();
+        }
+        Err(e) => return Json::<ApiResponse<()>>(ApiResponse::error(&e)).into_response(),
+    };
 
-    match client.delete(&url).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                Json(ApiResponse::success(()))
-            } else {
-                Json(ApiResponse::error("Failed to delete access key"))
-            }
+    if !user.is_admin() && key.user_id != user.id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<()>>(ApiResponse::error("Cannot delete other user's key")),
+        )
+            .into_response();
+    }
+
+    match state.s3_keys.delete_key(&id) {
+        Ok(true) => Json(ApiResponse::success(())).into_response(),
+        Ok(false) => {
+            Json::<ApiResponse<()>>(ApiResponse::error("AccessKey not found")).into_response()
         }
-        Err(e) => {
-            warn!("S3 backend connection error: {}", e);
-            Json(ApiResponse::error("S3 backend connection error"))
-        }
+        Err(e) => Json::<ApiResponse<()>>(ApiResponse::error(&e)).into_response(),
     }
 }
 
@@ -834,27 +993,63 @@ async fn get_metric_history(
     Json(ApiResponse::success(data))
 }
 
-async fn get_alerts(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<AlertInfo>>> {
-    let alerts = state.alert_engine.get_alerts().await;
+async fn get_alerts(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<AlertInfo>>> {
+    let mut alerts = state.alert_engine.get_alerts().await;
+    // 非 admin 用户仅可见归属自己的告警；系统级告警（owner_id=None）仅 admin 可见
+    if !user.is_admin() {
+        alerts.retain(|a| a.owner_id.as_deref() == Some(&user.id));
+    }
     Json(ApiResponse::success(alerts))
 }
 
 async fn get_alert(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<AlertInfo>> {
     match state.alert_engine.get_alert(&id).await {
-        Some(alert) => Json(ApiResponse::success(alert)),
+        Some(alert) => {
+            // 非 admin 用户只能查看归属自己的告警
+            if !user.is_admin() && alert.owner_id.as_deref() != Some(&user.id) {
+                return Json(ApiResponse::error("Forbidden"));
+            }
+            Json(ApiResponse::success(alert))
+        }
         None => Json(ApiResponse::error("Alert not found")),
     }
 }
 
 async fn acknowledge_alert(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Json<ApiResponse<()>> {
+) -> Response {
+    // 非 admin 用户只能确认归属自己的告警
+    if !user.is_admin() {
+        match state.alert_engine.get_alert(&id).await {
+            Some(alert) => {
+                if alert.owner_id.as_deref() != Some(&user.id) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json::<ApiResponse<()>>(ApiResponse::error("Forbidden")),
+                    )
+                        .into_response();
+                }
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json::<ApiResponse<()>>(ApiResponse::error("Alert not found")),
+                )
+                    .into_response();
+            }
+        }
+    }
     state.alert_engine.acknowledge_alert(&id).await;
-    Json(ApiResponse::success(()))
+    Json::<ApiResponse<()>>(ApiResponse::success(())).into_response()
 }
 
 async fn get_alert_rules(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<AlertRule>>> {
@@ -885,6 +1080,462 @@ async fn delete_alert_rule(
 ) -> Json<ApiResponse<()>> {
     state.alert_engine.remove_rule(&id).await;
     Json(ApiResponse::success(()))
+}
+
+// ===== Auth API =====
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    token: String,
+    refresh_token: String,
+    expires_in: u64,
+    user: UserInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserInfo {
+    id: String,
+    username: String,
+    role: String,
+    status: String,
+    email: Option<String>,
+    phone: Option<String>,
+    created_at: String,
+}
+
+impl From<&powerfs_monitor::auth::User> for UserInfo {
+    fn from(u: &powerfs_monitor::auth::User) -> Self {
+        Self {
+            id: u.id.clone(),
+            username: u.username.clone(),
+            role: u.role.to_string(),
+            status: format!("{:?}", u.status).to_lowercase(),
+            email: u.email.clone(),
+            phone: u.phone.clone(),
+            created_at: u.created_at.to_rfc3339(),
+        }
+    }
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(login_req): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let client_ip = "127.0.0.1";
+
+    if !state
+        .rate_limiter
+        .check_login(client_ip, &login_req.username)
+        .await
+        .unwrap_or(false)
+    {
+        return Json(ApiResponse::<LoginResponse>::error(
+            "Too many login attempts, please try again later",
+        ));
+    }
+
+    let auth_state = &state.auth;
+    let user = match auth_state
+        .user_store
+        .get_user_by_username(&login_req.username)
+    {
+        Ok(Some(u)) => u,
+        _ => {
+            return Json(ApiResponse::<LoginResponse>::error(
+                "Invalid username or password",
+            ));
+        }
+    };
+
+    if !user.is_active() {
+        return Json(ApiResponse::<LoginResponse>::error(
+            "Account is disabled or locked",
+        ));
+    }
+
+    if !auth_state
+        .user_store
+        .verify_password(&user, &login_req.password)
+    {
+        return Json(ApiResponse::<LoginResponse>::error(
+            "Invalid username or password",
+        ));
+    }
+
+    let tokens =
+        auth_state
+            .validator
+            .generate_token_pair(&user.id, &user.username, &user.role.to_string());
+
+    Json(ApiResponse::success(LoginResponse {
+        token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_in: tokens.expires_in,
+        user: UserInfo::from(&user),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+async fn refresh_token(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RefreshRequest>,
+) -> impl IntoResponse {
+    let auth_state = &state.auth;
+    match auth_state
+        .validator
+        .refresh_access_token(&req.refresh_token)
+    {
+        Ok(tokens) => {
+            // Get latest user info
+            let claims = auth_state
+                .validator
+                .validate_refresh_token(&req.refresh_token)
+                .ok();
+            let user = if let Some(c) = &claims {
+                auth_state.user_store.get_user_by_id(&c.sub).ok().flatten()
+            } else {
+                None
+            };
+
+            if let Some(u) = user {
+                Json(ApiResponse::success(LoginResponse {
+                    token: tokens.access_token,
+                    refresh_token: tokens.refresh_token,
+                    expires_in: tokens.expires_in,
+                    user: UserInfo::from(&u),
+                }))
+            } else {
+                Json(ApiResponse::<LoginResponse>::error("User not found"))
+            }
+        }
+        Err(e) => Json(ApiResponse::<LoginResponse>::error(&e)),
+    }
+}
+
+async fn get_current_user(
+    Extension(user): Extension<CurrentUser>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let auth_state = &state.auth;
+    match auth_state.user_store.get_user_by_id(&user.id) {
+        Ok(Some(u)) => Json(ApiResponse::success(UserInfo::from(&u))),
+        _ => Json(ApiResponse::<UserInfo>::error("User not found")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    role: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+}
+
+async fn list_users(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<Vec<UserInfo>>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    let auth_state = &state.auth;
+    match auth_state.user_store.list_users() {
+        Ok(users) => {
+            let users: Vec<UserInfo> = users.iter().map(UserInfo::from).collect();
+            Json(ApiResponse::success(users)).into_response()
+        }
+        Err(e) => Json::<ApiResponse<Vec<UserInfo>>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<CreateUserRequest>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<UserInfo>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+
+    let role = req
+        .role
+        .as_deref()
+        .map(|r| r.parse::<UserRole>().unwrap_or(UserRole::User))
+        .unwrap_or(UserRole::User);
+
+    let auth_state = &state.auth;
+    match auth_state
+        .user_store
+        .create_user(&req.username, &req.password, role)
+    {
+        Ok(mut u) => {
+            if req.email.is_some() || req.phone.is_some() {
+                u = auth_state
+                    .user_store
+                    .update_user(&u.id, req.email.clone(), req.phone.clone(), None, None)
+                    .unwrap_or(u);
+            }
+            Json(ApiResponse::success(UserInfo::from(&u))).into_response()
+        }
+        Err(e) => Json::<ApiResponse<UserInfo>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    email: Option<String>,
+    phone: Option<String>,
+    status: Option<String>,
+    role: Option<String>,
+    password: Option<String>,
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateUserRequest>,
+) -> impl IntoResponse {
+    // Admin can update anyone; users can only update themselves
+    if !current.is_admin() && current.id != id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<UserInfo>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+
+    // 仅管理员可修改角色和状态
+    let status = if current.is_admin() {
+        req.status.as_deref().and_then(|s| match s {
+            "active" => Some(UserStatus::Active),
+            "inactive" => Some(UserStatus::Inactive),
+            "locked" => Some(UserStatus::Locked),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let role = if current.is_admin() {
+        req.role.as_deref().and_then(|r| match r {
+            "admin" => Some(UserRole::Admin),
+            "user" => Some(UserRole::User),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let auth_state = &state.auth;
+
+    if let Some(pwd) = req.password {
+        if let Err(e) = auth_state.user_store.update_password(&id, &pwd) {
+            return Json::<ApiResponse<UserInfo>>(ApiResponse::error(&e)).into_response();
+        }
+    }
+
+    match auth_state
+        .user_store
+        .update_user(&id, req.email, req.phone, status, role)
+    {
+        Ok(u) => Json(ApiResponse::success(UserInfo::from(&u))).into_response(),
+        Err(e) => Json::<ApiResponse<UserInfo>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<()>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    if user.id == id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json::<ApiResponse<()>>(ApiResponse::error("Cannot delete yourself")),
+        )
+            .into_response();
+    }
+
+    let auth_state = &state.auth;
+    match auth_state.user_store.delete_user(&id) {
+        Ok(true) => {
+            let _ = state.s3_keys.clear_user_keys(&id);
+            let _ = state.resource_owners.clear_user_resources(&id);
+            Json(ApiResponse::success(())).into_response()
+        }
+        Ok(false) => Json::<ApiResponse<()>>(ApiResponse::error("User not found")).into_response(),
+        Err(e) => Json::<ApiResponse<()>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+// ===== 角色管理 API =====
+
+#[derive(Debug, Serialize)]
+struct RoleInfo {
+    id: String,
+    name: String,
+    description: String,
+    permissions: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<&Role> for RoleInfo {
+    fn from(r: &Role) -> Self {
+        Self {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            description: r.description.clone(),
+            permissions: r.permissions.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRoleRequest {
+    name: String,
+    description: Option<String>,
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateRoleRequest {
+    name: Option<String>,
+    description: Option<String>,
+    permissions: Option<Vec<String>>,
+}
+
+async fn list_roles(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<Vec<RoleInfo>>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    match state.roles.list_roles() {
+        Ok(roles) => Json(ApiResponse::success(
+            roles.iter().map(RoleInfo::from).collect::<Vec<_>>(),
+        ))
+        .into_response(),
+        Err(e) => Json::<ApiResponse<Vec<RoleInfo>>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn get_role(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<RoleInfo>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    match state.roles.get_role_by_id(&id) {
+        Ok(Some(role)) => Json(ApiResponse::success(RoleInfo::from(&role))).into_response(),
+        Ok(None) => {
+            Json::<ApiResponse<RoleInfo>>(ApiResponse::error("Role not found")).into_response()
+        }
+        Err(e) => Json::<ApiResponse<RoleInfo>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn create_role(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<CreateRoleRequest>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<RoleInfo>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    match state.roles.create_role(
+        &req.name,
+        req.description.as_deref().unwrap_or(""),
+        req.permissions,
+    ) {
+        Ok(role) => Json(ApiResponse::success(RoleInfo::from(&role))).into_response(),
+        Err(e) => Json::<ApiResponse<RoleInfo>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn update_role(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateRoleRequest>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<RoleInfo>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    match state
+        .roles
+        .update_role(&id, req.name, req.description, req.permissions)
+    {
+        Ok(role) => Json(ApiResponse::success(RoleInfo::from(&role))).into_response(),
+        Err(e) => Json::<ApiResponse<RoleInfo>>(ApiResponse::error(&e)).into_response(),
+    }
+}
+
+async fn delete_role(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json::<ApiResponse<()>>(ApiResponse::error("Forbidden")),
+        )
+            .into_response();
+    }
+    match state.roles.delete_role(&id) {
+        Ok(true) => Json(ApiResponse::success(())).into_response(),
+        Ok(false) => Json::<ApiResponse<()>>(ApiResponse::error("Role not found")).into_response(),
+        Err(e) => Json::<ApiResponse<()>>(ApiResponse::error(&e)).into_response(),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -931,6 +1582,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Listening on: {}", args.addr);
     info!("Redis URL: {}", args.redis_url);
 
+    // Initialize auth store
+    let user_store = Arc::new(UserStore::new(&args.auth_db_path)?);
+    user_store.ensure_admin_exists(&args.admin_username, &args.admin_password)?;
+    let resource_owners = Arc::new(ResourceOwnerStore::from_user_store(&user_store));
+    let roles = Arc::new(RoleStore::from_user_store(&user_store));
+    roles.ensure_default_roles()?;
+    let s3_keys = Arc::new(S3AccessKeyStore::from_user_store(&user_store));
+    let jwt_validator = JwtValidator::new(&args.jwt_secret);
+
+    let auth_state = Arc::new(AuthState {
+        validator: jwt_validator,
+        user_store: user_store.clone(),
+    });
+
     let metric_store = Arc::new(MetricStore::new());
     let alert_engine = Arc::new(AlertEngine::new(metric_store.clone()));
     alert_engine.load_default_rules().await;
@@ -943,7 +1608,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_clients,
         s3_endpoint: args.s3_endpoint,
         s3_backend_endpoint: args.s3_backend_endpoint,
+        s3_access_key: args.s3_access_key,
+        s3_secret_key: args.s3_secret_key,
         fuse_mounts: Arc::new(Mutex::new(Vec::new())),
+        auth: auth_state.clone(),
+        resource_owners: resource_owners.clone(),
+        roles: roles.clone(),
+        s3_keys: s3_keys.clone(),
+        hmac_secret: args.hmac_secret.clone(),
+        rate_limiter: Arc::new(RateLimiter::new(Arc::new(
+            redis::Client::open(args.redis_url.clone())
+                .expect("Failed to create Redis client for rate limiter"),
+        ))),
     });
 
     let event_bus = EventBus::new(&args.redis_url, &args.stream_key);
@@ -970,7 +1646,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
-    let app = Router::new()
+    // Public routes (no auth required)
+    let public_routes = Router::new()
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/refresh", post(refresh_token));
+
+    // Authenticated routes - all routes under this layer require JWT
+    let protected_routes = Router::new()
+        .route("/api/auth/me", get(get_current_user))
+        .route("/api/users", get(list_users))
+        .route("/api/users", post(create_user))
+        .route("/api/users/:id", put(update_user))
+        .route("/api/users/:id", delete(delete_user))
+        .route("/api/roles", get(list_roles))
+        .route("/api/roles/:id", get(get_role))
+        .route("/api/roles", post(create_role))
+        .route("/api/roles/:id", put(update_role))
+        .route("/api/roles/:id", delete(delete_role))
         .route("/api/metrics/cluster", get(get_cluster_metrics))
         .route("/api/metrics/nodes", get(get_nodes))
         .route("/api/metrics/nodes/:id", get(get_node))
@@ -1009,6 +1701,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/alert-rules", post(add_alert_rule))
         .route("/api/alert-rules/:id", put(update_alert_rule))
         .route("/api/alert-rules/:id/delete", post(delete_alert_rule))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(protected_routes)
         .route("/ws/metrics", get(ws_handler))
         .with_state(app_state)
         .layer(cors);

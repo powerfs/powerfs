@@ -127,6 +127,7 @@ impl DirectoryTree {
                     disk_size: 4096,
                     ttl: "".to_string(),
                     symlink_target: "".to_string(),
+                    owner: String::new(),
                 };
                 let _ = self.create_entry(entry);
             }
@@ -247,6 +248,7 @@ impl DirectoryTree {
                 disk_size: 4096,
                 ttl: "".to_string(),
                 symlink_target: "".to_string(),
+                owner: String::new(),
             };
 
             let mut data = Vec::new();

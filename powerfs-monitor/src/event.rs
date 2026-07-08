@@ -38,6 +38,8 @@ pub struct AlertInfo {
     pub message: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 资源归属用户ID：None 表示系统级告警（仅 admin 可见）
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

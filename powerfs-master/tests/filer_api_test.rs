@@ -30,6 +30,7 @@ fn create_test_entry(name: &str, directory: &str, mode: u32) -> Entry {
         disk_size: 0,
         ttl: String::new(),
         symlink_target: String::new(),
+        owner: String::new(),
     }
 }
 

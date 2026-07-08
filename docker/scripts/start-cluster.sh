@@ -2,6 +2,20 @@
 
 set -e
 
+BUILD_IMAGES=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build|-b)
+            BUILD_IMAGES=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 DOCKER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
 HOST_IP=$(hostname -I | awk '{print $1}')
@@ -13,22 +27,29 @@ echo ""
 echo "Host IP: $HOST_IP"
 echo ""
 
-echo "[1/7] Building Docker images..."
-cd "$DOCKER_DIR"
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+if [ "$BUILD_IMAGES" = true ]; then
+    echo "[1/7] Building Docker images..."
+    cd "$DOCKER_DIR"
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
-echo "  Building Rust binaries..."
-cd "$PROJECT_DIR"
-cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor 2>&1 | tail -5
-echo "  [OK] Binaries built"
+    echo "  Building Rust binaries..."
+    cd "$PROJECT_DIR"
+    cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor 2>&1 | tail -5
+    echo "  [OK] Binaries built"
 
-echo "  Building Docker image..."
-cd "$DOCKER_DIR"
-docker compose build 2>&1 | tail -5
-echo "[OK] Images built"
+    echo "  Building Docker image..."
+    cd "$DOCKER_DIR"
+    docker compose build 2>&1 | tail -5
+    echo "[OK] Images built"
+else
+    echo "[1/7] Using existing Docker images..."
+    echo "  Use --build or -b flag to rebuild images"
+    echo "[OK] Using existing images"
+fi
 
 echo ""
 echo "[2/7] Starting Redis..."
+cd "$DOCKER_DIR"
 docker compose up -d redis
 
 echo "  Waiting for redis to be ready..."
