@@ -524,6 +524,70 @@ service KVCacheService {
     rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
     rpc ListSessions (ListSessionsRequest) returns (ListSessionsResponse);
     rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
+    rpc CreateNamespace (CreateNamespaceRequest) returns (CreateNamespaceResponse);
+    rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesResponse);
+    rpc GetNamespace (GetNamespaceRequest) returns (GetNamespaceResponse);
+    rpc DeleteNamespace (DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
+
+    rpc KVPut (KVPutRequest) returns (KVResponse);
+    rpc KVGet (KVGetRequest) returns (KVGetResponse);
+    rpc KVDelete (KVDeleteRequest) returns (KVResponse);
+    rpc KVExists (KVExistsRequest) returns (KVExistsResponse);
+    rpc KVList (KVListRequest) returns (KVListResponse);
+    rpc KVRemoveByRegex (KVRemoveByRegexRequest) returns (KVResponse);
+    rpc KVRemoveAll (KVRemoveAllRequest) returns (KVResponse);
+    rpc KVBatchPut (KVBatchPutRequest) returns (KVBatchResponse);
+    rpc KVBatchGet (KVBatchGetRequest) returns (KVBatchGetResponse);
+}
+
+message CreateNamespaceRequest {
+    string namespace_id = 1;
+    string name = 2;
+    string owner_id = 3;
+}
+
+message CreateNamespaceResponse {
+    bool success = 1;
+    string error = 2;
+    string namespace_id = 3;
+}
+
+message ListNamespacesRequest {
+    string owner_id = 1;
+}
+
+message ListNamespacesResponse {
+    repeated KVNamespace namespaces = 1;
+    string error = 2;
+}
+
+message GetNamespaceRequest {
+    string namespace_id = 1;
+    string owner_id = 2;
+}
+
+message GetNamespaceResponse {
+    bool found = 1;
+    KVNamespace namespace = 2;
+    string error = 3;
+}
+
+message DeleteNamespaceRequest {
+    string namespace_id = 1;
+    string owner_id = 2;
+}
+
+message DeleteNamespaceResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message KVNamespace {
+    string id = 1;
+    string name = 2;
+    string owner_id = 3;
+    uint64 created_at = 4;
+    uint64 updated_at = 5;
 }
 
 message CreateSessionRequest {
@@ -534,6 +598,8 @@ message CreateSessionRequest {
     uint32 head_dim = 5;
     string dtype = 6;
     uint64 ttl_seconds = 7;
+    string owner_id = 8;
+    string namespace_id = 9;
 }
 
 message CreateSessionResponse {
@@ -630,4 +696,86 @@ message GetStatsResponse {
     uint64 cache_hits = 5;
     uint64 cache_misses = 6;
     uint64 evictions = 7;
+}
+
+message KVPutRequest {
+    string namespace_id = 1;
+    string key = 2;
+    bytes value = 3;
+    string owner_id = 4;
+    uint64 ttl_seconds = 5;
+}
+
+message KVGetRequest {
+    string namespace_id = 1;
+    string key = 2;
+}
+
+message KVGetResponse {
+    bool success = 1;
+    string error = 2;
+    bytes value = 3;
+    bool found = 4;
+}
+
+message KVDeleteRequest {
+    string namespace_id = 1;
+    string key = 2;
+}
+
+message KVResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message KVExistsRequest {
+    string namespace_id = 1;
+    string key = 2;
+}
+
+message KVExistsResponse {
+    bool exists = 1;
+    string error = 2;
+}
+
+message KVListRequest {
+    string namespace_id = 1;
+    string prefix = 2;
+}
+
+message KVListResponse {
+    repeated string keys = 1;
+    string error = 2;
+}
+
+message KVRemoveByRegexRequest {
+    string namespace_id = 1;
+    string pattern = 2;
+}
+
+message KVRemoveAllRequest {
+    string namespace_id = 1;
+}
+
+message KVBatchPutRequest {
+    string namespace_id = 1;
+    repeated string keys = 2;
+    repeated bytes values = 3;
+    string owner_id = 4;
+}
+
+message KVBatchResponse {
+    repeated bool successes = 1;
+    string error = 2;
+}
+
+message KVBatchGetRequest {
+    string namespace_id = 1;
+    repeated string keys = 2;
+}
+
+message KVBatchGetResponse {
+    repeated bytes values = 1;
+    repeated bool found = 2;
+    string error = 3;
 }

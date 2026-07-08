@@ -1,4 +1,5 @@
 pub mod jwt;
+pub mod kv_access_key;
 pub mod middleware;
 pub mod rate_limiter;
 pub mod resource_owner;
@@ -8,6 +9,7 @@ pub mod user;
 pub mod user_store;
 
 pub use jwt::{Claims, JwtValidator, TokenPair};
+pub use kv_access_key::{KVAccessKey, KVAccessKeyInfo, KVAccessKeyStore, KVKeyStatus};
 pub use middleware::{auth_middleware, require_admin, AuthState, CurrentUser};
 pub use rate_limiter::RateLimiter;
 pub use resource_owner::{ResourceOwner, ResourceOwnerStore, ResourceType};

@@ -63,7 +63,7 @@ impl RateLimiter {
     pub async fn reset_login(&self, username: &str) -> Result<(), String> {
         let mut conn = self.client.get_async_connection().await.map_err(|e| {
             log::warn!("Redis connection failed for rate limiter: {}", e);
-    "Rate limit reset failed".to_string()
+            "Rate limit reset failed".to_string()
         })?;
 
         let user_key = format!("login:user:{}", username);

@@ -302,6 +302,8 @@ impl MasterNode {
                     let dtype = meta.dtype_enum();
                     let _ = kv_cache.create_session(
                         &session_id,
+                        "",
+                        "",
                         &meta.model_name,
                         meta.num_layers,
                         meta.num_heads,

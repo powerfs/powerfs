@@ -1,15 +1,29 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, message } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, message, Form, Input, Tabs } from 'antd'
 import {
   KeyOutlined,
   DeleteOutlined,
   EyeOutlined,
   WarningOutlined,
   ApiOutlined,
+  PlusOutlined,
+  CopyOutlined,
+  CheckCircleOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
-import type { KVSessionInfo, KVMetrics } from '@/types'
-import { getKVSessions, getKVMetrics, deleteKVSession } from '@/services/api'
+import type { KVSessionInfo, KVMetrics, KVNamespace, KVAccessKey } from '@/types'
+import {
+  getKVSessions,
+  getKVMetrics,
+  deleteKVSession,
+  createKVNamespace,
+  listKVNamespaces,
+  deleteKVNamespace,
+  createKVKey,
+  listKVKeys,
+  deleteKVKey,
+} from '@/services/api'
 import { formatBytes, formatPercent, formatNumber } from '@/utils/format'
 import { generateTimeSeriesData } from '@/utils/mockData'
 
@@ -21,13 +35,21 @@ function KV() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [hitRatioTrend] = useState(generateTimeSeriesData(24, 90, 10))
 
+  const [namespaces, setNamespaces] = useState<KVNamespace[]>([])
+  const [showCreateNamespace, setShowCreateNamespace] = useState(false)
+  const [namespaceForm] = Form.useForm()
+
+  const [keys, setKeys] = useState<KVAccessKey[]>([])
+  const [showCreateKey, setShowCreateKey] = useState(false)
+  const [newKey, setNewKey] = useState<{ access_key: string; secret_key: string } | null>(null)
+
   useEffect(() => {
-    loadData()
-    const interval = setInterval(loadData, 10000)
+    loadKVData()
+    const interval = setInterval(loadKVData, 10000)
     return () => clearInterval(interval)
   }, [])
 
-  const loadData = async () => {
+  const loadKVData = async () => {
     const [sessionList, kvMetrics] = await Promise.all([
       getKVSessions(),
       getKVMetrics(),
@@ -36,26 +58,97 @@ function KV() {
     setMetrics(kvMetrics)
   }
 
+  useEffect(() => {
+    loadNamespaces()
+  }, [])
+
+  const loadNamespaces = async () => {
+    const ns = await listKVNamespaces()
+    setNamespaces(ns)
+  }
+
+  useEffect(() => {
+    loadKeys()
+  }, [])
+
+  const loadKeys = async () => {
+    const k = await listKVKeys()
+    setKeys(k)
+  }
+
   const handleViewDetail = (session: KVSessionInfo) => {
     setSelectedSession(session)
     setShowDetail(true)
   }
 
-  const handleDelete = (session: KVSessionInfo) => {
+  const handleDeleteSession = (session: KVSessionInfo) => {
     setSelectedSession(session)
     setShowDeleteConfirm(true)
   }
 
-  const confirmDelete = async () => {
+  const confirmDeleteSession = async () => {
     if (selectedSession) {
       await deleteKVSession(selectedSession.id)
       message.success('会话删除成功')
       setShowDeleteConfirm(false)
-      loadData()
+      loadKVData()
     }
   }
 
-  const columns = [
+  const handleCreateNamespace = async () => {
+    try {
+      const values = await namespaceForm.validateFields()
+      await createKVNamespace(values.name)
+      message.success('命名空间创建成功')
+      setShowCreateNamespace(false)
+      namespaceForm.resetFields()
+      loadNamespaces()
+    } catch (error) {
+      message.error('创建失败')
+    }
+  }
+
+  const handleDeleteNamespace = async (id: string) => {
+    try {
+      await deleteKVNamespace(id)
+      message.success('命名空间删除成功')
+      loadNamespaces()
+    } catch (error) {
+      message.error('删除失败')
+    }
+  }
+
+  const handleCreateKey = async () => {
+    try {
+      const key = await createKVKey()
+      setNewKey({ access_key: key.access_key, secret_key: key.secret_key })
+      setShowCreateKey(true)
+      loadKeys()
+    } catch (error) {
+      message.error('创建失败')
+    }
+  }
+
+  const handleDeleteKey = async (id: string) => {
+    try {
+      await deleteKVKey(id)
+      message.success('API Key 删除成功')
+      loadKeys()
+    } catch (error) {
+      message.error('删除失败')
+    }
+  }
+
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      message.success('已复制到剪贴板')
+    } catch (error) {
+      message.error('复制失败')
+    }
+  }
+
+  const sessionColumns = [
     {
       title: '会话ID',
       dataIndex: 'id',
@@ -138,7 +231,7 @@ function KV() {
             type="text"
             danger
             icon={<DeleteOutlined />}
-            onClick={() => handleDelete(record)}
+            onClick={() => handleDeleteSession(record)}
           >
             删除
           </Button>
@@ -147,10 +240,115 @@ function KV() {
     },
   ]
 
-  return (
+  const namespaceColumns = [
+    {
+      title: 'ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 200,
+    },
+    {
+      title: '名称',
+      dataIndex: 'name',
+      key: 'name',
+      width: 200,
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 180,
+      render: (time: number) => new Date(time * 1000).toLocaleString(),
+    },
+    {
+      title: '更新时间',
+      dataIndex: 'updated_at',
+      key: 'updated_at',
+      width: 180,
+      render: (time: number) => new Date(time * 1000).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 100,
+      render: (_: unknown, record: KVNamespace) => (
+        <Button
+          type="text"
+          danger
+          icon={<DeleteOutlined />}
+          onClick={() => handleDeleteNamespace(record.id)}
+        >
+          删除
+        </Button>
+      ),
+    },
+  ]
+
+  const keyColumns = [
+    {
+      title: 'ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 150,
+    },
+    {
+      title: 'Access Key',
+      dataIndex: 'access_key',
+      key: 'access_key',
+      width: 250,
+      render: (key: string) => (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{key}</span>
+          <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyToClipboard(key)} />
+        </div>
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 100,
+      render: (status: string) => (
+        <Tag color={status === 'active' ? 'green' : 'red'}>
+          {status === 'active' ? '活跃' : '停用'}
+        </Tag>
+      ),
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 180,
+      render: (time: string) => new Date(time).toLocaleString(),
+    },
+    {
+      title: '最后使用',
+      dataIndex: 'last_used_at',
+      key: 'last_used_at',
+      width: 180,
+      render: (time: string | undefined) => time ? new Date(time).toLocaleString() : '-',
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 100,
+      render: (_: unknown, record: KVAccessKey) => (
+        <Button
+          type="text"
+          danger
+          icon={<DeleteOutlined />}
+          onClick={() => handleDeleteKey(record.id)}
+        >
+          删除
+        </Button>
+      ),
+    },
+  ]
+
+  const SessionMonitor = () => (
     <div>
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col span={6}>
+      <div style={{ marginBottom: 16, display: 'flex', gap: 16 }}>
+        <div style={{ flex: 1 }}>
           <Card
             hoverable
             style={{ borderRadius: 12 }}
@@ -168,8 +366,8 @@ function KV() {
               </span>
             </Space>
           </Card>
-        </Col>
-        <Col span={6}>
+        </div>
+        <div style={{ flex: 1 }}>
           <Card
             hoverable
             style={{ borderRadius: 12 }}
@@ -187,8 +385,8 @@ function KV() {
               </span>
             </Space>
           </Card>
-        </Col>
-        <Col span={6}>
+        </div>
+        <div style={{ flex: 1 }}>
           <Card
             hoverable
             style={{ borderRadius: 12 }}
@@ -206,8 +404,8 @@ function KV() {
               </span>
             </Space>
           </Card>
-        </Col>
-        <Col span={6}>
+        </div>
+        <div style={{ flex: 1 }}>
           <Card
             hoverable
             style={{ borderRadius: 12 }}
@@ -225,11 +423,11 @@ function KV() {
               </span>
             </Space>
           </Card>
-        </Col>
-      </Row>
+        </div>
+      </div>
 
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col span={12}>
+      <div style={{ marginBottom: 16, display: 'flex', gap: 16 }}>
+        <div style={{ flex: 1 }}>
           <Card
             title="命中率趋势"
             style={{ borderRadius: 12 }}
@@ -292,8 +490,8 @@ function KV() {
               style={{ height: 300 }}
             />
           </Card>
-        </Col>
-        <Col span={12}>
+        </div>
+        <div style={{ flex: 1 }}>
           <Card
             title="缓存统计"
             style={{ borderRadius: 12 }}
@@ -322,15 +520,15 @@ function KV() {
               </div>
             </Space>
           </Card>
-        </Col>
-      </Row>
+        </div>
+      </div>
 
       <Card
         title="KV会话列表"
         style={{ borderRadius: 12 }}
       >
         <Table
-          columns={columns}
+          columns={sessionColumns}
           dataSource={sessions}
           rowKey="id"
           pagination={{ pageSize: 10 }}
@@ -409,7 +607,7 @@ function KV() {
         title="确认删除"
         open={showDeleteConfirm}
         onCancel={() => setShowDeleteConfirm(false)}
-        onOk={confirmDelete}
+        onOk={confirmDeleteSession}
         okText="确认删除"
         cancelText="取消"
         okButtonProps={{ danger: true }}
@@ -419,7 +617,150 @@ function KV() {
       </Modal>
     </div>
   )
+
+  const NamespaceManagement = () => (
+    <div>
+      <div style={{ marginBottom: 16 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreateNamespace(true)}>
+          创建命名空间
+        </Button>
+      </div>
+
+      <Card
+        title="命名空间列表"
+        style={{ borderRadius: 12 }}
+      >
+        <Table
+          columns={namespaceColumns}
+          dataSource={namespaces}
+          rowKey="id"
+          pagination={{ pageSize: 10 }}
+          scroll={{ x: 800 }}
+        />
+      </Card>
+    </div>
+  )
+
+  const APIKeyManagement = () => (
+    <div>
+      <div style={{ marginBottom: 16 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateKey}>
+          创建 API Key
+        </Button>
+      </div>
+
+      <Card
+        title="API Key 列表"
+        style={{ borderRadius: 12 }}
+      >
+        <Table
+          columns={keyColumns}
+          dataSource={keys}
+          rowKey="id"
+          pagination={{ pageSize: 10 }}
+          scroll={{ x: 1000 }}
+        />
+      </Card>
+
+      <Modal
+        title="API Key 创建成功"
+        open={showCreateKey}
+        onCancel={() => { setShowCreateKey(false); setNewKey(null); }}
+        footer={null}
+        width={500}
+      >
+        {newKey && (
+          <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ background: '#f6ffed', padding: 12, borderRadius: 12 }}>
+                <CheckCircleOutlined style={{ fontSize: 32, color: '#52c41a' }} />
+              </div>
+              <div>
+                <h3 style={{ margin: 0 }}>API Key 创建成功</h3>
+                <p style={{ color: '#8c8c8c', fontSize: 12, margin: '4px 0' }}>请妥善保存您的 Secret Key，它只会显示一次</p>
+              </div>
+            </div>
+
+            <div>
+              <h4 style={{ margin: '0 0 8px' }}>Access Key</h4>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Input
+                  value={newKey.access_key}
+                  readOnly
+                  style={{ fontFamily: 'monospace' }}
+                />
+                <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(newKey.access_key)} />
+              </div>
+            </div>
+
+            <div>
+              <h4 style={{ margin: '0 0 8px' }}>Secret Key</h4>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Input
+                  value={newKey.secret_key}
+                  readOnly
+                  style={{ fontFamily: 'monospace' }}
+                />
+                <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(newKey.secret_key)} />
+              </div>
+            </div>
+
+            <div style={{ background: '#fff7e6', padding: 12, borderRadius: 8, display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+              <ExclamationCircleOutlined style={{ color: '#fa8c16', fontSize: 16, marginTop: 2 }} />
+              <div>
+                <p style={{ margin: 0, fontSize: 12, color: '#fa8c16' }}>重要提示</p>
+                <p style={{ margin: '4px 0 0', fontSize: 12, color: '#8c8c8c' }}>
+                  Secret Key 只会显示一次，丢失后无法找回。请立即复制保存到安全的地方。
+                </p>
+              </div>
+            </div>
+          </Space>
+        )}
+      </Modal>
+    </div>
+  )
+
+  return (
+    <div>
+      <Tabs
+        defaultActiveKey="sessions"
+        items={[
+          {
+            key: 'sessions',
+            label: '会话监控',
+            children: <SessionMonitor />,
+          },
+          {
+            key: 'namespaces',
+            label: '命名空间管理',
+            children: <NamespaceManagement />,
+          },
+          {
+            key: 'keys',
+            label: 'API Key 管理',
+            children: <APIKeyManagement />,
+          },
+        ]}
+      />
+
+      <Modal
+        title="创建命名空间"
+        open={showCreateNamespace}
+        onCancel={() => { setShowCreateNamespace(false); namespaceForm.resetFields(); }}
+        onOk={handleCreateNamespace}
+      >
+        <Form form={namespaceForm} layout="vertical">
+          <Form.Item
+            name="name"
+            label="名称"
+            rules={[{ required: true, message: '请输入命名空间名称' }]}
+          >
+            <Input placeholder="请输入命名空间名称" />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </div>
+  )
 }
 
-import { Row, Col } from 'antd'
 export default KV

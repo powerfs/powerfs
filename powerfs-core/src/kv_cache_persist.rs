@@ -173,6 +173,8 @@ impl PersistentKVCache {
     pub fn create_session(
         &self,
         session_id: &str,
+        namespace_id: &str,
+        owner_id: &str,
         model_name: &str,
         num_layers: u32,
         num_heads: u32,
@@ -182,6 +184,8 @@ impl PersistentKVCache {
     ) -> Result<(), String> {
         self.engine.create_session(
             session_id,
+            namespace_id,
+            owner_id,
             model_name,
             num_layers,
             num_heads,
@@ -214,9 +218,15 @@ impl PersistentKVCache {
         fid: &str,
         block_index: u32,
     ) -> Result<u64, String> {
-        let block_id =
-            self.engine
-                .put_block(session_id, layer_id, num_tokens, data, fid, block_index)?;
+        let block_id = self.engine.put_block(
+            session_id,
+            layer_id,
+            num_tokens,
+            data,
+            fid,
+            block_index,
+            crate::kv_cache::PinMode::None,
+        )?;
         self.store.save_block(session_id, block_id, data)?;
         self.store.save_block_fid(block_id, fid)?;
         Ok(block_id)

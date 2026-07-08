@@ -47,6 +47,8 @@ impl KvCacheClient {
             head_dim,
             dtype: dtype.to_string(),
             ttl_seconds,
+            owner_id: "".to_string(),
+            namespace_id: "".to_string(),
         };
 
         let resp = self.client.create_session(req).await?.into_inner();
@@ -158,5 +160,107 @@ impl KvCacheClient {
         let req = GetStatsRequest {};
         let resp = self.client.get_stats(req).await?.into_inner();
         Ok(resp)
+    }
+
+    pub async fn create_namespace(&mut self, name: &str) -> Result<(), KvCacheClientError> {
+        let req = CreateNamespaceRequest {
+            namespace_id: name.to_string(),
+            name: name.to_string(),
+            owner_id: "".to_string(),
+        };
+
+        let resp = self.client.create_namespace(req).await?.into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(KvCacheClientError::Server(resp.error))
+        }
+    }
+
+    pub async fn list_namespaces(&mut self) -> Result<Vec<KvNamespace>, KvCacheClientError> {
+        let req = ListNamespacesRequest {
+            owner_id: "".to_string(),
+        };
+
+        let resp = self.client.list_namespaces(req).await?.into_inner();
+        Ok(resp.namespaces)
+    }
+
+    pub async fn delete_namespace(&mut self, name: &str) -> Result<(), KvCacheClientError> {
+        let req = DeleteNamespaceRequest {
+            namespace_id: name.to_string(),
+            owner_id: "".to_string(),
+        };
+
+        let resp = self.client.delete_namespace(req).await?.into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(KvCacheClientError::Server(resp.error))
+        }
+    }
+
+    pub async fn put_key(
+        &mut self,
+        namespace: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), KvCacheClientError> {
+        let req = KvPutRequest {
+            namespace_id: namespace.to_string(),
+            key: key.to_string(),
+            value: value.as_bytes().to_vec(),
+            owner_id: "".to_string(),
+            ttl_seconds: 0,
+        };
+
+        let resp = self.client.kv_put(req).await?.into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(KvCacheClientError::Server(resp.error))
+        }
+    }
+
+    pub async fn get_key(
+        &mut self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<String>, KvCacheClientError> {
+        let req = KvGetRequest {
+            namespace_id: namespace.to_string(),
+            key: key.to_string(),
+        };
+
+        let resp = self.client.kv_get(req).await?.into_inner();
+        if resp.found {
+            Ok(Some(String::from_utf8_lossy(&resp.value).to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn delete_key(&mut self, namespace: &str, key: &str) -> Result<(), KvCacheClientError> {
+        let req = KvDeleteRequest {
+            namespace_id: namespace.to_string(),
+            key: key.to_string(),
+        };
+
+        let resp = self.client.kv_delete(req).await?.into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(KvCacheClientError::Server(resp.error))
+        }
+    }
+
+    pub async fn list_keys(&mut self, namespace: &str) -> Result<Vec<String>, KvCacheClientError> {
+        let req = KvListRequest {
+            namespace_id: namespace.to_string(),
+            prefix: "".to_string(),
+        };
+
+        let resp = self.client.kv_list(req).await?.into_inner();
+        Ok(resp.keys)
     }
 }

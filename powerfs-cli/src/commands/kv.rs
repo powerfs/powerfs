@@ -45,6 +45,12 @@ pub enum SessionCommands {
 
         #[arg(long, default_value = "3600")]
         ttl_seconds: u64,
+
+        #[arg(long)]
+        owner_id: Option<String>,
+
+        #[arg(long)]
+        namespace_id: Option<String>,
     },
 
     Delete {
@@ -126,6 +132,8 @@ async fn kv_session(mut client: KvCacheClient, args: KvSessionArgs) -> super::Co
             head_dim,
             dtype,
             ttl_seconds,
+            owner_id,
+            namespace_id,
         } => {
             let req = crate::kv_client::CreateSessionRequest {
                 session_id,
@@ -135,6 +143,8 @@ async fn kv_session(mut client: KvCacheClient, args: KvSessionArgs) -> super::Co
                 head_dim,
                 dtype,
                 ttl_seconds,
+                owner_id: owner_id.unwrap_or_default(),
+                namespace_id: namespace_id.unwrap_or_default(),
             };
 
             let resp = svc.create_session(req).await.map_err(|e| {

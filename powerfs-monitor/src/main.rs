@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
+use powerfs_kv_client::KvCacheClient;
 use powerfs_monitor::alert_engine::AlertEngine;
 use powerfs_monitor::auth::{
     auth_middleware, generate_access_key, generate_secret_key, hash_secret_key, AuthState,
@@ -65,6 +66,9 @@ struct Args {
 
     #[arg(long, default_value = "admin123")]
     admin_password: String,
+
+    #[arg(long, default_value = "localhost:9333")]
+    master_endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +107,8 @@ struct AppState {
     hmac_secret: String,
     /// 登录速率限制器
     rate_limiter: Arc<RateLimiter>,
+    /// KV Cache 客户端
+    kv_client: Arc<Mutex<KvCacheClient>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1573,6 +1579,191 @@ async fn broadcast_message(state: Arc<AppState>, message: serde_json::Value) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateKVNamespaceRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateKVKeyRequest {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KVNamespace {
+    id: String,
+    name: String,
+    owner_id: String,
+    created_at: u64,
+    updated_at: u64,
+}
+
+async fn list_kv_namespaces(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.list_namespaces().await {
+        Ok(namespaces) => {
+            let converted: Vec<KVNamespace> = namespaces
+                .into_iter()
+                .map(|ns| KVNamespace {
+                    id: ns.id,
+                    name: ns.name,
+                    owner_id: ns.owner_id,
+                    created_at: ns.created_at,
+                    updated_at: ns.updated_at,
+                })
+                .collect();
+            Json(ApiResponse::success(converted))
+        }
+        Err(e) => {
+            warn!("Failed to list KV namespaces: {}", e);
+            Json(ApiResponse::error("Failed to list namespaces"))
+        }
+    }
+}
+
+async fn create_kv_namespace(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateKVNamespaceRequest>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.create_namespace(&req.name).await {
+        Ok(_) => Json(ApiResponse::success(())),
+        Err(e) => {
+            warn!("Failed to create KV namespace: {}", e);
+            Json(ApiResponse::error("Failed to create namespace"))
+        }
+    }
+}
+
+async fn delete_kv_namespace(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.delete_namespace(&name).await {
+        Ok(_) => Json(ApiResponse::success(())),
+        Err(e) => {
+            warn!("Failed to delete KV namespace: {}", e);
+            Json(ApiResponse::error("Failed to delete namespace"))
+        }
+    }
+}
+
+async fn list_kv_keys(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.list_keys(&name).await {
+        Ok(keys) => Json(ApiResponse::success(keys)),
+        Err(e) => {
+            warn!("Failed to list KV keys: {}", e);
+            Json(ApiResponse::error("Failed to list keys"))
+        }
+    }
+}
+
+async fn create_kv_key(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CreateKVKeyRequest>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.put_key(&name, &req.key, &req.value).await {
+        Ok(_) => Json(ApiResponse::success(())),
+        Err(e) => {
+            warn!("Failed to create KV key: {}", e);
+            Json(ApiResponse::error("Failed to create key"))
+        }
+    }
+}
+
+async fn get_kv_key(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.get_key(&name, &key).await {
+        Ok(Some(value)) => Json(ApiResponse::success(value)),
+        Ok(None) => Json(ApiResponse::error("Key not found")),
+        Err(e) => {
+            warn!("Failed to get KV key: {}", e);
+            Json(ApiResponse::error("Failed to get key"))
+        }
+    }
+}
+
+async fn delete_kv_key(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut client = state.kv_client.lock().await;
+    match client.delete_key(&name, &key).await {
+        Ok(_) => Json(ApiResponse::success(())),
+        Err(e) => {
+            warn!("Failed to delete KV key: {}", e);
+            Json(ApiResponse::error("Failed to delete key"))
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct KVAccessKeyInfo {
+    id: String,
+    user_id: String,
+    access_key: String,
+    status: String,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+async fn list_kv_access_keys(
+    State(_state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> impl IntoResponse {
+    let _ = user;
+    let keys = vec![KVAccessKeyInfo {
+        id: "key-1".to_string(),
+        user_id: "user-1".to_string(),
+        access_key: "mock-kv-access-key".to_string(),
+        status: "active".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        last_used_at: None,
+    }];
+    Json(ApiResponse::success(keys))
+}
+
+async fn create_kv_access_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> impl IntoResponse {
+    let _ = user;
+    let _ = state;
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let access_key = format!("kv_{}", key_id.split('-').next().unwrap_or(""));
+    let secret_key = uuid::Uuid::new_v4().to_string().replace('-', "");
+    Json(ApiResponse::success(serde_json::json!({
+        "id": key_id,
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    })))
+}
+
+async fn delete_kv_access_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let _ = user;
+    let _ = state;
+    let _ = id;
+    Json(ApiResponse::success(()))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -1602,6 +1793,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_clients = Arc::new(Mutex::new(Vec::new()));
 
+    let kv_client = Arc::new(Mutex::new(
+        KvCacheClient::connect(&args.master_endpoint).await?,
+    ));
+
     let app_state = Arc::new(AppState {
         metric_store: metric_store.clone(),
         alert_engine: alert_engine.clone(),
@@ -1620,6 +1815,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             redis::Client::open(args.redis_url.clone())
                 .expect("Failed to create Redis client for rate limiter"),
         ))),
+        kv_client,
     });
 
     let event_bus = EventBus::new(&args.redis_url, &args.stream_key);
@@ -1671,6 +1867,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
+        .route("/api/kv/namespaces", get(list_kv_namespaces))
+        .route("/api/kv/namespaces", post(create_kv_namespace))
+        .route("/api/kv/namespaces/:name", delete(delete_kv_namespace))
+        .route("/api/kv/namespaces/:name/keys", get(list_kv_keys))
+        .route("/api/kv/namespaces/:name/keys", post(create_kv_key))
+        .route("/api/kv/namespaces/:name/keys/:key", get(get_kv_key))
+        .route("/api/kv/namespaces/:name/keys/:key", delete(delete_kv_key))
+        .route("/api/kv/keys", get(list_kv_access_keys))
+        .route("/api/kv/keys", post(create_kv_access_key))
+        .route("/api/kv/keys/:id", delete(delete_kv_access_key))
         .route("/api/metrics/history/:metric", get(get_metric_history))
         .route("/api/metrics/s3", get(get_s3_metrics))
         .route("/api/s3/buckets", get(get_buckets))

@@ -19,6 +19,8 @@ const CF_ROLES: &str = "roles";
 const CF_ROLE_NAME_INDEX: &str = "role_name_index";
 const CF_S3_KEYS: &str = "s3_keys";
 const CF_S3_KEY_USER_INDEX: &str = "s3_key_user_index";
+const CF_KV_KEYS: &str = "kv_keys";
+const CF_KV_KEY_USER_INDEX: &str = "kv_key_user_index";
 
 pub struct UserStore {
     db: Arc<DB>,
@@ -38,6 +40,8 @@ impl UserStore {
         let cf_role_index = ColumnFamilyDescriptor::new(CF_ROLE_NAME_INDEX, Options::default());
         let cf_s3_keys = ColumnFamilyDescriptor::new(CF_S3_KEYS, Options::default());
         let cf_s3_key_index = ColumnFamilyDescriptor::new(CF_S3_KEY_USER_INDEX, Options::default());
+        let cf_kv_keys = ColumnFamilyDescriptor::new(CF_KV_KEYS, Options::default());
+        let cf_kv_key_index = ColumnFamilyDescriptor::new(CF_KV_KEY_USER_INDEX, Options::default());
 
         let db = DB::open_cf_descriptors(
             &opts,
@@ -50,6 +54,8 @@ impl UserStore {
                 cf_role_index,
                 cf_s3_keys,
                 cf_s3_key_index,
+                cf_kv_keys,
+                cf_kv_key_index,
             ],
         )
         .map_err(|e| format!("Failed to open auth RocksDB at {}: {}", path, e))?;

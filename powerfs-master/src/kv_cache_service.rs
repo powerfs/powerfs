@@ -59,6 +59,8 @@ impl KvCacheService for KvCacheServiceImpl {
 
         let result = self.engine.create_session(
             &req.session_id,
+            &req.namespace_id,
+            &req.owner_id,
             &req.model_name,
             req.num_layers,
             req.num_heads,
@@ -189,6 +191,7 @@ impl KvCacheService for KvCacheServiceImpl {
             &req.data,
             &fid_str,
             0,
+            powerfs_core::kv_cache::PinMode::None,
         );
 
         match result {
@@ -348,11 +351,20 @@ impl KvCacheService for KvCacheServiceImpl {
                                     head_dim: sess.head_dim,
                                     num_heads: sess.num_heads,
                                     size_bytes: data.len() as u64,
-                                    created_at: std::time::Instant::now(),
-                                    last_accessed: std::time::Instant::now(),
+                                    created_at: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    last_accessed: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
                                     ttl: sess.ttl,
                                     fid: fid_str.clone(),
+                                    namespace_id: sess.namespace_id,
+                                    owner_id: sess.owner_id,
                                     block_index: 0,
+                                    pin_mode: powerfs_core::kv_cache::PinMode::None,
                                 };
                                 let locations = self.get_fid_locations(&fid_str);
                                 Ok(Response::new(GetBlockResponse {
@@ -528,6 +540,302 @@ impl KvCacheService for KvCacheServiceImpl {
             cache_hits: stats.hits,
             cache_misses: stats.misses,
             evictions: stats.evictions,
+        }))
+    }
+
+    async fn create_namespace(
+        &self,
+        request: Request<CreateNamespaceRequest>,
+    ) -> Result<Response<CreateNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .engine
+            .create_namespace(&req.namespace_id, &req.name, &req.owner_id);
+
+        match result {
+            Ok(()) => Ok(Response::new(CreateNamespaceResponse {
+                success: true,
+                error: String::new(),
+                namespace_id: req.namespace_id,
+            })),
+            Err(e) => Ok(Response::new(CreateNamespaceResponse {
+                success: false,
+                error: e,
+                namespace_id: String::new(),
+            })),
+        }
+    }
+
+    async fn list_namespaces(
+        &self,
+        request: Request<ListNamespacesRequest>,
+    ) -> Result<Response<ListNamespacesResponse>, Status> {
+        let req = request.into_inner();
+        let namespaces = self.engine.list_namespaces(&req.owner_id);
+
+        let proto_namespaces: Vec<KvNamespace> = namespaces
+            .into_iter()
+            .map(|ns| KvNamespace {
+                id: ns.id,
+                name: ns.name,
+                owner_id: ns.owner_id,
+                created_at: ns.created_at,
+                updated_at: ns.updated_at,
+            })
+            .collect();
+
+        Ok(Response::new(ListNamespacesResponse {
+            namespaces: proto_namespaces,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_namespace(
+        &self,
+        request: Request<GetNamespaceRequest>,
+    ) -> Result<Response<GetNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        let namespace = self.engine.get_namespace(&req.namespace_id);
+
+        match namespace {
+            Some(ns) => Ok(Response::new(GetNamespaceResponse {
+                found: true,
+                namespace: Some(KvNamespace {
+                    id: ns.id,
+                    name: ns.name,
+                    owner_id: ns.owner_id,
+                    created_at: ns.created_at,
+                    updated_at: ns.updated_at,
+                }),
+                error: String::new(),
+            })),
+            None => Ok(Response::new(GetNamespaceResponse {
+                found: false,
+                namespace: None,
+                error: "namespace not found".to_string(),
+            })),
+        }
+    }
+
+    async fn delete_namespace(
+        &self,
+        request: Request<DeleteNamespaceRequest>,
+    ) -> Result<Response<DeleteNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .engine
+            .delete_namespace(&req.namespace_id, &req.owner_id);
+
+        match result {
+            Ok(()) => Ok(Response::new(DeleteNamespaceResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteNamespaceResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_put(&self, request: Request<KvPutRequest>) -> Result<Response<KvResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .engine
+            .kv_put(&req.namespace_id, &req.key, &req.value, &req.owner_id);
+
+        match result {
+            Ok(()) => Ok(Response::new(KvResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_get(
+        &self,
+        request: Request<KvGetRequest>,
+    ) -> Result<Response<KvGetResponse>, Status> {
+        let req = request.into_inner();
+        let result = self.engine.kv_get(&req.namespace_id, &req.key);
+
+        match result {
+            Ok(Some(value)) => Ok(Response::new(KvGetResponse {
+                success: true,
+                error: String::new(),
+                value: value.data,
+                found: true,
+            })),
+            Ok(None) => Ok(Response::new(KvGetResponse {
+                success: true,
+                error: String::new(),
+                value: Vec::new(),
+                found: false,
+            })),
+            Err(e) => Ok(Response::new(KvGetResponse {
+                success: false,
+                error: e,
+                value: Vec::new(),
+                found: false,
+            })),
+        }
+    }
+
+    async fn kv_delete(
+        &self,
+        request: Request<KvDeleteRequest>,
+    ) -> Result<Response<KvResponse>, Status> {
+        let req = request.into_inner();
+        let result = self.engine.kv_delete(&req.namespace_id, &req.key);
+
+        match result {
+            Ok(_) => Ok(Response::new(KvResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_exists(
+        &self,
+        request: Request<KvExistsRequest>,
+    ) -> Result<Response<KvExistsResponse>, Status> {
+        let req = request.into_inner();
+        let result = self.engine.kv_exists(&req.namespace_id, &req.key);
+
+        match result {
+            Ok(exists) => Ok(Response::new(KvExistsResponse {
+                exists,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvExistsResponse {
+                exists: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_list(
+        &self,
+        request: Request<KvListRequest>,
+    ) -> Result<Response<KvListResponse>, Status> {
+        let req = request.into_inner();
+        let prefix = if req.prefix.is_empty() {
+            None
+        } else {
+            Some(req.prefix.as_str())
+        };
+        let result = self.engine.kv_list(&req.namespace_id, prefix);
+
+        match result {
+            Ok(keys) => Ok(Response::new(KvListResponse {
+                keys,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvListResponse {
+                keys: Vec::new(),
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_remove_by_regex(
+        &self,
+        request: Request<KvRemoveByRegexRequest>,
+    ) -> Result<Response<KvResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .engine
+            .kv_remove_by_regex(&req.namespace_id, &req.pattern);
+
+        match result {
+            Ok(_) => Ok(Response::new(KvResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_remove_all(
+        &self,
+        request: Request<KvRemoveAllRequest>,
+    ) -> Result<Response<KvResponse>, Status> {
+        let req = request.into_inner();
+        let result = self.engine.kv_remove_all(&req.namespace_id);
+
+        match result {
+            Ok(_) => Ok(Response::new(KvResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(KvResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn kv_batch_put(
+        &self,
+        request: Request<KvBatchPutRequest>,
+    ) -> Result<Response<KvBatchResponse>, Status> {
+        let req = request.into_inner();
+        let mut successes = Vec::new();
+
+        for (key, value) in req.keys.iter().zip(req.values.iter()) {
+            let result = self
+                .engine
+                .kv_put(&req.namespace_id, key, value, &req.owner_id);
+            successes.push(result.is_ok());
+        }
+
+        Ok(Response::new(KvBatchResponse {
+            successes,
+            error: String::new(),
+        }))
+    }
+
+    async fn kv_batch_get(
+        &self,
+        request: Request<KvBatchGetRequest>,
+    ) -> Result<Response<KvBatchGetResponse>, Status> {
+        let req = request.into_inner();
+        let mut values = Vec::new();
+        let mut found = Vec::new();
+
+        for key in &req.keys {
+            match self.engine.kv_get(&req.namespace_id, key) {
+                Ok(Some(v)) => {
+                    values.push(v.data);
+                    found.push(true);
+                }
+                Ok(None) => {
+                    values.push(Vec::new());
+                    found.push(false);
+                }
+                Err(_) => {
+                    values.push(Vec::new());
+                    found.push(false);
+                }
+            }
+        }
+
+        Ok(Response::new(KvBatchGetResponse {
+            values,
+            found,
+            error: String::new(),
         }))
     }
 }

@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -79,6 +79,11 @@ api.interceptors.response.use(
 )
 
 let useMock = false
+
+let mockKVNamespaces: KVNamespace[] = [
+  { id: 'ns-1', name: 'default', owner_id: 'user-1', created_at: Date.now() - 86400000, updated_at: Date.now() - 86400000 },
+  { id: 'ns-2', name: 'production', owner_id: 'user-1', created_at: Date.now() - 172800000, updated_at: Date.now() - 86400000 },
+]
 
 export function setUseMock(value: boolean) {
   useMock = value
@@ -363,4 +368,75 @@ export async function deleteFuseMount(id: string): Promise<void> {
     return
   }
   await api.delete(`/fuse/mounts/${id}`)
+}
+
+export async function createKVNamespace(name: string): Promise<void> {
+  if (useMock) {
+    const newNamespace: KVNamespace = {
+      id: `ns-${Date.now()}`,
+      name,
+      owner_id: 'user-1',
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    }
+    mockKVNamespaces.push(newNamespace)
+    return
+  }
+  await api.post('/kv/namespaces', { name })
+}
+
+export async function listKVNamespaces(): Promise<KVNamespace[]> {
+  if (useMock) {
+    return mockKVNamespaces
+  }
+  const response = await api.get('/kv/namespaces')
+  return response.data.data
+}
+
+export async function getKVNamespace(id: string): Promise<KVNamespace> {
+  if (useMock) {
+    const ns = mockKVNamespaces.find(n => n.id === id)
+    return ns || { id, name: 'default', owner_id: 'user-1', created_at: Date.now(), updated_at: Date.now() }
+  }
+  const response = await api.get(`/kv/namespaces/${id}`)
+  return response.data.data
+}
+
+export async function deleteKVNamespace(id: string): Promise<void> {
+  if (useMock) {
+    mockKVNamespaces = mockKVNamespaces.filter(n => n.id !== id)
+    return
+  }
+  await api.delete(`/kv/namespaces/${id}`)
+}
+
+export async function createKVKey(): Promise<{ id: string; access_key: string; secret_key: string; created_at: string }> {
+  if (useMock) {
+    return {
+      id: 'key-1',
+      access_key: 'mock-access-key',
+      secret_key: 'mock-secret-key',
+      created_at: new Date().toISOString(),
+    }
+  }
+  const response = await api.post('/kv/keys')
+  return response.data.data
+}
+
+export async function listKVKeys(): Promise<KVAccessKey[]> {
+  if (useMock) {
+    return [
+      { id: 'key-1', user_id: 'user-1', access_key: 'mock-access-key', status: 'active', created_at: new Date(Date.now() - 86400000).toISOString() },
+      { id: 'key-2', user_id: 'user-1', access_key: 'mock-access-key-2', status: 'inactive', created_at: new Date(Date.now() - 172800000).toISOString() },
+    ]
+  }
+  const response = await api.get('/kv/keys')
+  return response.data.data
+}
+
+export async function deleteKVKey(id: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.delete(`/kv/keys/${id}`)
 }

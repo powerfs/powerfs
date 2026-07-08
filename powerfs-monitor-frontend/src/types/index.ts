@@ -45,6 +45,23 @@ export interface KVBlockInfo {
   last_accessed: string
 }
 
+export interface KVNamespace {
+  id: string
+  name: string
+  owner_id: string
+  created_at: number
+  updated_at: number
+}
+
+export interface KVAccessKey {
+  id: string
+  user_id: string
+  access_key: string
+  status: string
+  created_at: string
+  last_used_at?: string
+}
+
 export interface AlertInfo {
   id: string
   name: string
