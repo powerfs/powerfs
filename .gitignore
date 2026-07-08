@@ -7,13 +7,13 @@ articles/
 seaweedfs/
 Mooncake/
 rustfs/
+node_modules/
 log
 *.log
 p*.sh
 u*.sh
 setp.sh
 !kernel/**/test_*.sh
-docs/
 .cargo
 vendor/
 logs/
