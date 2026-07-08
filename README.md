@@ -107,34 +107,6 @@ Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Di
 
 ---
 
-## Roadmap
-
-### Phase 0 · Project Initialization (1 Week)
-
-Repository initialization, CI/CD pipeline construction, official document site framework, architecture whitepaper drafting and community environment preparation.
-
-### Phase 1 · Core Storage Base (2-3 Weeks)
-
-Implement core storage stack including master scheduling, volume management, O(1) indexed addressing, basic replica mechanism and FUSE user-mode client to complete basic file read-write capabilities.
-
-### Phase 2 · HPC Parallel Enhancement (3 Weeks)
-
-Complete distributed sharded metadata service, file striping parallel I/O, full POSIX semantic compatibility, and implement HPC job-level QoS isolation and low-jitter background scheduling.
-
-### Phase 3 · Linux Kernel Client (4-6 Weeks)
-
-Develop native Linux kernel client, dock with Linux VFS system, completely eliminate FUSE overhead, and reach enterprise-level HPC ultra-low latency performance indicators.
-
-### Phase 4 · Native KV Cache Engine (3 Weeks)
-
-Complete LLM dedicated KV cache engine development, implement session isolation, intelligent hot-cold elimination, incremental update, and dock GPU Direct zero-copy acceleration pipeline.
-
-### Phase 5 · Production-Grade Optimization (Continuous Iteration)
-
-Full-link SPDK/RDMA hardware offloading, EC erasure coding hierarchical storage, multi-tenant permission management, complete monitoring and operation system, and release full-standard benchmark performance comparison data.
-
----
-
 ## Application Scenarios
 
 - **HPC Supercomputing Cluster**：Fluid mechanics, meteorological simulation, structural calculation, material simulation and large-scale MPI parallel computing jobs

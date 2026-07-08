@@ -240,7 +240,11 @@ impl KvCacheClient {
         }
     }
 
-    pub async fn delete_key(&mut self, namespace: &str, key: &str) -> Result<(), KvCacheClientError> {
+    pub async fn delete_key(
+        &mut self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<(), KvCacheClientError> {
         let req = KvDeleteRequest {
             namespace_id: namespace.to_string(),
             key: key.to_string(),

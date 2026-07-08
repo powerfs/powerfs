@@ -30,7 +30,9 @@ fn benchmark_report(name: &str, ops: usize, duration: Duration) {
 #[test]
 fn storage_write_benchmark() {
     let engine = make_engine();
-    engine.create_namespace("ns_write", "write", "user1").unwrap();
+    engine
+        .create_namespace("ns_write", "write", "user1")
+        .unwrap();
 
     let data_sizes = vec![512, 1024, 2048, 4096];
     let ops_per_size = 100;
@@ -82,7 +84,9 @@ fn storage_read_benchmark() {
 #[test]
 fn storage_read_write_mixed_benchmark() {
     let engine = make_engine();
-    engine.create_namespace("ns_mixed", "mixed", "user1").unwrap();
+    engine
+        .create_namespace("ns_mixed", "mixed", "user1")
+        .unwrap();
 
     for i in 0..100 {
         let key = format!("mixed_key_{:04}", i);
@@ -112,7 +116,9 @@ fn storage_read_write_mixed_benchmark() {
 #[test]
 fn storage_concurrent_write_benchmark() {
     let engine = Arc::new(make_engine());
-    engine.create_namespace("ns_concurrent_write", "concurrent_write", "user1").unwrap();
+    engine
+        .create_namespace("ns_concurrent_write", "concurrent_write", "user1")
+        .unwrap();
 
     let thread_counts = vec![1, 2, 4];
     let ops_per_thread = 100;
@@ -127,7 +133,9 @@ fn storage_concurrent_write_benchmark() {
                 for i in 0..ops_per_thread {
                     let key = format!("concurrent_write_{}_{}", thread_id, i);
                     let data = make_data(4096);
-                    engine.kv_put("ns_concurrent_write", &key, &data, "user1").unwrap();
+                    engine
+                        .kv_put("ns_concurrent_write", &key, &data, "user1")
+                        .unwrap();
                 }
             }));
         }
@@ -148,12 +156,16 @@ fn storage_concurrent_write_benchmark() {
 #[test]
 fn storage_concurrent_read_benchmark() {
     let engine = Arc::new(make_engine());
-    engine.create_namespace("ns_concurrent_read", "concurrent_read", "user1").unwrap();
+    engine
+        .create_namespace("ns_concurrent_read", "concurrent_read", "user1")
+        .unwrap();
 
     for i in 0..1000 {
         let key = format!("concurrent_read_key_{:05}", i);
         let data = make_data(4096);
-        engine.kv_put("ns_concurrent_read", &key, &data, "user1").unwrap();
+        engine
+            .kv_put("ns_concurrent_read", &key, &data, "user1")
+            .unwrap();
     }
 
     let thread_counts = vec![1, 2, 4];
@@ -199,7 +211,9 @@ fn storage_persistence_benchmark() {
     for iteration in 0..iterations {
         let engine = KVCacheEngine::new_with_db(10 * 1024 * 1024, 1024 * 1024, db_path).unwrap();
         let ns_name = format!("ns_persist_{}", iteration);
-        engine.create_namespace(&ns_name, "persist", "user1").unwrap();
+        engine
+            .create_namespace(&ns_name, "persist", "user1")
+            .unwrap();
 
         for i in 0..50 {
             let key = format!("persist_key_{}_{}", iteration, i);
@@ -222,13 +236,19 @@ fn storage_persistence_benchmark() {
     }
 
     let duration = start.elapsed();
-    benchmark_report(&format!("Persistence Reload ({} iterations)", iterations), iterations, duration);
+    benchmark_report(
+        &format!("Persistence Reload ({} iterations)", iterations),
+        iterations,
+        duration,
+    );
 }
 
 #[test]
 fn storage_large_value_benchmark() {
     let engine = make_engine();
-    engine.create_namespace("ns_large", "large", "user1").unwrap();
+    engine
+        .create_namespace("ns_large", "large", "user1")
+        .unwrap();
 
     let large_sizes = vec![256 * 1024, 512 * 1024, 1024 * 1024];
 
@@ -242,7 +262,11 @@ fn storage_large_value_benchmark() {
         }
 
         let duration = start.elapsed();
-        benchmark_report(&format!("Large Value Write {} KB", size / 1024), 5, duration);
+        benchmark_report(
+            &format!("Large Value Write {} KB", size / 1024),
+            5,
+            duration,
+        );
     }
 
     for size in &large_sizes {

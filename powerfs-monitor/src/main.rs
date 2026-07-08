@@ -1599,9 +1599,7 @@ struct KVNamespace {
     updated_at: u64,
 }
 
-async fn list_kv_namespaces(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn list_kv_namespaces(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut client = state.kv_client.lock().await;
     match client.list_namespaces().await {
         Ok(namespaces) => {
