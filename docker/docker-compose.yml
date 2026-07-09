@@ -264,3 +264,57 @@ services:
     depends_on:
       monitor:
         condition: service_healthy
+
+  fuse-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: fuse-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.41
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    command: bash -c "RUST_LOG=debug /app/powerfs-fuse --master 172.20.0.11:9333 --mount-point /mnt/powerfs --collection default --replication 000 --threads 8 --verbose 2>&1 || sleep 30"
+    depends_on:
+      volume-1:
+        condition: service_healthy
+      volume-2:
+        condition: service_healthy
+      volume-3:
+        condition: service_healthy
+
+  fuse-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: fuse-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.42
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    command: bash -c "RUST_LOG=debug /app/powerfs-fuse --master 172.20.0.11:9333 --mount-point /mnt/powerfs --collection default --replication 000 --threads 8 --verbose 2>&1 || sleep 30"
+    depends_on:
+      volume-1:
+        condition: service_healthy
+      volume-2:
+        condition: service_healthy
+      volume-3:
+        condition: service_healthy

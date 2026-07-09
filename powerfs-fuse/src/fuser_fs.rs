@@ -16,25 +16,25 @@ use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 
-struct WriteBufferEntry {
-    offset: u64,
-    data: Vec<u8>,
+pub struct WriteBufferEntry {
+    pub offset: u64,
+    pub data: Vec<u8>,
 }
 
-struct WriteBuffer {
+pub struct WriteBuffer {
     buffers: RwLock<HashMap<u64, Vec<WriteBufferEntry>>>,
     max_entries: usize,
 }
 
 impl WriteBuffer {
-    fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize) -> Self {
         Self {
             buffers: RwLock::new(HashMap::new()),
             max_entries,
         }
     }
 
-    fn add(&self, inode: u64, offset: u64, data: &[u8]) -> bool {
+    pub fn add(&self, inode: u64, offset: u64, data: &[u8]) -> bool {
         let mut buffers = self.buffers.write().unwrap();
         let entries = buffers.entry(inode).or_default();
 
@@ -47,7 +47,7 @@ impl WriteBuffer {
         entries.len() >= self.max_entries
     }
 
-    fn take(&self, inode: u64) -> Vec<WriteBufferEntry> {
+    pub fn take(&self, inode: u64) -> Vec<WriteBufferEntry> {
         let mut buffers = self.buffers.write().unwrap();
         buffers.remove(&inode).unwrap_or_default()
     }
@@ -104,9 +104,24 @@ impl PowerFsFuserFs {
             .get_inode(inode)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let fid = entry
-            .fid
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+        let fid = if let Some(fid) = entry.fid {
+            fid
+        } else {
+            let (new_fid, _, _, _) = self
+                .client
+                .assign_fid(&self.collection, &self.replication)
+                .map_err(|e| {
+                    error!("assign_fid failed: {}", e);
+                    std::io::Error::from_raw_os_error(libc::EIO)
+                })?;
+
+            let mut updated_entry = entry.clone();
+            updated_entry.fid = Some(new_fid.clone());
+            self.cache.insert(updated_entry);
+
+            info!("Assigned new fid for inode {}: {}", inode, new_fid);
+            new_fid
+        };
 
         let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
             error!("lookup_volume failed: {}", e);
@@ -224,14 +239,14 @@ impl PowerFsFuserFs {
             let start_chunk_idx = entry.offset / chunk_size;
             let end_chunk_idx = (entry.offset + entry.data.len() as u64).div_ceil(chunk_size);
 
-            for chunk_idx in start_chunk_idx..=end_chunk_idx {
+            for chunk_idx in start_chunk_idx..end_chunk_idx {
                 let _chunk_offset = chunk_idx * chunk_size;
                 let data_start_in_chunk = if chunk_idx == start_chunk_idx {
                     entry.offset % chunk_size
                 } else {
                     0
                 };
-                let data_end_in_chunk = if chunk_idx == end_chunk_idx {
+                let data_end_in_chunk = if chunk_idx == end_chunk_idx - 1 {
                     std::cmp::min(data_start_in_chunk + entry.data.len() as u64, chunk_size)
                 } else {
                     chunk_size
@@ -741,7 +756,7 @@ impl Filesystem for PowerFsFuserFs {
             .unwrap_or_else(|| "/".to_string());
         let filer_entry = FilerEntry {
             name: name_str.to_string(),
-            directory: parent_path,
+            directory: parent_path.clone(),
             attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                 ino: inode,
                 mode: mode | 0o100000,
@@ -821,8 +836,11 @@ impl Filesystem for PowerFsFuserFs {
         let start_chunk_idx = offset_u64 / chunk_size;
         let end_chunk_idx = (offset_u64 + actual_size as u64).div_ceil(chunk_size);
 
-        for chunk_idx in start_chunk_idx..=end_chunk_idx {
+        for chunk_idx in start_chunk_idx..end_chunk_idx {
             let chunk_offset = chunk_idx * chunk_size;
+            if chunk_offset >= entry.size {
+                continue;
+            }
             let chunk_data = self.chunk_cache.get(inode, chunk_offset);
 
             let chunk_data = match chunk_data {
@@ -949,9 +967,10 @@ impl Filesystem for PowerFsFuserFs {
             } else {
                 0
             };
-            let data_end_in_chunk = if chunk_idx == end_chunk_idx {
+            let data_end_in_chunk = if chunk_idx == end_chunk_idx - 1 {
                 std::cmp::min(
-                    (offset_u64 + actual_size as u64) % chunk_size,
+                    data_start_in_chunk + actual_size as u64
+                        - (chunk_idx - start_chunk_idx) * chunk_size,
                     chunk_data.data.len() as u64,
                 )
             } else {
@@ -1019,7 +1038,7 @@ impl Filesystem for PowerFsFuserFs {
         let start_chunk_idx = offset_u64 / chunk_size;
         let end_chunk_idx = (offset_u64 + data_len as u64).div_ceil(chunk_size);
 
-        for chunk_idx in start_chunk_idx..=end_chunk_idx {
+        for chunk_idx in start_chunk_idx..end_chunk_idx {
             let chunk_offset = chunk_idx * chunk_size;
 
             let data_start_in_chunk = if chunk_idx == start_chunk_idx {
@@ -1027,7 +1046,7 @@ impl Filesystem for PowerFsFuserFs {
             } else {
                 0
             };
-            let data_end_in_chunk = if chunk_idx == end_chunk_idx {
+            let data_end_in_chunk = if chunk_idx == end_chunk_idx - 1 {
                 std::cmp::min(data_start_in_chunk + data_len as u64, chunk_size)
             } else {
                 chunk_size
@@ -1121,6 +1140,12 @@ impl Filesystem for PowerFsFuserFs {
         reply: ReplyEmpty,
     ) {
         debug!("flush: inode={}", inode);
+
+        let entries = self.write_buffer.take(inode);
+        if !entries.is_empty() {
+            self.flush_write_buffer(inode, &entries);
+        }
+
         if let Err(e) = self.flush_dirty_chunks(inode) {
             warn!("flush failed: {}", e);
         }
@@ -1186,6 +1211,67 @@ impl Filesystem for PowerFsFuserFs {
         if !entry.is_dir {
             reply.error(libc::ENOTDIR);
             return;
+        }
+
+        let path = self
+            .cache
+            .inode_to_path(inode)
+            .unwrap_or_else(|| "/".to_string());
+        if let Ok(entries) = self.client.list_entries(&path, 1000, "") {
+            for entry in entries {
+                let existing = self.cache.lookup_in_cache(inode, &entry.name);
+                if existing.is_none() {
+                    let ino = entry
+                        .attributes
+                        .as_ref()
+                        .map(|a| a.ino)
+                        .unwrap_or(self.cache.allocate_inode());
+                    let cached_entry = CachedEntry {
+                        inode: ino,
+                        parent: inode,
+                        name: entry.name,
+                        is_dir: entry
+                            .attributes
+                            .as_ref()
+                            .map(|a| (a.mode & 0o40000) != 0)
+                            .unwrap_or(false),
+                        is_symlink: false,
+                        symlink_target: None,
+                        nlink: entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1),
+                        fid: None,
+                        size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
+                        mode: entry
+                            .attributes
+                            .as_ref()
+                            .map(|a| a.mode & 0o7777)
+                            .unwrap_or(0o644),
+                        uid: entry.attributes.as_ref().map(|a| a.uid).unwrap_or(0),
+                        gid: entry.attributes.as_ref().map(|a| a.gid).unwrap_or(0),
+                        atime: entry
+                            .attributes
+                            .as_ref()
+                            .map(|a| a.atime as i64)
+                            .unwrap_or(0),
+                        mtime: entry
+                            .attributes
+                            .as_ref()
+                            .map(|a| a.mtime as i64)
+                            .unwrap_or(0),
+                        ctime: entry
+                            .attributes
+                            .as_ref()
+                            .map(|a| a.ctime as i64)
+                            .unwrap_or(0),
+                        xattrs: HashMap::new(),
+                        chunks: entry.chunks.into_iter().map(|c| c.into()).collect(),
+                        hard_link_id: entry.hard_link_id,
+                        hard_link_counter: entry.hard_link_counter,
+                        content_size: entry.content_size,
+                        disk_size: entry.disk_size,
+                    };
+                    self.cache.insert(cached_entry);
+                }
+            }
         }
 
         let children = self.cache.list_children(inode);
@@ -1658,15 +1744,6 @@ impl FuserApp {
             MountOption::DefaultPermissions,
         ];
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                tokio::signal::ctrl_c().await.ok();
-                let _ = sender.send(());
-            });
-        });
-
         let fs_for_mount = fs.clone();
         let mount_point_clone = self.mount_point.clone();
         let options_clone = options.clone();
@@ -1675,16 +1752,12 @@ impl FuserApp {
             .name("fuse_server".to_string())
             .spawn(move || {
                 info!("FUSE server started");
-                let _ = fuser::spawn_mount2(fs_for_mount, mount_point_clone, &options_clone);
+                let _ = fuser::mount2(fs_for_mount, mount_point_clone, &options_clone);
                 warn!("FUSE server exited");
             })
             .map_err(|e| PowerFsError::Internal(format!("failed to spawn fuse thread: {}", e)))?;
 
-        let _ = receiver.recv();
-
-        info!("Received Ctrl+C, unmounting...");
-
-        session_handle.join().ok();
+        let _ = session_handle.join();
 
         info!("FUSE session ended");
         Ok(())
