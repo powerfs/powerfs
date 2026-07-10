@@ -1133,9 +1133,9 @@ mod chunk_cache_tests {
 
         // Same generation -> not stale
         cache.update_path_generation("/stale.txt", 1);
-        assert!(!cache
+        assert!(cache
             .get_path_generation("/stale.txt")
-            .is_some_and(|g| g > cached_gen));
+            .is_none_or(|g| g <= cached_gen));
     }
 
     #[test]

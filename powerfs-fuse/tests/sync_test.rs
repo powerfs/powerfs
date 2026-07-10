@@ -72,10 +72,10 @@ fn test_write_buffer_flush_when_full() {
 
     let inode = 100;
     let should_flush1 = write_buffer.add(inode, 0, b"First");
-    assert_eq!(should_flush1, false);
+    assert!(!should_flush1);
 
     let should_flush2 = write_buffer.add(inode, 5, b"Second");
-    assert_eq!(should_flush2, true);
+    assert!(should_flush2);
 
     let entries = write_buffer.take(inode);
     assert_eq!(entries.len(), 2);
@@ -259,7 +259,7 @@ fn test_concurrent_write_buffer_access() {
         let write_buffer_clone = Arc::clone(&write_buffer);
         let handle = std::thread::spawn(move || {
             for j in 0..10 {
-                write_buffer_clone.add(i as u64, j as u64 * 10, &format!("data{}", j).as_bytes());
+                write_buffer_clone.add(i as u64, j as u64 * 10, format!("data{}", j).as_bytes());
             }
         });
         handles.push(handle);
@@ -327,8 +327,6 @@ fn test_concurrent_dirty_chunks_access() {
 fn test_chunk_size_calculations() {
     let chunk_size = DEFAULT_CHUNK_SIZE;
 
-    assert_eq!(0 / chunk_size, 0);
-    assert_eq!(1 / chunk_size, 0);
     assert_eq!(chunk_size / chunk_size, 1);
     assert_eq!((chunk_size + 1) / chunk_size, 1);
 
@@ -337,8 +335,8 @@ fn test_chunk_size_calculations() {
     assert_eq!(chunk_size % chunk_size, 0);
 
     let data_size: u64 = 100;
-    let start_chunk_idx = 0 / chunk_size;
-    let end_chunk_idx = (0 + data_size).div_ceil(chunk_size);
+    let start_chunk_idx = 0;
+    let end_chunk_idx = data_size.div_ceil(chunk_size);
     assert_eq!(start_chunk_idx, 0);
     assert_eq!(end_chunk_idx, 1);
 }
