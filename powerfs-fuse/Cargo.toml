@@ -33,3 +33,4 @@ env_logger = { workspace = true }
 clap = { workspace = true }
 lru = { workspace = true }
 num_cpus = "1.16"
+uuid = { workspace = true }

@@ -721,7 +721,7 @@ impl MasterService for MasterGrpcServer {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
 
-        match dir_tree.update_entry(&req.entry.unwrap_or_default()) {
+        match dir_tree.update_entry(req.entry.unwrap_or_default()) {
             Ok(_) => Ok(Response::new(UpdateEntryResponse {
                 success: true,
                 error: String::new(),
@@ -789,7 +789,7 @@ impl MasterService for MasterGrpcServer {
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
                         update_req,
                     )) => dir_tree
-                        .update_entry(&update_req.entry.unwrap_or_default())
+                        .update_entry(update_req.entry.unwrap_or_default())
                         .map_err(|e| e.to_string()),
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
                         delete_req,
@@ -840,5 +840,150 @@ impl MasterService for MasterGrpcServer {
         };
 
         Ok(Response::new(Box::pin(output_stream)))
+    }
+
+    async fn acquire_lease(
+        &self,
+        request: Request<powerfs::LeaseRequest>,
+    ) -> Result<Response<powerfs::LeaseResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let lease_id = dir_tree.acquire_lease(&req.path, &req.client_id, req.duration_ms);
+        let epoch = dir_tree.get_epoch();
+
+        Ok(Response::new(powerfs::LeaseResponse {
+            success: true,
+            error: String::new(),
+            lease_id,
+            duration_ms: req.duration_ms,
+            epoch,
+        }))
+    }
+
+    async fn release_lease(
+        &self,
+        request: Request<powerfs::LeaseReleaseRequest>,
+    ) -> Result<Response<powerfs::LeaseReleaseResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let success = dir_tree.release_lease(&req.lease_id);
+
+        Ok(Response::new(powerfs::LeaseReleaseResponse {
+            success,
+            error: if success {
+                String::new()
+            } else {
+                "Lease not found".to_string()
+            },
+        }))
+    }
+
+    async fn renew_lease(
+        &self,
+        request: Request<powerfs::LeaseRenewRequest>,
+    ) -> Result<Response<powerfs::LeaseRenewResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.renew_lease(&req.lease_id, req.duration_ms) {
+            Some(epoch) => Ok(Response::new(powerfs::LeaseRenewResponse {
+                success: true,
+                error: String::new(),
+                epoch,
+            })),
+            None => Ok(Response::new(powerfs::LeaseRenewResponse {
+                success: false,
+                error: "Lease not found".to_string(),
+                epoch: 0,
+            })),
+        }
+    }
+
+    async fn register_job_client(
+        &self,
+        request: Request<powerfs::JobRegistrationRequest>,
+    ) -> Result<Response<powerfs::JobRegistrationResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let success = dir_tree.register_job_client(&req.job_id, &req.job_name, &req.client_id);
+
+        Ok(Response::new(powerfs::JobRegistrationResponse {
+            success,
+            error: if success {
+                String::new()
+            } else {
+                "Failed to register job client".to_string()
+            },
+        }))
+    }
+
+    async fn deregister_job_client(
+        &self,
+        request: Request<powerfs::JobDeregistrationRequest>,
+    ) -> Result<Response<powerfs::JobDeregistrationResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        let success = dir_tree.deregister_job_client(&req.job_id, &req.client_id);
+
+        Ok(Response::new(powerfs::JobDeregistrationResponse {
+            success,
+            error: if success {
+                String::new()
+            } else {
+                "Job not found".to_string()
+            },
+        }))
+    }
+
+    async fn complete_job(
+        &self,
+        request: Request<powerfs::JobCompletionRequest>,
+    ) -> Result<Response<powerfs::JobCompletionResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.complete_job(&req.job_id) {
+            Some(invalidated_entries) => Ok(Response::new(powerfs::JobCompletionResponse {
+                success: true,
+                error: String::new(),
+                invalidated_entries,
+            })),
+            None => Err(Status::not_found("Job not found")),
+        }
+    }
+
+    async fn get_job_info(
+        &self,
+        request: Request<powerfs::JobInfoRequest>,
+    ) -> Result<Response<powerfs::JobInfoResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.get_job_info(&req.job_id) {
+            Some(job) => {
+                let job_ctx = powerfs::JobContext {
+                    job_id: job.job_id,
+                    job_name: job.job_name,
+                    client_ids: job.client_ids.into_iter().collect(),
+                    start_time: job.start_time,
+                    end_time: job.end_time,
+                    is_active: job.is_active,
+                };
+                Ok(Response::new(powerfs::JobInfoResponse {
+                    found: true,
+                    job: Some(job_ctx),
+                    error: String::new(),
+                }))
+            }
+            None => Ok(Response::new(powerfs::JobInfoResponse {
+                found: false,
+                job: None,
+                error: "Job not found".to_string(),
+            })),
+        }
     }
 }

@@ -28,6 +28,7 @@ fn create_test_entry(name: &str, directory: &str, mode: u32) -> Entry {
         extended: std::collections::HashMap::new(),
         content_size: 0,
         disk_size: 0,
+        generation: 0,
         ttl: String::new(),
         symlink_target: String::new(),
         owner: String::new(),
@@ -102,7 +103,7 @@ fn test_filer_update_entry() {
     }
     file_entry.content_size = 1024;
 
-    let result = tree.update_entry(&file_entry);
+    let result = tree.update_entry(file_entry);
     assert!(result.is_ok());
 
     let found = tree.lookup("/", "update_test.txt");

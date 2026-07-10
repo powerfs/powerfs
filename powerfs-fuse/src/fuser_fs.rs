@@ -7,12 +7,13 @@ use fuser::{
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
-use powerfs_master::proto::powerfs::Entry as FilerEntry;
+use powerfs_master::proto::powerfs::{Entry as FilerEntry, MetadataNotification};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
+use uuid;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -53,6 +54,14 @@ impl WriteBuffer {
     }
 }
 
+#[derive(Clone)]
+struct LeaseInfo {
+    lease_id: String,
+    path: String,
+    duration_ms: u64,
+    acquired_at: std::time::Instant,
+}
+
 struct PowerFsFuserFs {
     client: Arc<SyncFuseClient>,
     cache: Arc<MetadataCache>,
@@ -62,9 +71,14 @@ struct PowerFsFuserFs {
     dirty_chunks: Arc<RwLock<HashSet<(u64, u64)>>>,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
     write_buffer: Arc<WriteBuffer>,
+    leases: Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
+    master_epoch: Arc<std::sync::atomic::AtomicU64>,
+    client_id: String,
+    job_id: String,
 }
 
 impl PowerFsFuserFs {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         client: Arc<SyncFuseClient>,
         cache: Arc<MetadataCache>,
@@ -72,6 +86,8 @@ impl PowerFsFuserFs {
         collection: String,
         replication: String,
         write_buffer: Arc<WriteBuffer>,
+        client_id: String,
+        job_id: String,
     ) -> Self {
         Self {
             client,
@@ -82,6 +98,10 @@ impl PowerFsFuserFs {
             dirty_chunks: Arc::new(RwLock::new(HashSet::new())),
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_buffer,
+            leases: Arc::new(RwLock::new(HashMap::new())),
+            master_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            client_id,
+            job_id,
         }
     }
 
@@ -198,6 +218,7 @@ impl PowerFsFuserFs {
                 ttl: String::new(),
                 symlink_target: String::new(),
                 owner: String::new(),
+                generation: entry.generation,
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -372,6 +393,7 @@ impl PowerFsFuserFs {
             hard_link_counter: entry.hard_link_counter,
             content_size: entry.content_size,
             disk_size: entry.disk_size,
+            generation: entry.generation,
         }
     }
 }
@@ -387,6 +409,10 @@ impl Clone for PowerFsFuserFs {
             dirty_chunks: self.dirty_chunks.clone(),
             has_dirty: self.has_dirty.clone(),
             write_buffer: self.write_buffer.clone(),
+            leases: self.leases.clone(),
+            master_epoch: self.master_epoch.clone(),
+            client_id: self.client_id.clone(),
+            job_id: self.job_id.clone(),
         }
     }
 }
@@ -409,12 +435,6 @@ impl Filesystem for PowerFsFuserFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("lookup: parent={}, name={}", parent, name_str);
 
-        if let Some(entry) = self.lookup_in_cache(parent, name_str) {
-            let attr = self.create_file_attr(&entry);
-            reply.entry(&TTL, &attr, 0);
-            return;
-        }
-
         let parent_path = self
             .cache
             .inode_to_path(parent)
@@ -424,6 +444,24 @@ impl Filesystem for PowerFsFuserFs {
         } else {
             format!("{}/{}", parent_path, name_str)
         };
+
+        if let Some(entry) = self.lookup_in_cache(parent, name_str) {
+            let is_stale = self
+                .cache
+                .get_path_generation(&lookup_path)
+                .is_some_and(|latest_gen| entry.generation < latest_gen);
+            if !is_stale {
+                let attr = self.create_file_attr(&entry);
+                reply.entry(&TTL, &attr, 0);
+                return;
+            }
+            debug!(
+                "Cache stale for {}: cached gen={}, latest gen={:?}, fetching from master",
+                lookup_path,
+                entry.generation,
+                self.cache.get_path_generation(&lookup_path)
+            );
+        }
 
         match self.client.get_entry(&lookup_path) {
             Ok(Some(entry)) => {
@@ -480,7 +518,7 @@ impl Filesystem for PowerFsFuserFs {
             inode, mode, uid, gid, size
         );
 
-        let _entry = match self.cache.get_inode(inode) {
+        let entry = match self.cache.get_inode(inode) {
             Some(e) => e,
             None => {
                 reply.error(libc::ENOENT);
@@ -510,23 +548,89 @@ impl Filesystem for PowerFsFuserFs {
             None => None,
         };
 
-        self.cache.update_attr(
-            inode,
-            crate::cache::UpdateAttrParams {
-                mode,
-                size,
-                uid,
-                gid,
-                atime: atime_val,
-                mtime: mtime_val,
-            },
-        );
+        let path = self
+            .cache
+            .inode_to_path(inode)
+            .unwrap_or_else(|| "/".to_string());
 
-        if let Some(updated) = self.cache.get_inode(inode) {
-            let new_attr = self.create_file_attr(&updated);
-            reply.attr(&TTL, &new_attr);
-        } else {
-            reply.error(libc::ENOENT);
+        let new_mode = mode.unwrap_or(entry.mode);
+        let new_uid = uid.unwrap_or(entry.uid);
+        let new_gid = gid.unwrap_or(entry.gid);
+        let new_size = size.unwrap_or(entry.size);
+        let new_atime = atime_val.unwrap_or(entry.atime);
+        let new_mtime = mtime_val.unwrap_or(entry.mtime);
+
+        let filer_entry = FilerEntry {
+            name: entry.name.clone(),
+            directory: path.clone(),
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: inode,
+                mode: if entry.is_dir {
+                    new_mode | 0o040000
+                } else {
+                    new_mode | 0o100000
+                },
+                nlink: entry.nlink,
+                uid: new_uid,
+                gid: new_gid,
+                rdev: 0,
+                size: new_size,
+                blksize: 4096,
+                blocks: new_size.div_ceil(512),
+                atime: new_atime as u64,
+                mtime: new_mtime as u64,
+                ctime: now as u64,
+                crtime: entry.ctime as u64,
+                perm: 0,
+            }),
+            chunks: entry
+                .chunks
+                .iter()
+                .map(|c| powerfs_master::proto::powerfs::FileChunk {
+                    offset: c.offset,
+                    size: c.size,
+                    mtime: c.mtime,
+                    fid: c.fid.clone(),
+                    cookie: c.cookie,
+                    crc32: c.crc32,
+                })
+                .collect(),
+            hard_link_id: entry.hard_link_id.clone(),
+            hard_link_counter: entry.hard_link_counter,
+            extended: HashMap::new(),
+            content_size: entry.content_size,
+            disk_size: entry.disk_size,
+            ttl: String::new(),
+            symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+            owner: String::new(),
+            generation: entry.generation,
+        };
+
+        match self.client.update_entry(&filer_entry) {
+            Ok(_) => {
+                self.cache.update_attr(
+                    inode,
+                    crate::cache::UpdateAttrParams {
+                        mode,
+                        size,
+                        uid,
+                        gid,
+                        atime: atime_val,
+                        mtime: mtime_val,
+                    },
+                );
+
+                if let Some(updated) = self.cache.get_inode(inode) {
+                    let new_attr = self.create_file_attr(&updated);
+                    reply.attr(&TTL, &new_attr);
+                } else {
+                    reply.error(libc::ENOENT);
+                }
+            }
+            Err(e) => {
+                error!("Failed to update entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
     }
 
@@ -574,6 +678,7 @@ impl Filesystem for PowerFsFuserFs {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(entry.clone());
 
@@ -609,14 +714,20 @@ impl Filesystem for PowerFsFuserFs {
             ttl: String::new(),
             symlink_target: String::new(),
             owner: String::new(),
+            generation: 0,
         };
 
-        if let Err(e) = self.client.create_entry(filer_entry) {
-            warn!("Failed to create directory entry on master: {}", e);
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {
+                let attr = self.create_file_attr(&entry);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => {
+                self.cache.remove(inode);
+                error!("Failed to create directory entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-
-        let attr = self.create_file_attr(&entry);
-        reply.entry(&TTL, &attr, 0);
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -645,12 +756,16 @@ impl Filesystem for PowerFsFuserFs {
             .cache
             .inode_to_path(entry.inode)
             .unwrap_or_else(|| "/".to_string());
-        if let Err(e) = self.client.delete_entry(&entry_path, true) {
-            warn!("Failed to delete directory entry on master: {}", e);
+        match self.client.delete_entry(&entry_path, true) {
+            Ok(_) => {
+                self.cache.remove(entry.inode);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("Failed to delete directory entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-
-        self.cache.remove(entry.inode);
-        reply.ok();
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -668,6 +783,11 @@ impl Filesystem for PowerFsFuserFs {
         let should_delete = self.cache.dec_nlink(entry.inode);
 
         if should_delete {
+            let entry_path = self
+                .cache
+                .inode_to_path(entry.inode)
+                .unwrap_or_else(|| "/".to_string());
+
             if let Some(fid) = &entry.fid {
                 match self.client.lookup_volume(fid.volume_id) {
                     Ok(locations) => {
@@ -677,27 +797,30 @@ impl Filesystem for PowerFsFuserFs {
                                 self.client
                                     .delete_data(&addr, fid.volume_id.0, fid.file_key)
                             {
-                                warn!("Failed to delete data: {}", e);
+                                error!("Failed to delete data: {}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to lookup volume: {}", e);
+                        error!("Failed to lookup volume: {}", e);
                     }
                 }
             }
 
-            let entry_path = self
-                .cache
-                .inode_to_path(entry.inode)
-                .unwrap_or_else(|| "/".to_string());
-            if let Err(e) = self.client.delete_entry(&entry_path, false) {
-                warn!("Failed to delete entry on master: {}", e);
+            match self.client.delete_entry(&entry_path, false) {
+                Ok(_) => {
+                    self.cache.remove(entry.inode);
+                    reply.ok();
+                }
+                Err(e) => {
+                    error!("Failed to delete entry on master: {}", e);
+                    reply.error(libc::EIO);
+                }
             }
+        } else {
+            self.cache.remove(entry.inode);
+            reply.ok();
         }
-
-        self.cache.remove(entry.inode);
-        reply.ok();
     }
 
     fn create(
@@ -747,6 +870,7 @@ impl Filesystem for PowerFsFuserFs {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(entry.clone());
 
@@ -782,20 +906,54 @@ impl Filesystem for PowerFsFuserFs {
             ttl: String::new(),
             symlink_target: String::new(),
             owner: String::new(),
+            generation: 0,
         };
 
-        if let Err(e) = self.client.create_entry(filer_entry) {
-            warn!("Failed to create file entry on master: {}", e);
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {
+                let attr = self.create_file_attr(&entry);
+                reply.created(&TTL, &attr, 0, 0, 0);
+            }
+            Err(e) => {
+                self.cache.remove(inode);
+                error!("Failed to create file entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-
-        let attr = self.create_file_attr(&entry);
-        reply.created(&TTL, &attr, 0, 0, 0);
     }
 
     fn open(&mut self, _req: &Request<'_>, inode: u64, _flags: i32, reply: ReplyOpen) {
         debug!("open: inode={}", inode);
         if let Some(entry) = self.cache.get_inode(inode) {
             let _attr = self.create_file_attr(&entry);
+
+            if let Some(path) = self.cache.inode_to_path(inode) {
+                match self.client.acquire_lease(&path, &self.client_id, 30000) {
+                    Ok((lease_id, epoch)) => {
+                        self.master_epoch
+                            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                        let lease_info = LeaseInfo {
+                            lease_id: lease_id.clone(),
+                            path: path.clone(),
+                            duration_ms: 30000,
+                            acquired_at: std::time::Instant::now(),
+                        };
+                        let mut leases = self.leases.write().unwrap();
+                        leases.entry(inode).or_default().push(lease_info);
+                        debug!(
+                            "Acquired lease for inode {} (path: {}, epoch: {}, duration: 30s)",
+                            inode, path, epoch
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to acquire lease for inode {} (path: {}): {}",
+                            inode, path, e
+                        );
+                    }
+                }
+            }
+
             reply.opened(0, 0);
         } else {
             reply.error(libc::ENOENT);
@@ -1170,6 +1328,28 @@ impl Filesystem for PowerFsFuserFs {
         if let Err(e) = self.flush_dirty_chunks(inode) {
             warn!("release flush failed: {}", e);
         }
+
+        // Pop one lease info for this inode (supports multiple concurrent opens).
+        let lease_info = {
+            let mut leases = self.leases.write().unwrap();
+            if let Some(lease_list) = leases.get_mut(&inode) {
+                lease_list.pop()
+            } else {
+                None
+            }
+        };
+
+        if let Some(info) = lease_info {
+            // Synchronously release the lease so it is freed on master before we
+            // return; otherwise the lease could outlive the close and block
+            // invalidations meant for other clients.
+            if let Err(e) = self.client.release_lease(&info.lease_id) {
+                warn!("Failed to release lease {}: {}", info.lease_id, e);
+            } else {
+                debug!("Released lease: {}", info.lease_id);
+            }
+        }
+
         reply.ok();
     }
 
@@ -1268,6 +1448,7 @@ impl Filesystem for PowerFsFuserFs {
                         hard_link_counter: entry.hard_link_counter,
                         content_size: entry.content_size,
                         disk_size: entry.disk_size,
+                        generation: entry.generation,
                     };
                     self.cache.insert(cached_entry);
                 }
@@ -1430,16 +1611,24 @@ impl Filesystem for PowerFsFuserFs {
             ttl: String::new(),
             symlink_target: entry.symlink_target.unwrap_or_default(),
             owner: String::new(),
+            generation: entry.generation,
         };
 
-        if let Err(e) = self.client.delete_entry(&old_path, entry.is_dir) {
-            warn!("Failed to delete old entry: {}", e);
+        match self.client.delete_entry(&old_path, entry.is_dir) {
+            Ok(_) => match self.client.create_entry(filer_entry) {
+                Ok(_) => {
+                    reply.ok();
+                }
+                Err(e) => {
+                    error!("Failed to create new entry during rename: {}", e);
+                    reply.error(libc::EIO);
+                }
+            },
+            Err(e) => {
+                error!("Failed to delete old entry during rename: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-        if let Err(e) = self.client.create_entry(filer_entry) {
-            warn!("Failed to create new entry: {}", e);
-        }
-
-        reply.ok();
     }
 
     fn symlink(
@@ -1481,6 +1670,7 @@ impl Filesystem for PowerFsFuserFs {
             hard_link_counter: 0,
             content_size: link_str.len() as u64,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(entry.clone());
 
@@ -1516,14 +1706,20 @@ impl Filesystem for PowerFsFuserFs {
             ttl: String::new(),
             symlink_target: link_str.to_string(),
             owner: String::new(),
+            generation: 0,
         };
 
-        if let Err(e) = self.client.create_entry(filer_entry) {
-            warn!("Failed to create symlink entry on master: {}", e);
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {
+                let attr = self.create_file_attr(&entry);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => {
+                self.cache.remove(inode);
+                error!("Failed to create symlink entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-
-        let attr = self.create_file_attr(&entry);
-        reply.entry(&TTL, &attr, 0);
     }
 
     fn readlink(&mut self, _req: &Request<'_>, inode: u64, reply: ReplyData) {
@@ -1597,6 +1793,7 @@ impl Filesystem for PowerFsFuserFs {
             hard_link_counter: entry.hard_link_counter + 1,
             content_size: entry.content_size,
             disk_size: entry.disk_size,
+            generation: 0,
         };
         self.cache.insert(new_entry.clone());
 
@@ -1647,14 +1844,21 @@ impl Filesystem for PowerFsFuserFs {
             ttl: String::new(),
             symlink_target: entry.symlink_target.clone().unwrap_or_default(),
             owner: String::new(),
+            generation: entry.generation,
         };
 
-        if let Err(e) = self.client.create_entry(filer_entry) {
-            warn!("Failed to create hard link entry on master: {}", e);
+        match self.client.create_entry(filer_entry) {
+            Ok(_) => {
+                let attr = self.create_file_attr(&new_entry);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => {
+                self.cache.remove(new_inode);
+                self.cache.dec_nlink(inode);
+                error!("Failed to create hard link entry on master: {}", e);
+                reply.error(libc::EIO);
+            }
         }
-
-        let attr = self.create_file_attr(&new_entry);
-        reply.entry(&TTL, &attr, 0);
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _inode: u64, reply: ReplyStatfs) {
@@ -1669,6 +1873,187 @@ impl Filesystem for PowerFsFuserFs {
             255,
             4096,
         );
+    }
+}
+
+async fn metadata_subscription_loop(
+    master_addr: String,
+    cache: Arc<MetadataCache>,
+    runtime_handle: Handle,
+    leases: Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
+    master_epoch: Arc<std::sync::atomic::AtomicU64>,
+    job_id: String,
+) {
+    let client = PowerFuseClient::new(&master_addr, runtime_handle.clone());
+
+    loop {
+        info!("Starting metadata subscription...");
+        match client.subscribe_metadata("/").await {
+            Ok(mut stream) => {
+                while let Ok(notification) = stream.message().await {
+                    if let Some(notif) = notification {
+                        // Epoch-based lease invalidation: if the notification's epoch
+                        // is greater than our locally tracked epoch, the Master has
+                        // restarted and all our leases are stale. Clear them.
+                        let notif_epoch = notif.epoch;
+                        let local_epoch = master_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                        if notif_epoch > local_epoch {
+                            warn!(
+                                "Master epoch changed: {} -> {} (Master restarted), clearing all local leases",
+                                local_epoch, notif_epoch
+                            );
+                            let mut leases_guard = leases.write().unwrap();
+                            let cleared = leases_guard.len();
+                            leases_guard.clear();
+                            master_epoch.store(notif_epoch, std::sync::atomic::Ordering::SeqCst);
+                            debug!("Cleared {} lease entries due to epoch change", cleared);
+                        }
+                        handle_metadata_notification(&cache, &notif, &leases, &job_id);
+                    }
+                }
+                warn!("Metadata subscription stream closed, reconnecting...");
+            }
+            Err(e) => {
+                error!("Metadata subscription failed: {}", e);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn handle_metadata_notification(
+    cache: &Arc<MetadataCache>,
+    notification: &MetadataNotification,
+    leases: &Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
+    job_id: &str,
+) {
+    // Update path generation tracking for staleness detection
+    if notification.generation > 0 {
+        cache.update_path_generation(&notification.path, notification.generation);
+    }
+
+    // Client-side lease filtering with job-level exception:
+    // If this client holds a lease on the path, skip invalidation.
+    // BUT if the notification came from the same job, do NOT skip —
+    // changes from job peers should be visible even when we hold a lease.
+    let has_lease = |path: &str| -> bool {
+        if !notification.job_id.is_empty() && notification.job_id == job_id {
+            return false;
+        }
+        if let Some(inode) = cache.get_path(path) {
+            let leases = leases.read().unwrap();
+            leases.get(&inode).is_some_and(|v| !v.is_empty())
+        } else {
+            false
+        }
+    };
+
+    match notification.event_type() {
+        powerfs_master::proto::powerfs::metadata_notification::EventType::Create => {
+            let path = notification.path.clone();
+            debug!("Received CREATE notification for: {}", path);
+            if !has_lease(&path) {
+                cache.invalidate_path(&path);
+            } else {
+                debug!("Skipping invalidation for {} due to local lease", path);
+            }
+        }
+        powerfs_master::proto::powerfs::metadata_notification::EventType::Update => {
+            let path = notification.path.clone();
+            debug!("Received UPDATE notification for: {}", path);
+            if !has_lease(&path) {
+                cache.invalidate_path(&path);
+            } else {
+                debug!("Skipping invalidation for {} due to local lease", path);
+            }
+        }
+        powerfs_master::proto::powerfs::metadata_notification::EventType::Delete => {
+            let path = notification.path.clone();
+            debug!("Received DELETE notification for: {}", path);
+            if !has_lease(&path) {
+                cache.invalidate_path(&path);
+            } else {
+                debug!("Skipping invalidation for {} due to local lease", path);
+            }
+        }
+        powerfs_master::proto::powerfs::metadata_notification::EventType::Rename => {
+            let old_path = notification.old_path.clone();
+            let new_path = notification.path.clone();
+            debug!("Received RENAME notification: {} -> {}", old_path, new_path);
+            if !has_lease(&old_path) {
+                cache.invalidate_path(&old_path);
+            } else {
+                debug!("Skipping invalidation for {} due to local lease", old_path);
+            }
+            cache.invalidate_path(&new_path);
+        }
+        powerfs_master::proto::powerfs::metadata_notification::EventType::JobComplete => {
+            debug!("Received JOB_COMPLETE notification, clearing entire metadata cache");
+            cache.clear_all();
+        }
+    }
+}
+
+async fn lease_renewal_loop(
+    master_addr: String,
+    runtime_handle: Handle,
+    leases: Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
+    master_epoch: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let client = PowerFuseClient::new(&master_addr, runtime_handle.clone());
+    let check_interval = Duration::from_secs(5);
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        let leases_to_renew: Vec<LeaseInfo> = {
+            let leases_guard = leases.read().unwrap();
+            let now = std::time::Instant::now();
+            leases_guard
+                .values()
+                .flatten()
+                .filter(|info| {
+                    let elapsed = now.duration_since(info.acquired_at);
+                    let remaining = info.duration_ms.saturating_sub(elapsed.as_millis() as u64);
+                    remaining < info.duration_ms / 3
+                })
+                .cloned()
+                .collect()
+        };
+
+        for lease_info in leases_to_renew {
+            match client
+                .renew_lease(&lease_info.lease_id, lease_info.duration_ms)
+                .await
+            {
+                Ok((true, epoch)) => {
+                    master_epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
+                    let mut leases_guard = leases.write().unwrap();
+                    for lease_list in leases_guard.values_mut() {
+                        if let Some(l) = lease_list
+                            .iter_mut()
+                            .find(|l| l.lease_id == lease_info.lease_id)
+                        {
+                            l.acquired_at = std::time::Instant::now();
+                        }
+                    }
+                    debug!("Renewed lease: {}", lease_info.lease_id);
+                }
+                Ok((false, _)) => {
+                    debug!(
+                        "Lease {} (path: {}) no longer exists on master, removing locally",
+                        lease_info.lease_id, lease_info.path
+                    );
+                    let mut leases_guard = leases.write().unwrap();
+                    for lease_list in leases_guard.values_mut() {
+                        lease_list.retain(|l| l.lease_id != lease_info.lease_id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to renew lease {}: {}", lease_info.lease_id, e);
+                }
+            }
+        }
     }
 }
 
@@ -1709,12 +2094,14 @@ impl FuserApp {
         );
 
         let grpc_client = PowerFuseClient::new(&self.master_addr, self.runtime_handle.clone());
-        let sync_client = Arc::new(SyncFuseClient::new(grpc_client));
+        let sync_client = Arc::new(SyncFuseClient::new(grpc_client.clone()));
 
         let cache = Arc::new(MetadataCache::new());
         let chunk_cache = Arc::new(ChunkCache::with_defaults());
         let write_buffer = Arc::new(WriteBuffer::new(64));
 
+        let client_id = uuid::Uuid::new_v4().to_string();
+        let job_id = std::env::var("POWERFS_JOB_ID").unwrap_or_default();
         let fs = PowerFsFuserFs::new(
             sync_client.clone(),
             cache.clone(),
@@ -1722,6 +2109,8 @@ impl FuserApp {
             self.collection.clone(),
             self.replication.clone(),
             write_buffer.clone(),
+            client_id.clone(),
+            job_id.clone(),
         );
 
         let fs_clone = fs.clone();
@@ -1737,6 +2126,55 @@ impl FuserApp {
             }
             std::thread::sleep(Duration::from_millis(100));
         });
+
+        let cache_clone = cache.clone();
+        let leases_clone = fs.leases.clone();
+        let epoch_clone = fs.master_epoch.clone();
+        let runtime_handle_clone = self.runtime_handle.clone();
+        let master_addr_clone = self.master_addr.clone();
+        let job_id_clone = job_id.clone();
+        tokio::spawn(async move {
+            metadata_subscription_loop(
+                master_addr_clone,
+                cache_clone,
+                runtime_handle_clone,
+                leases_clone,
+                epoch_clone,
+                job_id_clone,
+            )
+            .await;
+        });
+
+        let leases_renewal = fs.leases.clone();
+        let epoch_renewal = fs.master_epoch.clone();
+        let master_addr_renewal = self.master_addr.clone();
+        let runtime_handle_renewal = self.runtime_handle.clone();
+        tokio::spawn(async move {
+            lease_renewal_loop(
+                master_addr_renewal,
+                runtime_handle_renewal,
+                leases_renewal,
+                epoch_renewal,
+            )
+            .await;
+        });
+
+        if !job_id.is_empty() {
+            let job_name = std::env::var("POWERFS_JOB_NAME").unwrap_or_else(|_| job_id.clone());
+            let sync_client_clone = sync_client.clone();
+            let client_id_clone = client_id.clone();
+            tokio::spawn(async move {
+                info!("Registering client to job: {} ({})", job_id, job_name);
+                match sync_client_clone.register_job_client(&job_id, &job_name, &client_id_clone) {
+                    Ok(_) => {
+                        info!("Successfully registered to job: {}", job_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to register to job {}: {}", job_id, e);
+                    }
+                }
+            });
+        }
 
         let options = vec![
             MountOption::FSName("powerfs".to_string()),

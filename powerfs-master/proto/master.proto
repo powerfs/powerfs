@@ -35,6 +35,17 @@ service MasterService {
     rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
     rpc StreamMutateEntry(stream MutateEntryRequest) returns (stream MutateEntryResponse);
     rpc SubscribeMetadata(SubscribeMetadataRequest) returns (stream MetadataNotification);
+    
+    // Lease management for file consistency
+    rpc AcquireLease(LeaseRequest) returns (LeaseResponse);
+    rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
+    rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
+
+    // Job-level consistency (Phase 3)
+    rpc RegisterJobClient(JobRegistrationRequest) returns (JobRegistrationResponse);
+    rpc DeregisterJobClient(JobDeregistrationRequest) returns (JobDeregistrationResponse);
+    rpc CompleteJob(JobCompletionRequest) returns (JobCompletionResponse);
+    rpc GetJobInfo(JobInfoRequest) returns (JobInfoResponse);
 }
 
 message Heartbeat {
@@ -286,6 +297,94 @@ message CollectionStats {
     uint64 used_size = 4;
 }
 
+message LeaseRequest {
+    string path = 1;
+    uint64 duration_ms = 2;
+    string client_id = 3;
+}
+
+message LeaseResponse {
+    bool success = 1;
+    string error = 2;
+    string lease_id = 3;
+    uint64 duration_ms = 4;
+    uint64 epoch = 5;  // Master epoch when lease was granted
+}
+
+message LeaseReleaseRequest {
+    string lease_id = 1;
+}
+
+message LeaseReleaseResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message LeaseRenewRequest {
+    string lease_id = 1;
+    uint64 duration_ms = 2;
+}
+
+message LeaseRenewResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 epoch = 3;
+}
+
+// ============================================================
+// Job-level consistency (Phase 3)
+// ============================================================
+
+message JobContext {
+    string job_id = 1;
+    string job_name = 2;
+    repeated string client_ids = 3;
+    uint64 start_time = 4;
+    uint64 end_time = 5;
+    bool is_active = 6;
+}
+
+message JobRegistrationRequest {
+    string job_id = 1;
+    string job_name = 2;
+    string client_id = 3;
+}
+
+message JobRegistrationResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message JobDeregistrationRequest {
+    string job_id = 1;
+    string client_id = 2;
+}
+
+message JobDeregistrationResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message JobCompletionRequest {
+    string job_id = 1;
+}
+
+message JobCompletionResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 invalidated_entries = 3;
+}
+
+message JobInfoRequest {
+    string job_id = 1;
+}
+
+message JobInfoResponse {
+    bool found = 1;
+    JobContext job = 2;
+    string error = 3;
+}
+
 message DataCenterStats {
     string name = 1;
     uint64 node_count = 2;
@@ -420,6 +519,7 @@ message Entry {
     string ttl = 10;
     string symlink_target = 11;
     string owner = 12;  // 资源归属用户ID（空字符串表示无归属/系统资源）
+    uint64 generation = 13;  // 代次号，每次元数据变更递增
 }
 
 message LookupDirectoryEntryRequest {
@@ -506,11 +606,17 @@ message MetadataNotification {
         CREATE = 0;
         UPDATE = 1;
         DELETE = 2;
+        RENAME = 3;
+        JOB_COMPLETE = 4;
     }
     EventType event_type = 1;
     string path = 2;
     Entry entry = 3;
     uint64 timestamp = 4;
+    uint64 generation = 5;  // 新的 generation 号
+    string old_path = 6;    // RENAME 事件的旧路径
+    uint64 epoch = 7;       // Master epoch for lease invalidation detection
+    string job_id = 8;      // Job ID for job-level lease sharing
 }
 
 // KV Cache service for LLM inference KV cache management

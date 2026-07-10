@@ -279,6 +279,7 @@ impl PowerFsFs {
                 ttl: String::new(),
                 symlink_target: String::new(),
                 owner: String::new(),
+                generation: entry.generation,
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -409,6 +410,7 @@ impl PowerFsFs {
             content_size: entry.content_size,
 
             disk_size: entry.disk_size,
+            generation: entry.generation,
         }
     }
 }
@@ -594,6 +596,7 @@ impl FileSystem for PowerFsFs {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(entry.clone());
 
@@ -629,6 +632,7 @@ impl FileSystem for PowerFsFs {
             ttl: String::new(),
             symlink_target: String::new(),
             owner: String::new(),
+            generation: 0,
         };
 
         match self.client.create_entry(filer_entry) {
@@ -782,6 +786,7 @@ impl FileSystem for PowerFsFs {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(entry.clone());
 
@@ -817,6 +822,7 @@ impl FileSystem for PowerFsFs {
             ttl: String::new(),
             symlink_target: String::new(),
             owner: String::new(),
+            generation: 0,
         };
 
         match self.client.create_entry(filer_entry) {
@@ -1144,6 +1150,7 @@ impl FileSystem for PowerFsFs {
                 ttl: String::new(),
                 symlink_target: String::new(),
                 owner: String::new(),
+                generation: entry.generation,
             };
 
             if let Err(e) = self.client.update_entry(&filer_entry) {
@@ -1348,6 +1355,7 @@ impl FileSystem for PowerFsFs {
             ttl: String::new(),
             symlink_target: entry.symlink_target.clone().unwrap_or_default(),
             owner: String::new(),
+            generation: entry.generation,
         };
 
         match self.client.delete_entry(&old_path, entry.is_dir) {
@@ -1419,6 +1427,7 @@ impl FileSystem for PowerFsFs {
             ttl: String::new(),
             symlink_target: link_str.to_string(),
             owner: String::new(),
+            generation: 0,
         };
 
         let inode = match self.client.create_entry(entry) {
@@ -1451,6 +1460,7 @@ impl FileSystem for PowerFsFs {
             hard_link_counter: 0,
             content_size: link_str.len() as u64,
             disk_size: 0,
+            generation: 0,
         };
         self.cache.insert(cached_entry.clone());
         Ok(self.create_fuse_entry(&cached_entry))
@@ -1517,6 +1527,7 @@ impl FileSystem for PowerFsFs {
             hard_link_counter: entry.hard_link_counter,
             content_size: entry.content_size,
             disk_size: entry.disk_size,
+            generation: 0,
         };
 
         self.cache.insert(new_entry.clone());

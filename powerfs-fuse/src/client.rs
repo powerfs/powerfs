@@ -2,8 +2,10 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
-    DeleteEntryRequest, Entry, GetEntryRequest, ListEntriesRequest, LookupDirectoryEntryRequest,
-    LookupVolumeRequest, UpdateEntryRequest,
+    DeleteEntryRequest, Entry, GetEntryRequest, JobCompletionRequest, JobDeregistrationRequest,
+    JobRegistrationRequest, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
+    ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification,
+    SubscribeMetadataRequest, UpdateEntryRequest,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -1054,6 +1056,287 @@ impl PowerFuseClient {
 
         Err("lookup_directory_entry failed after max retries".to_string())
     }
+
+    pub async fn subscribe_metadata(
+        &self,
+        path_prefix: &str,
+    ) -> Result<tonic::Streaming<MetadataNotification>, String> {
+        debug!("subscribe_metadata: path_prefix={}", path_prefix);
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = SubscribeMetadataRequest {
+            path_prefix: path_prefix.to_string(),
+        };
+
+        match client
+            .subscribe_metadata(tonic::Request::new(request))
+            .await
+        {
+            Ok(response) => {
+                debug!("subscribe_metadata succeeded");
+                Ok(response.into_inner())
+            }
+            Err(e) => {
+                let msg = format!("subscribe_metadata failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn acquire_lease(
+        &self,
+        path: &str,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        debug!(
+            "acquire_lease: path={}, client_id={}, duration_ms={}",
+            path, client_id, duration_ms
+        );
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = LeaseRequest {
+            path: path.to_string(),
+            client_id: client_id.to_string(),
+            duration_ms,
+        };
+
+        match client.acquire_lease(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!(
+                        "acquire_lease succeeded: lease_id={}, epoch={}",
+                        resp.lease_id, resp.epoch
+                    );
+                    Ok((resp.lease_id, resp.epoch))
+                } else {
+                    let msg = format!("acquire_lease failed: {}", resp.error);
+                    error!("{}", msg);
+                    Err(msg)
+                }
+            }
+            Err(e) => {
+                let msg = format!("acquire_lease failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn release_lease(&self, lease_id: &str) -> Result<bool, String> {
+        debug!("release_lease: lease_id={}", lease_id);
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = LeaseReleaseRequest {
+            lease_id: lease_id.to_string(),
+        };
+
+        match client.release_lease(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let resp = response.into_inner();
+                debug!("release_lease succeeded: success={}", resp.success);
+                Ok(resp.success)
+            }
+            Err(e) => {
+                let msg = format!("release_lease failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn renew_lease(
+        &self,
+        lease_id: &str,
+        duration_ms: u64,
+    ) -> Result<(bool, u64), String> {
+        debug!(
+            "renew_lease: lease_id={}, duration_ms={}",
+            lease_id, duration_ms
+        );
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = LeaseRenewRequest {
+            lease_id: lease_id.to_string(),
+            duration_ms,
+        };
+
+        match client.renew_lease(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!(
+                        "renew_lease succeeded: lease_id={}, epoch={}",
+                        lease_id, resp.epoch
+                    );
+                    Ok((true, resp.epoch))
+                } else {
+                    debug!("renew_lease failed: {}", resp.error);
+                    Ok((false, 0))
+                }
+            }
+            Err(e) => {
+                let msg = format!("renew_lease failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn register_job_client(
+        &self,
+        job_id: &str,
+        job_name: &str,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        debug!(
+            "register_job_client: job_id={}, job_name={}, client_id={}",
+            job_id, job_name, client_id
+        );
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = JobRegistrationRequest {
+            job_id: job_id.to_string(),
+            job_name: job_name.to_string(),
+            client_id: client_id.to_string(),
+        };
+
+        match client
+            .register_job_client(tonic::Request::new(request))
+            .await
+        {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!("register_job_client succeeded: job_id={}", job_id);
+                    Ok(true)
+                } else {
+                    let msg = format!("register_job_client failed: {}", resp.error);
+                    error!("{}", msg);
+                    Err(msg)
+                }
+            }
+            Err(e) => {
+                let msg = format!("register_job_client failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn deregister_job_client(
+        &self,
+        job_id: &str,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        debug!(
+            "deregister_job_client: job_id={}, client_id={}",
+            job_id, client_id
+        );
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = JobDeregistrationRequest {
+            job_id: job_id.to_string(),
+            client_id: client_id.to_string(),
+        };
+
+        match client
+            .deregister_job_client(tonic::Request::new(request))
+            .await
+        {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!("deregister_job_client succeeded: job_id={}", job_id);
+                    Ok(true)
+                } else {
+                    let msg = format!("deregister_job_client failed: {}", resp.error);
+                    error!("{}", msg);
+                    Err(msg)
+                }
+            }
+            Err(e) => {
+                let msg = format!("deregister_job_client failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn complete_job(&self, job_id: &str) -> Result<u64, String> {
+        debug!("complete_job: job_id={}", job_id);
+
+        let channel = match self.ensure_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+        let request = JobCompletionRequest {
+            job_id: job_id.to_string(),
+        };
+
+        match client.complete_job(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!(
+                        "complete_job succeeded: job_id={}, invalidated={}",
+                        job_id, resp.invalidated_entries
+                    );
+                    Ok(resp.invalidated_entries)
+                } else {
+                    let msg = format!("complete_job failed: {}", resp.error);
+                    error!("{}", msg);
+                    Err(msg)
+                }
+            }
+            Err(e) => {
+                let msg = format!("complete_job failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
 }
 
 pub struct SyncFuseClient {
@@ -1223,5 +1506,51 @@ impl SyncFuseClient {
         self.client
             .runtime_handle
             .block_on(self.client.invalidate_volume_channel(addr));
+    }
+
+    pub fn acquire_lease(
+        &self,
+        path: &str,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.acquire_lease(path, client_id, duration_ms))
+    }
+
+    pub fn release_lease(&self, lease_id: &str) -> Result<bool, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.release_lease(lease_id))
+    }
+
+    pub fn renew_lease(&self, lease_id: &str, duration_ms: u64) -> Result<(bool, u64), String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.renew_lease(lease_id, duration_ms))
+    }
+
+    pub fn register_job_client(
+        &self,
+        job_id: &str,
+        job_name: &str,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.register_job_client(job_id, job_name, client_id))
+    }
+
+    pub fn deregister_job_client(&self, job_id: &str, client_id: &str) -> Result<bool, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.deregister_job_client(job_id, client_id))
+    }
+
+    pub fn complete_job(&self, job_id: &str) -> Result<u64, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.complete_job(job_id))
     }
 }

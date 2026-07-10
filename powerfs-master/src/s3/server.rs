@@ -600,6 +600,7 @@ pub mod handlers {
             ttl: "".to_string(),
             symlink_target: "".to_string(),
             owner: String::new(),
+            generation: 0,
         };
 
         match state.directory_tree.create_entry(entry).await {
@@ -1077,6 +1078,7 @@ pub mod handlers {
             ttl: "".to_string(),
             symlink_target: "".to_string(),
             owner: String::new(),
+            generation: 0,
         };
 
         match state.directory_tree.create_entry(entry).await {

@@ -256,6 +256,7 @@ impl KvCacheService for KvCacheServiceImpl {
                             ttl: "".to_string(),
                             symlink_target: "".to_string(),
                             owner: String::new(),
+                            generation: 0,
                         };
                         let _ = self.master.directory_tree.create_entry(file_entry);
 

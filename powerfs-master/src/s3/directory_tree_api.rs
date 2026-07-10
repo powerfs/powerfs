@@ -266,6 +266,7 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                     ttl: "".to_string(),
                     symlink_target: "".to_string(),
                     owner: String::new(),
+                    generation: 0,
                 };
 
                 let create_request = CreateEntryRequest { entry: Some(entry) };

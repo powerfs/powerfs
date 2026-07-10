@@ -1,3 +1,4 @@
+use log::debug;
 use lru::LruCache;
 use powerfs_common::types::Fid;
 use powerfs_master::proto::FileChunk;
@@ -56,6 +57,7 @@ pub struct CachedEntry {
     pub hard_link_counter: u32,
     pub content_size: u64,
     pub disk_size: u64,
+    pub generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +88,8 @@ pub struct MetadataCache {
     next_inode: AtomicU64,
     /// TTL for directory cache
     dir_cache_ttl: Duration,
+    /// Latest known generation per path (from notifications)
+    path_generations: RwLock<HashMap<String, u64>>,
 }
 
 impl MetadataCache {
@@ -102,6 +106,7 @@ impl MetadataCache {
             dir_cache: RwLock::new(HashMap::new()),
             next_inode: AtomicU64::new(2),
             dir_cache_ttl: Duration::from_secs(5),
+            path_generations: RwLock::new(HashMap::new()),
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
@@ -129,6 +134,7 @@ impl MetadataCache {
             hard_link_counter: 0,
             content_size: 4096,
             disk_size: 4096,
+            generation: 1,
         });
         cache
     }
@@ -481,6 +487,108 @@ impl MetadataCache {
         }
         None
     }
+
+    /// Invalidate cache entry by path
+    pub fn invalidate_path(&self, path: &str) {
+        let maybe_inode = {
+            let path_map = self.path_map.read().unwrap();
+            path_map.get(path).copied()
+        };
+        if let Some(inode) = maybe_inode {
+            self.remove(inode);
+            debug!("Invalidated cache for path: {} (inode: {})", path, inode);
+        }
+
+        let parent_path = if let Some(last_slash) = path.rfind('/') {
+            if last_slash == 0 {
+                "/"
+            } else {
+                &path[..last_slash]
+            }
+        } else {
+            "/"
+        };
+
+        let maybe_parent_inode = {
+            let path_map = self.path_map.read().unwrap();
+            path_map.get(parent_path).copied()
+        };
+        if let Some(parent_inode) = maybe_parent_inode {
+            let mut dir_cache = self.dir_cache.write().unwrap();
+            dir_cache.remove(&parent_inode);
+            debug!("Invalidated directory cache for: {}", parent_path);
+        }
+    }
+
+    /// Clear all cache entries and re-initialize root directory.
+    /// Called when JOB_COMPLETE notification is received.
+    pub fn clear_all(&self) {
+        {
+            let mut cache = self.inode_cache.write().unwrap();
+            cache.clear();
+        }
+        {
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.clear();
+        }
+        {
+            let mut dir_cache = self.dir_cache.write().unwrap();
+            dir_cache.clear();
+        }
+        {
+            let mut gens = self.path_generations.write().unwrap();
+            gens.clear();
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let mut cache = self.inode_cache.write().unwrap();
+        cache.put(
+            1,
+            CachedEntry {
+                inode: 1,
+                parent: 1,
+                name: String::new(),
+                is_dir: true,
+                is_symlink: false,
+                symlink_target: None,
+                nlink: 2,
+                fid: None,
+                size: 4096,
+                mode: 0o755,
+                uid,
+                gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                xattrs: HashMap::new(),
+                chunks: Vec::new(),
+                hard_link_id: String::new(),
+                hard_link_counter: 0,
+                content_size: 4096,
+                disk_size: 4096,
+                generation: 1,
+            },
+        );
+        drop(cache);
+        let mut path_map = self.path_map.write().unwrap();
+        path_map.insert("/".to_string(), 1);
+
+        debug!("Metadata cache fully cleared and root re-initialized");
+    }
+
+    /// Update the latest known generation for a path (from notifications)
+    pub fn update_path_generation(&self, path: &str, generation: u64) {
+        let mut gens = self.path_generations.write().unwrap();
+        gens.insert(path.to_string(), generation);
+    }
+
+    /// Get the latest known generation for a path
+    pub fn get_path_generation(&self, path: &str) -> Option<u64> {
+        let gens = self.path_generations.read().unwrap();
+        gens.get(path).copied()
+    }
 }
 
 impl Default for MetadataCache {
@@ -537,6 +645,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -573,6 +682,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -609,6 +719,7 @@ mod tests {
                 hard_link_counter: 0,
                 content_size: 0,
                 disk_size: 0,
+                generation: 0,
             });
         }
 
@@ -643,6 +754,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         cache.update_size(inode, 1024);
@@ -677,6 +789,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -714,6 +827,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -752,6 +866,7 @@ mod tests {
             hard_link_counter: 0,
             content_size: 0,
             disk_size: 0,
+            generation: 0,
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -961,5 +1076,112 @@ mod chunk_cache_tests {
         assert_eq!(cache.get_chunk_offset(512), 512);
         assert_eq!(cache.get_chunk_offset(1024), 0);
         assert_eq!(cache.get_chunk_offset(1536), 512);
+    }
+
+    #[test]
+    fn test_path_generation_update_and_get() {
+        let cache = MetadataCache::new();
+
+        assert!(cache.get_path_generation("/test/file.txt").is_none());
+
+        cache.update_path_generation("/test/file.txt", 5);
+        assert_eq!(cache.get_path_generation("/test/file.txt"), Some(5));
+
+        cache.update_path_generation("/test/file.txt", 10);
+        assert_eq!(cache.get_path_generation("/test/file.txt"), Some(10));
+    }
+
+    #[test]
+    fn test_path_generation_stale_detection() {
+        let cache = MetadataCache::new();
+        let ino = cache.allocate_inode();
+
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "stale.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+        });
+
+        // No generation tracking -> not stale
+        assert!(cache.get_path_generation("/stale.txt").is_none());
+
+        // Updated generation > cached generation -> stale
+        cache.update_path_generation("/stale.txt", 5);
+        let cached_gen = cache.get_inode(ino).unwrap().generation;
+        assert!(cache
+            .get_path_generation("/stale.txt")
+            .is_some_and(|g| g > cached_gen));
+
+        // Same generation -> not stale
+        cache.update_path_generation("/stale.txt", 1);
+        assert!(!cache
+            .get_path_generation("/stale.txt")
+            .is_some_and(|g| g > cached_gen));
+    }
+
+    #[test]
+    fn test_clear_all_empties_and_reinitializes() {
+        let cache = MetadataCache::new();
+        let ino = cache.allocate_inode();
+
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "clear_test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+        });
+
+        cache.update_path_generation("/clear_test.txt", 5);
+
+        assert!(cache.get_inode(ino).is_some());
+
+        cache.clear_all();
+
+        assert!(cache.get_inode(ino).is_none(), "Entry should be cleared");
+        assert!(
+            cache.get_inode(1).is_some(),
+            "Root should be re-initialized"
+        );
+        assert!(
+            cache.get_path_generation("/clear_test.txt").is_none(),
+            "Generation tracking should be cleared"
+        );
     }
 }

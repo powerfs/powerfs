@@ -1,5 +1,6 @@
 use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::{Entry, MetadataNotification};
+use log::debug;
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -7,11 +8,34 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+pub struct Lease {
+    pub lease_id: String,
+    pub path: String,
+    pub client_id: String,
+    pub expires_at: std::time::Instant,
+    pub epoch: u64,
+}
+
+pub struct JobInfo {
+    pub job_id: String,
+    pub job_name: String,
+    pub client_ids: HashSet<String>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub is_active: bool,
+}
+
 pub struct DirectoryTree {
     db: DB,
     inode_counter: std::sync::atomic::AtomicU64,
+    generation_counter: std::sync::atomic::AtomicU64,
+    epoch: std::sync::atomic::AtomicU64,
     notifier: Arc<broadcast::Sender<MetadataNotification>>,
     subscribers: std::sync::RwLock<HashSet<String>>,
+    pub leases: std::sync::RwLock<HashMap<String, Lease>>,
+    path_lease_map: std::sync::RwLock<HashMap<String, HashSet<String>>>,
+    jobs: std::sync::RwLock<HashMap<String, JobInfo>>,
+    current_job_id: std::sync::RwLock<Option<String>>,
 }
 
 impl DirectoryTree {
@@ -23,13 +47,21 @@ impl DirectoryTree {
         let db = DB::open(&opts, path)?;
 
         let inode_counter = Self::load_inode_counter(&db);
-        let (notifier, _) = broadcast::channel(100);
+        let generation_counter = Self::load_generation_counter(&db);
+        let epoch = Self::load_and_increment_epoch(&db);
+        let (notifier, _) = broadcast::channel(10000);
 
         Ok(DirectoryTree {
             db,
             inode_counter,
+            generation_counter,
+            epoch: std::sync::atomic::AtomicU64::new(epoch),
             notifier: Arc::new(notifier),
             subscribers: std::sync::RwLock::new(HashSet::new()),
+            leases: std::sync::RwLock::new(HashMap::new()),
+            path_lease_map: std::sync::RwLock::new(HashMap::new()),
+            jobs: std::sync::RwLock::new(HashMap::new()),
+            current_job_id: std::sync::RwLock::new(None),
         })
     }
 
@@ -42,6 +74,50 @@ impl DirectoryTree {
             }
         }
         std::sync::atomic::AtomicU64::new(2)
+    }
+
+    fn load_generation_counter(db: &DB) -> std::sync::atomic::AtomicU64 {
+        if let Ok(Some(val)) = db.get(b"generation_counter") {
+            if let Ok(s) = String::from_utf8(val) {
+                if let Ok(counter) = s.parse::<u64>() {
+                    return std::sync::atomic::AtomicU64::new(counter);
+                }
+            }
+        }
+        std::sync::atomic::AtomicU64::new(1)
+    }
+
+    fn load_and_increment_epoch(db: &DB) -> u64 {
+        let current = if let Ok(Some(val)) = db.get(b"epoch") {
+            if let Ok(s) = String::from_utf8(val) {
+                s.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let new_epoch = current + 1;
+        let _ = db.put(b"epoch", new_epoch.to_string().as_bytes());
+        debug!(
+            "Master epoch loaded: {} -> {} (incremented on restart)",
+            current, new_epoch
+        );
+        new_epoch
+    }
+
+    pub fn get_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn allocate_generation(&self) -> u64 {
+        let generation = self
+            .generation_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .db
+            .put(b"generation_counter", generation.to_string().as_bytes());
+        generation
     }
 
     fn allocate_inode(&self) -> u64 {
@@ -128,6 +204,7 @@ impl DirectoryTree {
                     ttl: "".to_string(),
                     symlink_target: "".to_string(),
                     owner: String::new(),
+                    generation: self.allocate_generation(),
                 };
                 let _ = self.create_entry(entry);
             }
@@ -138,10 +215,12 @@ impl DirectoryTree {
 
     pub fn create_entry(&self, mut entry: Entry) -> Result<u64, rocksdb::Error> {
         let inode = self.allocate_inode();
+        let generation = self.allocate_generation();
 
         if let Some(attrs) = &mut entry.attributes {
             attrs.ino = inode;
         }
+        entry.generation = generation;
 
         let key = Self::path_to_key(&entry.directory, &entry.name);
         let path = String::from_utf8_lossy(&key).to_string();
@@ -155,7 +234,10 @@ impl DirectoryTree {
         Ok(inode)
     }
 
-    pub fn update_entry(&self, entry: &Entry) -> Result<(), rocksdb::Error> {
+    pub fn update_entry(&self, mut entry: Entry) -> Result<(), rocksdb::Error> {
+        let generation = self.allocate_generation();
+        entry.generation = generation;
+
         let key = Self::path_to_key(&entry.directory, &entry.name);
         let path = String::from_utf8_lossy(&key).to_string();
         let mut data = Vec::new();
@@ -163,7 +245,7 @@ impl DirectoryTree {
 
         self.db.put(&key, &data)?;
 
-        self.publish_notification(EventType::Update, &path, Some(entry.clone()));
+        self.publish_notification(EventType::Update, &path, Some(entry));
 
         Ok(())
     }
@@ -249,6 +331,7 @@ impl DirectoryTree {
                 ttl: "".to_string(),
                 symlink_target: "".to_string(),
                 owner: String::new(),
+                generation: 1,
             };
 
             let mut data = Vec::new();
@@ -269,11 +352,26 @@ impl DirectoryTree {
     }
 
     fn publish_notification(&self, event_type: EventType, path: &str, entry: Option<Entry>) {
+        // Note: lease filtering is performed on the client side. The master always
+        // publishes notifications so that non-leasing clients receive invalidations.
+        // A client holding a lease on a path will ignore notifications for that path.
+        let generation = entry.as_ref().map(|e| e.generation).unwrap_or(0);
+        let epoch = self.get_epoch();
+        let job_id = self
+            .current_job_id
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
         let notification = MetadataNotification {
             event_type: event_type as i32,
             path: path.to_string(),
             entry,
             timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            generation,
+            old_path: String::new(),
+            epoch,
+            job_id,
         };
         let _ = self.notifier.send(notification);
     }
@@ -287,8 +385,217 @@ impl DirectoryTree {
         subscribers.insert(path_prefix.to_string());
     }
 
+    pub fn acquire_lease(&self, path: &str, client_id: &str, duration_ms: u64) -> String {
+        // Opportunistic cleanup of expired leases to bound memory usage.
+        self.cleanup_expired_leases();
+
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+        let epoch = self.get_epoch();
+
+        let lease = Lease {
+            lease_id: lease_id.clone(),
+            path: path.to_string(),
+            client_id: client_id.to_string(),
+            expires_at,
+            epoch,
+        };
+
+        {
+            let mut leases = self.leases.write().unwrap();
+            leases.insert(lease_id.clone(), lease);
+        }
+
+        {
+            let mut path_lease_map = self.path_lease_map.write().unwrap();
+            path_lease_map
+                .entry(path.to_string())
+                .or_default()
+                .insert(lease_id.clone());
+        }
+
+        lease_id
+    }
+
+    pub fn release_lease(&self, lease_id: &str) -> bool {
+        let lease = {
+            let mut leases = self.leases.write().unwrap();
+            leases.remove(lease_id)
+        };
+
+        if let Some(lease) = lease {
+            let mut path_lease_map = self.path_lease_map.write().unwrap();
+            if let Some(lease_ids) = path_lease_map.get_mut(&lease.path) {
+                lease_ids.remove(lease_id);
+                if lease_ids.is_empty() {
+                    path_lease_map.remove(&lease.path);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn renew_lease(&self, lease_id: &str, duration_ms: u64) -> Option<u64> {
+        let mut leases = self.leases.write().unwrap();
+        if let Some(lease) = leases.get_mut(lease_id) {
+            lease.expires_at =
+                std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+            let epoch = lease.epoch;
+            debug!(
+                "Renewed lease {}: new expiry in {}ms",
+                lease_id, duration_ms
+            );
+            Some(epoch)
+        } else {
+            None
+        }
+    }
+
+    pub fn has_active_lease(&self, path: &str) -> bool {
+        let now = std::time::Instant::now();
+        let current_epoch = self.get_epoch();
+
+        if let Some(lease_ids) = self.path_lease_map.read().unwrap().get(path) {
+            let leases = self.leases.read().unwrap();
+            for lease_id in lease_ids {
+                if let Some(lease) = leases.get(lease_id) {
+                    if lease.epoch == current_epoch && lease.expires_at > now {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn cleanup_expired_leases(&self) {
+        let now = std::time::Instant::now();
+
+        // Collect expired lease ids and their paths atomically under a single write lock
+        // to avoid TOCTOU races with concurrent release_lease.
+        let expired: Vec<(String, String)> = {
+            let leases = self.leases.read().unwrap();
+            leases
+                .iter()
+                .filter(|(_, lease)| lease.expires_at <= now)
+                .map(|(id, lease)| (id.clone(), lease.path.clone()))
+                .collect()
+        };
+
+        if expired.is_empty() {
+            return;
+        }
+
+        let expired_count = expired.len();
+        for (lease_id, path) in &expired {
+            {
+                let mut leases = self.leases.write().unwrap();
+                leases.remove(lease_id);
+            }
+            let mut path_lease_map = self.path_lease_map.write().unwrap();
+            if let Some(lease_ids) = path_lease_map.get_mut(path) {
+                lease_ids.remove(lease_id);
+                if lease_ids.is_empty() {
+                    path_lease_map.remove(path);
+                }
+            }
+        }
+
+        debug!("Cleaned up {} expired leases", expired_count);
+    }
+
     pub fn remove_subscriber(&self, path_prefix: &str) {
         let mut subscribers = self.subscribers.write().unwrap();
         subscribers.remove(path_prefix);
+    }
+
+    pub fn register_job_client(&self, job_id: &str, job_name: &str, client_id: &str) -> bool {
+        let mut jobs = self.jobs.write().unwrap();
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.client_ids.insert(client_id.to_string());
+            debug!(
+                "Client {} joined job {} (total clients: {})",
+                client_id,
+                job_id,
+                job.client_ids.len()
+            );
+        } else {
+            let mut client_ids = HashSet::new();
+            client_ids.insert(client_id.to_string());
+            jobs.insert(
+                job_id.to_string(),
+                JobInfo {
+                    job_id: job_id.to_string(),
+                    job_name: job_name.to_string(),
+                    client_ids,
+                    start_time: now,
+                    end_time: 0,
+                    is_active: true,
+                },
+            );
+            debug!("New job registered: {} ({})", job_id, job_name);
+        }
+        drop(jobs);
+        *self.current_job_id.write().unwrap() = Some(job_id.to_string());
+        true
+    }
+
+    pub fn deregister_job_client(&self, job_id: &str, client_id: &str) -> bool {
+        let mut jobs = self.jobs.write().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.client_ids.remove(client_id);
+            debug!(
+                "Client {} left job {} (remaining clients: {})",
+                client_id,
+                job_id,
+                job.client_ids.len()
+            );
+            if job.client_ids.is_empty() {
+                job.is_active = false;
+                job.end_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn complete_job(&self, job_id: &str) -> Option<u64> {
+        let mut jobs = self.jobs.write().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.is_active = false;
+            job.end_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+            let client_count = job.client_ids.len() as u64;
+            debug!("Job {} completed with {} clients", job_id, client_count);
+
+            drop(jobs);
+            self.publish_notification(EventType::JobComplete, "/", None);
+
+            Some(client_count)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_job_info(&self, job_id: &str) -> Option<JobInfo> {
+        let jobs = self.jobs.read().unwrap();
+        jobs.get(job_id).map(|j| JobInfo {
+            job_id: j.job_id.clone(),
+            job_name: j.job_name.clone(),
+            client_ids: j.client_ids.clone(),
+            start_time: j.start_time,
+            end_time: j.end_time,
+            is_active: j.is_active,
+        })
+    }
+
+    pub fn is_job_active(&self, job_id: &str) -> bool {
+        let jobs = self.jobs.read().unwrap();
+        jobs.get(job_id).is_some_and(|j| j.is_active)
     }
 }
