@@ -753,14 +753,14 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<UpdateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let entry = req.entry.as_ref();
         info!(
-            "update_entry request: name={}, directory={}, client_id={}",
-            req.entry.as_ref().map(|e| e.name.as_str()).unwrap_or(""),
-            req.entry
-                .as_ref()
-                .map(|e| e.directory.as_str())
-                .unwrap_or(""),
-            req.client_id
+            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}",
+            entry.map(|e| e.name.as_str()).unwrap_or(""),
+            entry.map(|e| e.directory.as_str()).unwrap_or(""),
+            req.client_id,
+            entry.map(|e| e.content_size).unwrap_or(0),
+            entry.and_then(|e| e.attributes.as_ref()).map(|a| a.size).unwrap_or(0)
         );
 
         match dir_tree.update_entry(req.entry.unwrap_or_default(), &req.client_id) {

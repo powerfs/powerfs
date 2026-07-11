@@ -1,5 +1,6 @@
 use crate::cache::{ChunkCache, MetadataCache};
 use crate::client::{PowerFuseClient, SyncFuseClient};
+use crate::error::parse_master_error;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
@@ -52,6 +53,18 @@ impl WriteBuffer {
     pub fn take(&self, inode: u64) -> Vec<WriteBufferEntry> {
         let mut buffers = self.buffers.write().unwrap();
         buffers.remove(&inode).unwrap_or_default()
+    }
+
+    pub fn get_max_write_offset(&self, inode: u64) -> u64 {
+        let buffers = self.buffers.read().unwrap();
+        if let Some(entries) = buffers.get(&inode) {
+            entries.iter()
+                .map(|e| e.offset + e.data.len() as u64)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        }
     }
 }
 
@@ -126,7 +139,7 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
+    fn flush_dirty_chunks(&self, inode: u64, max_write_offset: u64) -> std::io::Result<()> {
         let dirty: Vec<(u64, u64)> = {
             let dirty_set = self.dirty_chunks.read().unwrap();
             dirty_set
@@ -136,13 +149,20 @@ impl PowerFsFuserFs {
                 .collect()
         };
 
+        info!("flush_dirty_chunks: inode={}, dirty_chunks={}", inode, dirty.len());
+        
         if dirty.is_empty() {
             return Ok(());
         }
 
         let (entry, path) = match self.client.get_entry_by_inode(inode) {
             Ok(Some(e)) => e,
-            _ => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            Ok(None) => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("flush_dirty_chunks: failed to get entry: {}", fs_error);
+                return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+            }
         };
 
         let existing_fid = entry
@@ -158,8 +178,9 @@ impl PowerFsFuserFs {
                 .client
                 .assign_fid(&self.collection, &self.replication)
                 .map_err(|e| {
-                    error!("assign_fid failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
+                    let fs_error = parse_master_error(&e);
+                    error!("assign_fid failed: {}", fs_error);
+                    std::io::Error::from_raw_os_error(fs_error.to_errno())
                 })?;
 
             info!("Assigned new fid for inode {}: {}", inode, new_fid);
@@ -167,8 +188,9 @@ impl PowerFsFuserFs {
         };
 
         let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-            error!("lookup_volume failed: {}", e);
-            std::io::Error::from_raw_os_error(libc::EIO)
+            let fs_error = parse_master_error(&e);
+            error!("lookup_volume failed: {}", fs_error);
+            std::io::Error::from_raw_os_error(fs_error.to_errno())
         })?;
 
         let loc = locations
@@ -203,8 +225,9 @@ impl PowerFsFuserFs {
             self.client
                 .batch_write_blob(&addr, fid.volume_id.0, fid.file_key, entries)
                 .map_err(|e| {
-                    error!("batch_write_blob failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
+                    let fs_error = crate::error::parse_volume_error(&e);
+                    error!("batch_write_blob failed: {}", fs_error);
+                    std::io::Error::from_raw_os_error(fs_error.to_errno())
                 })?;
         }
 
@@ -223,6 +246,15 @@ impl PowerFsFuserFs {
 
         if !path.is_empty() && !chunks.is_empty() {
             let attrs = entry.attributes.as_ref();
+            
+            let mut content_size = entry.content_size;
+            let mut size = attrs.map(|a| a.size).unwrap_or(0);
+            
+            if max_write_offset > 0 && max_write_offset < size {
+                size = max_write_offset;
+                content_size = max_write_offset;
+            }
+            
             let filer_entry = powerfs_master::proto::powerfs::Entry {
                 name: entry.name,
                 directory,
@@ -233,11 +265,11 @@ impl PowerFsFuserFs {
                     uid: attrs.map(|a| a.uid).unwrap_or(0),
                     gid: attrs.map(|a| a.gid).unwrap_or(0),
                     rdev: 0,
-                    size: attrs.map(|a| a.size).unwrap_or(0),
+                    size,
                     blksize: 4096,
-                    blocks: attrs.map(|a| a.size.div_ceil(512)).unwrap_or(0),
+                    blocks: size.div_ceil(512),
                     atime: attrs.map(|a| a.atime).unwrap_or(0),
-                    mtime: attrs.map(|a| a.mtime).unwrap_or(0),
+                    mtime: chrono::Utc::now().timestamp() as u64,
                     ctime: chrono::Utc::now().timestamp() as u64,
                     crtime: attrs.map(|a| a.crtime).unwrap_or(0),
                     perm: 0,
@@ -246,7 +278,7 @@ impl PowerFsFuserFs {
                 hard_link_id: entry.hard_link_id,
                 hard_link_counter: entry.hard_link_counter,
                 extended: HashMap::new(),
-                content_size: entry.content_size,
+                content_size,
                 disk_size: entry.disk_size,
                 ttl: String::new(),
                 symlink_target: entry.symlink_target,
@@ -254,8 +286,15 @@ impl PowerFsFuserFs {
                 generation: entry.generation,
             };
 
+            info!(
+                "flush_dirty_chunks: updating entry with content_size={}, size={}",
+                content_size, size
+            );
             if let Err(e) = self.client.update_entry(&filer_entry, &self.client_id) {
                 warn!("Failed to update entry on master: {}", e);
+            } else {
+                info!("flush_dirty_chunks: entry updated successfully, invalidating inode {}", inode);
+                self.invalidate_kernel_inode(inode);
             }
         }
 
@@ -275,7 +314,7 @@ impl PowerFsFuserFs {
         let inodes: HashSet<u64> = dirty.iter().map(|(ino, _)| *ino).collect();
 
         for inode in inodes {
-            let _ = self.flush_dirty_chunks(inode);
+            let _ = self.flush_dirty_chunks(inode, 0);
         }
 
         Ok(())
@@ -426,6 +465,10 @@ impl PowerFsFuserFs {
 
         match self.client.list_entries(1, 1000, "") {
             Ok(entries) => {
+                debug!("readdir_root: got {} entries from master", entries.len());
+                for (i, entry) in entries.iter().enumerate() {
+                    debug!("readdir_root: entry[{}] name='{}', ino={}", i, entry.name, entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0));
+                }
                 let child_offset = idx.saturating_sub(2);
                 for (i, entry) in entries.iter().enumerate().skip(child_offset) {
                     let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
@@ -691,28 +734,42 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = match self.client.get_entry_by_inode(parent) {
             Ok(Some((_, p))) => p,
-            _ => {
+            Ok(None) => {
                 error!("mkdir: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
                 return;
             }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("mkdir: failed to get parent entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
+                return;
+            }
         };
 
+        debug!("mkdir: parent_inode={}, parent_path='{}'", parent, parent_path);
+
         let now = chrono::Utc::now().timestamp();
-        let dir_path = if parent_path == "/" {
+        let dir_path = if parent_path == "/" || parent_path.is_empty() {
             format!("/{}", name_str)
         } else {
             format!("{}/{}", parent_path, name_str)
         };
 
+        debug!("mkdir: dir_path='{}'", dir_path);
+
         match self.client.get_entry(&dir_path) {
             Ok(Some(_)) => {
+                debug!("mkdir: directory '{}' already exists", dir_path);
                 reply.error(libc::EEXIST);
                 return;
             }
             Ok(None) => {}
             Err(e) => {
-                warn!("mkdir: lookup failed: {}", e);
+                let fs_error = parse_master_error(&e);
+                error!("mkdir: lookup failed: {}", fs_error);
+                reply.error(fs_error.to_errno());
+                return;
             }
         }
 
@@ -754,7 +811,7 @@ impl Filesystem for PowerFsFuserFs {
                         let attr = self.create_file_attr_from_entry(&entry);
                         reply.entry(&TTL, &attr, 0);
                     }
-                    _ => {
+                    Ok(None) => {
                         let attr = FileAttr {
                             ino: master_inode,
                             size: 0,
@@ -778,12 +835,19 @@ impl Filesystem for PowerFsFuserFs {
                         };
                         reply.entry(&TTL, &attr, 0);
                     }
+                    Err(e) => {
+                        let fs_error = parse_master_error(&e);
+                        error!("mkdir: failed to get created entry: {}", fs_error);
+                        reply.error(fs_error.to_errno());
+                        return;
+                    }
                 }
                 self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
-                error!("Failed to create directory entry on master: {}", e);
-                reply.error(libc::EIO);
+                let fs_error = parse_master_error(&e);
+                error!("Failed to create directory entry on master: {}", fs_error);
+                reply.error(fs_error.to_errno());
             }
         }
     }
@@ -794,9 +858,15 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = match self.client.get_entry_by_inode(parent) {
             Ok(Some((_, p))) => p,
-            _ => {
+            Ok(None) => {
                 error!("rmdir: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("rmdir: failed to get parent entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
                 return;
             }
         };
@@ -824,8 +894,9 @@ impl Filesystem for PowerFsFuserFs {
                         }
                     }
                     Err(e) => {
-                        error!("rmdir: failed to list entries: {}", e);
-                        reply.error(libc::EIO);
+                        let fs_error = parse_master_error(&e);
+                        error!("rmdir: failed to list entries: {}", fs_error);
+                        reply.error(fs_error.to_errno());
                         return;
                     }
                 }
@@ -839,8 +910,9 @@ impl Filesystem for PowerFsFuserFs {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to delete directory entry on master: {}", e);
-                        reply.error(libc::EIO);
+                        let fs_error = parse_master_error(&e);
+                        error!("Failed to delete directory entry on master: {}", fs_error);
+                        reply.error(fs_error.to_errno());
                     }
                 }
             }
@@ -848,8 +920,9 @@ impl Filesystem for PowerFsFuserFs {
                 reply.error(libc::ENOENT);
             }
             Err(e) => {
-                error!("rmdir: failed to get entry: {}", e);
-                reply.error(libc::EIO);
+                let fs_error = parse_master_error(&e);
+                error!("rmdir: failed to get entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
             }
         }
     }
@@ -860,9 +933,15 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = match self.client.get_entry_by_inode(parent) {
             Ok(Some((_, p))) => p,
-            _ => {
+            Ok(None) => {
                 error!("unlink: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("unlink: failed to get parent entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
                 return;
             }
         };
@@ -888,12 +967,14 @@ impl Filesystem for PowerFsFuserFs {
                                     self.client
                                         .delete_data(&addr, fid.volume_id.0, fid.file_key)
                                 {
-                                    error!("Failed to delete data: {}", e);
+                                    let fs_error = crate::error::parse_volume_error(&e);
+                                    error!("Failed to delete data: {}", fs_error);
                                 }
                             }
                         }
                         Err(e) => {
-                            error!("Failed to lookup volume: {}", e);
+                            let fs_error = parse_master_error(&e);
+                            error!("Failed to lookup volume: {}", fs_error);
                         }
                     }
                 }
@@ -908,8 +989,9 @@ impl Filesystem for PowerFsFuserFs {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to delete entry on master: {}", e);
-                        reply.error(libc::EIO);
+                        let fs_error = parse_master_error(&e);
+                        error!("Failed to delete entry on master: {}", fs_error);
+                        reply.error(fs_error.to_errno());
                     }
                 }
             }
@@ -917,8 +999,9 @@ impl Filesystem for PowerFsFuserFs {
                 reply.error(libc::ENOENT);
             }
             Err(e) => {
-                error!("unlink: failed to get entry: {}", e);
-                reply.error(libc::EIO);
+                let fs_error = parse_master_error(&e);
+                error!("unlink: failed to get entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
             }
         }
     }
@@ -941,9 +1024,15 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = match self.client.get_entry_by_inode(parent) {
             Ok(Some((_, p))) => p,
-            _ => {
+            Ok(None) => {
                 error!("create: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("create: failed to get parent entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
                 return;
             }
         };
@@ -963,7 +1052,10 @@ impl Filesystem for PowerFsFuserFs {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("create: lookup failed: {}", e);
+                    let fs_error = parse_master_error(&e);
+                    error!("create: lookup failed: {}", fs_error);
+                    reply.error(fs_error.to_errno());
+                    return;
                 }
             }
         }
@@ -1018,9 +1110,10 @@ impl Filesystem for PowerFsFuserFs {
                         leases.entry(parent).or_default().push(lease_info);
                     }
                     Err(e) => {
+                        let fs_error = parse_master_error(&e);
                         warn!(
                             "Failed to acquire lease for parent directory {}: {}",
-                            parent_path, e
+                            parent_path, fs_error
                         );
                     }
                 }
@@ -1042,9 +1135,10 @@ impl Filesystem for PowerFsFuserFs {
                         leases.entry(master_inode).or_default().push(lease_info);
                     }
                     Err(e) => {
+                        let fs_error = parse_master_error(&e);
                         warn!(
                             "Failed to acquire lease for created file {}: {}",
-                            file_path, e
+                            file_path, fs_error
                         );
                     }
                 }
@@ -1070,8 +1164,9 @@ impl Filesystem for PowerFsFuserFs {
                 self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
-                error!("Failed to create file entry on master: {}", e);
-                reply.error(libc::EIO);
+                let fs_error = parse_master_error(&e);
+                error!("Failed to create file entry on master: {}", fs_error);
+                reply.error(fs_error.to_errno());
             }
         }
     }
@@ -1081,9 +1176,15 @@ impl Filesystem for PowerFsFuserFs {
 
         let path = match self.client.get_entry_by_inode(inode) {
             Ok(Some((_, p))) => p,
-            _ => {
+            Ok(None) => {
                 error!("open: inode {} not found on master", inode);
                 reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("open: failed to get entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
                 return;
             }
         };
@@ -1106,9 +1207,10 @@ impl Filesystem for PowerFsFuserFs {
                 );
             }
             Err(e) => {
+                let fs_error = parse_master_error(&e);
                 warn!(
                     "Failed to acquire lease for inode {} (path: {}): {}",
-                    inode, path, e
+                    inode, path, fs_error
                 );
             }
         }
@@ -1131,9 +1233,15 @@ impl Filesystem for PowerFsFuserFs {
 
         let entry = match self.client.get_entry_by_inode(inode) {
             Ok(Some((entry, _))) => entry,
-            _ => {
+            Ok(None) => {
                 error!("read: inode {} not found on master", inode);
                 reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                let fs_error = parse_master_error(&e);
+                error!("read: failed to get entry: {}", fs_error);
+                reply.error(fs_error.to_errno());
                 return;
             }
         };
@@ -1174,7 +1282,7 @@ impl Filesystem for PowerFsFuserFs {
                                 };
                                 if is_dirty {
                                     info!("read: chunk {} is dirty, flushing first", chunk_idx);
-                                    if let Err(e) = self.flush_dirty_chunks(inode) {
+                                    if let Err(e) = self.flush_dirty_chunks(inode, 0) {
                                         warn!("Failed to flush dirty chunks: {}", e);
                                         reply.error(libc::EIO);
                                         return;
@@ -1207,7 +1315,7 @@ impl Filesystem for PowerFsFuserFs {
                         };
                         if is_dirty {
                             info!("read: chunk {} is dirty, flushing first", chunk_idx);
-                            if let Err(e) = self.flush_dirty_chunks(inode) {
+                            if let Err(e) = self.flush_dirty_chunks(inode, 0) {
                                 warn!("Failed to flush dirty chunks: {}", e);
                                 reply.error(libc::EIO);
                                 return;
@@ -1247,8 +1355,9 @@ impl Filesystem for PowerFsFuserFs {
                                     let locations = match self.client.lookup_volume(fid.volume_id) {
                                         Ok(l) => l,
                                         Err(e) => {
-                                            error!("lookup_volume failed: {}", e);
-                                            reply.error(libc::EIO);
+                                            let fs_error = parse_master_error(&e);
+                                            error!("lookup_volume failed: {}", fs_error);
+                                            reply.error(fs_error.to_errno());
                                             return;
                                         }
                                     };
@@ -1282,8 +1391,10 @@ impl Filesystem for PowerFsFuserFs {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("read_blob failed: {}", e);
-                                            continue;
+                                            let fs_error = crate::error::parse_volume_error(&e);
+                                            error!("read_blob failed: {}", fs_error);
+                                            reply.error(fs_error.to_errno());
+                                            return;
                                         }
                                     }
                                 }
@@ -1375,6 +1486,51 @@ impl Filesystem for PowerFsFuserFs {
                 let entries = self.write_buffer.take(inode);
                 self.flush_write_buffer(inode, &entries);
             }
+
+            let new_file_size = offset_u64 + data_len as u64;
+            if let Ok(Some((entry, _))) = self.client.get_entry_by_inode(inode) {
+                if let Some(attrs) = entry.attributes {
+                    if new_file_size > attrs.size {
+                        debug!("write (small): updating file size from {} to {}", attrs.size, new_file_size);
+                        let filer_entry = powerfs_master::proto::powerfs::Entry {
+                            name: entry.name,
+                            directory: entry.directory,
+                            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                                ino: inode,
+                                mode: attrs.mode,
+                                nlink: attrs.nlink,
+                                uid: attrs.uid,
+                                gid: attrs.gid,
+                                rdev: 0,
+                                size: new_file_size,
+                                blksize: 4096,
+                                blocks: new_file_size.div_ceil(512),
+                                atime: attrs.atime,
+                                mtime: chrono::Utc::now().timestamp() as u64,
+                                ctime: chrono::Utc::now().timestamp() as u64,
+                                crtime: attrs.crtime,
+                                perm: 0,
+                            }),
+                            chunks: entry.chunks,
+                            hard_link_id: entry.hard_link_id,
+                            hard_link_counter: entry.hard_link_counter,
+                            extended: HashMap::new(),
+                            content_size: new_file_size,
+                            disk_size: entry.disk_size,
+                            ttl: String::new(),
+                            symlink_target: entry.symlink_target,
+                            owner: String::new(),
+                            generation: entry.generation,
+                        };
+                        if let Err(e) = self.client.update_entry(&filer_entry, &self.client_id) {
+                            warn!("Failed to update file size on master (small write): {}", e);
+                        } else {
+                            self.invalidate_kernel_inode(inode);
+                        }
+                    }
+                }
+            }
+
             reply.written(data_len as u32);
             return;
         }
@@ -1419,9 +1575,15 @@ impl Filesystem for PowerFsFuserFs {
             if !modified {
                 let entry = match self.client.get_entry_by_inode(inode) {
                     Ok(Some((entry, _))) => entry,
-                    _ => {
+                    Ok(None) => {
                         error!("write: inode {} not found on master", inode);
                         reply.error(libc::ENOENT);
+                        return;
+                    }
+                    Err(e) => {
+                        let fs_error = parse_master_error(&e);
+                        error!("write: failed to get entry: {}", fs_error);
+                        reply.error(fs_error.to_errno());
                         return;
                     }
                 };
@@ -1450,8 +1612,9 @@ impl Filesystem for PowerFsFuserFs {
                     let locations = match self.client.lookup_volume(fid.volume_id) {
                         Ok(l) => l,
                         Err(e) => {
-                            error!("lookup_volume failed: {}", e);
-                            reply.error(libc::EIO);
+                            let fs_error = parse_master_error(&e);
+                            error!("lookup_volume failed: {}", fs_error);
+                            reply.error(fs_error.to_errno());
                             return;
                         }
                     };
@@ -1468,7 +1631,8 @@ impl Filesystem for PowerFsFuserFs {
                                 initial_data[..existing.len()].copy_from_slice(&existing);
                             }
                             Err(e) => {
-                                warn!("read_blob for write failed: {}", e);
+                                let fs_error = crate::error::parse_volume_error(&e);
+                                warn!("read_blob for write failed: {}", fs_error);
                             }
                         }
                     }
@@ -1491,6 +1655,60 @@ impl Filesystem for PowerFsFuserFs {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        let new_file_size = offset_u64 + data_len as u64;
+        debug!("write: inode={}, offset={}, data_len={}, new_file_size={}", inode, offset_u64, data_len, new_file_size);
+        
+        if let Ok(Some((entry, _))) = self.client.get_entry_by_inode(inode) {
+            if let Some(attrs) = entry.attributes {
+                debug!("write: current file size on master: {}", attrs.size);
+                if new_file_size > attrs.size {
+                    debug!("write: updating file size from {} to {}", attrs.size, new_file_size);
+                    let filer_entry = powerfs_master::proto::powerfs::Entry {
+                        name: entry.name,
+                        directory: entry.directory,
+                        attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                            ino: inode,
+                            mode: attrs.mode,
+                            nlink: attrs.nlink,
+                            uid: attrs.uid,
+                            gid: attrs.gid,
+                            rdev: 0,
+                            size: new_file_size,
+                            blksize: 4096,
+                            blocks: new_file_size.div_ceil(512),
+                            atime: attrs.atime,
+                            mtime: chrono::Utc::now().timestamp() as u64,
+                            ctime: chrono::Utc::now().timestamp() as u64,
+                            crtime: attrs.crtime,
+                            perm: 0,
+                        }),
+                        chunks: entry.chunks,
+                        hard_link_id: entry.hard_link_id,
+                        hard_link_counter: entry.hard_link_counter,
+                        extended: HashMap::new(),
+                        content_size: new_file_size,
+                        disk_size: entry.disk_size,
+                        ttl: String::new(),
+                        symlink_target: entry.symlink_target,
+                        owner: String::new(),
+                        generation: entry.generation,
+                    };
+                    if let Err(e) = self.client.update_entry(&filer_entry, &self.client_id) {
+                        warn!("Failed to update file size on master: {}", e);
+                    } else {
+                        debug!("write: file size updated on master, invalidating kernel inode");
+                        self.invalidate_kernel_inode(inode);
+                    }
+                } else {
+                    debug!("write: new_file_size ({}) not larger than current size ({})", new_file_size, attrs.size);
+                }
+            } else {
+                debug!("write: no attributes found for inode {}", inode);
+            }
+        } else {
+            debug!("write: entry not found for inode {}", inode);
+        }
+
         reply.written(data_len as u32);
     }
 
@@ -1504,13 +1722,16 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("flush: inode={}", inode);
 
+        let max_write_offset = self.write_buffer.get_max_write_offset(inode);
         let entries = self.write_buffer.take(inode);
         if !entries.is_empty() {
             self.flush_write_buffer(inode, &entries);
         }
 
-        if let Err(e) = self.flush_dirty_chunks(inode) {
-            warn!("flush failed: {}", e);
+        if let Err(e) = self.flush_dirty_chunks(inode, max_write_offset) {
+            error!("flush failed: {}", e);
+            reply.error(libc::EIO);
+            return;
         }
         reply.ok();
     }
@@ -1526,12 +1747,15 @@ impl Filesystem for PowerFsFuserFs {
         reply: ReplyEmpty,
     ) {
         debug!("release: inode={}, flush={}", inode, _flush);
+        let max_write_offset = self.write_buffer.get_max_write_offset(inode);
         let write_buffer_entries = self.write_buffer.take(inode);
         if !write_buffer_entries.is_empty() {
             self.flush_write_buffer(inode, &write_buffer_entries);
         }
-        if let Err(e) = self.flush_dirty_chunks(inode) {
-            warn!("release flush failed: {}", e);
+        if let Err(e) = self.flush_dirty_chunks(inode, max_write_offset) {
+            error!("release flush failed: {}", e);
+            reply.error(libc::EIO);
+            return;
         }
 
         // Pop one lease info for this inode (supports multiple concurrent opens).
@@ -1567,7 +1791,8 @@ impl Filesystem for PowerFsFuserFs {
         reply: ReplyEmpty,
     ) {
         debug!("fsync: inode={}", inode);
-        if let Err(e) = self.flush_dirty_chunks(inode) {
+        let max_write_offset = self.write_buffer.get_max_write_offset(inode);
+        if let Err(e) = self.flush_dirty_chunks(inode, max_write_offset) {
             warn!("fsync failed: {}", e);
             reply.error(libc::EIO);
             return;

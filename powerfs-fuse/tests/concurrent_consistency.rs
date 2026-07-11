@@ -6,11 +6,13 @@ use std::thread;
 
 mod test_harness;
 
-const FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
+fn fuse_mount() -> String {
+    test_harness::get_fuse_mount()
+}
 
 macro_rules! test_path {
     ($name:expr) => {
-        Path::new(FUSE_MOUNT).join($name)
+        Path::new(&fuse_mount()).join($name)
     };
 }
 

@@ -8,8 +8,16 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-const FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
-const TEST_DATA_DIR: &str = "/tmp/powerfs-test-data";
+const DEFAULT_FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
+const DEFAULT_TEST_DATA_DIR: &str = "/tmp/powerfs-test-data";
+
+pub fn get_fuse_mount() -> String {
+    env::var("POWERFS_MOUNT").unwrap_or_else(|_| DEFAULT_FUSE_MOUNT.to_string())
+}
+
+pub fn get_test_data_dir() -> String {
+    env::var("POWERFS_TEST_DATA_DIR").unwrap_or_else(|_| DEFAULT_TEST_DATA_DIR.to_string())
+}
 
 #[allow(dead_code)]
 struct TestEnvironment {
@@ -27,16 +35,19 @@ impl Drop for TestEnvironment {
 static TEST_ENV: OnceLock<TestEnvironment> = OnceLock::new();
 
 fn force_cleanup() {
+    let fuse_mount = get_fuse_mount();
+    let test_data_dir = get_test_data_dir();
+
     let _ = Command::new("fusermount3")
         .arg("-u")
-        .arg(FUSE_MOUNT)
+        .arg(&fuse_mount)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 
     let _ = Command::new("fusermount3")
         .arg("-zu")
-        .arg(FUSE_MOUNT)
+        .arg(&fuse_mount)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -65,7 +76,7 @@ fn force_cleanup() {
 
     thread::sleep(Duration::from_secs(2));
 
-    let _ = fs::remove_dir_all(TEST_DATA_DIR);
+    let _ = fs::remove_dir_all(&test_data_dir);
 }
 
 fn register_cleanup_handler() {}
@@ -140,7 +151,8 @@ fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
 }
 
 fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {
-    let master_dir = format!("{}/master", TEST_DATA_DIR);
+    let test_data_dir = get_test_data_dir();
+    let master_dir = format!("{}/master", test_data_dir);
     let _ = fs::create_dir_all(&master_dir);
 
     Command::new(format!("{}/powerfs", target_dir))
@@ -157,16 +169,17 @@ fn spawn_master(target_dir: &str, port: u16) -> io::Result<Child> {
 }
 
 fn spawn_volume(target_dir: &str, port: u16, master_addr: &str) -> io::Result<Child> {
-    let data_dir = format!("{}/volume1", TEST_DATA_DIR);
+    let test_data_dir = get_test_data_dir();
+    let data_dir = format!("{}/volume1", test_data_dir);
     let _ = fs::create_dir_all(&data_dir);
 
     Command::new(format!("{}/powerfs", target_dir))
         .arg("volume")
-        .arg("--grpc-address")
-        .arg(format!("127.0.0.1:{}", port))
-        .arg("--data-dir")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--dir")
         .arg(&data_dir)
-        .arg("--master-address")
+        .arg("--master")
         .arg(master_addr)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -174,12 +187,13 @@ fn spawn_volume(target_dir: &str, port: u16, master_addr: &str) -> io::Result<Ch
 }
 
 fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
-    let _ = fs::create_dir_all(FUSE_MOUNT);
+    let fuse_mount = get_fuse_mount();
+    let _ = fs::create_dir_all(&fuse_mount);
 
     Command::new(format!("{}/powerfs", target_dir))
         .arg("fuse")
         .arg("--dir")
-        .arg(FUSE_MOUNT)
+        .arg(&fuse_mount)
         .arg("--master")
         .arg(master_addr)
         .stdout(Stdio::null())
@@ -188,6 +202,10 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
 }
 
 pub fn ensure_fuse_mounted() {
+    if env::var("POWERFS_DOCKER_TEST").is_ok() {
+        return;
+    }
+
     if !is_fuse_available() {
         eprintln!("FUSE not available, skipping tests");
         std::process::exit(0);
@@ -204,7 +222,8 @@ pub fn ensure_fuse_mounted() {
         let volume_port = get_free_port();
         let master_addr = format!("127.0.0.1:{}", master_port);
 
-        let _ = fs::create_dir_all(TEST_DATA_DIR);
+        let test_data_dir = get_test_data_dir();
+        let _ = fs::create_dir_all(&test_data_dir);
 
         let master_process =
             spawn_master(&target_dir, master_port).expect("Failed to start master");
@@ -221,7 +240,8 @@ pub fn ensure_fuse_mounted() {
 
         let fuse_process = spawn_fuse(&target_dir, &master_addr).expect("Failed to start fuse");
 
-        assert!(wait_for_mount(FUSE_MOUNT, 30), "FUSE did not mount in time");
+        let fuse_mount = get_fuse_mount();
+        assert!(wait_for_mount(&fuse_mount, 30), "FUSE did not mount in time");
 
         TestEnvironment {
             master_process,

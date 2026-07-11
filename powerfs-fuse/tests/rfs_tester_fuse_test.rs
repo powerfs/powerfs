@@ -1,18 +1,19 @@
 use rfs_tester::FsTester;
+use std::env;
 use std::fs;
 use std::path::Path;
 
-mod test_harness;
-
-const FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
-
-fn setup() {
-    test_harness::ensure_fuse_mounted();
+fn get_mount_path() -> String {
+    env::var("POWERFS_MOUNT").unwrap_or_else(|_| "/mnt/powerfs".to_string())
 }
+
+fn setup() {}
 
 #[test]
 fn test_rfs_tester_fuse_basic_operations() {
     setup();
+
+    let mount_path = get_mount_path();
 
     const YAML_CONFIG: &str = r#"
     - !directory
@@ -31,7 +32,7 @@ fn test_rfs_tester_fuse_basic_operations() {
                       !inline_text "Nested file content"
     "#;
 
-    let tester = FsTester::new(YAML_CONFIG, FUSE_MOUNT).expect("Incorrect configuration");
+    let tester = FsTester::new(YAML_CONFIG, &mount_path).expect("Incorrect configuration");
     tester.perform_fs_test(|dirname| {
         let hello_path = Path::new(dirname).join("hello.txt");
         let content = fs::read_to_string(&hello_path)?;
@@ -55,6 +56,8 @@ fn test_rfs_tester_fuse_basic_operations() {
 fn test_rfs_tester_fuse_file_creation_and_deletion() {
     setup();
 
+    let mount_path = get_mount_path();
+
     const YAML_CONFIG: &str = r#"
     - !directory
         name: rfs_test_create_delete
@@ -65,7 +68,7 @@ fn test_rfs_tester_fuse_file_creation_and_deletion() {
                 !inline_text "Will be deleted"
     "#;
 
-    let tester = FsTester::new(YAML_CONFIG, FUSE_MOUNT).expect("Incorrect configuration");
+    let tester = FsTester::new(YAML_CONFIG, &mount_path).expect("Incorrect configuration");
     tester.perform_fs_test(|dirname| {
         let file_path = Path::new(dirname).join("to_delete.txt");
         assert!(file_path.exists());
@@ -81,13 +84,15 @@ fn test_rfs_tester_fuse_file_creation_and_deletion() {
 fn test_rfs_tester_fuse_directory_operations() {
     setup();
 
+    let mount_path = get_mount_path();
+
     const YAML_CONFIG: &str = r#"
     - !directory
         name: rfs_test_dir_ops
         content: []
     "#;
 
-    let tester = FsTester::new(YAML_CONFIG, FUSE_MOUNT).expect("Incorrect configuration");
+    let tester = FsTester::new(YAML_CONFIG, &mount_path).expect("Incorrect configuration");
     tester.perform_fs_test(|dirname| {
         let new_dir = Path::new(dirname).join("new_subdir");
         fs::create_dir(&new_dir)?;
@@ -111,6 +116,8 @@ fn test_rfs_tester_fuse_directory_operations() {
 fn test_rfs_tester_fuse_file_content_types() {
     setup();
 
+    let mount_path = get_mount_path();
+
     const YAML_CONFIG: &str = r#"
     - !directory
         name: rfs_test_content_types
@@ -128,7 +135,7 @@ fn test_rfs_tester_fuse_file_content_types() {
               content: empty
     "#;
 
-    let tester = FsTester::new(YAML_CONFIG, FUSE_MOUNT).expect("Incorrect configuration");
+    let tester = FsTester::new(YAML_CONFIG, &mount_path).expect("Incorrect configuration");
     tester.perform_fs_test(|dirname| {
         let text_content = fs::read_to_string(Path::new(dirname).join("text_file.txt"))?;
         assert_eq!(text_content, "Plain text content");
