@@ -843,3 +843,137 @@ fn test_file_sync_rename() {
 
     let _ = fs::remove_file(&final_path);
 }
+
+#[test]
+fn test_directory_recursive_copy() {
+    setup();
+    let src_dir = test_path!("test_copy_src");
+    let dst_dir = test_path!("test_copy_dst");
+    let dst_subdir = dst_dir.join("test_copy_src");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dst_dir);
+
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let mut f = File::create(src_dir.join("file1.txt")).unwrap();
+    f.write_all(b"file1 content").unwrap();
+    drop(f);
+
+    let mut f = File::create(src_dir.join("file2.txt")).unwrap();
+    f.write_all(b"file2 content").unwrap();
+    drop(f);
+
+    let subdir1 = src_dir.join("subdir1");
+    fs::create_dir(&subdir1).unwrap();
+    let mut f = File::create(subdir1.join("nested1.txt")).unwrap();
+    f.write_all(b"nested1 content").unwrap();
+    drop(f);
+
+    let subdir2 = src_dir.join("subdir1/subdir2");
+    fs::create_dir_all(&subdir2).unwrap();
+    let mut f = File::create(subdir2.join("deep.txt")).unwrap();
+    f.write_all(b"deep nested content").unwrap();
+    drop(f);
+
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    copy_directory(&src_dir, &dst_subdir);
+
+    assert!(dst_subdir.exists(), "Destination subdir should exist");
+    assert!(dst_subdir.join("file1.txt").exists(), "file1.txt should exist in dest");
+    assert!(dst_subdir.join("file2.txt").exists(), "file2.txt should exist in dest");
+    assert!(dst_subdir.join("subdir1").exists(), "subdir1 should exist in dest");
+    assert!(dst_subdir.join("subdir1/nested1.txt").exists(), "nested1.txt should exist");
+    assert!(dst_subdir.join("subdir1/subdir2").exists(), "subdir2 should exist");
+    assert!(dst_subdir.join("subdir1/subdir2/deep.txt").exists(), "deep.txt should exist");
+
+    let mut f = File::open(dst_subdir.join("file1.txt")).unwrap();
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "file1 content");
+
+    let mut f = File::open(dst_subdir.join("subdir1/nested1.txt")).unwrap();
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "nested1 content");
+
+    let mut f = File::open(dst_subdir.join("subdir1/subdir2/deep.txt")).unwrap();
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "deep nested content");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
+fn test_directory_copy_to_current_dir() {
+    setup();
+    let src_dir = test_path!("powerfs-core");
+    let dst_dir = test_path!("powerfs-core-dst");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dst_dir);
+
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let mut f = File::create(src_dir.join("Cargo.toml")).unwrap();
+    f.write_all(b"[package]\nname = \"powerfs-core\"\n").unwrap();
+    drop(f);
+
+    let subdir = src_dir.join("src");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let mut f = File::create(subdir.join("lib.rs")).unwrap();
+    f.write_all(b"pub fn hello() {}\n").unwrap();
+    drop(f);
+
+    let mut f = File::create(subdir.join("mod.rs")).unwrap();
+    f.write_all(b"pub mod inner;\n").unwrap();
+    drop(f);
+
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    let dst_subdir = dst_dir.join("powerfs-core");
+    copy_directory(&src_dir, &dst_subdir);
+
+    assert!(dst_subdir.exists(), "powerfs-core should exist in dst dir");
+    assert!(dst_subdir.join("Cargo.toml").exists(), "Cargo.toml should exist");
+    assert!(dst_subdir.join("src/lib.rs").exists(), "src/lib.rs should exist");
+    assert!(dst_subdir.join("src/mod.rs").exists(), "src/mod.rs should exist");
+
+    let mut f = File::open(dst_subdir.join("Cargo.toml")).unwrap();
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "[package]\nname = \"powerfs-core\"\n");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dst_dir);
+}
+
+fn copy_directory(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&src_path, &dst_path);
+        } else {
+            let mut src_file = File::open(&src_path).unwrap();
+            let mut dst_file = File::create(&dst_path).unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let bytes_read = src_file.read(&mut buf).unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                dst_file.write_all(&buf[..bytes_read]).unwrap();
+            }
+            drop(src_file);
+            drop(dst_file);
+        }
+    }
+}

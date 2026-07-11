@@ -163,6 +163,21 @@ impl DirectoryTree {
         None
     }
 
+    fn inode_to_key(inode: u64) -> Vec<u8> {
+        format!("inode:{}", inode).as_bytes().to_vec()
+    }
+
+    pub fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, String)> {
+        let inode_key = Self::inode_to_key(inode);
+        if let Ok(Some(path_bytes)) = self.db.get(&inode_key) {
+            let path = String::from_utf8_lossy(&path_bytes).to_string();
+            if let Some(entry) = self.get_entry(&path) {
+                return Some((entry, path));
+            }
+        }
+        None
+    }
+
     pub fn create_directory(&self, path: &str) -> Result<u64, rocksdb::Error> {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let mut current_path = "/".to_string();
@@ -228,6 +243,7 @@ impl DirectoryTree {
         entry.encode(&mut data).expect("failed to encode entry");
 
         self.db.put(&key, &data)?;
+        self.db.put(Self::inode_to_key(inode), path.as_bytes())?;
 
         self.publish_notification(EventType::Create, &path, Some(entry), client_id);
 
@@ -258,6 +274,7 @@ impl DirectoryTree {
                 let decode_result: Result<Entry, _> = prost::Message::decode(bytes.as_ref());
                 if let Ok(entry) = decode_result {
                     if let Some(attr) = entry.attributes {
+                        self.db.delete(Self::inode_to_key(attr.ino))?;
                         if (attr.mode & 0o40000) != 0 {
                             let mut to_delete = Vec::new();
                             let mut stack = vec![path.to_string()];
@@ -279,6 +296,7 @@ impl DirectoryTree {
                                             prost::Message::decode(value.as_ref());
                                         if let Ok(child_entry) = child_decode {
                                             if let Some(child_attr) = child_entry.attributes {
+                                                self.db.delete(Self::inode_to_key(child_attr.ino))?;
                                                 if (child_attr.mode & 0o40000) != 0 {
                                                     stack.push(child_path);
                                                 }
@@ -344,6 +362,9 @@ impl DirectoryTree {
 
                 self.db.delete(old_path.as_bytes())?;
                 self.db.put(&new_key, &data)?;
+                if let Some(ref attr) = entry.attributes {
+                    self.db.put(Self::inode_to_key(attr.ino), new_path.as_bytes())?;
+                }
                 info!("rename_entry: db updated successfully");
 
                 self.publish_notification(EventType::Delete, old_path, None, client_id);

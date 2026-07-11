@@ -160,7 +160,8 @@ fn spawn_volume(target_dir: &str, port: u16, master_addr: &str) -> io::Result<Ch
     let data_dir = format!("{}/volume1", TEST_DATA_DIR);
     let _ = fs::create_dir_all(&data_dir);
 
-    Command::new(format!("{}/powerfs-volume", target_dir))
+    Command::new(format!("{}/powerfs", target_dir))
+        .arg("volume")
         .arg("--grpc-address")
         .arg(format!("127.0.0.1:{}", port))
         .arg("--data-dir")

@@ -693,6 +693,30 @@ impl MasterService for MasterGrpcServer {
         }
     }
 
+    async fn get_entry_by_inode(
+        &self,
+        request: Request<GetEntryByInodeRequest>,
+    ) -> Result<Response<GetEntryByInodeResponse>, Status> {
+        let req = request.into_inner();
+        let dir_tree = self.master.directory_tree.clone();
+
+        if let Some((entry, path)) = dir_tree.get_entry_by_inode(req.inode) {
+            Ok(Response::new(GetEntryByInodeResponse {
+                found: true,
+                entry: Some(entry),
+                path,
+                error: String::new(),
+            }))
+        } else {
+            Ok(Response::new(GetEntryByInodeResponse {
+                found: false,
+                entry: None,
+                path: String::new(),
+                error: String::new(),
+            }))
+        }
+    }
+
     async fn create_entry(
         &self,
         request: Request<CreateEntryRequest>,

@@ -29,6 +29,7 @@ service MasterService {
     // Filer metadata API
     rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
     rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
+    rpc GetEntryByInode(GetEntryByInodeRequest) returns (GetEntryByInodeResponse);
     rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
     rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse);
     rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
@@ -542,6 +543,17 @@ message GetEntryResponse {
     bool found = 1;
     Entry entry = 2;
     string error = 3;
+}
+
+message GetEntryByInodeRequest {
+    uint64 inode = 1;
+}
+
+message GetEntryByInodeResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string path = 3;
+    string error = 4;
 }
 
 message CreateEntryRequest {

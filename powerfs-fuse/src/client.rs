@@ -2,10 +2,10 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
-    DeleteEntryRequest, Entry, GetEntryRequest, JobCompletionRequest, JobDeregistrationRequest,
-    JobRegistrationRequest, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification,
-    RenameEntryRequest, SubscribeMetadataRequest, UpdateEntryRequest,
+    DeleteEntryRequest, Entry, GetEntryByInodeRequest, GetEntryRequest, JobCompletionRequest,
+    JobDeregistrationRequest, JobRegistrationRequest, LeaseReleaseRequest, LeaseRenewRequest,
+    LeaseRequest, ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest,
+    MetadataNotification, RenameEntryRequest, SubscribeMetadataRequest, UpdateEntryRequest,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -921,6 +921,52 @@ impl PowerFuseClient {
         Err("get_entry failed after max retries".to_string())
     }
 
+    pub async fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>, String> {
+        debug!("get_entry_by_inode: inode={}", inode);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = GetEntryByInodeRequest { inode };
+
+            match client.get_entry_by_inode(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("get_entry_by_inode succeeded: found={}", resp.found);
+                    if resp.found {
+                        return Ok(Some((resp.entry.unwrap(), resp.path)));
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let msg = format!("get_entry_by_inode failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("get_entry_by_inode failed after max retries".to_string())
+    }
+
     pub async fn delete_entry(
         &self,
         path: &str,
@@ -1564,6 +1610,12 @@ impl SyncFuseClient {
         self.client
             .runtime_handle
             .block_on(self.client.get_entry(path))
+    }
+
+    pub fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.get_entry_by_inode(inode))
     }
 
     pub fn delete_entry(
