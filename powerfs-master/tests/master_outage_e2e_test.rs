@@ -698,8 +698,14 @@ async fn test_generation_increments_on_metadata_changes() {
     );
 
     // Delete the entry (publishes DELETE)
+    let ino = dir_tree
+        .get_entry("/test/gen_test_file")
+        .unwrap()
+        .attributes
+        .unwrap()
+        .ino;
     let deleted = dir_tree
-        .delete_entry("/test/gen_test_file", "test_client")
+        .delete_entry(ino, "test_client")
         .expect("delete_entry failed");
     assert!(deleted, "delete_entry should report the entry was deleted");
 

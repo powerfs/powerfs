@@ -524,8 +524,92 @@ message Entry {
     uint64 generation = 13;  // 代次号，每次元数据变更递增
 }
 
+enum StorageBackend {
+    POWERFS_VOLUME = 0;
+    S3 = 1;
+    KV = 2;
+    LOCAL_DISK = 3;
+}
+
+message ChunkLocation {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    uint32 cookie = 3;
+    string fid = 4;
+    string data_center = 5;
+    string rack = 6;
+    string node_address = 7;
+}
+
+message StripeInfo {
+    uint32 stripe_index = 1;
+    uint64 stripe_offset = 2;
+    uint64 stripe_size = 3;
+    uint32 volume_id = 4;
+    uint64 file_key = 5;
+}
+
+message StripeConfig {
+    uint64 stripe_size = 1;
+    uint32 stripe_count = 2;
+}
+
+message S3Location {
+    string bucket = 1;
+    string key = 2;
+    string region = 3;
+    uint64 part_size = 4;
+    repeated string part_etags = 5;
+    string upload_id = 6;
+    uint64 total_parts = 7;
+}
+
+message KVLocation {
+    string table = 1;
+    bytes key = 2;
+    uint32 crc32 = 3;
+}
+
+message InodeEntry {
+    uint64 ino = 1;
+    string name = 2;
+    uint64 parent_ino = 3;
+    FuseAttributes attributes = 4;
+    repeated FileChunk chunks = 5;
+    string symlink_target = 6;
+    string hard_link_id = 7;
+    uint32 hard_link_counter = 8;
+    uint64 generation = 9;
+    map<string, bytes> extended = 10;
+    uint64 content_size = 11;
+    uint64 disk_size = 12;
+    string ttl = 13;
+    string owner = 14;
+    StorageBackend backend = 15;
+    S3Location s3_location = 16;
+    KVLocation kv_location = 17;
+    StripeConfig stripe_config = 18;
+}
+
+message DirEntry {
+    uint64 parent_ino = 1;
+    string name = 2;
+    uint64 child_ino = 3;
+    uint32 child_type = 4;
+    uint32 mode = 5;
+    uint64 size = 6;
+    uint64 mtime = 7;
+    uint32 nlink = 8;
+}
+
+message PathIndexEntry {
+    uint64 ino = 1;
+    uint64 parent_ino = 2;
+    uint64 generation = 3;
+}
+
 message LookupDirectoryEntryRequest {
-    string directory = 1;
+    uint64 parent_ino = 1;
     string name = 2;
 }
 
@@ -578,7 +662,7 @@ message UpdateEntryResponse {
 }
 
 message DeleteEntryRequest {
-    string path = 1;
+    uint64 ino = 1;
     bool is_directory = 2;
     string client_id = 3;
 }
@@ -589,12 +673,11 @@ message DeleteEntryResponse {
 }
 
 message RenameEntryRequest {
-    string old_path = 1;
-    string old_directory = 2;
-    string old_name = 3;
-    string new_directory = 4;
-    string new_name = 5;
-    string client_id = 6;
+    uint64 old_parent_ino = 1;
+    string old_name = 2;
+    uint64 new_parent_ino = 3;
+    string new_name = 4;
+    string client_id = 5;
 }
 
 message RenameEntryResponse {
@@ -603,7 +686,7 @@ message RenameEntryResponse {
 }
 
 message ListEntriesRequest {
-    string directory = 1;
+    uint64 parent_ino = 1;
     uint64 limit = 2;
     string last_name = 3;
 }

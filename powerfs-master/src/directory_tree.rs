@@ -1,6 +1,7 @@
 use crate::proto::powerfs::metadata_notification::EventType;
+use crate::proto::powerfs::{DirEntry, InodeEntry, PathIndexEntry};
 use crate::proto::{Entry, MetadataNotification};
-use log::{debug, info, warn};
+use log::debug;
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -128,51 +129,155 @@ impl DirectoryTree {
         inode
     }
 
-    fn path_to_key(directory: &str, name: &str) -> Vec<u8> {
-        if directory == "/" {
-            format!("/{}", name).into_bytes()
-        } else {
-            format!("{}/{}", directory, name).into_bytes()
-        }
+    fn inode_key(ino: u64) -> Vec<u8> {
+        format!("inode:{}", ino).as_bytes().to_vec()
     }
 
-    fn path_prefix(directory: &str) -> Vec<u8> {
-        if directory == "/" {
-            b"/".to_vec()
-        } else {
-            format!("{}/", directory).into_bytes()
-        }
+    fn dir_key(parent_ino: u64, name: &str) -> Vec<u8> {
+        format!("dir:{}:{}", parent_ino, name).as_bytes().to_vec()
     }
 
-    pub fn lookup(&self, directory: &str, name: &str) -> Option<Entry> {
-        let key = Self::path_to_key(directory, name);
-        if let Ok(Some(data)) = self.db.get(&key) {
-            if let Ok(entry) = prost::Message::decode(data.as_ref()) {
-                return Some(entry);
+    fn dir_prefix(parent_ino: u64) -> Vec<u8> {
+        format!("dir:{}:", parent_ino).as_bytes().to_vec()
+    }
+
+    fn path_key(path: &str) -> Vec<u8> {
+        format!("path:{}", path).as_bytes().to_vec()
+    }
+
+    pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<Entry> {
+        let dir_key = Self::dir_key(parent_ino, name);
+        if let Ok(Some(data)) = self.db.get(&dir_key) {
+            let decode_result: Result<DirEntry, _> = prost::Message::decode(data.as_ref());
+            if let Ok(dir_entry) = decode_result {
+                return self
+                    .get_entry_by_inode_internal(dir_entry.child_ino)
+                    .map(|e| e.0);
+            }
+        }
+        None
+    }
+
+    fn get_entry_by_inode_internal(&self, ino: u64) -> Option<(Entry, String)> {
+        let inode_key = Self::inode_key(ino);
+        if let Ok(Some(data)) = self.db.get(&inode_key) {
+            if let Ok(inode_entry) = prost::Message::decode(data.as_ref()) {
+                let path = self.get_path_by_inode(ino);
+                return Some((self.inode_entry_to_entry(&inode_entry, &path), path));
             }
         }
         None
     }
 
     pub fn get_entry(&self, path: &str) -> Option<Entry> {
-        if let Ok(Some(data)) = self.db.get(path.as_bytes()) {
-            if let Ok(entry) = prost::Message::decode(data.as_ref()) {
-                return Some(entry);
+        let path_key = Self::path_key(path);
+        if let Ok(Some(data)) = self.db.get(&path_key) {
+            let decode_result: Result<PathIndexEntry, _> = prost::Message::decode(data.as_ref());
+            if let Ok(path_index) = decode_result {
+                return self
+                    .get_entry_by_inode_internal(path_index.ino)
+                    .map(|e| e.0);
             }
         }
         None
     }
 
-    fn inode_to_key(inode: u64) -> Vec<u8> {
-        format!("inode:{}", inode).as_bytes().to_vec()
+    pub fn get_entry_by_inode(&self, ino: u64) -> Option<(Entry, String)> {
+        self.get_entry_by_inode_internal(ino)
     }
 
-    pub fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, String)> {
-        let inode_key = Self::inode_to_key(inode);
-        if let Ok(Some(path_bytes)) = self.db.get(&inode_key) {
-            let path = String::from_utf8_lossy(&path_bytes).to_string();
-            if let Some(entry) = self.get_entry(&path) {
-                return Some((entry, path));
+    fn get_path_by_inode(&self, ino: u64) -> String {
+        if ino == 1 {
+            return "/".to_string();
+        }
+
+        let mut path = String::new();
+        let mut current_ino = ino;
+
+        loop {
+            let inode_key = Self::inode_key(current_ino);
+            if let Ok(Some(data)) = self.db.get(&inode_key) {
+                let decode_result: Result<InodeEntry, _> = prost::Message::decode(data.as_ref());
+                if let Ok(inode_entry) = decode_result {
+                    let name = inode_entry.name;
+                    if current_ino == 1 {
+                        break;
+                    }
+                    path.insert_str(0, &format!("/{}", name));
+                    current_ino = inode_entry.parent_ino;
+                    if current_ino == 0 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        }
+    }
+
+    fn inode_entry_to_entry(&self, inode_entry: &InodeEntry, _path: &str) -> Entry {
+        Entry {
+            name: inode_entry.name.clone(),
+            directory: if inode_entry.parent_ino == 0 {
+                "/".to_string()
+            } else {
+                self.get_path_by_inode(inode_entry.parent_ino)
+            },
+            attributes: inode_entry.attributes.clone(),
+            chunks: inode_entry.chunks.clone(),
+            hard_link_id: inode_entry.hard_link_id.clone(),
+            hard_link_counter: inode_entry.hard_link_counter,
+            extended: inode_entry.extended.clone(),
+            content_size: inode_entry.content_size,
+            disk_size: inode_entry.disk_size,
+            ttl: inode_entry.ttl.clone(),
+            symlink_target: inode_entry.symlink_target.clone(),
+            owner: inode_entry.owner.clone(),
+            generation: inode_entry.generation,
+        }
+    }
+
+    fn entry_to_inode_entry(&self, entry: &Entry, parent_ino: u64) -> InodeEntry {
+        InodeEntry {
+            ino: entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0),
+            name: entry.name.clone(),
+            parent_ino,
+            attributes: entry.attributes.clone(),
+            chunks: entry.chunks.clone(),
+            symlink_target: entry.symlink_target.clone(),
+            hard_link_id: entry.hard_link_id.clone(),
+            hard_link_counter: entry.hard_link_counter,
+            generation: entry.generation,
+            extended: entry.extended.clone(),
+            content_size: entry.content_size,
+            disk_size: entry.disk_size,
+            ttl: entry.ttl.clone(),
+            owner: entry.owner.clone(),
+            backend: Default::default(),
+            s3_location: None,
+            kv_location: None,
+            stripe_config: None,
+        }
+    }
+
+    fn get_parent_ino(&self, directory: &str) -> Option<u64> {
+        if directory == "/" || directory.is_empty() {
+            return Some(1);
+        }
+
+        let path_key = Self::path_key(directory);
+        if let Ok(Some(data)) = self.db.get(&path_key) {
+            let decode_result: Result<PathIndexEntry, _> = prost::Message::decode(data.as_ref());
+            if let Ok(path_index) = decode_result {
+                return Some(path_index.ino);
             }
         }
         None
@@ -180,55 +285,116 @@ impl DirectoryTree {
 
     pub fn create_directory(&self, path: &str) -> Result<u64, rocksdb::Error> {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut current_path = "/".to_string();
+        let mut current_ino = 1;
 
         for part in parts {
-            let parent_path = current_path.clone();
-            current_path = if current_path == "/" {
-                format!("/{}", part)
-            } else {
-                format!("{}/{}", current_path, part)
+            if self.lookup(current_ino, part).is_some() {
+                let entry = self.lookup(current_ino, part).unwrap();
+                current_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                continue;
+            }
+
+            let inode = self.allocate_inode();
+            let generation = self.allocate_generation();
+
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+            let inode_entry = InodeEntry {
+                ino: inode,
+                name: part.to_string(),
+                parent_ino: current_ino,
+                attributes: Some(crate::proto::FuseAttributes {
+                    ino: inode,
+                    mode: 0o40755,
+                    nlink: 2,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    size: 4096,
+                    blksize: 4096,
+                    blocks: 1,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
+                    perm: 0o755,
+                }),
+                chunks: vec![],
+                symlink_target: "".to_string(),
+                hard_link_id: "".to_string(),
+                hard_link_counter: 0,
+                generation,
+                extended: HashMap::new(),
+                content_size: 4096,
+                disk_size: 4096,
+                ttl: "".to_string(),
+                owner: String::new(),
+                backend: Default::default(),
+                s3_location: None,
+                kv_location: None,
+                stripe_config: None,
             };
 
-            if self.get_entry(&current_path).is_none() {
-                let entry = Entry {
-                    name: part.to_string(),
-                    directory: parent_path,
-                    attributes: Some(crate::proto::FuseAttributes {
-                        ino: 0,
-                        mode: 0o40755,
-                        nlink: 2,
-                        uid: 0,
-                        gid: 0,
-                        rdev: 0,
-                        size: 4096,
-                        blksize: 4096,
-                        blocks: 1,
-                        atime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                        mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                        ctime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                        crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                        perm: 0o755,
-                    }),
-                    chunks: vec![],
-                    hard_link_id: "".to_string(),
-                    hard_link_counter: 0,
-                    extended: HashMap::new(),
-                    content_size: 4096,
-                    disk_size: 4096,
-                    ttl: "".to_string(),
-                    symlink_target: "".to_string(),
-                    owner: String::new(),
-                    generation: self.allocate_generation(),
-                };
-                let _ = self.create_entry(entry, "");
-            }
+            let mut inode_data = Vec::new();
+            inode_entry
+                .encode(&mut inode_data)
+                .expect("failed to encode inode entry");
+            self.db.put(Self::inode_key(inode), &inode_data)?;
+
+            let dir_entry = DirEntry {
+                parent_ino: current_ino,
+                name: part.to_string(),
+                child_ino: inode,
+                child_type: 1,
+                mode: 0o40755,
+                size: 4096,
+                mtime: now,
+                nlink: 2,
+            };
+
+            let mut dir_data = Vec::new();
+            dir_entry
+                .encode(&mut dir_data)
+                .expect("failed to encode dir entry");
+            self.db.put(Self::dir_key(current_ino, part), &dir_data)?;
+
+            let full_path = if current_ino == 1 {
+                format!("/{}", part)
+            } else {
+                let parent_path = self.get_path_by_inode(current_ino);
+                format!("{}/{}", parent_path, part)
+            };
+
+            let path_index = PathIndexEntry {
+                ino: inode,
+                parent_ino: current_ino,
+                generation,
+            };
+
+            let mut path_data = Vec::new();
+            path_index
+                .encode(&mut path_data)
+                .expect("failed to encode path index");
+            self.db.put(Self::path_key(&full_path), &path_data)?;
+
+            self.publish_notification(
+                EventType::Create,
+                &full_path,
+                Some(self.inode_entry_to_entry(&inode_entry, &full_path)),
+                "",
+            );
+
+            current_ino = inode;
         }
 
-        Ok(0)
+        Ok(current_ino)
     }
 
     pub fn create_entry(&self, mut entry: Entry, client_id: &str) -> Result<u64, rocksdb::Error> {
+        let parent_ino = match self.get_parent_ino(&entry.directory) {
+            Some(ino) => ino,
+            None => return Ok(0),
+        };
+
         let inode = self.allocate_inode();
         let generation = self.allocate_generation();
 
@@ -237,181 +403,364 @@ impl DirectoryTree {
         }
         entry.generation = generation;
 
-        let key = Self::path_to_key(&entry.directory, &entry.name);
-        let path = String::from_utf8_lossy(&key).to_string();
-        let mut data = Vec::new();
-        entry.encode(&mut data).expect("failed to encode entry");
+        let inode_entry = self.entry_to_inode_entry(&entry, parent_ino);
 
-        self.db.put(&key, &data)?;
-        self.db.put(Self::inode_to_key(inode), path.as_bytes())?;
+        let mut inode_data = Vec::new();
+        inode_entry
+            .encode(&mut inode_data)
+            .expect("failed to encode inode entry");
+        self.db.put(Self::inode_key(inode), &inode_data)?;
 
-        self.publish_notification(EventType::Create, &path, Some(entry), client_id);
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+        let size_val = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
+        let nlink_val = entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1);
+
+        let dir_entry = DirEntry {
+            parent_ino,
+            name: entry.name.clone(),
+            child_ino: inode,
+            child_type: if (mode_val & 0o40000) != 0 { 1 } else { 0 },
+            mode: mode_val,
+            size: size_val,
+            mtime: now,
+            nlink: nlink_val,
+        };
+
+        let mut dir_data = Vec::new();
+        dir_entry
+            .encode(&mut dir_data)
+            .expect("failed to encode dir entry");
+        self.db
+            .put(Self::dir_key(parent_ino, &entry.name), &dir_data)?;
+
+        let full_path = if parent_ino == 1 {
+            format!("/{}", entry.name)
+        } else {
+            let parent_path = self.get_path_by_inode(parent_ino);
+            format!("{}/{}", parent_path, entry.name)
+        };
+
+        let path_index = PathIndexEntry {
+            ino: inode,
+            parent_ino,
+            generation,
+        };
+
+        let mut path_data = Vec::new();
+        path_index
+            .encode(&mut path_data)
+            .expect("failed to encode path index");
+        self.db.put(Self::path_key(&full_path), &path_data)?;
+
+        self.publish_notification(EventType::Create, &full_path, Some(entry), client_id);
 
         Ok(inode)
     }
 
     pub fn update_entry(&self, mut entry: Entry, client_id: &str) -> Result<(), rocksdb::Error> {
+        let ino = match entry.attributes.as_ref().map(|a| a.ino) {
+            Some(ino) => ino,
+            None => return Ok(()),
+        };
+
         let generation = self.allocate_generation();
         entry.generation = generation;
 
-        let key = Self::path_to_key(&entry.directory, &entry.name);
-        let path = String::from_utf8_lossy(&key).to_string();
-        let mut data = Vec::new();
-        entry.encode(&mut data).expect("failed to encode entry");
+        let inode_key = Self::inode_key(ino);
+        let existing_data = self.db.get(&inode_key)?;
+        if existing_data.is_none() {
+            return Ok(());
+        }
 
-        self.db.put(&key, &data)?;
+        let decode_result: Result<InodeEntry, _> =
+            prost::Message::decode(existing_data.unwrap().as_ref());
+        let existing_entry = match decode_result {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
 
+        let inode_entry = self.entry_to_inode_entry(&entry, existing_entry.parent_ino);
+
+        let mut inode_data = Vec::new();
+        inode_entry
+            .encode(&mut inode_data)
+            .expect("failed to encode inode entry");
+        self.db.put(&inode_key, &inode_data)?;
+
+        let dir_entry = DirEntry {
+            parent_ino: existing_entry.parent_ino,
+            name: entry.name.clone(),
+            child_ino: ino,
+            child_type: if (entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0) & 0o40000) != 0 {
+                1
+            } else {
+                0
+            },
+            mode: entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
+            size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
+            mtime: entry.attributes.as_ref().map(|a| a.mtime).unwrap_or(0),
+            nlink: entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1),
+        };
+
+        let mut dir_data = Vec::new();
+        dir_entry
+            .encode(&mut dir_data)
+            .expect("failed to encode dir entry");
+        self.db.put(
+            Self::dir_key(existing_entry.parent_ino, &entry.name),
+            &dir_data,
+        )?;
+
+        let path = self.get_path_by_inode(ino);
         self.publish_notification(EventType::Update, &path, Some(entry), client_id);
 
         Ok(())
     }
 
-    pub fn delete_entry(&self, path: &str, client_id: &str) -> Result<bool, rocksdb::Error> {
-        let exists = self.db.get(path.as_bytes())?.is_some();
-        if exists {
-            let entry_bytes = self.db.get(path.as_bytes())?;
-            if let Some(bytes) = entry_bytes {
-                let decode_result: Result<Entry, _> = prost::Message::decode(bytes.as_ref());
-                if let Ok(entry) = decode_result {
-                    if let Some(attr) = entry.attributes {
-                        self.db.delete(Self::inode_to_key(attr.ino))?;
-                        if (attr.mode & 0o40000) != 0 {
-                            let mut to_delete = Vec::new();
-                            let mut stack = vec![path.to_string()];
+    pub fn delete_entry(&self, ino: u64, client_id: &str) -> Result<bool, rocksdb::Error> {
+        let inode_key = Self::inode_key(ino);
+        let existing_data = self.db.get(&inode_key)?;
+        if existing_data.is_none() {
+            return Ok(false);
+        }
 
-                            while let Some(dir_path) = stack.pop() {
-                                let prefix = Self::path_prefix(&dir_path);
-                                let mut iter = self.db.iterator(IteratorMode::From(
-                                    &prefix,
-                                    rocksdb::Direction::Forward,
-                                ));
-                                while let Some(Ok((key, value))) = iter.next() {
-                                    if !key.starts_with(&prefix) {
-                                        break;
-                                    }
-                                    let child_path = String::from_utf8_lossy(&key).to_string();
-                                    if child_path != dir_path {
-                                        to_delete.push(child_path.clone());
-                                        let child_decode: Result<Entry, _> =
-                                            prost::Message::decode(value.as_ref());
-                                        if let Ok(child_entry) = child_decode {
-                                            if let Some(child_attr) = child_entry.attributes {
-                                                self.db.delete(Self::inode_to_key(child_attr.ino))?;
-                                                if (child_attr.mode & 0o40000) != 0 {
-                                                    stack.push(child_path);
-                                                }
-                                            }
-                                        }
-                                    }
+        let decode_result: Result<InodeEntry, _> =
+            prost::Message::decode(existing_data.unwrap().as_ref());
+        let inode_entry = match decode_result {
+            Ok(e) => e,
+            Err(_) => return Ok(false),
+        };
+
+        let path = self.get_path_by_inode(ino);
+        let is_directory = inode_entry
+            .attributes
+            .as_ref()
+            .map(|a| (a.mode & 0o40000) != 0)
+            .unwrap_or(false);
+
+        if is_directory {
+            let mut to_delete = Vec::new();
+            let mut stack = vec![ino];
+
+            while let Some(current_ino) = stack.pop() {
+                let dir_prefix = Self::dir_prefix(current_ino);
+                let mut iter = self
+                    .db
+                    .iterator(IteratorMode::From(&dir_prefix, rocksdb::Direction::Forward));
+                while let Some(Ok((key, value))) = iter.next() {
+                    if !key.starts_with(&dir_prefix) {
+                        break;
+                    }
+                    let dir_decode: Result<DirEntry, _> = prost::Message::decode(value.as_ref());
+                    if let Ok(dir_entry) = dir_decode {
+                        let child_ino = dir_entry.child_ino;
+                        to_delete.push(child_ino);
+                        let child_inode_key = Self::inode_key(child_ino);
+                        if let Ok(Some(child_data)) = self.db.get(&child_inode_key) {
+                            let child_decode: Result<InodeEntry, _> =
+                                prost::Message::decode(child_data.as_ref());
+                            if let Ok(child_inode) = child_decode {
+                                if (child_inode.attributes.as_ref().map(|a| a.mode).unwrap_or(0)
+                                    & 0o40000)
+                                    != 0
+                                {
+                                    stack.push(child_ino);
                                 }
-                            }
-
-                            for child_path in to_delete {
-                                self.db.delete(child_path.as_bytes())?;
-                                self.publish_notification(
-                                    EventType::Delete,
-                                    &child_path,
-                                    None,
-                                    client_id,
-                                );
                             }
                         }
                     }
                 }
             }
 
-            self.db.delete(path.as_bytes())?;
-            self.publish_notification(EventType::Delete, path, None, client_id);
-            Ok(true)
-        } else {
-            Ok(false)
+            for child_ino in to_delete {
+                let child_path = self.get_path_by_inode(child_ino);
+                let child_inode_key = Self::inode_key(child_ino);
+
+                let child_inode_data = self.db.get(&child_inode_key)?;
+
+                self.db.delete(&child_inode_key)?;
+
+                if let Some(data) = child_inode_data {
+                    let child_decode: Result<InodeEntry, _> = prost::Message::decode(data.as_ref());
+                    if let Ok(child_inode) = child_decode {
+                        let dir_key = Self::dir_key(child_inode.parent_ino, &child_inode.name);
+                        self.db.delete(&dir_key)?;
+                    }
+                }
+
+                let path_key = Self::path_key(&child_path);
+                self.db.delete(&path_key)?;
+
+                self.publish_notification(EventType::Delete, &child_path, None, client_id);
+            }
         }
+
+        self.db.delete(&inode_key)?;
+
+        let dir_key = Self::dir_key(inode_entry.parent_ino, &inode_entry.name);
+        self.db.delete(&dir_key)?;
+
+        let path_key = Self::path_key(&path);
+        self.db.delete(&path_key)?;
+
+        self.publish_notification(EventType::Delete, &path, None, client_id);
+        Ok(true)
+    }
+
+    pub fn delete_entry_by_path(
+        &self,
+        path: &str,
+        client_id: &str,
+    ) -> Result<bool, rocksdb::Error> {
+        let entry = self.get_entry(path);
+        if entry.is_none() {
+            return Ok(false);
+        }
+        let ino = entry
+            .unwrap()
+            .attributes
+            .as_ref()
+            .map(|a| a.ino)
+            .unwrap_or(0);
+        if ino == 0 {
+            return Ok(false);
+        }
+        self.delete_entry(ino, client_id)
     }
 
     pub fn rename_entry(
         &self,
-        old_path: &str,
-        _old_directory: &str,
-        _old_name: &str,
-        new_directory: &str,
+        old_parent_ino: u64,
+        old_name: &str,
+        new_parent_ino: u64,
         new_name: &str,
         client_id: &str,
     ) -> Result<bool, rocksdb::Error> {
-        info!(
-            "rename_entry: old_path={}, new_directory={}, new_name={}",
-            old_path, new_directory, new_name
-        );
-        let entry_bytes = self.db.get(old_path.as_bytes())?;
-        if let Some(bytes) = entry_bytes {
-            let decode_result: Result<Entry, _> = prost::Message::decode(bytes.as_ref());
-            if let Ok(mut entry) = decode_result {
-                info!(
-                    "rename_entry: found entry name={}, directory={}",
-                    entry.name, entry.directory
-                );
-                let generation = self.allocate_generation();
-                entry.generation = generation;
-                entry.name = new_name.to_string();
-                entry.directory = new_directory.to_string();
-
-                let new_key = Self::path_to_key(new_directory, new_name);
-                let new_path = String::from_utf8_lossy(&new_key).to_string();
-                info!("rename_entry: new_key={}", new_path);
-                let mut data = Vec::new();
-                entry.encode(&mut data).expect("failed to encode entry");
-
-                self.db.delete(old_path.as_bytes())?;
-                self.db.put(&new_key, &data)?;
-                if let Some(ref attr) = entry.attributes {
-                    self.db.put(Self::inode_to_key(attr.ino), new_path.as_bytes())?;
-                }
-                info!("rename_entry: db updated successfully");
-
-                self.publish_notification(EventType::Delete, old_path, None, client_id);
-                self.publish_notification(EventType::Rename, &new_path, Some(entry), client_id);
-
-                Ok(true)
-            } else {
-                warn!("rename_entry: failed to decode entry");
-                Ok(false)
-            }
-        } else {
-            warn!("rename_entry: old_path not found in db");
-            Ok(false)
+        let old_dir_key = Self::dir_key(old_parent_ino, old_name);
+        let old_data = self.db.get(&old_dir_key)?;
+        if old_data.is_none() {
+            return Ok(false);
         }
+
+        let dir_decode: Result<DirEntry, _> = prost::Message::decode(old_data.unwrap().as_ref());
+        let dir_entry = match dir_decode {
+            Ok(e) => e,
+            Err(_) => return Ok(false),
+        };
+
+        let ino = dir_entry.child_ino;
+
+        let inode_key = Self::inode_key(ino);
+        let inode_data = self.db.get(&inode_key)?;
+        if inode_data.is_none() {
+            return Ok(false);
+        }
+
+        let inode_decode: Result<InodeEntry, _> =
+            prost::Message::decode(inode_data.unwrap().as_ref());
+        let mut inode_entry = match inode_decode {
+            Ok(e) => e,
+            Err(_) => return Ok(false),
+        };
+
+        let old_path = self.get_path_by_inode(ino);
+
+        let generation = self.allocate_generation();
+        inode_entry.generation = generation;
+        inode_entry.name = new_name.to_string();
+        inode_entry.parent_ino = new_parent_ino;
+
+        if let Some(attrs) = &mut inode_entry.attributes {
+            attrs.ino = ino;
+        }
+
+        let mut new_inode_data = Vec::new();
+        inode_entry
+            .encode(&mut new_inode_data)
+            .expect("failed to encode inode entry");
+        self.db.put(&inode_key, &new_inode_data)?;
+
+        self.db.delete(&old_dir_key)?;
+
+        let new_dir_entry = DirEntry {
+            parent_ino: new_parent_ino,
+            name: new_name.to_string(),
+            child_ino: ino,
+            child_type: dir_entry.child_type,
+            mode: dir_entry.mode,
+            size: dir_entry.size,
+            mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+            nlink: dir_entry.nlink,
+        };
+
+        let mut new_dir_data = Vec::new();
+        new_dir_entry
+            .encode(&mut new_dir_data)
+            .expect("failed to encode dir entry");
+        self.db
+            .put(Self::dir_key(new_parent_ino, new_name), &new_dir_data)?;
+
+        self.db.delete(Self::path_key(&old_path))?;
+
+        let new_path = if new_parent_ino == 1 {
+            format!("/{}", new_name)
+        } else {
+            let parent_path = self.get_path_by_inode(new_parent_ino);
+            format!("{}/{}", parent_path, new_name)
+        };
+
+        let new_path_index = PathIndexEntry {
+            ino,
+            parent_ino: new_parent_ino,
+            generation,
+        };
+
+        let mut new_path_data = Vec::new();
+        new_path_index
+            .encode(&mut new_path_data)
+            .expect("failed to encode path index");
+        self.db.put(Self::path_key(&new_path), &new_path_data)?;
+
+        self.publish_notification(EventType::Delete, &old_path, None, client_id);
+        self.publish_notification(
+            EventType::Rename,
+            &new_path,
+            Some(self.inode_entry_to_entry(&inode_entry, &new_path)),
+            client_id,
+        );
+
+        Ok(true)
     }
 
-    pub fn list_entries(&self, directory: &str, limit: u64, last_name: &str) -> Vec<Entry> {
-        let prefix = Self::path_prefix(directory);
+    pub fn list_entries(&self, parent_ino: u64, limit: u64, last_name: &str) -> Vec<Entry> {
+        let dir_prefix = Self::dir_prefix(parent_ino);
         let mut entries = Vec::new();
 
         let mut iter = self
             .db
-            .iterator(IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+            .iterator(IteratorMode::From(&dir_prefix, rocksdb::Direction::Forward));
         let mut count = 0u64;
 
         while let Some(Ok((key, value))) = iter.next() {
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(&dir_prefix) {
                 break;
             }
 
-            let path = String::from_utf8_lossy(&key);
-            let prefix_str = String::from_utf8_lossy(&prefix);
-            let entry_name = path.trim_start_matches(&*prefix_str);
+            let dir_decode: Result<DirEntry, _> = prost::Message::decode(value.as_ref());
+            if let Ok(dir_entry) = dir_decode {
+                let entry_name = dir_entry.name.clone();
 
-            if entry_name.is_empty() {
-                continue;
-            }
+                if !last_name.is_empty() && entry_name.as_str() <= last_name {
+                    continue;
+                }
 
-            if !last_name.is_empty() && entry_name <= last_name {
-                continue;
-            }
-
-            if let Ok(entry) = prost::Message::decode(value.as_ref()) {
-                entries.push(entry);
-                count += 1;
-                if count >= limit {
-                    break;
+                if let Some((entry, _)) = self.get_entry_by_inode_internal(dir_entry.child_ino) {
+                    entries.push(entry);
+                    count += 1;
+                    if count >= limit {
+                        break;
+                    }
                 }
             }
         }
@@ -421,9 +770,11 @@ impl DirectoryTree {
 
     pub fn init_root(&self) -> Result<(), rocksdb::Error> {
         if self.get_entry("/").is_none() {
-            let root_entry = Entry {
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+            let root_inode = InodeEntry {
+                ino: 1,
                 name: "/".to_string(),
-                directory: "/".to_string(),
+                parent_ino: 0,
                 attributes: Some(crate::proto::FuseAttributes {
                     ino: 1,
                     mode: 0o40755,
@@ -434,29 +785,45 @@ impl DirectoryTree {
                     size: 4096,
                     blksize: 4096,
                     blocks: 1,
-                    atime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                    mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                    ctime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                    crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
                     perm: 0o755,
                 }),
                 chunks: vec![],
+                symlink_target: "".to_string(),
                 hard_link_id: "".to_string(),
                 hard_link_counter: 0,
+                generation: 1,
                 extended: HashMap::new(),
                 content_size: 4096,
                 disk_size: 4096,
                 ttl: "".to_string(),
-                symlink_target: "".to_string(),
                 owner: String::new(),
+                backend: Default::default(),
+                s3_location: None,
+                kv_location: None,
+                stripe_config: None,
+            };
+
+            let mut inode_data = Vec::new();
+            root_inode
+                .encode(&mut inode_data)
+                .expect("failed to encode root inode");
+            self.db.put(Self::inode_key(1), &inode_data)?;
+
+            let path_index = PathIndexEntry {
+                ino: 1,
+                parent_ino: 0,
                 generation: 1,
             };
 
-            let mut data = Vec::new();
-            root_entry
-                .encode(&mut data)
-                .expect("failed to encode root entry");
-            self.db.put(b"/", &data)?;
+            let mut path_data = Vec::new();
+            path_index
+                .encode(&mut path_data)
+                .expect("failed to encode path index");
+            self.db.put(Self::path_key("/"), &path_data)?;
 
             let _ = self.inode_counter.compare_exchange(
                 2,

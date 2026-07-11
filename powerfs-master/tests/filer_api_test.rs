@@ -49,11 +49,11 @@ fn test_filer_lookup() {
     let file_entry = create_test_entry("test.txt", "/", 0o100644);
     tree.create_entry(file_entry, "test_client").unwrap();
 
-    let found = tree.lookup("/", "test.txt");
+    let found = tree.lookup(1, "test.txt");
     assert!(found.is_some());
     assert_eq!(found.unwrap().name, "test.txt");
 
-    let not_found = tree.lookup("/", "nonexistent.txt");
+    let not_found = tree.lookup(1, "nonexistent.txt");
     assert!(not_found.is_none());
 }
 
@@ -81,7 +81,7 @@ fn test_filer_create_entry() {
 
     assert!(inode > 0);
 
-    let found = tree.lookup("/", "create_test.txt");
+    let found = tree.lookup(1, "create_test.txt");
     assert!(found.is_some());
     assert_eq!(found.unwrap().attributes.unwrap().ino, inode);
 
@@ -107,7 +107,7 @@ fn test_filer_update_entry() {
     let result = tree.update_entry(file_entry, "test_client");
     assert!(result.is_ok());
 
-    let found = tree.lookup("/", "update_test.txt");
+    let found = tree.lookup(1, "update_test.txt");
     assert!(found.is_some());
     let entry = found.unwrap();
     let attrs = entry.attributes.unwrap();
@@ -122,14 +122,18 @@ fn test_filer_delete_entry() {
     let file_entry = create_test_entry("delete_test.txt", "/", 0o100644);
     tree.create_entry(file_entry, "test_client").unwrap();
 
-    let result = tree.delete_entry("/delete_test.txt", "test_client");
+    let found = tree.lookup(1, "delete_test.txt");
+    assert!(found.is_some());
+    let ino = found.unwrap().attributes.unwrap().ino;
+
+    let result = tree.delete_entry(ino, "test_client");
     assert!(result.is_ok());
     assert!(result.unwrap());
 
-    let found = tree.lookup("/", "delete_test.txt");
+    let found = tree.lookup(1, "delete_test.txt");
     assert!(found.is_none());
 
-    let result = tree.delete_entry("/nonexistent.txt", "test_client");
+    let result = tree.delete_entry(99999, "test_client");
     assert!(result.is_ok());
     assert!(!result.unwrap());
 }
@@ -143,16 +147,16 @@ fn test_filer_list_entries() {
         tree.create_entry(file_entry, "test_client").unwrap();
     }
 
-    let entries = tree.list_entries("/", 3, "");
+    let entries = tree.list_entries(1, 3, "");
     assert_eq!(entries.len(), 3);
 
-    let entries = tree.list_entries("/", 10, "");
+    let entries = tree.list_entries(1, 10, "");
     assert_eq!(entries.len(), 5);
 
     let subdir = create_test_entry("subdir", "/", 0o040755);
     tree.create_entry(subdir, "test_client").unwrap();
 
-    let entries = tree.list_entries("/", 10, "");
+    let entries = tree.list_entries(1, 10, "");
     assert_eq!(entries.len(), 6);
 }
 
@@ -170,9 +174,9 @@ fn test_filer_stream_mutate() {
         tree.create_entry(entry, "test_client").unwrap();
     }
 
-    let found1 = tree.lookup("/", "stream1.txt");
-    let found2 = tree.lookup("/", "stream2.txt");
-    let found3 = tree.lookup("/", "stream3.txt");
+    let found1 = tree.lookup(1, "stream1.txt");
+    let found2 = tree.lookup(1, "stream2.txt");
+    let found3 = tree.lookup(1, "stream3.txt");
 
     assert!(found1.is_some());
     assert!(found2.is_some());

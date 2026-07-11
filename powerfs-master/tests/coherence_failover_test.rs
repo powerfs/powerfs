@@ -348,7 +348,13 @@ fn test_delete_notification_contains_epoch() {
         .expect("create_entry failed");
     let _ = rx.try_recv();
 
-    tree.delete_entry("/epoch_delete_file", "test_client")
+    let ino = tree
+        .get_entry("/epoch_delete_file")
+        .unwrap()
+        .attributes
+        .unwrap()
+        .ino;
+    tree.delete_entry(ino, "test_client")
         .expect("delete failed");
 
     let notif = rx.try_recv().expect("Should receive DELETE notification");
@@ -689,7 +695,13 @@ fn test_all_event_types_carry_epoch() {
     assert_eq!(notif_update.epoch, current_epoch);
 
     // DELETE
-    tree.delete_entry("/all_events_file", "test_client")
+    let ino = tree
+        .get_entry("/all_events_file")
+        .unwrap()
+        .attributes
+        .unwrap()
+        .ino;
+    tree.delete_entry(ino, "test_client")
         .expect("delete failed");
     let notif_delete = rx.try_recv().expect("Should receive DELETE");
     assert_eq!(notif_delete.event_type, EventType::Delete as i32);

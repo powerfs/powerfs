@@ -940,7 +940,10 @@ impl PowerFuseClient {
             let mut client = MasterServiceClient::new(channel);
             let request = GetEntryByInodeRequest { inode };
 
-            match client.get_entry_by_inode(tonic::Request::new(request)).await {
+            match client
+                .get_entry_by_inode(tonic::Request::new(request))
+                .await
+            {
                 Ok(response) => {
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
@@ -969,11 +972,11 @@ impl PowerFuseClient {
 
     pub async fn delete_entry(
         &self,
-        path: &str,
+        ino: u64,
         is_directory: bool,
         client_id: &str,
     ) -> Result<bool, String> {
-        debug!("delete_entry: path={}, is_directory={}", path, is_directory);
+        debug!("delete_entry: ino={}, is_directory={}", ino, is_directory);
 
         for attempt in 1..=self.config.max_retry_count {
             let channel = match self.ensure_master_channel().await {
@@ -990,7 +993,7 @@ impl PowerFuseClient {
 
             let mut client = MasterServiceClient::new(channel);
             let request = DeleteEntryRequest {
-                path: path.to_string(),
+                ino,
                 is_directory,
                 client_id: client_id.to_string(),
             };
@@ -1021,16 +1024,15 @@ impl PowerFuseClient {
 
     pub async fn rename_entry(
         &self,
-        old_path: &str,
-        old_directory: &str,
+        old_parent_ino: u64,
         old_name: &str,
-        new_directory: &str,
+        new_parent_ino: u64,
         new_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
         debug!(
-            "rename_entry: old_path={}, new_directory={}, new_name={}",
-            old_path, new_directory, new_name
+            "rename_entry: old_parent_ino={}, old_name={}, new_parent_ino={}, new_name={}",
+            old_parent_ino, old_name, new_parent_ino, new_name
         );
 
         for attempt in 1..=self.config.max_retry_count {
@@ -1048,10 +1050,9 @@ impl PowerFuseClient {
 
             let mut client = MasterServiceClient::new(channel.clone());
             let request = RenameEntryRequest {
-                old_path: old_path.to_string(),
-                old_directory: old_directory.to_string(),
+                old_parent_ino,
                 old_name: old_name.to_string(),
-                new_directory: new_directory.to_string(),
+                new_parent_ino,
                 new_name: new_name.to_string(),
                 client_id: client_id.to_string(),
             };
@@ -1082,13 +1083,13 @@ impl PowerFuseClient {
 
     pub async fn list_entries(
         &self,
-        path: &str,
+        parent_ino: u64,
         limit: u64,
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
         debug!(
-            "list_entries: path={}, limit={}, start_after={}",
-            path, limit, start_after
+            "list_entries: parent_ino={}, limit={}, start_after={}",
+            parent_ino, limit, start_after
         );
 
         for attempt in 1..=self.config.max_retry_count {
@@ -1106,7 +1107,7 @@ impl PowerFuseClient {
 
             let mut client = MasterServiceClient::new(channel);
             let request = ListEntriesRequest {
-                directory: path.to_string(),
+                parent_ino,
                 limit,
                 last_name: start_after.to_string(),
             };
@@ -1137,12 +1138,12 @@ impl PowerFuseClient {
 
     pub async fn lookup_directory_entry(
         &self,
-        directory: &str,
+        parent_ino: u64,
         name: &str,
     ) -> Result<Option<Entry>, String> {
         debug!(
-            "lookup_directory_entry: directory={}, name={}",
-            directory, name
+            "lookup_directory_entry: parent_ino={}, name={}",
+            parent_ino, name
         );
 
         for attempt in 1..=self.config.max_retry_count {
@@ -1160,7 +1161,7 @@ impl PowerFuseClient {
 
             let mut client = MasterServiceClient::new(channel);
             let request = LookupDirectoryEntryRequest {
-                directory: directory.to_string(),
+                parent_ino,
                 name: name.to_string(),
             };
 
@@ -1620,31 +1621,29 @@ impl SyncFuseClient {
 
     pub fn delete_entry(
         &self,
-        path: &str,
+        ino: u64,
         is_directory: bool,
         client_id: &str,
     ) -> Result<bool, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.delete_entry(path, is_directory, client_id))
+            .block_on(self.client.delete_entry(ino, is_directory, client_id))
     }
 
     pub fn rename_entry(
         &self,
-        old_path: &str,
-        old_directory: &str,
+        old_parent_ino: u64,
         old_name: &str,
-        new_directory: &str,
+        new_parent_ino: u64,
         new_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
         self.client
             .runtime_handle
             .block_on(self.client.rename_entry(
-                old_path,
-                old_directory,
+                old_parent_ino,
                 old_name,
-                new_directory,
+                new_parent_ino,
                 new_name,
                 client_id,
             ))
@@ -1652,23 +1651,23 @@ impl SyncFuseClient {
 
     pub fn list_entries(
         &self,
-        path: &str,
+        parent_ino: u64,
         limit: u64,
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.list_entries(path, limit, start_after))
+            .block_on(self.client.list_entries(parent_ino, limit, start_after))
     }
 
     pub fn lookup_directory_entry(
         &self,
-        directory: &str,
+        parent_ino: u64,
         name: &str,
     ) -> Result<Option<Entry>, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.lookup_directory_entry(directory, name))
+            .block_on(self.client.lookup_directory_entry(parent_ino, name))
     }
 
     pub fn invalidate_volume_channel(&self, addr: &str) {

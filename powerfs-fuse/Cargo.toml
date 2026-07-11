@@ -34,3 +34,6 @@ clap = { workspace = true }
 lru = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
+
+[dev-dependencies]
+rfs_tester = { path = "../rfs_tester" }

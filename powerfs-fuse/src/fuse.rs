@@ -572,43 +572,25 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let inode = self.cache.allocate_inode();
         let now = chrono::Utc::now().timestamp();
-        let entry = CachedEntry {
-            inode,
-            parent,
-            name: name_str.to_string(),
-            is_dir: true,
-            is_symlink: false,
-            symlink_target: None,
-            nlink: 2,
-            fid: None,
-            size: 0,
-            mode: mode & 0o7777,
-            uid: ctx.uid,
-            gid: ctx.gid,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            xattrs: HashMap::new(),
-            chunks: Vec::new(),
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            content_size: 0,
-            disk_size: 0,
-            generation: 0,
-        };
-        self.cache.insert(entry.clone());
 
-        let parent_path = self
-            .cache
-            .inode_to_path(parent)
-            .unwrap_or_else(|| "/".to_string());
+        let parent_path = if let Some(path) = self.cache.inode_to_path(parent) {
+            path
+        } else {
+            match self.client.get_entry_by_inode(parent) {
+                Ok(Some((_, path))) => path,
+                _ => {
+                    error!("Failed to get parent path for inode {}", parent);
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+            }
+        };
+
         let filer_entry = FilerEntry {
             name: name_str.to_string(),
             directory: parent_path,
             attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: inode,
+                ino: 0,
                 mode: mode | 0o040000,
                 nlink: 2,
                 uid: ctx.uid,
@@ -635,12 +617,36 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry, "") {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to create directory entry on master: {}", e);
-            }
-        }
+        let inode = self.client.create_entry(filer_entry, "").map_err(|e| {
+            error!("Failed to create directory entry on master: {}", e);
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })?;
+
+        let entry = CachedEntry {
+            inode,
+            parent,
+            name: name_str.to_string(),
+            is_dir: true,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 2,
+            fid: None,
+            size: 0,
+            mode: mode & 0o7777,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+        };
+        self.cache.insert(entry.clone());
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -661,11 +667,7 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
-        let entry_path = self
-            .cache
-            .inode_to_path(entry.inode)
-            .unwrap_or_else(|| "/".to_string());
-        match self.client.delete_entry(&entry_path, true, "") {
+        match self.client.delete_entry(entry.inode, true, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete directory entry on master: {}", e);
@@ -705,11 +707,7 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            let entry_path = self
-                .cache
-                .inode_to_path(entry.inode)
-                .unwrap_or_else(|| "/".to_string());
-            match self.client.delete_entry(&entry_path, false, "") {
+            match self.client.delete_entry(entry.inode, false, "") {
                 Ok(_) => {}
                 Err(e) => {
                     warn!("Failed to delete file entry on master: {}", e);
@@ -744,7 +742,6 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let inode = self.cache.allocate_inode();
         let now = chrono::Utc::now().timestamp();
 
         let (fid, _location, _stripe_fids, _stripe_locations) = self
@@ -756,6 +753,54 @@ impl FileSystem for PowerFsFs {
             })?;
 
         let fid_str = fid.to_string();
+
+        let parent_path = if let Some(path) = self.cache.inode_to_path(parent) {
+            path
+        } else {
+            match self.client.get_entry_by_inode(parent) {
+                Ok(Some((_, path))) => path,
+                _ => {
+                    error!("Failed to get parent path for inode {}", parent);
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+            }
+        };
+
+        let filer_entry = FilerEntry {
+            name: name_str.to_string(),
+            directory: parent_path,
+            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                ino: 0,
+                mode: args.mode | 0o100000,
+                nlink: 1,
+                uid: ctx.uid,
+                gid: ctx.gid,
+                rdev: 0,
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: now as u64,
+                mtime: now as u64,
+                ctime: now as u64,
+                crtime: now as u64,
+                perm: 0,
+            }),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            extended: HashMap::new(),
+            content_size: 0,
+            disk_size: 0,
+            ttl: String::new(),
+            symlink_target: String::new(),
+            owner: String::new(),
+            generation: 0,
+        };
+
+        let inode = self.client.create_entry(filer_entry, "").map_err(|e| {
+            error!("Failed to create file entry on master: {}", e);
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })?;
 
         let entry = CachedEntry {
             inode,
@@ -789,48 +834,6 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
         self.cache.insert(entry.clone());
-
-        let parent_path = self
-            .cache
-            .inode_to_path(parent)
-            .unwrap_or_else(|| "/".to_string());
-        let filer_entry = FilerEntry {
-            name: name_str.to_string(),
-            directory: parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: inode,
-                mode: args.mode | 0o100000,
-                nlink: 1,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                rdev: 0,
-                size: 0,
-                blksize: 4096,
-                blocks: 0,
-                atime: now as u64,
-                mtime: now as u64,
-                ctime: now as u64,
-                crtime: now as u64,
-                perm: 0,
-            }),
-            chunks: Vec::new(),
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            extended: HashMap::new(),
-            content_size: 0,
-            disk_size: 0,
-            ttl: String::new(),
-            symlink_target: String::new(),
-            owner: String::new(),
-            generation: 0,
-        };
-
-        match self.client.create_entry(filer_entry, "") {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to create file entry on master: {}", e);
-            }
-        }
 
         Ok((
             self.create_fuse_entry(&entry),
@@ -1231,11 +1234,7 @@ impl FileSystem for PowerFsFs {
 
         let mut children = self.cache.list_children(inode);
         if children.is_empty() {
-            let dir_path = self
-                .cache
-                .inode_to_path(inode)
-                .unwrap_or_else(|| "/".to_string());
-            if let Ok(entries) = self.client.list_entries(&dir_path, 1000, "") {
+            if let Ok(entries) = self.client.list_entries(inode, 1000, "") {
                 for child_entry in entries {
                     let cached = self.entry_to_cached(inode, &child_entry);
                     self.cache.insert(cached);
@@ -1295,11 +1294,6 @@ impl FileSystem for PowerFsFs {
             .lookup_in_cache(olddir, old_str)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let old_path = self
-            .cache
-            .inode_to_path(entry.inode)
-            .unwrap_or_else(|| "/".to_string());
-
         self.cache
             .rename(olddir, old_str, newdir, new_str)
             .map_err(|e| {
@@ -1358,7 +1352,7 @@ impl FileSystem for PowerFsFs {
             generation: entry.generation,
         };
 
-        match self.client.delete_entry(&old_path, entry.is_dir, "") {
+        match self.client.delete_entry(entry.inode, entry.is_dir, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete old entry on master during rename: {}", e);

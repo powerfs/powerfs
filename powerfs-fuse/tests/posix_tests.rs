@@ -881,12 +881,30 @@ fn test_directory_recursive_copy() {
     copy_directory(&src_dir, &dst_subdir);
 
     assert!(dst_subdir.exists(), "Destination subdir should exist");
-    assert!(dst_subdir.join("file1.txt").exists(), "file1.txt should exist in dest");
-    assert!(dst_subdir.join("file2.txt").exists(), "file2.txt should exist in dest");
-    assert!(dst_subdir.join("subdir1").exists(), "subdir1 should exist in dest");
-    assert!(dst_subdir.join("subdir1/nested1.txt").exists(), "nested1.txt should exist");
-    assert!(dst_subdir.join("subdir1/subdir2").exists(), "subdir2 should exist");
-    assert!(dst_subdir.join("subdir1/subdir2/deep.txt").exists(), "deep.txt should exist");
+    assert!(
+        dst_subdir.join("file1.txt").exists(),
+        "file1.txt should exist in dest"
+    );
+    assert!(
+        dst_subdir.join("file2.txt").exists(),
+        "file2.txt should exist in dest"
+    );
+    assert!(
+        dst_subdir.join("subdir1").exists(),
+        "subdir1 should exist in dest"
+    );
+    assert!(
+        dst_subdir.join("subdir1/nested1.txt").exists(),
+        "nested1.txt should exist"
+    );
+    assert!(
+        dst_subdir.join("subdir1/subdir2").exists(),
+        "subdir2 should exist"
+    );
+    assert!(
+        dst_subdir.join("subdir1/subdir2/deep.txt").exists(),
+        "deep.txt should exist"
+    );
 
     let mut f = File::open(dst_subdir.join("file1.txt")).unwrap();
     let mut buf = String::new();
@@ -919,7 +937,8 @@ fn test_directory_copy_to_current_dir() {
     fs::create_dir_all(&src_dir).unwrap();
 
     let mut f = File::create(src_dir.join("Cargo.toml")).unwrap();
-    f.write_all(b"[package]\nname = \"powerfs-core\"\n").unwrap();
+    f.write_all(b"[package]\nname = \"powerfs-core\"\n")
+        .unwrap();
     drop(f);
 
     let subdir = src_dir.join("src");
@@ -939,9 +958,18 @@ fn test_directory_copy_to_current_dir() {
     copy_directory(&src_dir, &dst_subdir);
 
     assert!(dst_subdir.exists(), "powerfs-core should exist in dst dir");
-    assert!(dst_subdir.join("Cargo.toml").exists(), "Cargo.toml should exist");
-    assert!(dst_subdir.join("src/lib.rs").exists(), "src/lib.rs should exist");
-    assert!(dst_subdir.join("src/mod.rs").exists(), "src/mod.rs should exist");
+    assert!(
+        dst_subdir.join("Cargo.toml").exists(),
+        "Cargo.toml should exist"
+    );
+    assert!(
+        dst_subdir.join("src/lib.rs").exists(),
+        "src/lib.rs should exist"
+    );
+    assert!(
+        dst_subdir.join("src/mod.rs").exists(),
+        "src/mod.rs should exist"
+    );
 
     let mut f = File::open(dst_subdir.join("Cargo.toml")).unwrap();
     let mut buf = String::new();

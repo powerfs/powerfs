@@ -656,7 +656,7 @@ impl MasterService for MasterGrpcServer {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
 
-        if let Some(entry) = dir_tree.lookup(&req.directory, &req.name) {
+        if let Some(entry) = dir_tree.lookup(req.parent_ino, &req.name) {
             Ok(Response::new(LookupDirectoryEntryResponse {
                 found: true,
                 entry: Some(entry),
@@ -782,7 +782,7 @@ impl MasterService for MasterGrpcServer {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
 
-        match dir_tree.delete_entry(&req.path, &req.client_id) {
+        match dir_tree.delete_entry(req.ino, &req.client_id) {
             Ok(_) => Ok(Response::new(DeleteEntryResponse {
                 success: true,
                 error: String::new(),
@@ -800,16 +800,15 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::RenameEntryResponse>, Status> {
         let req = request.into_inner();
         info!(
-            "rename_entry request: old_path={}, new_directory={}, new_name={}, client_id={}",
-            req.old_path, req.new_directory, req.new_name, req.client_id
+            "rename_entry request: old_parent_ino={}, old_name={}, new_parent_ino={}, new_name={}, client_id={}",
+            req.old_parent_ino, req.old_name, req.new_parent_ino, req.new_name, req.client_id
         );
         let dir_tree = self.master.directory_tree.clone();
 
         match dir_tree.rename_entry(
-            &req.old_path,
-            &req.old_directory,
+            req.old_parent_ino,
             &req.old_name,
-            &req.new_directory,
+            req.new_parent_ino,
             &req.new_name,
             &req.client_id,
         ) {
@@ -837,7 +836,7 @@ impl MasterService for MasterGrpcServer {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
 
-        let entries = dir_tree.list_entries(&req.directory, req.limit, &req.last_name);
+        let entries = dir_tree.list_entries(req.parent_ino, req.limit, &req.last_name);
 
         Ok(Response::new(ListEntriesResponse {
             entries,
@@ -880,7 +879,7 @@ impl MasterService for MasterGrpcServer {
                     )) => {
                         let client_id = delete_req.client_id.clone();
                         dir_tree
-                            .delete_entry(&delete_req.path, &client_id)
+                            .delete_entry(delete_req.ino, &client_id)
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     }

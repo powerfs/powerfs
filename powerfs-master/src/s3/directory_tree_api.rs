@@ -83,7 +83,7 @@ impl DirectoryTreeApi for DirectoryTreeClient {
             DirectoryTreeClient::Direct(dt) => {
                 let dt = dt.clone();
                 Box::pin(async move {
-                    dt.delete_entry(&path, "").map_err(|e| {
+                    dt.delete_entry_by_path(&path, "").map_err(|e| {
                         PowerFsError::Internal(format!("Failed to delete entry: {}", e))
                     })
                 })
@@ -106,7 +106,13 @@ impl DirectoryTreeApi for DirectoryTreeClient {
         match self {
             DirectoryTreeClient::Direct(dt) => {
                 let dt = dt.clone();
-                Box::pin(async move { dt.list_entries(&directory, limit, &last_name) })
+                Box::pin(async move {
+                    let parent_ino = dt
+                        .get_entry(&directory)
+                        .and_then(|e| e.attributes.map(|a| a.ino))
+                        .unwrap_or(1);
+                    dt.list_entries(parent_ino, limit, &last_name)
+                })
             }
             DirectoryTreeClient::Remote(rdt) => {
                 let rdt = rdt.clone();
@@ -303,12 +309,18 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
         let path = path.to_string();
         let this = self.clone();
         Box::pin(async move {
+            let entry = this.get_entry(&path).await;
+            let ino = match entry {
+                Some(e) => e.attributes.map(|a| a.ino).unwrap_or(0),
+                None => return Err(PowerFsError::FileNotFound(path)),
+            };
+
             let mut client = match this.get_client().await {
                 Ok(c) => c,
                 Err(e) => return Err(e),
             };
             let request = DeleteEntryRequest {
-                path,
+                ino,
                 is_directory: false,
                 client_id: "".to_string(),
             };
@@ -339,12 +351,21 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
         let last_name = last_name.to_string();
         let this = self.clone();
         Box::pin(async move {
+            let parent_ino = if directory == "/" {
+                1
+            } else {
+                let entry = this.get_entry(&directory).await;
+                entry
+                    .map(|e| e.attributes.map(|a| a.ino).unwrap_or(0))
+                    .unwrap_or(0)
+            };
+
             let mut client = match this.get_client().await {
                 Ok(c) => c,
                 Err(_) => return Vec::new(),
             };
             let request = ListEntriesRequest {
-                directory,
+                parent_ino,
                 limit,
                 last_name,
             };

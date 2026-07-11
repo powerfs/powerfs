@@ -1,4 +1,4 @@
-use crate::cache::{CachedEntry, CachedFileChunk, ChunkCache, MetadataCache};
+use crate::cache::{ChunkCache, MetadataCache};
 use crate::client::{PowerFuseClient, SyncFuseClient};
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
@@ -145,7 +145,9 @@ impl PowerFsFuserFs {
             _ => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
         };
 
-        let existing_fid = entry.chunks.iter()
+        let existing_fid = entry
+            .chunks
+            .iter()
             .find(|c| !c.fid.is_empty())
             .and_then(|c| Fid::from_string(&c.fid).ok());
 
@@ -369,39 +371,11 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn create_file_attr(&self, entry: &CachedEntry) -> FileAttr {
-        let file_type = if entry.is_symlink {
-            FileType::Symlink
-        } else if entry.is_dir {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        };
-
-        FileAttr {
-            ino: entry.inode,
-            size: entry.size,
-            blocks: entry.size.div_ceil(512),
-            atime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.atime as u64),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime as u64),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.ctime as u64),
-            crtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.ctime as u64),
-            kind: file_type,
-            perm: entry.mode as u16,
-            nlink: entry.nlink,
-            uid: entry.uid,
-            gid: entry.gid,
-            rdev: 0,
-            blksize: 4096,
-            flags: 0,
-        }
-    }
-
     fn create_file_attr_from_entry(&self, entry: &FilerEntry) -> FileAttr {
         let attrs = entry.attributes.as_ref();
         let mode_val = attrs.map(|a| a.mode).unwrap_or(0);
         let file_type = mode_val & 0o170000;
-        
+
         let kind = match file_type {
             0o040000 => FileType::Directory,
             0o120000 => FileType::Symlink,
@@ -412,10 +386,14 @@ impl PowerFsFuserFs {
             ino: attrs.map(|a| a.ino).unwrap_or(0),
             size: attrs.map(|a| a.size).unwrap_or(0),
             blocks: attrs.map(|a| a.size.div_ceil(512)).unwrap_or(0),
-            atime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(attrs.map(|a| a.atime).unwrap_or(0) as u64),
-            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(attrs.map(|a| a.mtime).unwrap_or(0) as u64),
-            ctime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(attrs.map(|a| a.ctime).unwrap_or(0) as u64),
-            crtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(attrs.map(|a| a.ctime).unwrap_or(0) as u64),
+            atime: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(attrs.map(|a| a.atime).unwrap_or(0)),
+            mtime: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(attrs.map(|a| a.mtime).unwrap_or(0)),
+            ctime: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(attrs.map(|a| a.ctime).unwrap_or(0)),
+            crtime: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(attrs.map(|a| a.ctime).unwrap_or(0)),
             kind,
             perm: (attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644)) as u16,
             nlink: attrs.map(|a| a.nlink).unwrap_or(1),
@@ -427,73 +405,14 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
-        let attrs = entry.attributes.as_ref();
-        let chunks = entry
-            .chunks
-            .iter()
-            .map(|chunk| CachedFileChunk {
-                offset: chunk.offset,
-                size: chunk.size,
-                mtime: chunk.mtime,
-                fid: chunk.fid.clone(),
-                cookie: chunk.cookie,
-                crc32: chunk.crc32,
-            })
-            .collect();
-
-        let fid = entry.chunks.first().and_then(|chunk| {
-            info!("Parsing fid from chunk: {}", chunk.fid);
-            let result = Fid::from_string(&chunk.fid);
-            info!("Fid parse result: {:?}", result);
-            result.ok()
-        });
-
-        let mode_val = attrs.map(|a| a.mode).unwrap_or(0);
-        let file_type = mode_val & 0o170000;
-        let is_dir = file_type == 0o040000;
-        let is_symlink = file_type == 0o120000;
-
-        CachedEntry {
-            inode: attrs.map(|a| a.ino).unwrap_or(0),
-            parent,
-            name: entry.name.clone(),
-            is_dir,
-            is_symlink,
-            symlink_target: if is_symlink {
-                Some(entry.symlink_target.clone())
-            } else {
-                None
-            },
-            nlink: attrs.map(|a| a.nlink).unwrap_or(1),
-            fid,
-            size: attrs.map(|a| a.size).unwrap_or(0),
-            mode: attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644),
-            uid: attrs.map(|a| a.uid).unwrap_or(0),
-            gid: attrs.map(|a| a.gid).unwrap_or(0),
-            atime: attrs.map(|a| a.atime as i64).unwrap_or(0),
-            mtime: attrs.map(|a| a.mtime as i64).unwrap_or(0),
-            ctime: attrs.map(|a| a.ctime as i64).unwrap_or(0),
-            xattrs: HashMap::new(),
-            chunks,
-            hard_link_id: entry.hard_link_id.clone(),
-            hard_link_counter: entry.hard_link_counter,
-            content_size: entry.content_size,
-            disk_size: entry.disk_size,
-            generation: entry.generation,
-        }
-    }
-
     fn readdir_root(&self, mut reply: ReplyDirectory, offset: i64) {
         let mut idx = offset as usize;
-        let mut next_offset: i64 = 0;
 
         if idx == 0 {
             if !reply.add(1, 1, FileType::Directory, ".") {
                 reply.ok();
                 return;
             }
-            next_offset = 1;
             idx = 1;
         }
 
@@ -502,11 +421,10 @@ impl PowerFsFuserFs {
                 reply.ok();
                 return;
             }
-            next_offset = 2;
             idx = 2;
         }
 
-        match self.client.list_entries("/", 1000, "") {
+        match self.client.list_entries(1, 1000, "") {
             Ok(entries) => {
                 let child_offset = idx.saturating_sub(2);
                 for (i, entry) in entries.iter().enumerate().skip(child_offset) {
@@ -520,7 +438,7 @@ impl PowerFsFuserFs {
                         _ => FileType::RegularFile,
                     };
 
-                    next_offset = (child_offset + i + 3) as i64;
+                    let next_offset = (child_offset + i + 3) as i64;
                     if !reply.add(child_ino, next_offset, kind, &entry.name) {
                         break;
                     }
@@ -572,28 +490,11 @@ impl Filesystem for PowerFsFuserFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("lookup: parent={}, name={}", parent, name_str);
 
-        let parent_path = match self.client.get_entry_by_inode(parent) {
-            Ok(Some((_, p))) => p,
-            _ => {
-                error!(
-                    "lookup: parent inode {} not found on master, name={}",
-                    parent, name_str
-                );
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let lookup_path = if parent_path == "/" {
-            format!("/{}", name_str)
-        } else {
-            format!("{}/{}", parent_path, name_str)
-        };
-
-        match self.client.get_entry(&lookup_path) {
+        match self.client.lookup_directory_entry(parent, name_str) {
             Ok(Some(entry)) => {
                 info!(
-                    "lookup found entry: path={}, chunks={}, content_size={}",
-                    lookup_path,
+                    "lookup found entry: name={}, chunks={}, content_size={}",
+                    entry.name,
                     entry.chunks.len(),
                     entry.content_size
                 );
@@ -757,17 +658,15 @@ impl Filesystem for PowerFsFuserFs {
         };
 
         match self.client.update_entry(&filer_entry, &self.client_id) {
-            Ok(_) => {
-                match self.client.get_entry(&path) {
-                    Ok(Some(updated_entry)) => {
-                        let new_attr = self.create_file_attr_from_entry(&updated_entry);
-                        reply.attr(&TTL, &new_attr);
-                    }
-                    _ => {
-                        reply.error(libc::ENOENT);
-                    }
+            Ok(_) => match self.client.get_entry(&path) {
+                Ok(Some(updated_entry)) => {
+                    let new_attr = self.create_file_attr_from_entry(&updated_entry);
+                    reply.attr(&TTL, &new_attr);
                 }
-            }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            },
             Err(e) => {
                 error!("Failed to update entry on master: {}", e);
                 reply.error(libc::EIO);
@@ -860,10 +759,14 @@ impl Filesystem for PowerFsFuserFs {
                             ino: master_inode,
                             size: 0,
                             blocks: 0,
-                            atime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64),
-                            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64),
-                            ctime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64),
-                            crtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64),
+                            atime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(now as u64),
+                            mtime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(now as u64),
+                            ctime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(now as u64),
+                            crtime: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(now as u64),
                             kind: FileType::Directory,
                             perm: (mode & 0o7777) as u16,
                             nlink: 2,
@@ -912,7 +815,8 @@ impl Filesystem for PowerFsFuserFs {
                     return;
                 }
 
-                match self.client.list_entries(&dir_path, 1000, "") {
+                let ino = attrs.unwrap().ino;
+                match self.client.list_entries(ino, 1000, "") {
                     Ok(entries) => {
                         if !entries.is_empty() {
                             reply.error(libc::ENOTEMPTY);
@@ -926,7 +830,7 @@ impl Filesystem for PowerFsFuserFs {
                     }
                 }
 
-                match self.client.delete_entry(&dir_path, true, &self.client_id) {
+                match self.client.delete_entry(ino, true, &self.client_id) {
                     Ok(_) => {
                         reply.ok();
                         self.invalidate_kernel_dentry(parent, name_str);
@@ -971,9 +875,11 @@ impl Filesystem for PowerFsFuserFs {
 
         match self.client.get_entry(&entry_path) {
             Ok(Some(entry)) => {
-                if let Some(fid) = entry.chunks.first().and_then(|chunk| {
-                    Fid::from_string(&chunk.fid).ok()
-                }) {
+                if let Some(fid) = entry
+                    .chunks
+                    .first()
+                    .and_then(|chunk| Fid::from_string(&chunk.fid).ok())
+                {
                     match self.client.lookup_volume(fid.volume_id) {
                         Ok(locations) => {
                             if let Some(loc) = locations.first() {
@@ -992,10 +898,8 @@ impl Filesystem for PowerFsFuserFs {
                     }
                 }
 
-                match self
-                    .client
-                    .delete_entry(&entry_path, false, &self.client_id)
-                {
+                let ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                match self.client.delete_entry(ino, false, &self.client_id) {
                     Ok(_) => {
                         reply.ok();
                         self.invalidate_kernel_dentry(parent, name_str);
@@ -1097,7 +1001,6 @@ impl Filesystem for PowerFsFuserFs {
 
         match self.client.create_entry(filer_entry, &self.client_id) {
             Ok(master_inode) => {
-
                 match self
                     .client
                     .acquire_lease(&parent_path, &self.client_id, 30000)
@@ -1321,9 +1224,17 @@ impl Filesystem for PowerFsFuserFs {
                                 }
                             }
                         } else {
-                            let chunk_fid = entry.chunks.iter()
+                            let chunk_fid = entry
+                                .chunks
+                                .iter()
                                 .find(|c| c.offset == chunk_offset)
-                                .and_then(|c| if c.fid.is_empty() { None } else { Some(c.fid.clone()) });
+                                .and_then(|c| {
+                                    if c.fid.is_empty() {
+                                        None
+                                    } else {
+                                        Some(c.fid.clone())
+                                    }
+                                });
                             match chunk_fid {
                                 Some(fid_str) => {
                                     let fid = match Fid::from_string(&fid_str) {
@@ -1517,9 +1428,17 @@ impl Filesystem for PowerFsFuserFs {
 
                 let mut initial_data = vec![0u8; chunk_size as usize];
 
-                let chunk_fid = entry.chunks.iter()
+                let chunk_fid = entry
+                    .chunks
+                    .iter()
                     .find(|c| c.offset == chunk_offset)
-                    .and_then(|c| if c.fid.is_empty() { None } else { Some(c.fid.clone()) });
+                    .and_then(|c| {
+                        if c.fid.is_empty() {
+                            None
+                        } else {
+                            Some(c.fid.clone())
+                        }
+                    });
                 if let Some(fid_str) = chunk_fid {
                     let fid = match Fid::from_string(&fid_str) {
                         Ok(f) => f,
@@ -1694,7 +1613,9 @@ impl Filesystem for PowerFsFuserFs {
                                 1
                             } else {
                                 match self.client.get_entry(parent_path) {
-                                    Ok(Some(e)) => e.attributes.as_ref().map(|a| a.ino).unwrap_or(1),
+                                    Ok(Some(e)) => {
+                                        e.attributes.as_ref().map(|a| a.ino).unwrap_or(1)
+                                    }
                                     _ => 1,
                                 }
                             }
@@ -1709,14 +1630,12 @@ impl Filesystem for PowerFsFuserFs {
         };
 
         let mut idx = offset as usize;
-        let mut next_offset: i64 = 0;
 
         if idx == 0 {
             if !reply.add(inode, 1, FileType::Directory, ".") {
                 reply.ok();
                 return;
             }
-            next_offset = 1;
             idx = 1;
         }
 
@@ -1725,11 +1644,10 @@ impl Filesystem for PowerFsFuserFs {
                 reply.ok();
                 return;
             }
-            next_offset = 2;
             idx = 2;
         }
 
-        match self.client.list_entries(&path, 1000, "") {
+        match self.client.list_entries(inode, 1000, "") {
             Ok(entries) => {
                 let child_offset = idx.saturating_sub(2);
                 for (i, entry) in entries.iter().enumerate().skip(child_offset) {
@@ -1743,7 +1661,7 @@ impl Filesystem for PowerFsFuserFs {
                         _ => FileType::RegularFile,
                     };
 
-                    next_offset = (child_offset + i + 3) as i64;
+                    let next_offset = (child_offset + i + 3) as i64;
                     if !reply.add(child_ino, next_offset, kind, &entry.name) {
                         break;
                     }
@@ -1786,7 +1704,10 @@ impl Filesystem for PowerFsFuserFs {
         let new_parent_path = match self.client.get_entry_by_inode(new_parent) {
             Ok(Some((_, p))) => p,
             _ => {
-                error!("rename: new_parent inode {} not found on master", new_parent);
+                error!(
+                    "rename: new_parent inode {} not found on master",
+                    new_parent
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -1874,31 +1795,32 @@ impl Filesystem for PowerFsFuserFs {
 
         if let Some(target) = target_entry {
             let target_attrs = target.attributes.as_ref();
-            let target_is_dir = target_attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+            let target_is_dir = target_attrs
+                .map(|a| (a.mode & 0o040000) != 0)
+                .unwrap_or(false);
             let entry_attrs = entry.attributes.as_ref();
-            let entry_is_dir = entry_attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+            let entry_is_dir = entry_attrs
+                .map(|a| (a.mode & 0o040000) != 0)
+                .unwrap_or(false);
 
             if target_is_dir && !entry_is_dir {
                 reply.error(libc::ENOTDIR);
                 return;
             }
 
-            if let Err(e) =
-                self.client
-                    .delete_entry(&target_path, target_is_dir, &self.client_id)
+            let target_ino = target_attrs.map(|a| a.ino).unwrap_or(0);
+            if let Err(e) = self
+                .client
+                .delete_entry(target_ino, target_is_dir, &self.client_id)
             {
                 warn!("Failed to delete target entry: {}", e);
             }
         }
 
-        match self.client.rename_entry(
-            &old_path,
-            &parent_path,
-            name_str,
-            &new_parent_path,
-            new_name_str,
-            &self.client_id,
-        ) {
+        match self
+            .client
+            .rename_entry(parent, name_str, new_parent, new_name_str, &self.client_id)
+        {
             Ok(_) => {
                 reply.ok();
                 self.invalidate_kernel_dentry(parent, name_str);
