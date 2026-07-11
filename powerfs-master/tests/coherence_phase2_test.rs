@@ -47,7 +47,7 @@ fn test_acquire_lease_returns_id() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("lease_test.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     let lease_id = tree.acquire_lease("/lease_test.txt", "client-1", 60000);
     assert!(!lease_id.is_empty());
@@ -58,7 +58,7 @@ fn test_has_active_lease_after_acquire() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("active.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     assert!(!tree.has_active_lease("/active.txt"));
 
@@ -72,7 +72,7 @@ fn test_release_lease_removes_lease() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("release_test.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     let lease_id = tree.acquire_lease("/release_test.txt", "client-1", 60000);
     assert!(tree.has_active_lease("/release_test.txt"));
@@ -96,7 +96,7 @@ fn test_multiple_leases_on_same_path() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("multi.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     let lease1 = tree.acquire_lease("/multi.txt", "client-1", 60000);
     let lease2 = tree.acquire_lease("/multi.txt", "client-2", 60000);
@@ -123,7 +123,7 @@ fn test_lease_expires_cleanup() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("expire.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     tree.acquire_lease("/expire.txt", "client-1", 1);
 
@@ -139,7 +139,7 @@ fn test_opportunistic_cleanup_on_acquire() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("opportune.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     tree.acquire_lease("/opportune.txt", "client-old", 1);
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -155,8 +155,8 @@ fn test_lease_independent_per_path() {
 
     let entry1 = create_test_entry("a.txt", "/", 0o100644);
     let entry2 = create_test_entry("b.txt", "/", 0o100644);
-    tree.create_entry(entry1).unwrap();
-    tree.create_entry(entry2).unwrap();
+    tree.create_entry(entry1, "test_client").unwrap();
+    tree.create_entry(entry2, "test_client").unwrap();
 
     let lease_a = tree.acquire_lease("/a.txt", "client-1", 60000);
 
@@ -174,7 +174,7 @@ fn test_release_one_lease_does_not_affect_others() {
     let (tree, _td) = setup_tree();
 
     let entry = create_test_entry("shared.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     let lease1 = tree.acquire_lease("/shared.txt", "client-a", 60000);
     let lease2 = tree.acquire_lease("/shared.txt", "client-b", 60000);
@@ -196,12 +196,12 @@ fn test_notification_always_published_even_with_lease() {
     let mut rx = tree.subscribe();
 
     let entry = create_test_entry("notify1.txt", "/", 0o100644);
-    tree.create_entry(entry).unwrap();
+    tree.create_entry(entry, "test_client").unwrap();
 
     tree.acquire_lease("/notify1.txt", "client-1", 60000);
 
     let entry2 = create_test_entry("notify2.txt", "/", 0o100644);
-    tree.create_entry(entry2).unwrap();
+    tree.create_entry(entry2, "test_client").unwrap();
 
     let mut count = 0;
     loop {
@@ -226,7 +226,7 @@ fn test_cleanup_expired_leases_multiple() {
     for i in 0..5 {
         let name = format!("expire_{}.txt", i);
         let entry = create_test_entry(&name, "/", 0o100644);
-        tree.create_entry(entry).unwrap();
+        tree.create_entry(entry, "test_client").unwrap();
         tree.acquire_lease(&format!("/{}", name), &format!("client-{}", i), 1);
     }
 
@@ -235,7 +235,7 @@ fn test_cleanup_expired_leases_multiple() {
     for i in 0..5 {
         let name = format!("stay_{}.txt", i);
         let entry = create_test_entry(&name, "/", 0o100644);
-        tree.create_entry(entry).unwrap();
+        tree.create_entry(entry, "test_client").unwrap();
         tree.acquire_lease(&format!("/{}", name), &format!("client-s{}", i), 60000);
     }
 

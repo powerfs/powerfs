@@ -295,7 +295,8 @@ fn test_update_notification_contains_epoch() {
         ..Entry::default()
     };
 
-    tree.create_entry(entry).expect("create_entry failed");
+    tree.create_entry(entry, "test_client")
+        .expect("create_entry failed");
     let _ = rx.try_recv();
 
     let updated_entry = Entry {
@@ -309,7 +310,7 @@ fn test_update_notification_contains_epoch() {
         }),
         ..Entry::default()
     };
-    tree.update_entry(updated_entry)
+    tree.update_entry(updated_entry, "test_client")
         .expect("update_entry failed");
 
     let notif = rx.try_recv().expect("Should receive UPDATE notification");
@@ -343,10 +344,11 @@ fn test_delete_notification_contains_epoch() {
         }),
         ..Entry::default()
     };
-    tree.create_entry(entry).expect("create_entry failed");
+    tree.create_entry(entry, "test_client")
+        .expect("create_entry failed");
     let _ = rx.try_recv();
 
-    tree.delete_entry("/epoch_delete_file")
+    tree.delete_entry("/epoch_delete_file", "test_client")
         .expect("delete failed");
 
     let notif = rx.try_recv().expect("Should receive DELETE notification");
@@ -669,7 +671,8 @@ fn test_all_event_types_carry_epoch() {
     };
 
     // CREATE
-    tree.create_entry(entry.clone()).expect("create failed");
+    tree.create_entry(entry.clone(), "test_client")
+        .expect("create failed");
     let notif_create = rx.try_recv().expect("Should receive CREATE");
     assert_eq!(notif_create.event_type, EventType::Create as i32);
     assert_eq!(notif_create.epoch, current_epoch);
@@ -679,13 +682,14 @@ fn test_all_event_types_carry_epoch() {
     if let Some(ref mut attrs) = updated_entry.attributes {
         attrs.size = 42;
     }
-    tree.update_entry(updated_entry).expect("update failed");
+    tree.update_entry(updated_entry, "test_client")
+        .expect("update failed");
     let notif_update = rx.try_recv().expect("Should receive UPDATE");
     assert_eq!(notif_update.event_type, EventType::Update as i32);
     assert_eq!(notif_update.epoch, current_epoch);
 
     // DELETE
-    tree.delete_entry("/all_events_file")
+    tree.delete_entry("/all_events_file", "test_client")
         .expect("delete failed");
     let notif_delete = rx.try_recv().expect("Should receive DELETE");
     assert_eq!(notif_delete.event_type, EventType::Delete as i32);
@@ -838,7 +842,8 @@ fn test_notification_includes_job_id() {
         }),
         ..Entry::default()
     };
-    tree.create_entry(entry).expect("create_entry failed");
+    tree.create_entry(entry, "test_client")
+        .expect("create_entry failed");
 
     let notif = rx.try_recv().expect("Should receive notification");
     assert_eq!(
@@ -865,7 +870,8 @@ fn test_notification_without_job_has_empty_job_id() {
         }),
         ..Entry::default()
     };
-    tree.create_entry(entry).expect("create_entry failed");
+    tree.create_entry(entry, "test_client")
+        .expect("create_entry failed");
 
     let notif = rx.try_recv().expect("Should receive notification");
     assert_eq!(

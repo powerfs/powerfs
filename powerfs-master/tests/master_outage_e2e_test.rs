@@ -617,7 +617,7 @@ async fn test_generation_increments_on_metadata_changes() {
     // Create an entry
     let entry = make_test_entry("gen_test_file", "/test");
     let _inode = dir_tree
-        .create_entry(entry.clone())
+        .create_entry(entry.clone(), "test_client")
         .expect("create_entry failed");
 
     let stored_after_create = dir_tree
@@ -634,7 +634,7 @@ async fn test_generation_increments_on_metadata_changes() {
     let mut updated_entry = entry.clone();
     updated_entry.generation = 0; // update_entry will assign a new generation
     dir_tree
-        .update_entry(updated_entry)
+        .update_entry(updated_entry, "test_client")
         .expect("update_entry failed");
 
     let stored_after_update = dir_tree
@@ -699,7 +699,7 @@ async fn test_generation_increments_on_metadata_changes() {
 
     // Delete the entry (publishes DELETE)
     let deleted = dir_tree
-        .delete_entry("/test/gen_test_file")
+        .delete_entry("/test/gen_test_file", "test_client")
         .expect("delete_entry failed");
     assert!(deleted, "delete_entry should report the entry was deleted");
 

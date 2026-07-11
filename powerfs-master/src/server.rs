@@ -3,7 +3,7 @@ use super::master::{AddNodeParams, MasterNode, UpdateNodeVolumesParams};
 use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::*;
 use futures::Stream;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
@@ -699,8 +699,17 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<CreateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        info!(
+            "create_entry request: name={}, directory={}, client_id={}",
+            req.entry.as_ref().map(|e| e.name.as_str()).unwrap_or(""),
+            req.entry
+                .as_ref()
+                .map(|e| e.directory.as_str())
+                .unwrap_or(""),
+            req.client_id
+        );
 
-        match dir_tree.create_entry(req.entry.unwrap_or_default()) {
+        match dir_tree.create_entry(req.entry.unwrap_or_default(), &req.client_id) {
             Ok(inode) => Ok(Response::new(CreateEntryResponse {
                 success: true,
                 error: String::new(),
@@ -720,8 +729,17 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<UpdateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        info!(
+            "update_entry request: name={}, directory={}, client_id={}",
+            req.entry.as_ref().map(|e| e.name.as_str()).unwrap_or(""),
+            req.entry
+                .as_ref()
+                .map(|e| e.directory.as_str())
+                .unwrap_or(""),
+            req.client_id
+        );
 
-        match dir_tree.update_entry(req.entry.unwrap_or_default()) {
+        match dir_tree.update_entry(req.entry.unwrap_or_default(), &req.client_id) {
             Ok(_) => Ok(Response::new(UpdateEntryResponse {
                 success: true,
                 error: String::new(),
@@ -740,7 +758,7 @@ impl MasterService for MasterGrpcServer {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
 
-        match dir_tree.delete_entry(&req.path) {
+        match dir_tree.delete_entry(&req.path, &req.client_id) {
             Ok(_) => Ok(Response::new(DeleteEntryResponse {
                 success: true,
                 error: String::new(),
@@ -749,6 +767,42 @@ impl MasterService for MasterGrpcServer {
                 success: false,
                 error: e.to_string(),
             })),
+        }
+    }
+
+    async fn rename_entry(
+        &self,
+        request: Request<powerfs::RenameEntryRequest>,
+    ) -> Result<Response<powerfs::RenameEntryResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            "rename_entry request: old_path={}, new_directory={}, new_name={}, client_id={}",
+            req.old_path, req.new_directory, req.new_name, req.client_id
+        );
+        let dir_tree = self.master.directory_tree.clone();
+
+        match dir_tree.rename_entry(
+            &req.old_path,
+            &req.old_directory,
+            &req.old_name,
+            &req.new_directory,
+            &req.new_name,
+            &req.client_id,
+        ) {
+            Ok(success) => {
+                info!("rename_entry result: success={}", success);
+                Ok(Response::new(powerfs::RenameEntryResponse {
+                    success,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => {
+                info!("rename_entry error: {}", e);
+                Ok(Response::new(powerfs::RenameEntryResponse {
+                    success: false,
+                    error: e.to_string(),
+                }))
+            }
         }
     }
 
@@ -782,21 +836,30 @@ impl MasterService for MasterGrpcServer {
                 let result = match req.mutation {
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Create(
                         create_req,
-                    )) => dir_tree
-                        .create_entry(create_req.entry.unwrap_or_default())
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
+                    )) => {
+                        let client_id = create_req.client_id.clone();
+                        dir_tree
+                            .create_entry(create_req.entry.unwrap_or_default(), &client_id)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
                         update_req,
-                    )) => dir_tree
-                        .update_entry(update_req.entry.unwrap_or_default())
-                        .map_err(|e| e.to_string()),
+                    )) => {
+                        let client_id = update_req.client_id.clone();
+                        dir_tree
+                            .update_entry(update_req.entry.unwrap_or_default(), &client_id)
+                            .map_err(|e| e.to_string())
+                    }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
                         delete_req,
-                    )) => dir_tree
-                        .delete_entry(&delete_req.path)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
+                    )) => {
+                        let client_id = delete_req.client_id.clone();
+                        dir_tree
+                            .delete_entry(&delete_req.path, &client_id)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
                     None => Ok(()),
                 };
 

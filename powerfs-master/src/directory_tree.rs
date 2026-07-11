@@ -1,6 +1,6 @@
 use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::{Entry, MetadataNotification};
-use log::debug;
+use log::{debug, info, warn};
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -206,14 +206,14 @@ impl DirectoryTree {
                     owner: String::new(),
                     generation: self.allocate_generation(),
                 };
-                let _ = self.create_entry(entry);
+                let _ = self.create_entry(entry, "");
             }
         }
 
         Ok(0)
     }
 
-    pub fn create_entry(&self, mut entry: Entry) -> Result<u64, rocksdb::Error> {
+    pub fn create_entry(&self, mut entry: Entry, client_id: &str) -> Result<u64, rocksdb::Error> {
         let inode = self.allocate_inode();
         let generation = self.allocate_generation();
 
@@ -229,12 +229,12 @@ impl DirectoryTree {
 
         self.db.put(&key, &data)?;
 
-        self.publish_notification(EventType::Create, &path, Some(entry));
+        self.publish_notification(EventType::Create, &path, Some(entry), client_id);
 
         Ok(inode)
     }
 
-    pub fn update_entry(&self, mut entry: Entry) -> Result<(), rocksdb::Error> {
+    pub fn update_entry(&self, mut entry: Entry, client_id: &str) -> Result<(), rocksdb::Error> {
         let generation = self.allocate_generation();
         entry.generation = generation;
 
@@ -245,20 +245,117 @@ impl DirectoryTree {
 
         self.db.put(&key, &data)?;
 
-        self.publish_notification(EventType::Update, &path, Some(entry));
+        self.publish_notification(EventType::Update, &path, Some(entry), client_id);
 
         Ok(())
     }
 
-    pub fn delete_entry(&self, path: &str) -> Result<bool, rocksdb::Error> {
+    pub fn delete_entry(&self, path: &str, client_id: &str) -> Result<bool, rocksdb::Error> {
         let exists = self.db.get(path.as_bytes())?.is_some();
         if exists {
+            let entry_bytes = self.db.get(path.as_bytes())?;
+            if let Some(bytes) = entry_bytes {
+                let decode_result: Result<Entry, _> = prost::Message::decode(bytes.as_ref());
+                if let Ok(entry) = decode_result {
+                    if let Some(attr) = entry.attributes {
+                        if (attr.mode & 0o40000) != 0 {
+                            let mut to_delete = Vec::new();
+                            let mut stack = vec![path.to_string()];
+
+                            while let Some(dir_path) = stack.pop() {
+                                let prefix = Self::path_prefix(&dir_path);
+                                let mut iter = self.db.iterator(IteratorMode::From(
+                                    &prefix,
+                                    rocksdb::Direction::Forward,
+                                ));
+                                while let Some(Ok((key, value))) = iter.next() {
+                                    if !key.starts_with(&prefix) {
+                                        break;
+                                    }
+                                    let child_path = String::from_utf8_lossy(&key).to_string();
+                                    if child_path != dir_path {
+                                        to_delete.push(child_path.clone());
+                                        let child_decode: Result<Entry, _> =
+                                            prost::Message::decode(value.as_ref());
+                                        if let Ok(child_entry) = child_decode {
+                                            if let Some(child_attr) = child_entry.attributes {
+                                                if (child_attr.mode & 0o40000) != 0 {
+                                                    stack.push(child_path);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            for child_path in to_delete {
+                                self.db.delete(child_path.as_bytes())?;
+                                self.publish_notification(
+                                    EventType::Delete,
+                                    &child_path,
+                                    None,
+                                    client_id,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             self.db.delete(path.as_bytes())?;
-
-            self.publish_notification(EventType::Delete, path, None);
-
+            self.publish_notification(EventType::Delete, path, None, client_id);
             Ok(true)
         } else {
+            Ok(false)
+        }
+    }
+
+    pub fn rename_entry(
+        &self,
+        old_path: &str,
+        _old_directory: &str,
+        _old_name: &str,
+        new_directory: &str,
+        new_name: &str,
+        client_id: &str,
+    ) -> Result<bool, rocksdb::Error> {
+        info!(
+            "rename_entry: old_path={}, new_directory={}, new_name={}",
+            old_path, new_directory, new_name
+        );
+        let entry_bytes = self.db.get(old_path.as_bytes())?;
+        if let Some(bytes) = entry_bytes {
+            let decode_result: Result<Entry, _> = prost::Message::decode(bytes.as_ref());
+            if let Ok(mut entry) = decode_result {
+                info!(
+                    "rename_entry: found entry name={}, directory={}",
+                    entry.name, entry.directory
+                );
+                let generation = self.allocate_generation();
+                entry.generation = generation;
+                entry.name = new_name.to_string();
+                entry.directory = new_directory.to_string();
+
+                let new_key = Self::path_to_key(new_directory, new_name);
+                let new_path = String::from_utf8_lossy(&new_key).to_string();
+                info!("rename_entry: new_key={}", new_path);
+                let mut data = Vec::new();
+                entry.encode(&mut data).expect("failed to encode entry");
+
+                self.db.delete(old_path.as_bytes())?;
+                self.db.put(&new_key, &data)?;
+                info!("rename_entry: db updated successfully");
+
+                self.publish_notification(EventType::Delete, old_path, None, client_id);
+                self.publish_notification(EventType::Rename, &new_path, Some(entry), client_id);
+
+                Ok(true)
+            } else {
+                warn!("rename_entry: failed to decode entry");
+                Ok(false)
+            }
+        } else {
+            warn!("rename_entry: old_path not found in db");
             Ok(false)
         }
     }
@@ -351,10 +448,13 @@ impl DirectoryTree {
         Ok(())
     }
 
-    fn publish_notification(&self, event_type: EventType, path: &str, entry: Option<Entry>) {
-        // Note: lease filtering is performed on the client side. The master always
-        // publishes notifications so that non-leasing clients receive invalidations.
-        // A client holding a lease on a path will ignore notifications for that path.
+    fn publish_notification(
+        &self,
+        event_type: EventType,
+        path: &str,
+        entry: Option<Entry>,
+        client_id: &str,
+    ) {
         let generation = entry.as_ref().map(|e| e.generation).unwrap_or(0);
         let epoch = self.get_epoch();
         let job_id = self
@@ -372,6 +472,7 @@ impl DirectoryTree {
             old_path: String::new(),
             epoch,
             job_id,
+            source_client_id: client_id.to_string(),
         };
         let _ = self.notifier.send(notification);
     }
@@ -574,7 +675,7 @@ impl DirectoryTree {
             debug!("Job {} completed with {} clients", job_id, client_count);
 
             drop(jobs);
-            self.publish_notification(EventType::JobComplete, "/", None);
+            self.publish_notification(EventType::JobComplete, "/", None, "");
 
             Some(client_count)
         } else {

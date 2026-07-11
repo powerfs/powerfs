@@ -5,7 +5,7 @@ use powerfs_master::proto::powerfs::{
     DeleteEntryRequest, Entry, GetEntryRequest, JobCompletionRequest, JobDeregistrationRequest,
     JobRegistrationRequest, LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
     ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification,
-    SubscribeMetadataRequest, UpdateEntryRequest,
+    RenameEntryRequest, SubscribeMetadataRequest, UpdateEntryRequest,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -49,23 +49,45 @@ impl ConnectionPool {
             return Ok(ch);
         }
 
-        info!("Creating new connection to: {}", self.addr);
-        let grpc_addr = format!("http://{}", self.addr);
-        let ch = Channel::from_shared(grpc_addr)
-            .map_err(|e| format!("invalid address: {}", e))?
-            .http2_keep_alive_interval(self.config.keepalive_interval)
-            .keep_alive_timeout(self.config.keepalive_timeout)
-            .connect_timeout(self.config.connect_timeout)
-            .connect()
-            .await
-            .map_err(|e| {
-                let msg = format!("failed to connect to {}: {}", self.addr, e);
-                error!("{}", msg);
-                msg
-            })?;
+        let mut backoff = Duration::from_millis(100);
+        let max_backoff = Duration::from_secs(10);
+        let max_attempts = 5;
 
-        info!("Connected to: {}", self.addr);
-        Ok(ch)
+        for attempt in 1..=max_attempts {
+            info!(
+                "Creating new connection to: {} (attempt {}/{})",
+                self.addr, attempt, max_attempts
+            );
+            let grpc_addr = format!("http://{}", self.addr);
+            match Channel::from_shared(grpc_addr)
+                .map_err(|e| format!("invalid address: {}", e))?
+                .http2_keep_alive_interval(self.config.keepalive_interval)
+                .keep_alive_timeout(self.config.keepalive_timeout)
+                .connect_timeout(self.config.connect_timeout)
+                .connect()
+                .await
+            {
+                Ok(ch) => {
+                    info!("Connected to: {}", self.addr);
+                    return Ok(ch);
+                }
+                Err(e) => {
+                    let msg = format!("failed to connect to {}: {}", self.addr, e);
+                    if attempt == max_attempts {
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                    warn!("{} (retrying in {:?})", msg, backoff);
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                }
+            }
+        }
+
+        Err(format!(
+            "failed to connect to {} after {} attempts",
+            self.addr, max_attempts
+        ))
     }
 
     async fn put(&self, ch: Channel) {
@@ -754,7 +776,7 @@ impl PowerFuseClient {
         Err("read_blob failed after max retries".to_string())
     }
 
-    pub async fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+    pub async fn create_entry(&self, entry: Entry, client_id: &str) -> Result<u64, String> {
         debug!(
             "create_entry: name={}, directory={}",
             entry.name, entry.directory
@@ -776,6 +798,7 @@ impl PowerFuseClient {
             let mut client = MasterServiceClient::new(channel);
             let request = CreateEntryRequest {
                 entry: Some(entry.clone()),
+                client_id: client_id.to_string(),
             };
 
             match client.create_entry(tonic::Request::new(request)).await {
@@ -802,7 +825,7 @@ impl PowerFuseClient {
         Err("create_entry failed after max retries".to_string())
     }
 
-    pub async fn update_entry(&self, entry: &Entry) -> Result<(), String> {
+    pub async fn update_entry(&self, entry: &Entry, client_id: &str) -> Result<(), String> {
         debug!(
             "update_entry: name={}, directory={}",
             entry.name, entry.directory
@@ -824,6 +847,7 @@ impl PowerFuseClient {
             let mut client = MasterServiceClient::new(channel);
             let request = UpdateEntryRequest {
                 entry: Some(entry.clone()),
+                client_id: client_id.to_string(),
             };
 
             match client.update_entry(tonic::Request::new(request)).await {
@@ -897,7 +921,12 @@ impl PowerFuseClient {
         Err("get_entry failed after max retries".to_string())
     }
 
-    pub async fn delete_entry(&self, path: &str, is_directory: bool) -> Result<bool, String> {
+    pub async fn delete_entry(
+        &self,
+        path: &str,
+        is_directory: bool,
+        client_id: &str,
+    ) -> Result<bool, String> {
         debug!("delete_entry: path={}, is_directory={}", path, is_directory);
 
         for attempt in 1..=self.config.max_retry_count {
@@ -917,6 +946,7 @@ impl PowerFuseClient {
             let request = DeleteEntryRequest {
                 path: path.to_string(),
                 is_directory,
+                client_id: client_id.to_string(),
             };
 
             match client.delete_entry(tonic::Request::new(request)).await {
@@ -941,6 +971,67 @@ impl PowerFuseClient {
         }
 
         Err("delete_entry failed after max retries".to_string())
+    }
+
+    pub async fn rename_entry(
+        &self,
+        old_path: &str,
+        old_directory: &str,
+        old_name: &str,
+        new_directory: &str,
+        new_name: &str,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        debug!(
+            "rename_entry: old_path={}, new_directory={}, new_name={}",
+            old_path, new_directory, new_name
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.ensure_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel.clone());
+            let request = RenameEntryRequest {
+                old_path: old_path.to_string(),
+                old_directory: old_directory.to_string(),
+                old_name: old_name.to_string(),
+                new_directory: new_directory.to_string(),
+                new_name: new_name.to_string(),
+                client_id: client_id.to_string(),
+            };
+
+            match client.rename_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("rename_entry succeeded");
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("rename_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("rename_entry failed after max retries".to_string())
     }
 
     pub async fn list_entries(
@@ -1457,16 +1548,16 @@ impl SyncFuseClient {
         ))
     }
 
-    pub fn create_entry(&self, entry: Entry) -> Result<u64, String> {
+    pub fn create_entry(&self, entry: Entry, client_id: &str) -> Result<u64, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.create_entry(entry))
+            .block_on(self.client.create_entry(entry, client_id))
     }
 
-    pub fn update_entry(&self, entry: &Entry) -> Result<(), String> {
+    pub fn update_entry(&self, entry: &Entry, client_id: &str) -> Result<(), String> {
         self.client
             .runtime_handle
-            .block_on(self.client.update_entry(entry))
+            .block_on(self.client.update_entry(entry, client_id))
     }
 
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
@@ -1475,10 +1566,36 @@ impl SyncFuseClient {
             .block_on(self.client.get_entry(path))
     }
 
-    pub fn delete_entry(&self, path: &str, is_directory: bool) -> Result<bool, String> {
+    pub fn delete_entry(
+        &self,
+        path: &str,
+        is_directory: bool,
+        client_id: &str,
+    ) -> Result<bool, String> {
         self.client
             .runtime_handle
-            .block_on(self.client.delete_entry(path, is_directory))
+            .block_on(self.client.delete_entry(path, is_directory, client_id))
+    }
+
+    pub fn rename_entry(
+        &self,
+        old_path: &str,
+        old_directory: &str,
+        old_name: &str,
+        new_directory: &str,
+        new_name: &str,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        self.client
+            .runtime_handle
+            .block_on(self.client.rename_entry(
+                old_path,
+                old_directory,
+                old_name,
+                new_directory,
+                new_name,
+                client_id,
+            ))
     }
 
     pub fn list_entries(

@@ -11,11 +11,27 @@ cleanup_processes() {
     pkill -f "powerfs master" 2>/dev/null || true
     pkill -f "powerfs-volume" 2>/dev/null || true
     pkill -f "powerfs-fuse" 2>/dev/null || true
+    pkill -f "powerfs-server" 2>/dev/null || true
+    pkill -f "powerfs-monitor" 2>/dev/null || true
+    pkill -f "powerfs-s3" 2>/dev/null || true
     
     sleep 1
     
     for pid in $(pgrep -f "powerfs" 2>/dev/null); do
         kill -9 "$pid" 2>/dev/null || true
+    done
+    
+    sleep 0.5
+}
+
+cleanup_test_processes() {
+    echo "Cleaning up leftover test processes..."
+    
+    for proc in "cargo test" "rustc" "sync_test" "coherence_phase" "master_outage" "filer_api_test"; do
+        pids=$(pgrep -f "$proc" 2>/dev/null)
+        for pid in $pids; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
     done
     
     sleep 0.5
@@ -56,6 +72,7 @@ main() {
     
     cleanup_mount
     cleanup_processes
+    cleanup_test_processes
     cleanup_ports
     cleanup_dirs
     

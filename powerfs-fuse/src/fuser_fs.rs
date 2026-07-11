@@ -10,12 +10,13 @@ use powerfs_common::types::Fid;
 use powerfs_master::proto::powerfs::{Entry as FilerEntry, MetadataNotification};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use uuid;
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(0);
 
 pub struct WriteBufferEntry {
     pub offset: u64,
@@ -75,6 +76,7 @@ struct PowerFsFuserFs {
     master_epoch: Arc<std::sync::atomic::AtomicU64>,
     client_id: String,
     job_id: String,
+    notifier: Arc<std::sync::Mutex<Option<fuser::Notifier>>>,
 }
 
 impl PowerFsFuserFs {
@@ -102,7 +104,54 @@ impl PowerFsFuserFs {
             master_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client_id,
             job_id,
+            notifier: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn invalidate_kernel_dentry(&self, parent: u64, name: &str) {
+        let notifier_guard = self.notifier.lock().unwrap();
+        if let Some(notifier) = notifier_guard.as_ref() {
+            if let Err(e) = notifier.inval_entry(parent, OsStr::new(name)) {
+                debug!(
+                    "Failed to invalidate kernel dentry (parent={}, name={}): {}",
+                    parent, name, e
+                );
+            }
+        }
+    }
+
+    fn invalidate_kernel_inode(&self, inode: u64) {
+        let notifier_guard = self.notifier.lock().unwrap();
+        if let Some(notifier) = notifier_guard.as_ref() {
+            if let Err(e) = notifier.inval_inode(inode, 0, -1) {
+                debug!("Failed to invalidate kernel inode ({}): {}", inode, e);
+            }
+        }
+    }
+
+    fn remove_inode_recursive(&self, inode: u64) {
+        let mut visited = std::collections::HashSet::new();
+        self.remove_inode_recursive_inner(inode, &mut visited);
+    }
+
+    fn remove_inode_recursive_inner(
+        &self,
+        inode: u64,
+        visited: &mut std::collections::HashSet<u64>,
+    ) {
+        if !visited.insert(inode) {
+            warn!(
+                "Detected cycle in directory tree, skipping inode: {}",
+                inode
+            );
+            return;
+        }
+        let children = self.cache.list_children(inode);
+        for (child_inode, _, _) in children {
+            self.remove_inode_recursive_inner(child_inode, visited);
+        }
+        self.cache.remove(inode);
+        self.chunk_cache.remove_inode_chunks(inode);
     }
 
     fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
@@ -188,11 +237,23 @@ impl PowerFsFuserFs {
         let mut dirty_set = self.dirty_chunks.write().unwrap();
         dirty_set.retain(|(ino, _)| *ino != inode);
 
-        let path = self.cache.inode_to_path(inode).unwrap_or_default();
+        let path = self
+            .cache
+            .get_path_by_parent_chain(inode)
+            .unwrap_or_default();
+        let directory = if let Some(last_slash) = path.rfind('/') {
+            if last_slash == 0 {
+                "/".to_string()
+            } else {
+                path[..last_slash].to_string()
+            }
+        } else {
+            "/".to_string()
+        };
         if !path.is_empty() && !chunks.is_empty() {
             let filer_entry = powerfs_master::proto::powerfs::Entry {
                 name: entry.name.clone(),
-                directory: self.cache.inode_to_path(entry.parent).unwrap_or_default(),
+                directory,
                 attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                     ino: entry.inode,
                     mode: entry.mode | 0o100000,
@@ -213,7 +274,7 @@ impl PowerFsFuserFs {
                 hard_link_id: entry.hard_link_id.clone(),
                 hard_link_counter: entry.hard_link_counter,
                 extended: HashMap::new(),
-                content_size: entry.content_size,
+                content_size: entry.size,
                 disk_size: entry.disk_size,
                 ttl: String::new(),
                 symlink_target: String::new(),
@@ -221,7 +282,7 @@ impl PowerFsFuserFs {
                 generation: entry.generation,
             };
 
-            if let Err(e) = self.client.update_entry(&filer_entry) {
+            if let Err(e) = self.client.update_entry(&filer_entry, &self.client_id) {
                 warn!("Failed to update entry on master: {}", e);
             }
         }
@@ -299,7 +360,37 @@ impl PowerFsFuserFs {
         for (chunk_idx, data) in merged_data {
             let chunk_offset = chunk_idx * chunk_size;
             let now = chrono::Utc::now().timestamp() as u64;
-            self.chunk_cache.put(inode, chunk_offset, data, now, 0);
+
+            let existing_chunk = self.chunk_cache.get(inode, chunk_offset);
+            info!(
+                "flush_write_buffer: inode={}, chunk_idx={}, has_existing_chunk={}, data_non_zero={}",
+                inode,
+                chunk_idx,
+                existing_chunk.is_some(),
+                data.iter().filter(|&&b| b != 0).count()
+            );
+
+            if let Some(existing_chunk) = existing_chunk {
+                let mut merged_chunk = existing_chunk.data.clone();
+                let mut changed = false;
+                for (i, byte) in data.iter().enumerate() {
+                    if *byte != 0 {
+                        merged_chunk[i] = *byte;
+                        changed = true;
+                    }
+                }
+                let merged_non_zero = merged_chunk.iter().filter(|&&b| b != 0).count();
+                info!(
+                    "flush_write_buffer: merged existing chunk, non-zero bytes after merge: {}",
+                    merged_non_zero
+                );
+                if changed {
+                    self.chunk_cache
+                        .put(inode, chunk_offset, merged_chunk, now, 0);
+                }
+            } else {
+                self.chunk_cache.put(inode, chunk_offset, data, now, 0);
+            }
 
             let mut dirty_set = self.dirty_chunks.write().unwrap();
             dirty_set.insert((inode, chunk_idx));
@@ -413,6 +504,7 @@ impl Clone for PowerFsFuserFs {
             master_epoch: self.master_epoch.clone(),
             client_id: self.client_id.clone(),
             job_id: self.job_id.clone(),
+            notifier: self.notifier.clone(),
         }
     }
 }
@@ -437,7 +529,7 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = self
             .cache
-            .inode_to_path(parent)
+            .get_path_by_parent_chain(parent)
             .unwrap_or_else(|| "/".to_string());
         let lookup_path = if parent_path == "/" {
             format!("/{}", name_str)
@@ -550,8 +642,18 @@ impl Filesystem for PowerFsFuserFs {
 
         let path = self
             .cache
-            .inode_to_path(inode)
+            .get_path_by_parent_chain(inode)
             .unwrap_or_else(|| "/".to_string());
+
+        let directory = if let Some(last_slash) = path.rfind('/') {
+            if last_slash == 0 {
+                "/".to_string()
+            } else {
+                path[..last_slash].to_string()
+            }
+        } else {
+            "/".to_string()
+        };
 
         let new_mode = mode.unwrap_or(entry.mode);
         let new_uid = uid.unwrap_or(entry.uid);
@@ -562,7 +664,7 @@ impl Filesystem for PowerFsFuserFs {
 
         let filer_entry = FilerEntry {
             name: entry.name.clone(),
-            directory: path.clone(),
+            directory,
             attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                 ino: inode,
                 mode: if entry.is_dir {
@@ -606,7 +708,7 @@ impl Filesystem for PowerFsFuserFs {
             generation: entry.generation,
         };
 
-        match self.client.update_entry(&filer_entry) {
+        match self.client.update_entry(&filer_entry, &self.client_id) {
             Ok(_) => {
                 self.cache.update_attr(
                     inode,
@@ -684,8 +786,33 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = self
             .cache
-            .inode_to_path(parent)
+            .get_path_by_parent_chain(parent)
             .unwrap_or_else(|| "/".to_string());
+
+        match self
+            .client
+            .acquire_lease(&parent_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                let lease_info = LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: parent_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                };
+                let mut leases = self.leases.write().unwrap();
+                leases.entry(parent).or_default().push(lease_info);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for parent directory {}: {}",
+                    parent_path, e
+                );
+            }
+        }
+
         let filer_entry = FilerEntry {
             name: name_str.to_string(),
             directory: parent_path,
@@ -717,10 +844,22 @@ impl Filesystem for PowerFsFuserFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry) {
-            Ok(_) => {
-                let attr = self.create_file_attr(&entry);
+        match self.client.create_entry(filer_entry, &self.client_id) {
+            Ok(master_inode) => {
+                let final_inode = if master_inode != inode {
+                    self.cache.remove(inode);
+                    let mut corrected_entry = entry.clone();
+                    corrected_entry.inode = master_inode;
+                    self.cache.insert(corrected_entry);
+                    master_inode
+                } else {
+                    inode
+                };
+
+                let corrected_entry = self.cache.get_inode(final_inode).unwrap_or(entry);
+                let attr = self.create_file_attr(&corrected_entry);
                 reply.entry(&TTL, &attr, 0);
+                self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
                 self.cache.remove(inode);
@@ -747,19 +886,51 @@ impl Filesystem for PowerFsFuserFs {
             return;
         }
 
-        if !self.cache.list_children(entry.inode).is_empty() {
+        let children = self.cache.list_children(entry.inode);
+        if !children.is_empty() {
             reply.error(libc::ENOTEMPTY);
             return;
         }
 
+        let parent_path = self
+            .cache
+            .get_path_by_parent_chain(parent)
+            .unwrap_or_else(|| "/".to_string());
+
+        match self
+            .client
+            .acquire_lease(&parent_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                let lease_info = LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: parent_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                };
+                let mut leases = self.leases.write().unwrap();
+                leases.entry(parent).or_default().push(lease_info);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for parent directory {}: {}",
+                    parent_path, e
+                );
+            }
+        }
+
         let entry_path = self
             .cache
-            .inode_to_path(entry.inode)
+            .get_path_by_parent_chain(entry.inode)
             .unwrap_or_else(|| "/".to_string());
-        match self.client.delete_entry(&entry_path, true) {
+        match self.client.delete_entry(&entry_path, true, &self.client_id) {
             Ok(_) => {
-                self.cache.remove(entry.inode);
+                self.remove_inode_recursive(entry.inode);
                 reply.ok();
+                self.invalidate_kernel_dentry(parent, name_str);
+                self.invalidate_kernel_inode(entry.inode);
             }
             Err(e) => {
                 error!("Failed to delete directory entry on master: {}", e);
@@ -780,12 +951,41 @@ impl Filesystem for PowerFsFuserFs {
             }
         };
 
+        let parent_path = self
+            .cache
+            .get_path_by_parent_chain(parent)
+            .unwrap_or_else(|| "/".to_string());
+
+        match self
+            .client
+            .acquire_lease(&parent_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                let lease_info = LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: parent_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                };
+                let mut leases = self.leases.write().unwrap();
+                leases.entry(parent).or_default().push(lease_info);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for parent directory {}: {}",
+                    parent_path, e
+                );
+            }
+        }
+
         let should_delete = self.cache.dec_nlink(entry.inode);
 
         if should_delete {
             let entry_path = self
                 .cache
-                .inode_to_path(entry.inode)
+                .get_path_by_parent_chain(entry.inode)
                 .unwrap_or_else(|| "/".to_string());
 
             if let Some(fid) = &entry.fid {
@@ -807,10 +1007,15 @@ impl Filesystem for PowerFsFuserFs {
                 }
             }
 
-            match self.client.delete_entry(&entry_path, false) {
+            match self
+                .client
+                .delete_entry(&entry_path, false, &self.client_id)
+            {
                 Ok(_) => {
                     self.cache.remove(entry.inode);
                     reply.ok();
+                    self.invalidate_kernel_dentry(parent, name_str);
+                    self.invalidate_kernel_inode(entry.inode);
                 }
                 Err(e) => {
                     error!("Failed to delete entry on master: {}", e);
@@ -872,12 +1077,74 @@ impl Filesystem for PowerFsFuserFs {
             disk_size: 0,
             generation: 0,
         };
-        self.cache.insert(entry.clone());
-
         let parent_path = self
             .cache
-            .inode_to_path(parent)
+            .get_path_by_parent_chain(parent)
             .unwrap_or_else(|| "/".to_string());
+        let file_path = if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
+
+        let mut parent_lease_info: Option<LeaseInfo> = None;
+        match self
+            .client
+            .acquire_lease(&parent_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                parent_lease_info = Some(LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: parent_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for parent directory {}: {}",
+                    parent_path, e
+                );
+            }
+        }
+
+        if let Some(lease) = &parent_lease_info {
+            let mut leases = self.leases.write().unwrap();
+            leases.entry(parent).or_default().push(lease.clone());
+        }
+
+        let lease_info = match self
+            .client
+            .acquire_lease(&file_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                Some(LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: file_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                })
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for created file {}: {}",
+                    file_path, e
+                );
+                None
+            }
+        };
+
+        if let Some(lease) = &lease_info {
+            let mut leases = self.leases.write().unwrap();
+            leases.entry(inode).or_default().push(lease.clone());
+        }
+
+        self.cache.insert(entry.clone());
+
         let filer_entry = FilerEntry {
             name: name_str.to_string(),
             directory: parent_path.clone(),
@@ -909,10 +1176,34 @@ impl Filesystem for PowerFsFuserFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry) {
-            Ok(_) => {
-                let attr = self.create_file_attr(&entry);
+        match self.client.create_entry(filer_entry, &self.client_id) {
+            Ok(master_inode) => {
+                info!(
+                    "create: local_inode={}, master_inode={}",
+                    inode, master_inode
+                );
+                let final_inode = if master_inode != inode {
+                    info!("create: replacing inode {} with {}", inode, master_inode);
+                    self.cache.remove(inode);
+                    let mut corrected_entry = entry.clone();
+                    corrected_entry.inode = master_inode;
+                    self.cache.insert(corrected_entry);
+                    master_inode
+                } else {
+                    inode
+                };
+
+                if let Some(lease) = &lease_info {
+                    let mut leases = self.leases.write().unwrap();
+                    leases.entry(final_inode).or_default().push(lease.clone());
+                    leases.remove(&inode);
+                }
+
+                let corrected_entry = self.cache.get_inode(final_inode).unwrap_or(entry);
+                let attr = self.create_file_attr(&corrected_entry);
+                info!("create: returning inode={}", attr.ino);
                 reply.created(&TTL, &attr, 0, 0, 0);
+                self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
                 self.cache.remove(inode);
@@ -927,7 +1218,7 @@ impl Filesystem for PowerFsFuserFs {
         if let Some(entry) = self.cache.get_inode(inode) {
             let _attr = self.create_file_attr(&entry);
 
-            if let Some(path) = self.cache.inode_to_path(inode) {
+            if let Some(path) = self.cache.get_path_by_parent_chain(inode) {
                 match self.client.acquire_lease(&path, &self.client_id, 30000) {
                     Ok((lease_id, epoch)) => {
                         self.master_epoch
@@ -1182,10 +1473,23 @@ impl Filesystem for PowerFsFuserFs {
         self.cache.update_size(inode, new_size);
 
         let chunk_size = self.chunk_cache.chunk_size();
+        info!(
+            "write: inode={}, offset={}, size={}, chunk_size={}, threshold={}",
+            inode,
+            offset_u64,
+            data_len,
+            chunk_size,
+            chunk_size / 4
+        );
 
         if data_len < chunk_size as usize / 4 {
+            debug!(
+                "write: small write, using write_buffer, inode={}, offset={}, size={}",
+                inode, offset_u64, data_len
+            );
             let should_flush = self.write_buffer.add(inode, offset_u64, data);
             if should_flush {
+                debug!("write: write_buffer full, flushing");
                 let entries = self.write_buffer.take(inode);
                 self.flush_write_buffer(inode, &entries);
             }
@@ -1395,9 +1699,23 @@ impl Filesystem for PowerFsFuserFs {
 
         let path = self
             .cache
-            .inode_to_path(inode)
+            .get_path_by_parent_chain(inode)
             .unwrap_or_else(|| "/".to_string());
         if let Ok(entries) = self.client.list_entries(&path, 1000, "") {
+            let master_names: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.name.clone()).collect();
+
+            let children = self.cache.list_children(inode);
+            for (child_inode, child_name, _) in &children {
+                if !master_names.contains(child_name) {
+                    debug!(
+                        "readdir: removing stale cache entry '{}' (inode={}) not in master",
+                        child_name, child_inode
+                    );
+                    self.cache.remove(*child_inode);
+                }
+            }
+
             for entry in entries {
                 let existing = self.cache.lookup_in_cache(inode, &entry.name);
                 if existing.is_none() {
@@ -1457,8 +1775,30 @@ impl Filesystem for PowerFsFuserFs {
 
         let children = self.cache.list_children(inode);
 
+        let parent_inode = entry.parent;
+        let mut next_offset: i64 = 0;
         let mut idx = offset as usize;
-        for (child_inode, ref child_name, _is_dir) in children.iter().skip(idx) {
+
+        if idx == 0 {
+            if !reply.add(inode, 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+            next_offset = 1;
+            idx = 1;
+        }
+
+        if idx == 1 {
+            if !reply.add(parent_inode, 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+            next_offset = 2;
+            idx = 2;
+        }
+
+        let child_offset = idx.saturating_sub(2);
+        for (child_inode, ref child_name, _is_dir) in children.iter().skip(child_offset) {
             let child_entry = match self.cache.get_inode(*child_inode) {
                 Some(e) => e,
                 None => continue,
@@ -1472,17 +1812,14 @@ impl Filesystem for PowerFsFuserFs {
                 FileType::RegularFile
             };
 
-            if !reply.add(
-                *child_inode,
-                (idx + 1) as i64,
-                file_type,
-                child_name.as_str(),
-            ) {
+            next_offset = (idx + 1) as i64;
+            if !reply.add(*child_inode, next_offset, file_type, child_name.as_str()) {
                 break;
             }
             idx += 1;
         }
 
+        let _ = next_offset;
         reply.ok();
     }
 
@@ -1511,13 +1848,68 @@ impl Filesystem for PowerFsFuserFs {
             }
         };
 
-        let old_path = self
+        let parent_path = self
             .cache
-            .inode_to_path(entry.inode)
+            .get_path_by_parent_chain(parent)
             .unwrap_or_else(|| "/".to_string());
         let new_parent_path = self
             .cache
-            .inode_to_path(new_parent)
+            .get_path_by_parent_chain(new_parent)
+            .unwrap_or_else(|| "/".to_string());
+
+        match self
+            .client
+            .acquire_lease(&parent_path, &self.client_id, 30000)
+        {
+            Ok((lease_id, epoch)) => {
+                self.master_epoch
+                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                let lease_info = LeaseInfo {
+                    lease_id: lease_id.clone(),
+                    path: parent_path.clone(),
+                    duration_ms: 30000,
+                    acquired_at: std::time::Instant::now(),
+                };
+                let mut leases = self.leases.write().unwrap();
+                leases.entry(parent).or_default().push(lease_info);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to acquire lease for parent directory {}: {}",
+                    parent_path, e
+                );
+            }
+        }
+
+        if parent != new_parent {
+            match self
+                .client
+                .acquire_lease(&new_parent_path, &self.client_id, 30000)
+            {
+                Ok((lease_id, epoch)) => {
+                    self.master_epoch
+                        .store(epoch, std::sync::atomic::Ordering::SeqCst);
+                    let lease_info = LeaseInfo {
+                        lease_id: lease_id.clone(),
+                        path: new_parent_path.clone(),
+                        duration_ms: 30000,
+                        acquired_at: std::time::Instant::now(),
+                    };
+                    let mut leases = self.leases.write().unwrap();
+                    leases.entry(new_parent).or_default().push(lease_info);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to acquire lease for new parent directory {}: {}",
+                        new_parent_path, e
+                    );
+                }
+            }
+        }
+
+        let old_path = self
+            .cache
+            .get_path_by_parent_chain(entry.inode)
             .unwrap_or_else(|| "/".to_string());
 
         let target_path = if new_parent_path == "/" {
@@ -1556,7 +1948,10 @@ impl Filesystem for PowerFsFuserFs {
                     }
                 }
 
-                if let Err(e) = self.client.delete_entry(&target_path, target.is_dir) {
+                if let Err(e) =
+                    self.client
+                        .delete_entry(&target_path, target.is_dir, &self.client_id)
+                {
                     warn!("Failed to delete target entry: {}", e);
                 }
             }
@@ -1568,64 +1963,37 @@ impl Filesystem for PowerFsFuserFs {
             .cache
             .rename(parent, name_str, new_parent, new_name_str);
 
-        let filer_entry = FilerEntry {
-            name: new_name_str.to_string(),
-            directory: new_parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: entry.inode,
-                mode: if entry.is_dir {
-                    entry.mode | 0o040000
-                } else {
-                    entry.mode | 0o100000
-                },
-                nlink: entry.nlink,
-                uid: entry.uid,
-                gid: entry.gid,
-                rdev: 0,
-                size: entry.size,
-                blksize: 4096,
-                blocks: entry.size.div_ceil(512),
-                atime: entry.atime as u64,
-                mtime: entry.mtime as u64,
-                ctime: chrono::Utc::now().timestamp() as u64,
-                crtime: entry.ctime as u64,
-                perm: 0,
-            }),
-            chunks: entry
-                .chunks
-                .iter()
-                .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                    offset: c.offset,
-                    size: c.size,
-                    mtime: c.mtime,
-                    fid: c.fid.clone(),
-                    cookie: c.cookie,
-                    crc32: c.crc32,
-                })
-                .collect(),
-            hard_link_id: entry.hard_link_id,
-            hard_link_counter: entry.hard_link_counter,
-            extended: HashMap::new(),
-            content_size: entry.content_size,
-            disk_size: entry.disk_size,
-            ttl: String::new(),
-            symlink_target: entry.symlink_target.unwrap_or_default(),
-            owner: String::new(),
-            generation: entry.generation,
-        };
+        match self.cache.get_inode(entry.inode) {
+            Some(updated) => debug!(
+                "After local rename: inode={}, name={}, parent={}",
+                updated.inode, updated.name, updated.parent
+            ),
+            None => warn!(
+                "Entry disappeared after local rename: inode={}",
+                entry.inode
+            ),
+        }
 
-        match self.client.delete_entry(&old_path, entry.is_dir) {
-            Ok(_) => match self.client.create_entry(filer_entry) {
-                Ok(_) => {
-                    reply.ok();
+        let new_parent_path_clone = new_parent_path.clone();
+
+        match self.client.rename_entry(
+            &old_path,
+            &parent_path,
+            name_str,
+            &new_parent_path_clone,
+            new_name_str,
+            &self.client_id,
+        ) {
+            Ok(_) => {
+                reply.ok();
+                self.invalidate_kernel_dentry(parent, name_str);
+                if parent != new_parent {
+                    self.invalidate_kernel_dentry(new_parent, new_name_str);
                 }
-                Err(e) => {
-                    error!("Failed to create new entry during rename: {}", e);
-                    reply.error(libc::EIO);
-                }
-            },
+                self.invalidate_kernel_inode(entry.inode);
+            }
             Err(e) => {
-                error!("Failed to delete old entry during rename: {}", e);
+                error!("Failed to rename entry: {}", e);
                 reply.error(libc::EIO);
             }
         }
@@ -1676,7 +2044,7 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = self
             .cache
-            .inode_to_path(parent)
+            .get_path_by_parent_chain(parent)
             .unwrap_or_else(|| "/".to_string());
         let filer_entry = FilerEntry {
             name: name_str.to_string(),
@@ -1709,7 +2077,7 @@ impl Filesystem for PowerFsFuserFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry) {
+        match self.client.create_entry(filer_entry, &self.client_id) {
             Ok(_) => {
                 let attr = self.create_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
@@ -1799,7 +2167,7 @@ impl Filesystem for PowerFsFuserFs {
 
         let parent_path = self
             .cache
-            .inode_to_path(new_parent)
+            .get_path_by_parent_chain(new_parent)
             .unwrap_or_else(|| "/".to_string());
         let filer_entry = FilerEntry {
             name: new_name_str.to_string(),
@@ -1847,7 +2215,7 @@ impl Filesystem for PowerFsFuserFs {
             generation: entry.generation,
         };
 
-        match self.client.create_entry(filer_entry) {
+        match self.client.create_entry(filer_entry, &self.client_id) {
             Ok(_) => {
                 let attr = self.create_file_attr(&new_entry);
                 reply.entry(&TTL, &attr, 0);
@@ -1876,25 +2244,29 @@ impl Filesystem for PowerFsFuserFs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn metadata_subscription_loop(
     master_addr: String,
     cache: Arc<MetadataCache>,
+    chunk_cache: Arc<ChunkCache>,
     runtime_handle: Handle,
     leases: Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
     master_epoch: Arc<std::sync::atomic::AtomicU64>,
     job_id: String,
+    client_id: String,
 ) {
     let client = PowerFuseClient::new(&master_addr, runtime_handle.clone());
+
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
 
     loop {
         info!("Starting metadata subscription...");
         match client.subscribe_metadata("/").await {
             Ok(mut stream) => {
+                backoff = Duration::from_secs(1);
                 while let Ok(notification) = stream.message().await {
                     if let Some(notif) = notification {
-                        // Epoch-based lease invalidation: if the notification's epoch
-                        // is greater than our locally tracked epoch, the Master has
-                        // restarted and all our leases are stale. Clear them.
                         let notif_epoch = notif.epoch;
                         let local_epoch = master_epoch.load(std::sync::atomic::Ordering::SeqCst);
                         if notif_epoch > local_epoch {
@@ -1908,7 +2280,14 @@ async fn metadata_subscription_loop(
                             master_epoch.store(notif_epoch, std::sync::atomic::Ordering::SeqCst);
                             debug!("Cleared {} lease entries due to epoch change", cleared);
                         }
-                        handle_metadata_notification(&cache, &notif, &leases, &job_id);
+                        handle_metadata_notification(
+                            &cache,
+                            &chunk_cache,
+                            &notif,
+                            &leases,
+                            &job_id,
+                            &client_id,
+                        );
                     }
                 }
                 warn!("Metadata subscription stream closed, reconnecting...");
@@ -1917,34 +2296,32 @@ async fn metadata_subscription_loop(
                 error!("Metadata subscription failed: {}", e);
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff * 2, max_backoff);
     }
 }
 
 fn handle_metadata_notification(
     cache: &Arc<MetadataCache>,
+    chunk_cache: &Arc<ChunkCache>,
     notification: &MetadataNotification,
-    leases: &Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
-    job_id: &str,
+    _leases: &Arc<RwLock<HashMap<u64, Vec<LeaseInfo>>>>,
+    _job_id: &str,
+    client_id: &str,
 ) {
-    // Update path generation tracking for staleness detection
+    if !notification.source_client_id.is_empty() && notification.source_client_id == client_id {
+        return;
+    }
+
     if notification.generation > 0 {
         cache.update_path_generation(&notification.path, notification.generation);
     }
 
-    // Client-side lease filtering with job-level exception:
-    // If this client holds a lease on the path, skip invalidation.
-    // BUT if the notification came from the same job, do NOT skip —
-    // changes from job peers should be visible even when we hold a lease.
-    let has_lease = |path: &str| -> bool {
-        if !notification.job_id.is_empty() && notification.job_id == job_id {
-            return false;
-        }
-        if let Some(inode) = cache.get_path(path) {
-            let leases = leases.read().unwrap();
-            leases.get(&inode).is_some_and(|v| !v.is_empty())
-        } else {
-            false
+    let invalidate_path_with_chunks = |path: &str| {
+        let inode = cache.get_path(path);
+        cache.invalidate_path(path);
+        if let Some(inode) = inode {
+            chunk_cache.remove_inode_chunks(inode);
         }
     };
 
@@ -1952,44 +2329,29 @@ fn handle_metadata_notification(
         powerfs_master::proto::powerfs::metadata_notification::EventType::Create => {
             let path = notification.path.clone();
             debug!("Received CREATE notification for: {}", path);
-            if !has_lease(&path) {
-                cache.invalidate_path(&path);
-            } else {
-                debug!("Skipping invalidation for {} due to local lease", path);
-            }
+            invalidate_path_with_chunks(&path);
         }
         powerfs_master::proto::powerfs::metadata_notification::EventType::Update => {
             let path = notification.path.clone();
             debug!("Received UPDATE notification for: {}", path);
-            if !has_lease(&path) {
-                cache.invalidate_path(&path);
-            } else {
-                debug!("Skipping invalidation for {} due to local lease", path);
-            }
+            invalidate_path_with_chunks(&path);
         }
         powerfs_master::proto::powerfs::metadata_notification::EventType::Delete => {
             let path = notification.path.clone();
             debug!("Received DELETE notification for: {}", path);
-            if !has_lease(&path) {
-                cache.invalidate_path(&path);
-            } else {
-                debug!("Skipping invalidation for {} due to local lease", path);
-            }
+            invalidate_path_with_chunks(&path);
         }
         powerfs_master::proto::powerfs::metadata_notification::EventType::Rename => {
             let old_path = notification.old_path.clone();
             let new_path = notification.path.clone();
             debug!("Received RENAME notification: {} -> {}", old_path, new_path);
-            if !has_lease(&old_path) {
-                cache.invalidate_path(&old_path);
-            } else {
-                debug!("Skipping invalidation for {} due to local lease", old_path);
-            }
-            cache.invalidate_path(&new_path);
+            invalidate_path_with_chunks(&old_path);
+            invalidate_path_with_chunks(&new_path);
         }
         powerfs_master::proto::powerfs::metadata_notification::EventType::JobComplete => {
             debug!("Received JOB_COMPLETE notification, clearing entire metadata cache");
             cache.clear_all();
+            chunk_cache.clear();
         }
     }
 }
@@ -2133,14 +2495,18 @@ impl FuserApp {
         let runtime_handle_clone = self.runtime_handle.clone();
         let master_addr_clone = self.master_addr.clone();
         let job_id_clone = job_id.clone();
+        let client_id_clone = client_id.clone();
+        let chunk_cache_clone = chunk_cache.clone();
         tokio::spawn(async move {
             metadata_subscription_loop(
                 master_addr_clone,
                 cache_clone,
+                chunk_cache_clone,
                 runtime_handle_clone,
                 leases_clone,
                 epoch_clone,
                 job_id_clone,
+                client_id_clone,
             )
             .await;
         });
@@ -2185,12 +2551,31 @@ impl FuserApp {
         let fs_for_mount = fs.clone();
         let mount_point_clone = self.mount_point.clone();
         let options_clone = options.clone();
+        let notifier_clone = fs.notifier.clone();
 
         let session_handle = std::thread::Builder::new()
             .name("fuse_server".to_string())
             .spawn(move || {
                 info!("FUSE server started");
-                let _ = fuser::mount2(fs_for_mount, mount_point_clone, &options_clone);
+                match fuser::Session::new(
+                    fs_for_mount,
+                    Path::new(&mount_point_clone),
+                    &options_clone,
+                ) {
+                    Ok(mut session) => {
+                        let notifier = session.notifier();
+                        {
+                            let mut guard = notifier_clone.lock().unwrap();
+                            *guard = Some(notifier);
+                        }
+                        if let Err(e) = session.run() {
+                            warn!("FUSE session error: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to create FUSE session: {}", e);
+                    }
+                }
                 warn!("FUSE server exited");
             })
             .map_err(|e| PowerFsError::Internal(format!("failed to spawn fuse thread: {}", e)))?;

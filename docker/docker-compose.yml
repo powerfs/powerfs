@@ -271,6 +271,8 @@ services:
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: fuse-1
+    cpus: '1.0'
+    mem_limit: 512m
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.41
@@ -298,6 +300,8 @@ services:
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: fuse-2
+    cpus: '1.0'
+    mem_limit: 512m
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.42

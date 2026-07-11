@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use lru::LruCache;
 use powerfs_common::types::Fid;
 use powerfs_master::proto::FileChunk;
@@ -150,6 +150,37 @@ impl MetadataCache {
         cache.get(&inode).cloned()
     }
 
+    /// Get path by walking up parent chain
+    pub fn get_path_by_parent_chain(&self, inode: u64) -> Option<String> {
+        if inode == 1 {
+            return Some("/".to_string());
+        }
+        let entry = self.get_inode(inode)?;
+        let mut parts = vec![entry.name.clone()];
+        let mut current = entry.parent;
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(inode);
+
+        while current != 1 {
+            if !visited.insert(current) {
+                warn!("Cycle detected in parent chain for inode: {}", inode);
+                return None;
+            }
+            let parent_entry = self.get_inode(current)?;
+            parts.push(parent_entry.name.clone());
+            current = parent_entry.parent;
+        }
+        parts.reverse();
+        let mut path = String::from("/");
+        for part in parts {
+            if path != "/" {
+                path.push('/');
+            }
+            path.push_str(&part);
+        }
+        Some(path)
+    }
+
     /// Get inode by full path
     pub fn get_path(&self, path: &str) -> Option<u64> {
         let path_map = self.path_map.read().unwrap();
@@ -160,20 +191,35 @@ impl MetadataCache {
     pub fn insert(&self, entry: CachedEntry) {
         let parent = entry.parent;
         let inode = entry.inode;
-        // Build path from parent
         let path = if inode == 1 {
             String::from("/")
         } else {
-            let parent_entry = self.get_inode(parent);
-            match parent_entry {
-                Some(p) if p.inode == 1 => format!("/{}", entry.name),
-                Some(p) => format!(
-                    "{}/{}",
-                    self.inode_to_path(p.inode).unwrap_or_default(),
-                    entry.name
-                ),
-                None => format!("/{}", entry.name),
+            let mut parts = Vec::new();
+            parts.push(entry.name.clone());
+            let mut current = parent;
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(inode);
+            while current != 1 {
+                if !visited.insert(current) {
+                    warn!("Detected cycle in path construction, breaking");
+                    break;
+                }
+                if let Some(e) = self.get_inode(current) {
+                    parts.push(e.name.clone());
+                    current = e.parent;
+                } else {
+                    break;
+                }
             }
+            parts.reverse();
+            let mut path = String::from("/");
+            for part in parts {
+                if path != "/" {
+                    path.push('/');
+                }
+                path.push_str(&part);
+            }
+            path
         };
 
         {
@@ -184,7 +230,6 @@ impl MetadataCache {
             let mut cache = self.inode_cache.write().unwrap();
             cache.put(inode, entry);
         }
-        // Invalidate parent's dir cache
         self.invalidate_dir(parent);
     }
 
@@ -195,11 +240,16 @@ impl MetadataCache {
             cache.pop(&inode)
         };
         if let Some(entry) = entry {
-            let path = self.inode_to_path(inode).unwrap_or_default();
-            {
-                let mut path_map = self.path_map.write().unwrap();
+            let mut path_map = self.path_map.write().unwrap();
+            let paths_to_remove: Vec<String> = path_map
+                .iter()
+                .filter(|(_, &ino)| ino == inode)
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in paths_to_remove {
                 path_map.remove(&path);
             }
+            drop(path_map);
             self.invalidate_dir(entry.parent);
         }
     }
@@ -969,6 +1019,11 @@ impl ChunkCache {
         let chunk_index = self.get_chunk_index(offset);
         let mut cache = self.cache.write().unwrap();
         cache.remove(&(inode, chunk_index));
+    }
+
+    pub fn remove_inode_chunks(&self, inode: u64) {
+        let mut cache = self.cache.write().unwrap();
+        cache.retain(|key, _| key.0 != inode);
     }
 
     pub fn clear(&self) {

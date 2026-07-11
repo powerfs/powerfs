@@ -282,7 +282,7 @@ impl PowerFsFs {
                 generation: entry.generation,
             };
 
-            if let Err(e) = self.client.update_entry(&filer_entry) {
+            if let Err(e) = self.client.update_entry(&filer_entry, "") {
                 warn!("Failed to update entry on master: {}", e);
             }
         }
@@ -635,7 +635,7 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry) {
+        match self.client.create_entry(filer_entry, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to create directory entry on master: {}", e);
@@ -665,7 +665,7 @@ impl FileSystem for PowerFsFs {
             .cache
             .inode_to_path(entry.inode)
             .unwrap_or_else(|| "/".to_string());
-        match self.client.delete_entry(&entry_path, true) {
+        match self.client.delete_entry(&entry_path, true, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete directory entry on master: {}", e);
@@ -709,7 +709,7 @@ impl FileSystem for PowerFsFs {
                 .cache
                 .inode_to_path(entry.inode)
                 .unwrap_or_else(|| "/".to_string());
-            match self.client.delete_entry(&entry_path, false) {
+            match self.client.delete_entry(&entry_path, false, "") {
                 Ok(_) => {}
                 Err(e) => {
                     warn!("Failed to delete file entry on master: {}", e);
@@ -825,7 +825,7 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        match self.client.create_entry(filer_entry) {
+        match self.client.create_entry(filer_entry, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to create file entry on master: {}", e);
@@ -1153,7 +1153,7 @@ impl FileSystem for PowerFsFs {
                 generation: entry.generation,
             };
 
-            if let Err(e) = self.client.update_entry(&filer_entry) {
+            if let Err(e) = self.client.update_entry(&filer_entry, "") {
                 warn!("Failed to update entry on master: {}", e);
             }
         }
@@ -1358,14 +1358,14 @@ impl FileSystem for PowerFsFs {
             generation: entry.generation,
         };
 
-        match self.client.delete_entry(&old_path, entry.is_dir) {
+        match self.client.delete_entry(&old_path, entry.is_dir, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete old entry on master during rename: {}", e);
             }
         }
 
-        match self.client.create_entry(filer_entry) {
+        match self.client.create_entry(filer_entry, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to create new entry on master during rename: {}", e);
@@ -1430,7 +1430,7 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        let inode = match self.client.create_entry(entry) {
+        let inode = match self.client.create_entry(entry, "") {
             Ok(ino) => ino,
             Err(e) => {
                 error!("create_entry failed for symlink: {}", e);

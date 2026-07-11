@@ -258,7 +258,7 @@ impl KvCacheService for KvCacheServiceImpl {
                             owner: String::new(),
                             generation: 0,
                         };
-                        let _ = self.master.directory_tree.create_entry(file_entry);
+                        let _ = self.master.directory_tree.create_entry(file_entry, "");
 
                         let mut locations = Vec::new();
                         for node in nodes {

@@ -47,7 +47,7 @@ impl DirectoryTreeApi for DirectoryTreeClient {
             DirectoryTreeClient::Direct(dt) => {
                 let dt = dt.clone();
                 Box::pin(async move {
-                    dt.create_entry(entry).map_err(|e| {
+                    dt.create_entry(entry, "").map_err(|e| {
                         PowerFsError::Internal(format!("Failed to create entry: {}", e))
                     })
                 })
@@ -83,7 +83,7 @@ impl DirectoryTreeApi for DirectoryTreeClient {
             DirectoryTreeClient::Direct(dt) => {
                 let dt = dt.clone();
                 Box::pin(async move {
-                    dt.delete_entry(&path).map_err(|e| {
+                    dt.delete_entry(&path, "").map_err(|e| {
                         PowerFsError::Internal(format!("Failed to delete entry: {}", e))
                     })
                 })
@@ -190,7 +190,10 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                 Ok(c) => c,
                 Err(e) => return Err(e),
             };
-            let request = CreateEntryRequest { entry: Some(entry) };
+            let request = CreateEntryRequest {
+                entry: Some(entry),
+                client_id: "".to_string(),
+            };
             match client.create_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
                     let resp = response.into_inner();
@@ -269,7 +272,10 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                     generation: 0,
                 };
 
-                let create_request = CreateEntryRequest { entry: Some(entry) };
+                let create_request = CreateEntryRequest {
+                    entry: Some(entry),
+                    client_id: "".to_string(),
+                };
                 match client
                     .create_entry(tonic::Request::new(create_request))
                     .await
@@ -304,6 +310,7 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
             let request = DeleteEntryRequest {
                 path,
                 is_directory: false,
+                client_id: "".to_string(),
             };
             match client.delete_entry(tonic::Request::new(request)).await {
                 Ok(response) => {

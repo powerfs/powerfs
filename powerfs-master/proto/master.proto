@@ -32,6 +32,7 @@ service MasterService {
     rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
     rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse);
     rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
+    rpc RenameEntry(RenameEntryRequest) returns (RenameEntryResponse);
     rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
     rpc StreamMutateEntry(stream MutateEntryRequest) returns (stream MutateEntryResponse);
     rpc SubscribeMetadata(SubscribeMetadataRequest) returns (stream MetadataNotification);
@@ -545,6 +546,7 @@ message GetEntryResponse {
 
 message CreateEntryRequest {
     Entry entry = 1;
+    string client_id = 2;
 }
 
 message CreateEntryResponse {
@@ -555,6 +557,7 @@ message CreateEntryResponse {
 
 message UpdateEntryRequest {
     Entry entry = 1;
+    string client_id = 2;
 }
 
 message UpdateEntryResponse {
@@ -565,9 +568,24 @@ message UpdateEntryResponse {
 message DeleteEntryRequest {
     string path = 1;
     bool is_directory = 2;
+    string client_id = 3;
 }
 
 message DeleteEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RenameEntryRequest {
+    string old_path = 1;
+    string old_directory = 2;
+    string old_name = 3;
+    string new_directory = 4;
+    string new_name = 5;
+    string client_id = 6;
+}
+
+message RenameEntryResponse {
     bool success = 1;
     string error = 2;
 }
@@ -617,6 +635,7 @@ message MetadataNotification {
     string old_path = 6;    // RENAME 事件的旧路径
     uint64 epoch = 7;       // Master epoch for lease invalidation detection
     string job_id = 8;      // Job ID for job-level lease sharing
+    string source_client_id = 9;  // Source client ID to suppress self-notifications
 }
 
 // KV Cache service for LLM inference KV cache management
