@@ -65,7 +65,6 @@ struct LeaseInfo {
 
 struct PowerFsFuserFs {
     client: Arc<SyncFuseClient>,
-    cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
     collection: String,
     replication: String,
@@ -83,7 +82,6 @@ impl PowerFsFuserFs {
     #[allow(clippy::too_many_arguments)]
     fn new(
         client: Arc<SyncFuseClient>,
-        cache: Arc<MetadataCache>,
         chunk_cache: Arc<ChunkCache>,
         collection: String,
         replication: String,
@@ -93,7 +91,6 @@ impl PowerFsFuserFs {
     ) -> Self {
         Self {
             client,
-            cache,
             chunk_cache,
             collection,
             replication,
@@ -129,31 +126,6 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn remove_inode_recursive(&self, inode: u64) {
-        let mut visited = std::collections::HashSet::new();
-        self.remove_inode_recursive_inner(inode, &mut visited);
-    }
-
-    fn remove_inode_recursive_inner(
-        &self,
-        inode: u64,
-        visited: &mut std::collections::HashSet<u64>,
-    ) {
-        if !visited.insert(inode) {
-            warn!(
-                "Detected cycle in directory tree, skipping inode: {}",
-                inode
-            );
-            return;
-        }
-        let children = self.cache.list_children(inode);
-        for (child_inode, _, _) in children {
-            self.remove_inode_recursive_inner(child_inode, visited);
-        }
-        self.cache.remove(inode);
-        self.chunk_cache.remove_inode_chunks(inode);
-    }
-
     fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
         let dirty: Vec<(u64, u64)> = {
             let dirty_set = self.dirty_chunks.read().unwrap();
@@ -168,12 +140,16 @@ impl PowerFsFuserFs {
             return Ok(());
         }
 
-        let entry = self
-            .cache
-            .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        let (entry, path) = match self.client.get_entry_by_inode(inode) {
+            Ok(Some(e)) => e,
+            _ => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+        };
 
-        let fid = if let Some(fid) = entry.fid {
+        let existing_fid = entry.chunks.iter()
+            .find(|c| !c.fid.is_empty())
+            .and_then(|c| Fid::from_string(&c.fid).ok());
+
+        let fid = if let Some(fid) = existing_fid {
             fid
         } else {
             let (new_fid, _, _, _) = self
@@ -183,10 +159,6 @@ impl PowerFsFuserFs {
                     error!("assign_fid failed: {}", e);
                     std::io::Error::from_raw_os_error(libc::EIO)
                 })?;
-
-            let mut updated_entry = entry.clone();
-            updated_entry.fid = Some(new_fid.clone());
-            self.cache.insert(updated_entry);
 
             info!("Assigned new fid for inode {}: {}", inode, new_fid);
             new_fid
@@ -237,10 +209,6 @@ impl PowerFsFuserFs {
         let mut dirty_set = self.dirty_chunks.write().unwrap();
         dirty_set.retain(|(ino, _)| *ino != inode);
 
-        let path = self
-            .cache
-            .get_path_by_parent_chain(inode)
-            .unwrap_or_default();
         let directory = if let Some(last_slash) = path.rfind('/') {
             if last_slash == 0 {
                 "/".to_string()
@@ -250,34 +218,36 @@ impl PowerFsFuserFs {
         } else {
             "/".to_string()
         };
+
         if !path.is_empty() && !chunks.is_empty() {
+            let attrs = entry.attributes.as_ref();
             let filer_entry = powerfs_master::proto::powerfs::Entry {
-                name: entry.name.clone(),
+                name: entry.name,
                 directory,
                 attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                    ino: entry.inode,
-                    mode: entry.mode | 0o100000,
-                    nlink: entry.nlink,
-                    uid: entry.uid,
-                    gid: entry.gid,
+                    ino: inode,
+                    mode: attrs.map(|a| a.mode).unwrap_or(0o100000),
+                    nlink: attrs.map(|a| a.nlink).unwrap_or(1),
+                    uid: attrs.map(|a| a.uid).unwrap_or(0),
+                    gid: attrs.map(|a| a.gid).unwrap_or(0),
                     rdev: 0,
-                    size: entry.size,
+                    size: attrs.map(|a| a.size).unwrap_or(0),
                     blksize: 4096,
-                    blocks: entry.size.div_ceil(512),
-                    atime: entry.atime as u64,
-                    mtime: entry.mtime as u64,
-                    ctime: entry.ctime as u64,
-                    crtime: entry.ctime as u64,
+                    blocks: attrs.map(|a| a.size.div_ceil(512)).unwrap_or(0),
+                    atime: attrs.map(|a| a.atime).unwrap_or(0),
+                    mtime: attrs.map(|a| a.mtime).unwrap_or(0),
+                    ctime: chrono::Utc::now().timestamp() as u64,
+                    crtime: attrs.map(|a| a.crtime).unwrap_or(0),
                     perm: 0,
                 }),
                 chunks,
-                hard_link_id: entry.hard_link_id.clone(),
+                hard_link_id: entry.hard_link_id,
                 hard_link_counter: entry.hard_link_counter,
                 extended: HashMap::new(),
-                content_size: entry.size,
+                content_size: entry.content_size,
                 disk_size: entry.disk_size,
                 ttl: String::new(),
-                symlink_target: String::new(),
+                symlink_target: entry.symlink_target,
                 owner: String::new(),
                 generation: entry.generation,
             };
@@ -457,10 +427,6 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn lookup_in_cache(&self, parent: u64, name: &str) -> Option<CachedEntry> {
-        self.cache.lookup_in_cache(parent, name)
-    }
-
     fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
         let attrs = entry.attributes.as_ref();
         let chunks = entry
@@ -518,10 +484,54 @@ impl PowerFsFuserFs {
         }
     }
 
-    fn cache_entry_from_master(&self, _inode: u64, parent: u64, entry: &FilerEntry) -> CachedEntry {
-        let cached_entry = self.entry_to_cached(parent, entry);
-        self.cache.insert(cached_entry.clone());
-        cached_entry
+    fn readdir_root(&self, mut reply: ReplyDirectory, offset: i64) {
+        let mut idx = offset as usize;
+        let mut next_offset: i64 = 0;
+
+        if idx == 0 {
+            if !reply.add(1, 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+            next_offset = 1;
+            idx = 1;
+        }
+
+        if idx == 1 {
+            if !reply.add(1, 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+            next_offset = 2;
+            idx = 2;
+        }
+
+        match self.client.list_entries("/", 1000, "") {
+            Ok(entries) => {
+                let child_offset = idx.saturating_sub(2);
+                for (i, entry) in entries.iter().enumerate().skip(child_offset) {
+                    let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                    let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+                    let file_type = mode_val & 0o170000;
+
+                    let kind = match file_type {
+                        0o040000 => FileType::Directory,
+                        0o120000 => FileType::Symlink,
+                        _ => FileType::RegularFile,
+                    };
+
+                    next_offset = (child_offset + i + 3) as i64;
+                    if !reply.add(child_ino, next_offset, kind, &entry.name) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("readdir_root: list_entries failed: {}", e);
+            }
+        }
+
+        reply.ok();
     }
 }
 
@@ -529,7 +539,6 @@ impl Clone for PowerFsFuserFs {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            cache: self.cache.clone(),
             chunk_cache: self.chunk_cache.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
@@ -659,9 +668,10 @@ impl Filesystem for PowerFsFuserFs {
             inode, mode, uid, gid, size
         );
 
-        let entry = match self.cache.get_inode(inode) {
-            Some(e) => e,
-            None => {
+        let (entry, path) = match self.client.get_entry_by_inode(inode) {
+            Ok(Some(e)) => e,
+            _ => {
+                error!("setattr: inode {} not found on master", inode);
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -689,10 +699,17 @@ impl Filesystem for PowerFsFuserFs {
             None => None,
         };
 
-        let path = self
-            .cache
-            .get_path_by_parent_chain(inode)
-            .unwrap_or_else(|| "/".to_string());
+        let attrs = entry.attributes.as_ref();
+        let is_dir = attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+
+        let new_mode = mode.unwrap_or_else(|| attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644));
+        let new_uid = uid.unwrap_or_else(|| attrs.map(|a| a.uid).unwrap_or(0));
+        let new_gid = gid.unwrap_or_else(|| attrs.map(|a| a.gid).unwrap_or(0));
+        let new_size = size.unwrap_or_else(|| attrs.map(|a| a.size).unwrap_or(0));
+        let new_atime = atime_val.unwrap_or_else(|| attrs.map(|a| a.atime as i64).unwrap_or(0));
+        let new_mtime = mtime_val.unwrap_or_else(|| attrs.map(|a| a.mtime as i64).unwrap_or(0));
+        let new_nlink = attrs.map(|a| a.nlink).unwrap_or(1);
+        let old_ctime = attrs.map(|a| a.ctime).unwrap_or(0);
 
         let directory = if let Some(last_slash) = path.rfind('/') {
             if last_slash == 0 {
@@ -704,24 +721,17 @@ impl Filesystem for PowerFsFuserFs {
             "/".to_string()
         };
 
-        let new_mode = mode.unwrap_or(entry.mode);
-        let new_uid = uid.unwrap_or(entry.uid);
-        let new_gid = gid.unwrap_or(entry.gid);
-        let new_size = size.unwrap_or(entry.size);
-        let new_atime = atime_val.unwrap_or(entry.atime);
-        let new_mtime = mtime_val.unwrap_or(entry.mtime);
-
         let filer_entry = FilerEntry {
             name: entry.name.clone(),
             directory,
             attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                 ino: inode,
-                mode: if entry.is_dir {
+                mode: if is_dir {
                     new_mode | 0o040000
                 } else {
                     new_mode | 0o100000
                 },
-                nlink: entry.nlink,
+                nlink: new_nlink,
                 uid: new_uid,
                 gid: new_gid,
                 rdev: 0,
@@ -731,51 +741,31 @@ impl Filesystem for PowerFsFuserFs {
                 atime: new_atime as u64,
                 mtime: new_mtime as u64,
                 ctime: now as u64,
-                crtime: entry.ctime as u64,
+                crtime: old_ctime,
                 perm: 0,
             }),
-            chunks: entry
-                .chunks
-                .iter()
-                .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                    offset: c.offset,
-                    size: c.size,
-                    mtime: c.mtime,
-                    fid: c.fid.clone(),
-                    cookie: c.cookie,
-                    crc32: c.crc32,
-                })
-                .collect(),
-            hard_link_id: entry.hard_link_id.clone(),
+            chunks: entry.chunks,
+            hard_link_id: entry.hard_link_id,
             hard_link_counter: entry.hard_link_counter,
             extended: HashMap::new(),
             content_size: entry.content_size,
             disk_size: entry.disk_size,
             ttl: String::new(),
-            symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+            symlink_target: entry.symlink_target,
             owner: String::new(),
             generation: entry.generation,
         };
 
         match self.client.update_entry(&filer_entry, &self.client_id) {
             Ok(_) => {
-                self.cache.update_attr(
-                    inode,
-                    crate::cache::UpdateAttrParams {
-                        mode,
-                        size,
-                        uid,
-                        gid,
-                        atime: atime_val,
-                        mtime: mtime_val,
-                    },
-                );
-
-                if let Some(updated) = self.cache.get_inode(inode) {
-                    let new_attr = self.create_file_attr(&updated);
-                    reply.attr(&TTL, &new_attr);
-                } else {
-                    reply.error(libc::ENOENT);
+                match self.client.get_entry(&path) {
+                    Ok(Some(updated_entry)) => {
+                        let new_attr = self.create_file_attr_from_entry(&updated_entry);
+                        reply.attr(&TTL, &new_attr);
+                    }
+                    _ => {
+                        reply.error(libc::ENOENT);
+                    }
                 }
             }
             Err(e) => {
@@ -899,67 +889,62 @@ impl Filesystem for PowerFsFuserFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("rmdir: parent={}, name={}", parent, name_str);
 
-        let entry = match self.lookup_in_cache(parent, name_str) {
-            Some(e) => e,
-            None => {
+        let parent_path = match self.client.get_entry_by_inode(parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("rmdir: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        if !entry.is_dir {
-            reply.error(libc::ENOTDIR);
-            return;
-        }
+        let dir_path = if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
 
-        let children = self.cache.list_children(entry.inode);
-        if !children.is_empty() {
-            reply.error(libc::ENOTEMPTY);
-            return;
-        }
+        match self.client.get_entry(&dir_path) {
+            Ok(Some(entry)) => {
+                let attrs = entry.attributes.as_ref();
+                if attrs.is_none() || (attrs.unwrap().mode & 0o040000) == 0 {
+                    reply.error(libc::ENOTDIR);
+                    return;
+                }
 
-        let parent_path = self
-            .cache
-            .get_path_by_parent_chain(parent)
-            .unwrap_or_else(|| "/".to_string());
+                match self.client.list_entries(&dir_path, 1000, "") {
+                    Ok(entries) => {
+                        if !entries.is_empty() {
+                            reply.error(libc::ENOTEMPTY);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("rmdir: failed to list entries: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                }
 
-        match self
-            .client
-            .acquire_lease(&parent_path, &self.client_id, 30000)
-        {
-            Ok((lease_id, epoch)) => {
-                self.master_epoch
-                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
-                let lease_info = LeaseInfo {
-                    lease_id: lease_id.clone(),
-                    path: parent_path.clone(),
-                    duration_ms: 30000,
-                    acquired_at: std::time::Instant::now(),
-                };
-                let mut leases = self.leases.write().unwrap();
-                leases.entry(parent).or_default().push(lease_info);
+                match self.client.delete_entry(&dir_path, true, &self.client_id) {
+                    Ok(_) => {
+                        reply.ok();
+                        self.invalidate_kernel_dentry(parent, name_str);
+                        if let Some(attr) = attrs {
+                            self.invalidate_kernel_inode(attr.ino);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to delete directory entry on master: {}", e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Ok(None) => {
+                reply.error(libc::ENOENT);
             }
             Err(e) => {
-                warn!(
-                    "Failed to acquire lease for parent directory {}: {}",
-                    parent_path, e
-                );
-            }
-        }
-
-        let entry_path = self
-            .cache
-            .get_path_by_parent_chain(entry.inode)
-            .unwrap_or_else(|| "/".to_string());
-        match self.client.delete_entry(&entry_path, true, &self.client_id) {
-            Ok(_) => {
-                self.remove_inode_recursive(entry.inode);
-                reply.ok();
-                self.invalidate_kernel_dentry(parent, name_str);
-                self.invalidate_kernel_inode(entry.inode);
-            }
-            Err(e) => {
-                error!("Failed to delete directory entry on master: {}", e);
+                error!("rmdir: failed to get entry: {}", e);
                 reply.error(libc::EIO);
             }
         }
@@ -969,88 +954,68 @@ impl Filesystem for PowerFsFuserFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
 
-        let entry = match self.lookup_in_cache(parent, name_str) {
-            Some(e) => e,
-            None => {
+        let parent_path = match self.client.get_entry_by_inode(parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("unlink: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let parent_path = self
-            .cache
-            .get_path_by_parent_chain(parent)
-            .unwrap_or_else(|| "/".to_string());
+        let entry_path = if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
 
-        match self
-            .client
-            .acquire_lease(&parent_path, &self.client_id, 30000)
-        {
-            Ok((lease_id, epoch)) => {
-                self.master_epoch
-                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
-                let lease_info = LeaseInfo {
-                    lease_id: lease_id.clone(),
-                    path: parent_path.clone(),
-                    duration_ms: 30000,
-                    acquired_at: std::time::Instant::now(),
-                };
-                let mut leases = self.leases.write().unwrap();
-                leases.entry(parent).or_default().push(lease_info);
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to acquire lease for parent directory {}: {}",
-                    parent_path, e
-                );
-            }
-        }
-
-        let should_delete = self.cache.dec_nlink(entry.inode);
-
-        if should_delete {
-            let entry_path = self
-                .cache
-                .get_path_by_parent_chain(entry.inode)
-                .unwrap_or_else(|| "/".to_string());
-
-            if let Some(fid) = &entry.fid {
-                match self.client.lookup_volume(fid.volume_id) {
-                    Ok(locations) => {
-                        if let Some(loc) = locations.first() {
-                            let addr = PowerFuseClient::location_to_grpc_addr(loc);
-                            if let Err(e) =
-                                self.client
-                                    .delete_data(&addr, fid.volume_id.0, fid.file_key)
-                            {
-                                error!("Failed to delete data: {}", e);
+        match self.client.get_entry(&entry_path) {
+            Ok(Some(entry)) => {
+                if let Some(fid) = entry.chunks.first().and_then(|chunk| {
+                    Fid::from_string(&chunk.fid).ok()
+                }) {
+                    match self.client.lookup_volume(fid.volume_id) {
+                        Ok(locations) => {
+                            if let Some(loc) = locations.first() {
+                                let addr = PowerFuseClient::location_to_grpc_addr(loc);
+                                if let Err(e) =
+                                    self.client
+                                        .delete_data(&addr, fid.volume_id.0, fid.file_key)
+                                {
+                                    error!("Failed to delete data: {}", e);
+                                }
                             }
+                        }
+                        Err(e) => {
+                            error!("Failed to lookup volume: {}", e);
+                        }
+                    }
+                }
+
+                match self
+                    .client
+                    .delete_entry(&entry_path, false, &self.client_id)
+                {
+                    Ok(_) => {
+                        reply.ok();
+                        self.invalidate_kernel_dentry(parent, name_str);
+                        if let Some(attrs) = entry.attributes {
+                            self.invalidate_kernel_inode(attrs.ino);
                         }
                     }
                     Err(e) => {
-                        error!("Failed to lookup volume: {}", e);
+                        error!("Failed to delete entry on master: {}", e);
+                        reply.error(libc::EIO);
                     }
                 }
             }
-
-            match self
-                .client
-                .delete_entry(&entry_path, false, &self.client_id)
-            {
-                Ok(_) => {
-                    self.cache.remove(entry.inode);
-                    reply.ok();
-                    self.invalidate_kernel_dentry(parent, name_str);
-                    self.invalidate_kernel_inode(entry.inode);
-                }
-                Err(e) => {
-                    error!("Failed to delete entry on master: {}", e);
-                    reply.error(libc::EIO);
-                }
+            Ok(None) => {
+                reply.error(libc::ENOENT);
             }
-        } else {
-            self.cache.remove(entry.inode);
-            reply.ok();
+            Err(e) => {
+                error!("unlink: failed to get entry: {}", e);
+                reply.error(libc::EIO);
+            }
         }
     }
 
@@ -1261,31 +1226,23 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("read: inode={}, offset={}, size={}", inode, offset, size);
 
-        let entry = match self.cache.get_inode(inode) {
-            Some(e) => e,
-            None => {
-                info!("read: inode {} not in cache, querying master", inode);
-                match self.client.get_entry_by_inode(inode) {
-                    Ok(Some((entry, _))) => {
-                        let cached_entry = self.cache_entry_from_master(inode, 0, &entry);
-                        cached_entry
-                    }
-                    _ => {
-                        error!("read: inode {} not found in cache or master", inode);
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
-                }
+        let entry = match self.client.get_entry_by_inode(inode) {
+            Ok(Some((entry, _))) => entry,
+            _ => {
+                error!("read: inode {} not found on master", inode);
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
+        let file_size = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
         let offset_u64 = offset as u64;
-        if offset_u64 >= entry.size {
+        if offset_u64 >= file_size {
             reply.data(&[]);
             return;
         }
 
-        let actual_size = std::cmp::min(size as u64, entry.size - offset_u64) as usize;
+        let actual_size = std::cmp::min(size as u64, file_size - offset_u64) as usize;
         let mut result = vec![0u8; actual_size];
 
         let chunk_size = self.chunk_cache.chunk_size();
@@ -1294,7 +1251,7 @@ impl Filesystem for PowerFsFuserFs {
 
         for chunk_idx in start_chunk_idx..end_chunk_idx {
             let chunk_offset = chunk_idx * chunk_size;
-            if chunk_offset >= entry.size {
+            if chunk_offset >= file_size {
                 continue;
             }
             let chunk_data = self.chunk_cache.get(inode, chunk_offset);
@@ -1364,8 +1321,18 @@ impl Filesystem for PowerFsFuserFs {
                                 }
                             }
                         } else {
-                            match &entry.fid {
-                                Some(fid) => {
+                            let chunk_fid = entry.chunks.iter()
+                                .find(|c| c.offset == chunk_offset)
+                                .and_then(|c| if c.fid.is_empty() { None } else { Some(c.fid.clone()) });
+                            match chunk_fid {
+                                Some(fid_str) => {
+                                    let fid = match Fid::from_string(&fid_str) {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            error!("invalid fid format: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let locations = match self.client.lookup_volume(fid.volume_id) {
                                         Ok(l) => l,
                                         Err(e) => {
@@ -1475,9 +1442,6 @@ impl Filesystem for PowerFsFuserFs {
 
         let offset_u64 = offset as u64;
         let data_len = data.len();
-        let new_size = offset_u64 + data_len as u64;
-
-        self.cache.update_size(inode, new_size);
 
         let chunk_size = self.chunk_cache.chunk_size();
         info!(
@@ -1542,27 +1506,28 @@ impl Filesystem for PowerFsFuserFs {
             });
 
             if !modified {
-                let entry = match self.cache.get_inode(inode) {
-                    Some(e) => e,
-                    None => {
-                        info!("write: inode {} not in cache, querying master", inode);
-                        match self.client.get_entry_by_inode(inode) {
-                            Ok(Some((entry, _))) => {
-                                let cached_entry = self.cache_entry_from_master(inode, 0, &entry);
-                                cached_entry
-                            }
-                            _ => {
-                                error!("write: inode {} not found in cache or master", inode);
-                                reply.error(libc::ENOENT);
-                                return;
-                            }
-                        }
+                let entry = match self.client.get_entry_by_inode(inode) {
+                    Ok(Some((entry, _))) => entry,
+                    _ => {
+                        error!("write: inode {} not found on master", inode);
+                        reply.error(libc::ENOENT);
+                        return;
                     }
                 };
 
                 let mut initial_data = vec![0u8; chunk_size as usize];
 
-                if let Some(fid) = &entry.fid {
+                let chunk_fid = entry.chunks.iter()
+                    .find(|c| c.offset == chunk_offset)
+                    .and_then(|c| if c.fid.is_empty() { None } else { Some(c.fid.clone()) });
+                if let Some(fid_str) = chunk_fid {
+                    let fid = match Fid::from_string(&fid_str) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("invalid fid format: {}", e);
+                            continue;
+                        }
+                    };
                     let locations = match self.client.lookup_volume(fid.volume_id) {
                         Ok(l) => l,
                         Err(e) => {
@@ -1701,102 +1666,50 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("readdir: inode={}, offset={}", inode, offset);
 
-        let entry = match self.cache.get_inode(inode) {
-            Some(e) => e,
-            None => {
+        if inode == 1 {
+            self.readdir_root(reply, offset);
+            return;
+        }
+
+        let (_, path) = match self.client.get_entry_by_inode(inode) {
+            Ok(Some(e)) => e,
+            _ => {
+                error!("readdir: inode {} not found on master", inode);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        if !entry.is_dir {
-            reply.error(libc::ENOTDIR);
-            return;
-        }
-
-        let path = self
-            .cache
-            .get_path_by_parent_chain(inode)
-            .unwrap_or_else(|| "/".to_string());
-        if let Ok(entries) = self.client.list_entries(&path, 1000, "") {
-            let master_names: std::collections::HashSet<String> =
-                entries.iter().map(|e| e.name.clone()).collect();
-
-            let children = self.cache.list_children(inode);
-            for (child_inode, child_name, _) in &children {
-                if !master_names.contains(child_name) {
-                    debug!(
-                        "readdir: removing stale cache entry '{}' (inode={}) not in master",
-                        child_name, child_inode
-                    );
-                    self.cache.remove(*child_inode);
+        let parent_inode = match self.client.get_entry_by_inode(inode) {
+            Ok(Some((entry, _))) => {
+                let attrs = entry.attributes.as_ref();
+                if attrs.is_none() || (attrs.unwrap().mode & 0o040000) == 0 {
+                    reply.error(libc::ENOTDIR);
+                    return;
+                }
+                match self.client.get_entry(&path) {
+                    Ok(Some(entry)) => {
+                        if let Some(parent_path) = entry.directory.strip_suffix("/") {
+                            if parent_path.is_empty() {
+                                1
+                            } else {
+                                match self.client.get_entry(parent_path) {
+                                    Ok(Some(e)) => e.attributes.as_ref().map(|a| a.ino).unwrap_or(1),
+                                    _ => 1,
+                                }
+                            }
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 1,
                 }
             }
+            _ => 1,
+        };
 
-            for entry in entries {
-                let existing = self.cache.lookup_in_cache(inode, &entry.name);
-                if existing.is_none() {
-                    let ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or_else(|| {
-                        warn!(
-                            "readdir: entry '{}' has no ino from master, allocating locally",
-                            entry.name
-                        );
-                        self.cache.allocate_inode()
-                    });
-                    let cached_entry = CachedEntry {
-                        inode: ino,
-                        parent: inode,
-                        name: entry.name,
-                        is_dir: entry
-                            .attributes
-                            .as_ref()
-                            .map(|a| (a.mode & 0o40000) != 0)
-                            .unwrap_or(false),
-                        is_symlink: false,
-                        symlink_target: None,
-                        nlink: entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1),
-                        fid: None,
-                        size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
-                        mode: entry
-                            .attributes
-                            .as_ref()
-                            .map(|a| a.mode & 0o7777)
-                            .unwrap_or(0o644),
-                        uid: entry.attributes.as_ref().map(|a| a.uid).unwrap_or(0),
-                        gid: entry.attributes.as_ref().map(|a| a.gid).unwrap_or(0),
-                        atime: entry
-                            .attributes
-                            .as_ref()
-                            .map(|a| a.atime as i64)
-                            .unwrap_or(0),
-                        mtime: entry
-                            .attributes
-                            .as_ref()
-                            .map(|a| a.mtime as i64)
-                            .unwrap_or(0),
-                        ctime: entry
-                            .attributes
-                            .as_ref()
-                            .map(|a| a.ctime as i64)
-                            .unwrap_or(0),
-                        xattrs: HashMap::new(),
-                        chunks: entry.chunks.into_iter().map(|c| c.into()).collect(),
-                        hard_link_id: entry.hard_link_id,
-                        hard_link_counter: entry.hard_link_counter,
-                        content_size: entry.content_size,
-                        disk_size: entry.disk_size,
-                        generation: entry.generation,
-                    };
-                    self.cache.insert(cached_entry);
-                }
-            }
-        }
-
-        let children = self.cache.list_children(inode);
-
-        let parent_inode = entry.parent;
-        let mut next_offset: i64 = 0;
         let mut idx = offset as usize;
+        let mut next_offset: i64 = 0;
 
         if idx == 0 {
             if !reply.add(inode, 1, FileType::Directory, ".") {
@@ -1816,29 +1729,31 @@ impl Filesystem for PowerFsFuserFs {
             idx = 2;
         }
 
-        let child_offset = idx.saturating_sub(2);
-        for (child_inode, ref child_name, _is_dir) in children.iter().skip(child_offset) {
-            let child_entry = match self.cache.get_inode(*child_inode) {
-                Some(e) => e,
-                None => continue,
-            };
+        match self.client.list_entries(&path, 1000, "") {
+            Ok(entries) => {
+                let child_offset = idx.saturating_sub(2);
+                for (i, entry) in entries.iter().enumerate().skip(child_offset) {
+                    let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                    let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+                    let file_type = mode_val & 0o170000;
 
-            let file_type = if child_entry.is_symlink {
-                FileType::Symlink
-            } else if child_entry.is_dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
+                    let kind = match file_type {
+                        0o040000 => FileType::Directory,
+                        0o120000 => FileType::Symlink,
+                        _ => FileType::RegularFile,
+                    };
 
-            next_offset = (idx + 1) as i64;
-            if !reply.add(*child_inode, next_offset, file_type, child_name.as_str()) {
-                break;
+                    next_offset = (child_offset + i + 3) as i64;
+                    if !reply.add(child_ino, next_offset, kind, &entry.name) {
+                        break;
+                    }
+                }
             }
-            idx += 1;
+            Err(e) => {
+                error!("readdir: list_entries failed: {}", e);
+            }
         }
 
-        let _ = next_offset;
         reply.ok();
     }
 
@@ -1859,22 +1774,51 @@ impl Filesystem for PowerFsFuserFs {
             parent, name_str, new_parent, new_name_str
         );
 
-        let entry = match self.lookup_in_cache(parent, name_str) {
-            Some(e) => e,
-            None => {
+        let parent_path = match self.client.get_entry_by_inode(parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("rename: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let parent_path = self
-            .cache
-            .get_path_by_parent_chain(parent)
-            .unwrap_or_else(|| "/".to_string());
-        let new_parent_path = self
-            .cache
-            .get_path_by_parent_chain(new_parent)
-            .unwrap_or_else(|| "/".to_string());
+        let new_parent_path = match self.client.get_entry_by_inode(new_parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("rename: new_parent inode {} not found on master", new_parent);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let old_path = if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
+
+        let target_path = if new_parent_path == "/" {
+            format!("/{}", new_name_str)
+        } else {
+            format!("{}/{}", new_parent_path, new_name_str)
+        };
+
+        let entry = match self.client.get_entry(&old_path) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                error!("rename: entry {} not found on master", old_path);
+                reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                error!("rename: failed to get entry {}: {}", old_path, e);
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+
+        let entry_inode = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
 
         match self
             .client
@@ -1926,80 +1870,32 @@ impl Filesystem for PowerFsFuserFs {
             }
         }
 
-        let old_path = self
-            .cache
-            .get_path_by_parent_chain(entry.inode)
-            .unwrap_or_else(|| "/".to_string());
-
-        let target_path = if new_parent_path == "/" {
-            format!("/{}", new_name_str)
-        } else {
-            format!("{}/{}", new_parent_path, new_name_str)
-        };
-
-        let target_entry = self.lookup_in_cache(new_parent, new_name_str);
+        let target_entry = self.client.get_entry(&target_path).ok().flatten();
 
         if let Some(target) = target_entry {
-            if target.is_dir && !entry.is_dir {
+            let target_attrs = target.attributes.as_ref();
+            let target_is_dir = target_attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+            let entry_attrs = entry.attributes.as_ref();
+            let entry_is_dir = entry_attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+
+            if target_is_dir && !entry_is_dir {
                 reply.error(libc::ENOTDIR);
                 return;
             }
 
-            let should_delete_target = self.cache.dec_nlink(target.inode);
-
-            if should_delete_target {
-                if let Some(fid) = &target.fid {
-                    match self.client.lookup_volume(fid.volume_id) {
-                        Ok(locations) => {
-                            if let Some(loc) = locations.first() {
-                                let addr = PowerFuseClient::location_to_grpc_addr(loc);
-                                if let Err(e) =
-                                    self.client
-                                        .delete_data(&addr, fid.volume_id.0, fid.file_key)
-                                {
-                                    warn!("Failed to delete target data: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to lookup target volume: {}", e);
-                        }
-                    }
-                }
-
-                if let Err(e) =
-                    self.client
-                        .delete_entry(&target_path, target.is_dir, &self.client_id)
-                {
-                    warn!("Failed to delete target entry: {}", e);
-                }
+            if let Err(e) =
+                self.client
+                    .delete_entry(&target_path, target_is_dir, &self.client_id)
+            {
+                warn!("Failed to delete target entry: {}", e);
             }
-
-            self.cache.remove(target.inode);
         }
-
-        let _ = self
-            .cache
-            .rename(parent, name_str, new_parent, new_name_str);
-
-        match self.cache.get_inode(entry.inode) {
-            Some(updated) => debug!(
-                "After local rename: inode={}, name={}, parent={}",
-                updated.inode, updated.name, updated.parent
-            ),
-            None => warn!(
-                "Entry disappeared after local rename: inode={}",
-                entry.inode
-            ),
-        }
-
-        let new_parent_path_clone = new_parent_path.clone();
 
         match self.client.rename_entry(
             &old_path,
             &parent_path,
             name_str,
-            &new_parent_path_clone,
+            &new_parent_path,
             new_name_str,
             &self.client_id,
         ) {
@@ -2009,7 +1905,7 @@ impl Filesystem for PowerFsFuserFs {
                 if parent != new_parent {
                     self.invalidate_kernel_dentry(new_parent, new_name_str);
                 }
-                self.invalidate_kernel_inode(entry.inode);
+                self.invalidate_kernel_inode(entry_inode);
             }
             Err(e) => {
                 error!("Failed to rename entry: {}", e);
@@ -2033,10 +1929,10 @@ impl Filesystem for PowerFsFuserFs {
             parent, name_str, link_str
         );
 
-        let parent_path = match self.cache.get_path_by_parent_chain(parent) {
-            Some(p) => p,
-            None => {
-                error!("symlink: parent inode {} not found in cache", parent);
+        let parent_path = match self.client.get_entry_by_inode(parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("symlink: parent inode {} not found on master", parent);
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -2076,34 +1972,15 @@ impl Filesystem for PowerFsFuserFs {
 
         match self.client.create_entry(filer_entry, &self.client_id) {
             Ok(master_inode) => {
-                let entry = CachedEntry {
-                    inode: master_inode,
-                    parent,
-                    name: name_str.to_string(),
-                    is_dir: false,
-                    is_symlink: true,
-                    symlink_target: Some(link_str.to_string()),
-                    nlink: 1,
-                    fid: None,
-                    size: link_str.len() as u64,
-                    mode: 0o777,
-                    uid: 0,
-                    gid: 0,
-                    atime: now,
-                    mtime: now,
-                    ctime: now,
-                    xattrs: HashMap::new(),
-                    chunks: Vec::new(),
-                    hard_link_id: String::new(),
-                    hard_link_counter: 0,
-                    content_size: link_str.len() as u64,
-                    disk_size: 0,
-                    generation: 0,
-                };
-                self.cache.insert(entry.clone());
-
-                let attr = self.create_file_attr(&entry);
-                reply.entry(&TTL, &attr, 0);
+                match self.client.get_entry_by_inode(master_inode) {
+                    Ok(Some((entry, _))) => {
+                        let attr = self.create_file_attr_from_entry(&entry);
+                        reply.entry(&TTL, &attr, 0);
+                    }
+                    _ => {
+                        reply.error(libc::ENOENT);
+                    }
+                }
                 self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
@@ -2116,23 +1993,17 @@ impl Filesystem for PowerFsFuserFs {
     fn readlink(&mut self, _req: &Request<'_>, inode: u64, reply: ReplyData) {
         debug!("readlink: inode={}", inode);
 
-        let entry = match self.cache.get_inode(inode) {
-            Some(e) => e,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
+        match self.client.get_entry_by_inode(inode) {
+            Ok(Some((entry, _))) => {
+                if !entry.symlink_target.is_empty() {
+                    reply.data(entry.symlink_target.as_bytes());
+                } else {
+                    reply.data(&[]);
+                }
             }
-        };
-
-        if !entry.is_symlink {
-            reply.error(libc::EINVAL);
-            return;
-        }
-
-        if let Some(target) = &entry.symlink_target {
-            reply.data(target.as_bytes());
-        } else {
-            reply.data(&[]);
+            _ => {
+                reply.error(libc::ENOENT);
+            }
         }
     }
 
@@ -2150,24 +2021,33 @@ impl Filesystem for PowerFsFuserFs {
             inode, new_parent, new_name_str
         );
 
-        let entry = match self.cache.get_inode(inode) {
-            Some(e) => e,
-            None => {
+        let (entry, _) = match self.client.get_entry_by_inode(inode) {
+            Ok(Some(e)) => e,
+            _ => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let parent_path = match self.cache.get_path_by_parent_chain(new_parent) {
-            Some(p) => p,
-            None => {
-                error!("link: new_parent inode {} not found in cache", new_parent);
+        let parent_path = match self.client.get_entry_by_inode(new_parent) {
+            Ok(Some((_, p))) => p,
+            _ => {
+                error!("link: new_parent inode {} not found on master", new_parent);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        self.cache.inc_nlink(inode);
+        let attrs = entry.attributes.as_ref();
+        let is_dir = attrs.map(|a| (a.mode & 0o040000) != 0).unwrap_or(false);
+        let mode = attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644);
+        let nlink = attrs.map(|a| a.nlink).unwrap_or(1);
+        let uid = attrs.map(|a| a.uid).unwrap_or(0);
+        let gid = attrs.map(|a| a.gid).unwrap_or(0);
+        let size = attrs.map(|a| a.size).unwrap_or(0);
+        let atime = attrs.map(|a| a.atime as i64).unwrap_or(0);
+        let mtime = attrs.map(|a| a.mtime as i64).unwrap_or(0);
+        let ctime = attrs.map(|a| a.ctime as i64).unwrap_or(0);
 
         let now = chrono::Utc::now().timestamp();
         let filer_entry = FilerEntry {
@@ -2175,81 +2055,50 @@ impl Filesystem for PowerFsFuserFs {
             directory: parent_path,
             attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
                 ino: 0,
-                mode: if entry.is_dir {
-                    entry.mode | 0o040000
+                mode: if is_dir {
+                    mode | 0o040000
                 } else {
-                    entry.mode | 0o100000
+                    mode | 0o100000
                 },
-                nlink: entry.nlink + 1,
-                uid: entry.uid,
-                gid: entry.gid,
+                nlink: nlink + 1,
+                uid,
+                gid,
                 rdev: 0,
-                size: entry.size,
+                size,
                 blksize: 4096,
-                blocks: entry.size.div_ceil(512),
-                atime: entry.atime as u64,
-                mtime: entry.mtime as u64,
+                blocks: size.div_ceil(512),
+                atime: atime as u64,
+                mtime: mtime as u64,
                 ctime: now as u64,
-                crtime: entry.ctime as u64,
+                crtime: ctime as u64,
                 perm: 0,
             }),
-            chunks: entry
-                .chunks
-                .iter()
-                .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                    offset: c.offset,
-                    size: c.size,
-                    mtime: c.mtime,
-                    fid: c.fid.clone(),
-                    cookie: c.cookie,
-                    crc32: c.crc32,
-                })
-                .collect(),
-            hard_link_id: entry.hard_link_id.clone(),
+            chunks: entry.chunks,
+            hard_link_id: entry.hard_link_id,
             hard_link_counter: entry.hard_link_counter + 1,
             extended: HashMap::new(),
             content_size: entry.content_size,
             disk_size: entry.disk_size,
             ttl: String::new(),
-            symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+            symlink_target: entry.symlink_target,
             owner: String::new(),
             generation: entry.generation,
         };
 
         match self.client.create_entry(filer_entry, &self.client_id) {
             Ok(master_inode) => {
-                let new_entry = CachedEntry {
-                    inode: master_inode,
-                    parent: new_parent,
-                    name: new_name_str.to_string(),
-                    is_dir: entry.is_dir,
-                    is_symlink: entry.is_symlink,
-                    symlink_target: entry.symlink_target.clone(),
-                    nlink: entry.nlink + 1,
-                    fid: entry.fid.clone(),
-                    size: entry.size,
-                    mode: entry.mode,
-                    uid: entry.uid,
-                    gid: entry.gid,
-                    atime: entry.atime,
-                    mtime: entry.mtime,
-                    ctime: now,
-                    xattrs: entry.xattrs.clone(),
-                    chunks: entry.chunks.clone(),
-                    hard_link_id: entry.hard_link_id.clone(),
-                    hard_link_counter: entry.hard_link_counter + 1,
-                    content_size: entry.content_size,
-                    disk_size: entry.disk_size,
-                    generation: 0,
-                };
-                self.cache.insert(new_entry.clone());
-
-                let attr = self.create_file_attr(&new_entry);
-                reply.entry(&TTL, &attr, 0);
+                match self.client.get_entry_by_inode(master_inode) {
+                    Ok(Some((new_entry, _))) => {
+                        let attr = self.create_file_attr_from_entry(&new_entry);
+                        reply.entry(&TTL, &attr, 0);
+                    }
+                    _ => {
+                        reply.error(libc::ENOENT);
+                    }
+                }
                 self.invalidate_kernel_dentry(new_parent, new_name_str);
             }
             Err(e) => {
-                self.cache.dec_nlink(inode);
                 error!("Failed to create hard link entry on master: {}", e);
                 reply.error(libc::EIO);
             }
@@ -2493,7 +2342,6 @@ impl FuserApp {
         let job_id = std::env::var("POWERFS_JOB_ID").unwrap_or_default();
         let fs = PowerFsFuserFs::new(
             sync_client.clone(),
-            cache.clone(),
             chunk_cache.clone(),
             self.collection.clone(),
             self.replication.clone(),
