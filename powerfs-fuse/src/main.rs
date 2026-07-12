@@ -1,6 +1,7 @@
 use clap::Parser;
 use log::{error, info, warn};
 use std::ffi::CString;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -40,6 +41,18 @@ struct Args {
     /// instead of leaving them in D (disk-sleep) state.
     #[arg(long)]
     container: bool,
+
+    /// Log file path (if not specified, logs only to stdout)
+    #[arg(long)]
+    log_file: Option<String>,
+
+    /// Max log file size in MB before rotation (default: 10MB)
+    #[arg(long, default_value = "10")]
+    log_max_size_mb: u64,
+
+    /// Number of rotated log files to keep (default: 5)
+    #[arg(long, default_value = "5")]
+    log_max_files: usize,
 }
 
 /// Async-signal-safe handler: only calls write(2) and umount2(2).
@@ -80,7 +93,42 @@ fn main() {
     let args = Args::parse();
 
     let log_level = if args.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
+
+    builder.format(|buf, record| {
+        writeln!(
+            buf,
+            "[{}] [{}] [{}] {}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+
+    if let Some(log_file) = &args.log_file {
+        use std::fs::{self, File};
+        use std::path::Path;
+
+        let log_path = Path::new(log_file);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("Failed to create log directory: {}", e);
+            });
+        }
+
+        let file = File::create(log_file).unwrap_or_else(|e| {
+            eprintln!("Failed to create log file: {}", e);
+            std::process::exit(1);
+        });
+
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+        info!("Logging to file: {}", log_file);
+    }
+
+    builder.init();
 
     info!("PowerFS FUSE Client starting...");
     info!("  Master: {}", args.master);

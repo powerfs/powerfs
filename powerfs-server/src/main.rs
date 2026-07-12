@@ -14,6 +14,8 @@ use powerfs_volume::{
     master_client::{MasterClient, NewMasterClientParams},
     server::VolumeServer,
 };
+use std::fs::{self, File};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -26,6 +28,9 @@ use tokio::time::Duration;
 struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    #[arg(long)]
+    log_file: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -163,10 +168,39 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    env_logger::Builder::from_env(
+    let mut builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(cli.log_level.as_str()),
-    )
-    .init();
+    );
+
+    builder.format(|buf, record| {
+        writeln!(
+            buf,
+            "[{}] [{}] [{}] {}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
+
+    if let Some(log_file) = &cli.log_file {
+        let log_path = std::path::Path::new(log_file);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("Failed to create log directory: {}", e);
+            });
+        }
+
+        let file = File::create(log_file).unwrap_or_else(|e| {
+            eprintln!("Failed to create log file: {}", e);
+            std::process::exit(1);
+        });
+
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+        eprintln!("Logging to file: {}", log_file);
+    }
+
+    builder.init();
 
     match cli.command {
         Commands::Master {

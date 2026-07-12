@@ -175,12 +175,8 @@ fn wait_for_port(addr: &str, timeout_secs: u64) -> bool {
 fn wait_for_mount(mount_path: &str, timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < timeout_secs {
-        if Path::new(mount_path).exists() {
-            if let Ok(m) = fs::metadata(mount_path) {
-                if m.is_dir() {
-                    return true;
-                }
-            }
+        if is_powerfs_mounted(mount_path) {
+            return true;
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -227,7 +223,12 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
     let fuse_mount = get_fuse_mount();
     let _ = fs::create_dir_all(&fuse_mount);
 
+    let log_file = "/tmp/powerfs-fuse-test.log";
+    let _ = fs::remove_file(log_file);
+
     Command::new(format!("{}/powerfs", target_dir))
+        .arg("--log-file")
+        .arg(log_file)
         .arg("fuse")
         .arg("--dir")
         .arg(&fuse_mount)
@@ -238,14 +239,13 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
         .spawn()
 }
 
-pub fn ensure_fuse_mounted() {
+pub fn ensure_fuse_mounted() -> Result<(), String> {
     if env::var("POWERFS_DOCKER_TEST").is_ok() {
-        return;
+        return Ok(());
     }
 
     if !is_fuse_available() {
-        eprintln!("FUSE not available, skipping tests");
-        std::process::exit(0);
+        return Err("FUSE not available, skipping test".to_string());
     }
 
     register_cleanup_handler();
@@ -289,4 +289,6 @@ pub fn ensure_fuse_mounted() {
             fuse_process,
         }
     });
+
+    Ok(())
 }

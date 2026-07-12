@@ -1,7 +1,7 @@
 use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::powerfs::{DirEntry, InodeEntry, PathIndexEntry};
 use crate::proto::{Entry, MetadataNotification};
-use log::debug;
+use log::{debug, info};
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -464,6 +464,13 @@ impl DirectoryTree {
             None => return Ok(()),
         };
 
+        let received_mode = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+        let received_file_type = received_mode & 0o170000;
+        info!(
+            "[DIR_TREE] update_entry: ino={}, received_mode={:o}, received_file_type={:o}, name={}, directory={}",
+            ino, received_mode, received_file_type, entry.name, entry.directory
+        );
+
         let generation = self.allocate_generation();
         entry.generation = generation;
 
@@ -480,7 +487,25 @@ impl DirectoryTree {
             Err(_) => return Ok(()),
         };
 
+        let existing_mode = existing_entry
+            .attributes
+            .as_ref()
+            .map(|a| a.mode)
+            .unwrap_or(0);
+        let existing_file_type = existing_mode & 0o170000;
+        info!(
+            "[DIR_TREE] update_entry: ino={}, existing_mode={:o}, existing_file_type={:o}",
+            ino, existing_mode, existing_file_type
+        );
+
         let inode_entry = self.entry_to_inode_entry(&entry, existing_entry.parent_ino);
+
+        let stored_mode = inode_entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+        let stored_file_type = stored_mode & 0o170000;
+        info!(
+            "[DIR_TREE] update_entry: ino={}, stored_mode={:o}, stored_file_type={:o}",
+            ino, stored_mode, stored_file_type
+        );
 
         let mut inode_data = Vec::new();
         inode_entry

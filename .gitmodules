@@ -1,6 +1,6 @@
 [submodule "rfs_tester"]
 	path = rfs_tester
-	url = git@github.com:FudanPPI/rfs_tester.git
+	url = https://github.com/FudanPPI/rfs_tester.git
 [submodule "s3-tests"]
 	path = s3-tests
-	url = git@github.com:FudanPPI/s3-tests.git
+	url = https://github.com/FudanPPI/s3-tests.git

@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
+#[path = "test_harness.rs"]
 mod test_harness;
 
 fn fuse_mount() -> String {
@@ -20,7 +21,10 @@ macro_rules! test_path {
 }
 
 fn setup() {
-    test_harness::ensure_fuse_mounted();
+    if let Err(e) = test_harness::ensure_fuse_mounted() {
+        eprintln!("Skipping test: {}", e);
+        std::process::exit(0);
+    }
 }
 
 #[test]

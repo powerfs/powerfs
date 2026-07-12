@@ -302,6 +302,8 @@ services:
       - "8"
       - --verbose
       - --container
+      - --log-file
+      - /var/log/powerfs-fuse.log
     depends_on:
       volume-1:
         condition: service_healthy
@@ -347,6 +349,8 @@ services:
       - "8"
       - --verbose
       - --container
+      - --log-file
+      - /var/log/powerfs-fuse.log
     depends_on:
       volume-1:
         condition: service_healthy

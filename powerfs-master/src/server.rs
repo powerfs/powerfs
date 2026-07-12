@@ -7,6 +7,7 @@ use log::{debug, info, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,11 +19,16 @@ use uuid::Uuid;
 pub struct MasterGrpcServer {
     master: Arc<MasterNode>,
     kv_cache: Arc<KVCacheEngine>,
+    leader_channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
 }
 
 impl MasterGrpcServer {
     pub fn new(master: Arc<MasterNode>, kv_cache: Arc<KVCacheEngine>) -> Self {
-        MasterGrpcServer { master, kv_cache }
+        MasterGrpcServer {
+            master,
+            kv_cache,
+            leader_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
     }
 
     pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
@@ -47,15 +53,38 @@ impl MasterGrpcServer {
         if leader.is_empty() {
             return None;
         }
-        let addr = format!("http://{}", leader);
-        match crate::proto::powerfs::master_service_client::MasterServiceClient::connect(addr).await
+
         {
-            Ok(client) => Some(client),
-            Err(e) => {
-                warn!("Failed to connect to leader {}: {}", leader, e);
-                None
+            let channels = self.leader_channels.read().await;
+            if let Some(ch) = channels.get(&leader) {
+                return Some(
+                    crate::proto::powerfs::master_service_client::MasterServiceClient::new(
+                        ch.clone(),
+                    ),
+                );
             }
         }
+
+        let addr = format!("http://{}", leader);
+        let channel = match Channel::from_shared(addr)
+            .map_err(|e| {
+                warn!("Invalid leader address: {}", e);
+                e
+            })
+            .ok()?
+            .connect()
+            .await
+        {
+            Ok(ch) => ch,
+            Err(e) => {
+                warn!("Failed to connect to leader {}: {}", leader, e);
+                return None;
+            }
+        };
+
+        let mut channels = self.leader_channels.write().await;
+        channels.insert(leader, channel.clone());
+        Some(crate::proto::powerfs::master_service_client::MasterServiceClient::new(channel))
     }
 }
 
@@ -716,6 +745,12 @@ impl MasterService for MasterGrpcServer {
             .unwrap();
 
         if let Some((entry, path)) = result {
+            let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+            let file_type = mode_val & 0o170000;
+            info!(
+                "get_entry_by_inode response: inode={}, name={}, path={}, mode={:o}, file_type={:o}, is_symlink={}, symlink_target='{}'",
+                inode, entry.name, path, mode_val, file_type, file_type == 0o120000, entry.symlink_target
+            );
             Ok(Response::new(GetEntryByInodeResponse {
                 found: true,
                 entry: Some(entry),
@@ -741,10 +776,12 @@ impl MasterService for MasterGrpcServer {
         let client_id = req.client_id.clone();
         let entry = req.entry.unwrap_or_default();
         info!(
-            "create_entry request: name={}, directory={}, client_id={}",
+            "create_entry request: name={}, directory={}, client_id={}, mode={:o}, symlink_target='{}'",
             entry.name.as_str(),
             entry.directory.as_str(),
-            client_id
+            client_id,
+            entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
+            entry.symlink_target
         );
 
         let inode = tokio::task::spawn_blocking(move || dir_tree.create_entry(entry, &client_id))
@@ -775,12 +812,14 @@ impl MasterService for MasterGrpcServer {
         let entry = req.entry.unwrap_or_default();
         let entry_ref = &entry;
         info!(
-            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}",
+            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}, mode={:o}, symlink_target='{}'",
             entry_ref.name.as_str(),
             entry_ref.directory.as_str(),
             client_id,
             entry_ref.content_size,
-            entry_ref.attributes.as_ref().map(|a| a.size).unwrap_or(0)
+            entry_ref.attributes.as_ref().map(|a| a.size).unwrap_or(0),
+            entry_ref.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
+            entry_ref.symlink_target
         );
 
         let result = tokio::task::spawn_blocking(move || dir_tree.update_entry(entry, &client_id))

@@ -313,11 +313,11 @@ impl PowerFsFs {
         let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
         attr.st_ino = entry.inode;
         attr.st_mode = if entry.is_symlink {
-            entry.mode | 0o120000
+            (entry.mode | 0o120000) as libc::mode_t
         } else if entry.is_dir {
-            entry.mode | 0o040000
+            (entry.mode | 0o040000) as libc::mode_t
         } else {
-            entry.mode | 0o100000
+            (entry.mode | 0o100000) as libc::mode_t
         };
         attr.st_nlink = entry.nlink as u64;
         attr.st_uid = entry.uid;
@@ -854,15 +854,33 @@ impl FileSystem for PowerFsFs {
         fuse_backend_rs::abi::fuse_abi::OpenOptions,
         Option<u32>,
     )> {
+        eprintln!(
+            "fuse::open called: inode={}, ROOT_INODE={}",
+            inode, ROOT_INODE
+        );
         debug!("open: inode={}", inode);
 
-        if inode == ROOT_INODE || self.cache.get_inode(inode).is_some() {
+        if inode == ROOT_INODE {
+            eprintln!("fuse::open: inode is root, returning EISDIR");
+            return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        }
+
+        if let Some(entry) = self.cache.get_inode(inode) {
+            eprintln!(
+                "fuse::open: found entry in cache, is_dir={}, mode={:o}",
+                entry.is_dir, entry.mode
+            );
+            if entry.is_dir {
+                eprintln!("fuse::open: entry is directory, returning EISDIR");
+                return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+            }
             Ok((
                 Some(inode),
                 fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
                 None,
             ))
         } else {
+            eprintln!("fuse::open: entry not found in cache, returning ENOENT");
             Err(std::io::Error::from_raw_os_error(libc::ENOENT))
         }
     }

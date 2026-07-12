@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN mkdir -p /mnt/powerfs && chown root:root /mnt/powerfs && chmod 755 /mnt/powerfs
+RUN mkdir -p /var/log && chown root:root /var/log && chmod 755 /var/log
 
 COPY target/release/powerfs /app/
 COPY target/release/powerfs-volume /app/

@@ -122,7 +122,7 @@ impl MetadataCache {
             nlink: 2,
             fid: None,
             size: 4096,
-            mode: 0o755,
+            mode: 0o777,
             uid,
             gid,
             atime: now,
