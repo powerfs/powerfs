@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 use uuid;
 
 const TTL: Duration = Duration::from_secs(0);
@@ -58,7 +59,8 @@ impl WriteBuffer {
     pub fn get_max_write_offset(&self, inode: u64) -> u64 {
         let buffers = self.buffers.read().unwrap();
         if let Some(entries) = buffers.get(&inode) {
-            entries.iter()
+            entries
+                .iter()
                 .map(|e| e.offset + e.data.len() as u64)
                 .max()
                 .unwrap_or(0)
@@ -89,6 +91,8 @@ struct PowerFsFuserFs {
     client_id: String,
     job_id: String,
     notifier: Arc<std::sync::Mutex<Option<fuser::Notifier>>>,
+    pending_requests: Arc<RwLock<HashMap<u64, CancellationToken>>>,
+    request_id_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PowerFsFuserFs {
@@ -115,27 +119,62 @@ impl PowerFsFuserFs {
             client_id,
             job_id,
             notifier: Arc::new(std::sync::Mutex::new(None)),
+            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            request_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     fn invalidate_kernel_dentry(&self, parent: u64, name: &str) {
-        let notifier_guard = self.notifier.lock().unwrap();
-        if let Some(notifier) = notifier_guard.as_ref() {
-            if let Err(e) = notifier.inval_entry(parent, OsStr::new(name)) {
-                debug!(
-                    "Failed to invalidate kernel dentry (parent={}, name={}): {}",
-                    parent, name, e
-                );
+        let notifier = self.notifier.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let notifier_guard = notifier.lock().unwrap();
+            if let Some(n) = notifier_guard.as_ref() {
+                if let Err(e) = n.inval_entry(parent, OsStr::new(&name)) {
+                    debug!(
+                        "Failed to invalidate kernel dentry (parent={}, name={}): {}",
+                        parent, name, e
+                    );
+                }
             }
-        }
+        });
     }
 
     fn invalidate_kernel_inode(&self, inode: u64) {
-        let notifier_guard = self.notifier.lock().unwrap();
-        if let Some(notifier) = notifier_guard.as_ref() {
-            if let Err(e) = notifier.inval_inode(inode, 0, -1) {
-                debug!("Failed to invalidate kernel inode ({}): {}", inode, e);
+        let notifier = self.notifier.clone();
+        std::thread::spawn(move || {
+            let notifier_guard = notifier.lock().unwrap();
+            if let Some(n) = notifier_guard.as_ref() {
+                if let Err(e) = n.inval_inode(inode, 0, -1) {
+                    debug!("Failed to invalidate kernel inode ({}): {}", inode, e);
+                }
             }
+        });
+    }
+
+    #[allow(dead_code)]
+    fn register_request(&self) -> u64 {
+        let request_id = self
+            .request_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = CancellationToken::new();
+        self.pending_requests
+            .write()
+            .unwrap()
+            .insert(request_id, token);
+        request_id
+    }
+
+    #[allow(dead_code)]
+    fn unregister_request(&self, request_id: u64) {
+        self.pending_requests.write().unwrap().remove(&request_id);
+    }
+
+    #[allow(dead_code)]
+    fn cancel_request(&self, request_id: u64) {
+        if let Some(token) = self.pending_requests.write().unwrap().remove(&request_id) {
+            token.cancel();
+            debug!("Cancelled request {}", request_id);
         }
     }
 
@@ -149,8 +188,12 @@ impl PowerFsFuserFs {
                 .collect()
         };
 
-        info!("flush_dirty_chunks: inode={}, dirty_chunks={}", inode, dirty.len());
-        
+        info!(
+            "flush_dirty_chunks: inode={}, dirty_chunks={}",
+            inode,
+            dirty.len()
+        );
+
         if dirty.is_empty() {
             return Ok(());
         }
@@ -246,15 +289,15 @@ impl PowerFsFuserFs {
 
         if !path.is_empty() && !chunks.is_empty() {
             let attrs = entry.attributes.as_ref();
-            
+
             let mut content_size = entry.content_size;
             let mut size = attrs.map(|a| a.size).unwrap_or(0);
-            
+
             if max_write_offset > 0 && max_write_offset < size {
                 size = max_write_offset;
                 content_size = max_write_offset;
             }
-            
+
             let filer_entry = powerfs_master::proto::powerfs::Entry {
                 name: entry.name,
                 directory,
@@ -293,7 +336,10 @@ impl PowerFsFuserFs {
             if let Err(e) = self.client.update_entry(&filer_entry, &self.client_id) {
                 warn!("Failed to update entry on master: {}", e);
             } else {
-                info!("flush_dirty_chunks: entry updated successfully, invalidating inode {}", inode);
+                info!(
+                    "flush_dirty_chunks: entry updated successfully, invalidating inode {}",
+                    inode
+                );
                 self.invalidate_kernel_inode(inode);
             }
         }
@@ -445,45 +491,37 @@ impl PowerFsFuserFs {
     }
 
     fn readdir_root(&self, mut reply: ReplyDirectory, offset: i64) {
-        let mut idx = offset as usize;
+        let idx = offset as usize;
 
-        if idx == 0 {
-            if !reply.add(1, 1, FileType::Directory, ".") {
-                reply.ok();
-                return;
-            }
-            idx = 1;
+        if idx == 0 && !reply.add(1, 1, FileType::Directory, ".") {
+            reply.ok();
+            return;
         }
 
-        if idx == 1 {
-            if !reply.add(1, 2, FileType::Directory, "..") {
-                reply.ok();
-                return;
-            }
-            idx = 2;
+        if idx <= 1 && !reply.add(1, 2, FileType::Directory, "..") {
+            reply.ok();
+            return;
         }
 
         match self.client.list_entries(1, 1000, "") {
             Ok(entries) => {
-                debug!("readdir_root: got {} entries from master", entries.len());
                 for (i, entry) in entries.iter().enumerate() {
-                    debug!("readdir_root: entry[{}] name='{}', ino={}", i, entry.name, entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0));
-                }
-                let child_offset = idx.saturating_sub(2);
-                for (i, entry) in entries.iter().enumerate().skip(child_offset) {
-                    let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
-                    let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
-                    let file_type = mode_val & 0o170000;
+                    let entry_idx = 2 + i;
+                    if entry_idx >= idx {
+                        let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                        let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+                        let file_type = mode_val & 0o170000;
 
-                    let kind = match file_type {
-                        0o040000 => FileType::Directory,
-                        0o120000 => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
+                        let kind = match file_type {
+                            0o040000 => FileType::Directory,
+                            0o120000 => FileType::Symlink,
+                            _ => FileType::RegularFile,
+                        };
 
-                    let next_offset = (child_offset + i + 3) as i64;
-                    if !reply.add(child_ino, next_offset, kind, &entry.name) {
-                        break;
+                        let next_offset = (entry_idx + 1) as i64;
+                        if !reply.add(child_ino, next_offset, kind, &entry.name) {
+                            break;
+                        }
                     }
                 }
             }
@@ -511,6 +549,8 @@ impl Clone for PowerFsFuserFs {
             client_id: self.client_id.clone(),
             job_id: self.job_id.clone(),
             notifier: self.notifier.clone(),
+            pending_requests: self.pending_requests.clone(),
+            request_id_counter: self.request_id_counter.clone(),
         }
     }
 }
@@ -552,7 +592,7 @@ impl Filesystem for PowerFsFuserFs {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, inode: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, inode: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("getattr: inode={}", inode);
 
         if inode == 1 {
@@ -580,10 +620,21 @@ impl Filesystem for PowerFsFuserFs {
         match self.client.get_entry_by_inode(inode) {
             Ok(Some((entry, _))) => {
                 let attr = self.create_file_attr_from_entry(&entry);
+                debug!(
+                    "getattr: inode={}, name='{}', mode={:o}, size={}",
+                    inode, entry.name, attr.perm, attr.size
+                );
                 reply.attr(&TTL, &attr);
             }
-            _ => {
-                error!("getattr: inode {} not found on master", inode);
+            Ok(None) => {
+                error!(
+                    "getattr: inode {} not found on master (returned None)",
+                    inode
+                );
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                error!("getattr: inode {} failed: {}", inode, e);
                 reply.error(libc::ENOENT);
             }
         }
@@ -747,7 +798,10 @@ impl Filesystem for PowerFsFuserFs {
             }
         };
 
-        debug!("mkdir: parent_inode={}, parent_path='{}'", parent, parent_path);
+        debug!(
+            "mkdir: parent_inode={}, parent_path='{}'",
+            parent, parent_path
+        );
 
         let now = chrono::Utc::now().timestamp();
         let dir_path = if parent_path == "/" || parent_path.is_empty() {
@@ -1491,7 +1545,10 @@ impl Filesystem for PowerFsFuserFs {
             if let Ok(Some((entry, _))) = self.client.get_entry_by_inode(inode) {
                 if let Some(attrs) = entry.attributes {
                     if new_file_size > attrs.size {
-                        debug!("write (small): updating file size from {} to {}", attrs.size, new_file_size);
+                        debug!(
+                            "write (small): updating file size from {} to {}",
+                            attrs.size, new_file_size
+                        );
                         let filer_entry = powerfs_master::proto::powerfs::Entry {
                             name: entry.name,
                             directory: entry.directory,
@@ -1656,13 +1713,19 @@ impl Filesystem for PowerFsFuserFs {
         }
 
         let new_file_size = offset_u64 + data_len as u64;
-        debug!("write: inode={}, offset={}, data_len={}, new_file_size={}", inode, offset_u64, data_len, new_file_size);
-        
+        debug!(
+            "write: inode={}, offset={}, data_len={}, new_file_size={}",
+            inode, offset_u64, data_len, new_file_size
+        );
+
         if let Ok(Some((entry, _))) = self.client.get_entry_by_inode(inode) {
             if let Some(attrs) = entry.attributes {
                 debug!("write: current file size on master: {}", attrs.size);
                 if new_file_size > attrs.size {
-                    debug!("write: updating file size from {} to {}", attrs.size, new_file_size);
+                    debug!(
+                        "write: updating file size from {} to {}",
+                        attrs.size, new_file_size
+                    );
                     let filer_entry = powerfs_master::proto::powerfs::Entry {
                         name: entry.name,
                         directory: entry.directory,
@@ -1700,7 +1763,10 @@ impl Filesystem for PowerFsFuserFs {
                         self.invalidate_kernel_inode(inode);
                     }
                 } else {
-                    debug!("write: new_file_size ({}) not larger than current size ({})", new_file_size, attrs.size);
+                    debug!(
+                        "write: new_file_size ({}) not larger than current size ({})",
+                        new_file_size, attrs.size
+                    );
                 }
             } else {
                 debug!("write: no attributes found for inode {}", inode);
@@ -1874,21 +1940,23 @@ impl Filesystem for PowerFsFuserFs {
 
         match self.client.list_entries(inode, 1000, "") {
             Ok(entries) => {
-                let child_offset = idx.saturating_sub(2);
-                for (i, entry) in entries.iter().enumerate().skip(child_offset) {
-                    let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
-                    let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
-                    let file_type = mode_val & 0o170000;
+                for (i, entry) in entries.iter().enumerate() {
+                    let entry_idx = 2 + i;
+                    if entry_idx >= idx {
+                        let child_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                        let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+                        let file_type = mode_val & 0o170000;
 
-                    let kind = match file_type {
-                        0o040000 => FileType::Directory,
-                        0o120000 => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
+                        let kind = match file_type {
+                            0o040000 => FileType::Directory,
+                            0o120000 => FileType::Symlink,
+                            _ => FileType::RegularFile,
+                        };
 
-                    let next_offset = (child_offset + i + 3) as i64;
-                    if !reply.add(child_ino, next_offset, kind, &entry.name) {
-                        break;
+                        let next_offset = (entry_idx + 1) as i64;
+                        if !reply.add(child_ino, next_offset, kind, &entry.name) {
+                            break;
+                        }
                     }
                 }
             }

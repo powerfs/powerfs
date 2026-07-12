@@ -655,8 +655,13 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<LookupDirectoryEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let name = req.name.clone();
 
-        if let Some(entry) = dir_tree.lookup(req.parent_ino, &req.name) {
+        let entry = tokio::task::spawn_blocking(move || dir_tree.lookup(req.parent_ino, &name))
+            .await
+            .unwrap();
+
+        if let Some(entry) = entry {
             Ok(Response::new(LookupDirectoryEntryResponse {
                 found: true,
                 entry: Some(entry),
@@ -677,8 +682,13 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<GetEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let path = req.path.clone();
 
-        if let Some(entry) = dir_tree.get_entry(&req.path) {
+        let entry = tokio::task::spawn_blocking(move || dir_tree.get_entry(&path))
+            .await
+            .unwrap();
+
+        if let Some(entry) = entry {
             Ok(Response::new(GetEntryResponse {
                 found: true,
                 entry: Some(entry),
@@ -699,8 +709,13 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<GetEntryByInodeResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let inode = req.inode;
 
-        if let Some((entry, path)) = dir_tree.get_entry_by_inode(req.inode) {
+        let result = tokio::task::spawn_blocking(move || dir_tree.get_entry_by_inode(inode))
+            .await
+            .unwrap();
+
+        if let Some((entry, path)) = result {
             Ok(Response::new(GetEntryByInodeResponse {
                 found: true,
                 entry: Some(entry),
@@ -723,17 +738,20 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<CreateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let client_id = req.client_id.clone();
+        let entry = req.entry.unwrap_or_default();
         info!(
             "create_entry request: name={}, directory={}, client_id={}",
-            req.entry.as_ref().map(|e| e.name.as_str()).unwrap_or(""),
-            req.entry
-                .as_ref()
-                .map(|e| e.directory.as_str())
-                .unwrap_or(""),
-            req.client_id
+            entry.name.as_str(),
+            entry.directory.as_str(),
+            client_id
         );
 
-        match dir_tree.create_entry(req.entry.unwrap_or_default(), &req.client_id) {
+        let inode = tokio::task::spawn_blocking(move || dir_tree.create_entry(entry, &client_id))
+            .await
+            .unwrap();
+
+        match inode {
             Ok(inode) => Ok(Response::new(CreateEntryResponse {
                 success: true,
                 error: String::new(),
@@ -753,17 +771,23 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<UpdateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
-        let entry = req.entry.as_ref();
+        let client_id = req.client_id.clone();
+        let entry = req.entry.unwrap_or_default();
+        let entry_ref = &entry;
         info!(
             "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}",
-            entry.map(|e| e.name.as_str()).unwrap_or(""),
-            entry.map(|e| e.directory.as_str()).unwrap_or(""),
-            req.client_id,
-            entry.map(|e| e.content_size).unwrap_or(0),
-            entry.and_then(|e| e.attributes.as_ref()).map(|a| a.size).unwrap_or(0)
+            entry_ref.name.as_str(),
+            entry_ref.directory.as_str(),
+            client_id,
+            entry_ref.content_size,
+            entry_ref.attributes.as_ref().map(|a| a.size).unwrap_or(0)
         );
 
-        match dir_tree.update_entry(req.entry.unwrap_or_default(), &req.client_id) {
+        let result = tokio::task::spawn_blocking(move || dir_tree.update_entry(entry, &client_id))
+            .await
+            .unwrap();
+
+        match result {
             Ok(_) => Ok(Response::new(UpdateEntryResponse {
                 success: true,
                 error: String::new(),
@@ -781,8 +805,14 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<DeleteEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let ino = req.ino;
+        let client_id = req.client_id.clone();
 
-        match dir_tree.delete_entry(req.ino, &req.client_id) {
+        let result = tokio::task::spawn_blocking(move || dir_tree.delete_entry(ino, &client_id))
+            .await
+            .unwrap();
+
+        match result {
             Ok(_) => Ok(Response::new(DeleteEntryResponse {
                 success: true,
                 error: String::new(),
@@ -804,14 +834,25 @@ impl MasterService for MasterGrpcServer {
             req.old_parent_ino, req.old_name, req.new_parent_ino, req.new_name, req.client_id
         );
         let dir_tree = self.master.directory_tree.clone();
+        let old_parent_ino = req.old_parent_ino;
+        let old_name = req.old_name.clone();
+        let new_parent_ino = req.new_parent_ino;
+        let new_name = req.new_name.clone();
+        let client_id = req.client_id.clone();
 
-        match dir_tree.rename_entry(
-            req.old_parent_ino,
-            &req.old_name,
-            req.new_parent_ino,
-            &req.new_name,
-            &req.client_id,
-        ) {
+        let result = tokio::task::spawn_blocking(move || {
+            dir_tree.rename_entry(
+                old_parent_ino,
+                &old_name,
+                new_parent_ino,
+                &new_name,
+                &client_id,
+            )
+        })
+        .await
+        .unwrap();
+
+        match result {
             Ok(success) => {
                 info!("rename_entry result: success={}", success);
                 Ok(Response::new(powerfs::RenameEntryResponse {
@@ -835,8 +876,15 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<ListEntriesResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let parent_ino = req.parent_ino;
+        let limit = req.limit;
+        let last_name = req.last_name.clone();
 
-        let entries = dir_tree.list_entries(req.parent_ino, req.limit, &req.last_name);
+        let entries = tokio::task::spawn_blocking(move || {
+            dir_tree.list_entries(parent_ino, limit, &last_name)
+        })
+        .await
+        .unwrap();
 
         Ok(Response::new(ListEntriesResponse {
             entries,
@@ -856,32 +904,45 @@ impl MasterService for MasterGrpcServer {
 
         tokio::spawn(async move {
             while let Some(req) = stream.message().await.unwrap_or(None) {
+                let dir_tree_clone = dir_tree.clone();
                 let result = match req.mutation {
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Create(
                         create_req,
                     )) => {
                         let client_id = create_req.client_id.clone();
-                        dir_tree
-                            .create_entry(create_req.entry.unwrap_or_default(), &client_id)
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
+                        let entry = create_req.entry.unwrap_or_default();
+                        tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.create_entry(entry, &client_id)
+                        })
+                        .await
+                        .unwrap()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
                     }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
                         update_req,
                     )) => {
                         let client_id = update_req.client_id.clone();
-                        dir_tree
-                            .update_entry(update_req.entry.unwrap_or_default(), &client_id)
-                            .map_err(|e| e.to_string())
+                        let entry = update_req.entry.unwrap_or_default();
+                        tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.update_entry(entry, &client_id)
+                        })
+                        .await
+                        .unwrap()
+                        .map_err(|e| e.to_string())
                     }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
                         delete_req,
                     )) => {
                         let client_id = delete_req.client_id.clone();
-                        dir_tree
-                            .delete_entry(delete_req.ino, &client_id)
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
+                        let ino = delete_req.ino;
+                        tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.delete_entry(ino, &client_id)
+                        })
+                        .await
+                        .unwrap()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
                     }
                     None => Ok(()),
                 };
@@ -934,15 +995,23 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::LeaseResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let path = req.path.clone();
+        let client_id = req.client_id.clone();
+        let duration_ms = req.duration_ms;
 
-        let lease_id = dir_tree.acquire_lease(&req.path, &req.client_id, req.duration_ms);
-        let epoch = dir_tree.get_epoch();
+        let (lease_id, epoch) = tokio::task::spawn_blocking(move || {
+            let lease_id = dir_tree.acquire_lease(&path, &client_id, duration_ms);
+            let epoch = dir_tree.get_epoch();
+            (lease_id, epoch)
+        })
+        .await
+        .unwrap();
 
         Ok(Response::new(powerfs::LeaseResponse {
             success: true,
             error: String::new(),
             lease_id,
-            duration_ms: req.duration_ms,
+            duration_ms,
             epoch,
         }))
     }
@@ -953,8 +1022,11 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::LeaseReleaseResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let lease_id = req.lease_id.clone();
 
-        let success = dir_tree.release_lease(&req.lease_id);
+        let success = tokio::task::spawn_blocking(move || dir_tree.release_lease(&lease_id))
+            .await
+            .unwrap();
 
         Ok(Response::new(powerfs::LeaseReleaseResponse {
             success,
@@ -972,8 +1044,15 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::LeaseRenewResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let lease_id = req.lease_id.clone();
+        let duration_ms = req.duration_ms;
 
-        match dir_tree.renew_lease(&req.lease_id, req.duration_ms) {
+        let result =
+            tokio::task::spawn_blocking(move || dir_tree.renew_lease(&lease_id, duration_ms))
+                .await
+                .unwrap();
+
+        match result {
             Some(epoch) => Ok(Response::new(powerfs::LeaseRenewResponse {
                 success: true,
                 error: String::new(),
@@ -993,8 +1072,15 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::JobRegistrationResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let job_id = req.job_id.clone();
+        let job_name = req.job_name.clone();
+        let client_id = req.client_id.clone();
 
-        let success = dir_tree.register_job_client(&req.job_id, &req.job_name, &req.client_id);
+        let success = tokio::task::spawn_blocking(move || {
+            dir_tree.register_job_client(&job_id, &job_name, &client_id)
+        })
+        .await
+        .unwrap();
 
         Ok(Response::new(powerfs::JobRegistrationResponse {
             success,
@@ -1012,8 +1098,14 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::JobDeregistrationResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let job_id = req.job_id.clone();
+        let client_id = req.client_id.clone();
 
-        let success = dir_tree.deregister_job_client(&req.job_id, &req.client_id);
+        let success = tokio::task::spawn_blocking(move || {
+            dir_tree.deregister_job_client(&job_id, &client_id)
+        })
+        .await
+        .unwrap();
 
         Ok(Response::new(powerfs::JobDeregistrationResponse {
             success,
@@ -1031,8 +1123,13 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::JobCompletionResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let job_id = req.job_id.clone();
 
-        match dir_tree.complete_job(&req.job_id) {
+        let result = tokio::task::spawn_blocking(move || dir_tree.complete_job(&job_id))
+            .await
+            .unwrap();
+
+        match result {
             Some(invalidated_entries) => Ok(Response::new(powerfs::JobCompletionResponse {
                 success: true,
                 error: String::new(),
@@ -1048,8 +1145,13 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<powerfs::JobInfoResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let job_id = req.job_id.clone();
 
-        match dir_tree.get_job_info(&req.job_id) {
+        let result = tokio::task::spawn_blocking(move || dir_tree.get_job_info(&job_id))
+            .await
+            .unwrap();
+
+        match result {
             Some(job) => {
                 let job_ctx = powerfs::JobContext {
                     job_id: job.job_id,

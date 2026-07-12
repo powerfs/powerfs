@@ -7,7 +7,30 @@ fn get_mount_path() -> String {
     env::var("POWERFS_MOUNT").unwrap_or_else(|_| "/mnt/powerfs".to_string())
 }
 
-fn setup() {}
+fn assert_powerfs_mounted() {
+    let mount_path = get_mount_path();
+    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == mount_path {
+                let fstype = parts[2];
+                // 接受 "fuse"、"fuse.powerfs-fuse" 以及任何 "fuse.*" 形式
+                if fstype == "fuse" || fstype == "fuse.powerfs-fuse" || fstype.starts_with("fuse.")
+                {
+                    return;
+                }
+            }
+        }
+    }
+    panic!(
+        "Mount path '{}' is not a PowerFS FUSE mount! Tests must run against PowerFS.",
+        mount_path
+    );
+}
+
+fn setup() {
+    assert_powerfs_mounted();
+}
 
 #[test]
 fn test_rfs_tester_fuse_basic_operations() {

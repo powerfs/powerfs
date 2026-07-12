@@ -34,6 +34,7 @@ clap = { workspace = true }
 lru = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
+tokio-util = "0.7"
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

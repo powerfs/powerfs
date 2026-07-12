@@ -26,7 +26,13 @@ fn container_exists(name: &str) -> bool {
 
 fn restart_fuse() {
     let _ = Command::new("docker")
-        .args(["compose", "-f", "/home/portion/powerfs/docker/docker-compose.test.yml", "restart", "fuse-test"])
+        .args([
+            "compose",
+            "-f",
+            "/home/portion/powerfs/docker/docker-compose.test.yml",
+            "restart",
+            "fuse-test",
+        ])
         .output();
     std::thread::sleep(Duration::from_secs(5));
 }
@@ -34,31 +40,43 @@ fn restart_fuse() {
 #[test]
 fn test_data_persists_across_fuse_restart() {
     let mount_path = get_mount_path();
-    
+
     let test_file = Path::new(&mount_path).join("persistence_test.txt");
     let expected_content = "Data that should persist in Volume";
-    
+
     fs::write(&test_file, expected_content).expect("Failed to write test file");
-    
+
     let before_restart = fs::read_to_string(&test_file).expect("Failed to read before restart");
-    assert_eq!(before_restart, expected_content, "Content mismatch before restart");
-    
+    assert_eq!(
+        before_restart, expected_content,
+        "Content mismatch before restart"
+    );
+
     restart_fuse();
-    
+
     let after_restart = fs::read_to_string(&test_file).expect("Failed to read after restart");
-    assert_eq!(after_restart, expected_content, "Data lost after FUSE restart! Volume not working.");
+    assert_eq!(
+        after_restart, expected_content,
+        "Data lost after FUSE restart! Volume not working."
+    );
 }
 
 #[test]
 fn test_volume_has_data_files() {
-    assert!(container_exists("powerfs-test-volume"), "Volume container not running");
-    
+    assert!(
+        container_exists("powerfs-test-volume"),
+        "Volume container not running"
+    );
+
     let volume_dirs = docker_exec("ls -la /data/");
-    assert!(volume_dirs.contains("volume_"), "Volume directories not found");
-    
+    assert!(
+        volume_dirs.contains("volume_"),
+        "Volume directories not found"
+    );
+
     let volume1_files = docker_exec("ls -la /data/volume_1/");
     assert!(volume1_files.contains("data"), "Volume data file not found");
-    
+
     let volume1_index = docker_exec("ls -la /data/volume_1/index/");
     assert!(volume1_index.contains("index"), "Volume index not found");
 }
@@ -66,19 +84,19 @@ fn test_volume_has_data_files() {
 #[test]
 fn test_write_and_read_cycle() {
     let mount_path = get_mount_path();
-    
+
     let test_file = Path::new(&mount_path).join("write_read_test.txt");
-    
+
     fs::write(&test_file, "initial content").expect("Failed to write");
-    
+
     let content = fs::read_to_string(&test_file).expect("Failed to read");
     assert_eq!(content, "initial content");
-    
+
     fs::write(&test_file, "updated content").expect("Failed to update");
-    
+
     let updated = fs::read_to_string(&test_file).expect("Failed to read updated");
     assert_eq!(updated, "updated content");
-    
+
     fs::remove_file(&test_file).expect("Failed to delete");
     assert!(!test_file.exists(), "File should be deleted");
 }

@@ -273,6 +273,7 @@ services:
     container_name: fuse-1
     cpus: '1.0'
     mem_limit: 512m
+    init: true
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.41
@@ -285,7 +286,22 @@ services:
       - apparmor:unconfined
     privileged: true
     restart: unless-stopped
-    command: bash -c "RUST_LOG=debug /app/powerfs-fuse --master 172.20.0.11:9333 --mount-point /mnt/powerfs --collection default --replication 000 --threads 8 --verbose 2>&1 || sleep 30"
+    environment:
+      - RUST_LOG=debug
+    command:
+      - /app/powerfs-fuse
+      - --master
+      - 172.20.0.11:9333
+      - --mount-point
+      - /mnt/powerfs
+      - --collection
+      - default
+      - --replication
+      - "000"
+      - --threads
+      - "8"
+      - --verbose
+      - --container
     depends_on:
       volume-1:
         condition: service_healthy
@@ -302,6 +318,7 @@ services:
     container_name: fuse-2
     cpus: '1.0'
     mem_limit: 512m
+    init: true
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.42
@@ -314,7 +331,22 @@ services:
       - apparmor:unconfined
     privileged: true
     restart: unless-stopped
-    command: bash -c "RUST_LOG=debug /app/powerfs-fuse --master 172.20.0.11:9333 --mount-point /mnt/powerfs --collection default --replication 000 --threads 8 --verbose 2>&1 || sleep 30"
+    environment:
+      - RUST_LOG=debug
+    command:
+      - /app/powerfs-fuse
+      - --master
+      - 172.20.0.11:9333
+      - --mount-point
+      - /mnt/powerfs
+      - --collection
+      - default
+      - --replication
+      - "000"
+      - --threads
+      - "8"
+      - --verbose
+      - --container
     depends_on:
       volume-1:
         condition: service_healthy

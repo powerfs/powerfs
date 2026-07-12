@@ -15,6 +15,43 @@ pub fn get_fuse_mount() -> String {
     env::var("POWERFS_MOUNT").unwrap_or_else(|_| DEFAULT_FUSE_MOUNT.to_string())
 }
 
+#[allow(dead_code)]
+pub fn is_powerfs_mounted(mount_path: &str) -> bool {
+    if !fs::metadata(mount_path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    match fs::read_to_string("/proc/mounts") {
+        Ok(content) => {
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[1] == mount_path {
+                    let fstype = parts[2];
+                    // 接受 "fuse"、"fuse.powerfs-fuse" 以及任何 "fuse.*" 形式
+                    return fstype == "fuse"
+                        || fstype == "fuse.powerfs-fuse"
+                        || fstype.starts_with("fuse.");
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+#[allow(dead_code)]
+pub fn assert_powerfs_mounted() {
+    let mount_path = get_fuse_mount();
+    assert!(
+        is_powerfs_mounted(&mount_path),
+        "Mount path '{}' is not a PowerFS FUSE mount! Tests must run against PowerFS.",
+        mount_path
+    );
+}
+
 pub fn get_test_data_dir() -> String {
     env::var("POWERFS_TEST_DATA_DIR").unwrap_or_else(|_| DEFAULT_TEST_DATA_DIR.to_string())
 }
@@ -241,7 +278,10 @@ pub fn ensure_fuse_mounted() {
         let fuse_process = spawn_fuse(&target_dir, &master_addr).expect("Failed to start fuse");
 
         let fuse_mount = get_fuse_mount();
-        assert!(wait_for_mount(&fuse_mount, 30), "FUSE did not mount in time");
+        assert!(
+            wait_for_mount(&fuse_mount, 30),
+            "FUSE did not mount in time"
+        );
 
         TestEnvironment {
             master_process,

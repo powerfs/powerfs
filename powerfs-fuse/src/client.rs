@@ -1481,9 +1481,34 @@ pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
 
+/// Timeout for synchronous gRPC calls invoked from the FUSE session thread.
+/// Without this, a hung master/volume response blocks the FUSE session
+/// forever, making every subsequent FUSE operation (ls, df, stat, ...)
+/// hang in the kernel.
+const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl SyncFuseClient {
     pub fn new(client: Arc<PowerFuseClient>) -> Self {
         SyncFuseClient { client }
+    }
+
+    /// Run an async gRPC call on the tokio runtime with a hard timeout.
+    /// Returns Err(...) if the call does not complete within
+    /// `GRPC_CALL_TIMEOUT`, so the FUSE session thread is never blocked
+    /// indefinitely by a hung master/volume server.
+    fn block_with_timeout<F, T>(&self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.client.runtime_handle.block_on(async {
+            match tokio::time::timeout(GRPC_CALL_TIMEOUT, future).await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "gRPC call timed out after {}s",
+                    GRPC_CALL_TIMEOUT.as_secs()
+                )),
+            }
+        })
     }
 
     pub fn assign_fid(
@@ -1491,15 +1516,11 @@ impl SyncFuseClient {
         collection: &str,
         replication: &str,
     ) -> Result<AssignFidResult, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.assign_fid(collection, replication))
+        self.block_with_timeout(self.client.assign_fid(collection, replication))
     }
 
     pub fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.lookup_volume(volume_id))
+        self.block_with_timeout(self.client.lookup_volume(volume_id))
     }
 
     pub fn write_data(
@@ -1509,12 +1530,10 @@ impl SyncFuseClient {
         file_key: u64,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(self.client.write_data(
-            volume_addr,
-            volume_id,
-            file_key,
-            data,
-        ))
+        self.block_with_timeout(
+            self.client
+                .write_data(volume_addr, volume_id, file_key, data),
+        )
     }
 
     pub fn read_data(
@@ -1523,9 +1542,7 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<Vec<u8>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.read_data(volume_addr, volume_id, file_key))
+        self.block_with_timeout(self.client.read_data(volume_addr, volume_id, file_key))
     }
 
     pub fn delete_data(
@@ -1534,11 +1551,7 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(self.client.delete_data(
-            volume_addr,
-            volume_id,
-            file_key,
-        ))
+        self.block_with_timeout(self.client.delete_data(volume_addr, volume_id, file_key))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1552,7 +1565,7 @@ impl SyncFuseClient {
         data: Vec<u8>,
         cookie: u32,
     ) -> Result<(), String> {
-        self.client.runtime_handle.block_on(self.client.write_blob(
+        self.block_with_timeout(self.client.write_blob(
             volume_addr,
             volume_id,
             file_key,
@@ -1570,12 +1583,12 @@ impl SyncFuseClient {
         file_key: u64,
         entries: Vec<(i64, i32, Vec<u8>, u32)>,
     ) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(
-                self.client
-                    .batch_write_blob(volume_addr, volume_id, file_key, entries),
-            )
+        self.block_with_timeout(self.client.batch_write_blob(
+            volume_addr,
+            volume_id,
+            file_key,
+            entries,
+        ))
     }
 
     pub fn read_blob(
@@ -1586,7 +1599,7 @@ impl SyncFuseClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        self.client.runtime_handle.block_on(self.client.read_blob(
+        self.block_with_timeout(self.client.read_blob(
             volume_addr,
             volume_id,
             file_key,
@@ -1596,27 +1609,19 @@ impl SyncFuseClient {
     }
 
     pub fn create_entry(&self, entry: Entry, client_id: &str) -> Result<u64, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.create_entry(entry, client_id))
+        self.block_with_timeout(self.client.create_entry(entry, client_id))
     }
 
     pub fn update_entry(&self, entry: &Entry, client_id: &str) -> Result<(), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.update_entry(entry, client_id))
+        self.block_with_timeout(self.client.update_entry(entry, client_id))
     }
 
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.get_entry(path))
+        self.block_with_timeout(self.client.get_entry(path))
     }
 
     pub fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.get_entry_by_inode(inode))
+        self.block_with_timeout(self.client.get_entry_by_inode(inode))
     }
 
     pub fn delete_entry(
@@ -1625,9 +1630,7 @@ impl SyncFuseClient {
         is_directory: bool,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.delete_entry(ino, is_directory, client_id))
+        self.block_with_timeout(self.client.delete_entry(ino, is_directory, client_id))
     }
 
     pub fn rename_entry(
@@ -1638,15 +1641,13 @@ impl SyncFuseClient {
         new_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.rename_entry(
-                old_parent_ino,
-                old_name,
-                new_parent_ino,
-                new_name,
-                client_id,
-            ))
+        self.block_with_timeout(self.client.rename_entry(
+            old_parent_ino,
+            old_name,
+            new_parent_ino,
+            new_name,
+            client_id,
+        ))
     }
 
     pub fn list_entries(
@@ -1655,9 +1656,7 @@ impl SyncFuseClient {
         limit: u64,
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.list_entries(parent_ino, limit, start_after))
+        self.block_with_timeout(self.client.list_entries(parent_ino, limit, start_after))
     }
 
     pub fn lookup_directory_entry(
@@ -1665,9 +1664,7 @@ impl SyncFuseClient {
         parent_ino: u64,
         name: &str,
     ) -> Result<Option<Entry>, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.lookup_directory_entry(parent_ino, name))
+        self.block_with_timeout(self.client.lookup_directory_entry(parent_ino, name))
     }
 
     pub fn invalidate_volume_channel(&self, addr: &str) {
@@ -1682,21 +1679,15 @@ impl SyncFuseClient {
         client_id: &str,
         duration_ms: u64,
     ) -> Result<(String, u64), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.acquire_lease(path, client_id, duration_ms))
+        self.block_with_timeout(self.client.acquire_lease(path, client_id, duration_ms))
     }
 
     pub fn release_lease(&self, lease_id: &str) -> Result<bool, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.release_lease(lease_id))
+        self.block_with_timeout(self.client.release_lease(lease_id))
     }
 
     pub fn renew_lease(&self, lease_id: &str, duration_ms: u64) -> Result<(bool, u64), String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.renew_lease(lease_id, duration_ms))
+        self.block_with_timeout(self.client.renew_lease(lease_id, duration_ms))
     }
 
     pub fn register_job_client(
@@ -1705,20 +1696,14 @@ impl SyncFuseClient {
         job_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.register_job_client(job_id, job_name, client_id))
+        self.block_with_timeout(self.client.register_job_client(job_id, job_name, client_id))
     }
 
     pub fn deregister_job_client(&self, job_id: &str, client_id: &str) -> Result<bool, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.deregister_job_client(job_id, client_id))
+        self.block_with_timeout(self.client.deregister_job_client(job_id, client_id))
     }
 
     pub fn complete_job(&self, job_id: &str) -> Result<u64, String> {
-        self.client
-            .runtime_handle
-            .block_on(self.client.complete_job(job_id))
+        self.block_with_timeout(self.client.complete_job(job_id))
     }
 }
