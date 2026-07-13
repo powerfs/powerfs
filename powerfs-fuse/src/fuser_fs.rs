@@ -1140,12 +1140,18 @@ impl Filesystem for PowerFsFuserFs {
         debug!("release: inode={}, flush={}", inode, _flush);
 
         // flush 脏数据（失败不影响文件关闭，数据已在本地缓存，稍后可重试）
-        if let Err(e) = self.flush_dirty_chunks(inode) {
-            error!("release: flush failed for inode={}, error={}", inode, e);
+        let flush_ok = self.flush_dirty_chunks(inode).is_ok();
+        if !flush_ok {
+            error!("release: flush failed for inode={}", inode);
         }
 
-        // 释放 DataManager 资源
-        self.data.release_inode(inode);
+        // 清理 write_buffer（数据已在 chunk_cache 中）
+        self.data.write_buffer().take(inode);
+
+        // 只在 flush 成功时才清除脏标记和释放资源
+        if flush_ok {
+            self.data.clear_dirty(inode);
+        }
 
         reply.ok();
     }

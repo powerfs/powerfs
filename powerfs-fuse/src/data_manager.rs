@@ -177,6 +177,7 @@ impl DataManager {
                 }
                 chunk.data[chunk_offset as usize..end_in_chunk]
                     .copy_from_slice(&remaining[..write_len]);
+                chunk.dirty = true;
             });
 
             if !written {
@@ -276,6 +277,7 @@ impl DataManager {
     pub fn clear_dirty(&self, ino: u64) {
         let mut dirty = self.dirty_chunks.write().unwrap();
         dirty.retain(|(i, _)| *i != ino);
+        self.chunk_cache.clear_dirty(ino);
     }
 
     /// 是否有脏数据待 flush

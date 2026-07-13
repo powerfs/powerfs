@@ -926,6 +926,7 @@ pub struct ChunkData {
     pub size: u64,
     pub mtime: u64,
     pub crc32: u32,
+    pub dirty: bool,
 }
 
 pub struct ChunkCache {
@@ -1014,6 +1015,7 @@ impl ChunkCache {
                 size: self.chunk_size,
                 mtime,
                 crc32,
+                dirty: true,
             },
         );
         self.current_bytes
@@ -1026,6 +1028,7 @@ impl ChunkCache {
     }
 
     /// 当缓存超过 max_bytes 时，按 mtime 从旧到新淘汰
+    /// 注意：跳过脏 chunk（dirty = true），避免数据丢失
     fn evict_if_needed(&self, cache: &mut HashMap<(u64, u64), ChunkData>) {
         if self.max_bytes == 0 {
             return;
@@ -1034,14 +1037,24 @@ impl ChunkCache {
             if cache.is_empty() {
                 break;
             }
-            // 找到 mtime 最小的 chunk 移除
-            let oldest_key = cache.iter().min_by_key(|(_, v)| v.mtime).map(|(k, _)| *k);
+            // 找到 mtime 最小且非脏的 chunk 移除
+            let oldest_key = cache
+                .iter()
+                .filter(|(_, v)| !v.dirty)
+                .min_by_key(|(_, v)| v.mtime)
+                .map(|(k, _)| *k);
             if let Some(key) = oldest_key {
                 if let Some(removed) = cache.remove(&key) {
                     self.current_bytes
                         .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
                 }
             } else {
+                // 没有可淘汰的非脏 chunk，缓存已满但不能淘汰脏数据
+                warn!(
+                    "ChunkCache: cache full but all chunks are dirty, cannot evict. current_bytes={}, max_bytes={}",
+                    self.current_bytes.load(Ordering::SeqCst),
+                    self.max_bytes
+                );
                 break;
             }
         }
@@ -1105,6 +1118,16 @@ impl ChunkCache {
 
     pub fn remove_inode_chunks(&self, inode: u64) {
         self.remove(inode);
+    }
+
+    /// 清除指定 inode 的所有脏标记（flush 完成后调用）
+    pub fn clear_dirty(&self, inode: u64) {
+        let mut cache = self.cache.write().unwrap();
+        for ((ino, _), chunk) in cache.iter_mut() {
+            if *ino == inode {
+                chunk.dirty = false;
+            }
+        }
     }
 
     pub fn clear(&self) {
