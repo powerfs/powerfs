@@ -1,13 +1,26 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn get_mount_path() -> String {
     std::env::var("POWERFS_MOUNT").unwrap_or_else(|_| "/tmp/powerfs-test".to_string())
 }
 
 fn get_test_dir_name() -> String {
-    format!("test_{}", std::process::id())
+    let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let test_name = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() % 1_000_000)
+        .unwrap_or(0);
+    format!("test_{}_{}_{}", counter, test_name, timestamp)
 }
 
 fn assert_powerfs_mounted() {
@@ -208,7 +221,7 @@ fn test_append_write() {
     assert_eq!(content, "First part Second part", "Append content mismatch");
 
     let metadata = fs::metadata(&file_path).expect("Failed to get metadata");
-    assert_eq!(metadata.len(), 26, "File size should be 26");
+    assert_eq!(metadata.len(), 22, "File size should be 22");
 
     fs::remove_file(&file_path).expect("Failed to remove file");
     fs::remove_dir(&test_dir).expect("Failed to remove test dir");
@@ -250,5 +263,284 @@ fn test_truncate_file() {
     assert_eq!(content, "This ", "Truncated content mismatch");
 
     fs::remove_file(&file_path).expect("Failed to remove file");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_readdir_contains_dot_and_dotdot() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    // Create a subdirectory and a file
+    let subdir = test_dir.join("subdir");
+    fs::create_dir(&subdir).expect("Failed to create subdir");
+
+    let file_path = test_dir.join("file.txt");
+    let mut file = File::create(&file_path).expect("Failed to create file");
+    file.write_all(b"test").expect("Failed to write");
+    drop(file);
+
+    // Read directory entries using `ls -a` (std::fs::read_dir filters . and ..)
+    let output = std::process::Command::new("ls")
+        .arg("-a")
+        .arg(&test_dir)
+        .output()
+        .expect("Failed to run ls -a");
+    assert!(output.status.success(), "ls -a failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries: Vec<&str> = stdout.trim().split('\n').collect();
+
+    // Verify . and .. are present (POSIX compliance)
+    assert!(
+        entries.contains(&"."),
+        "readdir should contain '.' (current directory)"
+    );
+    assert!(
+        entries.contains(&".."),
+        "readdir should contain '..' (parent directory)"
+    );
+    assert!(
+        entries.contains(&"subdir"),
+        "readdir should contain 'subdir'"
+    );
+    assert!(
+        entries.contains(&"file.txt"),
+        "readdir should contain 'file.txt'"
+    );
+
+    // Cleanup
+    fs::remove_file(&file_path).expect("Failed to remove file");
+    fs::remove_dir(&subdir).expect("Failed to remove subdir");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_rename_file() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let old_path = test_dir.join("old_name.txt");
+    let new_path = test_dir.join("new_name.txt");
+
+    let mut file = File::create(&old_path).expect("Failed to create file");
+    file.write_all(b"rename content").expect("Failed to write");
+    drop(file);
+
+    // Rename the file
+    fs::rename(&old_path, &new_path).expect("Failed to rename file");
+
+    // Old path should not exist
+    assert!(!old_path.exists(), "Old path should not exist after rename");
+
+    // New path should exist and have correct content
+    assert!(new_path.exists(), "New path should exist after rename");
+
+    let mut content = String::new();
+    File::open(&new_path)
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(content, "rename content", "Content mismatch after rename");
+
+    // Cleanup
+    fs::remove_file(&new_path).expect("Failed to remove file");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_rename_directory() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let old_dir = test_dir.join("old_dir");
+    let new_dir = test_dir.join("new_dir");
+
+    fs::create_dir(&old_dir).expect("Failed to create old_dir");
+
+    // Create a file inside the directory
+    let inner_file = old_dir.join("inner.txt");
+    let mut file = File::create(&inner_file).expect("Failed to create inner file");
+    file.write_all(b"inner content").expect("Failed to write");
+    drop(file);
+
+    // Rename the directory
+    fs::rename(&old_dir, &new_dir).expect("Failed to rename directory");
+
+    // Old directory should not exist
+    assert!(!old_dir.exists(), "Old dir should not exist after rename");
+
+    // New directory should exist with contents
+    assert!(new_dir.exists(), "New dir should exist after rename");
+    assert!(new_dir.is_dir(), "New path should be a directory");
+
+    let new_inner = new_dir.join("inner.txt");
+    assert!(
+        new_inner.exists(),
+        "Inner file should exist after dir rename"
+    );
+
+    let mut content = String::new();
+    File::open(&new_inner)
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(
+        content, "inner content",
+        "Inner file content mismatch after dir rename"
+    );
+
+    // Cleanup
+    fs::remove_file(&new_inner).expect("Failed to remove inner file");
+    fs::remove_dir(&new_dir).expect("Failed to remove new dir");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_stat_and_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let file_path = test_dir.join("chmod_test.txt");
+    let mut file = File::create(&file_path).expect("Failed to create file");
+    file.write_all(b"chmod content").expect("Failed to write");
+    drop(file);
+
+    // Get initial metadata (stat)
+    let metadata = fs::metadata(&file_path).expect("Failed to get metadata");
+    assert_eq!(metadata.len(), 13, "File size should be 13");
+    assert!(metadata.is_file(), "Should be a file");
+
+    // Get initial permissions
+    let initial_mode = metadata.permissions().mode() & 0o7777;
+
+    // Change permissions to 0o600
+    fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))
+        .expect("Failed to set permissions");
+
+    // Verify permissions changed
+    let new_metadata = fs::metadata(&file_path).expect("Failed to get metadata after chmod");
+    let new_mode = new_metadata.permissions().mode() & 0o7777;
+    assert_eq!(
+        new_mode, 0o600,
+        "Permissions should be 0o600 after chmod, got {:o}",
+        new_mode
+    );
+    assert_ne!(new_mode, initial_mode, "Permissions should have changed");
+
+    // Cleanup
+    fs::remove_file(&file_path).expect("Failed to remove file");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_unlink_file() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let file_path = test_dir.join("unlink_test.txt");
+
+    // Create and verify file exists
+    let mut file = File::create(&file_path).expect("Failed to create file");
+    file.write_all(b"unlink me").expect("Failed to write");
+    drop(file);
+    assert!(file_path.exists(), "File should exist before unlink");
+
+    // Unlink (remove) the file
+    fs::remove_file(&file_path).expect("Failed to unlink file");
+
+    // Verify file no longer exists
+    assert!(!file_path.exists(), "File should not exist after unlink");
+
+    // Verify readdir does not contain the file
+    let entries: Vec<String> = fs::read_dir(&test_dir)
+        .expect("Failed to read dir")
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        !entries.contains(&"unlink_test.txt".to_string()),
+        "readdir should not contain unlinked file"
+    );
+
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_large_file_multiblock_write() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let file_path = test_dir.join("large_file.bin");
+
+    // Write 1MB of data (verifies multi-block writes even within a single chunk)
+    let data_size = 1024 * 1024; // 1MB
+    let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
+
+    let mut file = File::create(&file_path).expect("Failed to create file");
+    file.write_all(&data).expect("Failed to write large data");
+    drop(file);
+
+    // Verify file size
+    let metadata = fs::metadata(&file_path).expect("Failed to get metadata");
+    assert_eq!(
+        metadata.len(),
+        data_size as u64,
+        "File size should be {}",
+        data_size
+    );
+
+    // Read back and verify content
+    let mut file = File::open(&file_path).expect("Failed to open file");
+    let mut read_data = Vec::new();
+    file.read_to_end(&mut read_data).expect("Failed to read");
+    assert_eq!(read_data.len(), data_size, "Read data length mismatch");
+    assert_eq!(read_data, data, "Data content mismatch");
+
+    // Cleanup
+    fs::remove_file(&file_path).expect("Failed to remove file");
+    fs::remove_dir(&test_dir).expect("Failed to remove test dir");
+}
+
+#[test]
+fn test_rmdir_non_empty_fails() {
+    assert_powerfs_mounted();
+    let mount_path = get_mount_path();
+    let test_dir = Path::new(&mount_path).join(get_test_dir_name());
+
+    fs::create_dir_all(&test_dir).expect("Failed to create test dir");
+
+    let subdir = test_dir.join("nonempty_dir");
+    fs::create_dir(&subdir).expect("Failed to create subdir");
+
+    // Create a file inside subdir
+    let inner_file = subdir.join("inner.txt");
+    File::create(&inner_file).expect("Failed to create inner file");
+
+    // rmdir on non-empty directory should fail
+    let result = fs::remove_dir(&subdir);
+    assert!(result.is_err(), "rmdir on non-empty directory should fail");
+
+    // Cleanup: remove file first, then dir
+    fs::remove_file(&inner_file).expect("Failed to remove inner file");
+    fs::remove_dir(&subdir).expect("Failed to remove subdir after emptying");
     fs::remove_dir(&test_dir).expect("Failed to remove test dir");
 }

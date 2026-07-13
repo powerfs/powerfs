@@ -1,5 +1,13 @@
 # PowerFS FUSE Coherence 方案设计（v2）
 
+> ⚠️ **[已废弃 - 2026-07-13]** 本文档描述的强一致租约方案已被 OR-Set 弱一致方案替代。
+> PowerFS 已重定位为弱一致分布式数据同步存储，放弃全局线性一致，采用 OR-Set CRDT + 冲突合并。
+> 新方案请参考：[fuse-cache-architecture.md](fuse-cache-architecture.md) v2.0
+>
+> 本文档保留作为历史参考，不再维护。相关规范已标注废弃见 project_memory.md。
+
+---
+
 ## 1. 架构概述
 
 ### 1.1 一致性模型

@@ -1,5 +1,18 @@
 # PowerFS 测试规范
 
+> **[架构更新 - 2026-07-13]** PowerFS 已重定位为弱一致分布式数据同步存储。
+>
+> **测试策略调整**：
+> - POSIX 兼容性测试改为**投影层兼容性测试**（主版本可见 + `.conflicts/` 冲突副本）
+> - 新增 OR-Set 冲突场景测试（并发新建/修改/删除同名文件，验证全部保留不丢失）
+> - 新增跨节点刷新测试（xattr `user.fs.need_sync` + API 增量/全量刷新）
+> - 弱一致窗口测试（验证 2s 增量 + 30s 全量同步收敛）
+> - 旧 coherence 测试基于强一致租约方案，标注为 [待迁移]
+>
+> 详细架构方案：[design/fuse-cache-architecture.md](design/fuse-cache-architecture.md) v2.0
+
+---
+
 ## 1. 一键测试脚本
 
 ### 使用 run-tests.sh 运行所有测试
@@ -37,10 +50,12 @@ docker/scripts/run-tests.sh --build --skip-build
 | basic | fuse_basic_test | FUSE 基础操作测试 |
 | rfs | rfs_tester_fuse_test | RFS 测试集成 |
 | volume | volume_integration_test, volume_verification_test | Volume 服务测试 |
-| posix | posix_tests | POSIX 兼容性测试 |
-| concurrent | concurrent_consistency | 并发一致性测试 |
+| posix | posix_tests | 投影层兼容性测试（主版本可见 + .conflicts/） |
+| concurrent | concurrent_consistency | 并发冲突保留测试（OR-Set 全部保留） |
 | mount | mount_verification_test | 挂载点验证测试 |
-| coherence | coherence_phase0_test, coherence_phase1_test | 一致性阶段测试 |
+| coherence | coherence_phase0_test, coherence_phase1_test | [待迁移] 旧强一致方案测试 |
+| orset | orset_conflict_test | [新增] OR-Set 五类冲突场景 + 合并策略 |
+| refresh | refresh_test | [新增] 跨节点刷新（xattr + API） |
 | fs | fs_test | 文件系统核心测试 |
 | sync | sync_test | 同步操作测试 |
 | minimal | fuse_minimal_test | 最小化 FUSE 测试 |

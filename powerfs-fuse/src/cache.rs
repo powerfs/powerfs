@@ -9,9 +9,9 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const ROOT_INODE: u64 = 1;
-pub const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedFileChunk {
     pub offset: u64,
     pub size: u64,
@@ -942,18 +942,36 @@ pub struct ChunkData {
 pub struct ChunkCache {
     cache: RwLock<HashMap<(u64, u64), ChunkData>>,
     chunk_size: u64,
+    /// 最大缓存字节数（0 表示不限制）
+    max_bytes: usize,
+    /// 当前缓存字节数
+    current_bytes: AtomicU64,
 }
 
 impl ChunkCache {
-    pub fn new(chunk_size: u64, _max_chunks: usize) -> Self {
+    pub fn new(chunk_size: u64, max_chunks: usize) -> Self {
+        let max_bytes = chunk_size as usize * max_chunks;
         ChunkCache {
             cache: RwLock::new(HashMap::new()),
             chunk_size,
+            max_bytes,
+            current_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// 创建按字节数限制的缓存
+    pub fn with_max_bytes(chunk_size: u64, max_bytes: usize) -> Self {
+        ChunkCache {
+            cache: RwLock::new(HashMap::new()),
+            chunk_size,
+            max_bytes,
+            current_bytes: AtomicU64::new(0),
         }
     }
 
     pub fn with_defaults() -> Self {
-        ChunkCache::new(DEFAULT_CHUNK_SIZE, 100)
+        // 默认 128MB 缓存上限
+        ChunkCache::with_max_bytes(DEFAULT_CHUNK_SIZE, 128 * 1024 * 1024)
     }
 
     pub fn chunk_size(&self) -> u64 {
@@ -990,7 +1008,15 @@ impl ChunkCache {
 
     pub fn put(&self, inode: u64, offset: u64, data: Vec<u8>, mtime: u64, crc32: u32) {
         let chunk_index = self.get_chunk_index(offset);
+        let data_len = data.len();
         let mut cache = self.cache.write().unwrap();
+
+        // 如果已有旧 chunk，先减去其字节数
+        if let Some(old) = cache.get(&(inode, chunk_index)) {
+            let old_len = old.data.len() as u64;
+            self.current_bytes.fetch_sub(old_len, Ordering::SeqCst);
+        }
+
         cache.insert(
             (inode, chunk_index),
             ChunkData {
@@ -1001,6 +1027,69 @@ impl ChunkCache {
                 crc32,
             },
         );
+        self.current_bytes
+            .fetch_add(data_len as u64, Ordering::SeqCst);
+
+        // LRU 淘汰：超过 max_bytes 时移除最旧的 chunk
+        if self.max_bytes > 0 {
+            self.evict_if_needed(&mut cache);
+        }
+    }
+
+    /// 当缓存超过 max_bytes 时，按 mtime 从旧到新淘汰
+    fn evict_if_needed(&self, cache: &mut HashMap<(u64, u64), ChunkData>) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        while self.current_bytes.load(Ordering::SeqCst) > self.max_bytes as u64 {
+            if cache.is_empty() {
+                break;
+            }
+            // 找到 mtime 最小的 chunk 移除
+            let oldest_key = cache.iter().min_by_key(|(_, v)| v.mtime).map(|(k, _)| *k);
+            if let Some(key) = oldest_key {
+                if let Some(removed) = cache.remove(&key) {
+                    self.current_bytes
+                        .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 移除指定 inode 中 chunk offset >= max_offset 的所有 chunk（用于 truncate）
+    pub fn remove_after(&self, inode: u64, max_offset: u64) {
+        // 计算第一个需要移除的 chunk index
+        // chunk i 覆盖字节 [i*chunk_size, (i+1)*chunk_size)
+        // 我们要保留字节 [0, max_offset)，所以保留与 [0, max_offset) 有重叠的 chunk
+        // chunk i 有重叠当且仅当 i*chunk_size < max_offset
+        // 移除条件: i*chunk_size >= max_offset
+        let first_to_remove = if max_offset == 0 {
+            0
+        } else {
+            (max_offset - 1) / self.chunk_size + 1
+        };
+        let mut cache = self.cache.write().unwrap();
+        let keys_to_remove: Vec<_> = cache
+            .iter()
+            .filter(|((ino, chunk_idx), _)| *ino == inode && *chunk_idx >= first_to_remove)
+            .map(|(k, v)| (*k, v.data.len() as u64))
+            .collect();
+        for (key, data_len) in keys_to_remove {
+            cache.remove(&key);
+            self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
+        }
+    }
+
+    /// 获取当前缓存总字节数
+    pub fn current_bytes(&self) -> u64 {
+        self.current_bytes.load(Ordering::SeqCst)
+    }
+
+    /// 获取最大缓存字节数
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     pub fn remove(&self, inode: u64) {
@@ -1008,27 +1097,31 @@ impl ChunkCache {
         let keys_to_remove: Vec<_> = cache
             .iter()
             .filter(|((ino, _), _)| *ino == inode)
-            .map(|(k, _)| *k)
+            .map(|(k, v)| (*k, v.data.len() as u64))
             .collect();
-        for key in keys_to_remove {
+        for (key, data_len) in keys_to_remove {
             cache.remove(&key);
+            self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
         }
     }
 
     pub fn remove_chunk(&self, inode: u64, offset: u64) {
         let chunk_index = self.get_chunk_index(offset);
         let mut cache = self.cache.write().unwrap();
-        cache.remove(&(inode, chunk_index));
+        if let Some(removed) = cache.remove(&(inode, chunk_index)) {
+            self.current_bytes
+                .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
+        }
     }
 
     pub fn remove_inode_chunks(&self, inode: u64) {
-        let mut cache = self.cache.write().unwrap();
-        cache.retain(|key, _| key.0 != inode);
+        self.remove(inode);
     }
 
     pub fn clear(&self) {
         let mut cache = self.cache.write().unwrap();
         cache.clear();
+        self.current_bytes.store(0, Ordering::SeqCst);
     }
 
     pub fn len(&self) -> usize {
@@ -1131,6 +1224,79 @@ mod chunk_cache_tests {
         assert_eq!(cache.get_chunk_offset(512), 512);
         assert_eq!(cache.get_chunk_offset(1024), 0);
         assert_eq!(cache.get_chunk_offset(1536), 512);
+    }
+
+    #[test]
+    fn test_chunk_cache_lru_eviction() {
+        // max_bytes = 2048，只能容纳 2 个 1024 字节 chunk
+        let cache = ChunkCache::with_max_bytes(1024, 2048);
+        let inode = 100;
+
+        // 放入 3 个 chunk，第 1 个应该被淘汰（mtime 最旧）
+        cache.put(inode, 0, vec![0u8; 1024], 1000, 0); // mtime=1000
+        cache.put(inode, 1024, vec![1u8; 1024], 2000, 1); // mtime=2000
+        cache.put(inode, 2048, vec![2u8; 1024], 3000, 2); // mtime=3000
+
+        // 最旧的（mtime=1000）应被淘汰
+        assert!(
+            cache.get(inode, 0).is_none(),
+            "oldest chunk should be evicted"
+        );
+        assert!(cache.get(inode, 1024).is_some());
+        assert!(cache.get(inode, 2048).is_some());
+
+        // 当前字节数不超过 max_bytes
+        assert!(cache.current_bytes() <= 2048);
+    }
+
+    #[test]
+    fn test_chunk_cache_remove_after_truncate() {
+        let cache = ChunkCache::new(1024, 100);
+        let inode = 100;
+
+        // 放入 4 个 chunk（offset 0, 1024, 2048, 3072）
+        cache.put(inode, 0, vec![0u8; 1024], 1000, 0);
+        cache.put(inode, 1024, vec![1u8; 1024], 1000, 1);
+        cache.put(inode, 2048, vec![2u8; 1024], 1000, 2);
+        cache.put(inode, 3072, vec![3u8; 1024], 1000, 3);
+
+        // truncate 到 2048：移除 offset >= 2048 的 chunk
+        cache.remove_after(inode, 2048);
+
+        assert!(cache.get(inode, 0).is_some(), "chunk at 0 should remain");
+        assert!(
+            cache.get(inode, 1024).is_some(),
+            "chunk at 1024 should remain"
+        );
+        assert!(
+            cache.get(inode, 2048).is_none(),
+            "chunk at 2048 should be removed"
+        );
+        assert!(
+            cache.get(inode, 3072).is_none(),
+            "chunk at 3072 should be removed"
+        );
+    }
+
+    #[test]
+    fn test_chunk_cache_byte_tracking() {
+        let cache = ChunkCache::with_max_bytes(1024, 10240);
+        let inode = 100;
+
+        assert_eq!(cache.current_bytes(), 0);
+
+        cache.put(inode, 0, vec![0u8; 512], 1000, 0);
+        assert_eq!(cache.current_bytes(), 512);
+
+        cache.put(inode, 1024, vec![1u8; 256], 1000, 1);
+        assert_eq!(cache.current_bytes(), 768);
+
+        // 替换已有 chunk（512 → 1024）
+        cache.put(inode, 0, vec![2u8; 1024], 1000, 0);
+        assert_eq!(cache.current_bytes(), 1280); // 1024 + 256
+
+        cache.remove(inode);
+        assert_eq!(cache.current_bytes(), 0);
     }
 
     #[test]

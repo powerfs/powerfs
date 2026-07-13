@@ -1,5 +1,18 @@
 # PowerFS FUSE 测试规范
 
+> **[架构更新 - 2026-07-13]** PowerFS 已重定位为弱一致分布式数据同步存储。
+>
+> **测试策略调整**：
+> - POSIX 兼容性测试改为**投影层兼容性测试**（主版本可见 + `.conflicts/` 冲突副本）
+> - 新增 OR-Set 冲突场景测试（并发新建/修改/删除同名文件，验证全部保留）
+> - 新增跨节点刷新测试（xattr `user.fs.need_sync` + API 增量/全量刷新）
+> - 弱一致窗口测试（验证 2s 增量 + 30s 全量同步收敛）
+> - 一致性测试（coherence suite）相关用例基于旧强一致方案，需逐步迁移
+>
+> 详细架构方案：[design/fuse-cache-architecture.md](design/fuse-cache-architecture.md) v2.0
+
+---
+
 ## 一、一键测试脚本（推荐）
 
 ### 1.1 使用 run-tests.sh 运行所有测试
@@ -38,9 +51,11 @@ docker/scripts/run-tests.sh --skip-cleanup
 | basic | FUSE 基础操作 | fuse_basic_test.rs | 文件/目录基本操作 |
 | rfs | RFS 测试集成 | rfs_tester_fuse_test.rs | RFS 兼容性测试 |
 | volume | Volume 服务测试 | volume_integration_test.rs, volume_verification_test.rs | Volume 服务集成验证 |
-| posix | POSIX 兼容性 | posix_tests.rs | POSIX 标准兼容性 |
-| concurrent | 并发一致性 | concurrent_consistency.rs | 多客户端并发一致性 |
-| coherence | 一致性阶段 | coherence_phase0_test.rs, coherence_phase1_test.rs | 缓存一致性验证 |
+| posix | 投影层兼容性 | posix_tests.rs | POSIX 投影层兼容性（主版本可见 + .conflicts/） |
+| concurrent | 并发冲突保留 | concurrent_consistency.rs | 多客户端并发写，验证 OR-Set 全部保留 |
+| coherence | 一致性阶段 | coherence_phase0_test.rs, coherence_phase1_test.rs | [待迁移] 旧强一致方案测试 |
+| orset | OR-Set 冲突场景 | orset_conflict_test.rs | [新增] 五类冲突场景 + 合并策略 |
+| refresh | 跨节点刷新 | refresh_test.rs | [新增] xattr + API 增量/全量刷新 |
 | fs | 文件系统核心 | fs_test.rs | 文件系统核心功能 |
 | sync | 同步操作 | sync_test.rs | 文件同步操作 |
 | minimal | 最小化测试 | fuse_minimal_test.rs | 最小功能验证 |

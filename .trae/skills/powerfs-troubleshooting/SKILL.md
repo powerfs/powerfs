@@ -1,9 +1,16 @@
 ---
 name: "powerfs-troubleshooting"
-description: "Troubleshooting guide for PowerFS FUSE client issues including connection pool, mount points, permissions, and error handling. Invoke when debugging PowerFS FUSE related problems."
+description: "Troubleshooting guide for PowerFS FUSE client issues including OR-Set cache, delta sync, conflict resolution, mount points, and error handling. Invoke when debugging PowerFS FUSE related problems."
 ---
 
 # PowerFS FUSE Troubleshooting Guide
+
+> **[架构更新 - 2026-07-13]** PowerFS 已采用 OR-Set CRDT 弱一致架构。
+> - 弱一致窗口：默认 2s 增量 + 30s 全量同步，窗口内可能读到旧数据
+> - 冲突处理：并发写全部保留，主版本可见 + `.conflicts/` 冲突副本
+> - 跨节点刷新：`user.fs.need_sync` xattr 或 API 触发即时收敛
+>
+> 详细方案：[design/fuse-cache-architecture.md](../../design/fuse-cache-architecture.md) v2.0
 
 This document records common issues and their solutions encountered during PowerFS FUSE client development and testing.
 
@@ -197,12 +204,47 @@ RUST_LOG=debug ./powerfs-fuse --master localhost:9334 --mount-point /mnt/powerfs
 
 | Error | Description | Common Cause |
 |-------|-------------|--------------|
-| ENOENT | No such file or directory | Inode not found in cache |
+| ENOENT | No such file or directory | Inode not found in OR-Set cache |
 | EISDIR | Is a directory | Opening directory with file open flags |
 | EACCES | Permission denied | Incorrect file/directory permissions |
-| EEXIST | File exists | Creating file that already exists |
+| EEXIST | File exists | Creating file that already exists (note: OR-Set allows concurrent same-name) |
 | ENODEV | No such device | FUSE mount not established |
 | EPERM | Operation not permitted | Invalid operation for file type |
+
+## OR-Set Weak Consistency Issues (New)
+
+### Problem: Cross-client writes not visible immediately
+
+**Symptom**: Client A writes file, Client B cannot see it immediately.
+
+**Root Cause**: OR-Set weak consistency, default 2s incremental + 30s full sync window.
+
+**Solution**:
+- Wait for sync window (2-30s)
+- Or set xattr `user.fs.need_sync=1` on the directory to force refresh on next access
+- Or call `refresh_dir_incremental()` API for immediate delta sync
+
+### Problem: `.conflicts/` directory appears with unexpected files
+
+**Symptom**: `ls -a` shows `.conflicts/` directory containing files like `file1.client2.123`.
+
+**Root Cause**: Concurrent writes from multiple clients created conflict copies. This is expected behavior — OR-Set preserves all concurrent versions.
+
+**Solution**:
+- Review conflict copies in `.conflicts/`
+- Manually resolve: keep one, delete others
+- Or configure directory MergePolicy to auto-merge (LwwTime/ContentHash/etc.)
+
+### Problem: Same file name shows different content on different clients
+
+**Symptom**: Client A sees file1 with content X, Client B sees file1 with content Y.
+
+**Root Cause**: OR-Set allows concurrent same-name entries. POSIX projection layer selects primary version by MergePolicy, which may differ before full sync.
+
+**Solution**:
+- Trigger full refresh: `setxattr("user.fs.sync_force", "1")`
+- Or call `refresh_dir_full()` API
+- After convergence, all clients see same primary version
 
 ## Checklist for FUSE Issues
 
@@ -210,7 +252,10 @@ RUST_LOG=debug ./powerfs-fuse --master localhost:9334 --mount-point /mnt/powerfs
 - [ ] Are the mount options correct (AllowOther, etc.)?
 - [ ] Is the root directory permission set to 0o777?
 - [ ] Are UID/GID correctly mapped to the current user?
-- [ ] Is the connection pool properly returning channels?
+- [ ] Is the OR-Set local cache properly initialized?
+- [ ] Is the delta sync background task running?
 - [ ] Are gRPC clients using `channel.clone()`?
-- [ ] Are error paths handling connection return correctly?
 - [ ] Is logging enabled to capture debug information?
+- [ ] [OR-Set] Is the `.conflicts/` directory accessible for conflict resolution?
+- [ ] [OR-Set] Is the sync window (2s/30s) acceptable for the use case?
+- [ ] [OR-Set] Are xattr refresh attributes working for cross-node consistency?

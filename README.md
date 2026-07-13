@@ -1,7 +1,7 @@
 # README.md
 
 PowerFS
-**Zero-jitter unified parallel file system for HPC simulation and LLM KV cache**
+**Zero-jitter unified parallel storage with OR-Set eventual consistency for HPC simulation and LLM KV cache**
 
 *Next-generation high-performance unified storage for HPC & AI super clusters*
 
@@ -14,11 +14,11 @@ PowerFS
 
 ## Introduction
 
-**PowerFS** is a high-performance, zero-jitter unified parallel file system built from scratch with Rust. It is specially designed for converged HPC simulation and LLM AI cluster workloads, delivering ultra-low latency, stable parallel I/O and native AI cache acceleration capabilities.
+**PowerFS** is a high-performance, zero-jitter unified parallel storage system built from scratch with Rust. It is specially designed for converged HPC simulation and LLM AI cluster workloads, delivering ultra-low latency, stable parallel I/O and native AI cache acceleration capabilities.
 
 Traditional storage solutions face obvious bottlenecks in converged HPC and AI scenarios. Professional HPC file systems suffer from complex deployment, heavy operation and maintenance, severe I/O jitter and poor small-file performance, and cannot adapt to AI inference workloads. Common cloud-native storage lacks massive parallel computing capability and native LLM KV cache support, resulting in insufficient overall cluster resource utilization.
 
-PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack, solving the fragmentation problem of separated HPC and AI storage systems. It is the optimal unified storage base for next-generation super computing and intelligent computing converged clusters.
+PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**, with an **OR-Set CRDT based eventual consistency model** that ensures zero data loss under concurrent conflicts while enabling write-zero-blocking and unlimited client scaling without broadcast storms. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack.
 
 ---
 
@@ -26,9 +26,11 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 
 - **Pure Rust Stack**：Complete user-state I/O implementation, no GC jitter, memory safety, ultra-stable latency under long-time high load
 
-- **Unified Converged Architecture**：One cluster supports standard POSIX parallel file access and LLM KV tensor high-speed cache access
+- **OR-Set Eventual Consistency**：Default weak consistency with conflict-not-lost guarantee; concurrent writes all preserved, intelligently merged via Auto/Manual/AI three-tier modes
 
-- **Zero-Jitter Priority**：Foreground computing I/O is prioritized; background balancing, GC and encoding tasks are fully noise-reduced to ensure steady-state performance
+- **Write-Zero-Blocking**：Local OR-Set cache returns success immediately, async delta sync to Meta cluster, no cross-node RPC waiting
+
+- **Unlimited Client Scaling**：Incremental delta sync replaces global broadcast invalidation, no performance degradation as clients grow
 
 - **Full Hardware Offloading**：Native adaptation to SPDK, RDMA and GPU Direct, end-to-end zero-copy hardware acceleration
 
@@ -42,7 +44,7 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 
 - Distributed sharded metadata architecture, supporting 10,000+ MPI process concurrent read and write
 
-- Complete standard POSIX semantics, fully compatible with mainstream HPC simulation software and parallel computing frameworks
+- POSIX-compatible via projection layer (primary version visible, conflict copies in `.conflicts/`), compatible with mainstream HPC simulation software and parallel computing frameworks
 
 - Adaptive file striping and multi-node aggregated I/O, supporting PB-level cluster aggregated bandwidth
 
@@ -61,6 +63,20 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 - Session-level cache isolation and hot data resident mechanism, greatly improving long-text inference token generation throughput
 
 - Native GPU Direct zero-copy transmission, extending GPU HBM video memory with NVMe storage to completely solve LLM inference video memory bottlenecks
+
+### 🔄 OR-Set CRDT Consistency Engine (Industry Exclusive)
+
+- OR-Set (Observed-Remove Set) CRDT directory cache, `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite
+
+- Five conflict scenarios fully covered: CreateCreate / WriteWrite / WriteUnlink / DeleteCreate / Rename, all conflicts retained not lost
+
+- Three-tier merge modes: Auto (policy-based automatic) / Manual (human confirmation) / AI (intelligent content merge - future)
+
+- POSIX projection layer: primary version visible by default, conflict copies in `.conflicts/` hidden directory, compatible with standard Unix tools
+
+- Cross-node refresh on demand: `user.fs.need_sync` xattr + incremental/full refresh API for strong-view-consistency when needed
+
+- Async delta sync: default 2s incremental + 30s full alignment, no global broadcast storm, unlimited client scaling
 
 ### 🚀 Ultra-Low Latency Hardware Acceleration
 

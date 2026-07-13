@@ -616,7 +616,7 @@ async fn test_generation_increments_on_metadata_changes() {
 
     // Create an entry
     let entry = make_test_entry("gen_test_file", "/test");
-    let _inode = dir_tree
+    let inode = dir_tree
         .create_entry(entry.clone(), "test_client")
         .expect("create_entry failed");
 
@@ -632,6 +632,9 @@ async fn test_generation_increments_on_metadata_changes() {
 
     // Update the entry
     let mut updated_entry = entry.clone();
+    if let Some(attrs) = &mut updated_entry.attributes {
+        attrs.ino = inode;
+    }
     updated_entry.generation = 0; // update_entry will assign a new generation
     dir_tree
         .update_entry(updated_entry, "test_client")

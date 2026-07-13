@@ -395,7 +395,24 @@ impl DirectoryTree {
             None => return Ok(0),
         };
 
-        let inode = self.allocate_inode();
+        // OR-Set 架构：客户端拥有 inode 分配权
+        // 如果客户端提供了有效 inode（>= 100，避开系统保留段），则使用客户端 inode
+        // 否则由 Master 分配（兼容旧客户端）
+        let client_ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+        let inode = if client_ino >= 100 {
+            // 使用客户端提供的 inode，并推进 Master 的 inode_counter 以避免未来冲突
+            let current = self.inode_counter.load(std::sync::atomic::Ordering::SeqCst);
+            if client_ino >= current {
+                self.inode_counter
+                    .store(client_ino + 1, std::sync::atomic::Ordering::SeqCst);
+                let _ = self
+                    .db
+                    .put(b"inode_counter", (client_ino + 1).to_string().as_bytes());
+            }
+            client_ino
+        } else {
+            self.allocate_inode()
+        };
         let generation = self.allocate_generation();
 
         if let Some(attrs) = &mut entry.attributes {

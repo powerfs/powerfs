@@ -1,121 +1,89 @@
 ---
 name: "fuse-fs-dev"
-description: "FUSE用户态文件系统开发规范与最佳实践。涵盖内核VFS dentry缓存失效、Notifier API、死锁避免、TTL策略、readdir实现、原子rename等。当开发或修改FUSE文件系统(fuser crate)代码时调用此skill。"
+description: "FUSE用户态文件系统开发规范与最佳实践。涵盖OR-Set弱一致缓存、POSIX投影层、VFS dentry失效、Notifier API、死锁避免、TTL策略、readdir的./..处理、冲突合并等。开发或修改FUSE(fuser)文件系统时调用。"
 ---
 
 # FUSE 用户态文件系统开发规范
+
+> **[架构更新 - 2026-07-13]** PowerFS 已采用 OR-Set CRDT 弱一致架构。
+> - 默认弱一致：本地 OR-Set 缓存即返回，异步 delta 同步
+> - POSIX 投影层：主版本可见 + 冲突副本进 `.conflicts/`
+> - 废弃：写保护租约、全局广播失效、同步提交+错误回滚
+> - 保留：Notifier API（内核 VFS 失效）、TTL=0、readdir 的 `.`/`..` 处理
+>
+> 详细方案：[design/fuse-cache-architecture.md](../../design/fuse-cache-architecture.md) v2.0
 
 本skill记录基于 `fuser` crate (Rust) 开发FUSE文件系统的最佳实践，特别是与内核VFS层交互的关键注意事项。
 
 ## 0. 核心架构原则
 
+### OR-Set 弱一致缓存模型（新架构）
+
+PowerFS FUSE 客户端采用 **OR-Set CRDT 弱一致缓存**，写操作本地即返回，异步 delta 同步到 Master。
+
+**核心数据结构：**
+- 目录条目唯一标识：`(name + client_id + seq)`，并发全部保留不覆盖
+- 本地 OR-Set 缓存：`dir_inode → DirORSet`，写操作直接修改本地
+- Delta 同步队列：本地变更异步推送到 Meta，默认 2s 增量 + 30s 全量
+
+**写操作流程（本地即成功）：**
+```rust
+// create/mkdir/unlink/rmdir/rename/setattr
+// 1. 修改本地 OR-Set，生成 DeltaOp 加入队列
+// 2. 立即返回成功给 FUSE
+// 3. 异步 delta 同步到 Master（后台任务）
+let entry = self.meta.create(dir_ino, name, params)?;  // 本地 OR-Set Add
+reply.entry(&TTL, &attr, 0);  // 立即返回
+// delta 异步同步
+```
+
+**读操作流程（POSIX 投影层）：**
+```rust
+// lookup/readdir/getattr 走本地 OR-Set 投影
+// 1. 查本地 OR-Set，按 name 分组
+// 2. 无冲突：直接返回
+// 3. 有冲突：按 MergePolicy 选主版本，其余进 .conflicts/
+let entry = self.meta.lookup(dir_ino, name)?;  // 本地投影
+```
+
 ### Inode 分配由 Master 统一管理
 
-FUSE 用户层**不应该**自行分配 inode。Inode 必须由 Master 统一分配和管理，确保全局唯一性和一致性。
+FUSE 用户层**不应该**自行分配 inode。Inode 必须由 Master 统一分配和管理，确保全局唯一性。
 
-**错误模式（导致数据丢失和路径混乱）：**
-```rust
-// 错误！本地分配 inode，与 Master 分配的不一致
-let inode = self.cache.allocate_inode();  // ❌ 本地分配
-self.cache.insert(entry);
-self.client.create_entry(filer_entry);    // Master 又分配一个 inode
-// 两个 inode 不同，缓存与 Master 不一致！
+> **注意**：新架构下，客户端本地 OR-Set 缓存会暂存 inode，但权威 inode 仍由 Master 分配。本地创建时生成临时 inode，delta 同步后由 Master 确认或重新分配。
+
+### POSIX 投影层（OR-Set → VFS 视图）
+
+OR-Set 允许同名多份，但 VFS 期望同名唯一。投影层负责转换：
+
+```
+OR-Set 真实存储                    FUSE 投影（VFS/应用看到）
+file1 (client1, seq1, 主版本) →   file1                 （可见）
+file1 (client2, seq2, 冲突)   →   .conflicts/file1.client2.seq2  （隐藏）
 ```
 
-**正确模式：**
-```rust
-// 正确！先调用 Master 创建，获取 Master 分配的 inode
-let parent_path = self.cache.get_path_by_parent_chain(parent)
-    .ok_or(libc::ENOENT)?;
+**投影规则：**
+1. 按文件名分组，每组按 MergePolicy 选主版本，用原文件名
+2. 冲突副本放入 `.conflicts/` 隐藏目录，命名 `{name}.{client_id}.{seq}`
+3. `ls` 默认不显示 `.conflicts/`，`ls -a` 显示
+4. 冲突状态通过 xattr `user.fs.conflict_count` 查询
 
-let filer_entry = FilerEntry {
-    name: name_str.to_string(),
-    directory: parent_path,
-    attributes: Some(FuseAttributes {
-        ino: 0,  // 设为 0，让 Master 分配
-        // ...
-    }),
-    // ...
-};
+### 跨节点刷新（按需强一致）
 
-match self.client.create_entry(filer_entry, &self.client_id) {
-    Ok(master_inode) => {
-        // 使用 Master 返回的 inode 创建缓存条目
-        let entry = CachedEntry {
-            inode: master_inode,  // ✅ 使用 Master 的 inode
-            parent,
-            // ...
-        };
-        self.cache.insert(entry);
-        reply.entry(&TTL, &attr, 0);
-    }
-    // ...
-}
-```
+弱一致架构下，需要强视图一致时通过两种方式触发：
 
-### 当前目录概念（Parent Inode）
+| 方式 | 触发 | 行为 |
+|------|------|------|
+| xattr | `setxattr("user.fs.need_sync", "1")` | 下次访问拉取最新 OR-Set |
+| API | `refresh_dir_incremental()` / `refresh_dir_full()` | 增量/全量刷新 |
 
-FUSE 文件系统操作基于**当前目录（parent inode）**，而非全路径。所有创建操作（mkdir、create、symlink、link）都通过 `parent` inode 参数指定父目录：
+### [已废弃] 旧强一致模型
 
-| FUSE Handler | Parent 参数含义 |
-|--------------|----------------|
-| `mkdir(parent, name, ...)` | 创建目录的父目录 inode |
-| `create(parent, name, ...)` | 创建文件的父目录 inode |
-| `symlink(parent, name, ...)` | 创建符号链接的父目录 inode |
-| `link(inode, new_parent, new_name)` | 硬链接的新父目录 inode |
-| `rename(parent, name, new_parent, new_name)` | 原父目录和新父目录 inode |
-
-### 本地缓存回退到 Master 查询
-
-FUSE 用户层**不维护** dentry 和 inode 的持久缓存，依赖 Master 作为权威数据源，内核层负责 dentry/inode 缓存。当本地缓存未命中时，必须通过 Master 的 `GetEntryByInode` API 查询：
-
-**路径计算规则：**
-1. 优先从本地缓存获取路径：`cache.get_path_by_parent_chain(parent)`
-2. 如果本地缓存未命中，回退到 Master 查询：`client.get_entry_by_inode(parent)`
-3. 文件/目录路径 = 父目录路径 + "/" + 名称
-4. **绝对禁止**默认设为 "/"（会导致文件创建到错误位置）
-
-**正确模式（缓存回退到 Master）：**
-```rust
-let parent_path = match self.cache.get_path_by_parent_chain(parent) {
-    Some(p) => p,
-    None => {
-        info!("mkdir: parent inode {} not in cache, querying master", parent);
-        match self.client.get_entry_by_inode(parent) {
-            Ok(Some((_, p))) => p,  // ✅ 从 Master 获取路径
-            _ => {
-                error!("mkdir: parent inode {} not found in cache or master", parent);
-                reply.error(libc::ENOENT);
-                return;
-            }
-        }
-    }
-};
-```
-
-**错误模式（导致文件创建到错误位置）：**
-```rust
-// 错误！父目录不在缓存时默认设为 "/"，导致所有文件创建到根目录
-let parent_path = self.cache.get_path_by_parent_chain(parent)
-    .unwrap_or_else(|| "/".to_string());  // ❌ 危险的默认值
-```
-
-### Inode 到路径的双向查询
-
-Master 必须维护 `inode -> path` 的双向映射，支持通过 inode 查询完整路径：
-
-**Master API：**
-- `GetEntryByInode(inode)` → 返回 `(Entry, path)`
-
-**RocksDB 键值设计：**
-- `path:{full_path}` → 存储完整的 Entry 信息
-- `inode:{ino}` → 存储路径字符串，支持快速查找
-
-**FUSE Handler 调用模式：**
-- `lookup(parent, name)` → 通过 parent inode 查询父目录路径
-- `open(inode)` → 通过 inode 查询文件路径（用于获取 lease）
-- `read(inode, ...)` → 如果缓存未命中，通过 inode 查询 Master
-- `write(inode, ...)` → 如果缓存未命中，通过 inode 查询 Master
+以下旧规范已废弃，仅作历史参考：
+- ~~本地缓存回退到 Master 查询~~ → 改为本地 OR-Set 优先，miss 才查 Master
+- ~~同步提交 + 错误回滚~~ → 改为本地即成功，异步 delta 同步
+- ~~写保护租约~~ → 废弃，弱一致无需排他保护
+- ~~全局广播失效~~ → 改为增量 delta 推送
 
 ## 1. 内核 VFS Dentry 缓存失效
 
@@ -239,21 +207,45 @@ const TTL: Duration = Duration::from_secs(0);
 - TTL=0 防止 VFS 长期缓存
 - Notifier 主动通知 VFS 失效已变更的条目
 
-## 4. readdir 实现
+## 4. readdir 与 `.` / `..` 目录项
 
-### `.` 和 `..` 条目
-文件系统的 readdir 必须返回 `.`（当前目录）和 `..`（父目录）条目：
+### 核心结论
+
+`.`、`..` **不是手动创建的 inode 文件**，是 `readdir` 回调**必须主动返回的标准目录项**，由 POSIX 规范强制要求。内核 VFS 读取目录时，只会从 `readdir` 返回的列表里识别 `.`/`..`，不返回会导致 `ls` 异常、`cd` 报错。
+
+### 两个特殊项含义
+
+1. `.` （当前目录）：inode = 当前目录自身 inode
+2. `..`（父目录）：inode = 该目录父目录的 inode
+
+**根目录（inode=1 / ROOT_INODE）的 `..` 仍然指向根自身。**
+
+### readdir 标准实现（带 offset 分页）
 
 ```rust
-fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
-    let entry = self.cache.get_inode(ino);
-    let parent_inode = entry.map(|e| e.parent).unwrap_or(1);
+fn readdir(
+    &mut self,
+    _req: &Request<'_>,
+    inode: u64,
+    _fh: u64,
+    offset: i64,
+    mut reply: ReplyDirectory,
+) {
+    // 1. 获取当前目录元数据，拿到父 inode
+    let entry = match self.cache.get_inode(inode) {
+        Some(e) if e.is_dir => e,
+        _ => {
+            reply.error(libc::ENOTDIR);
+            return;
+        }
+    };
+    let parent_ino = entry.parent;
 
     let mut idx = offset as usize;
 
     // offset 0: 返回 "."
     if idx == 0 {
-        if !reply.add(ino, 1, FileType::Directory, ".") {
+        if !reply.add(inode, 1, FileType::Directory, ".") {
             reply.ok();
             return;
         }
@@ -262,20 +254,106 @@ fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply:
 
     // offset 1: 返回 ".."
     if idx == 1 {
-        if !reply.add(parent_inode, 2, FileType::Directory, "..") {
+        if !reply.add(parent_ino, 2, FileType::Directory, "..") {
             reply.ok();
             return;
         }
         idx = 2;
     }
 
-    // offset 2+: 返回子条目
+    // offset 2+: 返回子条目（. 和 .. 占了索引 0 和 1
     let child_offset = idx.saturating_sub(2);
-    // ... 遍历 children.iter().skip(child_offset) ...
+    let children = self.cache.list_children(inode);
+    for (child_ino, child_name, is_dir) in children.iter().skip(child_offset) {
+        let dtype = if *is_dir { FileType::Directory } else { FileType::RegularFile };
+        if !reply.add(*child_ino, 1, dtype, child_name) {
+            reply.ok();
+            return;
+        }
+        idx += 1;
+    }
+
+    reply.ok();
 }
 ```
 
+### reply.add 参数说明
+
+```rust
+reply.add(ino: u64, offset: u64, file_type: FileType, name: &str)
+```
+
+- `ino`：对应文件 inode 号
+- `offset`：下一个条目的偏移量（从 1 开始递增，`. `..` 分别为 1 和 2）
+- `file_type`：文件类型（Directory / RegularFile / Symlink 等）
+- `name`：文件名（`.` / `..` / 普通文件名）
+
+### 配套 lookup 回调（cd . / cd .. 依赖）
+
+用户执行 `cd ..` / `stat .` 时，内核会调用 `lookup` 根据父目录 inode + 文件名查找子 inode，必须处理 `.` 和 `..` 两个特殊名称：
+
+```rust
+fn lookup(
+    &mut self,
+    _req: &Request<'_>,
+    parent: u64,
+    name: &OsStr,
+    reply: ReplyEntry,
+) {
+    let name_str = name.to_str().unwrap_or("");
+
+    // 处理特殊名称
+    let target_ino = match name_str {
+        "." => parent,                           // . 指向当前目录 inode
+        ".." => {
+            match self.cache.get_inode(parent) {
+                Some(dir) => dir.parent,         // .. 指向父 inode
+                None => { reply.error(libc::ENOENT); return; }
+            }
+        }
+        // 普通文件/目录，从缓存或 Master 查找
+        _ => {
+            match self.cache.lookup_in_cache(parent, name_str) {
+                Some(entry) => entry.inode,
+                None => {
+                    // 回退到 Master 查询...
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        }
+    };
+
+    // 获取目标条目属性并返回
+    // ...
+}
+```
+
+### 根目录特殊规则
+
+根目录 inode（一般固定为 1 / INODE_ROOT）的父 inode = 自身：
+- `.` → root ino
+- `..` → root ino
+
+`cd /..` 不会跳出根目录，符合 Linux 规范。
+
+### 常见问题
+
+1. **readdir 不返回 `.` / `..`**
+   - `ls -a` 看不到这两个隐藏项
+   - `cd .` / `cd ..` 报错 `No such file or directory`
+
+2. **lookup 未处理 `.` / `..`**
+   就算 readdir 能列出，cd/stat 访问会失败
+
+3. `.` / `..` 填错 inode
+   比如 `..` 填成 0、填成子文件 inode，会导致文件系统错乱、crash
+
+4. **offset 分页逻辑错误**
+   readdir 是分页读取，offset=0 才推送 `.` 和 `..`；offset>0 直接跳过，避免重复返回。
+
 ### Stale Cache 清理
+
 readdir 时对比 Master 返回的条目与本地缓存，移除已不存在的条目：
 
 ```rust
@@ -288,6 +366,12 @@ for (child_inode, child_name, _) in &children {
     }
 }
 ```
+
+### 整体流程总结
+
+1. **列举目录（ls）**：内核调用 `readdir`，手动 push `.`、`..` 两个目录项
+2. **访问 `.`/`..`（cd/stat）**：内核调用 `lookup`，匹配特殊名称返回对应 inode
+3. 两个接口配合，才能完整支持 `.`、`..` 标准目录语义
 
 ## 5. setattr 路径计算
 
@@ -325,48 +409,25 @@ let filer_entry = FilerEntry {
 
 这会导致 Master 在 RocksDB 中创建 `/dir/file.txt/file.txt` 幻影条目，使目录无法删除（rmdir 报 ENOTEMPTY）。
 
-## 6. 原子性 Rename
+## 6. Rename 操作（OR-Set 模型）
 
-### Master 端实现
-直接在 RocksDB 中删除旧 key + 写入新 key，而非 delete-then-create：
+> **[架构更新 - 2026-07-13]** Rename 从原子 delete+put 改为本地 OR-Set Remove+Add，异步 delta 同步。
 
-```rust
-pub fn rename_entry(&self, old_path: &str, new_directory: &str, new_name: &str, client_id: &str) -> Result<bool, rocksdb::Error> {
-    if let Some(bytes) = self.db.get(old_path.as_bytes())? {
-        let mut entry: Entry = prost::Message::decode(bytes.as_ref())?;
-        entry.generation = self.allocate_generation();
-        entry.name = new_name.to_string();
-        entry.directory = new_directory.to_string();
+### 新架构：本地 OR-Set Remove + Add
 
-        let new_key = Self::path_to_key(new_directory, new_name);
-        let mut data = Vec::new();
-        entry.encode(&mut data)?;
-
-        self.db.delete(old_path.as_bytes())?;   // 删除旧 key
-        self.db.put(&new_key, &data)?;            // 写入新 key
-
-        self.publish_notification(EventType::Delete, old_path, None, client_id);
-        self.publish_notification(EventType::Rename, &new_path, Some(entry), client_id);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-```
-
-### FUSE 端调用
 ```rust
 fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, reply: ReplyEmpty) {
-    // ... 获取 entry 和路径 ...
-
-    match self.client.rename_entry(&old_path, &parent_path, name_str, &new_parent_path, new_name_str, &self.client_id) {
+    // 1. 本地 OR-Set 操作：Remove 旧条目 + Add 新条目
+    match self.meta.rename(parent, name_str, new_parent, new_name_str) {
         Ok(_) => {
-            reply.ok();  // 1. 先 reply
-            self.invalidate_kernel_dentry(parent, name_str);           // 2. 失效旧 dentry
+            reply.ok();  // 2. 立即返回成功（本地操作，无 RPC）
+            // 3. 异步 delta 同步到 Master（后台任务自动处理）
+
+            // 4. 失效内核 VFS dentry 缓存（保留）
+            self.invalidate_kernel_dentry(parent, name_str);
             if parent != new_parent {
-                self.invalidate_kernel_dentry(new_parent, new_name_str); // 3. 失效新 dentry（跨目录时）
+                self.invalidate_kernel_dentry(new_parent, new_name_str);
             }
-            self.invalidate_kernel_inode(entry.inode);                  // 4. 失效 inode 缓存
         }
         Err(e) => {
             reply.error(libc::EIO);
@@ -374,6 +435,12 @@ fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, new_parent: u64,
     }
 }
 ```
+
+### [已废弃] 旧强一致原子 Rename
+
+~~Master 端直接在 RocksDB 中 delete + put 原子操作~~ → 改为本地 OR-Set Remove+Add，异步同步。
+
+旧实现保留作历史参考，新开发请使用 OR-Set 模式。
 
 ## 7. MountOption 注意事项
 

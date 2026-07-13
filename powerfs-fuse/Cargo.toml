@@ -32,6 +32,8 @@ prost = { workspace = true }
 env_logger = { workspace = true }
 clap = { workspace = true }
 lru = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
 tokio-util = "0.7"

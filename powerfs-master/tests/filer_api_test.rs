@@ -95,10 +95,12 @@ fn test_filer_update_entry() {
     let (tree, _temp_dir) = setup_tree();
 
     let mut file_entry = create_test_entry("update_test.txt", "/", 0o100644);
-    tree.create_entry(file_entry.clone(), "test_client")
+    let ino = tree
+        .create_entry(file_entry.clone(), "test_client")
         .unwrap();
 
     if let Some(attrs) = &mut file_entry.attributes {
+        attrs.ino = ino;
         attrs.size = 1024;
         attrs.mode = 0o100755;
     }

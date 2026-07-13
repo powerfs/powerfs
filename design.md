@@ -1,5 +1,21 @@
 # PowerFS｜面向极致HPC \& AI集群的融合存储文件系统设计方案（Rust原生重构 \+ SeaweedFS \+ BeeGFS双借鉴）
 
+> ⚠️ **[架构更新 - 2026-07-13]** PowerFS 已重定位为**弱一致分布式数据同步存储**。
+>
+> **核心变更**：
+> - 一致性模型从全局线性一致改为 OR-Set CRDT 最终一致 + 冲突不丢失
+> - 文件名从唯一主键改为 `(name+client+seq)` 唯一标识，并发全部保留
+> - 写操作从强制走 Master 改为本地 OR-Set 即返回，异步 delta 同步
+> - 失效机制从全局广播改为增量 delta 推送，客户端无限扩容无衰减
+> - 新增三级合并模式：Auto / Manual / AI
+> - 新增 POSIX 投影层：主版本可见 + 冲突副本进 `.conflicts/` 隐藏目录
+>
+> **详细方案**：[design/fuse-cache-architecture.md](design/fuse-cache-architecture.md) v2.0
+>
+> 本文档以下内容为早期设计，部分描述（如"完整标准 POSIX 语义"、"强一致"）已调整，请以新方案为准。
+
+---
+
 ## 0\. 项目总览与品牌定位（GitHub 首页 \& 官网文案定稿）
 
 ### 0\.1 项目名称：PowerFS（最终定稿）

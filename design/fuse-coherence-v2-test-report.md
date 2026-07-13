@@ -1,5 +1,13 @@
 # PowerFS FUSE Coherence v2 测试报告
 
+> ⚠️ **[已废弃 - 2026-07-13]** 本测试报告基于已废弃的强一致租约方案。
+> PowerFS 已重定位为弱一致分布式数据同步存储，采用 OR-Set CRDT + 冲突合并。
+> 新方案测试规范请参考：[fuse-cache-architecture.md](fuse-cache-architecture.md) v2.0 第十五章
+>
+> 本报告保留作为历史参考。
+
+---
+
 **报告生成时间**: 2026-07-10
 **测试版本**: PowerFS v0.1.0
 **测试范围**: FUSE Coherence v2 方案 Phase 0-3

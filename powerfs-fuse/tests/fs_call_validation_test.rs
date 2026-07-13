@@ -156,6 +156,7 @@ fn test_open_creat_new_file() {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&file_path)
         .expect("Failed to create new file");
 
@@ -191,6 +192,7 @@ fn test_open_creat_existing_file() {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&file_path)
         .expect("Failed to open existing file with create");
 
