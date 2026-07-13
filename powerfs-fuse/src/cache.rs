@@ -2,6 +2,7 @@ use log::{debug, warn};
 use lru::LruCache;
 use powerfs_common::types::Fid;
 use powerfs_master::proto::FileChunk;
+use powerfs_orset::CachedFileChunk;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,26 +12,14 @@ use std::time::{Duration, Instant};
 pub const ROOT_INODE: u64 = 1;
 pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CachedFileChunk {
-    pub offset: u64,
-    pub size: u64,
-    pub mtime: u64,
-    pub fid: String,
-    pub cookie: u32,
-    pub crc32: u32,
-}
-
-impl From<FileChunk> for CachedFileChunk {
-    fn from(chunk: FileChunk) -> Self {
-        CachedFileChunk {
-            offset: chunk.offset,
-            size: chunk.size,
-            mtime: chunk.mtime,
-            fid: chunk.fid,
-            cookie: chunk.cookie,
-            crc32: chunk.crc32,
-        }
+pub fn chunk_from_proto(chunk: FileChunk) -> CachedFileChunk {
+    CachedFileChunk {
+        offset: chunk.offset,
+        size: chunk.size,
+        mtime: chunk.mtime,
+        fid: chunk.fid,
+        cookie: chunk.cookie,
+        crc32: chunk.crc32,
     }
 }
 

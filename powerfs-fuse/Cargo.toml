@@ -17,6 +17,7 @@ powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-volume = { path = "../powerfs-volume" }
+powerfs-orset = { path = "../powerfs-orset" }
 fuse-backend-rs = { workspace = true }
 fuser = { workspace = true }
 libc = { workspace = true }
@@ -37,6 +38,7 @@ serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
 tokio-util = "0.7"
+md5 = "0.7"
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

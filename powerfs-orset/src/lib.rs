@@ -1,0 +1,1003 @@
+//! OR-Set (Observed-Remove Set) 核心数据结构
+//!
+//! 用于目录条目的弱一致缓存。每个条目由 (name, client_id, seq) 唯一标识，
+//! 避免并发写覆盖。配合 VectorClock 判定因果顺序与并发冲突。
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+/// 返回当前 Unix 时间戳（秒）
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 生成冲突 ID（UUID）
+pub fn generate_conflict_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// 文件类型
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileType {
+    RegularFile,
+    Directory,
+    Symlink,
+}
+
+impl FileType {
+    pub fn is_dir(self) -> bool {
+        matches!(self, FileType::Directory)
+    }
+
+    pub fn is_regular(self) -> bool {
+        matches!(self, FileType::RegularFile)
+    }
+
+    /// 转为 libc d_type 值
+    pub fn to_d_type(self) -> u32 {
+        match self {
+            FileType::RegularFile => libc::DT_REG as u32,
+            FileType::Directory => libc::DT_DIR as u32,
+            FileType::Symlink => libc::DT_LNK as u32,
+        }
+    }
+
+    /// 从 mode 构造文件类型
+    pub fn from_mode(mode: u32) -> Self {
+        match mode & libc::S_IFMT {
+            m if m == libc::S_IFDIR => FileType::Directory,
+            m if m == libc::S_IFLNK => FileType::Symlink,
+            _ => FileType::RegularFile,
+        }
+    }
+}
+
+/// 条目唯一标识：(name + client_id + seq)
+///
+/// 同名文件在不同客户端并发创建时，EntryId 不同，全部保留，永不覆盖。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntryId {
+    pub name: String,
+    pub client_id: u64,
+    pub seq: u64,
+}
+
+impl EntryId {
+    pub fn new(name: impl Into<String>, client_id: u64, seq: u64) -> Self {
+        Self {
+            name: name.into(),
+            client_id,
+            seq,
+        }
+    }
+}
+
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}#{}", self.name, self.client_id, self.seq)
+    }
+}
+
+/// 文件块信息
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CachedFileChunk {
+    pub offset: u64,
+    pub size: u64,
+    pub mtime: u64,
+    pub fid: String,
+    pub cookie: u32,
+    pub crc32: u32,
+}
+
+/// 目录条目（OR-Set 中的一个元素）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub id: EntryId,
+    pub inode: u64,
+    pub file_type: FileType,
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub atime: u64,
+    pub ctime: u64,
+    pub parent_ino: u64,
+    pub chunks: Vec<CachedFileChunk>,
+    pub symlink_target: Option<String>,
+}
+
+impl DirEntry {
+    pub fn new_file(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            file_type: FileType::RegularFile,
+            mode,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
+        }
+    }
+
+    pub fn new_dir(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            file_type: FileType::Directory,
+            mode,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
+        }
+    }
+
+    pub fn new_symlink(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        target: String,
+    ) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            file_type: FileType::Symlink,
+            mode,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: Some(target),
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.file_type.is_dir()
+    }
+
+    pub fn is_regular(&self) -> bool {
+        self.file_type.is_regular()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.id.name
+    }
+}
+
+/// 因果顺序判定结果
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CausalOrder {
+    Before,
+    After,
+    Equal,
+    Concurrent,
+}
+
+/// 冲突类型
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictType {
+    CreateCreate,
+    WriteWrite,
+    WriteUnlink,
+    DeleteCreate,
+    RenameConflict,
+}
+
+/// 冲突记录
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictRecord {
+    pub id: String,
+    pub conflict_type: ConflictType,
+    pub base: Option<DirEntry>,
+    pub branches: Vec<DirEntry>,
+    pub create_time: u64,
+    pub resolved: bool,
+    pub resolved_time: Option<u64>,
+    pub resolution: Option<ConflictResolution>,
+}
+
+/// 冲突解决方式
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    KeepFirst,
+    KeepLast,
+    KeepAll,
+    Merge,
+}
+
+/// 向量时钟
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VectorClock {
+    counters: HashMap<u64, u64>,
+}
+
+impl VectorClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn increment(&mut self, client_id: u64) -> u64 {
+        let counter = self.counters.entry(client_id).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
+    pub fn observe(&mut self, client_id: u64, seq: u64) {
+        let counter = self.counters.entry(client_id).or_insert(0);
+        if seq > *counter {
+            *counter = seq;
+        }
+    }
+
+    pub fn get(&self, client_id: u64) -> u64 {
+        self.counters.get(&client_id).copied().unwrap_or(0)
+    }
+
+    pub fn compare(&self, other: &Self) -> CausalOrder {
+        let all_keys: HashSet<u64> = self
+            .counters
+            .keys()
+            .chain(other.counters.keys())
+            .copied()
+            .collect();
+
+        let mut self_le = true;
+        let mut self_ge = true;
+
+        for key in all_keys {
+            let s = self.get(key);
+            let o = other.get(key);
+            if s > o {
+                self_le = false;
+            }
+            if s < o {
+                self_ge = false;
+            }
+        }
+
+        match (self_le, self_ge) {
+            (true, true) => CausalOrder::Equal,
+            (true, false) => CausalOrder::Before,
+            (false, true) => CausalOrder::After,
+            (false, false) => CausalOrder::Concurrent,
+        }
+    }
+
+    pub fn is_concurrent(&self, other: &Self) -> bool {
+        self.compare(other) == CausalOrder::Concurrent
+    }
+
+    pub fn dominates(&self, other: &Self) -> bool {
+        let all_keys: HashSet<u64> = self
+            .counters
+            .keys()
+            .chain(other.counters.keys())
+            .copied()
+            .collect();
+
+        let mut self_ge = true;
+        let mut has_strict = false;
+
+        for key in all_keys {
+            let s = self.get(key);
+            let o = other.get(key);
+            if s < o {
+                self_ge = false;
+                break;
+            }
+            if s > o {
+                has_strict = true;
+            }
+        }
+
+        self_ge && has_strict
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (&client_id, &seq) in &other.counters {
+            self.observe(client_id, seq);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counters.is_empty()
+    }
+
+    pub fn known_clients(&self) -> Vec<u64> {
+        self.counters.keys().copied().collect()
+    }
+}
+
+impl PartialEq for VectorClock {
+    fn eq(&self, other: &Self) -> bool {
+        self.compare(other) == CausalOrder::Equal
+    }
+}
+
+impl Eq for VectorClock {}
+
+/// Delta 操作
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DeltaOp {
+    Add {
+        entry: DirEntry,
+        vclock: VectorClock,
+    },
+    Remove {
+        id: EntryId,
+        vclock: VectorClock,
+    },
+    Rename {
+        old_id: EntryId,
+        new_entry: DirEntry,
+        vclock: VectorClock,
+    },
+    SetAttr {
+        inode: u64,
+        mode: Option<u32>,
+        size: Option<u64>,
+        mtime: Option<u64>,
+        vclock: VectorClock,
+    },
+}
+
+impl DeltaOp {
+    pub fn vclock(&self) -> &VectorClock {
+        match self {
+            DeltaOp::Add { vclock, .. }
+            | DeltaOp::Remove { vclock, .. }
+            | DeltaOp::Rename { vclock, .. }
+            | DeltaOp::SetAttr { vclock, .. } => vclock,
+        }
+    }
+
+    pub fn dir_ino(&self) -> Option<u64> {
+        match self {
+            DeltaOp::Add { entry, .. } => Some(entry.parent_ino),
+            DeltaOp::Remove { .. } => None,
+            DeltaOp::Rename { new_entry, .. } => Some(new_entry.parent_ino),
+            DeltaOp::SetAttr { .. } => None,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            DeltaOp::Add { entry, .. } => Some(&entry.id.name),
+            DeltaOp::Remove { id, .. } => Some(&id.name),
+            DeltaOp::Rename { new_entry, .. } => Some(&new_entry.id.name),
+            DeltaOp::SetAttr { .. } => None,
+        }
+    }
+}
+
+/// 目录 OR-Set
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DirORSet {
+    pub dir_ino: u64,
+    pub entries: HashMap<EntryId, DirEntry>,
+    pub tombstones: HashSet<EntryId>,
+    pub vclock: VectorClock,
+    pub conflicts: Vec<ConflictRecord>,
+    pub policy: MergePolicy,
+}
+
+/// 合并策略
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergePolicy {
+    #[default]
+    LwwTime,
+    ContentHash,
+    WeightBased,
+    KeepAll,
+    WritePriority,
+    DeletePriority,
+}
+
+impl DirORSet {
+    pub fn new(dir_ino: u64) -> Self {
+        Self {
+            dir_ino,
+            entries: HashMap::new(),
+            tombstones: HashSet::new(),
+            vclock: VectorClock::new(),
+            conflicts: Vec::new(),
+            policy: MergePolicy::default(),
+        }
+    }
+
+    pub fn add(&mut self, entry: DirEntry) {
+        if self.tombstones.contains(&entry.id) {
+            return;
+        }
+        self.entries.insert(entry.id.clone(), entry);
+    }
+
+    pub fn remove(&mut self, id: &EntryId) {
+        self.entries.remove(id);
+        self.tombstones.insert(id.clone());
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Vec<&DirEntry> {
+        self.entries
+            .values()
+            .filter(|e| e.id.name == name)
+            .collect()
+    }
+
+    pub fn get_by_inode(&self, inode: u64) -> Option<&DirEntry> {
+        self.entries.values().find(|e| e.inode == inode)
+    }
+
+    pub fn get_by_inode_mut(&mut self, inode: u64) -> Option<&mut DirEntry> {
+        self.entries.values_mut().find(|e| e.inode == inode)
+    }
+
+    pub fn list_all(&self) -> Vec<&DirEntry> {
+        self.entries.values().collect()
+    }
+
+    pub fn list_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.entries.values().map(|e| e.id.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn apply_delta(&mut self, delta: &DeltaOp) {
+        match delta {
+            DeltaOp::Add { entry, vclock } => {
+                self.detect_create_conflict(entry, vclock);
+                self.add(entry.clone());
+                self.vclock.merge(vclock);
+            }
+            DeltaOp::Remove { id, vclock } => {
+                self.detect_remove_conflict(id, vclock);
+                self.remove(id);
+                self.vclock.merge(vclock);
+            }
+            DeltaOp::Rename {
+                old_id,
+                new_entry,
+                vclock,
+            } => {
+                self.detect_rename_conflict(old_id, new_entry, vclock);
+                self.remove(old_id);
+                self.add(new_entry.clone());
+                self.vclock.merge(vclock);
+            }
+            DeltaOp::SetAttr {
+                inode,
+                mode,
+                size,
+                mtime,
+                vclock,
+            } => {
+                self.detect_write_write_conflict(*inode, vclock);
+                if let Some(entry) = self.get_by_inode_mut(*inode) {
+                    if let Some(m) = mode {
+                        entry.mode = *m;
+                    }
+                    if let Some(s) = size {
+                        entry.size = *s;
+                    }
+                    if let Some(t) = mtime {
+                        entry.mtime = *t;
+                    }
+                }
+                self.vclock.merge(vclock);
+            }
+        }
+    }
+
+    fn detect_create_conflict(&mut self, entry: &DirEntry, vclock: &VectorClock) {
+        if self.vclock.is_concurrent(vclock) {
+            let existing = self.get_by_name(&entry.id.name);
+            let mut conflicts_to_record: Vec<Vec<DirEntry>> = Vec::new();
+            for e in existing {
+                if e.id.client_id != entry.id.client_id {
+                    conflicts_to_record.push(vec![e.clone(), entry.clone()]);
+                }
+            }
+            for branches in conflicts_to_record {
+                self.record_conflict(ConflictType::CreateCreate, None, branches);
+            }
+        }
+
+        if self.tombstones.iter().any(|t| t.name == entry.id.name) {
+            let mut branches: Vec<DirEntry> = self
+                .get_by_name(&entry.id.name)
+                .iter()
+                .cloned()
+                .cloned()
+                .collect();
+            branches.push(entry.clone());
+            if !branches.is_empty() {
+                self.record_conflict(ConflictType::DeleteCreate, None, branches);
+            }
+        }
+    }
+
+    fn detect_remove_conflict(&mut self, id: &EntryId, vclock: &VectorClock) {
+        if self.vclock.is_concurrent(vclock) {
+            if let Some(entry) = self.entries.get(id) {
+                let branches = vec![entry.clone()];
+                self.record_conflict(ConflictType::WriteUnlink, None, branches);
+            }
+        }
+    }
+
+    fn detect_rename_conflict(
+        &mut self,
+        _old_id: &EntryId,
+        new_entry: &DirEntry,
+        vclock: &VectorClock,
+    ) {
+        if self.vclock.is_concurrent(vclock) {
+            let existing = self.get_by_name(&new_entry.id.name);
+            let mut conflicts_to_record: Vec<Vec<DirEntry>> = Vec::new();
+            for e in existing {
+                if e.id.client_id != new_entry.id.client_id {
+                    conflicts_to_record.push(vec![e.clone(), new_entry.clone()]);
+                }
+            }
+            for branches in conflicts_to_record {
+                self.record_conflict(ConflictType::RenameConflict, None, branches);
+            }
+        }
+    }
+
+    fn detect_write_write_conflict(&mut self, inode: u64, vclock: &VectorClock) {
+        if self.vclock.is_concurrent(vclock) {
+            if let Some(entry) = self.get_by_inode(inode) {
+                let branches = vec![entry.clone()];
+                self.record_conflict(ConflictType::WriteWrite, None, branches);
+            }
+        }
+    }
+
+    fn record_conflict(
+        &mut self,
+        conflict_type: ConflictType,
+        base: Option<DirEntry>,
+        branches: Vec<DirEntry>,
+    ) {
+        if branches.len() < 2
+            && conflict_type != ConflictType::WriteUnlink
+            && conflict_type != ConflictType::WriteWrite
+        {
+            return;
+        }
+
+        let conflict = ConflictRecord {
+            id: generate_conflict_id(),
+            conflict_type,
+            base,
+            branches,
+            create_time: now_unix(),
+            resolved: false,
+            resolved_time: None,
+            resolution: None,
+        };
+        self.conflicts.push(conflict);
+    }
+
+    pub fn unresolved_conflicts(&self) -> Vec<&ConflictRecord> {
+        self.conflicts.iter().filter(|c| !c.resolved).collect()
+    }
+
+    pub fn resolve_conflict(&mut self, conflict_id: &str, resolution: ConflictResolution) {
+        if let Some(conflict) = self.conflicts.iter_mut().find(|c| c.id == conflict_id) {
+            conflict.resolved = true;
+            conflict.resolved_time = Some(now_unix());
+            conflict.resolution = Some(resolution);
+        }
+    }
+
+    pub fn conflict_count(&self) -> usize {
+        self.conflicts.iter().filter(|c| !c.resolved).count()
+    }
+
+    pub fn has_unresolved_conflicts(&self) -> bool {
+        self.conflicts.iter().any(|c| !c.resolved)
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (id, entry) in &other.entries {
+            if !self.tombstones.contains(id) {
+                self.entries.insert(id.clone(), entry.clone());
+            }
+        }
+        for id in &other.tombstones {
+            self.entries.remove(id);
+            self.tombstones.insert(id.clone());
+        }
+        self.vclock.merge(&other.vclock);
+    }
+
+    pub fn gc_tombstones(&mut self, _max_age_secs: u64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vector_clock_basic() {
+        let mut vc1 = VectorClock::new();
+        assert_eq!(vc1.increment(1), 1);
+        assert_eq!(vc1.increment(1), 2);
+        assert_eq!(vc1.increment(2), 1);
+        assert_eq!(vc1.get(1), 2);
+        assert_eq!(vc1.get(2), 1);
+        assert_eq!(vc1.get(3), 0);
+    }
+
+    #[test]
+    fn test_vector_clock_equal() {
+        let mut vc1 = VectorClock::new();
+        vc1.increment(1);
+        vc1.increment(2);
+
+        let mut vc2 = VectorClock::new();
+        vc2.observe(1, 1);
+        vc2.observe(2, 1);
+
+        assert_eq!(vc1.compare(&vc2), CausalOrder::Equal);
+        assert!(!vc1.is_concurrent(&vc2));
+    }
+
+    #[test]
+    fn test_vector_clock_before_after() {
+        let mut vc1 = VectorClock::new();
+        vc1.increment(1);
+
+        let mut vc2 = VectorClock::new();
+        vc2.increment(1);
+        vc2.increment(2);
+
+        assert_eq!(vc1.compare(&vc2), CausalOrder::Before);
+        assert_eq!(vc2.compare(&vc1), CausalOrder::After);
+        assert!(!vc1.is_concurrent(&vc2));
+    }
+
+    #[test]
+    fn test_vector_clock_concurrent() {
+        let mut vc1 = VectorClock::new();
+        vc1.increment(1);
+
+        let mut vc2 = VectorClock::new();
+        vc2.increment(2);
+
+        assert_eq!(vc1.compare(&vc2), CausalOrder::Concurrent);
+        assert!(vc1.is_concurrent(&vc2));
+    }
+
+    #[test]
+    fn test_vector_clock_merge() {
+        let mut vc1 = VectorClock::new();
+        vc1.increment(1);
+
+        let mut vc2 = VectorClock::new();
+        vc2.increment(2);
+
+        vc1.merge(&vc2);
+        assert_eq!(vc1.get(1), 1);
+        assert_eq!(vc1.get(2), 1);
+    }
+
+    #[test]
+    fn test_vector_clock_dominates() {
+        let mut vc1 = VectorClock::new();
+        vc1.increment(1);
+        vc1.increment(2);
+
+        let mut vc2 = VectorClock::new();
+        vc2.increment(1);
+
+        assert!(vc1.dominates(&vc2));
+        assert!(!vc2.dominates(&vc1));
+    }
+
+    #[test]
+    fn test_vector_clock_observe() {
+        let mut vc = VectorClock::new();
+        vc.observe(1, 5);
+        assert_eq!(vc.get(1), 5);
+        vc.observe(1, 3);
+        assert_eq!(vc.get(1), 5);
+    }
+
+    #[test]
+    fn test_entry_id_uniqueness() {
+        let id1 = EntryId::new("file.txt", 1, 1);
+        let id2 = EntryId::new("file.txt", 2, 1);
+        let id3 = EntryId::new("file.txt", 1, 2);
+        let id4 = EntryId::new("file.txt", 1, 1);
+
+        assert_ne!(id1, id2);
+        assert_ne!(id1, id3);
+        assert_eq!(id1, id4);
+    }
+
+    #[test]
+    fn test_file_type_from_mode() {
+        assert_eq!(
+            FileType::from_mode(libc::S_IFREG | 0o644),
+            FileType::RegularFile
+        );
+        assert_eq!(
+            FileType::from_mode(libc::S_IFDIR | 0o755),
+            FileType::Directory
+        );
+        assert_eq!(
+            FileType::from_mode(libc::S_IFLNK | 0o777),
+            FileType::Symlink
+        );
+    }
+
+    #[test]
+    fn test_dir_entry_new_file() {
+        let id = EntryId::new("test.txt", 1, 1);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644 | libc::S_IFREG);
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.inode, 100);
+        assert_eq!(entry.parent_ino, 1);
+        assert!(entry.is_regular());
+        assert!(!entry.is_dir());
+        assert_eq!(entry.size, 0);
+    }
+
+    #[test]
+    fn test_dir_entry_new_dir() {
+        let id = EntryId::new("subdir", 1, 2);
+        let entry = DirEntry::new_dir(id, 200, 1, 0o755 | libc::S_IFDIR);
+        assert!(entry.is_dir());
+        assert_eq!(entry.parent_ino, 1);
+    }
+
+    #[test]
+    fn test_dir_orset_add_remove() {
+        let mut orset = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+
+        orset.add(entry);
+        assert_eq!(orset.len(), 1);
+        assert!(orset.get_by_name("file.txt").len() == 1);
+
+        orset.remove(&id);
+        assert_eq!(orset.len(), 0);
+        assert!(orset.get_by_name("file.txt").is_empty());
+        assert!(orset.tombstones.contains(&id));
+    }
+
+    #[test]
+    fn test_dir_orset_same_name_multiple_entries() {
+        let mut orset = DirORSet::new(1);
+
+        let id1 = EntryId::new("file.txt", 1, 1);
+        let id2 = EntryId::new("file.txt", 2, 1);
+        let entry1 = DirEntry::new_file(id1.clone(), 100, 1, 0o644);
+        let entry2 = DirEntry::new_file(id2.clone(), 200, 1, 0o644);
+
+        orset.add(entry1);
+        orset.add(entry2);
+
+        let found = orset.get_by_name("file.txt");
+        assert_eq!(found.len(), 2);
+        assert_eq!(orset.len(), 2);
+    }
+
+    #[test]
+    fn test_dir_orset_tombstone_prevents_revival() {
+        let mut orset = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+
+        orset.add(entry);
+        orset.remove(&id);
+
+        let entry2 = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        orset.add(entry2);
+        assert_eq!(orset.len(), 0);
+    }
+
+    #[test]
+    fn test_dir_orset_get_by_inode() {
+        let mut orset = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        let entry = DirEntry::new_file(id, 100, 1, 0o644);
+        orset.add(entry);
+
+        assert!(orset.get_by_inode(100).is_some());
+        assert!(orset.get_by_inode(999).is_none());
+    }
+
+    #[test]
+    fn test_dir_orset_list_names_dedup() {
+        let mut orset = DirORSet::new(1);
+        orset.add(DirEntry::new_file(
+            EntryId::new("a.txt", 1, 1),
+            100,
+            1,
+            0o644,
+        ));
+        orset.add(DirEntry::new_file(
+            EntryId::new("a.txt", 2, 1),
+            200,
+            1,
+            0o644,
+        ));
+        orset.add(DirEntry::new_file(
+            EntryId::new("b.txt", 1, 2),
+            300,
+            1,
+            0o644,
+        ));
+
+        let names = orset.list_names();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn test_dir_orset_apply_delta_add() {
+        let mut orset = DirORSet::new(1);
+        let mut vc = VectorClock::new();
+        vc.increment(1);
+
+        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let delta = DeltaOp::Add { entry, vclock: vc };
+
+        orset.apply_delta(&delta);
+        assert_eq!(orset.len(), 1);
+        assert_eq!(orset.vclock.get(1), 1);
+    }
+
+    #[test]
+    fn test_dir_orset_apply_delta_remove() {
+        let mut orset = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        orset.add(DirEntry::new_file(id.clone(), 100, 1, 0o644));
+
+        let mut vc = VectorClock::new();
+        vc.increment(1);
+        let delta = DeltaOp::Remove {
+            id: id.clone(),
+            vclock: vc,
+        };
+
+        orset.apply_delta(&delta);
+        assert_eq!(orset.len(), 0);
+        assert!(orset.tombstones.contains(&id));
+    }
+
+    #[test]
+    fn test_dir_orset_apply_delta_rename() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        orset.add(DirEntry::new_file(old_id.clone(), 100, 1, 0o644));
+
+        let mut vc = VectorClock::new();
+        vc.increment(1);
+        let new_entry = DirEntry::new_file(EntryId::new("new.txt", 1, 2), 100, 1, 0o644);
+        let delta = DeltaOp::Rename {
+            old_id,
+            new_entry,
+            vclock: vc,
+        };
+
+        orset.apply_delta(&delta);
+        assert!(orset.get_by_name("old.txt").is_empty());
+        assert!(orset.get_by_name("new.txt").len() == 1);
+        assert_eq!(orset.len(), 1);
+    }
+
+    #[test]
+    fn test_dir_orset_apply_delta_setattr() {
+        let mut orset = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        orset.add(DirEntry::new_file(id, 100, 1, 0o644));
+
+        let mut vc = VectorClock::new();
+        vc.increment(1);
+        let delta = DeltaOp::SetAttr {
+            inode: 100,
+            mode: Some(0o600 | libc::S_IFREG),
+            size: Some(1024),
+            mtime: Some(99999),
+            vclock: vc,
+        };
+
+        orset.apply_delta(&delta);
+        let entry = orset.get_by_inode(100).unwrap();
+        assert_eq!(entry.mode & 0o777, 0o600);
+        assert_eq!(entry.size, 1024);
+        assert_eq!(entry.mtime, 99999);
+    }
+
+    #[test]
+    fn test_dir_orset_merge_union() {
+        let mut orset1 = DirORSet::new(1);
+        orset1.add(DirEntry::new_file(
+            EntryId::new("a.txt", 1, 1),
+            100,
+            1,
+            0o644,
+        ));
+
+        let mut orset2 = DirORSet::new(1);
+        orset2.add(DirEntry::new_file(
+            EntryId::new("b.txt", 2, 1),
+            200,
+            1,
+            0o644,
+        ));
+
+        orset1.merge(&orset2);
+        assert_eq!(orset1.len(), 2);
+        assert!(orset1.get_by_name("a.txt").len() == 1);
+        assert!(orset1.get_by_name("b.txt").len() == 1);
+    }
+
+    #[test]
+    fn test_dir_orset_merge_with_tombstone() {
+        let mut orset1 = DirORSet::new(1);
+        let id = EntryId::new("file.txt", 1, 1);
+        orset1.add(DirEntry::new_file(id.clone(), 100, 1, 0o644));
+
+        let mut orset2 = DirORSet::new(1);
+        orset2.remove(&id);
+
+        orset1.merge(&orset2);
+        assert_eq!(orset1.len(), 0);
+        assert!(orset1.tombstones.contains(&id));
+    }
+
+    #[test]
+    fn test_delta_op_accessors() {
+        let mut vc = VectorClock::new();
+        vc.increment(1);
+
+        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let delta = DeltaOp::Add {
+            entry: entry.clone(),
+            vclock: vc.clone(),
+        };
+
+        assert_eq!(delta.name(), Some("file.txt"));
+        assert_eq!(delta.dir_ino(), Some(1));
+        assert_eq!(delta.vclock().get(1), 1);
+    }
+
+    #[test]
+    fn test_entry_id_display() {
+        let id = EntryId::new("file.txt", 42, 7);
+        assert_eq!(format!("{}", id), "file.txt#42#7");
+    }
+}

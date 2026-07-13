@@ -1,7 +1,7 @@
 use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::powerfs::{DirEntry, InodeEntry, PathIndexEntry};
 use crate::proto::{Entry, MetadataNotification};
-use log::{debug, info};
+use log::{debug, info, warn};
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -1128,5 +1128,154 @@ impl DirectoryTree {
     pub fn is_job_active(&self, job_id: &str) -> bool {
         let jobs = self.jobs.read().unwrap();
         jobs.get(job_id).is_some_and(|j| j.is_active)
+    }
+
+    pub fn push_delta(
+        &self,
+        client_id: &str,
+        deltas: &[crate::proto::powerfs::DeltaOp],
+    ) -> Result<crate::proto::powerfs::VectorClock, String> {
+        debug!(
+            "push_delta: client_id={}, count={}",
+            client_id,
+            deltas.len()
+        );
+
+        for delta in deltas {
+            match &delta.op {
+                Some(crate::proto::powerfs::delta_op::Op::Add(entry)) => {
+                    let parent_ino = entry.parent_ino;
+                    let name = entry
+                        .id
+                        .as_ref()
+                        .map(|id| id.name.clone())
+                        .unwrap_or_default();
+                    let mode = entry.mode;
+
+                    let mut attrs = crate::proto::powerfs::FuseAttributes {
+                        ino: entry.inode,
+                        mode,
+                        nlink: entry.nlink,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: entry.size,
+                        blksize: 4096,
+                        blocks: entry.size.div_ceil(512),
+                        atime: entry.atime,
+                        mtime: entry.mtime,
+                        ctime: entry.ctime,
+                        crtime: entry.ctime,
+                        perm: (mode & 0o777) as u32,
+                    };
+
+                    let mut entry_proto = crate::proto::powerfs::Entry {
+                        name: name.clone(),
+                        directory: "/".to_string(),
+                        attributes: Some(attrs),
+                        chunks: Vec::new(),
+                        hard_link_id: String::new(),
+                        hard_link_counter: 0,
+                        extended: HashMap::new(),
+                        content_size: entry.size,
+                        disk_size: entry.size,
+                        ttl: String::new(),
+                        symlink_target: entry.symlink_target.clone(),
+                        owner: String::new(),
+                        generation: self.allocate_generation(),
+                    };
+
+                    if let Err(e) = self.create_entry(entry_proto, client_id) {
+                        warn!("push_delta: create_entry failed: {}", e);
+                    }
+                }
+                Some(crate::proto::powerfs::delta_op::Op::Remove(id)) => {
+                    let parent_ino = 0;
+                    let name = id.name.clone();
+                    let ino = self
+                        .lookup(parent_ino, &name)
+                        .map(|e| e.attributes.as_ref().map(|a| a.ino).unwrap_or(0))
+                        .unwrap_or(0);
+                    if ino > 0 {
+                        if let Err(e) = self.delete_entry(ino, client_id) {
+                            warn!("push_delta: delete_entry failed: {}", e);
+                        }
+                    }
+                }
+                Some(crate::proto::powerfs::delta_op::Op::Rename(op)) => {
+                    let old_name = op
+                        .old_id
+                        .as_ref()
+                        .map(|id| id.name.clone())
+                        .unwrap_or_default();
+                    let new_entry = op.new_entry.as_ref();
+                    let new_name = new_entry
+                        .and_then(|e| e.id.as_ref())
+                        .map(|id| id.name.clone())
+                        .unwrap_or_default();
+                    let old_parent_ino = 0;
+                    let new_parent_ino = new_entry.map(|e| e.parent_ino).unwrap_or(0);
+
+                    if let Err(e) = self.rename_entry(
+                        old_parent_ino,
+                        &old_name,
+                        new_parent_ino,
+                        &new_name,
+                        client_id,
+                    ) {
+                        warn!("push_delta: rename_entry failed: {}", e);
+                    }
+                }
+                Some(crate::proto::powerfs::delta_op::Op::SetAttr(op)) => {
+                    let ino = op.inode;
+                    if let Some((mut entry, path)) = self.get_entry_by_inode_internal(ino) {
+                        if let Some(attrs) = entry.attributes.as_mut() {
+                            if op.size > 0 {
+                                attrs.size = op.size;
+                                attrs.blocks = op.size.div_ceil(512);
+                            }
+                            if op.mtime > 0 {
+                                attrs.mtime = op.mtime;
+                            }
+                            if op.mode > 0 {
+                                attrs.mode = op.mode;
+                            }
+                        }
+                        entry.content_size = op.size.max(entry.content_size);
+                        entry.disk_size = op.size.max(entry.disk_size);
+                        entry.generation = self.allocate_generation();
+
+                        if let Err(e) = self.update_entry(entry, client_id) {
+                            warn!("push_delta: update_entry failed: {}", e);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        Ok(crate::proto::powerfs::VectorClock {
+            entries: Vec::new(),
+        })
+    }
+
+    pub fn pull_delta(
+        &self,
+        client_id: &str,
+    ) -> Result<
+        (
+            Vec<crate::proto::powerfs::DeltaOp>,
+            crate::proto::powerfs::VectorClock,
+        ),
+        String,
+    > {
+        debug!("pull_delta: client_id={}", client_id);
+
+        Ok((
+            Vec::new(),
+            crate::proto::powerfs::VectorClock {
+                entries: Vec::new(),
+            },
+        ))
     }
 }

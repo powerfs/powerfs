@@ -2,13 +2,13 @@
 //!
 //! 将 OR-Set（可能包含同名多份条目）投影为 POSIX 兼容的目录视图：
 //! - 每个文件名只返回一个"主版本"（readdir/lookup 用）
-//! - 冲突副本通过 `.conflicts/` 虚拟目录访问（Phase 2 完整实现）
+//! - 冲突副本通过 `.conflicts/` 虚拟目录访问（Phase 1B 实现）
 //!
-//! Phase 1A：单客户端场景，每个 name 只有一个 entry，投影层直通返回。
+//! Phase 1B：支持冲突检测、主版本选择、.conflicts/ 虚拟目录。
 
 use std::collections::HashSet;
 
-use crate::orset::{DirEntry, DirORSet, FileType};
+use crate::orset::{DirEntry, DirORSet, FileType, MergePolicy};
 
 /// 投影后的可见条目（readdir 返回用）
 #[derive(Clone, Debug)]
@@ -19,20 +19,9 @@ pub struct VisibleEntry {
     pub has_conflict: bool,
 }
 
-/// 合并策略（Phase 2 完整实现，Phase 1A 仅用 LwwTime）
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MergePolicy {
-    /// 最新 mtime 优先（缺省）
-    #[default]
-    LwwTime,
-    /// 全部保留（不自动合并）
-    KeepAll,
-}
-
 /// 冲突目录中的条目展示
 #[derive(Clone, Debug)]
 pub struct ConflictEntry {
-    /// 展示名：{name}.{client_id}.{seq}
     pub display_name: String,
     pub original_name: String,
     pub inode: u64,
@@ -42,9 +31,41 @@ pub struct ConflictEntry {
     pub mtime: u64,
 }
 
+/// `.conflicts/` 虚拟目录的 inode 分配器
+///
+/// 为每个真实目录分配一个虚拟的 .conflicts/ 目录 inode。
+/// 使用特殊范围（0xFFFF000000000000 + dir_ino）避免与真实 inode 冲突。
+pub struct ConflictDirInodeMapper {
+    base: u64,
+}
+
+impl ConflictDirInodeMapper {
+    pub fn new() -> Self {
+        Self {
+            base: 0xFFFF000000000000,
+        }
+    }
+
+    /// 从真实目录 inode 获取对应的 .conflicts/ 虚拟目录 inode
+    pub fn get_conflict_dir_inode(&self, dir_ino: u64) -> u64 {
+        self.base | (dir_ino & 0xFFFFFFFF)
+    }
+
+    /// 判断一个 inode 是否为 .conflicts/ 虚拟目录
+    pub fn is_conflict_dir_inode(&self, ino: u64) -> bool {
+        (ino & 0xFFFF000000000000) == self.base
+    }
+
+    /// 从 .conflicts/ inode 还原出真实目录 inode
+    pub fn get_real_dir_inode(&self, conflict_dir_ino: u64) -> u64 {
+        conflict_dir_ino & 0xFFFFFFFF
+    }
+}
+
 /// POSIX 投影器
 pub struct PosixProjection {
     default_policy: MergePolicy,
+    conflict_dir_mapper: ConflictDirInodeMapper,
 }
 
 impl Default for PosixProjection {
@@ -57,13 +78,36 @@ impl PosixProjection {
     pub fn new() -> Self {
         Self {
             default_policy: MergePolicy::default(),
+            conflict_dir_mapper: ConflictDirInodeMapper::new(),
         }
     }
 
     pub fn with_policy(policy: MergePolicy) -> Self {
         Self {
             default_policy: policy,
+            conflict_dir_mapper: ConflictDirInodeMapper::new(),
         }
+    }
+
+    /// 获取 .conflicts/ 目录的 inode
+    pub fn get_conflict_dir_inode(&self, dir_ino: u64) -> u64 {
+        self.conflict_dir_mapper.get_conflict_dir_inode(dir_ino)
+    }
+
+    /// 判断一个 inode 是否为 .conflicts/ 虚拟目录
+    pub fn is_conflict_dir_inode(&self, ino: u64) -> bool {
+        self.conflict_dir_mapper.is_conflict_dir_inode(ino)
+    }
+
+    /// 从 .conflicts/ inode 获取真实目录 inode
+    pub fn get_real_dir_inode(&self, conflict_dir_ino: u64) -> u64 {
+        self.conflict_dir_mapper
+            .get_real_dir_inode(conflict_dir_ino)
+    }
+
+    /// 判断目录是否应该显示 .conflicts/ 条目
+    pub fn should_show_conflict_dir(&self, orset: &DirORSet) -> bool {
+        self.has_conflicts(orset)
     }
 
     /// 投影目录列表（readdir 用）
@@ -168,29 +212,46 @@ impl PosixProjection {
     /// 主版本选择
     fn select_primary<'a>(&self, entries: &'a [&DirEntry]) -> &'a DirEntry {
         match self.default_policy {
-            MergePolicy::LwwTime => {
-                // 最新 mtime 优先；mtime 相同则取 client_id 较大的；仍相同则取 seq 较大的
-                // （seq 作为最终 tiebreaker 保证同客户端同秒操作有确定性：后操作 seq 更大）
-                entries
-                    .iter()
-                    .max_by(|a, b| {
-                        a.mtime
-                            .cmp(&b.mtime)
-                            .then_with(|| a.id.client_id.cmp(&b.id.client_id))
-                            .then_with(|| a.id.seq.cmp(&b.id.seq))
-                    })
-                    .copied()
-                    .expect("select_primary called with empty entries")
-            }
-            MergePolicy::KeepAll => {
-                // 全部保留模式：仍需选一个主版本用于 readdir
-                // 取第一个（按 inode 排序保证确定性）
-                entries
-                    .iter()
-                    .min_by_key(|e| e.inode)
-                    .copied()
-                    .expect("select_primary called with empty entries")
-            }
+            MergePolicy::LwwTime => entries
+                .iter()
+                .max_by(|a, b| {
+                    a.mtime
+                        .cmp(&b.mtime)
+                        .then_with(|| a.id.client_id.cmp(&b.id.client_id))
+                        .then_with(|| a.id.seq.cmp(&b.id.seq))
+                })
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::KeepAll => entries
+                .iter()
+                .min_by_key(|e| e.inode)
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::ContentHash => entries
+                .iter()
+                .min_by_key(|e| e.inode)
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::WeightBased => entries
+                .iter()
+                .min_by_key(|e| e.inode)
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::WritePriority => entries
+                .iter()
+                .max_by(|a, b| {
+                    a.mtime
+                        .cmp(&b.mtime)
+                        .then_with(|| a.id.client_id.cmp(&b.id.client_id))
+                        .then_with(|| a.id.seq.cmp(&b.id.seq))
+                })
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::DeletePriority => entries
+                .iter()
+                .min_by_key(|e| e.inode)
+                .copied()
+                .expect("select_primary called with empty entries"),
         }
     }
 }

@@ -2,10 +2,12 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
-    DeleteEntryRequest, Entry, GetEntryByInodeRequest, GetEntryRequest, JobCompletionRequest,
-    JobDeregistrationRequest, JobRegistrationRequest, LeaseReleaseRequest, LeaseRenewRequest,
-    LeaseRequest, ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest,
-    MetadataNotification, RenameEntryRequest, SubscribeMetadataRequest, UpdateEntryRequest,
+    DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
+    JobCompletionRequest, JobDeregistrationRequest, JobRegistrationRequest, LeaseReleaseRequest,
+    LeaseRenewRequest, LeaseRequest, ListEntriesRequest, LookupDirectoryEntryRequest,
+    LookupVolumeRequest, MetadataNotification, PullDeltaRequest, PullDeltaResponse,
+    PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, SubscribeMetadataRequest,
+    UpdateEntryRequest, VectorClock,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -1374,6 +1376,106 @@ impl PowerFuseClient {
                 Err(msg)
             }
         }
+    }
+
+    pub async fn push_delta(
+        &self,
+        client_id: &str,
+        deltas: &[DeltaOp],
+        client_vclock: &VectorClock,
+    ) -> Result<PushDeltaResponse, String> {
+        debug!(
+            "push_delta: client_id={}, delta_count={}",
+            client_id,
+            deltas.len()
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = PushDeltaRequest {
+                client_id: client_id.to_string(),
+                deltas: deltas.to_vec(),
+                client_vclock: Some(client_vclock.clone()),
+            };
+
+            match client.push_delta(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("push_delta succeeded");
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let msg = format!("push_delta failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("push_delta failed after max retries".to_string())
+    }
+
+    pub async fn pull_delta(
+        &self,
+        client_id: &str,
+        client_vclock: &VectorClock,
+    ) -> Result<PullDeltaResponse, String> {
+        debug!("pull_delta: client_id={}", client_id);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = PullDeltaRequest {
+                client_id: client_id.to_string(),
+                client_vclock: Some(client_vclock.clone()),
+            };
+
+            match client.pull_delta(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("pull_delta succeeded: delta_count={}", resp.deltas.len());
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let msg = format!("pull_delta failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("pull_delta failed after max retries".to_string())
     }
 }
 

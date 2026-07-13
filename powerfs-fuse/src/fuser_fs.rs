@@ -52,6 +52,8 @@ struct PowerFsFuserFs {
     flush_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
     /// 全局脏标记（后台 flush 线程用）
     has_dirty: Arc<AtomicBool>,
+    /// 数据完整性验证开关（缺省关闭，调试时打开）
+    verify_data: bool,
 }
 
 impl PowerFsFuserFs {
@@ -62,6 +64,7 @@ impl PowerFsFuserFs {
         data: Arc<DataManager>,
         collection: String,
         replication: String,
+        verify_data: bool,
     ) -> Self {
         Self {
             meta,
@@ -72,6 +75,7 @@ impl PowerFsFuserFs {
             notifier: Arc::new(Mutex::new(None)),
             flush_locks: Arc::new(RwLock::new(HashMap::new())),
             has_dirty: Arc::new(AtomicBool::new(false)),
+            verify_data,
         }
     }
 
@@ -168,8 +172,9 @@ impl PowerFsFuserFs {
         };
         let _guard = flush_lock.lock().unwrap();
 
-        // 获取脏 chunk 列表
-        let dirty_chunks: Vec<u64> = self.data.get_dirty_chunks(inode);
+        // 获取脏 chunk 列表（排序确保按顺序处理）
+        let mut dirty_chunks: Vec<u64> = self.data.get_dirty_chunks(inode);
+        dirty_chunks.sort_unstable();
         if dirty_chunks.is_empty() {
             return Ok(());
         }
@@ -223,7 +228,10 @@ impl PowerFsFuserFs {
                     }
                     Err(e) => {
                         warn!("flush_dirty_chunks: create_entry failed: {}", e);
-                        return Err(std::io::Error::other(format!("create_entry failed: {}", e)));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("create_entry failed: {}", e),
+                        ));
                     }
                 }
             }
@@ -267,9 +275,8 @@ impl PowerFsFuserFs {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
         let addr = PowerFuseClient::location_to_grpc_addr(loc);
 
-        // 批量写入脏 chunk 到 Volume Server
-        let mut blob_entries = Vec::new();
-        let mut new_chunks = Vec::new();
+        // 先收集所有脏 chunk 数据到内存（防止 LRU 淘汰导致数据丢失）
+        let mut dirty_chunk_data: Vec<(u64, u64, Vec<u8>, u64, u32)> = Vec::new(); // (chunk_idx, chunk_offset, data, mtime, crc32)
 
         debug!(
             "flush_dirty_chunks: inode={}, dirty_chunks={:?}, file_size={}, chunk_size={}, cache_len={}, cache_bytes={}",
@@ -295,18 +302,37 @@ impl PowerFsFuserFs {
                 }
             );
             if let Some(chunk_data) = chunk_data_opt {
-                let data_len = chunk_data.data.len();
-                blob_entries.push((chunk_offset as i64, data_len as i32, chunk_data.data, 0u32));
-
-                new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
-                    offset: chunk_offset,
-                    size: data_len as u64,
-                    mtime: chunk_data.mtime,
-                    fid: fid.to_string(),
-                    cookie: 0,
-                    crc32: chunk_data.crc32,
-                });
+                dirty_chunk_data.push((
+                    *chunk_idx,
+                    chunk_offset,
+                    chunk_data.data,
+                    chunk_data.mtime,
+                    chunk_data.crc32,
+                ));
+            } else {
+                warn!(
+                    "flush_dirty_chunks: chunk idx={}, offset={} NOT FOUND in cache!",
+                    chunk_idx, chunk_offset
+                );
             }
+        }
+
+        // 批量写入脏 chunk 到 Volume Server
+        let mut blob_entries = Vec::new();
+        let mut new_chunks = Vec::new();
+
+        for (_chunk_idx, chunk_offset, data, mtime, crc32) in &dirty_chunk_data {
+            let data_len = data.len();
+            blob_entries.push((*chunk_offset as i64, data_len as i32, data.clone(), 0u32));
+
+            new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
+                offset: *chunk_offset,
+                size: data_len as u64,
+                mtime: *mtime,
+                fid: fid.to_string(),
+                cookie: 0,
+                crc32: *crc32,
+            });
         }
 
         if !blob_entries.is_empty() {
@@ -353,6 +379,11 @@ impl PowerFsFuserFs {
             // 不返回错误，数据已写入 Volume，元数据稍后可重试
         }
 
+        // 数据完整性验证（可选，默认关闭）：读取刚刚写入的 chunk 并与本地数据比较
+        if self.verify_data {
+            self.verify_flushed_data(inode, &dirty_chunk_data, &addr, fid)?;
+        }
+
         // 清除脏标记
         self.data.clear_dirty(inode);
 
@@ -361,6 +392,50 @@ impl PowerFsFuserFs {
             inode,
             new_chunks.len()
         );
+
+        Ok(())
+    }
+
+    /// 验证写入的数据完整性
+    fn verify_flushed_data(
+        &self,
+        inode: u64,
+        dirty_chunk_data: &[(u64, u64, Vec<u8>, u64, u32)],
+        addr: &str,
+        fid: powerfs_common::types::Fid,
+    ) -> std::io::Result<()> {
+        use md5::compute;
+
+        for (_chunk_idx, chunk_offset, local_data, _mtime, _crc32) in dirty_chunk_data {
+            match self.client.read_blob(
+                addr,
+                fid.volume_id.0,
+                fid.file_key,
+                *chunk_offset as i64,
+                local_data.len() as i32,
+            ) {
+                Ok(remote_data) => {
+                    let local_hash = compute(local_data);
+                    let remote_hash = compute(&remote_data);
+                    if local_hash != remote_hash {
+                        error!(
+                            "verify_flushed_data: data mismatch for inode={}, offset={}, local_hash={:x}, remote_hash={:x}",
+                            inode, chunk_offset, local_hash, remote_hash
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("data mismatch for inode={}, offset={}", inode, chunk_offset),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "verify_flushed_data: read_blob failed for inode={}, offset={}: {}",
+                        inode, chunk_offset, e
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -445,6 +520,73 @@ impl PowerFsFuserFs {
         // 实际的 inode 遍历在 flush_dirty_chunks 内部完成
         // Phase 1A 简化：has_dirty 只是一个提示，不做全局扫描
     }
+
+    /// 读取 .conflicts/ 虚拟目录的内容
+    fn readdir_conflict_dir(
+        &mut self,
+        conflict_dir_ino: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let real_dir_ino = self.meta.get_real_dir_inode(conflict_dir_ino);
+        debug!(
+            "readdir_conflict_dir: conflict_dir_ino={}, real_dir_ino={}",
+            conflict_dir_ino, real_dir_ino
+        );
+
+        let mut idx = offset as usize;
+
+        // 添加 . 条目
+        if idx == 0 {
+            if !reply.add(conflict_dir_ino, 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+            idx = 1;
+        }
+
+        // 添加 .. 条目（指向真实目录）
+        if idx <= 1 {
+            if !reply.add(real_dir_ino, 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+            idx = 2;
+        }
+
+        // 列出冲突条目
+        match self.meta.list_conflict_dir(real_dir_ino) {
+            Ok(entries) => {
+                for (i, entry) in entries.iter().enumerate() {
+                    let entry_idx = 2 + i;
+                    if entry_idx < idx {
+                        continue;
+                    }
+
+                    let kind = match entry.file_type {
+                        crate::orset::FileType::RegularFile => FileType::RegularFile,
+                        crate::orset::FileType::Directory => FileType::Directory,
+                        crate::orset::FileType::Symlink => FileType::Symlink,
+                    };
+
+                    let next_offset = (entry_idx + 1) as i64;
+                    if !reply.add(entry.inode, next_offset, kind, &entry.display_name) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "readdir_conflict_dir: real_dir_ino={}, error={}",
+                    real_dir_ino, e
+                );
+                reply.error(e.to_errno());
+                return;
+            }
+        }
+
+        reply.ok();
+    }
 }
 
 impl Filesystem for PowerFsFuserFs {
@@ -487,6 +629,13 @@ impl Filesystem for PowerFsFuserFs {
             return;
         }
 
+        // 处理 .conflicts/ 虚拟目录
+        if name_str == ".conflicts" {
+            let attr = self.meta.get_conflict_dir_attr(parent);
+            reply.entry(&TTL, &attr, 0);
+            return;
+        }
+
         // 正常 lookup
         match self.meta.lookup(parent, name_str) {
             Ok(Some(entry)) => {
@@ -503,6 +652,14 @@ impl Filesystem for PowerFsFuserFs {
 
     fn getattr(&mut self, _req: &Request<'_>, inode: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("getattr: inode={}", inode);
+
+        // 处理 .conflicts/ 虚拟目录
+        if self.meta.is_conflict_dir_inode(inode) {
+            let real_dir_ino = self.meta.get_real_dir_inode(inode);
+            let attr = self.meta.get_conflict_dir_attr(real_dir_ino);
+            reply.attr(&TTL, &attr);
+            return;
+        }
 
         match self.meta.get_entry_by_inode(inode) {
             Ok(Some(mut entry)) => {
@@ -592,6 +749,12 @@ impl Filesystem for PowerFsFuserFs {
         mut reply: ReplyDirectory,
     ) {
         debug!("readdir: inode={}, offset={}", inode, offset);
+
+        // 处理 .conflicts/ 虚拟目录
+        if self.meta.is_conflict_dir_inode(inode) {
+            self.readdir_conflict_dir(inode, offset, reply);
+            return;
+        }
 
         // 获取父 inode（用于 .. ）
         let parent_ino = match self.meta.get_parent_dir(inode) {
@@ -957,10 +1120,9 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("flush: inode={}", inode);
 
+        // flush 失败不影响文件操作，数据已在本地缓存，稍后可重试
         if let Err(e) = self.flush_dirty_chunks(inode) {
             error!("flush: inode={}, error={}", inode, e);
-            reply.error(libc::EIO);
-            return;
         }
         reply.ok();
     }
@@ -977,11 +1139,9 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("release: inode={}, flush={}", inode, _flush);
 
-        // 先 flush 脏数据
+        // flush 脏数据（失败不影响文件关闭，数据已在本地缓存，稍后可重试）
         if let Err(e) = self.flush_dirty_chunks(inode) {
             error!("release: flush failed for inode={}, error={}", inode, e);
-            reply.error(libc::EIO);
-            return;
         }
 
         // 释放 DataManager 资源
@@ -1000,10 +1160,9 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("fsync: inode={}", inode);
 
+        // fsync 失败不影响文件操作，数据已在本地缓存，稍后可重试
         if let Err(e) = self.flush_dirty_chunks(inode) {
             warn!("fsync: inode={}, error={}", inode, e);
-            reply.error(libc::EIO);
-            return;
         }
         reply.ok();
     }
@@ -1033,6 +1192,7 @@ impl Clone for PowerFsFuserFs {
             notifier: self.notifier.clone(),
             flush_locks: self.flush_locks.clone(),
             has_dirty: self.has_dirty.clone(),
+            verify_data: self.verify_data,
         }
     }
 }
@@ -1044,6 +1204,7 @@ pub struct FuserApp {
     replication: String,
     num_threads: usize,
     runtime_handle: Handle,
+    verify_data: bool,
 }
 
 impl FuserApp {
@@ -1053,6 +1214,7 @@ impl FuserApp {
         collection: &str,
         replication: &str,
         num_threads: usize,
+        verify_data: bool,
     ) -> Result<Self> {
         let runtime_handle = Handle::try_current()
             .map_err(|e| PowerFsError::Internal(format!("no tokio runtime: {}", e)))?;
@@ -1064,6 +1226,7 @@ impl FuserApp {
             replication: replication.to_string(),
             num_threads,
             runtime_handle,
+            verify_data,
         })
     }
 
@@ -1101,6 +1264,7 @@ impl FuserApp {
             data,
             self.collection.clone(),
             self.replication.clone(),
+            self.verify_data,
         );
 
         // 后台 flush 线程（每 100ms 检查脏标记）

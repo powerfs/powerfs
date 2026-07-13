@@ -1213,4 +1213,69 @@ impl MasterService for MasterGrpcServer {
             })),
         }
     }
+
+    async fn push_delta(
+        &self,
+        request: Request<PushDeltaRequest>,
+    ) -> Result<Response<PushDeltaResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = req.client_id;
+        let deltas = req.deltas;
+        let _client_vclock = req.client_vclock;
+
+        debug!(
+            "push_delta: client_id={}, delta_count={}",
+            client_id,
+            deltas.len()
+        );
+
+        let dir_tree = self.master.directory_tree.clone();
+        let result = tokio::task::spawn_blocking(move || dir_tree.push_delta(&client_id, &deltas))
+            .await
+            .unwrap();
+
+        match result {
+            Ok(server_vclock) => Ok(Response::new(PushDeltaResponse {
+                success: true,
+                error: String::new(),
+                server_vclock: Some(server_vclock),
+            })),
+            Err(e) => Ok(Response::new(PushDeltaResponse {
+                success: false,
+                error: e.to_string(),
+                server_vclock: None,
+            })),
+        }
+    }
+
+    async fn pull_delta(
+        &self,
+        request: Request<PullDeltaRequest>,
+    ) -> Result<Response<PullDeltaResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = req.client_id;
+        let _client_vclock = req.client_vclock;
+
+        debug!("pull_delta: client_id={}", client_id);
+
+        let dir_tree = self.master.directory_tree.clone();
+        let result = tokio::task::spawn_blocking(move || dir_tree.pull_delta(&client_id))
+            .await
+            .unwrap();
+
+        match result {
+            Ok((deltas, server_vclock)) => Ok(Response::new(PullDeltaResponse {
+                success: true,
+                error: String::new(),
+                deltas,
+                server_vclock: Some(server_vclock),
+            })),
+            Err(e) => Ok(Response::new(PullDeltaResponse {
+                success: false,
+                error: e.to_string(),
+                deltas: Vec::new(),
+                server_vclock: None,
+            })),
+        }
+    }
 }

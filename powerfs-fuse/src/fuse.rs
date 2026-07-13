@@ -1,4 +1,4 @@
-use crate::cache::{CachedEntry, CachedFileChunk, ChunkCache, MetadataCache, ROOT_INODE};
+use crate::cache::{CachedEntry, ChunkCache, MetadataCache, ROOT_INODE};
 use crate::client::{PowerFuseClient, SyncFuseClient};
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
@@ -10,6 +10,7 @@ use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
+use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::Path;
@@ -819,7 +820,7 @@ impl FileSystem for PowerFsFs {
             mtime: now,
             ctime: now,
             xattrs: HashMap::new(),
-            chunks: vec![crate::cache::CachedFileChunk {
+            chunks: vec![CachedFileChunk {
                 offset: 0,
                 size: 0,
                 mtime: now as u64,

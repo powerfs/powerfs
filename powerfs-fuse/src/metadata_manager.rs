@@ -213,6 +213,62 @@ impl MetadataManager {
         paths.get(&ino).cloned()
     }
 
+    // ==================== .conflicts/ 虚拟目录支持 ====================
+
+    /// 获取 .conflicts/ 目录的 inode
+    pub fn get_conflict_dir_inode(&self, dir_ino: u64) -> u64 {
+        self.projection.get_conflict_dir_inode(dir_ino)
+    }
+
+    /// 判断一个 inode 是否为 .conflicts/ 虚拟目录
+    pub fn is_conflict_dir_inode(&self, ino: u64) -> bool {
+        self.projection.is_conflict_dir_inode(ino)
+    }
+
+    /// 从 .conflicts/ inode 获取真实目录 inode
+    pub fn get_real_dir_inode(&self, conflict_dir_ino: u64) -> u64 {
+        self.projection.get_real_dir_inode(conflict_dir_ino)
+    }
+
+    /// 获取 .conflicts/ 虚拟目录的属性
+    pub fn get_conflict_dir_attr(&self, real_dir_ino: u64) -> fuser::FileAttr {
+        let dir_entry = self.get_entry_by_inode(real_dir_ino).ok().flatten();
+        let conflict_dir_ino = self.get_conflict_dir_inode(real_dir_ino);
+
+        let mode = dir_entry
+            .as_ref()
+            .map(|e| e.mode)
+            .unwrap_or(0o755 | libc::S_IFDIR);
+
+        fuser::FileAttr {
+            ino: conflict_dir_ino,
+            size: 0,
+            blocks: 1,
+            atime: std::time::UNIX_EPOCH,
+            mtime: std::time::UNIX_EPOCH,
+            ctime: std::time::UNIX_EPOCH,
+            crtime: std::time::UNIX_EPOCH,
+            kind: fuser::FileType::Directory,
+            perm: (mode & 0o777) as u16,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            flags: 0,
+            blksize: 4096,
+        }
+    }
+
+    /// 列出 .conflicts/ 目录中的所有冲突条目
+    pub fn list_conflict_dir(
+        &self,
+        dir_ino: u64,
+    ) -> Result<Vec<crate::posix_projection::ConflictEntry>, FsError> {
+        let orset_arc = self.ensure_dir_cache(dir_ino);
+        let orset = orset_arc.read().unwrap();
+        Ok(self.projection.list_conflict_dir(&orset))
+    }
+
     // ==================== 写路径 ====================
 
     /// 创建普通文件
@@ -792,10 +848,10 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
     let ctime = attrs.map(|a| a.ctime).unwrap_or(0);
 
     let file_type = FileType::from_mode(mode_val);
-    let chunks: Vec<crate::cache::CachedFileChunk> = proto
+    let chunks: Vec<crate::orset::CachedFileChunk> = proto
         .chunks
         .iter()
-        .map(|c| crate::cache::CachedFileChunk {
+        .map(|c| crate::orset::CachedFileChunk {
             offset: c.offset,
             size: c.size,
             mtime: c.mtime,

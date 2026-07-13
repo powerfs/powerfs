@@ -38,6 +38,10 @@ service MasterService {
     rpc StreamMutateEntry(stream MutateEntryRequest) returns (stream MutateEntryResponse);
     rpc SubscribeMetadata(SubscribeMetadataRequest) returns (stream MetadataNotification);
     
+    // Delta sync API (Phase 1B)
+    rpc PushDelta(PushDeltaRequest) returns (PushDeltaResponse);
+    rpc PullDelta(PullDeltaRequest) returns (PullDeltaResponse);
+    
     // Lease management for file consistency
     rpc AcquireLease(LeaseRequest) returns (LeaseResponse);
     rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
@@ -998,4 +1002,83 @@ message KVBatchGetResponse {
     repeated bytes values = 1;
     repeated bool found = 2;
     string error = 3;
+}
+
+// ============================================================
+// Delta sync types (Phase 1B)
+// ============================================================
+
+message VectorClockEntry {
+    uint64 client_id = 1;
+    uint64 seq = 2;
+}
+
+message VectorClock {
+    repeated VectorClockEntry entries = 1;
+}
+
+message EntryId {
+    string name = 1;
+    uint64 client_id = 2;
+    uint64 seq = 3;
+}
+
+message DirEntryOrset {
+    EntryId id = 1;
+    uint64 inode = 2;
+    uint64 parent_ino = 3;
+    uint32 mode = 4;
+    uint64 size = 5;
+    uint64 mtime = 6;
+    uint64 atime = 7;
+    uint64 ctime = 8;
+    uint32 nlink = 9;
+    string symlink_target = 10;
+    uint32 file_type = 11;
+}
+
+message DeltaOp {
+    oneof op {
+        DirEntryOrset add = 1;
+        EntryId remove = 2;
+        RenameOp rename = 3;
+        SetAttrOp set_attr = 4;
+    }
+    VectorClock vclock = 5;
+}
+
+message RenameOp {
+    EntryId old_id = 1;
+    DirEntryOrset new_entry = 2;
+}
+
+message SetAttrOp {
+    uint64 inode = 1;
+    uint64 size = 2;
+    uint64 mtime = 3;
+    uint32 mode = 4;
+}
+
+message PushDeltaRequest {
+    string client_id = 1;
+    repeated DeltaOp deltas = 2;
+    VectorClock client_vclock = 3;
+}
+
+message PushDeltaResponse {
+    bool success = 1;
+    string error = 2;
+    VectorClock server_vclock = 3;
+}
+
+message PullDeltaRequest {
+    string client_id = 1;
+    VectorClock client_vclock = 2;
+}
+
+message PullDeltaResponse {
+    bool success = 1;
+    string error = 2;
+    repeated DeltaOp deltas = 3;
+    VectorClock server_vclock = 4;
 }

@@ -53,6 +53,10 @@ struct Args {
     /// Number of rotated log files to keep (default: 5)
     #[arg(long, default_value = "5")]
     log_max_files: usize,
+
+    /// Enable data integrity verification (MD5 check after write, default: false)
+    #[arg(long, default_value = "false")]
+    verify_data: bool,
 }
 
 /// Async-signal-safe handler: only calls write(2) and umount2(2).
@@ -137,6 +141,7 @@ fn main() {
     info!("  Replication: {}", args.replication);
     info!("  Worker threads: {}", args.threads);
     info!("  Container mode: {}", args.container);
+    info!("  Data verification: {}", args.verify_data);
 
     // Create mount point directory if it doesn't exist
     let mount_path = std::path::Path::new(&args.mount_point);
@@ -165,6 +170,7 @@ fn main() {
             &args.collection,
             &args.replication,
             args.threads,
+            args.verify_data,
         )
         .await
         .expect("Failed to create FUSE client");
