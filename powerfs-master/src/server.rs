@@ -1,5 +1,5 @@
 use super::kv_cache_service::KvCacheServiceImpl;
-use super::master::{AddNodeParams, MasterNode, UpdateNodeVolumesParams};
+use super::master::{AddNodeParams, FuseClientInfo, MasterNode, UpdateNodeVolumesParams};
 use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::*;
 use futures::Stream;
@@ -357,7 +357,42 @@ impl MasterService for MasterGrpcServer {
         let master = self.master.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(1000);
-        let client_id = format!("client_{}", Uuid::new_v4());
+
+        let client_id = match stream.message().await {
+            Ok(Some(first_request)) => {
+                let id = if !first_request.client_type.is_empty() {
+                    format!("fuse_{}", first_request.client_type)
+                } else {
+                    format!("client_{}", Uuid::new_v4())
+                };
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let fuse_info = FuseClientInfo {
+                    client_id: id.clone(),
+                    client_type: first_request.client_type.clone(),
+                    mount_point: first_request.mount_point.clone(),
+                    collection: first_request.collection.clone(),
+                    replication: first_request.replication.clone(),
+                    host: first_request.host.clone(),
+                    pid: first_request.pid,
+                    connected_at: now,
+                    last_heartbeat: now,
+                    dirty_chunks: first_request.dirty_chunks,
+                    dirty_bytes: first_request.dirty_bytes,
+                };
+
+                master.register_fuse_client(fuse_info);
+                id
+            }
+            _ => {
+                let id = format!("client_{}", Uuid::new_v4());
+                id
+            }
+        };
 
         master.add_client(client_id.clone(), tx);
 
@@ -390,6 +425,7 @@ impl MasterService for MasterGrpcServer {
                         });
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        master.update_fuse_client_heartbeat(&client_id);
                         let leader = master.get_leader().await;
                         yield Ok(KeepConnectedResponse {
                             volume_location: Some(VolumeLocation {
@@ -403,7 +439,27 @@ impl MasterService for MasterGrpcServer {
                             }),
                         });
                     }
-                    _ = stream.message() => {
+                    msg = stream.message() => {
+                        if let Ok(Some(request)) = msg {
+                            master.update_fuse_client_heartbeat(&client_id);
+                            let fuse_info = FuseClientInfo {
+                                client_id: client_id.clone(),
+                                client_type: request.client_type.clone(),
+                                mount_point: request.mount_point.clone(),
+                                collection: request.collection.clone(),
+                                replication: request.replication.clone(),
+                                host: request.host.clone(),
+                                pid: request.pid,
+                                connected_at: 0,
+                                last_heartbeat: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                dirty_chunks: request.dirty_chunks,
+                                dirty_bytes: request.dirty_bytes,
+                            };
+                            master.register_fuse_client(fuse_info);
+                        }
                         continue;
                     }
                 }
@@ -630,6 +686,33 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<StatisticsResponse>, Status> {
         let stats = self.master.get_statistics().await;
         Ok(Response::new(stats))
+    }
+
+    async fn get_fuse_clients(
+        &self,
+        _request: Request<FuseClientsRequest>,
+    ) -> Result<Response<FuseClientsResponse>, Status> {
+        let clients = self.master.get_fuse_clients();
+        let mut proto_clients = Vec::new();
+        for client in clients {
+            proto_clients.push(powerfs::fuse_clients_response::FuseClientInfo {
+                client_id: client.client_id,
+                client_type: client.client_type,
+                mount_point: client.mount_point,
+                collection: client.collection,
+                replication: client.replication,
+                host: client.host,
+                pid: client.pid,
+                connected_at: client.connected_at,
+                last_heartbeat: client.last_heartbeat,
+                dirty_chunks: client.dirty_chunks,
+                dirty_bytes: client.dirty_bytes,
+            });
+        }
+        Ok(Response::new(FuseClientsResponse {
+            clients: proto_clients,
+            error: String::new(),
+        }))
     }
 
     async fn delete_volume(

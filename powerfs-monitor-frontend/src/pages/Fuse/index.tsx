@@ -60,6 +60,19 @@ function Fuse() {
 
   const columns = [
     {
+      title: '客户端ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 100,
+      render: (id: string) => id.slice(0, 8) + '...',
+    },
+    {
+      title: '主机',
+      dataIndex: 'host',
+      key: 'host',
+      width: 120,
+    },
+    {
       title: '挂载点',
       dataIndex: 'mount_point',
       key: 'mount_point',
@@ -81,14 +94,28 @@ function Fuse() {
       key: 'replication',
     },
     {
-      title: 'Master节点',
-      dataIndex: 'master',
-      key: 'master',
+      title: '脏Chunks',
+      dataIndex: 'dirty_chunks',
+      key: 'dirty_chunks',
+      width: 80,
+      render: (dirty: number | undefined) => (
+        <Tag color={dirty && dirty > 0 ? 'orange' : 'green'}>
+          {dirty ?? 0}
+        </Tag>
+      ),
     },
     {
-      title: '工作线程',
-      dataIndex: 'threads',
-      key: 'threads',
+      title: '脏数据',
+      dataIndex: 'dirty_bytes',
+      key: 'dirty_bytes',
+      width: 100,
+      render: (bytes: number | undefined) => {
+        if (!bytes) return '0 B'
+        if (bytes < 1024) return `${bytes} B`
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+        if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+      },
     },
     {
       title: '状态',
@@ -104,12 +131,19 @@ function Fuse() {
       title: '挂载时间',
       dataIndex: 'mounted_at',
       key: 'mounted_at',
-      render: (date: string) => new Date(date).toLocaleString(),
+      render: (date: string) => date ? new Date(date).toLocaleString() : '-',
+    },
+    {
+      title: '最后心跳',
+      dataIndex: 'last_heartbeat',
+      key: 'last_heartbeat',
+      render: (date: string) => date ? new Date(date).toLocaleString() : '-',
     },
     {
       title: '进程ID',
       dataIndex: 'pid',
       key: 'pid',
+      width: 70,
       render: (pid: number | undefined) => pid ?? '-',
     },
     {

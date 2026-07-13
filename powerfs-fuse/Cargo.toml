@@ -38,7 +38,9 @@ serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
 tokio-util = "0.7"
+tokio-stream = "0.1"
 md5 = "0.7"
+hostname = "0.3"
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

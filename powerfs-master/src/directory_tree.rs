@@ -1144,7 +1144,7 @@ impl DirectoryTree {
         for delta in deltas {
             match &delta.op {
                 Some(crate::proto::powerfs::delta_op::Op::Add(entry)) => {
-                    let parent_ino = entry.parent_ino;
+                    let _parent_ino = entry.parent_ino;
                     let name = entry
                         .id
                         .as_ref()
@@ -1152,7 +1152,7 @@ impl DirectoryTree {
                         .unwrap_or_default();
                     let mode = entry.mode;
 
-                    let mut attrs = crate::proto::powerfs::FuseAttributes {
+                    let attrs = crate::proto::powerfs::FuseAttributes {
                         ino: entry.inode,
                         mode,
                         nlink: entry.nlink,
@@ -1166,10 +1166,10 @@ impl DirectoryTree {
                         mtime: entry.mtime,
                         ctime: entry.ctime,
                         crtime: entry.ctime,
-                        perm: (mode & 0o777) as u32,
+                        perm: mode & 0o777,
                     };
 
-                    let mut entry_proto = crate::proto::powerfs::Entry {
+                    let entry_proto = crate::proto::powerfs::Entry {
                         name: name.clone(),
                         directory: "/".to_string(),
                         attributes: Some(attrs),
@@ -1228,7 +1228,7 @@ impl DirectoryTree {
                 }
                 Some(crate::proto::powerfs::delta_op::Op::SetAttr(op)) => {
                     let ino = op.inode;
-                    if let Some((mut entry, path)) = self.get_entry_by_inode_internal(ino) {
+                    if let Some((mut entry, _path)) = self.get_entry_by_inode_internal(ino) {
                         if let Some(attrs) = entry.attributes.as_mut() {
                             if op.size > 0 {
                                 attrs.size = op.size;

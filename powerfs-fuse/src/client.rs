@@ -3,11 +3,12 @@ use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
     DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
-    JobCompletionRequest, JobDeregistrationRequest, JobRegistrationRequest, LeaseReleaseRequest,
-    LeaseRenewRequest, LeaseRequest, ListEntriesRequest, LookupDirectoryEntryRequest,
-    LookupVolumeRequest, MetadataNotification, PullDeltaRequest, PullDeltaResponse,
-    PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, SubscribeMetadataRequest,
-    UpdateEntryRequest, VectorClock,
+    JobCompletionRequest, JobDeregistrationRequest, JobRegistrationRequest, KeepConnectedRequest,
+    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
+    ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification,
+    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, RenameEntryRequest,
+    StatisticsRequest, StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest,
+    VectorClock,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -1378,6 +1379,63 @@ impl PowerFuseClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn keep_connected(
+        &self,
+        client_type: &str,
+        mount_point: &str,
+        collection: &str,
+        replication: &str,
+        pid: u64,
+        host: &str,
+        dirty_chunks: u64,
+        dirty_bytes: u64,
+    ) -> Result<(), String> {
+        debug!(
+            "keep_connected: client_type={}, mount_point={}, collection={}",
+            client_type, mount_point, collection
+        );
+
+        let channel = match self.get_or_create_master_channel().await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut client = MasterServiceClient::new(channel);
+
+        let request_stream = tokio_stream::iter(vec![KeepConnectedRequest {
+            client_type: client_type.to_string(),
+            client_address: String::new(),
+            version: String::new(),
+            filer_group: String::new(),
+            data_center: String::new(),
+            rack: String::new(),
+            mount_point: mount_point.to_string(),
+            collection: collection.to_string(),
+            replication: replication.to_string(),
+            pid,
+            host: host.to_string(),
+            dirty_chunks,
+            dirty_bytes,
+        }]);
+
+        match client
+            .keep_connected(tonic::Request::new(request_stream))
+            .await
+        {
+            Ok(_response) => {
+                debug!("keep_connected succeeded");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("keep_connected failed: {}", e);
+                error!("{}", msg);
+                self.invalidate_master_channel().await;
+                Err(msg)
+            }
+        }
+    }
+
     pub async fn push_delta(
         &self,
         client_id: &str,
@@ -1476,6 +1534,56 @@ impl PowerFuseClient {
         }
 
         Err("pull_delta failed after max retries".to_string())
+    }
+
+    pub async fn get_statistics(&self, collection: &str) -> Result<StatisticsResponse, String> {
+        debug!("get_statistics: collection={}", collection);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = StatisticsRequest {
+                collection: collection.to_string(),
+                data_center: String::new(),
+                rack: String::new(),
+            };
+
+            match client.get_statistics(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!(
+                        "get_statistics succeeded: total_size={}, used_size={}",
+                        resp.total_volume_size, resp.total_used_size
+                    );
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let msg = format!("get_statistics failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("get_statistics failed after max retries".to_string())
     }
 }
 
@@ -1699,5 +1807,9 @@ impl SyncFuseClient {
 
     pub fn complete_job(&self, job_id: &str) -> Result<u64, String> {
         self.block_with_timeout(self.client.complete_job(job_id))
+    }
+
+    pub fn get_statistics(&self, collection: &str) -> Result<StatisticsResponse, String> {
+        self.block_with_timeout(self.client.get_statistics(collection))
     }
 }

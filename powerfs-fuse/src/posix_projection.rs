@@ -62,6 +62,12 @@ impl ConflictDirInodeMapper {
     }
 }
 
+impl Default for ConflictDirInodeMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// POSIX 投影器
 pub struct PosixProjection {
     default_policy: MergePolicy,

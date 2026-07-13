@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
 use powerfs_kv_client::KvCacheClient;
+use powerfs_master::proto::powerfs::master_service_client::MasterServiceClient;
 use powerfs_monitor::alert_engine::AlertEngine;
 use powerfs_monitor::auth::{
     auth_middleware, generate_access_key, generate_secret_key, hash_secret_key, AuthState,
@@ -122,6 +123,8 @@ struct AppState {
     rate_limiter: Arc<RateLimiter>,
     /// KV Cache 客户端
     kv_client: Arc<Mutex<KvCacheClient>>,
+    /// Master gRPC 客户端
+    master_client: Arc<Mutex<MasterServiceClient<tonic::transport::Channel>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -173,7 +176,12 @@ struct FuseMount {
     threads: usize,
     status: String,
     mounted_at: String,
-    pid: Option<u32>,
+    pid: Option<u64>,
+    host: Option<String>,
+    client_type: Option<String>,
+    dirty_chunks: Option<u64>,
+    dirty_bytes: Option<u64>,
+    last_heartbeat: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -832,8 +840,55 @@ async fn delete_s3_access_key(
 }
 
 async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<FuseMount>>> {
-    let mounts = state.fuse_mounts.lock().await;
-    let mut result = mounts.clone();
+    let mut result = Vec::new();
+
+    match state
+        .master_client
+        .lock()
+        .await
+        .get_fuse_clients(tonic::Request::new(
+            powerfs_master::proto::powerfs::FuseClientsRequest {},
+        ))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            for client in resp.clients {
+                result.push(FuseMount {
+                    id: client.client_id,
+                    mount_point: client.mount_point,
+                    collection: client.collection,
+                    replication: client.replication,
+                    master: String::new(),
+                    threads: 0,
+                    status: "mounted".to_string(),
+                    mounted_at: if client.connected_at > 0 {
+                        chrono::DateTime::from_timestamp(client.connected_at as i64, 0)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    pid: Some(client.pid),
+                    host: Some(client.host),
+                    client_type: Some(client.client_type),
+                    dirty_chunks: Some(client.dirty_chunks),
+                    dirty_bytes: Some(client.dirty_bytes),
+                    last_heartbeat: if client.last_heartbeat > 0 {
+                        chrono::DateTime::from_timestamp(client.last_heartbeat as i64, 0)
+                            .map(|dt| dt.to_rfc3339())
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        Err(e) => {
+            warn!("Failed to get fuse clients from master: {}", e);
+            let mounts = state.fuse_mounts.lock().await;
+            result = mounts.clone();
+        }
+    }
 
     for mount in result.iter_mut() {
         if let Some(pid) = mount.pid {
@@ -903,7 +958,12 @@ async fn create_fuse_mount(
                 threads: req.threads,
                 status: "mounted".to_string(),
                 mounted_at: chrono::Utc::now().to_rfc3339(),
-                pid,
+                pid: pid.map(|p| p as u64),
+                host: None,
+                client_type: None,
+                dirty_chunks: None,
+                dirty_bytes: None,
+                last_heartbeat: None,
             };
 
             state.fuse_mounts.lock().await.push(mount.clone());
@@ -1844,6 +1904,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         KvCacheClient::connect(&args.master_endpoint).await?,
     ));
 
+    let master_client = Arc::new(Mutex::new(
+        MasterServiceClient::connect(format!("http://{}", args.master_endpoint)).await?,
+    ));
+
     let app_state = Arc::new(AppState {
         metric_store: metric_store.clone(),
         alert_engine: alert_engine.clone(),
@@ -1863,6 +1927,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to create Redis client for rate limiter"),
         ))),
         kv_client,
+        master_client,
     });
 
     let event_bus = EventBus::new(&args.redis_url, &args.stream_key);

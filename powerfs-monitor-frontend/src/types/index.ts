@@ -169,6 +169,11 @@ export interface FuseMount {
   status: 'mounted' | 'unmounted' | 'error'
   mounted_at: string
   pid?: number
+  host?: string
+  client_type?: string
+  dirty_chunks?: number
+  dirty_bytes?: number
+  last_heartbeat?: string
 }
 
 export interface S3AccessKey {

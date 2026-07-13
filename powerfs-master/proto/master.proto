@@ -52,6 +52,9 @@ service MasterService {
     rpc DeregisterJobClient(JobDeregistrationRequest) returns (JobDeregistrationResponse);
     rpc CompleteJob(JobCompletionRequest) returns (JobCompletionResponse);
     rpc GetJobInfo(JobInfoRequest) returns (JobInfoResponse);
+    
+    // FUSE client management
+    rpc GetFuseClients(FuseClientsRequest) returns (FuseClientsResponse);
 }
 
 message Heartbeat {
@@ -141,6 +144,13 @@ message KeepConnectedRequest {
     string filer_group = 5;
     string data_center = 6;
     string rack = 7;
+    string mount_point = 8;
+    string collection = 9;
+    string replication = 10;
+    uint64 pid = 11;
+    string host = 12;
+    uint64 dirty_chunks = 13;
+    uint64 dirty_bytes = 14;
 }
 
 message VolumeLocation {
@@ -389,6 +399,27 @@ message JobInfoResponse {
     bool found = 1;
     JobContext job = 2;
     string error = 3;
+}
+
+// FUSE client management messages
+message FuseClientsRequest {}
+
+message FuseClientsResponse {
+    message FuseClientInfo {
+        string client_id = 1;
+        string client_type = 2;
+        string mount_point = 3;
+        string collection = 4;
+        string replication = 5;
+        string host = 6;
+        uint64 pid = 7;
+        uint64 connected_at = 8;
+        uint64 last_heartbeat = 9;
+        uint64 dirty_chunks = 10;
+        uint64 dirty_bytes = 11;
+    }
+    repeated FuseClientInfo clients = 1;
+    string error = 2;
 }
 
 message DataCenterStats {

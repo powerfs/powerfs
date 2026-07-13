@@ -1130,6 +1130,20 @@ impl ChunkCache {
         }
     }
 
+    pub fn dirty_chunks(&self) -> u64 {
+        let cache = self.cache.read().unwrap();
+        cache.values().filter(|chunk| chunk.dirty).count() as u64
+    }
+
+    pub fn dirty_bytes(&self) -> u64 {
+        let cache = self.cache.read().unwrap();
+        cache
+            .values()
+            .filter(|chunk| chunk.dirty)
+            .map(|chunk| chunk.data.len() as u64)
+            .sum()
+    }
+
     pub fn clear(&self) {
         let mut cache = self.cache.write().unwrap();
         cache.clear();

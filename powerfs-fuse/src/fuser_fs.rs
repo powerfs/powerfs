@@ -1174,16 +1174,49 @@ impl Filesystem for PowerFsFuserFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _inode: u64, reply: ReplyStatfs) {
-        reply.statfs(
-            1_000_000_000, // blocks total
-            500_000_000,   // blocks free
-            500_000_000,   // blocks available
-            1_000_000,     // files total
-            900_000,       // files free
-            4096,          // block size
-            1_000_000,     // max name length
-            4096,          // fragment size
+        const BLOCK_SIZE: u32 = 4096;
+        let block_size_u64 = BLOCK_SIZE as u64;
+
+        info!(
+            "statfs: requesting statistics for collection '{}'",
+            self.collection
         );
+        match self.client.get_statistics(&self.collection) {
+            Ok(stats) => {
+                let total_blocks = stats.total_volume_size / block_size_u64;
+                let used_blocks = stats.total_used_size / block_size_u64;
+                let free_blocks = total_blocks.saturating_sub(used_blocks);
+
+                info!(
+                    "statfs: success - total={} blocks, used={} blocks, free={} blocks, total_volume_size={}, total_used_size={}",
+                    total_blocks, used_blocks, free_blocks, stats.total_volume_size, stats.total_used_size
+                );
+
+                reply.statfs(
+                    total_blocks,
+                    free_blocks,
+                    free_blocks,
+                    stats.total_volume_count * 1000,
+                    stats.available_volume_count * 1000,
+                    BLOCK_SIZE,
+                    1_000_000,
+                    BLOCK_SIZE,
+                );
+            }
+            Err(e) => {
+                warn!("statfs: failed to get statistics: {}", e);
+                reply.statfs(
+                    1_000_000_000,
+                    500_000_000,
+                    500_000_000,
+                    1_000_000,
+                    900_000,
+                    BLOCK_SIZE,
+                    1_000_000,
+                    BLOCK_SIZE,
+                );
+            }
+        }
     }
 }
 
@@ -1287,6 +1320,41 @@ impl FuserApp {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_millis(100));
+        });
+
+        // 后台 keep_connected 线程（每 30 秒发送一次客户端信息）
+        let grpc_client_clone = grpc_client.clone();
+        let mount_point_clone = self.mount_point.clone();
+        let collection_clone = self.collection.clone();
+        let replication_clone = self.replication.clone();
+        let host_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let pid = std::process::id() as u64;
+        let runtime_handle_clone = self.runtime_handle.clone();
+
+        std::thread::spawn(move || {
+            runtime_handle_clone.block_on(async move {
+                loop {
+                    let dirty_chunks = fs_clone.data.chunk_cache().dirty_chunks();
+                    let dirty_bytes = fs_clone.data.chunk_cache().dirty_bytes();
+
+                    let _ = grpc_client_clone
+                        .keep_connected(
+                            "fuse",
+                            &mount_point_clone,
+                            &collection_clone,
+                            &replication_clone,
+                            pid,
+                            &host_name,
+                            dirty_chunks,
+                            dirty_bytes,
+                        )
+                        .await;
+
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
         });
 
         // 挂载选项

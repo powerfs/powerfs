@@ -99,14 +99,31 @@ pub struct UpdateNodeVolumesParams {
     pub http_port: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct FuseClientInfo {
+    pub client_id: String,
+    pub client_type: String,
+    pub mount_point: String,
+    pub collection: String,
+    pub replication: String,
+    pub host: String,
+    pub pid: u64,
+    pub connected_at: u64,
+    pub last_heartbeat: u64,
+    pub dirty_chunks: u64,
+    pub dirty_bytes: u64,
+}
+
 pub struct ClientManager {
     clients: HashMap<String, mpsc::Sender<VolumeLocationUpdate>>,
+    fuse_clients: HashMap<String, FuseClientInfo>,
 }
 
 impl ClientManager {
     fn new() -> Self {
         ClientManager {
             clients: HashMap::new(),
+            fuse_clients: HashMap::new(),
         }
     }
 
@@ -116,6 +133,7 @@ impl ClientManager {
 
     fn remove_client(&mut self, client_id: &str) {
         self.clients.remove(client_id);
+        self.fuse_clients.remove(client_id);
     }
 
     fn broadcast(&self, update: &VolumeLocationUpdate) {
@@ -124,6 +142,23 @@ impl ClientManager {
                 warn!("Failed to broadcast to client {}: {}", id, e);
             }
         }
+    }
+
+    fn register_fuse_client(&mut self, info: FuseClientInfo) {
+        self.fuse_clients.insert(info.client_id.clone(), info);
+    }
+
+    fn update_fuse_client_heartbeat(&mut self, client_id: &str) {
+        if let Some(client) = self.fuse_clients.get_mut(client_id) {
+            client.last_heartbeat = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+    }
+
+    fn get_fuse_clients(&self) -> Vec<FuseClientInfo> {
+        self.fuse_clients.values().cloned().collect()
     }
 }
 
@@ -1195,6 +1230,24 @@ impl MasterNode {
             .write()
             .unwrap()
             .remove_client(client_id);
+    }
+
+    pub fn register_fuse_client(&self, info: FuseClientInfo) {
+        self.client_manager
+            .write()
+            .unwrap()
+            .register_fuse_client(info);
+    }
+
+    pub fn update_fuse_client_heartbeat(&self, client_id: &str) {
+        self.client_manager
+            .write()
+            .unwrap()
+            .update_fuse_client_heartbeat(client_id);
+    }
+
+    pub fn get_fuse_clients(&self) -> Vec<FuseClientInfo> {
+        self.client_manager.read().unwrap().get_fuse_clients()
     }
 
     pub async fn lookup_volume(
