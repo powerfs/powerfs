@@ -1293,6 +1293,7 @@ impl FuserApp {
             client_id_num,
         ));
         let chunk_cache = Arc::new(crate::cache::ChunkCache::with_defaults());
+        let chunk_cache_clone_for_keep_connected = chunk_cache.clone();
         let write_buffer = Arc::new(crate::data_manager::WriteBuffer::new(64));
         let data = Arc::new(DataManager::new(chunk_cache, write_buffer));
 
@@ -1307,22 +1308,22 @@ impl FuserApp {
         );
 
         // 后台 flush 线程（每 100ms 检查脏标记）
-        let fs_clone = fs.clone();
+        let fs_clone_for_flush = fs.clone();
         std::thread::spawn(move || loop {
-            if fs_clone
+            if fs_clone_for_flush
                 .has_dirty
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 // Phase 1A: 后台 flush 暂不实现全局扫描
                 // 实际 flush 在 release/fsync 时触发
-                fs_clone
+                fs_clone_for_flush
                     .has_dirty
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_millis(100));
         });
 
-        // 后台 keep_connected 线程（每 30 秒发送一次客户端信息）
+        // 后台 keep_connected 线程（持久连接，定期发送客户端信息）
         let grpc_client_clone = grpc_client.clone();
         let mount_point_clone = self.mount_point.clone();
         let collection_clone = self.collection.clone();
@@ -1335,25 +1336,19 @@ impl FuserApp {
 
         std::thread::spawn(move || {
             runtime_handle_clone.block_on(async move {
-                loop {
-                    let dirty_chunks = fs_clone.data.chunk_cache().dirty_chunks();
-                    let dirty_bytes = fs_clone.data.chunk_cache().dirty_bytes();
-
-                    let _ = grpc_client_clone
-                        .keep_connected(
-                            "fuse",
-                            &mount_point_clone,
-                            &collection_clone,
-                            &replication_clone,
-                            pid,
-                            &host_name,
-                            dirty_chunks,
-                            dirty_bytes,
-                        )
-                        .await;
-
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
+                let _ = grpc_client_clone
+                    .keep_connected(
+                        "fuse",
+                        &mount_point_clone,
+                        &collection_clone,
+                        &replication_clone,
+                        pid,
+                        &host_name,
+                        chunk_cache_clone_for_keep_connected,
+                    )
+                    .await;
+                warn!("keep_connected stream closed, reconnecting in 10 seconds...");
+                tokio::time::sleep(Duration::from_secs(10)).await;
             });
         });
 

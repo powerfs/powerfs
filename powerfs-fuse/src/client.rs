@@ -4,11 +4,10 @@ use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
     DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
     JobCompletionRequest, JobDeregistrationRequest, JobRegistrationRequest, KeepConnectedRequest,
-    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest,
-    ListEntriesRequest, LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification,
-    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, RenameEntryRequest,
-    StatisticsRequest, StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest,
-    VectorClock,
+    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, ListEntriesRequest,
+    LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification, PullDeltaRequest,
+    PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, StatisticsRequest,
+    StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest, VectorClock,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -1388,8 +1387,7 @@ impl PowerFuseClient {
         replication: &str,
         pid: u64,
         host: &str,
-        dirty_chunks: u64,
-        dirty_bytes: u64,
+        chunk_cache: Arc<crate::cache::ChunkCache>,
     ) -> Result<(), String> {
         debug!(
             "keep_connected: client_type={}, mount_point={}, collection={}",
@@ -1403,28 +1401,52 @@ impl PowerFuseClient {
 
         let mut client = MasterServiceClient::new(channel);
 
-        let request_stream = tokio_stream::iter(vec![KeepConnectedRequest {
-            client_type: client_type.to_string(),
-            client_address: String::new(),
-            version: String::new(),
-            filer_group: String::new(),
-            data_center: String::new(),
-            rack: String::new(),
-            mount_point: mount_point.to_string(),
-            collection: collection.to_string(),
-            replication: replication.to_string(),
-            pid,
-            host: host.to_string(),
-            dirty_chunks,
-            dirty_bytes,
-        }]);
+        let client_type_clone = Arc::new(client_type.to_string());
+        let mount_point_clone = Arc::new(mount_point.to_string());
+        let collection_clone = Arc::new(collection.to_string());
+        let replication_clone = Arc::new(replication.to_string());
+        let host_clone = Arc::new(host.to_string());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let dirty_chunks = chunk_cache.dirty_chunks();
+                let dirty_bytes = chunk_cache.dirty_bytes();
+                let _ = tx
+                    .send(KeepConnectedRequest {
+                        client_type: client_type_clone.as_ref().clone(),
+                        client_address: String::new(),
+                        version: String::new(),
+                        filer_group: String::new(),
+                        data_center: String::new(),
+                        rack: String::new(),
+                        mount_point: mount_point_clone.as_ref().clone(),
+                        collection: collection_clone.as_ref().clone(),
+                        replication: replication_clone.as_ref().clone(),
+                        pid,
+                        host: host_clone.as_ref().clone(),
+                        dirty_chunks,
+                        dirty_bytes,
+                    })
+                    .await;
+            }
+        });
+
+        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
         match client
             .keep_connected(tonic::Request::new(request_stream))
             .await
         {
-            Ok(_response) => {
-                debug!("keep_connected succeeded");
+            Ok(mut response) => {
+                debug!("keep_connected stream started, listening for responses...");
+                while let Ok(Some(_resp)) = response.get_mut().message().await {
+                    debug!("keep_connected received response");
+                }
+                debug!("keep_connected stream ended");
                 Ok(())
             }
             Err(e) => {
