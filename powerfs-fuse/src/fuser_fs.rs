@@ -11,6 +11,7 @@
 //! - 读路径：本地缓存优先，miss 时从 Volume Server 拉取
 
 use crate::client::{PowerFuseClient, SyncFuseClient};
+use powerfs_master::proto::powerfs::StatisticsResponse;
 use crate::data_manager::DataManager;
 use crate::error::parse_master_error;
 use crate::metadata_manager::MetadataManager;
@@ -26,7 +27,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 
 /// FUSE dentry 缓存 TTL（0 = 不缓存，每次 lookup 都重新查询）
@@ -54,6 +55,8 @@ struct PowerFsFuserFs {
     has_dirty: Arc<AtomicBool>,
     /// 数据完整性验证开关（缺省关闭，调试时打开）
     verify_data: bool,
+    /// statfs 缓存（避免每次调用都访问 Master）
+    statfs_cache: Arc<Mutex<Option<(Instant, StatisticsResponse)>>>,
 }
 
 impl PowerFsFuserFs {
@@ -76,6 +79,7 @@ impl PowerFsFuserFs {
             flush_locks: Arc::new(RwLock::new(HashMap::new())),
             has_dirty: Arc::new(AtomicBool::new(false)),
             verify_data,
+            statfs_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1176,47 +1180,62 @@ impl Filesystem for PowerFsFuserFs {
     fn statfs(&mut self, _req: &Request<'_>, _inode: u64, reply: ReplyStatfs) {
         const BLOCK_SIZE: u32 = 4096;
         let block_size_u64 = BLOCK_SIZE as u64;
+        const CACHE_TTL: Duration = Duration::from_secs(30);
 
-        info!(
-            "statfs: requesting statistics for collection '{}'",
-            self.collection
+        let now = Instant::now();
+        let cached_stats = {
+            let cache_guard = self.statfs_cache.lock().unwrap();
+            if let Some((cached_time, cached_stats)) = &*cache_guard {
+                if now.duration_since(*cached_time) < CACHE_TTL {
+                    Some(cached_stats.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let stats = if let Some(s) = cached_stats {
+            s
+        } else {
+            match self.client.get_statistics(&self.collection) {
+                Ok(s) => {
+                    let mut cache_guard = self.statfs_cache.lock().unwrap();
+                    *cache_guard = Some((now, s.clone()));
+                    s
+                }
+                Err(e) => {
+                    warn!("statfs: failed to get statistics: {}", e);
+                    reply.statfs(
+                        1_000_000_000,
+                        500_000_000,
+                        500_000_000,
+                        1_000_000,
+                        900_000,
+                        BLOCK_SIZE,
+                        1_000_000,
+                        BLOCK_SIZE,
+                    );
+                    return;
+                }
+            }
+        };
+
+        let total_blocks = stats.total_volume_size / block_size_u64;
+        let used_blocks = stats.total_used_size / block_size_u64;
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+
+        reply.statfs(
+            total_blocks,
+            free_blocks,
+            free_blocks,
+            stats.total_volume_count * 1000,
+            stats.available_volume_count * 1000,
+            BLOCK_SIZE,
+            1_000_000,
+            BLOCK_SIZE,
         );
-        match self.client.get_statistics(&self.collection) {
-            Ok(stats) => {
-                let total_blocks = stats.total_volume_size / block_size_u64;
-                let used_blocks = stats.total_used_size / block_size_u64;
-                let free_blocks = total_blocks.saturating_sub(used_blocks);
-
-                info!(
-                    "statfs: success - total={} blocks, used={} blocks, free={} blocks, total_volume_size={}, total_used_size={}",
-                    total_blocks, used_blocks, free_blocks, stats.total_volume_size, stats.total_used_size
-                );
-
-                reply.statfs(
-                    total_blocks,
-                    free_blocks,
-                    free_blocks,
-                    stats.total_volume_count * 1000,
-                    stats.available_volume_count * 1000,
-                    BLOCK_SIZE,
-                    1_000_000,
-                    BLOCK_SIZE,
-                );
-            }
-            Err(e) => {
-                warn!("statfs: failed to get statistics: {}", e);
-                reply.statfs(
-                    1_000_000_000,
-                    500_000_000,
-                    500_000_000,
-                    1_000_000,
-                    900_000,
-                    BLOCK_SIZE,
-                    1_000_000,
-                    BLOCK_SIZE,
-                );
-            }
-        }
     }
 }
 
@@ -1232,6 +1251,7 @@ impl Clone for PowerFsFuserFs {
             flush_locks: self.flush_locks.clone(),
             has_dirty: self.has_dirty.clone(),
             verify_data: self.verify_data,
+            statfs_cache: self.statfs_cache.clone(),
         }
     }
 }
@@ -1292,6 +1312,7 @@ impl FuserApp {
             sync_client.clone(),
             client_id_num,
         ));
+        meta.start_delta_sync();
         let chunk_cache = Arc::new(crate::cache::ChunkCache::with_defaults());
         let chunk_cache_clone_for_keep_connected = chunk_cache.clone();
         let write_buffer = Arc::new(crate::data_manager::WriteBuffer::new(64));

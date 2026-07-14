@@ -17,13 +17,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use crate::client::SyncFuseClient;
 use crate::error::FsError;
 use crate::inode_allocator::InodeAllocator;
-use crate::orset::{now_unix, DirEntry, DirORSet, EntryId, FileType};
+use crate::orset::{now_unix, DirEntry, DirORSet, EntryId, FileType, VectorClock};
 use crate::posix_projection::{PosixProjection, VisibleEntry};
 
 /// 根目录 inode
@@ -34,11 +35,11 @@ const MASTER_CLIENT_ID: u64 = 0;
 
 pub struct MetadataManager {
     /// 本地 OR-Set 缓存：dir_inode -> DirORSet
-    dir_cache: RwLock<HashMap<u64, Arc<RwLock<DirORSet>>>>,
+    dir_cache: Arc<RwLock<HashMap<u64, Arc<RwLock<DirORSet>>>>>,
     /// inode 反向索引：ino -> (dir_ino, EntryId)
-    inode_index: RwLock<HashMap<u64, (u64, EntryId)>>,
+    inode_index: Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
     /// inode → 全路径映射（用于 Master 同步时的 path KV 兼容）
-    inode_paths: RwLock<HashMap<u64, String>>,
+    inode_paths: Arc<RwLock<HashMap<u64, String>>>,
     /// POSIX 投影层
     projection: PosixProjection,
     /// Inode 分配器
@@ -51,21 +52,24 @@ pub struct MetadataManager {
     seq_counter: AtomicU64,
     /// gRPC 客户端（可选，None 时仅本地缓存）
     client: Option<Arc<SyncFuseClient>>,
+    /// 客户端 VectorClock（用于 Delta Sync）
+    client_vclock: Arc<RwLock<VectorClock>>,
 }
 
 impl MetadataManager {
     /// 创建本地版 MetadataManager（无 Master 连接，仅本地缓存）
     pub fn new_local(client_id: u64) -> Self {
         let mgr = Self {
-            dir_cache: RwLock::new(HashMap::new()),
-            inode_index: RwLock::new(HashMap::new()),
-            inode_paths: RwLock::new(HashMap::new()),
+            dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            inode_index: Arc::new(RwLock::new(HashMap::new())),
+            inode_paths: Arc::new(RwLock::new(HashMap::new())),
             projection: PosixProjection::new(),
-            inode_allocator: InodeAllocator::new(),
+            inode_allocator: InodeAllocator::new(client_id),
             client_id,
             client_id_str: client_id.to_string(),
             seq_counter: AtomicU64::new(1),
             client: None,
+            client_vclock: Arc::new(RwLock::new(VectorClock::new())),
         };
         mgr.init_root();
         mgr
@@ -74,15 +78,16 @@ impl MetadataManager {
     /// 创建带 Master 连接的 MetadataManager
     pub fn new_with_master(client: Arc<SyncFuseClient>, client_id: u64) -> Self {
         let mgr = Self {
-            dir_cache: RwLock::new(HashMap::new()),
-            inode_index: RwLock::new(HashMap::new()),
-            inode_paths: RwLock::new(HashMap::new()),
+            dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            inode_index: Arc::new(RwLock::new(HashMap::new())),
+            inode_paths: Arc::new(RwLock::new(HashMap::new())),
             projection: PosixProjection::new(),
-            inode_allocator: InodeAllocator::new(),
+            inode_allocator: InodeAllocator::new(client_id),
             client_id,
             client_id_str: client_id.to_string(),
             seq_counter: AtomicU64::new(1),
             client: Some(client),
+            client_vclock: Arc::new(RwLock::new(VectorClock::new())),
         };
         mgr.init_root();
         mgr
@@ -144,7 +149,7 @@ impl MetadataManager {
         // 确保目录缓存存在
         let orset_arc = self.ensure_dir_cache(dir_ino);
 
-        // 如果本地为空，尝试从 Master 拉取
+        // 如果本地为空，尝试从 Master 拉取（仅首次）
         {
             let orset = orset_arc.read().unwrap();
             if !orset.is_empty() {
@@ -153,8 +158,13 @@ impl MetadataManager {
             }
         }
 
-        // 本地为空，尝试 Master
+        // 本地为空，尝试 Master（但避免重复调用）
         if self.client.is_some() {
+            let orset = orset_arc.write().unwrap();
+            if !orset.is_empty() {
+                return Ok(self.projection.project_listing(&orset));
+            }
+            drop(orset);
             self.fetch_dir_from_master(dir_ino)?;
         }
 
@@ -831,6 +841,214 @@ impl MetadataManager {
             );
         }
     }
+
+    // ==================== Delta Sync ====================
+
+    pub fn start_delta_sync(&self) {
+        info!("Starting Delta Sync for client_id={}", self.client_id_str);
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => {
+                warn!("No client available, Delta Sync cannot start");
+                return;
+            }
+        };
+        let client_id_str = self.client_id_str.clone();
+        let dir_cache = self.dir_cache.clone();
+        let inode_index = self.inode_index.clone();
+        let inode_paths = self.inode_paths.clone();
+        let client_vclock = self.client_vclock.clone();
+
+        tokio::spawn(async move {
+            info!("Performing initial full sync...");
+            let initial_vclock = client_vclock.read().expect("client_vclock lock poisoned").clone();
+            let initial_proto_vclock = vec_to_proto_vclock(&initial_vclock);
+
+            match client.pull_delta_async(&client_id_str, &initial_proto_vclock).await {
+                Ok(response) => {
+                    info!("Initial sync received {} deltas", response.deltas.len());
+                    for delta in response.deltas {
+                        apply_delta_helper(&delta, &dir_cache, &inode_index, &inode_paths);
+                    }
+                    if let Some(new_vclock) = response.server_vclock {
+                        let mut vclock_guard = client_vclock.write().expect("client_vclock lock poisoned");
+                        *vclock_guard = proto_to_vec_vclock(&new_vclock);
+                    }
+                }
+                Err(e) => {
+                    warn!("Initial sync failed: {}", e);
+                }
+            }
+
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut backoff = Duration::from_secs(1);
+            let max_backoff = Duration::from_secs(60);
+            let mut iteration = 0;
+
+            loop {
+                interval.tick().await;
+                iteration += 1;
+                info!("Delta Sync iteration {} starting", iteration);
+
+                match do_pull_and_apply_deltas(
+                    &client,
+                    &client_id_str,
+                    &dir_cache,
+                    &inode_index,
+                    &inode_paths,
+                    &client_vclock,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        warn!("Delta sync failed: {}, backing off {:?}", e, backoff);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn pull_and_apply_deltas(&self) -> Result<(), FsError> {
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        let vclock = self.client_vclock.read().expect("client_vclock lock poisoned").clone();
+        let proto_vclock = vec_to_proto_vclock(&vclock);
+
+        let response = client
+            .pull_delta(&self.client_id_str, &proto_vclock)
+            .map_err(|e| FsError::MasterError(format!("pull_delta: {}", e)))?;
+
+        if !response.deltas.is_empty() {
+            info!(
+                "pull_delta received {} deltas",
+                response.deltas.len()
+            );
+
+            for delta in response.deltas {
+                self.apply_delta(&delta);
+            }
+
+            if let Some(server_vclock) = response.server_vclock {
+                let new_vclock = proto_to_vec_vclock(&server_vclock);
+                let mut client_vclock = self.client_vclock.write().expect("client_vclock lock poisoned");
+                *client_vclock = new_vclock;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_delta(&self, delta: &powerfs_master::proto::powerfs::DeltaOp) {
+        match &delta.op {
+            Some(powerfs_master::proto::powerfs::delta_op::Op::Add(entry)) => {
+                if let Some(id) = &entry.id {
+                    let dir_entry = proto_dir_entry_to_local(entry);
+                    let dir_ino = entry.parent_ino;
+
+                    let orset_arc = self.ensure_dir_cache(dir_ino);
+                    let mut orset = orset_arc.write().expect("orset lock poisoned");
+                    orset.add(dir_entry.clone());
+
+                    self.inode_index
+                        .write()
+                        .expect("inode_index lock poisoned")
+                        .insert(entry.inode, (dir_ino, EntryId::new(id.name.clone(), id.client_id, id.seq)));
+
+                    let parent_path = self.get_path(dir_ino).unwrap_or_else(|| "/".to_string());
+                    let child_path = if parent_path == "/" {
+                        format!("/{}", id.name)
+                    } else {
+                        format!("{}/{}", parent_path, id.name)
+                    };
+                    self.inode_paths.write().expect("inode_paths lock poisoned").insert(entry.inode, child_path);
+                }
+            }
+            Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(id)) => {
+                let entry_id = EntryId::new(id.name.clone(), id.client_id, id.seq);
+
+                let mut index = self.inode_index.write().expect("inode_index lock poisoned");
+                let inode_to_remove: Option<u64> = index
+                    .iter()
+                    .find(|(_, (_, eid))| eid == &entry_id)
+                    .map(|(&ino, _)| ino);
+
+                if let Some(ino) = inode_to_remove {
+                    if let Some((dir_ino, eid)) = index.remove(&ino) {
+                        let orset_arc = self.ensure_dir_cache(dir_ino);
+                        let mut orset = orset_arc.write().expect("orset lock poisoned");
+                        orset.remove(&eid);
+
+                        self.inode_paths.write().expect("inode_paths lock poisoned").remove(&ino);
+                    }
+                }
+            }
+            Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(op)) => {
+                if let (Some(old_id), Some(new_entry)) = (&op.old_id, &op.new_entry) {
+                    if let Some(new_id) = &new_entry.id {
+                        let old_entry_id = EntryId::new(old_id.name.clone(), old_id.client_id, old_id.seq);
+
+                        let mut index = self.inode_index.write().expect("inode_index lock poisoned");
+                        let inode_to_rename: Option<u64> = index
+                            .iter()
+                            .find(|(_, (_, eid))| eid == &old_entry_id)
+                            .map(|(&ino, _)| ino);
+
+                        if let Some(ino) = inode_to_rename {
+                            if let Some((old_dir_ino, _)) = index.get(&ino) {
+                                let orset_arc_old = self.ensure_dir_cache(*old_dir_ino);
+                                let mut orset_old = orset_arc_old.write().expect("orset lock poisoned");
+                                orset_old.remove(&old_entry_id);
+                            }
+
+                            let dir_entry = proto_dir_entry_to_local(new_entry);
+                            let new_dir_ino = new_entry.parent_ino;
+
+                            let orset_arc_new = self.ensure_dir_cache(new_dir_ino);
+                            let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
+                            orset_new.add(dir_entry.clone());
+
+                            index.insert(ino, (new_dir_ino, EntryId::new(new_id.name.clone(), new_id.client_id, new_id.seq)));
+
+                            let parent_path = self.get_path(new_dir_ino).unwrap_or_else(|| "/".to_string());
+                            let child_path = if parent_path == "/" {
+                                format!("/{}", new_id.name)
+                            } else {
+                                format!("{}/{}", parent_path, new_id.name)
+                            };
+                            self.inode_paths.write().expect("inode_paths lock poisoned").insert(ino, child_path);
+                        }
+                    }
+                }
+            }
+            Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(op)) => {
+                let index = self.inode_index.read().expect("inode_index lock poisoned");
+                if let Some((dir_ino, entry_id)) = index.get(&op.inode) {
+                    let orset_arc = self.ensure_dir_cache(*dir_ino);
+                    let mut orset = orset_arc.write().expect("orset lock poisoned");
+                    if let Some(entry) = orset.entries.get_mut(entry_id) {
+                        if op.mode != 0 {
+                            entry.mode = op.mode;
+                        }
+                        if op.size != 0 {
+                            entry.size = op.size;
+                        }
+                        if op.mtime != 0 {
+                            entry.mtime = op.mtime;
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
 }
 
 // ==================== 转换函数 ====================
@@ -933,6 +1151,250 @@ pub fn dir_entry_to_proto(
         symlink_target: entry.symlink_target.clone().unwrap_or_default(),
         owner: String::new(),
         generation: 0,
+    }
+}
+
+fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrset) -> DirEntry {
+    let id = if let Some(id) = &entry.id {
+        EntryId::new(id.name.clone(), id.client_id, id.seq)
+    } else {
+        EntryId::new("unknown", 0, 0)
+    };
+
+    let file_type = match entry.file_type {
+        0 => FileType::RegularFile,
+        1 => FileType::Directory,
+        2 => FileType::Symlink,
+        _ => FileType::RegularFile,
+    };
+
+    DirEntry {
+        id,
+        inode: entry.inode,
+        file_type,
+        mode: entry.mode,
+        size: entry.size,
+        mtime: entry.mtime,
+        atime: entry.atime,
+        ctime: entry.ctime,
+        parent_ino: entry.parent_ino,
+        chunks: vec![],
+        symlink_target: if entry.symlink_target.is_empty() {
+            None
+        } else {
+            Some(entry.symlink_target.clone())
+        },
+    }
+}
+
+fn vec_to_proto_vclock(vclock: &VectorClock) -> powerfs_master::proto::powerfs::VectorClock {
+    powerfs_master::proto::powerfs::VectorClock {
+        entries: vclock
+            .iter()
+            .map(|(&client_id, &seq)| powerfs_master::proto::powerfs::VectorClockEntry {
+                client_id,
+                seq,
+            })
+            .collect(),
+    }
+}
+
+fn proto_to_vec_vclock(proto: &powerfs_master::proto::powerfs::VectorClock) -> VectorClock {
+    let mut vclock = VectorClock::new();
+    for entry in &proto.entries {
+        vclock.observe(entry.client_id, entry.seq);
+    }
+    vclock
+}
+
+async fn do_pull_and_apply_deltas(
+    client: &SyncFuseClient,
+    client_id_str: &str,
+    dir_cache: &Arc<RwLock<HashMap<u64, Arc<RwLock<DirORSet>>>>>,
+    inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
+    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    client_vclock: &Arc<RwLock<VectorClock>>,
+) -> Result<(), String> {
+    let vclock = client_vclock.read().expect("client_vclock lock poisoned").clone();
+    let proto_vclock = vec_to_proto_vclock(&vclock);
+
+    let response = client.pull_delta_async(client_id_str, &proto_vclock).await?;
+
+    if !response.deltas.is_empty() {
+            info!(
+                "pull_delta received {} deltas",
+                response.deltas.len()
+            );
+
+            for delta in response.deltas {
+                apply_delta_helper(
+                &delta,
+                dir_cache,
+                inode_index,
+                inode_paths,
+            );
+        }
+
+        if let Some(server_vclock) = response.server_vclock {
+            let new_vclock = proto_to_vec_vclock(&server_vclock);
+            let mut client_vclock = client_vclock.write().expect("client_vclock lock poisoned");
+            *client_vclock = new_vclock;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_delta_helper(
+    delta: &powerfs_master::proto::powerfs::DeltaOp,
+    dir_cache: &Arc<RwLock<HashMap<u64, Arc<RwLock<DirORSet>>>>>,
+    inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
+    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+) {
+    match &delta.op {
+        Some(powerfs_master::proto::powerfs::delta_op::Op::Add(entry)) => {
+            if let Some(id) = &entry.id {
+                let dir_entry = proto_dir_entry_to_local(entry);
+                let dir_ino = entry.parent_ino;
+
+                let orset_arc = {
+                    let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                    if let Some(arc) = cache.get(&dir_ino) {
+                        arc.clone()
+                    } else {
+                        let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
+                        let arc = Arc::new(RwLock::new(DirORSet::new(dir_ino)));
+                        cache.insert(dir_ino, arc.clone());
+                        arc
+                    }
+                };
+
+                {
+                    let mut orset = orset_arc.write().expect("orset lock poisoned");
+                    orset.add(dir_entry.clone());
+                }
+
+                inode_index
+                    .write()
+                    .expect("inode_index lock poisoned")
+                    .insert(entry.inode, (dir_ino, EntryId::new(id.name.clone(), id.client_id, id.seq)));
+
+                let parent_path = {
+                    let paths = inode_paths.read().expect("inode_paths lock poisoned");
+                    paths.get(&dir_ino).cloned().unwrap_or_else(|| "/".to_string())
+                };
+                let child_path = if parent_path == "/" {
+                    format!("/{}", id.name)
+                } else {
+                    format!("{}/{}", parent_path, id.name)
+                };
+                inode_paths.write().expect("inode_paths lock poisoned").insert(entry.inode, child_path);
+            }
+        }
+        Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(id)) => {
+            let entry_id = EntryId::new(id.name.clone(), id.client_id, id.seq);
+
+            let mut index = inode_index.write().expect("inode_index lock poisoned");
+            let inode_to_remove: Option<u64> = index
+                .iter()
+                .find(|(_, (_, eid))| eid == &entry_id)
+                .map(|(&ino, _)| ino);
+
+            if let Some(ino) = inode_to_remove {
+                if let Some((dir_ino, eid)) = index.remove(&ino) {
+                    let orset_arc = {
+                        let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                        cache.get(&dir_ino).cloned()
+                    };
+                    if let Some(arc) = orset_arc {
+                        let mut orset = arc.write().expect("orset lock poisoned");
+                        orset.remove(&eid);
+                    }
+
+                    inode_paths.write().expect("inode_paths lock poisoned").remove(&ino);
+                }
+            }
+        }
+        Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(op)) => {
+            if let (Some(old_id), Some(new_entry)) = (&op.old_id, &op.new_entry) {
+                if let Some(new_id) = &new_entry.id {
+                    let old_entry_id = EntryId::new(old_id.name.clone(), old_id.client_id, old_id.seq);
+
+                    let mut index = inode_index.write().expect("inode_index lock poisoned");
+                    let inode_to_rename: Option<u64> = index
+                        .iter()
+                        .find(|(_, (_, eid))| eid == &old_entry_id)
+                        .map(|(&ino, _)| ino);
+
+                    if let Some(ino) = inode_to_rename {
+                        if let Some((old_dir_ino, _)) = index.get(&ino) {
+                            let orset_arc_old = {
+                                let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                                cache.get(old_dir_ino).cloned()
+                            };
+                            if let Some(arc) = orset_arc_old {
+                                let mut orset_old = arc.write().expect("orset lock poisoned");
+                                orset_old.remove(&old_entry_id);
+                            }
+                        }
+
+                        let dir_entry = proto_dir_entry_to_local(new_entry);
+                        let new_dir_ino = new_entry.parent_ino;
+
+                        let orset_arc_new = {
+                            let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                            if let Some(arc) = cache.get(&new_dir_ino) {
+                                arc.clone()
+                            } else {
+                                let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
+                                let arc = Arc::new(RwLock::new(DirORSet::new(new_dir_ino)));
+                                cache.insert(new_dir_ino, arc.clone());
+                                arc
+                            }
+                        };
+                        let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
+                        orset_new.add(dir_entry.clone());
+
+                        index.insert(ino, (new_dir_ino, EntryId::new(new_id.name.clone(), new_id.client_id, new_id.seq)));
+
+                        let parent_path = {
+                            let paths = inode_paths.read().expect("inode_paths lock poisoned");
+                            paths.get(&new_dir_ino).cloned().unwrap_or_else(|| "/".to_string())
+                        };
+                        let child_path = if parent_path == "/" {
+                            format!("/{}", new_id.name)
+                        } else {
+                            format!("{}/{}", parent_path, new_id.name)
+                        };
+                        inode_paths.write().expect("inode_paths lock poisoned").insert(ino, child_path);
+                    }
+                }
+            }
+        }
+        Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(op)) => {
+            let index = inode_index.read().expect("inode_index lock poisoned");
+            if let Some((dir_ino, entry_id)) = index.get(&op.inode) {
+                let orset_arc = {
+                    let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                    cache.get(dir_ino).cloned()
+                };
+                if let Some(arc) = orset_arc {
+                    let mut orset = arc.write().expect("orset lock poisoned");
+                    if let Some(entry) = orset.entries.get_mut(entry_id) {
+                        if op.mode != 0 {
+                            entry.mode = op.mode;
+                        }
+                        if op.size != 0 {
+                            entry.size = op.size;
+                        }
+                        if op.mtime != 0 {
+                            entry.mtime = op.mtime;
+                        }
+                    }
+                }
+            }
+        }
+        None => {}
     }
 }
 
@@ -1374,5 +1836,177 @@ mod tests {
 
         // OR-Set 应被惰性创建
         assert_eq!(mgr.dir_orset_len(99998), 0);
+    }
+
+    #[test]
+    fn test_client_vclock_initialized() {
+        let mgr = create_mgr();
+        let vclock = mgr.client_vclock.read().expect("client_vclock lock poisoned");
+        assert!(vclock.iter().next().is_none());
+    }
+
+    #[test]
+    fn test_apply_delta_add() {
+        let mgr = create_mgr();
+
+        let delta_op = powerfs_master::proto::powerfs::DeltaOp {
+            op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
+                powerfs_master::proto::powerfs::DirEntryOrset {
+                    id: Some(powerfs_master::proto::powerfs::EntryId {
+                        name: "delta_file.txt".to_string(),
+                        client_id: 2,
+                        seq: 1,
+                    }),
+                    inode: 100,
+                    parent_ino: ROOT_INO,
+                    mode: 0o644,
+                    size: 100,
+                    mtime: 1000,
+                    atime: 1000,
+                    ctime: 1000,
+                    nlink: 1,
+                    symlink_target: "".to_string(),
+                    file_type: 0,
+                },
+            )),
+            vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
+        };
+
+        mgr.apply_delta(&delta_op);
+
+        assert_eq!(mgr.dir_orset_len(ROOT_INO), 1);
+        assert!(mgr.lookup(ROOT_INO, "delta_file.txt").unwrap().is_some());
+        assert_eq!(mgr.inode_index_size(), 1);
+    }
+
+    #[test]
+    fn test_apply_delta_remove() {
+        let mgr = create_mgr();
+
+        let add_delta = powerfs_master::proto::powerfs::DeltaOp {
+            op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
+                powerfs_master::proto::powerfs::DirEntryOrset {
+                    id: Some(powerfs_master::proto::powerfs::EntryId {
+                        name: "to_remove.txt".to_string(),
+                        client_id: 2,
+                        seq: 1,
+                    }),
+                    inode: 100,
+                    parent_ino: ROOT_INO,
+                    mode: 0o644,
+                    size: 100,
+                    mtime: 1000,
+                    atime: 1000,
+                    ctime: 1000,
+                    nlink: 1,
+                    symlink_target: "".to_string(),
+                    file_type: 0,
+                },
+            )),
+            vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
+        };
+        mgr.apply_delta(&add_delta);
+        assert_eq!(mgr.dir_orset_len(ROOT_INO), 1);
+
+        let remove_delta = powerfs_master::proto::powerfs::DeltaOp {
+            op: Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(
+                powerfs_master::proto::powerfs::EntryId {
+                    name: "to_remove.txt".to_string(),
+                    client_id: 2,
+                    seq: 1,
+                },
+            )),
+            vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
+        };
+        mgr.apply_delta(&remove_delta);
+
+        assert_eq!(mgr.dir_orset_len(ROOT_INO), 0);
+        assert!(mgr.lookup(ROOT_INO, "to_remove.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_apply_delta_setattr() {
+        let mgr = create_mgr();
+
+        let add_delta = powerfs_master::proto::powerfs::DeltaOp {
+            op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
+                powerfs_master::proto::powerfs::DirEntryOrset {
+                    id: Some(powerfs_master::proto::powerfs::EntryId {
+                        name: "setattr_file.txt".to_string(),
+                        client_id: 2,
+                        seq: 1,
+                    }),
+                    inode: 100,
+                    parent_ino: ROOT_INO,
+                    mode: 0o644,
+                    size: 100,
+                    mtime: 1000,
+                    atime: 1000,
+                    ctime: 1000,
+                    nlink: 1,
+                    symlink_target: "".to_string(),
+                    file_type: 0,
+                },
+            )),
+            vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
+        };
+        mgr.apply_delta(&add_delta);
+
+        let setattr_delta = powerfs_master::proto::powerfs::DeltaOp {
+            op: Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(
+                powerfs_master::proto::powerfs::SetAttrOp {
+                    inode: 100,
+                    mode: 0o755,
+                    size: 200,
+                    mtime: 2000,
+                },
+            )),
+            vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
+        };
+        mgr.apply_delta(&setattr_delta);
+
+        let entry = mgr.get_entry_by_inode(100).unwrap().unwrap();
+        assert_eq!(entry.mode, 0o755);
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.mtime, 2000);
+    }
+
+    #[test]
+    fn test_pull_and_apply_deltas_no_client() {
+        let mgr = create_mgr();
+        let result = mgr.pull_and_apply_deltas();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_vec_to_proto_vclock_conversion() {
+        let mut vclock = VectorClock::new();
+        vclock.increment(1);
+        vclock.increment(2);
+        vclock.increment(1);
+
+        let proto = vec_to_proto_vclock(&vclock);
+        assert_eq!(proto.entries.len(), 2);
+
+        let entry1 = proto.entries.iter().find(|e| e.client_id == 1).unwrap();
+        assert_eq!(entry1.seq, 2);
+
+        let entry2 = proto.entries.iter().find(|e| e.client_id == 2).unwrap();
+        assert_eq!(entry2.seq, 1);
+    }
+
+    #[test]
+    fn test_proto_to_vec_vclock_conversion() {
+        let proto = powerfs_master::proto::powerfs::VectorClock {
+            entries: vec![
+                powerfs_master::proto::powerfs::VectorClockEntry { client_id: 1, seq: 2 },
+                powerfs_master::proto::powerfs::VectorClockEntry { client_id: 3, seq: 5 },
+            ],
+        };
+
+        let vclock = proto_to_vec_vclock(&proto);
+        assert_eq!(vclock.get(1), 2);
+        assert_eq!(vclock.get(3), 5);
+        assert_eq!(vclock.get(2), 0);
     }
 }

@@ -8,8 +8,8 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
-    WriteArgs,
+    ConflictsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs,
+    VolumeListArgs, WriteArgs,
 };
 
 /// PowerFS CLI tool for testing and administration
@@ -74,6 +74,9 @@ enum Commands {
 
     /// KV Cache operations (session/block/list/stats)
     Kv(KvArgs),
+
+    /// Conflict management (list/resolve/set-policy/auto-resolve)
+    Conflicts(ConflictsArgs),
 }
 
 #[tokio::main]
@@ -113,6 +116,7 @@ async fn main() {
             let kv_client = kv_client::KvCacheClient::new(&cli.master);
             commands::kv(kv_client, args).await
         }
+        Commands::Conflicts(command) => commands::conflicts(client, command).await,
     };
 
     if let Err(e) = result {

@@ -41,6 +41,8 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 md5 = "0.7"
 hostname = "0.3"
+futures = { workspace = true }
+crossbeam = { workspace = true }
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

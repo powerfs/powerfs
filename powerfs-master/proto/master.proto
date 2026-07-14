@@ -55,6 +55,12 @@ service MasterService {
     
     // FUSE client management
     rpc GetFuseClients(FuseClientsRequest) returns (FuseClientsResponse);
+    
+    // Conflict management (Phase 2)
+    rpc GetConflicts(GetConflictsRequest) returns (GetConflictsResponse);
+    rpc ResolveConflict(ResolveConflictRequest) returns (ResolveConflictResponse);
+    rpc SetMergePolicy(SetMergePolicyRequest) returns (SetMergePolicyResponse);
+    rpc AutoResolveConflicts(AutoResolveConflictsRequest) returns (AutoResolveConflictsResponse);
 }
 
 message Heartbeat {
@@ -1112,4 +1118,97 @@ message PullDeltaResponse {
     string error = 2;
     repeated DeltaOp deltas = 3;
     VectorClock server_vclock = 4;
+}
+
+// ============================================================
+// Conflict management types (Phase 2)
+// ============================================================
+
+enum ConflictType {
+    CREATE_CREATE = 0;
+    WRITE_WRITE = 1;
+    WRITE_UNLINK = 2;
+    DELETE_CREATE = 3;
+    RENAME_CONFLICT = 4;
+}
+
+enum ConflictResolution {
+    KEEP_FIRST = 0;
+    KEEP_LAST = 1;
+    KEEP_ALL = 2;
+    MERGE = 3;
+}
+
+enum MergePolicy {
+    LWW_TIME = 0;
+    CONTENT_HASH = 1;
+    WEIGHT_BASED = 2;
+    MERGE_KEEP_ALL = 3;
+    WRITE_PRIORITY = 4;
+    DELETE_PRIORITY = 5;
+    AGGRESSIVE = 6;
+    CONSERVATIVE = 7;
+    MANUAL = 8;
+}
+
+message ConflictRecord {
+    string id = 1;
+    ConflictType conflict_type = 2;
+    uint64 dir_ino = 3;
+    string dir_path = 4;
+    string base_name = 5;
+    repeated DirEntryOrset branches = 6;
+    uint64 create_time = 7;
+    bool resolved = 8;
+    uint64 resolved_time = 9;
+    ConflictResolution resolution = 10;
+}
+
+message GetConflictsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    bool unresolved_only = 3;
+    uint64 limit = 4;
+}
+
+message GetConflictsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated ConflictRecord conflicts = 3;
+    uint64 total_count = 4;
+}
+
+message ResolveConflictRequest {
+    string conflict_id = 1;
+    ConflictResolution resolution = 2;
+    uint64 dir_ino = 3;
+    string dir_path = 4;
+}
+
+message ResolveConflictResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message SetMergePolicyRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    MergePolicy policy = 3;
+}
+
+message SetMergePolicyResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message AutoResolveConflictsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    MergePolicy policy = 3;
+}
+
+message AutoResolveConflictsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 resolved_count = 3;
 }

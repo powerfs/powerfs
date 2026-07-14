@@ -47,10 +47,10 @@ pub struct GrpcConfig {
 impl Default for GrpcConfig {
     fn default() -> Self {
         GrpcConfig {
-            keepalive_interval: Duration::from_secs(30),
-            keepalive_timeout: Duration::from_secs(10),
-            connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(60),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
             max_retry_count: 3,
             retry_delay: Duration::from_millis(500),
         }
@@ -129,8 +129,6 @@ impl PowerFuseClient {
             let grpc_addr = format!("http://{}", addr);
             match Channel::from_shared(grpc_addr)
                 .map_err(|e| format!("invalid address: {}", e))?
-                .http2_keep_alive_interval(self.config.keepalive_interval)
-                .keep_alive_timeout(self.config.keepalive_timeout)
                 .connect_timeout(self.config.connect_timeout)
                 .connect()
                 .await
@@ -1613,7 +1611,7 @@ pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
 
-const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl SyncFuseClient {
     pub fn new(client: Arc<PowerFuseClient>) -> Self {
@@ -1624,14 +1622,24 @@ impl SyncFuseClient {
     where
         F: std::future::Future<Output = Result<T, String>>,
     {
-        self.client.runtime_handle.block_on(async {
-            match tokio::time::timeout(GRPC_CALL_TIMEOUT, future).await {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "gRPC call timed out after {}s",
-                    GRPC_CALL_TIMEOUT.as_secs()
-                )),
+        thread_local! {
+            static BLOCKING_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Runtime>> = std::cell::RefCell::new(None);
+        }
+
+        BLOCKING_RUNTIME.with(|rt| {
+            let mut rt = rt.borrow_mut();
+            if rt.is_none() {
+                *rt = Some(tokio::runtime::Runtime::new().unwrap());
             }
+            rt.as_ref().unwrap().block_on(async {
+                match tokio::time::timeout(GRPC_CALL_TIMEOUT, future).await {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "gRPC call timed out after {}s",
+                        GRPC_CALL_TIMEOUT.as_secs()
+                    )),
+                }
+            })
         })
     }
 
@@ -1789,6 +1797,22 @@ impl SyncFuseClient {
         name: &str,
     ) -> Result<Option<Entry>, String> {
         self.block_with_timeout(self.client.lookup_directory_entry(parent_ino, name))
+    }
+
+    pub fn pull_delta(
+        &self,
+        client_id: &str,
+        client_vclock: &powerfs_master::proto::powerfs::VectorClock,
+    ) -> Result<powerfs_master::proto::powerfs::PullDeltaResponse, String> {
+        self.block_with_timeout(self.client.pull_delta(client_id, client_vclock))
+    }
+
+    pub async fn pull_delta_async(
+        &self,
+        client_id: &str,
+        client_vclock: &powerfs_master::proto::powerfs::VectorClock,
+    ) -> Result<powerfs_master::proto::powerfs::PullDeltaResponse, String> {
+        self.client.pull_delta(client_id, client_vclock).await
     }
 
     pub fn invalidate_volume_channel(&self, addr: &str) {

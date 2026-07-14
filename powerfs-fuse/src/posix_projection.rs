@@ -240,7 +240,7 @@ impl PosixProjection {
                 .expect("select_primary called with empty entries"),
             MergePolicy::WeightBased => entries
                 .iter()
-                .min_by_key(|e| e.inode)
+                .min_by_key(|e| e.id.client_id)
                 .copied()
                 .expect("select_primary called with empty entries"),
             MergePolicy::WritePriority => entries
@@ -255,7 +255,22 @@ impl PosixProjection {
                 .expect("select_primary called with empty entries"),
             MergePolicy::DeletePriority => entries
                 .iter()
-                .min_by_key(|e| e.inode)
+                .min_by(|a, b| {
+                    a.mtime
+                        .cmp(&b.mtime)
+                        .then_with(|| a.id.client_id.cmp(&b.id.client_id))
+                        .then_with(|| a.id.seq.cmp(&b.id.seq))
+                })
+                .copied()
+                .expect("select_primary called with empty entries"),
+            MergePolicy::Aggressive | MergePolicy::Conservative | MergePolicy::Manual => entries
+                .iter()
+                .max_by(|a, b| {
+                    a.mtime
+                        .cmp(&b.mtime)
+                        .then_with(|| a.id.client_id.cmp(&b.id.client_id))
+                        .then_with(|| a.id.seq.cmp(&b.id.seq))
+                })
                 .copied()
                 .expect("select_primary called with empty entries"),
         }

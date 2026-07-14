@@ -2,6 +2,7 @@ pub mod directory_tree;
 pub mod kv_cache_service;
 pub mod lock_manager;
 pub mod master;
+pub mod metadata_manager;
 pub mod metrics;
 pub mod proto;
 pub mod raft_client;

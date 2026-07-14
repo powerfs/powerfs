@@ -1258,12 +1258,18 @@ mod chunk_cache_tests {
         let cache = ChunkCache::with_max_bytes(1024, 2048);
         let inode = 100;
 
-        // 放入 3 个 chunk，第 1 个应该被淘汰（mtime 最旧）
+        // 放入 2 个 chunk（刚好填满）
         cache.put(inode, 0, vec![0u8; 1024], 1000, 0); // mtime=1000
         cache.put(inode, 1024, vec![1u8; 1024], 2000, 1); // mtime=2000
+        assert_eq!(cache.current_bytes(), 2048);
+
+        // 清除脏标记（模拟 flush 完成后的状态）
+        cache.clear_dirty(inode);
+
+        // 放入第 3 个 chunk 触发 LRU 淘汰
         cache.put(inode, 2048, vec![2u8; 1024], 3000, 2); // mtime=3000
 
-        // 最旧的（mtime=1000）应被淘汰
+        // 最旧的（mtime=1000）应被淘汰，剩下较新的两个
         assert!(
             cache.get(inode, 0).is_none(),
             "oldest chunk should be evicted"

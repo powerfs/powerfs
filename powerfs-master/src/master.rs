@@ -48,6 +48,7 @@ pub struct MasterNode {
     pub kv_cache: Arc<KVCacheEngine>,
     pub kv_persist: Arc<KVPersistStore>,
     pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
+    pub metadata_manager: Arc<crate::metadata_manager::MetadataManager>,
     pub volume_client_pool: Arc<VolumeClientPool>,
     event_publisher: Option<EventPublisher>,
 }
@@ -260,6 +261,10 @@ impl MasterNode {
 
         let volume_client_pool = Arc::new(VolumeClientPool::new());
 
+        let metadata_manager = Arc::new(crate::metadata_manager::MetadataManager::new(
+            dir_tree.db.clone(),
+        ));
+
         let event_publisher = match std::env::var("REDIS_URL") {
             Ok(url) => {
                 info!("Event publisher enabled with Redis: {}", url);
@@ -295,6 +300,7 @@ impl MasterNode {
             kv_cache,
             kv_persist,
             directory_tree: dir_tree,
+            metadata_manager,
             volume_client_pool,
             event_publisher,
         };
@@ -1250,6 +1256,38 @@ impl MasterNode {
         self.client_manager.read().unwrap().get_fuse_clients()
     }
 
+    pub fn get_conflicts(
+        &self,
+        dir_ino: u64,
+        unresolved_only: bool,
+    ) -> Vec<powerfs_orset::ConflictRecord> {
+        self.metadata_manager
+            .get_conflicts(dir_ino, unresolved_only)
+    }
+
+    pub fn resolve_conflict(
+        &self,
+        dir_ino: u64,
+        conflict_id: &str,
+        resolution: powerfs_orset::ConflictResolution,
+    ) {
+        self.metadata_manager
+            .resolve_conflict(dir_ino, conflict_id, resolution)
+    }
+
+    pub fn set_merge_policy(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) {
+        self.metadata_manager.set_merge_policy(dir_ino, policy)
+    }
+
+    pub fn auto_resolve_conflicts(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) -> u64 {
+        self.directory_tree
+            .auto_resolve_conflicts(dir_ino, policy)
+    }
+
+    pub fn resolve_path_to_inode(&self, path: &str) -> Option<u64> {
+        self.directory_tree.resolve_path_to_inode(path)
+    }
+
     pub async fn lookup_volume(
         &self,
         volume_ids: &[String],
@@ -1533,6 +1571,7 @@ impl Clone for MasterNode {
             kv_cache: self.kv_cache.clone(),
             kv_persist: self.kv_persist.clone(),
             directory_tree: self.directory_tree.clone(),
+            metadata_manager: self.metadata_manager.clone(),
             volume_client_pool: self.volume_client_pool.clone(),
             event_publisher: self.event_publisher.clone(),
         }

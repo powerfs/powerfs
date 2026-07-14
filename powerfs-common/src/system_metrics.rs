@@ -42,7 +42,7 @@ pub fn collect_system_metrics(sys: &mut System, _data_dir: &str) -> SystemMetric
     let networks = Networks::new_with_refreshed_list();
     let mut network_rx = 0;
     let mut network_tx = 0;
-    for (_, network) in networks.iter() {
+    for network in networks.values() {
         network_rx += network.received();
         network_tx += network.transmitted();
     }

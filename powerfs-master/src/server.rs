@@ -1,6 +1,7 @@
 use super::kv_cache_service::KvCacheServiceImpl;
 use super::master::{AddNodeParams, FuseClientInfo, MasterNode, UpdateNodeVolumesParams};
 use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
+use super::proto::powerfs::*;
 use super::proto::*;
 use futures::Stream;
 use log::{debug, info, warn};
@@ -39,6 +40,8 @@ impl MasterGrpcServer {
         };
 
         Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(5)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(15)))
             .add_service(MasterServiceServer::new(self))
             .add_service(KvCacheServiceServer::new(kv_svc))
             .serve(addr)
@@ -715,6 +718,228 @@ impl MasterService for MasterGrpcServer {
         }))
     }
 
+    async fn get_conflicts(
+        &self,
+        request: Request<GetConflictsRequest>,
+    ) -> Result<Response<GetConflictsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(GetConflictsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        conflicts: Vec::new(),
+                        total_count: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let conflicts = self.master.get_conflicts(dir_ino, req.unresolved_only);
+        let mut proto_conflicts = Vec::new();
+        for conflict in conflicts {
+            let mut branches = Vec::new();
+            for branch in &conflict.branches {
+                branches.push(powerfs::DirEntryOrset {
+                    id: Some(powerfs::EntryId {
+                        name: branch.id.name.clone(),
+                        client_id: branch.id.client_id,
+                        seq: branch.id.seq,
+                    }),
+                    inode: branch.inode,
+                    parent_ino: branch.parent_ino,
+                    mode: branch.mode,
+                    size: branch.size,
+                    mtime: branch.mtime,
+                    atime: branch.atime,
+                    ctime: branch.ctime,
+                    nlink: if branch.file_type == powerfs_orset::FileType::Directory {
+                        2
+                    } else {
+                        1
+                    },
+                    symlink_target: branch.symlink_target.clone().unwrap_or_default(),
+                    file_type: match branch.file_type {
+                        powerfs_orset::FileType::RegularFile => 0,
+                        powerfs_orset::FileType::Directory => 1,
+                        powerfs_orset::FileType::Symlink => 2,
+                    },
+                });
+            }
+            proto_conflicts.push(powerfs::ConflictRecord {
+                id: conflict.id.clone(),
+                conflict_type: match conflict.conflict_type {
+                    powerfs_orset::ConflictType::CreateCreate => 0,
+                    powerfs_orset::ConflictType::WriteWrite => 1,
+                    powerfs_orset::ConflictType::WriteUnlink => 2,
+                    powerfs_orset::ConflictType::DeleteCreate => 3,
+                    powerfs_orset::ConflictType::RenameConflict => 4,
+                },
+                dir_ino,
+                dir_path: req.dir_path.clone(),
+                base_name: conflict
+                    .branches
+                    .first()
+                    .map(|b| b.id.name.clone())
+                    .unwrap_or_default(),
+                branches,
+                create_time: conflict.create_time,
+                resolved: conflict.resolved,
+                resolved_time: conflict.resolved_time.unwrap_or(0),
+                resolution: match conflict.resolution {
+                    Some(powerfs_orset::ConflictResolution::KeepFirst) => 0,
+                    Some(powerfs_orset::ConflictResolution::KeepLast) => 1,
+                    Some(powerfs_orset::ConflictResolution::KeepAll) => 2,
+                    Some(powerfs_orset::ConflictResolution::Merge) => 3,
+                    None => 0,
+                },
+            });
+        }
+        let total_count = proto_conflicts.len() as u64;
+        Ok(Response::new(GetConflictsResponse {
+            success: true,
+            error: String::new(),
+            conflicts: proto_conflicts,
+            total_count,
+        }))
+    }
+
+    async fn resolve_conflict(
+        &self,
+        request: Request<ResolveConflictRequest>,
+    ) -> Result<Response<ResolveConflictResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(ResolveConflictResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let resolution = match req.resolution {
+            0 => powerfs_orset::ConflictResolution::KeepFirst,
+            1 => powerfs_orset::ConflictResolution::KeepLast,
+            2 => powerfs_orset::ConflictResolution::KeepAll,
+            3 => powerfs_orset::ConflictResolution::Merge,
+            _ => {
+                return Ok(Response::new(ResolveConflictResponse {
+                    success: false,
+                    error: "invalid resolution".to_string(),
+                }));
+            }
+        };
+        self.master
+            .resolve_conflict(dir_ino, &req.conflict_id, resolution);
+        Ok(Response::new(ResolveConflictResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn set_merge_policy(
+        &self,
+        request: Request<SetMergePolicyRequest>,
+    ) -> Result<Response<SetMergePolicyResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(SetMergePolicyResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let policy = match req.policy {
+            0 => powerfs_orset::MergePolicy::LwwTime,
+            1 => powerfs_orset::MergePolicy::ContentHash,
+            2 => powerfs_orset::MergePolicy::WeightBased,
+            3 => powerfs_orset::MergePolicy::KeepAll,
+            4 => powerfs_orset::MergePolicy::WritePriority,
+            5 => powerfs_orset::MergePolicy::DeletePriority,
+            6 => powerfs_orset::MergePolicy::Aggressive,
+            7 => powerfs_orset::MergePolicy::Conservative,
+            8 => powerfs_orset::MergePolicy::Manual,
+            _ => {
+                return Ok(Response::new(SetMergePolicyResponse {
+                    success: false,
+                    error: "invalid merge policy".to_string(),
+                }));
+            }
+        };
+        self.master.set_merge_policy(dir_ino, policy);
+        Ok(Response::new(SetMergePolicyResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn auto_resolve_conflicts(
+        &self,
+        request: Request<AutoResolveConflictsRequest>,
+    ) -> Result<Response<AutoResolveConflictsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(AutoResolveConflictsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        resolved_count: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let policy = match req.policy {
+            0 => powerfs_orset::MergePolicy::LwwTime,
+            1 => powerfs_orset::MergePolicy::ContentHash,
+            2 => powerfs_orset::MergePolicy::WeightBased,
+            3 => powerfs_orset::MergePolicy::KeepAll,
+            4 => powerfs_orset::MergePolicy::WritePriority,
+            5 => powerfs_orset::MergePolicy::DeletePriority,
+            6 => powerfs_orset::MergePolicy::Aggressive,
+            7 => powerfs_orset::MergePolicy::Conservative,
+            8 => powerfs_orset::MergePolicy::Manual,
+            _ => {
+                return Ok(Response::new(AutoResolveConflictsResponse {
+                    success: false,
+                    error: "invalid merge policy".to_string(),
+                    resolved_count: 0,
+                }));
+            }
+        };
+        let resolved_count = self.master.auto_resolve_conflicts(dir_ino, policy);
+        Ok(Response::new(AutoResolveConflictsResponse {
+            success: true,
+            error: String::new(),
+            resolved_count,
+        }))
+    }
+
     async fn delete_volume(
         &self,
         request: Request<DeleteVolumeRequest>,
@@ -856,8 +1081,11 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<CreateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let metadata_manager = self.master.metadata_manager.clone();
         let client_id = req.client_id.clone();
+        let client_id_clone = client_id.clone();
         let entry = req.entry.unwrap_or_default();
+        let entry_clone = entry.clone();
         info!(
             "create_entry request: name={}, directory={}, client_id={}, mode={:o}, symlink_target='{}'",
             entry.name.as_str(),
@@ -867,9 +1095,29 @@ impl MasterService for MasterGrpcServer {
             entry.symlink_target
         );
 
-        let inode = tokio::task::spawn_blocking(move || dir_tree.create_entry(entry, &client_id))
-            .await
-            .unwrap();
+        let inode =
+            tokio::task::spawn_blocking(move || dir_tree.create_entry(entry, &client_id_clone))
+                .await
+                .unwrap();
+
+        if let Ok(inode) = inode {
+            let parent_ino = self
+                .master
+                .resolve_path_to_inode(&entry_clone.directory)
+                .unwrap_or(0);
+            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+            info!(
+                "Sending Create event: name={}, parent_ino={}, inode={}, client_id_num={}",
+                entry_clone.name, parent_ino, inode, client_id_num
+            );
+            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Create {
+                client_id: client_id.clone(),
+                client_id_num,
+                entry: entry_clone,
+                parent_ino,
+                inode,
+            });
+        }
 
         match inode {
             Ok(inode) => Ok(Response::new(CreateEntryResponse {
@@ -891,8 +1139,11 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<UpdateEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let metadata_manager = self.master.metadata_manager.clone();
         let client_id = req.client_id.clone();
+        let client_id_clone = client_id.clone();
         let entry = req.entry.unwrap_or_default();
+        let entry_clone = entry.clone();
         let entry_ref = &entry;
         info!(
             "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}, mode={:o}, symlink_target='{}'",
@@ -905,9 +1156,21 @@ impl MasterService for MasterGrpcServer {
             entry_ref.symlink_target
         );
 
-        let result = tokio::task::spawn_blocking(move || dir_tree.update_entry(entry, &client_id))
-            .await
-            .unwrap();
+        let result =
+            tokio::task::spawn_blocking(move || dir_tree.update_entry(entry, &client_id_clone))
+                .await
+                .unwrap();
+
+        if result.is_ok() {
+            let inode = entry_clone.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Update {
+                client_id: client_id.clone(),
+                client_id_num,
+                entry: entry_clone,
+                inode,
+            });
+        }
 
         match result {
             Ok(_) => Ok(Response::new(UpdateEntryResponse {
@@ -927,12 +1190,28 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<DeleteEntryResponse>, Status> {
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let metadata_manager = self.master.metadata_manager.clone();
         let ino = req.ino;
         let client_id = req.client_id.clone();
+        let client_id_clone = client_id.clone();
 
-        let result = tokio::task::spawn_blocking(move || dir_tree.delete_entry(ino, &client_id))
-            .await
-            .unwrap();
+        let result =
+            tokio::task::spawn_blocking(move || dir_tree.delete_entry(ino, &client_id_clone))
+                .await
+                .unwrap();
+
+        if result.is_ok() {
+            let name = "unknown".to_string();
+            let path = "unknown".to_string();
+            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Delete {
+                client_id: client_id.clone(),
+                client_id_num,
+                path,
+                inode: ino,
+                name,
+            });
+        }
 
         match result {
             Ok(_) => Ok(Response::new(DeleteEntryResponse {
@@ -1021,50 +1300,99 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<Self::StreamMutateEntryStream>, Status> {
         let mut stream = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
+        let metadata_manager = self.master.metadata_manager.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         tokio::spawn(async move {
             while let Some(req) = stream.message().await.unwrap_or(None) {
                 let dir_tree_clone = dir_tree.clone();
+                let metadata_manager_clone = metadata_manager.clone();
                 let result = match req.mutation {
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Create(
                         create_req,
                     )) => {
                         let client_id = create_req.client_id.clone();
+                        let client_id_clone = client_id.clone();
                         let entry = create_req.entry.unwrap_or_default();
-                        tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.create_entry(entry, &client_id)
+                        let entry_clone = entry.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.create_entry(entry, &client_id_clone)
                         })
                         .await
-                        .unwrap()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+                        .unwrap();
+
+                        if let Ok(inode) = result {
+                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+                            let parent_ino = 1;
+                            info!("Sending Create event via StreamMutateEntry: name={}, inode={}, client_id_num={}", entry_clone.name, inode, client_id_num);
+                            metadata_manager_clone.send_event(
+                                crate::metadata_manager::MetadataEvent::Create {
+                                    client_id,
+                                    client_id_num,
+                                    entry: entry_clone,
+                                    parent_ino,
+                                    inode,
+                                },
+                            );
+                        }
+
+                        result.map(|_| ()).map_err(|e| e.to_string())
                     }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
                         update_req,
                     )) => {
                         let client_id = update_req.client_id.clone();
+                        let client_id_clone = client_id.clone();
                         let entry = update_req.entry.unwrap_or_default();
-                        tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.update_entry(entry, &client_id)
+                        let entry_clone = entry.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.update_entry(entry, &client_id_clone)
                         })
                         .await
-                        .unwrap()
-                        .map_err(|e| e.to_string())
+                        .unwrap();
+
+                        if result.is_ok() {
+                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+                            let inode = entry_clone.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                            metadata_manager_clone.send_event(
+                                crate::metadata_manager::MetadataEvent::Update {
+                                    client_id,
+                                    client_id_num,
+                                    entry: entry_clone,
+                                    inode,
+                                },
+                            );
+                        }
+
+                        result.map_err(|e| e.to_string())
                     }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
                         delete_req,
                     )) => {
                         let client_id = delete_req.client_id.clone();
+                        let client_id_clone = client_id.clone();
                         let ino = delete_req.ino;
-                        tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.delete_entry(ino, &client_id)
+                        let result = tokio::task::spawn_blocking(move || {
+                            dir_tree_clone.delete_entry(ino, &client_id_clone)
                         })
                         .await
-                        .unwrap()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+                        .unwrap();
+
+                        if result.is_ok() {
+                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
+                            metadata_manager_clone.send_event(
+                                crate::metadata_manager::MetadataEvent::Delete {
+                                    client_id,
+                                    client_id_num,
+                                    path: "unknown".to_string(),
+                                    inode: ino,
+                                    name: "unknown".to_string(),
+                                },
+                            );
+                        }
+
+                        result.map(|_| ()).map_err(|e| e.to_string())
                     }
                     None => Ok(()),
                 };

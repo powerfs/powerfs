@@ -2,11 +2,12 @@ use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::powerfs::{DirEntry, InodeEntry, PathIndexEntry};
 use crate::proto::{Entry, MetadataNotification};
 use log::{debug, info, warn};
+use powerfs_orset::{ConflictRecord, ConflictResolution, DirORSet, MergePolicy};
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 pub struct Lease {
@@ -27,7 +28,7 @@ pub struct JobInfo {
 }
 
 pub struct DirectoryTree {
-    db: DB,
+    pub db: Arc<DB>,
     inode_counter: std::sync::atomic::AtomicU64,
     generation_counter: std::sync::atomic::AtomicU64,
     epoch: std::sync::atomic::AtomicU64,
@@ -37,6 +38,9 @@ pub struct DirectoryTree {
     path_lease_map: std::sync::RwLock<HashMap<String, HashSet<String>>>,
     jobs: std::sync::RwLock<HashMap<String, JobInfo>>,
     current_job_id: std::sync::RwLock<Option<String>>,
+    orset: RwLock<DirORSet>,
+    merge_policies: RwLock<HashMap<u64, MergePolicy>>,
+    client_vclocks: RwLock<HashMap<String, powerfs_orset::VectorClock>>,
 }
 
 impl DirectoryTree {
@@ -45,7 +49,7 @@ impl DirectoryTree {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let db = DB::open(&opts, path)?;
+        let db = Arc::new(DB::open(&opts, path)?);
 
         let inode_counter = Self::load_inode_counter(&db);
         let generation_counter = Self::load_generation_counter(&db);
@@ -63,6 +67,9 @@ impl DirectoryTree {
             path_lease_map: std::sync::RwLock::new(HashMap::new()),
             jobs: std::sync::RwLock::new(HashMap::new()),
             current_job_id: std::sync::RwLock::new(None),
+            orset: RwLock::new(DirORSet::new(1)),
+            merge_policies: RwLock::new(HashMap::new()),
+            client_vclocks: RwLock::new(HashMap::new()),
         })
     }
 
@@ -177,6 +184,22 @@ impl DirectoryTree {
                 return self
                     .get_entry_by_inode_internal(path_index.ino)
                     .map(|e| e.0);
+            }
+        }
+        None
+    }
+
+    pub fn resolve_path_to_inode(&self, path: &str) -> Option<u64> {
+        let normalized_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{}", path)
+        };
+        let path_key = Self::path_key(&normalized_path);
+        if let Ok(Some(data)) = self.db.get(&path_key) {
+            let decode_result: Result<PathIndexEntry, _> = prost::Message::decode(data.as_ref());
+            if let Ok(path_index) = decode_result {
+                return Some(path_index.ino);
             }
         }
         None
@@ -470,7 +493,17 @@ impl DirectoryTree {
             .expect("failed to encode path index");
         self.db.put(Self::path_key(&full_path), &path_data)?;
 
-        self.publish_notification(EventType::Create, &full_path, Some(entry), client_id);
+        self.publish_notification(EventType::Create, &full_path, Some(entry.clone()), client_id);
+
+        let client_id_num: u64 = client_id.parse().unwrap_or(0);
+        let mut orset = self.orset.write().unwrap();
+        let entry_id = powerfs_orset::EntryId::new(entry.name.clone(), client_id_num, 0);
+        let dir_entry = if (mode_val & 0o40000) != 0 {
+            powerfs_orset::DirEntry::new_dir(entry_id, inode, parent_ino, mode_val)
+        } else {
+            powerfs_orset::DirEntry::new_file(entry_id, inode, parent_ino, mode_val)
+        };
+        orset.add(dir_entry);
 
         Ok(inode)
     }
@@ -555,7 +588,14 @@ impl DirectoryTree {
         )?;
 
         let path = self.get_path_by_inode(ino);
-        self.publish_notification(EventType::Update, &path, Some(entry), client_id);
+        self.publish_notification(EventType::Update, &path, Some(entry.clone()), client_id);
+
+        let client_id_num: u64 = client_id.parse().unwrap_or(0);
+        let mut orset = self.orset.write().unwrap();
+        let mode_val = entry.attributes.as_ref().map(|a| a.mode);
+        let size_val = entry.attributes.as_ref().map(|a| a.size);
+        let mtime_val = entry.attributes.as_ref().map(|a| a.mtime);
+        orset.update_attr(ino, mode_val, size_val, mtime_val, client_id_num);
 
         Ok(())
     }
@@ -647,6 +687,14 @@ impl DirectoryTree {
         self.db.delete(&path_key)?;
 
         self.publish_notification(EventType::Delete, &path, None, client_id);
+
+        let mut orset = self.orset.write().unwrap();
+        let entry_name = inode_entry.name.clone();
+        let entries_to_remove: Vec<_> = orset.get_by_name(&entry_name).into_iter().cloned().collect();
+        for entry in entries_to_remove {
+            orset.remove(&entry.id);
+        }
+
         Ok(true)
     }
 
@@ -1141,7 +1189,102 @@ impl DirectoryTree {
             deltas.len()
         );
 
+        let client_id_num: u64 = client_id.parse().unwrap_or(0);
+        let mut orset = self.orset.write().unwrap();
+
         for delta in deltas {
+            let orset_delta = match &delta.op {
+                Some(crate::proto::powerfs::delta_op::Op::Add(entry)) => {
+                    let entry_id = if let Some(id) = &entry.id {
+                        powerfs_orset::EntryId::new(id.name.clone(), id.client_id, id.seq)
+                    } else {
+                        powerfs_orset::EntryId::new("unknown", client_id_num, 0)
+                    };
+                    let file_type = match entry.file_type {
+                        0 => powerfs_orset::FileType::RegularFile,
+                        1 => powerfs_orset::FileType::Directory,
+                        _ => powerfs_orset::FileType::RegularFile,
+                    };
+                    let dir_entry = powerfs_orset::DirEntry {
+                        id: entry_id,
+                        inode: entry.inode,
+                        file_type,
+                        mode: entry.mode,
+                        size: entry.size,
+                        mtime: entry.mtime,
+                        atime: entry.atime,
+                        ctime: entry.ctime,
+                        parent_ino: entry.parent_ino,
+                        chunks: Vec::new(),
+                        symlink_target: if entry.symlink_target.is_empty() {
+                            None
+                        } else {
+                            Some(entry.symlink_target.clone())
+                        },
+                    };
+                    Some(powerfs_orset::DeltaOp::Add {
+                        entry: dir_entry,
+                        vclock: powerfs_orset::VectorClock::new(),
+                    })
+                }
+                Some(crate::proto::powerfs::delta_op::Op::Remove(id)) => {
+                    let entry_id =
+                        powerfs_orset::EntryId::new(id.name.clone(), id.client_id, id.seq);
+                    Some(powerfs_orset::DeltaOp::Remove {
+                        id: entry_id,
+                        vclock: powerfs_orset::VectorClock::new(),
+                    })
+                }
+                Some(crate::proto::powerfs::delta_op::Op::Rename(op)) => {
+                    let old_id = if let Some(id) = &op.old_id {
+                        powerfs_orset::EntryId::new(id.name.clone(), id.client_id, id.seq)
+                    } else {
+                        powerfs_orset::EntryId::new("unknown", client_id_num, 0)
+                    };
+                    let new_entry = if let Some(entry) = &op.new_entry {
+                        let entry_id = if let Some(id) = &entry.id {
+                            powerfs_orset::EntryId::new(id.name.clone(), id.client_id, id.seq)
+                        } else {
+                            powerfs_orset::EntryId::new("unknown", client_id_num, 0)
+                        };
+                        powerfs_orset::DirEntry {
+                            id: entry_id,
+                            inode: entry.inode,
+                            file_type: powerfs_orset::FileType::RegularFile,
+                            mode: entry.mode,
+                            size: entry.size,
+                            mtime: entry.mtime,
+                            atime: entry.atime,
+                            ctime: entry.ctime,
+                            parent_ino: entry.parent_ino,
+                            chunks: Vec::new(),
+                            symlink_target: None,
+                        }
+                    } else {
+                        continue;
+                    };
+                    Some(powerfs_orset::DeltaOp::Rename {
+                        old_id,
+                        new_entry,
+                        vclock: powerfs_orset::VectorClock::new(),
+                    })
+                }
+                Some(crate::proto::powerfs::delta_op::Op::SetAttr(op)) => {
+                    Some(powerfs_orset::DeltaOp::SetAttr {
+                        inode: op.inode,
+                        mode: if op.mode > 0 { Some(op.mode) } else { None },
+                        size: if op.size > 0 { Some(op.size) } else { None },
+                        mtime: if op.mtime > 0 { Some(op.mtime) } else { None },
+                        vclock: powerfs_orset::VectorClock::new(),
+                    })
+                }
+                None => None,
+            };
+
+            if let Some(d) = orset_delta {
+                orset.apply_delta(&d);
+            }
+
             match &delta.op {
                 Some(crate::proto::powerfs::delta_op::Op::Add(entry)) => {
                     let _parent_ino = entry.parent_ino;
@@ -1271,11 +1414,164 @@ impl DirectoryTree {
     > {
         debug!("pull_delta: client_id={}", client_id);
 
-        Ok((
-            Vec::new(),
-            crate::proto::powerfs::VectorClock {
-                entries: Vec::new(),
-            },
-        ))
+        let orset = self.orset.read().unwrap();
+        let client_vclock = self.client_vclocks
+            .read()
+            .unwrap()
+            .get(client_id)
+            .cloned()
+            .unwrap_or_else(powerfs_orset::VectorClock::new);
+
+        let deltas = orset.get_deltas_since(&client_vclock);
+
+        let proto_deltas: Vec<crate::proto::powerfs::DeltaOp> = deltas
+            .into_iter()
+            .map(|delta| delta_to_proto(&delta))
+            .collect();
+
+        drop(orset);
+
+        let mut client_vclocks = self.client_vclocks.write().unwrap();
+        client_vclocks.insert(client_id.to_string(), self.orset.read().unwrap().vclock.clone());
+
+        let server_vclock = self.orset.read().unwrap().vclock.clone();
+        let all_clients_caught_up = client_vclocks
+            .values()
+            .all(|vc| {
+                server_vclock.iter()
+                    .all(|(client_id, seq)| vc.get(*client_id) >= *seq)
+            });
+
+        if all_clients_caught_up {
+            self.orset.write().unwrap().clear_delta_log();
+        }
+
+        let server_vclock = vclock_to_proto(&self.orset.read().unwrap().vclock);
+
+        Ok((proto_deltas, server_vclock))
+    }
+
+    pub fn get_conflicts(&self, _dir_ino: u64, unresolved_only: bool) -> Vec<ConflictRecord> {
+        let orset = self.orset.read().unwrap();
+        if unresolved_only {
+            orset.unresolved_conflicts().into_iter().cloned().collect()
+        } else {
+            orset.conflicts()
+        }
+    }
+
+    pub fn resolve_conflict(
+        &self,
+        _dir_ino: u64,
+        conflict_id: &str,
+        resolution: ConflictResolution,
+    ) {
+        let mut orset = self.orset.write().unwrap();
+        orset.resolve_conflict(conflict_id, resolution);
+    }
+
+    pub fn set_merge_policy(&self, dir_ino: u64, policy: MergePolicy) {
+        let mut policies = self.merge_policies.write().unwrap();
+        policies.insert(dir_ino, policy);
+        let mut orset = self.orset.write().unwrap();
+        orset.set_policy(policy);
+    }
+
+    pub fn auto_resolve_conflicts(&self, _dir_ino: u64, policy: MergePolicy) -> u64 {
+        let mut orset = self.orset.write().unwrap();
+        orset.set_policy(policy);
+        orset.auto_resolve_all()
+    }
+}
+
+fn vclock_to_proto(vclock: &powerfs_orset::VectorClock) -> crate::proto::powerfs::VectorClock {
+    crate::proto::powerfs::VectorClock {
+        entries: vclock
+            .iter()
+            .map(|(&client_id, &seq)| crate::proto::powerfs::VectorClockEntry { client_id, seq })
+            .collect(),
+    }
+}
+
+fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::DeltaOp {
+    let op = match delta {
+        powerfs_orset::DeltaOp::Add { entry, .. } => {
+            let file_type_val = match entry.file_type {
+                powerfs_orset::FileType::RegularFile => 0,
+                powerfs_orset::FileType::Directory => 1,
+                powerfs_orset::FileType::Symlink => 2,
+            };
+            Some(crate::proto::powerfs::delta_op::Op::Add(
+                crate::proto::powerfs::DirEntryOrset {
+                    id: Some(crate::proto::powerfs::EntryId {
+                        name: entry.id.name.clone(),
+                        client_id: entry.id.client_id,
+                        seq: entry.id.seq,
+                    }),
+                    inode: entry.inode,
+                    parent_ino: entry.parent_ino,
+                    mode: entry.mode,
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    atime: entry.atime,
+                    ctime: entry.ctime,
+                    nlink: if entry.file_type.is_dir() { 2 } else { 1 },
+                    symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+                    file_type: file_type_val,
+                },
+            ))
+        }
+        powerfs_orset::DeltaOp::Remove { id, .. } => Some(
+            crate::proto::powerfs::delta_op::Op::Remove(crate::proto::powerfs::EntryId {
+                name: id.name.clone(),
+                client_id: id.client_id,
+                seq: id.seq,
+            }),
+        ),
+        powerfs_orset::DeltaOp::Rename { old_id, new_entry, .. } => {
+            let file_type_val = match new_entry.file_type {
+                powerfs_orset::FileType::RegularFile => 0,
+                powerfs_orset::FileType::Directory => 1,
+                powerfs_orset::FileType::Symlink => 2,
+            };
+            Some(crate::proto::powerfs::delta_op::Op::Rename(
+                crate::proto::powerfs::RenameOp {
+                    old_id: Some(crate::proto::powerfs::EntryId {
+                        name: old_id.name.clone(),
+                        client_id: old_id.client_id,
+                        seq: old_id.seq,
+                    }),
+                    new_entry: Some(crate::proto::powerfs::DirEntryOrset {
+                        id: Some(crate::proto::powerfs::EntryId {
+                            name: new_entry.id.name.clone(),
+                            client_id: new_entry.id.client_id,
+                            seq: new_entry.id.seq,
+                        }),
+                        inode: new_entry.inode,
+                        parent_ino: new_entry.parent_ino,
+                        mode: new_entry.mode,
+                        size: new_entry.size,
+                        mtime: new_entry.mtime,
+                        atime: new_entry.atime,
+                        ctime: new_entry.ctime,
+                        nlink: if new_entry.file_type.is_dir() { 2 } else { 1 },
+                        symlink_target: new_entry.symlink_target.clone().unwrap_or_default(),
+                        file_type: file_type_val,
+                    }),
+                },
+            ))
+        }
+        powerfs_orset::DeltaOp::SetAttr { inode, mode, size, mtime, .. } => Some(
+            crate::proto::powerfs::delta_op::Op::SetAttr(crate::proto::powerfs::SetAttrOp {
+                inode: *inode,
+                size: size.unwrap_or(0),
+                mtime: mtime.unwrap_or(0),
+                mode: mode.unwrap_or(0),
+            }),
+        ),
+    };
+    crate::proto::powerfs::DeltaOp {
+        op,
+        vclock: Some(vclock_to_proto(delta.vclock())),
     }
 }
