@@ -4,6 +4,7 @@ target/
 Cargo.lock
 beegfs/
 articles/
+design/
 seaweedfs/
 Mooncake/
 rustfs/

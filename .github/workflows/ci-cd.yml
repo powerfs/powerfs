@@ -1,0 +1,238 @@
+
+name: PowerFS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # 代码质量检查
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Format Check
+      run: cargo fmt --check --all
+    
+    - name: Clippy
+      run: cargo clippy --all -- -D warnings
+
+  # 编译检查
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Build All
+      run: cargo build --all --release
+
+  # 单元测试
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Unit Tests
+      run: cargo test --all -- --test-threads=2
+    
+    - name: Benchmark Tests
+      run: cargo test --package powerfs-core --test benchmark -- --test-threads=1
+
+  # 基准测试
+  benchmark:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Build Benchmark
+      run: cargo build --package powerfs-core --release --bench benchmark
+    
+    - name: Run Benchmark
+      run: |
+        mkdir -p benchmark-results
+        ./target/release/deps/powerfs_core-* --bench --save-baseline baseline
+      env:
+        BENCHMARK_RESULTS_DIR: ./benchmark-results
+    
+    - name: Upload Benchmark Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: ./benchmark-results
+
+  # 代码覆盖率
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install grcov
+      run: cargo install grcov
+    
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Run Tests with Coverage
+      run: |
+        cargo clean
+        RUSTFLAGS="-Z instrument-coverage" cargo build --all
+        RUSTFLAGS="-Z instrument-coverage" cargo test --all
+      env:
+        LLVM_PROFILE_FILE: "powerfs-%p-%m.profraw"
+    
+    - name: Generate Coverage Report
+      run: grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
+    
+    - name: Upload Coverage Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: ./coverage
+
+  # Docker 镜像构建
+  docker:
+    runs-on: ubuntu-latest
+    needs: [quality, build, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    
+    - name: Build and Push Master Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/powerfs-master.Dockerfile
+        push: true
+        tags: powerfs/master:latest, powerfs/master:${{ github.sha }}
+    
+    - name: Build and Push Volume Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/powerfs-volume.Dockerfile
+        push: true
+        tags: powerfs/volume:latest, powerfs/volume:${{ github.sha }}
+    
+    - name: Build and Push FUSE Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/powerfs-fuse.Dockerfile
+        push: true
+        tags: powerfs/fuse:latest, powerfs/fuse:${{ github.sha }}
+    
+    - name: Build and Push Monitor Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/powerfs-monitor.Dockerfile
+        push: true
+        tags: powerfs/monitor:latest, powerfs/monitor:${{ github.sha }}
+
+  # 部署到测试环境
+  deploy-test:
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to Test Cluster
+      run: |
+        echo "Deploying to test environment..."
+        # 替换为实际的部署命令
+        # kubectl apply -f k8s/test/
+
+  # 发布版本
+  release:
+    runs-on: ubuntu-latest
+    needs: [quality, build, test, docker, deploy-test]
+    if: contains(github.event.head_commit.message, 'release')
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          **Changes in this release:**
+          
+          - See commit history for details
+        draft: false
+        prerelease: false
+
+  # 前端构建
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install Dependencies
+      run: npm ci
+      working-directory: ./powerfs-monitor-frontend
+    
+    - name: Build Frontend
+      run: npm run build
+      working-directory: ./powerfs-monitor-frontend
+    
+    - name: Upload Frontend Build
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-build
+        path: ./powerfs-monitor-frontend/build
