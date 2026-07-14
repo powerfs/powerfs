@@ -130,7 +130,10 @@ async fn test_merge_policy_setting() {
     println!("Auto-resolved: {} conflicts", resolved);
 
     let remaining = mgr.get_conflicts(100, true);
-    println!("Remaining unresolved after resolve: {} conflicts", remaining.len());
+    println!(
+        "Remaining unresolved after resolve: {} conflicts",
+        remaining.len()
+    );
 
     assert_eq!(remaining.len(), 0, "All conflicts should be resolved");
 }

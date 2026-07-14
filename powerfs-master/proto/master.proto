@@ -101,6 +101,7 @@ message VolumeShortInfo {
     uint32 replica_placement = 5;
     uint32 ttl = 6;
     string disk_type = 7;
+    uint64 used = 8;
 }
 
 message Location {

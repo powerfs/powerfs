@@ -832,7 +832,11 @@ impl DirORSet {
         stats
     }
 
-    pub fn get_conflict_stats_full_by_dir(&self, dir_ino: u64, recursive: bool) -> ConflictStatsFull {
+    pub fn get_conflict_stats_full_by_dir(
+        &self,
+        dir_ino: u64,
+        recursive: bool,
+    ) -> ConflictStatsFull {
         let mut stats = ConflictStatsFull {
             total_count: 0,
             resolved_count: 0,
@@ -913,7 +917,12 @@ impl DirORSet {
         })
     }
 
-    pub fn batch_resolve_by_dir(&mut self, dir_ino: u64, recursive: bool, conflict_type: i32) -> u64 {
+    pub fn batch_resolve_by_dir(
+        &mut self,
+        dir_ino: u64,
+        recursive: bool,
+        conflict_type: i32,
+    ) -> u64 {
         let mut resolved_count = 0;
 
         let entries_snapshot: Vec<_> = self.entries.values().cloned().collect();
@@ -997,7 +1006,7 @@ impl DirORSet {
             return false;
         }
         let entry = entries.iter().find(|e| e.inode == inode);
-        entry.map_or(false, |e| {
+        entry.is_some_and(|e| {
             let parent_ino = e.parent_ino;
             parent_ino == dir_ino || Self::is_in_dir_snapshot(parent_ino, dir_ino, true, entries)
         })

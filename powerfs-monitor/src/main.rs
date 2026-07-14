@@ -20,11 +20,16 @@ use tower_http::cors::CorsLayer;
 
 use powerfs_kv_client::KvCacheClient;
 use powerfs_master::proto::powerfs::master_service_client::MasterServiceClient;
+use powerfs_master::proto::powerfs::{
+    AutoResolveConflictsRequest, BatchIgnoreConflictsRequest, BatchResolveConflictsRequest,
+    GetConflictStatsRequest, GetConflictsRequest, ResolveConflictRequest,
+};
 use powerfs_monitor::alert_engine::AlertEngine;
 use powerfs_monitor::auth::{
     auth_middleware, generate_access_key, generate_secret_key, hash_secret_key, AuthState,
-    CurrentUser, JwtValidator, RateLimiter, ResourceOwner, ResourceOwnerStore, ResourceType, Role,
-    RoleStore, S3AccessKey, S3AccessKeyInfo, S3AccessKeyStore, UserRole, UserStatus, UserStore,
+    CurrentUser, JwtValidator, KVAccessKey, KVAccessKeyInfo, KVAccessKeyStore, RateLimiter,
+    ResourceOwner, ResourceOwnerStore, ResourceType, Role, RoleStore, S3AccessKey, S3AccessKeyInfo,
+    S3AccessKeyStore, UserRole, UserStatus, UserStore,
 };
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
@@ -196,6 +201,128 @@ struct CreateFuseMountRequest {
 #[derive(Debug, Deserialize)]
 struct CreateBucketRequest {
     name: String,
+}
+
+// ===== Conflict management types =====
+
+#[derive(Debug, Deserialize)]
+struct ListConflictsQuery {
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    unresolved_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConflictStatsQuery {
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    recursive: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveConflictBody {
+    conflict_id: String,
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    /// 0=KeepFirst, 1=KeepLast, 2=KeepAll, 3=Merge
+    resolution: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoResolveBody {
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    /// 0=LwwTime, 1=ContentHash, 2=WeightBased, 3=KeepAll,
+    /// 4=WritePriority, 5=DeletePriority, 6=Aggressive, 7=Conservative, 8=Manual
+    policy: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchResolveBody {
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    recursive: Option<bool>,
+    /// -1 = all types
+    conflict_type: Option<i32>,
+    /// 0=LwwTime, 1=ContentHash, 2=WeightBased, 3=KeepAll,
+    /// 4=WritePriority, 5=DeletePriority, 6=Aggressive, 7=Conservative, 8=Manual
+    policy: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchIgnoreBody {
+    dir_path: Option<String>,
+    dir_ino: Option<u64>,
+    /// -1 = all types
+    conflict_type: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictBranchInfo {
+    name: String,
+    client_id: u64,
+    seq: u64,
+    inode: u64,
+    parent_ino: u64,
+    mode: u32,
+    size: u64,
+    mtime: u64,
+    atime: u64,
+    ctime: u64,
+    file_type: u32,
+    symlink_target: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictRecordInfo {
+    id: String,
+    conflict_type: i32,
+    dir_ino: u64,
+    dir_path: String,
+    base_name: String,
+    branches: Vec<ConflictBranchInfo>,
+    create_time: u64,
+    resolved: bool,
+    resolved_time: u64,
+    resolution: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictStatsInfo {
+    total_count: u64,
+    resolved_count: u64,
+    unresolved_count: u64,
+    create_create_count: u64,
+    create_create_resolved: u64,
+    write_write_count: u64,
+    write_write_resolved: u64,
+    write_unlink_count: u64,
+    write_unlink_resolved: u64,
+    delete_create_count: u64,
+    delete_create_resolved: u64,
+    rename_conflict_count: u64,
+    rename_conflict_resolved: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoResolveResult {
+    success: bool,
+    error: String,
+    resolved_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchResolveResult {
+    success: bool,
+    error: String,
+    resolved_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchIgnoreResult {
+    success: bool,
+    error: String,
+    ignored_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -890,26 +1017,22 @@ async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse
         }
     }
 
+    // 判断挂载状态：依赖 master 心跳时间戳，而非 PID 检查。
+    // 原因：FUSE 客户端通常运行在独立容器中，其 PID 在 monitor 容器命名空间内不存在，
+    // 使用 `kill -0 <pid>` 会误判为已卸载。心跳在 60 秒内视为 "mounted"，否则 "unmounted"。
+    let now = chrono::Utc::now().timestamp() as u64;
     for mount in result.iter_mut() {
-        if let Some(pid) = mount.pid {
-            match tokio::process::Command::new("kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    if let Ok(status) = child.wait().await {
-                        if !status.success() {
-                            mount.status = "unmounted".to_string();
-                        }
-                    } else {
-                        mount.status = "unmounted".to_string();
-                    }
-                }
-                Err(_) => {
-                    mount.status = "unmounted".to_string();
-                }
-            }
+        if let Some(last_hb) = mount
+            .last_heartbeat
+            .as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp() as u64)
+        {
+            mount.status = if now.saturating_sub(last_hb) <= 60 {
+                "mounted".to_string()
+            } else {
+                "unmounted".to_string()
+            };
         }
     }
 
@@ -1010,6 +1133,294 @@ async fn delete_fuse_mount(
         Json(ApiResponse::success(()))
     } else {
         Json(ApiResponse::error("Mount not found"))
+    }
+}
+
+// ===== Conflict management handlers =====
+
+async fn list_conflicts(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListConflictsQuery>,
+) -> Json<ApiResponse<Vec<ConflictRecordInfo>>> {
+    let request = GetConflictsRequest {
+        dir_path: params.dir_path.unwrap_or_default(),
+        dir_ino: params.dir_ino.unwrap_or(0),
+        unresolved_only: params.unresolved_only.unwrap_or(false),
+        limit: 1000,
+    };
+
+    match state
+        .master_client
+        .lock()
+        .await
+        .get_conflicts(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if !resp.success {
+                return Json(ApiResponse::error(&resp.error));
+            }
+            let mut result = Vec::with_capacity(resp.conflicts.len());
+            for c in resp.conflicts {
+                let branches = c
+                    .branches
+                    .into_iter()
+                    .map(|b| {
+                        let (name, client_id, seq) = match b.id {
+                            Some(i) => (i.name, i.client_id, i.seq),
+                            None => (String::new(), 0, 0),
+                        };
+                        ConflictBranchInfo {
+                            name,
+                            client_id,
+                            seq,
+                            inode: b.inode,
+                            parent_ino: b.parent_ino,
+                            mode: b.mode,
+                            size: b.size,
+                            mtime: b.mtime,
+                            atime: b.atime,
+                            ctime: b.ctime,
+                            file_type: b.file_type,
+                            symlink_target: b.symlink_target,
+                        }
+                    })
+                    .collect();
+                result.push(ConflictRecordInfo {
+                    id: c.id,
+                    conflict_type: c.conflict_type,
+                    dir_ino: c.dir_ino,
+                    dir_path: c.dir_path,
+                    base_name: c.base_name,
+                    branches,
+                    create_time: c.create_time,
+                    resolved: c.resolved,
+                    resolved_time: c.resolved_time,
+                    resolution: c.resolution,
+                });
+            }
+            Json(ApiResponse::success(result))
+        }
+        Err(e) => {
+            warn!("Failed to list conflicts: {}", e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
+}
+
+async fn resolve_conflict_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ResolveConflictBody>,
+) -> Json<ApiResponse<()>> {
+    if !(0..=3).contains(&body.resolution) {
+        return Json(ApiResponse::error("Invalid resolution (0-3)"));
+    }
+    let request = ResolveConflictRequest {
+        conflict_id: body.conflict_id,
+        dir_path: body.dir_path.unwrap_or_default(),
+        dir_ino: body.dir_ino.unwrap_or(0),
+        resolution: body.resolution,
+    };
+    match state
+        .master_client
+        .lock()
+        .await
+        .resolve_conflict(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if resp.success {
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error(&resp.error))
+            }
+        }
+        Err(e) => {
+            warn!("Failed to resolve conflict: {}", e);
+            Json(ApiResponse::error(&format!("gRPC error: {}", e)))
+        }
+    }
+}
+
+async fn auto_resolve_conflicts_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AutoResolveBody>,
+) -> Json<ApiResponse<AutoResolveResult>> {
+    if !(0..=8).contains(&body.policy) {
+        return Json(ApiResponse::success(AutoResolveResult {
+            success: false,
+            error: "Invalid policy (0-8)".to_string(),
+            resolved_count: 0,
+        }));
+    }
+    let request = AutoResolveConflictsRequest {
+        dir_path: body.dir_path.unwrap_or_default(),
+        dir_ino: body.dir_ino.unwrap_or(0),
+        policy: body.policy,
+    };
+    match state
+        .master_client
+        .lock()
+        .await
+        .auto_resolve_conflicts(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            Json(ApiResponse::success(AutoResolveResult {
+                success: resp.success,
+                error: resp.error,
+                resolved_count: resp.resolved_count,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to auto-resolve conflicts: {}", e);
+            Json(ApiResponse::success(AutoResolveResult {
+                success: false,
+                error: format!("gRPC error: {}", e),
+                resolved_count: 0,
+            }))
+        }
+    }
+}
+
+async fn get_conflict_stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ConflictStatsQuery>,
+) -> Json<ApiResponse<ConflictStatsInfo>> {
+    let request = GetConflictStatsRequest {
+        dir_path: params.dir_path.unwrap_or_default(),
+        dir_ino: params.dir_ino.unwrap_or(0),
+        recursive: params.recursive.unwrap_or(true),
+    };
+    match state
+        .master_client
+        .lock()
+        .await
+        .get_conflict_stats(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if !resp.success {
+                return Json(ApiResponse::error(&resp.error));
+            }
+            let stats = ConflictStatsInfo {
+                total_count: resp.total_count,
+                resolved_count: resp.resolved_count,
+                unresolved_count: resp.unresolved_count,
+                create_create_count: resp.create_create_count,
+                create_create_resolved: resp.create_create_resolved,
+                write_write_count: resp.write_write_count,
+                write_write_resolved: resp.write_write_resolved,
+                write_unlink_count: resp.write_unlink_count,
+                write_unlink_resolved: resp.write_unlink_resolved,
+                delete_create_count: resp.delete_create_count,
+                delete_create_resolved: resp.delete_create_resolved,
+                rename_conflict_count: resp.rename_conflict_count,
+                rename_conflict_resolved: resp.rename_conflict_resolved,
+            };
+            Json(ApiResponse::success(stats))
+        }
+        Err(e) => {
+            warn!("Failed to get conflict stats: {}", e);
+            Json(ApiResponse::success(ConflictStatsInfo {
+                total_count: 0,
+                resolved_count: 0,
+                unresolved_count: 0,
+                create_create_count: 0,
+                create_create_resolved: 0,
+                write_write_count: 0,
+                write_write_resolved: 0,
+                write_unlink_count: 0,
+                write_unlink_resolved: 0,
+                delete_create_count: 0,
+                delete_create_resolved: 0,
+                rename_conflict_count: 0,
+                rename_conflict_resolved: 0,
+            }))
+        }
+    }
+}
+
+async fn batch_resolve_conflicts_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchResolveBody>,
+) -> Json<ApiResponse<BatchResolveResult>> {
+    if !(0..=8).contains(&body.policy) {
+        return Json(ApiResponse::success(BatchResolveResult {
+            success: false,
+            error: "Invalid policy (0-8)".to_string(),
+            resolved_count: 0,
+        }));
+    }
+    let request = BatchResolveConflictsRequest {
+        dir_path: body.dir_path.unwrap_or_default(),
+        dir_ino: body.dir_ino.unwrap_or(0),
+        recursive: body.recursive.unwrap_or(true),
+        conflict_type: body.conflict_type.unwrap_or(-1),
+        policy: body.policy,
+    };
+    match state
+        .master_client
+        .lock()
+        .await
+        .batch_resolve_conflicts(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            Json(ApiResponse::success(BatchResolveResult {
+                success: resp.success,
+                error: resp.error,
+                resolved_count: resp.resolved_count,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to batch-resolve conflicts: {}", e);
+            Json(ApiResponse::success(BatchResolveResult {
+                success: false,
+                error: format!("gRPC error: {}", e),
+                resolved_count: 0,
+            }))
+        }
+    }
+}
+
+async fn batch_ignore_conflicts_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchIgnoreBody>,
+) -> Json<ApiResponse<BatchIgnoreResult>> {
+    let request = BatchIgnoreConflictsRequest {
+        dir_path: body.dir_path.unwrap_or_default(),
+        dir_ino: body.dir_ino.unwrap_or(0),
+        conflict_type: body.conflict_type.unwrap_or(-1),
+    };
+    match state
+        .master_client
+        .lock()
+        .await
+        .batch_ignore_conflicts(tonic::Request::new(request))
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            Json(ApiResponse::success(BatchIgnoreResult {
+                success: resp.success,
+                error: resp.error,
+                ignored_count: resp.ignored_count,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to batch-ignore conflicts: {}", e);
+            Json(ApiResponse::success(BatchIgnoreResult {
+                success: false,
+                error: format!("gRPC error: {}", e),
+                ignored_count: 0,
+            }))
+        }
     }
 }
 
@@ -1781,58 +2192,96 @@ async fn delete_kv_key(
     }
 }
 
+/// 创建 API Key 时返回的完整信息（包含 secret_key，仅此一次展示）
 #[derive(Debug, Serialize)]
-struct KVAccessKeyInfo {
+struct CreatedApiKeyInfo {
     id: String,
     user_id: String,
     access_key: String,
+    /// 完整的 API Key：`pak_<access_key>_<secret_key>`，仅创建时返回
+    api_key: String,
     status: String,
     created_at: String,
-    last_used_at: Option<String>,
 }
 
+/// 列出当前用户的所有 API Key
 async fn list_kv_access_keys(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(user): Extension<CurrentUser>,
 ) -> impl IntoResponse {
-    let _ = user;
-    let keys = vec![KVAccessKeyInfo {
-        id: "key-1".to_string(),
-        user_id: "user-1".to_string(),
-        access_key: "mock-kv-access-key".to_string(),
-        status: "active".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        last_used_at: None,
-    }];
-    Json(ApiResponse::success(keys))
+    match state.auth.api_key_store.list_user_keys(&user.id) {
+        Ok(keys) => {
+            let infos: Vec<KVAccessKeyInfo> = keys.iter().map(|k| k.into()).collect();
+            Json(ApiResponse::success(infos))
+        }
+        Err(e) => {
+            warn!("Failed to list API keys: {}", e);
+            Json(ApiResponse::error(&format!("Failed to list keys: {}", e)))
+        }
+    }
 }
 
+/// 创建新的 API Key
+///
+/// 生成格式为 `pak_<access_key>_<secret_key>` 的长效 API Key，
+/// 适合 Python SDK / Agent 长期访问 Monitor API。
 async fn create_kv_access_key(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<CurrentUser>,
 ) -> impl IntoResponse {
-    let _ = user;
-    let _ = state;
-    let key_id = uuid::Uuid::new_v4().to_string();
-    let access_key = format!("kv_{}", key_id.split('-').next().unwrap_or(""));
-    let secret_key = uuid::Uuid::new_v4().to_string().replace('-', "");
-    Json(ApiResponse::success(serde_json::json!({
-        "id": key_id,
-        "access_key": access_key,
-        "secret_key": secret_key,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    })))
+    let access_key = generate_access_key();
+    let secret_key = generate_secret_key();
+    let secret_hash = hash_secret_key(&secret_key, &state.auth.hmac_secret);
+
+    let key = KVAccessKey::new(&user.id, &access_key, &secret_hash);
+    let key_id = key.id.clone();
+    let created_at = key.created_at.to_rfc3339();
+
+    match state.auth.api_key_store.create_key(&key) {
+        Ok(_) => {
+            // 返回完整 API Key：pak_<access_key>_<secret_key>
+            let api_key = format!("pak_{}_{}", access_key, secret_key);
+            Json(ApiResponse::success(CreatedApiKeyInfo {
+                id: key_id,
+                user_id: user.id.clone(),
+                access_key,
+                api_key,
+                status: "active".to_string(),
+                created_at,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to create API key: {}", e);
+            Json(ApiResponse::error(&format!("Failed to create key: {}", e)))
+        }
+    }
 }
 
+/// 删除（吊销）API Key
 async fn delete_kv_access_key(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let _ = user;
-    let _ = state;
-    let _ = id;
-    Json(ApiResponse::success(()))
+    // 验证 key 属于当前用户
+    match state.auth.api_key_store.get_key_by_id(&id) {
+        Ok(Some(key)) if key.user_id == user.id => match state.auth.api_key_store.delete_key(&id) {
+            Ok(true) => Json(ApiResponse::success(())),
+            Ok(false) => Json(ApiResponse::error("Key not found")),
+            Err(e) => {
+                warn!("Failed to delete API key: {}", e);
+                Json(ApiResponse::error(&format!("Failed to delete key: {}", e)))
+            }
+        },
+        Ok(Some(_)) => Json(ApiResponse::error(
+            "Permission denied: key belongs to another user",
+        )),
+        Ok(None) => Json(ApiResponse::error("Key not found")),
+        Err(e) => {
+            warn!("Failed to lookup API key: {}", e);
+            Json(ApiResponse::error(&format!("Failed to lookup key: {}", e)))
+        }
+    }
 }
 
 #[tokio::main]
@@ -1887,11 +2336,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let roles = Arc::new(RoleStore::from_user_store(&user_store));
     roles.ensure_default_roles()?;
     let s3_keys = Arc::new(S3AccessKeyStore::from_user_store(&user_store));
+    let api_key_store = Arc::new(KVAccessKeyStore::from_user_store(&user_store));
     let jwt_validator = JwtValidator::new(&args.jwt_secret);
 
     let auth_state = Arc::new(AuthState {
         validator: jwt_validator,
         user_store: user_store.clone(),
+        api_key_store: api_key_store.clone(),
+        hmac_secret: args.hmac_secret.clone(),
     });
 
     let metric_store = Arc::new(MetricStore::new());
@@ -2012,6 +2464,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/mounts", get(get_fuse_mounts))
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
+        .route("/api/conflicts", get(list_conflicts))
+        .route("/api/conflicts/resolve", post(resolve_conflict_handler))
+        .route(
+            "/api/conflicts/auto-resolve",
+            post(auto_resolve_conflicts_handler),
+        )
+        .route("/api/conflicts/stats", get(get_conflict_stats_handler))
+        .route(
+            "/api/conflicts/batch-resolve",
+            post(batch_resolve_conflicts_handler),
+        )
+        .route(
+            "/api/conflicts/batch-ignore",
+            post(batch_ignore_conflicts_handler),
+        )
         .route("/api/alerts", get(get_alerts))
         .route("/api/alerts/:id", get(get_alert))
         .route("/api/alerts/:id/acknowledge", post(acknowledge_alert))

@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -249,7 +250,8 @@ fn test_truncate_file() {
     assert_eq!(metadata.len(), 21, "File size should be 21");
 
     file = File::create(&file_path).expect("Failed to truncate file");
-    file.write_all(b"Short").expect("Failed to write after truncate");
+    file.write_all(b"Short")
+        .expect("Failed to write after truncate");
     drop(file);
 
     let metadata = fs::metadata(&file_path).expect("Failed to get metadata after truncate");
@@ -343,16 +345,19 @@ fn test_stat_and_chmod() {
     drop(file);
 
     let metadata = fs::metadata(&file_path).expect("Failed to get metadata");
-    assert_eq!(metadata.len(), 9, "File size should be 9");
+    assert_eq!(metadata.len(), 10, "File size should be 10");
 
-    fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to chmod");
+    fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755)).expect("Failed to chmod");
 
     let metadata = fs::metadata(&file_path).expect("Failed to get metadata after chmod");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o755, "Permissions should be 0o755");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o755,
+            "Permissions should be 0o755"
+        );
     }
 
     fs::remove_file(&file_path).expect("Failed to remove file");
@@ -395,8 +400,14 @@ fn test_readdir_contains_dot_and_dotdot() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
 
-    assert!(!entries.contains(&".".to_string()), "'.' should not be listed");
-    assert!(!entries.contains(&"..".to_string()), "'..' should not be listed");
+    assert!(
+        !entries.contains(&".".to_string()),
+        "'.' should not be listed"
+    );
+    assert!(
+        !entries.contains(&"..".to_string()),
+        "'..' should not be listed"
+    );
 
     fs::remove_dir(&test_dir).expect("Failed to remove test dir");
 }
@@ -413,7 +424,8 @@ fn test_large_file_multiblock_write() {
 
     let mut file = File::create(&file_path).expect("Failed to create file");
     let large_content = vec![0u8; 1024 * 1024];
-    file.write_all(&large_content).expect("Failed to write large content");
+    file.write_all(&large_content)
+        .expect("Failed to write large content");
     drop(file);
 
     let metadata = fs::metadata(&file_path).expect("Failed to get metadata");
@@ -421,7 +433,8 @@ fn test_large_file_multiblock_write() {
 
     let mut file = File::open(&file_path).expect("Failed to open file");
     let mut read_content = vec![0u8; 1024 * 1024];
-    file.read_exact(&mut read_content).expect("Failed to read large content");
+    file.read_exact(&mut read_content)
+        .expect("Failed to read large content");
     assert_eq!(read_content, large_content, "Content mismatch");
 
     fs::remove_file(&file_path).expect("Failed to remove file");

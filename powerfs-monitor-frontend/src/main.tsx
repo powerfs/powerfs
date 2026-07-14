@@ -4,9 +4,6 @@ import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import App from './App'
 import './index.css'
-import { setUseMock } from './services/api'
-
-setUseMock(true)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <BrowserRouter>

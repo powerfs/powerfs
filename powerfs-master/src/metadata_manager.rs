@@ -46,9 +46,12 @@ pub enum MetadataEvent {
 }
 
 pub struct MetadataManager {
+    #[allow(dead_code)]
     db: Arc<DB>,
     orsets: Arc<RwLock<HashMap<u64, DirORSet>>>,
+    #[allow(dead_code)]
     policies: Arc<RwLock<HashMap<u64, MergePolicy>>>,
+    #[allow(dead_code)]
     client_counters: Arc<RwLock<HashMap<u64, u64>>>,
     event_tx: mpsc::Sender<MetadataEvent>,
 }

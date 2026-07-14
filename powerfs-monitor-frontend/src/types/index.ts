@@ -176,6 +176,83 @@ export interface FuseMount {
   last_heartbeat?: string
 }
 
+export type ConflictType = 'CreateCreate' | 'WriteWrite' | 'WriteUnlink' | 'DeleteCreate' | 'RenameConflict'
+
+export type ConflictResolution = 'KeepFirst' | 'KeepLast' | 'KeepAll' | 'Merge'
+
+export type MergePolicy =
+  | 'LwwTime'
+  | 'ContentHash'
+  | 'WeightBased'
+  | 'KeepAll'
+  | 'WritePriority'
+  | 'DeletePriority'
+  | 'Aggressive'
+  | 'Conservative'
+  | 'Manual'
+
+export interface ConflictBranch {
+  name: string
+  client_id: number
+  seq: number
+  inode: number
+  parent_ino: number
+  mode: number
+  size: number
+  mtime: number
+  atime: number
+  ctime: number
+  file_type: number
+  symlink_target: string
+}
+
+export interface ConflictRecord {
+  id: string
+  conflict_type: number
+  dir_ino: number
+  dir_path: string
+  base_name: string
+  branches: ConflictBranch[]
+  create_time: number
+  resolved: boolean
+  resolved_time: number
+  resolution: number
+}
+
+export interface ConflictStats {
+  total_count: number
+  resolved_count: number
+  unresolved_count: number
+  create_create_count: number
+  create_create_resolved: number
+  write_write_count: number
+  write_write_resolved: number
+  write_unlink_count: number
+  write_unlink_resolved: number
+  delete_create_count: number
+  delete_create_resolved: number
+  rename_conflict_count: number
+  rename_conflict_resolved: number
+}
+
+export interface AutoResolveResult {
+  success: boolean
+  error: string
+  resolved_count: number
+}
+
+export interface BatchResolveResult {
+  success: boolean
+  error: string
+  resolved_count: number
+}
+
+export interface BatchIgnoreResult {
+  success: boolean
+  error: string
+  ignored_count: number
+}
+
 export interface S3AccessKey {
   access_key: string
   secret_key: string

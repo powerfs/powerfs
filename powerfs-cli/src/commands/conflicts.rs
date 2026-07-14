@@ -539,11 +539,26 @@ async fn conflicts_stats(
     println!("  Resolved: {}", result.resolved_count);
     println!("  Unresolved: {}", result.unresolved_count);
     println!("\nBy type:");
-    println!("  CreateCreate: {} ({} resolved)", result.create_create_count, result.create_create_resolved);
-    println!("  WriteWrite: {} ({} resolved)", result.write_write_count, result.write_write_resolved);
-    println!("  WriteUnlink: {} ({} resolved)", result.write_unlink_count, result.write_unlink_resolved);
-    println!("  DeleteCreate: {} ({} resolved)", result.delete_create_count, result.delete_create_resolved);
-    println!("  RenameConflict: {} ({} resolved)", result.rename_conflict_count, result.rename_conflict_resolved);
+    println!(
+        "  CreateCreate: {} ({} resolved)",
+        result.create_create_count, result.create_create_resolved
+    );
+    println!(
+        "  WriteWrite: {} ({} resolved)",
+        result.write_write_count, result.write_write_resolved
+    );
+    println!(
+        "  WriteUnlink: {} ({} resolved)",
+        result.write_unlink_count, result.write_unlink_resolved
+    );
+    println!(
+        "  DeleteCreate: {} ({} resolved)",
+        result.delete_create_count, result.delete_create_resolved
+    );
+    println!(
+        "  RenameConflict: {} ({} resolved)",
+        result.rename_conflict_count, result.rename_conflict_resolved
+    );
 
     Ok(())
 }
@@ -588,10 +603,7 @@ async fn batch_ignore_conflicts(
     let result = response.into_inner();
 
     if result.success {
-        println!(
-            "Ignored {} conflicts successfully",
-            result.ignored_count
-        );
+        println!("Ignored {} conflicts successfully", result.ignored_count);
     } else {
         return Err(powerfs_common::error::PowerFsError::Internal(result.error));
     }

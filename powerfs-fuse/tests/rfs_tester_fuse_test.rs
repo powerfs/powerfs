@@ -25,12 +25,16 @@ fn is_powerfs_mounted() -> bool {
 }
 
 fn skip_if_not_mounted() {
-    if std::env::var("CI").is_ok() && !is_powerfs_mounted() {
-        eprintln!("Skipping test: PowerFS not mounted in CI environment");
+    if !is_powerfs_mounted() {
+        eprintln!(
+            "Skipping test: PowerFS not mounted at '{}'",
+            get_mount_path()
+        );
         std::process::exit(0);
     }
 }
 
+#[allow(dead_code)]
 fn assert_powerfs_mounted() {
     let mount_path = get_mount_path();
     if !is_powerfs_mounted() {

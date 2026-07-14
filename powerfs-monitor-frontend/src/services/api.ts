@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -370,6 +370,89 @@ export async function deleteFuseMount(id: string): Promise<void> {
   await api.delete(`/fuse/mounts/${id}`)
 }
 
+// ===== Conflict management =====
+
+export async function getConflicts(params?: {
+  dir_path?: string
+  dir_ino?: number
+  unresolved_only?: boolean
+}): Promise<ConflictRecord[]> {
+  if (useMock) {
+    return []
+  }
+  const response = await api.get('/conflicts', { params })
+  return response.data.data
+}
+
+export async function getConflictStats(params?: {
+  dir_path?: string
+  dir_ino?: number
+  recursive?: boolean
+}): Promise<ConflictStats> {
+  if (useMock) {
+    return {
+      total_count: 0, resolved_count: 0, unresolved_count: 0,
+      create_create_count: 0, create_create_resolved: 0,
+      write_write_count: 0, write_write_resolved: 0,
+      write_unlink_count: 0, write_unlink_resolved: 0,
+      delete_create_count: 0, delete_create_resolved: 0,
+      rename_conflict_count: 0, rename_conflict_resolved: 0,
+    }
+  }
+  const response = await api.get('/conflicts/stats', { params })
+  return response.data.data
+}
+
+export async function resolveConflict(params: {
+  conflict_id: string
+  dir_path?: string
+  dir_ino?: number
+  resolution: number
+}): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post('/conflicts/resolve', params)
+}
+
+export async function autoResolveConflicts(params: {
+  dir_path?: string
+  dir_ino?: number
+  policy: number
+}): Promise<AutoResolveResult> {
+  if (useMock) {
+    return { success: true, error: '', resolved_count: 0 }
+  }
+  const response = await api.post('/conflicts/auto-resolve', params)
+  return response.data.data
+}
+
+export async function batchResolveConflicts(params: {
+  dir_path?: string
+  dir_ino?: number
+  recursive?: boolean
+  conflict_type?: number
+  policy: number
+}): Promise<BatchResolveResult> {
+  if (useMock) {
+    return { success: true, error: '', resolved_count: 0 }
+  }
+  const response = await api.post('/conflicts/batch-resolve', params)
+  return response.data.data
+}
+
+export async function batchIgnoreConflicts(params: {
+  dir_path?: string
+  dir_ino?: number
+  conflict_type?: number
+}): Promise<BatchIgnoreResult> {
+  if (useMock) {
+    return { success: true, error: '', ignored_count: 0 }
+  }
+  const response = await api.post('/conflicts/batch-ignore', params)
+  return response.data.data
+}
+
 export async function createKVNamespace(name: string): Promise<void> {
   if (useMock) {
     const newNamespace: KVNamespace = {
@@ -410,12 +493,14 @@ export async function deleteKVNamespace(id: string): Promise<void> {
   await api.delete(`/kv/namespaces/${id}`)
 }
 
-export async function createKVKey(): Promise<{ id: string; access_key: string; secret_key: string; created_at: string }> {
+export async function createKVKey(): Promise<{ id: string; user_id: string; access_key: string; api_key: string; status: string; created_at: string }> {
   if (useMock) {
     return {
       id: 'key-1',
+      user_id: 'user-1',
       access_key: 'mock-access-key',
-      secret_key: 'mock-secret-key',
+      api_key: 'pak_mock-access-key_mock-secret-key',
+      status: 'active',
       created_at: new Date().toISOString(),
     }
   }

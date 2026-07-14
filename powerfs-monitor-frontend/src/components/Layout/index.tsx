@@ -18,6 +18,7 @@ import {
   TeamOutlined,
   SafetyCertificateOutlined,
   LockOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -51,6 +52,7 @@ function AppLayout() {
           { key: '/nodes', icon: <SaveOutlined />, label: '节点管理' },
           { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume管理' },
           { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE管理' },
+          { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
         ]
       : []),
     { key: '/kv', icon: <KeyOutlined />, label: 'KV管理' },

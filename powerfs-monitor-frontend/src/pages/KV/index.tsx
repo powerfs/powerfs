@@ -7,12 +7,9 @@ import {
   WarningOutlined,
   ApiOutlined,
   PlusOutlined,
-  CopyOutlined,
-  CheckCircleOutlined,
-  ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
-import type { KVSessionInfo, KVMetrics, KVNamespace, KVAccessKey } from '@/types'
+import type { KVSessionInfo, KVMetrics, KVNamespace } from '@/types'
 import {
   getKVSessions,
   getKVMetrics,
@@ -20,9 +17,6 @@ import {
   createKVNamespace,
   listKVNamespaces,
   deleteKVNamespace,
-  createKVKey,
-  listKVKeys,
-  deleteKVKey,
 } from '@/services/api'
 import { formatBytes, formatPercent, formatNumber } from '@/utils/format'
 import { generateTimeSeriesData } from '@/utils/mockData'
@@ -38,10 +32,6 @@ function KV() {
   const [namespaces, setNamespaces] = useState<KVNamespace[]>([])
   const [showCreateNamespace, setShowCreateNamespace] = useState(false)
   const [namespaceForm] = Form.useForm()
-
-  const [keys, setKeys] = useState<KVAccessKey[]>([])
-  const [showCreateKey, setShowCreateKey] = useState(false)
-  const [newKey, setNewKey] = useState<{ access_key: string; secret_key: string } | null>(null)
 
   useEffect(() => {
     loadKVData()
@@ -65,15 +55,6 @@ function KV() {
   const loadNamespaces = async () => {
     const ns = await listKVNamespaces()
     setNamespaces(ns)
-  }
-
-  useEffect(() => {
-    loadKeys()
-  }, [])
-
-  const loadKeys = async () => {
-    const k = await listKVKeys()
-    setKeys(k)
   }
 
   const handleViewDetail = (session: KVSessionInfo) => {
@@ -115,36 +96,6 @@ function KV() {
       loadNamespaces()
     } catch (error) {
       message.error('删除失败')
-    }
-  }
-
-  const handleCreateKey = async () => {
-    try {
-      const key = await createKVKey()
-      setNewKey({ access_key: key.access_key, secret_key: key.secret_key })
-      setShowCreateKey(true)
-      loadKeys()
-    } catch (error) {
-      message.error('创建失败')
-    }
-  }
-
-  const handleDeleteKey = async (id: string) => {
-    try {
-      await deleteKVKey(id)
-      message.success('API Key 删除成功')
-      loadKeys()
-    } catch (error) {
-      message.error('删除失败')
-    }
-  }
-
-  const copyToClipboard = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      message.success('已复制到剪贴板')
-    } catch (error) {
-      message.error('复制失败')
     }
   }
 
@@ -277,67 +228,6 @@ function KV() {
           danger
           icon={<DeleteOutlined />}
           onClick={() => handleDeleteNamespace(record.id)}
-        >
-          删除
-        </Button>
-      ),
-    },
-  ]
-
-  const keyColumns = [
-    {
-      title: 'ID',
-      dataIndex: 'id',
-      key: 'id',
-      width: 150,
-    },
-    {
-      title: 'Access Key',
-      dataIndex: 'access_key',
-      key: 'access_key',
-      width: 250,
-      render: (key: string) => (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{key}</span>
-          <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyToClipboard(key)} />
-        </div>
-      ),
-    },
-    {
-      title: '状态',
-      dataIndex: 'status',
-      key: 'status',
-      width: 100,
-      render: (status: string) => (
-        <Tag color={status === 'active' ? 'green' : 'red'}>
-          {status === 'active' ? '活跃' : '停用'}
-        </Tag>
-      ),
-    },
-    {
-      title: '创建时间',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 180,
-      render: (time: string) => new Date(time).toLocaleString(),
-    },
-    {
-      title: '最后使用',
-      dataIndex: 'last_used_at',
-      key: 'last_used_at',
-      width: 180,
-      render: (time: string | undefined) => time ? new Date(time).toLocaleString() : '-',
-    },
-    {
-      title: '操作',
-      key: 'action',
-      width: 100,
-      render: (_: unknown, record: KVAccessKey) => (
-        <Button
-          type="text"
-          danger
-          icon={<DeleteOutlined />}
-          onClick={() => handleDeleteKey(record.id)}
         >
           删除
         </Button>
@@ -641,85 +531,6 @@ function KV() {
     </div>
   )
 
-  const APIKeyManagement = () => (
-    <div>
-      <div style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateKey}>
-          创建 API Key
-        </Button>
-      </div>
-
-      <Card
-        title="API Key 列表"
-        style={{ borderRadius: 12 }}
-      >
-        <Table
-          columns={keyColumns}
-          dataSource={keys}
-          rowKey="id"
-          pagination={{ pageSize: 10 }}
-          scroll={{ x: 1000 }}
-        />
-      </Card>
-
-      <Modal
-        title="API Key 创建成功"
-        open={showCreateKey}
-        onCancel={() => { setShowCreateKey(false); setNewKey(null); }}
-        footer={null}
-        width={500}
-      >
-        {newKey && (
-          <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <div style={{ background: '#f6ffed', padding: 12, borderRadius: 12 }}>
-                <CheckCircleOutlined style={{ fontSize: 32, color: '#52c41a' }} />
-              </div>
-              <div>
-                <h3 style={{ margin: 0 }}>API Key 创建成功</h3>
-                <p style={{ color: '#8c8c8c', fontSize: 12, margin: '4px 0' }}>请妥善保存您的 Secret Key，它只会显示一次</p>
-              </div>
-            </div>
-
-            <div>
-              <h4 style={{ margin: '0 0 8px' }}>Access Key</h4>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Input
-                  value={newKey.access_key}
-                  readOnly
-                  style={{ fontFamily: 'monospace' }}
-                />
-                <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(newKey.access_key)} />
-              </div>
-            </div>
-
-            <div>
-              <h4 style={{ margin: '0 0 8px' }}>Secret Key</h4>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Input
-                  value={newKey.secret_key}
-                  readOnly
-                  style={{ fontFamily: 'monospace' }}
-                />
-                <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(newKey.secret_key)} />
-              </div>
-            </div>
-
-            <div style={{ background: '#fff7e6', padding: 12, borderRadius: 8, display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-              <ExclamationCircleOutlined style={{ color: '#fa8c16', fontSize: 16, marginTop: 2 }} />
-              <div>
-                <p style={{ margin: 0, fontSize: 12, color: '#fa8c16' }}>重要提示</p>
-                <p style={{ margin: '4px 0 0', fontSize: 12, color: '#8c8c8c' }}>
-                  Secret Key 只会显示一次，丢失后无法找回。请立即复制保存到安全的地方。
-                </p>
-              </div>
-            </div>
-          </Space>
-        )}
-      </Modal>
-    </div>
-  )
-
   return (
     <div>
       <Tabs
@@ -734,11 +545,6 @@ function KV() {
             key: 'namespaces',
             label: '命名空间管理',
             children: <NamespaceManagement />,
-          },
-          {
-            key: 'keys',
-            label: 'API Key 管理',
-            children: <APIKeyManagement />,
           },
         ]}
       />

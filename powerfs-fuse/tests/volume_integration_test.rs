@@ -8,6 +8,33 @@ fn get_mount_path() -> String {
     env::var("POWERFS_MOUNT").unwrap_or_else(|_| "/mnt/powerfs".to_string())
 }
 
+fn is_powerfs_mounted() -> bool {
+    let mount_path = get_mount_path();
+    if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == mount_path {
+                let fstype = parts[2];
+                if fstype == "fuse" || fstype == "fuse.powerfs-fuse" || fstype.starts_with("fuse.")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn skip_if_not_mounted() {
+    if !is_powerfs_mounted() {
+        eprintln!(
+            "Skipping test: PowerFS not mounted at '{}'",
+            get_mount_path()
+        );
+        std::process::exit(0);
+    }
+}
+
 fn docker_exec(cmd: &str) -> String {
     let output = Command::new("docker")
         .args(["exec", "powerfs-test-volume", "sh", "-c", cmd])
@@ -39,6 +66,7 @@ fn restart_fuse() {
 
 #[test]
 fn test_data_persists_across_fuse_restart() {
+    skip_if_not_mounted();
     let mount_path = get_mount_path();
 
     let test_file = Path::new(&mount_path).join("persistence_test.txt");
@@ -83,6 +111,7 @@ fn test_volume_has_data_files() {
 
 #[test]
 fn test_write_and_read_cycle() {
+    skip_if_not_mounted();
     let mount_path = get_mount_path();
 
     let test_file = Path::new(&mount_path).join("write_read_test.txt");

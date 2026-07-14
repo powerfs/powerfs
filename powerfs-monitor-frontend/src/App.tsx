@@ -9,6 +9,7 @@ import KV from './pages/KV'
 import Alerts from './pages/Alerts'
 import S3 from './pages/S3'
 import Fuse from './pages/Fuse'
+import Conflicts from './pages/Conflicts'
 import Users from './pages/Users'
 import Roles from './pages/Roles'
 import AccessKeys from './pages/AccessKeys'
@@ -56,6 +57,14 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <Fuse />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="conflicts"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Conflicts />
             </ProtectedRoute>
           }
         />

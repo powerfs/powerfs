@@ -146,6 +146,10 @@ impl ClientManager {
     }
 
     fn register_fuse_client(&mut self, info: FuseClientInfo) {
+        info!(
+            "Registering FUSE client: id={}, type={}, mount_point={}, collection={}",
+            info.client_id, info.client_type, info.mount_point, info.collection
+        );
         self.fuse_clients.insert(info.client_id.clone(), info);
     }
 
@@ -155,11 +159,15 @@ impl ClientManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+        } else {
+            warn!("FUSE client not found for heartbeat update: {}", client_id);
         }
     }
 
     fn get_fuse_clients(&self) -> Vec<FuseClientInfo> {
-        self.fuse_clients.values().cloned().collect()
+        let clients: Vec<_> = self.fuse_clients.values().cloned().collect();
+        debug!("Getting FUSE clients: count={}", clients.len());
+        clients
     }
 }
 
@@ -645,9 +653,9 @@ impl MasterNode {
                 VolumeInfo {
                     id: vid,
                     node_id: nid.clone(),
-                    collection: Collection::default(),
+                    collection: Collection(vol.collection.clone()),
                     size: vol.size,
-                    used: 0,
+                    used: vol.used,
                     replica_count: 1,
                     ttl: Ttl::default(),
                     disk_type: DiskType::default(),
@@ -900,6 +908,8 @@ impl MasterNode {
                 volume_id: v.volume_id,
                 size: v.size,
                 read_only: v.read_only,
+                used: v.used,
+                collection: v.collection.clone(),
             })
             .collect();
 
@@ -1270,7 +1280,8 @@ impl MasterNode {
         conflict_id: &str,
         resolution: powerfs_orset::ConflictResolution,
     ) {
-        self.directory_tree.resolve_conflict(dir_ino, conflict_id, resolution)
+        self.directory_tree
+            .resolve_conflict(dir_ino, conflict_id, resolution)
     }
 
     pub fn set_merge_policy(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) {

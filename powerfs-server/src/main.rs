@@ -396,6 +396,7 @@ async fn run_volume(
                 replica_placement: v.replica_count,
                 ttl: v.ttl.0 as u32,
                 disk_type: v.disk_type.0.clone(),
+                used: v.used,
             })
             .collect();
 
@@ -441,6 +442,7 @@ async fn run_volume(
                     replica_placement: v.replica_count,
                     ttl: v.ttl.0 as u32,
                     disk_type: v.disk_type.0.clone(),
+                    used: v.used,
                 })
                 .collect();
 

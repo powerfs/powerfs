@@ -74,6 +74,8 @@ pub struct RaftVolumeShortInfo {
     pub volume_id: u32,
     pub size: u64,
     pub read_only: bool,
+    pub used: u64,
+    pub collection: String,
 }
 
 impl From<&crate::proto::VolumeShortInfo> for RaftVolumeShortInfo {
@@ -82,6 +84,8 @@ impl From<&crate::proto::VolumeShortInfo> for RaftVolumeShortInfo {
             volume_id: v.volume_id,
             size: v.size,
             read_only: v.read_only,
+            used: v.used,
+            collection: v.collection.clone(),
         }
     }
 }

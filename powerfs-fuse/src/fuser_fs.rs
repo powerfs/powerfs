@@ -1186,10 +1186,14 @@ impl Filesystem for PowerFsFuserFs {
 
         let (total_bytes, used_bytes) = {
             let cache_guard = self.statfs_cache.lock().unwrap();
-            if let Some(stats) = &*cache_guard {
-                (stats.total_volume_size, stats.total_used_size)
-            } else {
-                (DEFAULT_TOTAL_BYTES, DEFAULT_USED_BYTES)
+            match &*cache_guard {
+                // master 上报了有效容量
+                Some(stats) if stats.total_volume_size > 0 => {
+                    (stats.total_volume_size, stats.total_used_size)
+                }
+                // 缓存为空，或 master 尚未上报容量（total=0）：
+                // 使用默认值兜底，避免 df 把挂载点过滤掉（df 会隐藏 blocks_total=0 的 fs）
+                _ => (DEFAULT_TOTAL_BYTES, DEFAULT_USED_BYTES),
             }
         };
 
@@ -1360,19 +1364,24 @@ impl FuserApp {
 
         std::thread::spawn(move || {
             runtime_handle_clone.block_on(async move {
-                let _ = grpc_client_clone
-                    .keep_connected(
-                        "fuse",
-                        &mount_point_clone,
-                        &collection_clone,
-                        &replication_clone,
-                        pid,
-                        &host_name,
-                        chunk_cache_clone_for_keep_connected,
-                    )
-                    .await;
-                warn!("keep_connected stream closed, reconnecting in 10 seconds...");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // 持续重连循环：master 重启或网络中断后，keep_connected 流会断开，
+                // 必须重新建立流并重新注册 FuseClientInfo，否则 master 端 fuse_clients
+                // 为空，前端无法看到 FUSE 连接。
+                loop {
+                    let _ = grpc_client_clone
+                        .keep_connected(
+                            "fuse",
+                            &mount_point_clone,
+                            &collection_clone,
+                            &replication_clone,
+                            pid,
+                            &host_name,
+                            chunk_cache_clone_for_keep_connected.clone(),
+                        )
+                        .await;
+                    warn!("keep_connected stream closed, reconnecting in 10 seconds...");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
             });
         });
 

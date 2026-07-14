@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Navigate } from 'react-router-dom'
 import { subscribe, isAuthenticated, getCurrentUser } from '@/services/auth'
-import { setUseMock } from '@/services/api'
 
 interface ProtectedRouteProps {
   children: ReactNode
@@ -20,8 +19,7 @@ export default function ProtectedRoute({ children, requireAdmin = false }: Prote
   }, [])
 
   if (!authed) {
-    setUseMock(true)
-    return <>{children}</>
+    return <Navigate to="/login" replace />
   }
 
   if (requireAdmin && getCurrentUser()?.role !== 'admin') {

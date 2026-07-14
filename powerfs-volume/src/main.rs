@@ -116,11 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     replica_placement: v.replica_count,
                     ttl: v.ttl.0 as u32,
                     disk_type: v.disk_type.0.clone(),
+                    used: v.used,
                 })
                 .collect();
 
-            if let Err(e) = master_client.send_heartbeat(proto_volumes).await {
-                warn!("Initial heartbeat failed: {}", e);
+            if master_client.send_heartbeat(proto_volumes).await.is_err() {
+                warn!("Initial heartbeat failed, reconnecting...");
+                if let Err(e) = master_client.start_heartbeat().await {
+                    warn!("Failed to restart heartbeat: {}", e);
+                }
             }
 
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -168,11 +172,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         replica_placement: v.replica_count,
                         ttl: v.ttl.0 as u32,
                         disk_type: v.disk_type.0.clone(),
+                        used: v.used,
                     })
                     .collect();
 
-                if let Err(e) = master_client.send_heartbeat(proto_volumes).await {
-                    warn!("Failed to send heartbeat: {}", e);
+                if master_client.send_heartbeat(proto_volumes).await.is_err() {
+                    warn!("Failed to send heartbeat, reconnecting...");
+                    // stream 断开后 sender 通道已关闭，必须重建 gRPC stream，
+                    // 否则后续 send_heartbeat 会一直报 "channel closed"
+                    if let Err(e) = master_client.start_heartbeat().await {
+                        warn!("Failed to restart heartbeat: {}", e);
+                    }
                 }
             }
         });

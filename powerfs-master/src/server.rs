@@ -333,6 +333,7 @@ impl MasterService for MasterGrpcServer {
                     replica_placement: volume.replica_count,
                     ttl: volume.ttl.0 as u32,
                     disk_type: volume.disk_type.0.clone(),
+                    used: volume.used,
                 });
             }
 
@@ -364,7 +365,7 @@ impl MasterService for MasterGrpcServer {
         let client_id = match stream.message().await {
             Ok(Some(first_request)) => {
                 let id = if !first_request.client_type.is_empty() {
-                    format!("fuse_{}", first_request.client_type)
+                    format!("fuse_{}_{}", first_request.client_type, Uuid::new_v4())
                 } else {
                     format!("client_{}", Uuid::new_v4())
                 };
@@ -966,7 +967,10 @@ impl MasterService for MasterGrpcServer {
             req.dir_ino
         };
 
-        let stats = self.master.directory_tree.get_conflict_stats(dir_ino, req.recursive);
+        let stats = self
+            .master
+            .directory_tree
+            .get_conflict_stats(dir_ino, req.recursive);
         Ok(Response::new(BatchDetectConflictsResponse {
             success: true,
             error: String::new(),
@@ -1066,7 +1070,10 @@ impl MasterService for MasterGrpcServer {
             req.dir_ino
         };
 
-        let stats = self.master.directory_tree.get_conflict_stats_full(dir_ino, req.recursive);
+        let stats = self
+            .master
+            .directory_tree
+            .get_conflict_stats_full(dir_ino, req.recursive);
         Ok(Response::new(GetConflictStatsResponse {
             success: true,
             error: String::new(),
@@ -1107,7 +1114,10 @@ impl MasterService for MasterGrpcServer {
             req.dir_ino
         };
 
-        let ignored_count = self.master.directory_tree.batch_ignore_conflicts(dir_ino, req.conflict_type);
+        let ignored_count = self
+            .master
+            .directory_tree
+            .batch_ignore_conflicts(dir_ino, req.conflict_type);
         Ok(Response::new(BatchIgnoreConflictsResponse {
             success: true,
             error: String::new(),
