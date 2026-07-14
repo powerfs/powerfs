@@ -1618,12 +1618,16 @@ impl SyncFuseClient {
         SyncFuseClient { client }
     }
 
+    pub fn inner(&self) -> &Arc<PowerFuseClient> {
+        &self.client
+    }
+
     fn block_with_timeout<F, T>(&self, future: F) -> Result<T, String>
     where
         F: std::future::Future<Output = Result<T, String>>,
     {
         thread_local! {
-            static BLOCKING_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Runtime>> = std::cell::RefCell::new(None);
+            static BLOCKING_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Runtime>> = const { std::cell::RefCell::new(None) };
         }
 
         BLOCKING_RUNTIME.with(|rt| {

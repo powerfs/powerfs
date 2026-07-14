@@ -11,7 +11,6 @@
 //! - 读路径：本地缓存优先，miss 时从 Volume Server 拉取
 
 use crate::client::{PowerFuseClient, SyncFuseClient};
-use powerfs_master::proto::powerfs::StatisticsResponse;
 use crate::data_manager::DataManager;
 use crate::error::parse_master_error;
 use crate::metadata_manager::MetadataManager;
@@ -22,12 +21,13 @@ use fuser::{
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
+use powerfs_master::proto::powerfs::StatisticsResponse;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 
 /// FUSE dentry 缓存 TTL（0 = 不缓存，每次 lookup 都重新查询）
@@ -56,7 +56,7 @@ struct PowerFsFuserFs {
     /// 数据完整性验证开关（缺省关闭，调试时打开）
     verify_data: bool,
     /// statfs 缓存（避免每次调用都访问 Master）
-    statfs_cache: Arc<Mutex<Option<(Instant, StatisticsResponse)>>>,
+    statfs_cache: Arc<Mutex<Option<StatisticsResponse>>>,
 }
 
 impl PowerFsFuserFs {
@@ -68,6 +68,7 @@ impl PowerFsFuserFs {
         collection: String,
         replication: String,
         verify_data: bool,
+        statfs_cache_value: Option<StatisticsResponse>,
     ) -> Self {
         Self {
             meta,
@@ -79,7 +80,7 @@ impl PowerFsFuserFs {
             flush_locks: Arc::new(RwLock::new(HashMap::new())),
             has_dirty: Arc::new(AtomicBool::new(false)),
             verify_data,
-            statfs_cache: Arc::new(Mutex::new(None)),
+            statfs_cache: Arc::new(Mutex::new(statfs_cache_value)),
         }
     }
 
@@ -1180,58 +1181,28 @@ impl Filesystem for PowerFsFuserFs {
     fn statfs(&mut self, _req: &Request<'_>, _inode: u64, reply: ReplyStatfs) {
         const BLOCK_SIZE: u32 = 4096;
         let block_size_u64 = BLOCK_SIZE as u64;
-        const CACHE_TTL: Duration = Duration::from_secs(30);
+        const DEFAULT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+        const DEFAULT_USED_BYTES: u64 = 0;
 
-        let now = Instant::now();
-        let cached_stats = {
+        let (total_bytes, used_bytes) = {
             let cache_guard = self.statfs_cache.lock().unwrap();
-            if let Some((cached_time, cached_stats)) = &*cache_guard {
-                if now.duration_since(*cached_time) < CACHE_TTL {
-                    Some(cached_stats.clone())
-                } else {
-                    None
-                }
+            if let Some(stats) = &*cache_guard {
+                (stats.total_volume_size, stats.total_used_size)
             } else {
-                None
+                (DEFAULT_TOTAL_BYTES, DEFAULT_USED_BYTES)
             }
         };
 
-        let stats = if let Some(s) = cached_stats {
-            s
-        } else {
-            match self.client.get_statistics(&self.collection) {
-                Ok(s) => {
-                    let mut cache_guard = self.statfs_cache.lock().unwrap();
-                    *cache_guard = Some((now, s.clone()));
-                    s
-                }
-                Err(e) => {
-                    warn!("statfs: failed to get statistics: {}", e);
-                    reply.statfs(
-                        1_000_000_000,
-                        500_000_000,
-                        500_000_000,
-                        1_000_000,
-                        900_000,
-                        BLOCK_SIZE,
-                        1_000_000,
-                        BLOCK_SIZE,
-                    );
-                    return;
-                }
-            }
-        };
-
-        let total_blocks = stats.total_volume_size / block_size_u64;
-        let used_blocks = stats.total_used_size / block_size_u64;
+        let total_blocks = total_bytes / block_size_u64;
+        let used_blocks = used_bytes / block_size_u64;
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
         reply.statfs(
             total_blocks,
             free_blocks,
             free_blocks,
-            stats.total_volume_count * 1000,
-            stats.available_volume_count * 1000,
+            1000,
+            1000,
             BLOCK_SIZE,
             1_000_000,
             BLOCK_SIZE,
@@ -1318,6 +1289,24 @@ impl FuserApp {
         let write_buffer = Arc::new(crate::data_manager::WriteBuffer::new(64));
         let data = Arc::new(DataManager::new(chunk_cache, write_buffer));
 
+        // 预加载 statfs 缓存（启动时只加载一次，之后不更新）
+        let statfs_cache_value = match sync_client.inner().get_statistics(&self.collection).await {
+            Ok(stats) => {
+                info!(
+                    "Preloaded statfs cache: total={} bytes",
+                    stats.total_volume_size
+                );
+                Some(stats)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to preload statfs cache, using default values: {}",
+                    e
+                );
+                None
+            }
+        };
+
         // 创建 FUSE 文件系统
         let fs = PowerFsFuserFs::new(
             sync_client.clone(),
@@ -1326,7 +1315,21 @@ impl FuserApp {
             self.collection.clone(),
             self.replication.clone(),
             self.verify_data,
+            statfs_cache_value,
         );
+
+        // 后台 statfs 缓存更新线程（每 1 分钟更新一次）
+        let fs_clone_for_statfs = fs.clone();
+        let collection_clone_for_statfs = self.collection.clone();
+        std::thread::spawn(move || loop {
+            let result = fs_clone_for_statfs
+                .client
+                .get_statistics(&collection_clone_for_statfs);
+            if let Ok(stats) = result {
+                *fs_clone_for_statfs.statfs_cache.lock().unwrap() = Some(stats);
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        });
 
         // 后台 flush 线程（每 100ms 检查脏标记）
         let fs_clone_for_flush = fs.clone();

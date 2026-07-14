@@ -88,10 +88,10 @@ mod tests {
     fn test_client_inode_range_isolation() {
         let alloc1 = InodeAllocator::new(1);
         let alloc2 = InodeAllocator::new(2);
-        
+
         let ino1 = alloc1.allocate();
         let ino2 = alloc2.allocate();
-        
+
         assert_ne!(ino1, ino2);
         assert!(ino1 >= 100 + INODE_RANGE_SIZE);
         assert!(ino2 >= 100 + 2 * INODE_RANGE_SIZE);

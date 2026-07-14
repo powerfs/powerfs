@@ -493,7 +493,12 @@ impl DirectoryTree {
             .expect("failed to encode path index");
         self.db.put(Self::path_key(&full_path), &path_data)?;
 
-        self.publish_notification(EventType::Create, &full_path, Some(entry.clone()), client_id);
+        self.publish_notification(
+            EventType::Create,
+            &full_path,
+            Some(entry.clone()),
+            client_id,
+        );
 
         let client_id_num: u64 = client_id.parse().unwrap_or(0);
         let mut orset = self.orset.write().unwrap();
@@ -690,7 +695,11 @@ impl DirectoryTree {
 
         let mut orset = self.orset.write().unwrap();
         let entry_name = inode_entry.name.clone();
-        let entries_to_remove: Vec<_> = orset.get_by_name(&entry_name).into_iter().cloned().collect();
+        let entries_to_remove: Vec<_> = orset
+            .get_by_name(&entry_name)
+            .into_iter()
+            .cloned()
+            .collect();
         for entry in entries_to_remove {
             orset.remove(&entry.id);
         }
@@ -1415,7 +1424,8 @@ impl DirectoryTree {
         debug!("pull_delta: client_id={}", client_id);
 
         let orset = self.orset.read().unwrap();
-        let client_vclock = self.client_vclocks
+        let client_vclock = self
+            .client_vclocks
             .read()
             .unwrap()
             .get(client_id)
@@ -1432,15 +1442,17 @@ impl DirectoryTree {
         drop(orset);
 
         let mut client_vclocks = self.client_vclocks.write().unwrap();
-        client_vclocks.insert(client_id.to_string(), self.orset.read().unwrap().vclock.clone());
+        client_vclocks.insert(
+            client_id.to_string(),
+            self.orset.read().unwrap().vclock.clone(),
+        );
 
         let server_vclock = self.orset.read().unwrap().vclock.clone();
-        let all_clients_caught_up = client_vclocks
-            .values()
-            .all(|vc| {
-                server_vclock.iter()
-                    .all(|(client_id, seq)| vc.get(*client_id) >= *seq)
-            });
+        let all_clients_caught_up = client_vclocks.values().all(|vc| {
+            server_vclock
+                .iter()
+                .all(|(client_id, seq)| vc.get(*client_id) >= *seq)
+        });
 
         if all_clients_caught_up {
             self.orset.write().unwrap().clear_delta_log();
@@ -1528,7 +1540,9 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 seq: id.seq,
             }),
         ),
-        powerfs_orset::DeltaOp::Rename { old_id, new_entry, .. } => {
+        powerfs_orset::DeltaOp::Rename {
+            old_id, new_entry, ..
+        } => {
             let file_type_val = match new_entry.file_type {
                 powerfs_orset::FileType::RegularFile => 0,
                 powerfs_orset::FileType::Directory => 1,
@@ -1561,14 +1575,20 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 },
             ))
         }
-        powerfs_orset::DeltaOp::SetAttr { inode, mode, size, mtime, .. } => Some(
-            crate::proto::powerfs::delta_op::Op::SetAttr(crate::proto::powerfs::SetAttrOp {
+        powerfs_orset::DeltaOp::SetAttr {
+            inode,
+            mode,
+            size,
+            mtime,
+            ..
+        } => Some(crate::proto::powerfs::delta_op::Op::SetAttr(
+            crate::proto::powerfs::SetAttrOp {
                 inode: *inode,
                 size: size.unwrap_or(0),
                 mtime: mtime.unwrap_or(0),
                 mode: mode.unwrap_or(0),
-            }),
-        ),
+            },
+        )),
     };
     crate::proto::powerfs::DeltaOp {
         op,

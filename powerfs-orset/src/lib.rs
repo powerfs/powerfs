@@ -438,18 +438,15 @@ impl DirORSet {
         }
         self.vclock.increment(entry.id.client_id);
         let vclock = self.vclock.clone();
-        
+
         self.entries.insert(entry.id.clone(), entry.clone());
-        self.delta_log.push(DeltaOp::Add {
-            entry,
-            vclock,
-        });
+        self.delta_log.push(DeltaOp::Add { entry, vclock });
     }
 
     pub fn remove(&mut self, id: &EntryId) {
         self.vclock.increment(id.client_id);
         let vclock = self.vclock.clone();
-        
+
         self.entries.remove(id);
         self.tombstones.insert(id.clone());
         self.delta_log.push(DeltaOp::Remove {
@@ -468,7 +465,7 @@ impl DirORSet {
     ) {
         self.vclock.increment(client_id);
         let vclock = self.vclock.clone();
-        
+
         if let Some(entry) = self.get_by_inode_mut(inode) {
             if let Some(m) = mode {
                 entry.mode = m;
@@ -480,7 +477,7 @@ impl DirORSet {
                 entry.mtime = t;
             }
         }
-        
+
         self.delta_log.push(DeltaOp::SetAttr {
             inode,
             mode,
@@ -646,7 +643,7 @@ impl DirORSet {
                 let branches: Vec<_> = entries.into_iter().cloned().collect();
                 self.record_conflict(ConflictType::WriteWrite, None, branches);
             } else {
-                for (id, _) in &self.entries {
+                for id in self.entries.keys() {
                     if self.tombstones.contains(id) {
                         self.record_conflict(ConflictType::WriteUnlink, None, vec![]);
                         break;

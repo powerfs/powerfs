@@ -1280,8 +1280,7 @@ impl MasterNode {
     }
 
     pub fn auto_resolve_conflicts(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) -> u64 {
-        self.directory_tree
-            .auto_resolve_conflicts(dir_ino, policy)
+        self.directory_tree.auto_resolve_conflicts(dir_ino, policy)
     }
 
     pub fn resolve_path_to_inode(&self, path: &str) -> Option<u64> {
