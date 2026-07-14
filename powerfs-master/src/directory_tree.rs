@@ -2,7 +2,7 @@ use crate::proto::powerfs::metadata_notification::EventType;
 use crate::proto::powerfs::{DirEntry, InodeEntry, PathIndexEntry};
 use crate::proto::{Entry, MetadataNotification};
 use log::{debug, info, warn};
-use powerfs_orset::{ConflictRecord, ConflictResolution, DirORSet, MergePolicy};
+use powerfs_orset::{ConflictRecord, ConflictResolution, ConflictStats, ConflictStatsFull, DirORSet, MergePolicy};
 use prost::Message;
 use rocksdb::{IteratorMode, Options, DB};
 use std::collections::{HashMap, HashSet};
@@ -1482,6 +1482,31 @@ impl DirectoryTree {
         orset.resolve_conflict(conflict_id, resolution);
     }
 
+    fn get_parent_ino_by_inode(&self, ino: u64) -> Option<u64> {
+        let inode_key = Self::inode_key(ino);
+        if let Ok(Some(data)) = self.db.get(&inode_key) {
+            let decode_result: Result<InodeEntry, _> = prost::Message::decode(data.as_ref());
+            if let Ok(inode_entry) = decode_result {
+                return Some(inode_entry.parent_ino);
+            }
+        }
+        None
+    }
+
+    pub fn get_merge_policy(&self, dir_ino: u64) -> MergePolicy {
+        let policies = self.merge_policies.read().unwrap();
+        if let Some(policy) = policies.get(&dir_ino) {
+            return *policy;
+        }
+        if dir_ino == 1 {
+            return MergePolicy::LwwTime;
+        }
+        match self.get_parent_ino_by_inode(dir_ino) {
+            Some(parent_ino) => self.get_merge_policy(parent_ino),
+            None => MergePolicy::LwwTime,
+        }
+    }
+
     pub fn set_merge_policy(&self, dir_ino: u64, policy: MergePolicy) {
         let mut policies = self.merge_policies.write().unwrap();
         policies.insert(dir_ino, policy);
@@ -1494,7 +1519,30 @@ impl DirectoryTree {
         orset.set_policy(policy);
         orset.auto_resolve_all()
     }
+
+    pub fn get_conflict_stats(&self, dir_ino: u64, recursive: bool) -> ConflictStats {
+        let orset = self.orset.read().unwrap();
+        orset.get_conflict_stats_by_dir(dir_ino, recursive)
+    }
+
+    pub fn get_conflict_stats_full(&self, dir_ino: u64, recursive: bool) -> ConflictStatsFull {
+        let orset = self.orset.read().unwrap();
+        orset.get_conflict_stats_full_by_dir(dir_ino, recursive)
+    }
+
+    pub fn batch_resolve_conflicts(&self, dir_ino: u64, policy: MergePolicy, recursive: bool, conflict_type: i32) -> u64 {
+        let mut orset = self.orset.write().unwrap();
+        orset.set_policy(policy);
+        orset.batch_resolve_by_dir(dir_ino, recursive, conflict_type)
+    }
+
+    pub fn batch_ignore_conflicts(&self, dir_ino: u64, conflict_type: i32) -> u64 {
+        let mut orset = self.orset.write().unwrap();
+        orset.batch_ignore_by_dir(dir_ino, conflict_type)
+    }
 }
+
+
 
 fn vclock_to_proto(vclock: &powerfs_orset::VectorClock) -> crate::proto::powerfs::VectorClock {
     crate::proto::powerfs::VectorClock {

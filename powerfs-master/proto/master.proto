@@ -61,6 +61,12 @@ service MasterService {
     rpc ResolveConflict(ResolveConflictRequest) returns (ResolveConflictResponse);
     rpc SetMergePolicy(SetMergePolicyRequest) returns (SetMergePolicyResponse);
     rpc AutoResolveConflicts(AutoResolveConflictsRequest) returns (AutoResolveConflictsResponse);
+    
+    // Batch conflict management (Phase 2 enhancement)
+    rpc BatchDetectConflicts(BatchDetectConflictsRequest) returns (BatchDetectConflictsResponse);
+    rpc BatchResolveConflicts(BatchResolveConflictsRequest) returns (BatchResolveConflictsResponse);
+    rpc GetConflictStats(GetConflictStatsRequest) returns (GetConflictStatsResponse);
+    rpc BatchIgnoreConflicts(BatchIgnoreConflictsRequest) returns (BatchIgnoreConflictsResponse);
 }
 
 message Heartbeat {
@@ -1211,4 +1217,72 @@ message AutoResolveConflictsResponse {
     bool success = 1;
     string error = 2;
     uint64 resolved_count = 3;
+}
+
+// Batch conflict management messages
+message BatchDetectConflictsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    bool recursive = 3;
+}
+
+message BatchDetectConflictsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 total_count = 3;
+    uint64 create_create_count = 4;
+    uint64 write_write_count = 5;
+    uint64 write_unlink_count = 6;
+    uint64 delete_create_count = 7;
+    uint64 rename_conflict_count = 8;
+}
+
+message BatchResolveConflictsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    MergePolicy policy = 3;
+    bool recursive = 4;
+    int32 conflict_type = 5;
+}
+
+message BatchResolveConflictsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 resolved_count = 3;
+}
+
+message GetConflictStatsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    bool recursive = 3;
+}
+
+message GetConflictStatsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 total_count = 3;
+    uint64 resolved_count = 4;
+    uint64 unresolved_count = 5;
+    uint64 create_create_count = 6;
+    uint64 create_create_resolved = 7;
+    uint64 write_write_count = 8;
+    uint64 write_write_resolved = 9;
+    uint64 write_unlink_count = 10;
+    uint64 write_unlink_resolved = 11;
+    uint64 delete_create_count = 12;
+    uint64 delete_create_resolved = 13;
+    uint64 rename_conflict_count = 14;
+    uint64 rename_conflict_resolved = 15;
+}
+
+message BatchIgnoreConflictsRequest {
+    uint64 dir_ino = 1;
+    string dir_path = 2;
+    int32 conflict_type = 3;
+}
+
+message BatchIgnoreConflictsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 ignored_count = 3;
 }

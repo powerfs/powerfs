@@ -203,6 +203,32 @@ pub enum ConflictType {
 
 /// 冲突记录
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictStats {
+    pub total_count: u64,
+    pub create_create_count: u64,
+    pub write_write_count: u64,
+    pub write_unlink_count: u64,
+    pub delete_create_count: u64,
+    pub rename_conflict_count: u64,
+}
+
+pub struct ConflictStatsFull {
+    pub total_count: u64,
+    pub resolved_count: u64,
+    pub unresolved_count: u64,
+    pub create_create_count: u64,
+    pub create_create_resolved: u64,
+    pub write_write_count: u64,
+    pub write_write_resolved: u64,
+    pub write_unlink_count: u64,
+    pub write_unlink_resolved: u64,
+    pub delete_create_count: u64,
+    pub delete_create_resolved: u64,
+    pub rename_conflict_count: u64,
+    pub rename_conflict_resolved: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConflictRecord {
     pub id: String,
     pub conflict_type: ConflictType,
@@ -775,6 +801,206 @@ impl DirORSet {
             }
         }
         resolved_count
+    }
+
+    pub fn get_conflict_stats_by_dir(&self, dir_ino: u64, recursive: bool) -> ConflictStats {
+        let mut stats = ConflictStats {
+            total_count: 0,
+            create_create_count: 0,
+            write_write_count: 0,
+            write_unlink_count: 0,
+            delete_create_count: 0,
+            rename_conflict_count: 0,
+        };
+
+        for conflict in &self.conflicts {
+            let inode = conflict.branches.first().map(|b| b.inode).unwrap_or(0);
+            if !self.is_in_dir(inode, dir_ino, recursive) {
+                continue;
+            }
+
+            stats.total_count += 1;
+            match conflict.conflict_type {
+                ConflictType::CreateCreate => stats.create_create_count += 1,
+                ConflictType::WriteWrite => stats.write_write_count += 1,
+                ConflictType::WriteUnlink => stats.write_unlink_count += 1,
+                ConflictType::DeleteCreate => stats.delete_create_count += 1,
+                ConflictType::RenameConflict => stats.rename_conflict_count += 1,
+            }
+        }
+
+        stats
+    }
+
+    pub fn get_conflict_stats_full_by_dir(&self, dir_ino: u64, recursive: bool) -> ConflictStatsFull {
+        let mut stats = ConflictStatsFull {
+            total_count: 0,
+            resolved_count: 0,
+            unresolved_count: 0,
+            create_create_count: 0,
+            create_create_resolved: 0,
+            write_write_count: 0,
+            write_write_resolved: 0,
+            write_unlink_count: 0,
+            write_unlink_resolved: 0,
+            delete_create_count: 0,
+            delete_create_resolved: 0,
+            rename_conflict_count: 0,
+            rename_conflict_resolved: 0,
+        };
+
+        for conflict in &self.conflicts {
+            let inode = conflict.branches.first().map(|b| b.inode).unwrap_or(0);
+            if !self.is_in_dir(inode, dir_ino, recursive) {
+                continue;
+            }
+
+            stats.total_count += 1;
+            if conflict.resolved {
+                stats.resolved_count += 1;
+            } else {
+                stats.unresolved_count += 1;
+            }
+
+            match conflict.conflict_type {
+                ConflictType::CreateCreate => {
+                    stats.create_create_count += 1;
+                    if conflict.resolved {
+                        stats.create_create_resolved += 1;
+                    }
+                }
+                ConflictType::WriteWrite => {
+                    stats.write_write_count += 1;
+                    if conflict.resolved {
+                        stats.write_write_resolved += 1;
+                    }
+                }
+                ConflictType::WriteUnlink => {
+                    stats.write_unlink_count += 1;
+                    if conflict.resolved {
+                        stats.write_unlink_resolved += 1;
+                    }
+                }
+                ConflictType::DeleteCreate => {
+                    stats.delete_create_count += 1;
+                    if conflict.resolved {
+                        stats.delete_create_resolved += 1;
+                    }
+                }
+                ConflictType::RenameConflict => {
+                    stats.rename_conflict_count += 1;
+                    if conflict.resolved {
+                        stats.rename_conflict_resolved += 1;
+                    }
+                }
+            }
+        }
+
+        stats
+    }
+
+    fn is_in_dir(&self, inode: u64, dir_ino: u64, recursive: bool) -> bool {
+        if inode == dir_ino {
+            return true;
+        }
+        if !recursive {
+            return false;
+        }
+        let entry = self.entries.values().find(|e| e.inode == inode);
+        entry.is_some_and(|e| {
+            let parent_ino = e.parent_ino;
+            parent_ino == dir_ino || self.is_in_dir(parent_ino, dir_ino, true)
+        })
+    }
+
+    pub fn batch_resolve_by_dir(&mut self, dir_ino: u64, recursive: bool, conflict_type: i32) -> u64 {
+        let mut resolved_count = 0;
+
+        let entries_snapshot: Vec<_> = self.entries.values().cloned().collect();
+
+        for conflict in self.conflicts.iter_mut() {
+            if conflict.resolved {
+                continue;
+            }
+
+            let inode = conflict.branches.first().map(|b| b.inode).unwrap_or(0);
+            if !Self::is_in_dir_snapshot(inode, dir_ino, recursive, &entries_snapshot) {
+                continue;
+            }
+
+            let conflict_type_matches = if conflict_type < 0 {
+                true
+            } else {
+                let ct = match conflict_type {
+                    0 => ConflictType::CreateCreate,
+                    1 => ConflictType::WriteWrite,
+                    2 => ConflictType::WriteUnlink,
+                    3 => ConflictType::DeleteCreate,
+                    4 => ConflictType::RenameConflict,
+                    _ => continue,
+                };
+                conflict.conflict_type == ct
+            };
+
+            if conflict_type_matches {
+                conflict.resolved = true;
+                conflict.resolved_time = Some(now_unix());
+                conflict.resolution = Some(ConflictResolution::KeepLast);
+                resolved_count += 1;
+            }
+        }
+
+        resolved_count
+    }
+
+    pub fn batch_ignore_by_dir(&mut self, dir_ino: u64, conflict_type: i32) -> u64 {
+        let mut ignored_count = 0;
+
+        let entries_snapshot: Vec<_> = self.entries.values().cloned().collect();
+
+        for conflict in self.conflicts.iter_mut() {
+            let inode = conflict.branches.first().map(|b| b.inode).unwrap_or(0);
+            if !Self::is_in_dir_snapshot(inode, dir_ino, true, &entries_snapshot) {
+                continue;
+            }
+
+            let conflict_type_matches = if conflict_type < 0 {
+                true
+            } else {
+                let ct = match conflict_type {
+                    0 => ConflictType::CreateCreate,
+                    1 => ConflictType::WriteWrite,
+                    2 => ConflictType::WriteUnlink,
+                    3 => ConflictType::DeleteCreate,
+                    4 => ConflictType::RenameConflict,
+                    _ => continue,
+                };
+                conflict.conflict_type == ct
+            };
+
+            if conflict_type_matches {
+                conflict.resolved = true;
+                conflict.resolved_time = Some(now_unix());
+                conflict.resolution = Some(ConflictResolution::KeepLast);
+                ignored_count += 1;
+            }
+        }
+
+        ignored_count
+    }
+
+    fn is_in_dir_snapshot(inode: u64, dir_ino: u64, recursive: bool, entries: &[DirEntry]) -> bool {
+        if inode == dir_ino {
+            return true;
+        }
+        if !recursive {
+            return false;
+        }
+        let entry = entries.iter().find(|e| e.inode == inode);
+        entry.map_or(false, |e| {
+            let parent_ino = e.parent_ino;
+            parent_ino == dir_ino || Self::is_in_dir_snapshot(parent_ino, dir_ino, true, entries)
+        })
     }
 
     pub fn merge(&mut self, other: &Self) {

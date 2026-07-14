@@ -47,11 +47,8 @@ pub enum MetadataEvent {
 
 pub struct MetadataManager {
     db: Arc<DB>,
-    #[allow(dead_code)]
     orsets: Arc<RwLock<HashMap<u64, DirORSet>>>,
-    #[allow(dead_code)]
     policies: Arc<RwLock<HashMap<u64, MergePolicy>>>,
-    #[allow(dead_code)]
     client_counters: Arc<RwLock<HashMap<u64, u64>>>,
     event_tx: mpsc::Sender<MetadataEvent>,
 }
@@ -293,25 +290,18 @@ impl MetadataManager {
     }
 
     pub fn get_conflicts(&self, _dir_ino: u64, unresolved_only: bool) -> Vec<ConflictRecord> {
-        let mut conflicts = Vec::new();
+        let orsets = self.orsets.read().unwrap();
+        let mut all_conflicts = Vec::new();
 
-        let prefix_str = "conflict:".to_string();
-        let prefix = prefix_str.as_bytes();
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        ));
-
-        for (_key, value) in iter.flatten() {
-            if let Ok(conflict) = serde_json::from_slice::<ConflictRecord>(&value) {
-                if unresolved_only && conflict.resolved {
-                    continue;
-                }
-                conflicts.push(conflict);
+        for orset in orsets.values() {
+            if unresolved_only {
+                all_conflicts.extend(orset.unresolved_conflicts().iter().cloned().cloned());
+            } else {
+                all_conflicts.extend(orset.conflicts());
             }
         }
 
-        conflicts
+        all_conflicts
     }
 
     pub fn resolve_conflict(
@@ -320,19 +310,9 @@ impl MetadataManager {
         conflict_id: &str,
         resolution: ConflictResolution,
     ) {
-        let key_str = format!("conflict:{}", conflict_id);
-        let key = key_str.as_bytes();
-
-        if let Ok(Some(data)) = self.db.get(key) {
-            if let Ok(mut conflict) = serde_json::from_slice::<ConflictRecord>(&data) {
-                conflict.resolved = true;
-                conflict.resolution = Some(resolution);
-                if let Ok(new_data) = serde_json::to_vec(&conflict) {
-                    if let Err(e) = self.db.put(key, new_data) {
-                        warn!("Failed to update conflict: {}", e);
-                    }
-                }
-            }
+        let mut orsets = self.orsets.write().unwrap();
+        for orset in orsets.values_mut() {
+            orset.resolve_conflict(conflict_id, resolution);
         }
     }
 
@@ -340,30 +320,13 @@ impl MetadataManager {
         self.send_event(MetadataEvent::SetPolicy { dir_ino, policy });
     }
 
-    pub fn auto_resolve_conflicts(&self, _dir_ino: u64, _policy: MergePolicy) -> u64 {
+    pub fn auto_resolve_conflicts(&self, _dir_ino: u64, policy: MergePolicy) -> u64 {
+        let mut orsets = self.orsets.write().unwrap();
         let mut resolved_count = 0;
 
-        let prefix_str = "conflict:".to_string();
-        let prefix = prefix_str.as_bytes();
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        ));
-
-        for (key, value) in iter.flatten() {
-            if let Ok(mut conflict) = serde_json::from_slice::<ConflictRecord>(&value) {
-                if !conflict.resolved {
-                    conflict.resolved = true;
-                    conflict.resolution = Some(ConflictResolution::KeepLast);
-                    if let Ok(new_data) = serde_json::to_vec(&conflict) {
-                        if let Err(e) = self.db.put(key, new_data) {
-                            warn!("Failed to auto-resolve conflict: {}", e);
-                        } else {
-                            resolved_count += 1;
-                        }
-                    }
-                }
-            }
+        for orset in orsets.values_mut() {
+            orset.set_policy(policy);
+            resolved_count += orset.auto_resolve_all();
         }
 
         resolved_count

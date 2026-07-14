@@ -940,6 +940,181 @@ impl MasterService for MasterGrpcServer {
         }))
     }
 
+    async fn batch_detect_conflicts(
+        &self,
+        request: Request<BatchDetectConflictsRequest>,
+    ) -> Result<Response<BatchDetectConflictsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(BatchDetectConflictsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        total_count: 0,
+                        create_create_count: 0,
+                        write_write_count: 0,
+                        write_unlink_count: 0,
+                        delete_create_count: 0,
+                        rename_conflict_count: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let stats = self.master.directory_tree.get_conflict_stats(dir_ino, req.recursive);
+        Ok(Response::new(BatchDetectConflictsResponse {
+            success: true,
+            error: String::new(),
+            total_count: stats.total_count,
+            create_create_count: stats.create_create_count,
+            write_write_count: stats.write_write_count,
+            write_unlink_count: stats.write_unlink_count,
+            delete_create_count: stats.delete_create_count,
+            rename_conflict_count: stats.rename_conflict_count,
+        }))
+    }
+
+    async fn batch_resolve_conflicts(
+        &self,
+        request: Request<BatchResolveConflictsRequest>,
+    ) -> Result<Response<BatchResolveConflictsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(BatchResolveConflictsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        resolved_count: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let policy = match req.policy {
+            0 => powerfs_orset::MergePolicy::LwwTime,
+            1 => powerfs_orset::MergePolicy::ContentHash,
+            2 => powerfs_orset::MergePolicy::WeightBased,
+            3 => powerfs_orset::MergePolicy::KeepAll,
+            4 => powerfs_orset::MergePolicy::WritePriority,
+            5 => powerfs_orset::MergePolicy::DeletePriority,
+            6 => powerfs_orset::MergePolicy::Aggressive,
+            7 => powerfs_orset::MergePolicy::Conservative,
+            8 => powerfs_orset::MergePolicy::Manual,
+            _ => {
+                return Ok(Response::new(BatchResolveConflictsResponse {
+                    success: false,
+                    error: "invalid merge policy".to_string(),
+                    resolved_count: 0,
+                }));
+            }
+        };
+
+        let resolved_count = self.master.directory_tree.batch_resolve_conflicts(
+            dir_ino,
+            policy,
+            req.recursive,
+            req.conflict_type,
+        );
+
+        Ok(Response::new(BatchResolveConflictsResponse {
+            success: true,
+            error: String::new(),
+            resolved_count,
+        }))
+    }
+
+    async fn get_conflict_stats(
+        &self,
+        request: Request<GetConflictStatsRequest>,
+    ) -> Result<Response<GetConflictStatsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(GetConflictStatsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        total_count: 0,
+                        resolved_count: 0,
+                        unresolved_count: 0,
+                        create_create_count: 0,
+                        create_create_resolved: 0,
+                        write_write_count: 0,
+                        write_write_resolved: 0,
+                        write_unlink_count: 0,
+                        write_unlink_resolved: 0,
+                        delete_create_count: 0,
+                        delete_create_resolved: 0,
+                        rename_conflict_count: 0,
+                        rename_conflict_resolved: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let stats = self.master.directory_tree.get_conflict_stats_full(dir_ino, req.recursive);
+        Ok(Response::new(GetConflictStatsResponse {
+            success: true,
+            error: String::new(),
+            total_count: stats.total_count,
+            resolved_count: stats.resolved_count,
+            unresolved_count: stats.unresolved_count,
+            create_create_count: stats.create_create_count,
+            create_create_resolved: stats.create_create_resolved,
+            write_write_count: stats.write_write_count,
+            write_write_resolved: stats.write_write_resolved,
+            write_unlink_count: stats.write_unlink_count,
+            write_unlink_resolved: stats.write_unlink_resolved,
+            delete_create_count: stats.delete_create_count,
+            delete_create_resolved: stats.delete_create_resolved,
+            rename_conflict_count: stats.rename_conflict_count,
+            rename_conflict_resolved: stats.rename_conflict_resolved,
+        }))
+    }
+
+    async fn batch_ignore_conflicts(
+        &self,
+        request: Request<BatchIgnoreConflictsRequest>,
+    ) -> Result<Response<BatchIgnoreConflictsResponse>, Status> {
+        let req = request.into_inner();
+
+        let dir_ino = if !req.dir_path.is_empty() {
+            match self.master.resolve_path_to_inode(&req.dir_path) {
+                Some(ino) => ino,
+                None => {
+                    return Ok(Response::new(BatchIgnoreConflictsResponse {
+                        success: false,
+                        error: format!("Path not found: {}", req.dir_path),
+                        ignored_count: 0,
+                    }));
+                }
+            }
+        } else {
+            req.dir_ino
+        };
+
+        let ignored_count = self.master.directory_tree.batch_ignore_conflicts(dir_ino, req.conflict_type);
+        Ok(Response::new(BatchIgnoreConflictsResponse {
+            success: true,
+            error: String::new(),
+            ignored_count,
+        }))
+    }
+
     async fn delete_volume(
         &self,
         request: Request<DeleteVolumeRequest>,

@@ -1261,8 +1261,7 @@ impl MasterNode {
         dir_ino: u64,
         unresolved_only: bool,
     ) -> Vec<powerfs_orset::ConflictRecord> {
-        self.metadata_manager
-            .get_conflicts(dir_ino, unresolved_only)
+        self.directory_tree.get_conflicts(dir_ino, unresolved_only)
     }
 
     pub fn resolve_conflict(
@@ -1271,12 +1270,11 @@ impl MasterNode {
         conflict_id: &str,
         resolution: powerfs_orset::ConflictResolution,
     ) {
-        self.metadata_manager
-            .resolve_conflict(dir_ino, conflict_id, resolution)
+        self.directory_tree.resolve_conflict(dir_ino, conflict_id, resolution)
     }
 
     pub fn set_merge_policy(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) {
-        self.metadata_manager.set_merge_policy(dir_ino, policy)
+        self.directory_tree.set_merge_policy(dir_ino, policy)
     }
 
     pub fn auto_resolve_conflicts(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) -> u64 {
