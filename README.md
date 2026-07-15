@@ -137,10 +137,18 @@ Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Di
 
 ## ⚡ Performance Highlights
 
+### Community Edition
 - Single-node bandwidth: **>3GB/s**
 - 4KB random write IOPS: **624,000+**
 - Full-load p99/p999 latency stable, no jitter
 - GPU utilization increased from 40%~50% to 90%+ for LLM inference
+
+### Enterprise Edition (Lock-Free Optimization)
+- **40x** faster single-thread metadata operations (mkdir/lookup/rmdir)
+- **55x** faster multi-thread metadata operations (8 threads)
+- **10.6x** faster directory listing (10,000 entries)
+- Zero deadlock under large directory copy operations
+- Separate statfs channel ensures `df` works under high load
 
 ---
 
@@ -189,6 +197,40 @@ All tests are conducted on a single-node setup with PowerFS FUSE client, using s
 - **Sync Write Performance**: Limited by gRPC round-trip and disk fsync (~1.3ms), typical for network-attached storage
 - **Multi-thread Scaling**: Random read scales to 23.3K IOPS with 4 threads, showing effective parallel processing
 - **Data Integrity**: All tests passed `--verify=crc32c` validation, confirming data correctness
+
+### Enterprise Edition Lock-Free Optimization Performance Comparison
+
+The Enterprise Edition introduces significant lock-free optimizations to the metadata management layer, delivering dramatic performance improvements for concurrent workloads.
+
+#### Test Environment
+- **Hardware**: 8-core CPU, NVMe SSD
+- **Test Method**: Local MetadataManager benchmark (no network overhead)
+- **Metrics**: Operations per second (ops/s)
+
+#### Performance Comparison
+
+| Operation | Community Edition (Single Lock) | Enterprise Edition (Lock-Free) | Improvement |
+|-----------|----------------------------------|--------------------------------|-------------|
+| Single-thread mkdir+lookup+rmdir | ~50,000 ops/s | **~2,000,000 ops/s** | **40x** |
+| Single-thread create+unlink | ~60,000 ops/s | **~2,220,000 ops/s** | **37x** |
+| Multi-thread (8) mkdir+lookup+rmdir | ~10,000 ops/s | **~550,000 ops/s** | **55x** |
+| Multi-thread (8) create+unlink | ~12,000 ops/s | **~600,000 ops/s** | **50x** |
+| list_dir (10,000 entries) | ~50ms | **~4.7ms** | **10.6x** |
+
+#### Lock-Free Optimization Features
+
+1. **Sharded DirCache**: Directory cache partitioned by parent inode hash (CPU cores × 2 shards), eliminating global lock contention
+2. **Per-Queue Single-Thread Consumption**: Each shard managed by dedicated worker thread, no cross-thread synchronization
+3. **Atomic Reference Counting**: Inode reference count managed via atomic operations, reducing lock scope
+4. **Optimistic Size Update**: File size updates with insize/outsize check, avoiding unnecessary locks on concurrent writes
+5. **Separate statfs Channel**: Dedicated gRPC channel for space queries, ensuring `df` works under high load
+6. **Generation Management**: Inode generation tracking prevents stale handles after file deletion
+
+#### Real-World Impact
+
+- **Large Directory Copy**: `cp -prf /usr/bin .` (665 files) completes in seconds without deadlock
+- **Concurrent File Operations**: Supports 10,000+ MPI processes concurrent read/write without performance degradation
+- **Steady-State Operation**: Zero jitter under full load, stable p99/p999 latency
 
 ### Benchmark Outlook
 
