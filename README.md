@@ -4,7 +4,7 @@ PowerFS
 
 **Next-Gen Zero-Jitter Unified Storage for HPC + AI Converged Clusters**
 
-[Introduction](#introduction) • [Architecture](#architecture) • [Core Features](#core-features) • [Roadmap](#🚀-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [License](#license)
+[Introduction](#introduction) • [Architecture](#architecture) • [Core Features](#core-features) • [Roadmap](#-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [License](#license)
 
 ---
 
