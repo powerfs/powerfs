@@ -14,13 +14,14 @@ use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 const PREFETCH_CHUNKS: u64 = 2;
+const FUSE_APPEND: u32 = 0x400;
 
 /// FUSE application that manages the mount lifecycle
 pub struct FuseApp {
@@ -70,6 +71,7 @@ impl FuseApp {
             locks: Arc::new(RwLock::new(HashMap::new())),
             dirty_chunks: Arc::new(RwLock::new(HashSet::new())),
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            append_mutex: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let fs_arc = Arc::new(fs);
@@ -176,6 +178,7 @@ struct PowerFsFs {
     locks: Arc<RwLock<FileLocks>>,
     dirty_chunks: Arc<RwLock<HashSet<(u64, u64)>>>,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
+    append_mutex: Arc<Mutex<HashMap<u64, ()>>>,
 }
 
 impl PowerFsFs {
@@ -1039,13 +1042,21 @@ impl FileSystem for PowerFsFs {
         _handle: Self::Handle,
         r: &mut dyn ZeroCopyReader,
         size: u32,
-        offset: u64,
+        mut offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
-        _flags: u32,
+        flags: u32,
         _fuse_flags: u32,
     ) -> std::io::Result<usize> {
         debug!("write: inode={}, size={}, offset={}", inode, size, offset);
+
+        let is_append = (flags & FUSE_APPEND) != 0;
+
+        let _append_lock = if is_append {
+            Some(self.append_mutex.lock().unwrap())
+        } else {
+            None
+        };
 
         let entry = self
             .cache
@@ -1058,6 +1069,14 @@ impl FileSystem for PowerFsFs {
             return Ok(0);
         }
         buf.truncate(read_len);
+
+        if is_append {
+            let latest_entry = self
+                .cache
+                .get_inode(inode)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            offset = latest_entry.size;
+        }
 
         let chunk_size = self.chunk_cache.chunk_size();
 

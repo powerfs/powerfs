@@ -173,10 +173,19 @@ impl MetadataManager {
             return Ok(listing);
         }
 
-        // 返回空列表
-        let orset_arc = self.ensure_dir_cache(dir_ino);
-        let orset = orset_arc.read().unwrap();
-        Ok(self.projection.project_listing(&orset))
+        // 最后的 fallback：使用非阻塞方式获取缓存
+        // 避免在锁竞争时无限阻塞
+        let dir_cache = self.dir_cache.try_read();
+        if let Ok(dir_cache) = dir_cache {
+            if let Some(orset_arc) = dir_cache.get(&dir_ino) {
+                let orset = orset_arc.try_read();
+                if let Ok(orset) = orset {
+                    return Ok(self.projection.project_listing(&orset));
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// 尝试从本地缓存列出目录（不触发 Master 拉取）
@@ -651,34 +660,120 @@ impl MetadataManager {
 
     /// 失效本地缓存条目（用于接收远程删除通知时）
     pub fn invalidate_local_cache_entry(&self, parent_ino: u64, name: &str) {
-        // 1. 查找本地条目
-        if let Some(entry) = self.lookup_local(parent_ino, name) {
-            let entry_id = entry.id.clone();
-            let inode_to_remove = entry.inode;
+        let entry = match self.try_lookup_local(parent_ino, name) {
+            Some(e) => e,
+            None => {
+                debug!(
+                    "Entry not found in local cache: parent_ino={}, name={}",
+                    parent_ino, name
+                );
+                return;
+            }
+        };
 
-            // 2. 从父目录 OR-Set 中移除
-            if let Some(orset_arc) = self.dir_cache.read().unwrap().get(&parent_ino) {
-                let mut orset = orset_arc.write().unwrap();
-                orset.remove(&entry_id);
+        let entry_id = entry.id.clone();
+        let inode_to_remove = entry.inode;
+
+        let mut dir_cache = self.dir_cache.write().unwrap();
+
+        if let Some(orset_arc) = dir_cache.get(&parent_ino) {
+            let mut orset = orset_arc.write().unwrap();
+            orset.remove(&entry_id);
+        }
+
+        dir_cache.remove(&inode_to_remove);
+
+        drop(dir_cache);
+
+        let mut inode_index = self.inode_index.write().unwrap();
+        inode_index.remove(&inode_to_remove);
+
+        let mut inode_paths = self.inode_paths.write().unwrap();
+        inode_paths.remove(&inode_to_remove);
+
+        info!(
+            "Invalidated local cache entry: parent_ino={}, name={}, inode={}",
+            parent_ino, name, inode_to_remove
+        );
+    }
+
+    /// 非阻塞方式失效缓存（用于订阅线程，避免死锁）
+    pub fn try_invalidate_local_cache_entry(&self, path: &str) -> bool {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return false;
+        }
+
+        let mut current_ino = 1;
+        let mut found = true;
+
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                break;
+            }
+            let entry = self.try_lookup_local(current_ino, part);
+            if let Some(e) = entry {
+                current_ino = e.inode;
+            } else {
+                found = false;
+                break;
+            }
+        }
+
+        if !found {
+            return false;
+        }
+
+        let entry_name = parts.last().unwrap();
+        let entry = self.try_lookup_local(current_ino, entry_name);
+        if entry.is_none() {
+            return false;
+        }
+
+        let entry = entry.unwrap();
+        let entry_id = entry.id;
+        let inode_to_remove = entry.inode;
+
+        if let Ok(mut dir_cache) = self.dir_cache.try_write() {
+            if let Some(orset_arc) = dir_cache.get(&current_ino) {
+                if let Ok(mut orset) = orset_arc.try_write() {
+                    orset.remove(&entry_id);
+                } else {
+                    return false;
+                }
             }
 
-            // 3. 清理子目录的 OR-Set 缓存
-            self.dir_cache.write().unwrap().remove(&inode_to_remove);
-
-            // 4. 清理 inode 索引和路径
-            self.inode_index.write().unwrap().remove(&inode_to_remove);
-            self.inode_paths.write().unwrap().remove(&inode_to_remove);
-
-            info!(
-                "Invalidated local cache entry: parent_ino={}, name={}, inode={}",
-                parent_ino, name, inode_to_remove
-            );
+            dir_cache.remove(&inode_to_remove);
         } else {
-            debug!(
-                "Entry not found in local cache: parent_ino={}, name={}",
-                parent_ino, name
-            );
+            return false;
         }
+
+        if let Ok(mut inode_index) = self.inode_index.try_write() {
+            inode_index.remove(&inode_to_remove);
+        }
+
+        if let Ok(mut inode_paths) = self.inode_paths.try_write() {
+            inode_paths.remove(&inode_to_remove);
+        }
+
+        true
+    }
+
+    fn try_lookup_local(&self, dir_ino: u64, name: &str) -> Option<DirEntry> {
+        let dir_cache_result = self.dir_cache.try_read();
+        if dir_cache_result.is_err() {
+            return None;
+        }
+        let dir_cache = dir_cache_result.unwrap();
+
+        let orset_arc = dir_cache.get(&dir_ino)?;
+        let orset_result = orset_arc.try_read();
+        if orset_result.is_err() {
+            return None;
+        }
+        let orset = orset_result.unwrap();
+
+        self.projection.project_lookup(&orset, name)
     }
 
     /// 更新 inode 的路径映射

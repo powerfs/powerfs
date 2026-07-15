@@ -1341,7 +1341,6 @@ impl FuserApp {
 
         // 后台元数据订阅线程（实时接收 Master 的目录变更通知）
         let meta_clone = meta_clone_for_subscribe;
-        let fs_clone_for_notify = fs.clone();
         let grpc_client_clone_for_subscribe = grpc_client.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1355,44 +1354,15 @@ impl FuserApp {
                             info!("Successfully subscribed to metadata notifications");
                             while let Some(notification) = stream.message().await.unwrap_or(None) {
                                 if notification.event_type == 2 {
-                                    // DELETE
+                                    // DELETE - 注意：使用非阻塞方式处理，避免死锁
                                     let path = notification.path;
                                     if !path.is_empty() {
-                                        info!("Received DELETE notification for: {}", path);
-                                        // 立即失效相关目录缓存
-                                        let parts: Vec<&str> =
-                                            path.split('/').filter(|p| !p.is_empty()).collect();
-                                        if !parts.is_empty() {
-                                            // 逐级查找父目录 inode（从 ROOT 开始）
-                                            let mut current_ino = 1; // ROOT_INO
-                                            let mut found = true;
-                                            for (i, part) in parts.iter().enumerate() {
-                                                if i == parts.len() - 1 {
-                                                    break; // 到达最后一个部分，current_ino 就是父目录
-                                                }
-                                                if let Some(entry) =
-                                                    meta_clone.lookup_local(current_ino, part)
-                                                {
-                                                    current_ino = entry.inode;
-                                                } else {
-                                                    found = false;
-                                                    break;
-                                                }
-                                            }
-                                            if found {
-                                                let entry_name = parts.last().unwrap();
-                                                // 从本地 OR-Set 移除被删除的条目
-                                                meta_clone.invalidate_local_cache_entry(
-                                                    current_ino,
-                                                    entry_name,
-                                                );
-
-                                                // 关键：同时失效内核 VFS 缓存，让 ls 等命令立即看到变化
-                                                fs_clone_for_notify.invalidate_kernel_dentry(
-                                                    current_ino,
-                                                    entry_name,
-                                                );
-                                            }
+                                        // 尝试非阻塞地失效缓存
+                                        // 如果锁被占用，跳过此次失效（下次 ls 会从 Master 重新拉取）
+                                        if meta_clone.try_invalidate_local_cache_entry(&path) {
+                                            info!("Successfully invalidated cache for deleted path: {}", path);
+                                        } else {
+                                            debug!("Skipped cache invalidation for {} (lock contention)", path);
                                         }
                                     }
                                 }
