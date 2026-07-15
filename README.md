@@ -560,7 +560,7 @@ PowerFS is open-source under Apache 2.0 license. We are committed to building th
 
 Welcome Star, Fork, PR and Issue to help us evolve!
 
-**GitHub**: https://github.com/powerfs/powerfs
+**GitHub**: https://github.com/FudanPPI/powerfs
 
 ---
 
