@@ -15,11 +15,12 @@
 //! Phase 1A：单客户端场景，每个 name 只有一个 entry，无冲突
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam::channel::{self, Receiver, Sender};
 use log::{debug, error, info, warn};
 
 use crate::client::SyncFuseClient;
@@ -46,15 +47,8 @@ enum ChangeOp {
     SetAttr(DirEntry),
 }
 
-/// 变更缓存结构
-struct ChangeCache {
-    pending_changes: Vec<ChangeOp>,
-    last_flush_time: u64,
-}
-
 /// 变更缓存配置
 const CHANGE_CACHE_BATCH_SIZE: usize = 64;
-const CHANGE_CACHE_FLUSH_INTERVAL_S: f64 = 0.05;
 
 pub struct MetadataManager {
     /// 本地 OR-Set 缓存：dir_inode -> DirORSet
@@ -77,10 +71,8 @@ pub struct MetadataManager {
     client: Option<Arc<SyncFuseClient>>,
     /// 客户端 VectorClock（用于 Delta Sync）
     client_vclock: Arc<RwLock<VectorClock>>,
-    /// 变更缓存（收集多个变更后异步批量发送）
-    change_cache: Arc<Mutex<ChangeCache>>,
-    /// 变更缓存是否有数据
-    has_pending_changes: Arc<AtomicBool>,
+    /// 变更缓存发送端（无锁化设计）
+    change_sender: Sender<ChangeOp>,
 }
 
 impl MetadataManager {
@@ -97,11 +89,7 @@ impl MetadataManager {
             seq_counter: AtomicU64::new(1),
             client: None,
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
-            change_cache: Arc::new(Mutex::new(ChangeCache {
-                pending_changes: Vec::new(),
-                last_flush_time: 0,
-            })),
-            has_pending_changes: Arc::new(AtomicBool::new(false)),
+            change_sender: channel::unbounded().0,
         };
         mgr.init_root();
         mgr
@@ -109,11 +97,7 @@ impl MetadataManager {
 
     /// 创建带 Master 连接的 MetadataManager
     pub fn new_with_master(client: Arc<SyncFuseClient>, client_id: u64) -> Self {
-        let change_cache = Arc::new(Mutex::new(ChangeCache {
-            pending_changes: Vec::new(),
-            last_flush_time: 0,
-        }));
-        let has_pending_changes = Arc::new(AtomicBool::new(false));
+        let (change_sender, change_receiver) = channel::unbounded();
 
         let mgr = Self {
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -126,11 +110,10 @@ impl MetadataManager {
             seq_counter: AtomicU64::new(1),
             client: Some(client),
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
-            change_cache: change_cache.clone(),
-            has_pending_changes: has_pending_changes.clone(),
+            change_sender,
         };
         mgr.init_root();
-        mgr.start_change_cache_flusher(change_cache, has_pending_changes);
+        mgr.start_change_cache_flusher(change_receiver);
         mgr
     }
 
@@ -235,40 +218,43 @@ impl MetadataManager {
         let orset_arc = dir_cache.get(&dir_ino)?;
 
         let orset = orset_arc.read().ok()?;
-        if orset.is_empty() {
-            return None;
-        }
-
+        // 【关键修复】当 OR-Set 为空时，返回空向量而不是 None
+        // 避免 list_dir 尝试从 Master 拉取数据，导致已删除的文件重新出现
         Some(self.projection.project_listing(&orset))
     }
 
     /// 按 inode 获取条目（getattr 用）
     pub fn get_entry_by_inode(&self, ino: u64) -> Result<Option<DirEntry>, FsError> {
         // 先查本地索引
-        let index = self.inode_index.read().unwrap();
-        if let Some((dir_ino, entry_id)) = index.get(&ino) {
+        let entry_info = {
+            let index = self.inode_index.read().unwrap();
+            index.get(&ino).map(|(d, e)| (*d, e.clone()))
+        };
+
+        if let Some((dir_ino, entry_id)) = entry_info {
+            // 【关键修复】先释放 inode_index 锁，再获取 dir_cache 锁
+            // 避免死锁场景：
+            // - 线程A（get_entry_by_inode）: 持有 inode_index 读锁 → 等待 dir_cache 读锁
+            // - 线程B（rmdir/unlink）: 持有 dir_cache 写锁 → 等待 inode_index 写锁
             let dir_cache_result = self.dir_cache.try_read();
             if let Ok(dir_cache) = dir_cache_result {
-                if let Some(orset_arc) = dir_cache.get(dir_ino) {
+                if let Some(orset_arc) = dir_cache.get(&dir_ino) {
                     let orset_result = orset_arc.try_read();
                     if let Ok(orset) = orset_result {
-                        if let Some(entry) = orset.entries.get(entry_id) {
+                        if let Some(entry) = orset.entries.get(&entry_id) {
                             return Ok(Some(entry.clone()));
                         }
                     }
                 }
             }
-            // 索引存在但 OR-Set 中找不到，标记为需要清理
+            // 索引存在但 OR-Set 中找不到，非阻塞清理
             let _ = self.try_cleanup_stale_inode(ino);
         }
-        drop(index);
 
-        // 根目录特殊处理
         if ino == ROOT_INO {
             return Ok(Some(self.make_root_entry()));
         }
 
-        // 本地未命中，回退 Master
         if self.client.is_some() {
             return self.fetch_entry_by_inode_from_master(ino);
         }
@@ -377,14 +363,17 @@ impl MetadataManager {
         let entry_id = EntryId::new(name, self.client_id, seq);
         let entry = DirEntry::new_dir(entry_id, inode, dir_ino, mode);
 
-        // 为新目录创建空 OR-Set（先获取 dir_cache 写锁并释放，避免锁顺序死锁）
+        // 【关键修复】先调用 apply_to_local_orset（更新 inode_index/inode_paths），再创建 OR-Set
+        // 避免死锁：apply_to_local_orset 需要 inode_index.write()，如果先持有 dir_cache.write()
+        // 而 get_entry_by_inode 持有 inode_index.read() 并等待 dir_cache.read()，会形成循环等待
+        self.apply_to_local_orset(dir_ino, entry.clone())?;
+
+        // 【关键修复】单独获取 dir_cache 写锁创建新目录的 OR-Set
         let new_dir_orset = Arc::new(RwLock::new(DirORSet::new(inode)));
         {
             let mut dir_cache = self.dir_cache.write().unwrap();
             dir_cache.insert(inode, new_dir_orset);
         }
-
-        self.apply_to_local_orset(dir_ino, entry.clone())?;
 
         // best-effort 同步到 Master（使用变更缓存）
         self.add_change(ChangeOp::Create(entry.clone()));
@@ -421,69 +410,106 @@ impl MetadataManager {
     ///
     /// 返回被删除文件的 inode（供调用方清理数据缓存）
     pub fn unlink(&self, dir_ino: u64, name: &str) -> Result<u64, FsError> {
-        let entry = self.lookup_local(dir_ino, name).ok_or_else(|| {
-            FsError::NotFound(format!("unlink: {} not found in dir {}", name, dir_ino))
-        })?;
+        // 先获取读锁查找信息
+        let (inode, entry_id) = {
+            let dir_cache = self.dir_cache.read().unwrap();
 
-        if entry.file_type == FileType::Directory {
-            return Err(FsError::IsDirectory(format!(
-                "unlink: {} is a directory, use rmdir instead",
-                name
-            )));
+            let entry = if let Some(parent_orset) = dir_cache.get(&dir_ino) {
+                let orset = parent_orset.read().unwrap();
+                self.projection.project_lookup(&orset, name)
+            } else {
+                None
+            }
+            .ok_or_else(|| {
+                FsError::NotFound(format!("unlink: {} not found in dir {}", name, dir_ino))
+            })?;
+
+            if entry.file_type == FileType::Directory {
+                return Err(FsError::IsDirectory(format!(
+                    "unlink: {} is a directory, use rmdir instead",
+                    name
+                )));
+            }
+
+            (entry.inode, entry.id.clone())
+        };
+
+        // 【关键修复】先修改 dir_cache/orset，再清理 inode_index/inode_paths
+        // 避免竞态条件和死锁：必须使用 dir_cache.write()，因为 orset.remove() 会修改 OR-Set
+        // 如果使用 dir_cache.read()，当 rmdir 等待 dir_cache.write() 时会形成死锁
+        {
+            let dir_cache = self.dir_cache.write().unwrap();
+            if let Some(parent_orset) = dir_cache.get(&dir_ino) {
+                let mut orset = parent_orset.write().unwrap();
+                orset.remove(&entry_id);
+            }
         }
 
-        let inode = entry.inode;
-        self.remove_from_local_orset(dir_ino, &entry.id)?;
-        // best-effort 同步到 Master（使用变更缓存）
-        self.add_change(ChangeOp::Delete(entry.inode, false));
+        {
+            let mut index = self.inode_index.write().unwrap();
+            index.remove(&inode);
+        }
+        {
+            let mut paths = self.inode_paths.write().unwrap();
+            paths.remove(&inode);
+        }
+
+        self.add_change(ChangeOp::Delete(inode, false));
         Ok(inode)
     }
 
     /// 删除目录（rmdir）
     pub fn rmdir(&self, dir_ino: u64, name: &str) -> Result<(), FsError> {
-        let entry = self.lookup_local(dir_ino, name).ok_or_else(|| {
-            FsError::NotFound(format!("rmdir: {} not found in dir {}", name, dir_ino))
-        })?;
+        // 【关键修复】整个操作在写锁保护下完成，避免竞态条件
+        // 问题：之前先获取读锁查找信息，释放后再获取写锁执行删除
+        // 在这段时间内，另一个线程可能已经修改了目录内容
+        let (child_inode, _entry_id) = {
+            let mut dir_cache = self.dir_cache.write().unwrap();
 
-        if entry.file_type != FileType::Directory {
-            return Err(FsError::NotDirectory(format!(
-                "rmdir: {} is not a directory",
-                name
-            )));
-        }
+            // 在写锁保护下查找和检查
+            let entry = if let Some(parent_orset) = dir_cache.get(&dir_ino) {
+                let orset = parent_orset.read().unwrap();
+                self.projection.project_lookup(&orset, name)
+            } else {
+                None
+            }
+            .ok_or_else(|| {
+                FsError::NotFound(format!("rmdir: {} not found in dir {}", name, dir_ino))
+            })?;
 
-        let child_inode = entry.inode;
-        let entry_id = entry.id.clone();
+            if entry.file_type != FileType::Directory {
+                return Err(FsError::NotDirectory(format!(
+                    "rmdir: {} is not a directory",
+                    name
+                )));
+            }
 
-        // 一次性获取写锁完成所有操作，避免锁顺序死锁
-        let mut dir_cache = self.dir_cache.write().unwrap();
+            // 检查目录是否为空（在写锁保护下）
+            let is_empty = if let Some(child_orset) = dir_cache.get(&entry.inode) {
+                let orset = child_orset.read().unwrap();
+                orset.is_empty()
+            } else {
+                true
+            };
 
-        // 检查目录是否为空
-        let is_empty = if let Some(child_orset) = dir_cache.get(&child_inode) {
-            let orset = child_orset.read().unwrap();
-            orset.is_empty()
-        } else {
-            true // 缓存已被清理，视为空
+            if !is_empty {
+                return Err(FsError::NotEmpty(format!(
+                    "rmdir: directory {} is not empty",
+                    name
+                )));
+            }
+
+            // 在写锁保护下执行删除
+            if let Some(parent_orset) = dir_cache.get(&dir_ino) {
+                let mut orset = parent_orset.write().unwrap();
+                orset.remove(&entry.id);
+            }
+            dir_cache.remove(&entry.inode);
+
+            (entry.inode, entry.id.clone())
         };
 
-        if !is_empty {
-            return Err(FsError::NotEmpty(format!(
-                "rmdir: directory {} is not empty",
-                name
-            )));
-        }
-
-        // 从父目录 OR-Set 中移除
-        if let Some(parent_orset) = dir_cache.get(&dir_ino) {
-            let mut orset = parent_orset.write().unwrap();
-            orset.remove(&entry_id);
-        }
-
-        // 清理该目录的 OR-Set 缓存
-        dir_cache.remove(&child_inode);
-        drop(dir_cache); // 释放 dir_cache 锁
-
-        // 清理 inode 索引和路径（单独的锁操作）
+        // 清理索引（在 dir_cache 写锁释放后）
         {
             let mut index = self.inode_index.write().unwrap();
             index.remove(&child_inode);
@@ -493,7 +519,6 @@ impl MetadataManager {
             paths.remove(&child_inode);
         }
 
-        // best-effort 同步到 Master（使用变更缓存）
         self.add_change(ChangeOp::Delete(child_inode, true));
         Ok(())
     }
@@ -515,30 +540,76 @@ impl MetadataManager {
         new_dir: u64,
         new_name: &str,
     ) -> Result<Option<u64>, FsError> {
-        let old_entry = self.lookup_local(old_dir, old_name).ok_or_else(|| {
+        if old_dir == new_dir && old_name == new_name {
+            // 同位置重命名，无操作
+            return Ok(None);
+        }
+
+        // 【关键修复】先获取父路径，避免在持有 dir_cache 锁时再获取 inode_paths 锁导致死锁
+        // 锁顺序死锁场景：
+        // - 线程A（rename）: 持有 dir_cache 写锁 → 等待 inode_paths 锁
+        // - 线程B（flush）: 持有 inode_paths 锁 → 等待 dir_cache 锁
+        let parent_path = self.get_path(new_dir).unwrap_or_else(|| "/".to_string());
+        let new_path = if parent_path == "/" {
+            format!("/{}", new_name)
+        } else {
+            format!("{}/{}", parent_path, new_name)
+        };
+
+        // 直接获取写锁，避免先获取读锁再升级到写锁导致的死锁
+        let mut dir_cache = self.dir_cache.write().unwrap();
+
+        // 在持有写锁的情况下查找旧条目
+        let old_entry = if let Some(old_orset) = dir_cache.get(&old_dir) {
+            let orset = old_orset.read().unwrap();
+            self.projection.project_lookup(&orset, old_name)
+        } else {
+            None
+        }
+        .ok_or_else(|| {
             FsError::NotFound(format!("rename: {} not found in dir {}", old_name, old_dir))
         })?;
 
         // 检查目标是否已存在（POSIX 覆盖语义）
-        let overwritten_inode = if old_dir == new_dir && old_name == new_name {
-            // 同位置重命名，无操作
-            None
-        } else {
-            self.lookup_local(new_dir, new_name)
-                .filter(|dest| dest.inode != old_entry.inode)
-                .and_then(|dest| {
+        let (overwritten_inode, dest_to_remove) = if let Some(new_orset) = dir_cache.get(&new_dir) {
+            let orset = new_orset.read().unwrap();
+            if let Some(dest) = self.projection.project_lookup(&orset, new_name) {
+                if dest.inode != old_entry.inode {
                     if dest.file_type == FileType::Directory {
                         // POSIX: 不能用普通文件覆盖目录
-                        // （完整实现需检查空目录+类型匹配，Phase 1A 简化为拒绝）
-                        return None;
+                        return Err(FsError::IsDirectory(format!(
+                            "rename: cannot overwrite directory {}",
+                            new_name
+                        )));
                     }
-                    // tombstone 旧目标
-                    let _ = self.remove_from_local_orset(new_dir, &dest.id);
-                    // best-effort 同步到 Master（使用变更缓存）
-                    self.add_change(ChangeOp::Delete(dest.inode, false));
-                    Some(dest.inode)
-                })
+                    (
+                        Some(dest.inode),
+                        Some((new_dir, dest.id.clone(), dest.inode)),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
         };
+
+        // 如果目标存在，先从新目录移除
+        if let Some((dest_dir, ref dest_id, _)) = dest_to_remove {
+            if let Some(orset) = dir_cache.get(&dest_dir) {
+                let mut orset = orset.write().unwrap();
+                orset.remove(dest_id);
+            }
+        }
+
+        // 从旧目录移除
+        let old_entry_id = old_entry.id.clone();
+        if let Some(orset) = dir_cache.get(&old_dir) {
+            let mut orset = orset.write().unwrap();
+            orset.remove(&old_entry_id);
+        }
 
         // 创建新条目（保留 inode 和大部分属性，更新 name 和 parent_ino）
         let seq = self.next_seq();
@@ -548,27 +619,59 @@ impl MetadataManager {
         new_entry.parent_ino = new_dir;
         new_entry.mtime = now_unix();
 
-        // 从旧目录移除
-        self.remove_from_local_orset(old_dir, &old_entry.id)?;
-
         // 加入新目录
-        self.apply_to_local_orset(new_dir, new_entry.clone())?;
+        let new_orset_arc = if let Some(orset) = dir_cache.get(&new_dir) {
+            orset.clone()
+        } else {
+            let orset = Arc::new(RwLock::new(DirORSet::new(new_dir)));
+            dir_cache.insert(new_dir, orset.clone());
+            orset
+        };
+        {
+            let mut orset = new_orset_arc.write().unwrap();
+            orset.add(new_entry.clone());
+        }
 
-        // 更新 inode 索引和路径
+        // 如果是目录，也需要更新其 OR-Set 的 dir_ino（在释放 dir_cache 锁之前完成）
+        if new_entry.file_type == FileType::Directory {
+            if let Some(child_orset) = dir_cache.get(&new_entry.inode) {
+                let mut orset = child_orset.write().unwrap();
+                orset.dir_ino = new_entry.inode;
+            }
+        }
+
+        // 【关键修复】记录需要更新的 inode 信息，先释放 dir_cache 锁
+        let dest_inode_to_remove = dest_to_remove.map(|(_, _, ino)| ino);
+        let inode_to_update = new_entry.inode;
+        let new_entry_id_for_index = new_entry.id.clone();
+
+        drop(dir_cache);
+
+        // 现在可以安全地更新 inode_index 和 inode_paths（不持有 dir_cache 锁）
+        if let Some(ino) = dest_inode_to_remove {
+            {
+                let mut index = self.inode_index.write().unwrap();
+                index.remove(&ino);
+            }
+            {
+                let mut paths = self.inode_paths.write().unwrap();
+                paths.remove(&ino);
+            }
+        }
+
         {
             let mut index = self.inode_index.write().unwrap();
-            index.insert(new_entry.inode, (new_dir, new_entry.id.clone()));
+            index.insert(inode_to_update, (new_dir, new_entry_id_for_index));
         }
-        self.update_path_for_inode(new_entry.inode, new_dir, new_name);
-
-        // 如果是目录，也需要更新其 OR-Set 的 dir_ino
-        if new_entry.file_type == FileType::Directory {
-            let orset_arc = self.ensure_dir_cache(new_entry.inode);
-            let mut orset = orset_arc.write().unwrap();
-            orset.dir_ino = new_entry.inode;
+        {
+            let mut paths = self.inode_paths.write().unwrap();
+            paths.insert(inode_to_update, new_path.clone());
         }
 
-        // best-effort 同步到 Master（使用变更缓存）
+        // 【关键修复】先释放所有锁再调用 add_change
+        // 避免死锁场景：
+        // - Thread A（rename）: 持有 inode_paths 写锁 → 等待 change_cache 锁
+        // - Thread B（flush_changes）: 持有 change_cache 锁 → 等待 inode_paths 读锁
         self.add_change(ChangeOp::Rename(
             old_dir,
             old_name.to_string(),
@@ -587,7 +690,7 @@ impl MetadataManager {
         size: Option<u64>,
         mtime: Option<u64>,
     ) -> Result<DirEntry, FsError> {
-        // 查找条目
+        // 【关键修复】先从 inode_index 获取信息（短暂持有），然后释放
         let (dir_ino, entry_id) = {
             let index = self.inode_index.read().unwrap();
             index
@@ -595,6 +698,7 @@ impl MetadataManager {
                 .cloned()
                 .ok_or_else(|| FsError::NotFound(format!("setattr: inode {} not found", ino)))?
         };
+        // inode_index 锁已释放
 
         // 更新本地 OR-Set 中的条目
         let orset_arc = self.ensure_dir_cache(dir_ino);
@@ -636,14 +740,17 @@ impl MetadataManager {
 
     /// 确保目录缓存存在，返回 OR-Set 的 Arc
     fn ensure_dir_cache(&self, dir_ino: u64) -> Arc<RwLock<DirORSet>> {
-        // 先尝试读锁
+        // 使用标准的读锁 + 写锁模式
+        // 先尝试读锁，如果找到则直接返回
+        // 如果没找到，释放读锁再获取写锁创建
+        // 这样可以避免读锁升级死锁
         {
             let dir_cache = self.dir_cache.read().unwrap();
             if let Some(orset_arc) = dir_cache.get(&dir_ino) {
                 return orset_arc.clone();
             }
         }
-        // 写锁创建
+        // 读锁已释放，现在获取写锁
         let mut dir_cache = self.dir_cache.write().unwrap();
         dir_cache
             .entry(dir_ino)
@@ -655,6 +762,7 @@ impl MetadataManager {
     fn apply_to_local_orset(&self, dir_ino: u64, entry: DirEntry) -> Result<(), FsError> {
         let inode = entry.inode;
         let entry_id = entry.id.clone();
+        let entry_name = entry_id.name.clone();
 
         let orset_arc = self.ensure_dir_cache(dir_ino);
         {
@@ -668,45 +776,10 @@ impl MetadataManager {
             .unwrap()
             .insert(inode, (dir_ino, entry_id));
 
-        // 更新路径映射
-        self.update_path_for_inode(
-            inode,
-            dir_ino,
-            &self.get_entry_name(inode).unwrap_or_default(),
-        );
+        // 更新路径映射（使用预获取的 entry_name，避免再次获取 inode_index 锁）
+        self.update_path_for_inode(inode, dir_ino, &entry_name);
 
         Ok(())
-    }
-
-    /// 从本地 OR-Set 移除条目
-    fn remove_from_local_orset(&self, dir_ino: u64, entry_id: &EntryId) -> Result<(), FsError> {
-        let orset_arc = self.ensure_dir_cache(dir_ino);
-        {
-            let mut orset = orset_arc.write().unwrap();
-            orset.remove(entry_id);
-        }
-
-        // 清理 inode 索引和路径
-        // 需要找到 entry_id 对应的 inode
-        let inode_to_remove: Option<u64> = {
-            let index = self.inode_index.read().unwrap();
-            index
-                .iter()
-                .find(|(_, (_, id))| id == entry_id)
-                .map(|(&ino, _)| ino)
-        };
-        if let Some(ino) = inode_to_remove {
-            self.inode_index.write().unwrap().remove(&ino);
-            self.inode_paths.write().unwrap().remove(&ino);
-        }
-
-        Ok(())
-    }
-
-    /// 获取 inode 对应的条目名（从索引查）
-    fn get_entry_name(&self, ino: u64) -> Option<String> {
-        let index = self.inode_index.read().unwrap();
-        index.get(&ino).map(|(_, id)| id.name.clone())
     }
 
     /// 失效本地缓存条目（用于接收远程删除通知时）
@@ -881,25 +954,17 @@ impl MetadataManager {
 
     // ==================== 变更缓存（Change Cache） ====================
 
-    /// 添加变更到变更缓存
+    /// 添加变更到变更缓存（无锁化设计）
+    /// 使用 crossbeam channel 替代 Mutex，完全消除锁竞争
     fn add_change(&self, op: ChangeOp) {
-        let mut cache = self.change_cache.lock().unwrap();
-        cache.pending_changes.push(op);
-        cache.last_flush_time = now_unix();
-        self.has_pending_changes.store(true, Ordering::Relaxed);
-
-        // 如果达到批量大小，立即触发一次 flush（非阻塞）
-        if cache.pending_changes.len() >= CHANGE_CACHE_BATCH_SIZE {
-            let _ = self.flush_changes();
+        if let Err(e) = self.change_sender.try_send(op) {
+            warn!("Failed to send change to channel: {}", e);
         }
     }
 
-    /// 启动变更缓存 flush 线程
-    fn start_change_cache_flusher(
-        &self,
-        change_cache: Arc<Mutex<ChangeCache>>,
-        has_pending_changes: Arc<AtomicBool>,
-    ) {
+    /// 启动变更缓存 flush 线程（无锁化设计）
+    /// 使用 crossbeam channel 的 try_recv 批量收集变更，完全消除锁竞争
+    fn start_change_cache_flusher(&self, change_receiver: Receiver<ChangeOp>) {
         let client = match &self.client {
             Some(c) => c.clone(),
             None => return,
@@ -913,139 +978,62 @@ impl MetadataManager {
             loop {
                 thread::sleep(Duration::from_millis(10));
 
-                if !has_pending_changes.load(Ordering::Relaxed) {
+                let mut changes = Vec::with_capacity(CHANGE_CACHE_BATCH_SIZE);
+                while let Ok(change) = change_receiver.try_recv() {
+                    changes.push(change);
+                    if changes.len() >= CHANGE_CACHE_BATCH_SIZE {
+                        break;
+                    }
+                }
+
+                if changes.is_empty() {
                     continue;
                 }
 
-                let now = now_unix();
+                info!("Flushing {} pending changes to Master", changes.len());
 
-                let should_flush = {
-                    let cache = change_cache.lock().unwrap();
-                    if cache.pending_changes.is_empty() {
-                        false
-                    } else {
-                        let cache_time_since_flush = (now - cache.last_flush_time) as f64 / 1000.0;
-                        cache.pending_changes.len() >= CHANGE_CACHE_BATCH_SIZE
-                            || cache_time_since_flush >= CHANGE_CACHE_FLUSH_INTERVAL_S
-                    }
-                };
-
-                if should_flush {
-                    let mut cache = change_cache.lock().unwrap();
-                    if cache.pending_changes.is_empty() {
-                        continue;
-                    }
-
-                    let changes: Vec<ChangeOp> = cache.pending_changes.drain(..).collect();
-                    drop(cache);
-
-                    info!("Flushing {} pending changes to Master", changes.len());
-
-                    for change in changes {
-                        match change {
-                            ChangeOp::Create(entry) => {
-                                if let Err(e) = sync_create_to_master_helper(
-                                    &client,
-                                    &client_id_str,
-                                    &entry,
-                                    &inode_paths,
-                                ) {
-                                    warn!("Failed to sync create to master: {}", e);
-                                }
+                for change in changes {
+                    match change {
+                        ChangeOp::Create(entry) => {
+                            if let Err(e) = sync_create_to_master_helper(
+                                &client,
+                                &client_id_str,
+                                &entry,
+                                &inode_paths,
+                            ) {
+                                warn!("Failed to sync create to master: {}", e);
                             }
-                            ChangeOp::Delete(ino, is_dir) => {
-                                if let Err(e) = client.delete_entry(ino, is_dir, &client_id_str) {
-                                    warn!("Failed to sync delete to master: {}", e);
-                                }
+                        }
+                        ChangeOp::Delete(ino, is_dir) => {
+                            if let Err(e) = client.delete_entry(ino, is_dir, &client_id_str) {
+                                warn!("Failed to sync delete to master: {}", e);
                             }
-                            ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
-                                if let Err(e) = client.rename_entry(
-                                    old_dir,
-                                    &old_name,
-                                    new_dir,
-                                    &new_name,
-                                    &client_id_str,
-                                ) {
-                                    warn!("Failed to sync rename to master: {}", e);
-                                }
+                        }
+                        ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
+                            if let Err(e) = client.rename_entry(
+                                old_dir,
+                                &old_name,
+                                new_dir,
+                                &new_name,
+                                &client_id_str,
+                            ) {
+                                warn!("Failed to sync rename to master: {}", e);
                             }
-                            ChangeOp::SetAttr(entry) => {
-                                if let Err(e) = sync_setattr_to_master_helper(
-                                    &client,
-                                    &client_id_str,
-                                    &entry,
-                                    &inode_paths,
-                                ) {
-                                    warn!("Failed to sync setattr to master: {}", e);
-                                }
+                        }
+                        ChangeOp::SetAttr(entry) => {
+                            if let Err(e) = sync_setattr_to_master_helper(
+                                &client,
+                                &client_id_str,
+                                &entry,
+                                &inode_paths,
+                            ) {
+                                warn!("Failed to sync setattr to master: {}", e);
                             }
                         }
                     }
-
-                    has_pending_changes.store(false, Ordering::Relaxed);
                 }
             }
         });
-    }
-
-    /// 手动触发一次变更缓存 flush
-    fn flush_changes(&self) -> Result<(), FsError> {
-        let mut cache = self.change_cache.lock().unwrap();
-        if cache.pending_changes.is_empty() {
-            return Ok(());
-        }
-
-        let changes: Vec<ChangeOp> = cache.pending_changes.drain(..).collect();
-        drop(cache);
-
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return Ok(()),
-        };
-
-        for change in changes {
-            match change {
-                ChangeOp::Create(entry) => {
-                    if let Err(e) = sync_create_to_master_helper(
-                        &client,
-                        &self.client_id_str,
-                        &entry,
-                        &self.inode_paths,
-                    ) {
-                        warn!("Failed to sync create to master: {}", e);
-                    }
-                }
-                ChangeOp::Delete(ino, is_dir) => {
-                    if let Err(e) = client.delete_entry(ino, is_dir, &self.client_id_str) {
-                        warn!("Failed to sync delete to master: {}", e);
-                    }
-                }
-                ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
-                    if let Err(e) = client.rename_entry(
-                        old_dir,
-                        &old_name,
-                        new_dir,
-                        &new_name,
-                        &self.client_id_str,
-                    ) {
-                        warn!("Failed to sync rename to master: {}", e);
-                    }
-                }
-                ChangeOp::SetAttr(entry) => {
-                    if let Err(e) = sync_setattr_to_master_helper(
-                        &client,
-                        &self.client_id_str,
-                        &entry,
-                        &self.inode_paths,
-                    ) {
-                        warn!("Failed to sync setattr to master: {}", e);
-                    }
-                }
-            }
-        }
-
-        self.has_pending_changes.store(false, Ordering::Relaxed);
-        Ok(())
     }
 
     // ==================== Master 同步（best-effort） ====================
@@ -1082,7 +1070,33 @@ impl MetadataManager {
                 .unwrap_or_else(|| "/".to_string())
         };
 
-        // 批量更新：获取 OR-Set 锁
+        // 预计算所有条目数据（不持有锁）
+        let mut dir_entries = Vec::with_capacity(num_entries);
+        let mut index_updates = Vec::with_capacity(num_entries);
+        let mut path_updates = Vec::with_capacity(num_entries);
+
+        for proto_entry in entries {
+            let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
+            let ino = dir_entry.inode;
+            let entry_id = dir_entry.id.clone();
+
+            dir_entries.push(dir_entry);
+            index_updates.push((ino, (dir_ino, entry_id)));
+
+            let child_path = if parent_path == "/" {
+                format!("/{}", proto_entry.name)
+            } else {
+                format!("{}/{}", parent_path, proto_entry.name)
+            };
+            path_updates.push((ino, child_path));
+        }
+
+        // 【关键修复】分开更新，避免同时持有 orset_arc 和 inode_index/inode_paths 锁
+        // 死锁场景：
+        // - 线程A（rmdir）: 持有 orset_arc 读锁 → 等待 inode_index 写锁
+        // - 线程B（此函数）: 持有 inode_index 写锁 → 等待 orset_arc 写锁
+
+        // 第一步：更新 OR-Set（只持有 dir_cache 和 orset_arc 锁）
         let orset_arc = {
             let mut dir_cache = self.dir_cache.write().unwrap();
             dir_cache
@@ -1091,24 +1105,26 @@ impl MetadataManager {
                 .clone()
         };
 
-        let mut orset = orset_arc.write().unwrap();
-        let mut inode_index = self.inode_index.write().unwrap();
-        let mut inode_paths = self.inode_paths.write().unwrap();
+        {
+            let mut orset = orset_arc.write().unwrap();
+            for dir_entry in dir_entries {
+                orset.add(dir_entry);
+            }
+        }
 
-        for proto_entry in entries {
-            let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
-            let ino = dir_entry.inode;
-            let entry_id = dir_entry.id.clone();
+        // 第二步：更新 inode_index 和 inode_paths（只持有这两个锁）
+        {
+            let mut inode_index = self.inode_index.write().unwrap();
+            for (ino, entry) in index_updates {
+                inode_index.insert(ino, entry);
+            }
+        }
 
-            orset.add(dir_entry);
-            inode_index.insert(ino, (dir_ino, entry_id));
-
-            let child_path = if parent_path == "/" {
-                format!("/{}", proto_entry.name)
-            } else {
-                format!("{}/{}", parent_path, proto_entry.name)
-            };
-            inode_paths.insert(ino, child_path);
+        {
+            let mut inode_paths = self.inode_paths.write().unwrap();
+            for (ino, path) in path_updates {
+                inode_paths.insert(ino, path);
+            }
         }
 
         debug!(
@@ -1130,37 +1146,64 @@ impl MetadataManager {
             .list_entries(dir_ino, 10000, "")
             .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
 
-        let orset_arc = self.ensure_dir_cache(dir_ino);
-        let mut orset = orset_arc.write().unwrap();
+        // 【关键修复】先获取父路径（不持有其他锁），避免违反锁顺序
+        let parent_path = {
+            let paths = self.inode_paths.read().unwrap();
+            paths
+                .get(&dir_ino)
+                .cloned()
+                .unwrap_or_else(|| "/".to_string())
+        };
 
-        let parent_path = self.get_path(dir_ino).unwrap_or_else(|| "/".to_string());
+        let num_entries = entries.len();
+
+        let mut dir_entries = Vec::with_capacity(num_entries);
+        let mut index_updates = Vec::with_capacity(num_entries);
+        let mut path_updates = Vec::with_capacity(num_entries);
 
         for proto_entry in entries {
             let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
             let ino = dir_entry.inode;
             let entry_id = dir_entry.id.clone();
 
-            orset.add(dir_entry);
+            dir_entries.push(dir_entry);
+            index_updates.push((ino, (dir_ino, entry_id)));
 
-            // 更新索引
-            self.inode_index
-                .write()
-                .unwrap()
-                .insert(ino, (dir_ino, entry_id));
-
-            // 更新路径
             let child_path = if parent_path == "/" {
                 format!("/{}", proto_entry.name)
             } else {
                 format!("{}/{}", parent_path, proto_entry.name)
             };
-            self.inode_paths.write().unwrap().insert(ino, child_path);
+            path_updates.push((ino, child_path));
+        }
+
+        // 按正确锁顺序更新：dir_cache → orset_arc → inode_index → inode_paths
+        let orset_arc = self.ensure_dir_cache(dir_ino);
+
+        {
+            let mut orset = orset_arc.write().unwrap();
+            for dir_entry in dir_entries {
+                orset.add(dir_entry);
+            }
+        }
+
+        {
+            let mut inode_index = self.inode_index.write().unwrap();
+            for (ino, entry) in index_updates {
+                inode_index.insert(ino, entry);
+            }
+        }
+
+        {
+            let mut inode_paths = self.inode_paths.write().unwrap();
+            for (ino, path) in path_updates {
+                inode_paths.insert(ino, path);
+            }
         }
 
         debug!(
             "fetch_dir_from_master: dir_ino={}, entries={}",
-            dir_ino,
-            orset.len()
+            dir_ino, num_entries
         );
         Ok(())
     }
@@ -1178,22 +1221,29 @@ impl MetadataManager {
 
         match result {
             Some((proto_entry, path)) => {
-                // 从 path 推断 parent_ino
                 let parent_ino = self.infer_parent_ino_from_path(&path);
                 let dir_entry = proto_to_dir_entry(&proto_entry, parent_ino);
-
-                // 更新索引和路径
                 let entry_id = dir_entry.id.clone();
-                self.inode_index
-                    .write()
-                    .unwrap()
-                    .insert(ino, (parent_ino, entry_id));
-                self.inode_paths.write().unwrap().insert(ino, path);
 
-                // 加入父目录的 OR-Set
+                // 【关键修复】按正确锁顺序更新：dir_cache → orset_arc → inode_index → inode_paths
+                // 先更新 OR-Set（需要 dir_cache）
                 let orset_arc = self.ensure_dir_cache(parent_ino);
-                let mut orset = orset_arc.write().unwrap();
-                orset.add(dir_entry.clone());
+                {
+                    let mut orset = orset_arc.write().unwrap();
+                    orset.add(dir_entry.clone());
+                }
+
+                // 再更新 inode_index
+                {
+                    let mut inode_index = self.inode_index.write().unwrap();
+                    inode_index.insert(ino, (parent_ino, entry_id));
+                }
+
+                // 最后更新 inode_paths
+                {
+                    let mut inode_paths = self.inode_paths.write().unwrap();
+                    inode_paths.insert(ino, path);
+                }
 
                 Ok(Some(dir_entry))
             }
@@ -1673,15 +1723,11 @@ fn apply_delta_helper(
                 let dir_ino = entry.parent_ino;
 
                 let orset_arc = {
-                    let cache = dir_cache.read().expect("dir_cache lock poisoned");
-                    if let Some(arc) = cache.get(&dir_ino) {
-                        arc.clone()
-                    } else {
-                        let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
-                        let arc = Arc::new(RwLock::new(DirORSet::new(dir_ino)));
-                        cache.insert(dir_ino, arc.clone());
-                        arc
-                    }
+                    let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
+                    cache
+                        .entry(dir_ino)
+                        .or_insert_with(|| Arc::new(RwLock::new(DirORSet::new(dir_ino))))
+                        .clone()
                 };
 
                 {
@@ -1718,27 +1764,34 @@ fn apply_delta_helper(
         Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(id)) => {
             let entry_id = EntryId::new(id.name.clone(), id.client_id, id.seq);
 
-            let mut index = inode_index.write().expect("inode_index lock poisoned");
-            let inode_to_remove: Option<u64> = index
-                .iter()
-                .find(|(_, (_, eid))| eid == &entry_id)
-                .map(|(&ino, _)| ino);
+            // 【关键修复】先获取 inode_index 信息，立即释放
+            let ino_info = {
+                let index = inode_index.read().expect("inode_index lock poisoned");
+                index
+                    .iter()
+                    .find(|(_, (_, eid))| eid == &entry_id)
+                    .map(|(&ino, &(d, ref e))| (ino, d, e.clone()))
+            };
 
-            if let Some(ino) = inode_to_remove {
-                if let Some((dir_ino, eid)) = index.remove(&ino) {
-                    let orset_arc = {
-                        let cache = dir_cache.read().expect("dir_cache lock poisoned");
-                        cache.get(&dir_ino).cloned()
-                    };
-                    if let Some(arc) = orset_arc {
-                        let mut orset = arc.write().expect("orset lock poisoned");
-                        orset.remove(&eid);
-                    }
+            if let Some((ino, dir_ino, eid)) = ino_info {
+                // 【关键修复】按正确锁顺序：先 dir_cache/orset，再 inode_index，最后 inode_paths
+                let orset_arc = {
+                    let cache = dir_cache.read().expect("dir_cache lock poisoned");
+                    cache.get(&dir_ino).cloned()
+                };
+                if let Some(arc) = orset_arc {
+                    let mut orset = arc.write().expect("orset lock poisoned");
+                    orset.remove(&eid);
+                }
 
-                    inode_paths
-                        .write()
-                        .expect("inode_paths lock poisoned")
-                        .remove(&ino);
+                {
+                    let mut index = inode_index.write().expect("inode_index lock poisoned");
+                    index.remove(&ino);
+                }
+
+                {
+                    let mut paths = inode_paths.write().expect("inode_paths lock poisoned");
+                    paths.remove(&ino);
                 }
             }
         }
@@ -1748,49 +1801,57 @@ fn apply_delta_helper(
                     let old_entry_id =
                         EntryId::new(old_id.name.clone(), old_id.client_id, old_id.seq);
 
-                    let mut index = inode_index.write().expect("inode_index lock poisoned");
-                    let inode_to_rename: Option<u64> = index
-                        .iter()
-                        .find(|(_, (_, eid))| eid == &old_entry_id)
-                        .map(|(&ino, _)| ino);
+                    // 【关键修复】先获取 inode_index 信息，立即释放
+                    let ino_info = {
+                        let index = inode_index.read().expect("inode_index lock poisoned");
+                        index
+                            .iter()
+                            .find(|(_, (_, eid))| eid == &old_entry_id)
+                            .map(|(&ino, &(d, _))| (ino, d))
+                    };
 
-                    if let Some(ino) = inode_to_rename {
-                        if let Some((old_dir_ino, _)) = index.get(&ino) {
-                            let orset_arc_old = {
-                                let cache = dir_cache.read().expect("dir_cache lock poisoned");
-                                cache.get(old_dir_ino).cloned()
-                            };
-                            if let Some(arc) = orset_arc_old {
-                                let mut orset_old = arc.write().expect("orset lock poisoned");
-                                orset_old.remove(&old_entry_id);
-                            }
+                    if let Some((ino, old_dir_ino)) = ino_info {
+                        // 【关键修复】按正确锁顺序：先 dir_cache/orset，再 inode_index，最后 inode_paths
+
+                        // 从旧目录 OR-Set 移除
+                        let orset_arc_old = {
+                            let cache = dir_cache.write().expect("dir_cache lock poisoned");
+                            cache.get(&old_dir_ino).cloned()
+                        };
+                        if let Some(arc) = orset_arc_old {
+                            let mut orset_old = arc.write().expect("orset lock poisoned");
+                            orset_old.remove(&old_entry_id);
                         }
 
+                        // 添加到新目录 OR-Set
                         let dir_entry = proto_dir_entry_to_local(new_entry);
                         let new_dir_ino = new_entry.parent_ino;
 
                         let orset_arc_new = {
-                            let cache = dir_cache.read().expect("dir_cache lock poisoned");
-                            if let Some(arc) = cache.get(&new_dir_ino) {
-                                arc.clone()
-                            } else {
-                                let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
-                                let arc = Arc::new(RwLock::new(DirORSet::new(new_dir_ino)));
-                                cache.insert(new_dir_ino, arc.clone());
-                                arc
-                            }
+                            let mut cache = dir_cache.write().expect("dir_cache lock poisoned");
+                            cache
+                                .entry(new_dir_ino)
+                                .or_insert_with(|| {
+                                    Arc::new(RwLock::new(DirORSet::new(new_dir_ino)))
+                                })
+                                .clone()
                         };
                         let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
                         orset_new.add(dir_entry.clone());
 
-                        index.insert(
-                            ino,
-                            (
-                                new_dir_ino,
-                                EntryId::new(new_id.name.clone(), new_id.client_id, new_id.seq),
-                            ),
-                        );
+                        // 更新 inode_index
+                        {
+                            let mut index = inode_index.write().expect("inode_index lock poisoned");
+                            index.insert(
+                                ino,
+                                (
+                                    new_dir_ino,
+                                    EntryId::new(new_id.name.clone(), new_id.client_id, new_id.seq),
+                                ),
+                            );
+                        }
 
+                        // 更新 inode_paths
                         let parent_path = {
                             let paths = inode_paths.read().expect("inode_paths lock poisoned");
                             paths
