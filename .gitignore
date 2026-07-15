@@ -35,3 +35,6 @@ kernel/**/Module.symvers
 kernel/**/modules.order
 kernel/**/.*.cmd
 kernel/**/.*.o
+
+# python
+__pycache__
