@@ -173,7 +173,7 @@ impl MetadataManager {
                     vclock.observe(client_id_num, *counter);
 
                     let mut orsets = orsets.write().unwrap();
-                    for (_dir_ino, orset) in orsets.iter_mut() {
+                    for orset in orsets.values_mut() {
                         if orset.get_by_inode(inode).is_some() {
                             let delta = powerfs_orset::DeltaOp::SetAttr {
                                 inode,
@@ -200,7 +200,7 @@ impl MetadataManager {
                     vclock.observe(client_id_num, *counter);
 
                     let mut orsets = orsets.write().unwrap();
-                    for (_, orset) in orsets.iter_mut() {
+                    for orset in orsets.values_mut() {
                         let ids: Vec<_> = orset
                             .get_by_name(&name)
                             .iter()
