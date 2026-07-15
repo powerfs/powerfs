@@ -101,6 +101,41 @@ PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-in
 
 ### 3-Layer Decoupled Architecture
 
+```
+┌────────────────────────────────────────────────────────────┐
+│                      Client Layer                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
+│  │  FUSE    │  │    S3    │  │      KV Cache Client     │  │
+│  │ (POSIX)  │  │  Client  │  │  (for LLM Inference)     │  │
+│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
+└───────┼──────────────┼───────────────────┼─────────────────┘
+        │              │                   │
+┌───────▼──────────────▼───────────────────▼─────────────────┐
+│      OR-Set CRDT Weak-Consistency Metadata Layer (Core)    │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Lockless Cache | Delta Sync | Conflict Merge        │  │
+│  │  Multi-Protocol Isolation (POSIX/KV/S3)              │  │
+│  └──────────────────────────────────────────────────────┘  │
+└──────────────────────┬─────────────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────────────┐
+│         Raft Global Scheduling Layer                       │
+│              (High-Availability Cluster)                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Cluster Management | Resource Allocation | Topology │  │
+│  └──────────────────────────────────────────────────────┘  │
+└──────────────────────┬─────────────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────────────┐
+│         Multi-Interface Unified Data Layer                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │      │
+│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│        [Unified Needle Binary Format]                      │
+└────────────────────────────────────────────────────────────┘
+```
+
 1. **OR-Set CRDT Weak-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Lockless OR-Set CRDT directory cache with `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite. Eliminates broadcast storm via incremental delta sync, enabling unlimited client linear scaling. Native multi-protocol metadata isolation for POSIX/KV/S3.
 
 2. **Raft Global Scheduling Layer**: High availability cluster providing the underlying consistency guarantee for the CRDT layer, responsible for cluster topology management, resource allocation and conflict policy management. It only maintains global metadata mapping without storing massive business data.
@@ -505,43 +540,6 @@ cargo test -p powerfs-core
 
 # Run storage benchmark tests
 cargo test -p powerfs-core --test storage_benchmark_test -- --nocapture
-```
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Client Layer                           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
-│  │  FUSE    │  │    S3    │  │      KV Cache Client     │  │
-│  │ (POSIX)  │  │  Client  │  │  (for LLM Inference)     │  │
-│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
-└───────┼──────────────┼───────────────────┼─────────────────┘
-        │              │                   │
-┌───────▼──────────────▼───────────────────▼─────────────────┐
-│      OR-Set CRDT Weak-Consistency Metadata Layer (Core)    │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Lockless Cache | Delta Sync | Conflict Merge        │  │
-│  │  Multi-Protocol Isolation (POSIX/KV/S3)              │  │
-│  └──────────────────────────────────────────────────────┘  │
-└──────────────────────┬─────────────────────────────────────┘
-                       │
-┌──────────────────────▼─────────────────────────────────────┐
-│         Raft Global Scheduling Layer                        │
-│              (High-Availability Cluster)                    │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Cluster Management | Resource Allocation | Topology │  │
-│  └──────────────────────────────────────────────────────┘  │
-└──────────────────────┬─────────────────────────────────────┘
-                       │
-┌──────────────────────▼─────────────────────────────────────┐
-│         Multi-Interface Unified Data Layer                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │     │
-│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-│        [Unified Needle Binary Format]                      │
-└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
