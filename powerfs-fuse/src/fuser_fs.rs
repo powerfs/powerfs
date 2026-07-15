@@ -1311,6 +1311,9 @@ impl FuserApp {
             }
         };
 
+        // 在创建 fs 之前先 clone meta，以便后续元数据订阅线程使用
+        let meta_clone_for_subscribe = meta.clone();
+
         // 创建 FUSE 文件系统
         let fs = PowerFsFuserFs::new(
             sync_client.clone(),
@@ -1322,7 +1325,7 @@ impl FuserApp {
             statfs_cache_value,
         );
 
-        // 后台 statfs 缓存更新线程（每 1 分钟更新一次）
+        // 后台 statfs 缓存更新线程（每 5 秒更新一次，及时反映空间使用变化）
         let fs_clone_for_statfs = fs.clone();
         let collection_clone_for_statfs = self.collection.clone();
         std::thread::spawn(move || loop {
@@ -1330,9 +1333,82 @@ impl FuserApp {
                 .client
                 .get_statistics(&collection_clone_for_statfs);
             if let Ok(stats) = result {
-                *fs_clone_for_statfs.statfs_cache.lock().unwrap() = Some(stats);
+                let mut cache_guard = fs_clone_for_statfs.statfs_cache.lock().unwrap();
+                *cache_guard = Some(stats);
             }
-            std::thread::sleep(Duration::from_secs(60));
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        // 后台元数据订阅线程（实时接收 Master 的目录变更通知）
+        let meta_clone = meta_clone_for_subscribe;
+        let fs_clone_for_notify = fs.clone();
+        let grpc_client_clone_for_subscribe = grpc_client.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                loop {
+                    match grpc_client_clone_for_subscribe
+                        .subscribe_metadata("/")
+                        .await
+                    {
+                        Ok(mut stream) => {
+                            info!("Successfully subscribed to metadata notifications");
+                            while let Some(notification) = stream.message().await.unwrap_or(None) {
+                                if notification.event_type == 2 {
+                                    // DELETE
+                                    let path = notification.path;
+                                    if !path.is_empty() {
+                                        info!("Received DELETE notification for: {}", path);
+                                        // 立即失效相关目录缓存
+                                        let parts: Vec<&str> =
+                                            path.split('/').filter(|p| !p.is_empty()).collect();
+                                        if !parts.is_empty() {
+                                            // 逐级查找父目录 inode（从 ROOT 开始）
+                                            let mut current_ino = 1; // ROOT_INO
+                                            let mut found = true;
+                                            for (i, part) in parts.iter().enumerate() {
+                                                if i == parts.len() - 1 {
+                                                    break; // 到达最后一个部分，current_ino 就是父目录
+                                                }
+                                                if let Some(entry) =
+                                                    meta_clone.lookup_local(current_ino, part)
+                                                {
+                                                    current_ino = entry.inode;
+                                                } else {
+                                                    found = false;
+                                                    break;
+                                                }
+                                            }
+                                            if found {
+                                                let entry_name = parts.last().unwrap();
+                                                // 从本地 OR-Set 移除被删除的条目
+                                                meta_clone.invalidate_local_cache_entry(
+                                                    current_ino,
+                                                    entry_name,
+                                                );
+
+                                                // 关键：同时失效内核 VFS 缓存，让 ls 等命令立即看到变化
+                                                fs_clone_for_notify.invalidate_kernel_dentry(
+                                                    current_ino,
+                                                    entry_name,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            info!("Metadata notification stream closed, reconnecting...");
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to subscribe to metadata notifications: {}, retrying in 5s",
+                                e
+                            );
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
         });
 
         // 后台 flush 线程（每 100ms 检查脏标记）

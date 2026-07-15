@@ -648,23 +648,31 @@ impl MasterNode {
                 VolumeState::Available
             };
 
-            volumes_map.insert(
-                vid,
-                VolumeInfo {
-                    id: vid,
-                    node_id: nid.clone(),
-                    collection: Collection(vol.collection.clone()),
-                    size: vol.size,
-                    used: vol.used,
-                    replica_count: 1,
-                    ttl: Ttl::default(),
-                    disk_type: DiskType::default(),
-                    state,
-                    created_at: Utc::now(),
-                    modified_at: Utc::now(),
-                    next_file_key: 1,
-                },
-            );
+            // 增量更新：只更新变化的字段（used, state），保留其他原有字段
+            if let Some(existing) = volumes_map.get_mut(&vid) {
+                existing.used = vol.used;
+                existing.state = state;
+                existing.modified_at = Utc::now();
+            } else {
+                // 新增 volume（首次注册）
+                volumes_map.insert(
+                    vid,
+                    VolumeInfo {
+                        id: vid,
+                        node_id: nid.clone(),
+                        collection: Collection(vol.collection.clone()),
+                        size: vol.size,
+                        used: vol.used,
+                        replica_count: 1,
+                        ttl: Ttl::default(),
+                        disk_type: DiskType::default(),
+                        state,
+                        created_at: Utc::now(),
+                        modified_at: Utc::now(),
+                        next_file_key: 1,
+                    },
+                );
+            }
         }
 
         Ok(())

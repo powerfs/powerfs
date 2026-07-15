@@ -1,8 +1,9 @@
-use powerfs_core::ec_thread::{EcConfig, EcEncoder, EcThread};
+use powerfs_core::ec_thread::{EcConfig, EcEncoder, EcThreadPool};
 
 #[tokio::test]
 async fn test_ec_encoder_encode_basic() {
-    let config = EcConfig::default();
+    let mut config = EcConfig::default();
+    config.min_small_file_size = 0;
     let encoder = EcEncoder::new(config);
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -67,12 +68,13 @@ async fn test_ec_encoder_can_recover() {
 }
 
 #[tokio::test]
-async fn test_ec_thread_encode() {
-    let config = EcConfig::default();
-    let ec_thread = EcThread::start(config.clone());
+async fn test_ec_thread_pool_encode() {
+    let mut config = EcConfig::default();
+    config.min_small_file_size = 0;
+    let ec_pool = EcThreadPool::start(config.clone());
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-    let result = ec_thread.encode(data, config).await;
+    let result = ec_pool.encode(data, config).await;
 
     assert!(result.is_ok());
     let shards = result.unwrap();
@@ -80,16 +82,16 @@ async fn test_ec_thread_encode() {
 }
 
 #[tokio::test]
-async fn test_ec_thread_decode() {
+async fn test_ec_thread_pool_decode() {
     let config = EcConfig::default();
-    let ec_thread = EcThread::start(config.clone());
+    let ec_pool = EcThreadPool::start(config.clone());
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
 
     let encoder = EcEncoder::new(config.clone());
     let shards = encoder.encode(&data);
 
-    let result = ec_thread.decode(shards, config).await;
+    let result = ec_pool.decode(shards, config).await;
 
     assert!(result.is_ok());
     let restored = result.unwrap();
@@ -97,18 +99,15 @@ async fn test_ec_thread_decode() {
 }
 
 #[tokio::test]
-async fn test_ec_thread_roundtrip() {
+async fn test_ec_thread_pool_roundtrip() {
     let config = EcConfig::default();
-    let ec_thread = EcThread::start(config.clone());
+    let ec_pool = EcThreadPool::start(config.clone());
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
 
-    let shards = ec_thread
-        .encode(data.clone(), config.clone())
-        .await
-        .unwrap();
+    let shards = ec_pool.encode(data.clone(), config.clone()).await.unwrap();
 
-    let restored = ec_thread.decode(shards, config).await.unwrap();
+    let restored = ec_pool.decode(shards, config).await.unwrap();
 
     assert_eq!(restored, data);
 }

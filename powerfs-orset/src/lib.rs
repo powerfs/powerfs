@@ -1,6 +1,6 @@
 //! OR-Set (Observed-Remove Set) 核心数据结构
 //!
-//! 用于目录条目的弱一致缓存。每个条目由 (name, client_id, seq) 唯一标识，
+//! 用于目录条目的弱一致缓存。每个条目由 (name, `client_id`, seq) 唯一标识，
 //! 避免并发写覆盖。配合 VectorClock 判定因果顺序与并发冲突。
 
 use std::collections::{HashMap, HashSet};
@@ -289,21 +289,21 @@ impl VectorClock {
             .copied()
             .collect();
 
-        let mut self_le = true;
-        let mut self_ge = true;
+        let mut is_less_or_equal = true;
+        let mut is_greater_or_equal = true;
 
         for key in all_keys {
             let s = self.get(key);
             let o = other.get(key);
             if s > o {
-                self_le = false;
+                is_less_or_equal = false;
             }
             if s < o {
-                self_ge = false;
+                is_greater_or_equal = false;
             }
         }
 
-        match (self_le, self_ge) {
+        match (is_less_or_equal, is_greater_or_equal) {
             (true, true) => CausalOrder::Equal,
             (true, false) => CausalOrder::Before,
             (false, true) => CausalOrder::After,

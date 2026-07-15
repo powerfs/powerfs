@@ -26,6 +26,7 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         hard_link_counter: 0,
         content_size: 0,
         disk_size: 0,
+        generation: 0,
     }
 }
 
@@ -52,6 +53,7 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         hard_link_counter: 0,
         content_size: 0,
         disk_size: 0,
+        generation: 0,
     }
 }
 

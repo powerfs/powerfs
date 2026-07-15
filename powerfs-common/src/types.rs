@@ -257,7 +257,7 @@ impl Fid {
         let volume_id = (session_id.len() as u32 % 1000) + 1;
         let cookie = ((layer_id as u64) << 32) | (block_index as u64);
         let file_key =
-            session_id.len() as u64 * 1000000 + layer_id as u64 * 1000 + block_index as u64;
+            session_id.len() as u64 * 1_000_000 + layer_id as u64 * 1_000 + block_index as u64;
         Fid {
             volume_id: VolumeId(volume_id),
             cookie,

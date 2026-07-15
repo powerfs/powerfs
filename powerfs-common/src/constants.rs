@@ -29,5 +29,5 @@ pub const POWERFS_VERSION: &str = "0.1.0";
 pub const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 pub const MAX_BLOCK_SIZE: usize = 1024 * 1024;
 
-pub const LRU_CACHE_SIZE: usize = 100000;
-pub const INDEX_CACHE_SIZE: usize = 10000;
+pub const LRU_CACHE_SIZE: usize = 100_000;
+pub const INDEX_CACHE_SIZE: usize = 10_000;

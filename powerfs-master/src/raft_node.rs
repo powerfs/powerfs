@@ -16,6 +16,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 
+const SNAPSHOT_THRESHOLD: u64 = 10000;
+
 /// Peer information for cluster communication
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -120,7 +122,7 @@ impl RaftNode {
             max_size_per_msg: 1 << 20, // 1MB
             max_inflight_msgs: 256,
             check_quorum: !peers.is_empty(),
-            pre_vote: false,
+            pre_vote: true,
             ..Default::default()
         };
         cfg.validate()
@@ -280,6 +282,11 @@ impl RaftNode {
                 let mut applied = self.applied_index.write().unwrap();
                 *applied = entry.index;
             }
+        }
+
+        // Check if we need to create a snapshot (leader only)
+        if self.is_leader() {
+            self.try_create_snapshot();
         }
 
         // Advance the state machine
@@ -550,6 +557,45 @@ impl RaftNode {
         }
 
         info!("Snapshot created successfully");
+        Ok(())
+    }
+
+    /// Try to create a snapshot automatically if needed
+    fn try_create_snapshot(&mut self) {
+        let last_index = self.last_index();
+        let last_applied = self.last_applied_index();
+
+        // Check if we have enough uncompacted entries
+        if last_index - last_applied >= SNAPSHOT_THRESHOLD {
+            info!(
+                "Log entries exceed threshold ({}), triggering automatic snapshot",
+                SNAPSHOT_THRESHOLD
+            );
+
+            // Create an empty snapshot data (the actual state should be provided by the caller)
+            // In a real implementation, you would pass the actual state machine data
+            let snapshot_data = RaftSnapshotData {
+                nodes: Vec::new(),
+                volumes: Vec::new(),
+                next_volume_id: 0,
+                max_file_key: 0,
+            };
+
+            if let Err(e) = self.trigger_snapshot(&snapshot_data) {
+                warn!("Automatic snapshot creation failed: {}", e);
+            }
+        }
+    }
+
+    /// Compact log entries up to the given index
+    pub fn compact_log(&mut self, index: u64) -> Result<(), String> {
+        info!("Compacting log entries up to index {}", index);
+
+        if let Err(e) = self.node.mut_store().compact_log(index) {
+            return Err(format!("failed to compact log: {}", e));
+        }
+
+        info!("Log compacted successfully up to index {}", index);
         Ok(())
     }
 

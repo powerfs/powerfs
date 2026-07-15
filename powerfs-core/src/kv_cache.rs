@@ -2,6 +2,9 @@ use base64::engine::{general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
+
+use crate::crdt::or_set::ReplicatedORSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KVDtype {
@@ -58,6 +61,12 @@ pub struct KVStoredValue {
     pub owner_id: String,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KVCRDTStats {
+    pub key_count: usize,
+    pub counter: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -172,12 +181,22 @@ pub struct KVCacheEngine {
     next_block_id: AtomicU64,
     block_id_map: RwLock<HashMap<u64, String>>,
     db: Option<rocksdb::DB>,
+    kv_store: ReplicatedORSet<String>,
+    kv_value_cache: RwLock<HashMap<String, Vec<u8>>>,
+    replica_id: String,
 }
 
 impl KVCacheEngine {
     pub fn new(max_memory_bytes: u64, block_size: usize) -> Self {
         let initial_blocks = (max_memory_bytes as usize / block_size / 10).max(1);
         let memory_pool = Arc::new(MemoryPool::new(block_size, initial_blocks));
+        let replica_id = format!(
+            "kv_engine_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         Self {
             max_memory_bytes,
             block_size,
@@ -189,6 +208,9 @@ impl KVCacheEngine {
             next_block_id: AtomicU64::new(1),
             block_id_map: RwLock::new(HashMap::new()),
             db: None,
+            kv_store: ReplicatedORSet::new(&replica_id),
+            kv_value_cache: RwLock::new(HashMap::new()),
+            replica_id,
         }
     }
 
@@ -203,6 +225,14 @@ impl KVCacheEngine {
         let db = rocksdb::DB::open_default(db_path)
             .map_err(|e| format!("Failed to open rocksdb: {}", e))?;
 
+        let replica_id = format!(
+            "kv_engine_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
         let mut engine = Self {
             max_memory_bytes,
             block_size,
@@ -214,6 +244,9 @@ impl KVCacheEngine {
             next_block_id: AtomicU64::new(1),
             block_id_map: RwLock::new(HashMap::new()),
             db: Some(db),
+            kv_store: ReplicatedORSet::new(&replica_id),
+            kv_value_cache: RwLock::new(HashMap::new()),
+            replica_id,
         };
 
         engine.load_from_db()?;
@@ -760,9 +793,15 @@ impl KVCacheEngine {
             updated_at: now,
         };
 
+        self.kv_store.insert(kv_key.clone());
+        let value_json = serde_json::to_string(&kv_value)
+            .map_err(|e| format!("Failed to serialize value: {}", e))?;
+        self.kv_value_cache
+            .write()
+            .unwrap()
+            .insert(kv_key.clone(), value_json.as_bytes().to_vec());
+
         if let Some(ref db) = self.db {
-            let value_json = serde_json::to_string(&kv_value)
-                .map_err(|e| format!("Failed to serialize value: {}", e))?;
             db.put(kv_key, value_json)
                 .map_err(|e| format!("Failed to put key: {}", e))?;
         }
@@ -782,11 +821,26 @@ impl KVCacheEngine {
 
         let kv_key = format!("kv:{}:{}", namespace_id, key);
 
+        if !self.kv_store.contains(&kv_key) {
+            return Ok(None);
+        }
+
+        if let Some(value) = self.kv_value_cache.read().unwrap().get(&kv_key) {
+            let value_str = String::from_utf8_lossy(value);
+            let kv_value = serde_json::from_str(&value_str)
+                .map_err(|e| format!("Failed to deserialize value: {}", e))?;
+            return Ok(Some(kv_value));
+        }
+
         if let Some(ref db) = self.db {
-            if let Ok(Some(value)) = db.get(kv_key) {
+            if let Ok(Some(value)) = db.get(&kv_key) {
                 let value_str = String::from_utf8_lossy(&value);
                 let kv_value = serde_json::from_str(&value_str)
                     .map_err(|e| format!("Failed to deserialize value: {}", e))?;
+                self.kv_value_cache
+                    .write()
+                    .unwrap()
+                    .insert(kv_key, value.to_vec());
                 return Ok(Some(kv_value));
             }
         }
@@ -806,13 +860,20 @@ impl KVCacheEngine {
 
         let kv_key = format!("kv:{}:{}", namespace_id, key);
 
+        if !self.kv_store.contains(&kv_key) {
+            return Ok(false);
+        }
+
+        self.kv_store.remove(&kv_key);
+        self.kv_value_cache.write().unwrap().remove(&kv_key);
+
         if let Some(ref db) = self.db {
-            match db.delete(kv_key) {
+            match db.delete(&kv_key) {
                 Ok(()) => Ok(true),
                 Err(e) => Err(format!("Failed to delete key: {}", e)),
             }
         } else {
-            Ok(false)
+            Ok(true)
         }
     }
 
@@ -828,8 +889,12 @@ impl KVCacheEngine {
 
         let kv_key = format!("kv:{}:{}", namespace_id, key);
 
+        if self.kv_store.contains(&kv_key) {
+            return Ok(true);
+        }
+
         if let Some(ref db) = self.db {
-            match db.get(kv_key) {
+            match db.get(&kv_key) {
                 Ok(Some(_)) => Ok(true),
                 Ok(None) => Ok(false),
                 Err(e) => Err(format!("Failed to check existence: {}", e)),
@@ -856,25 +921,37 @@ impl KVCacheEngine {
         };
 
         let mut keys = Vec::new();
-        if let Some(ref db) = self.db {
-            let prefix_bytes = full_prefix.as_bytes();
-            for result in db.iterator(rocksdb::IteratorMode::From(
-                prefix_bytes,
-                rocksdb::Direction::Forward,
-            )) {
-                match result {
-                    Ok((key, _)) => {
-                        let key_str = String::from_utf8_lossy(&key);
-                        if key_str.starts_with(&full_prefix) {
-                            let kv_key = key_str
-                                .strip_prefix(&format!("kv:{}:", namespace_id))
-                                .unwrap_or("");
-                            keys.push(kv_key.to_string());
-                        } else {
-                            break;
+
+        let orset_keys = self.kv_store.values();
+        for key in orset_keys {
+            if key.starts_with(&full_prefix) {
+                if let Some(kv_key) = key.strip_prefix(&format!("kv:{}:", namespace_id)) {
+                    keys.push(kv_key.to_string());
+                }
+            }
+        }
+
+        if keys.is_empty() {
+            if let Some(ref db) = self.db {
+                let prefix_bytes = full_prefix.as_bytes();
+                for result in db.iterator(rocksdb::IteratorMode::From(
+                    prefix_bytes,
+                    rocksdb::Direction::Forward,
+                )) {
+                    match result {
+                        Ok((key, _)) => {
+                            let key_str = String::from_utf8_lossy(&key);
+                            if key_str.starts_with(&full_prefix) {
+                                let kv_key = key_str
+                                    .strip_prefix(&format!("kv:{}:", namespace_id))
+                                    .unwrap_or("");
+                                keys.push(kv_key.to_string());
+                            } else {
+                                break;
+                            }
                         }
+                        Err(e) => return Err(format!("Failed to iterate: {}", e)),
                     }
-                    Err(e) => return Err(format!("Failed to iterate: {}", e)),
                 }
             }
         }
@@ -896,9 +973,10 @@ impl KVCacheEngine {
         let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
 
         let mut count = 0;
+        let mut to_delete = Vec::new();
+
         if let Some(ref db) = self.db {
             let prefix_bytes = prefix.as_bytes();
-            let mut to_delete = Vec::new();
 
             for result in db.iterator(rocksdb::IteratorMode::From(
                 prefix_bytes,
@@ -920,11 +998,16 @@ impl KVCacheEngine {
                 }
             }
 
-            for key in to_delete {
-                if db.delete(&key).is_ok() {
+            for key in &to_delete {
+                if db.delete(key).is_ok() {
                     count += 1;
                 }
             }
+        }
+
+        for key in to_delete {
+            self.kv_store.remove(&key);
+            self.kv_value_cache.write().unwrap().remove(&key);
         }
 
         Ok(count)
@@ -942,10 +1025,10 @@ impl KVCacheEngine {
 
         let prefix = format!("kv:{}:", namespace_id);
         let mut count = 0;
+        let mut to_delete = Vec::new();
 
         if let Some(ref db) = self.db {
             let prefix_bytes = prefix.as_bytes();
-            let mut to_delete = Vec::new();
 
             for result in db.iterator(rocksdb::IteratorMode::From(
                 prefix_bytes,
@@ -964,14 +1047,42 @@ impl KVCacheEngine {
                 }
             }
 
-            for key in to_delete {
-                if db.delete(&key).is_ok() {
+            for key in &to_delete {
+                if db.delete(key).is_ok() {
                     count += 1;
                 }
             }
         }
 
+        for key in to_delete {
+            self.kv_store.remove(&key);
+            self.kv_value_cache.write().unwrap().remove(&key);
+        }
+
         Ok(count)
+    }
+
+    pub fn kv_get_replica_id(&self) -> &str {
+        &self.replica_id
+    }
+
+    pub fn kv_snapshot(&self) -> Vec<String> {
+        self.kv_store.values()
+    }
+
+    pub fn kv_merge(&self, other_snapshot: &[String]) {
+        let mut other_or_set = crate::crdt::or_set::ORSet::new();
+        for key in other_snapshot {
+            other_or_set.insert_with_counter(key.clone(), "remote", 0);
+        }
+        self.kv_store.merge(&other_or_set);
+    }
+
+    pub fn kv_get_stats(&self) -> KVCRDTStats {
+        KVCRDTStats {
+            key_count: self.kv_store.len(),
+            counter: self.kv_store.get_counter(),
+        }
     }
 
     fn save_block_to_db(&self, block_id: u64, block: &KVBlock) -> Result<(), String> {
@@ -1055,6 +1166,12 @@ impl KVCacheEngine {
                             }
                         }
                     }
+                } else if key_str.starts_with("kv:") {
+                    self.kv_store.insert(key_str.to_string());
+                    self.kv_value_cache
+                        .write()
+                        .unwrap()
+                        .insert(key_str.to_string(), value.to_vec());
                 }
             }
         }

@@ -90,7 +90,7 @@ fn default_volume_size() -> u64 {
 }
 
 fn default_max_file_count() -> u64 {
-    1000000
+    1_000_000
 }
 
 fn default_election_tick() -> usize {

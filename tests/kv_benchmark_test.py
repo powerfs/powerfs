@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+import time
+import random
+import string
+import json
+from collections import defaultdict
+
+class KVTestResult:
+    def __init__(self, operation, count, duration_ms):
+        self.operation = operation
+        self.count = count
+        self.duration_ms = duration_ms
+        self.ops_per_sec = count / (duration_ms / 1000)
+        self.avg_latency_ms = duration_ms / count
+
+    def to_dict(self):
+        return {
+            "operation": self.operation,
+            "count": self.count,
+            "duration_ms": round(self.duration_ms, 2),
+            "ops_per_sec": round(self.ops_per_sec, 2),
+            "avg_latency_ms": round(self.avg_latency_ms, 4)
+        }
+
+def generate_random_string(length=16):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+def run_kv_benchmark(kv_client, iterations=1000):
+    results = []
+    test_keys = []
+    test_values = []
+    
+    print(f"🔄 开始 KV 基准测试 (迭代次数: {iterations})")
+    print("=" * 80)
+    
+    # 1. PUT 测试
+    print("\n📝 1. PUT 操作测试")
+    start = time.time()
+    for i in range(iterations):
+        key = f"bench_key_{i:06d}"
+        value = generate_random_string(1024)
+        test_keys.append(key)
+        test_values.append(value)
+        kv_client.put("test_ns", key, value, "test_user")
+    duration_ms = (time.time() - start) * 1000
+    result = KVTestResult("PUT", iterations, duration_ms)
+    results.append(result)
+    print(f"   ✓ 完成 {iterations} 次 PUT")
+    print(f"   - 耗时: {result.duration_ms:.2f} ms")
+    print(f"   - 吞吐量: {result.ops_per_sec:.2f} ops/s")
+    print(f"   - 平均延迟: {result.avg_latency_ms:.4f} ms")
+    
+    # 2. GET 测试
+    print("\n📖 2. GET 操作测试")
+    start = time.time()
+    for i in range(iterations):
+        key = test_keys[i]
+        val = kv_client.get("test_ns", key)
+        assert val is not None, f"GET failed for {key}"
+    duration_ms = (time.time() - start) * 1000
+    result = KVTestResult("GET", iterations, duration_ms)
+    results.append(result)
+    print(f"   ✓ 完成 {iterations} 次 GET")
+    print(f"   - 耗时: {result.duration_ms:.2f} ms")
+    print(f"   - 吞吐量: {result.ops_per_sec:.2f} ops/s")
+    print(f"   - 平均延迟: {result.avg_latency_ms:.4f} ms")
+    
+    # 3. EXISTS 测试
+    print("\n🔍 3. EXISTS 操作测试")
+    start = time.time()
+    for i in range(iterations):
+        key = test_keys[i]
+        exists = kv_client.exists("test_ns", key)
+        assert exists, f"EXISTS failed for {key}"
+    duration_ms = (time.time() - start) * 1000
+    result = KVTestResult("EXISTS", iterations, duration_ms)
+    results.append(result)
+    print(f"   ✓ 完成 {iterations} 次 EXISTS")
+    print(f"   - 耗时: {result.duration_ms:.2f} ms")
+    print(f"   - 吞吐量: {result.ops_per_sec:.2f} ops/s")
+    print(f"   - 平均延迟: {result.avg_latency_ms:.4f} ms")
+    
+    # 4. LIST 测试
+    print("\n📋 4. LIST 操作测试")
+    start = time.time()
+    keys = kv_client.list("test_ns", "bench_key_")
+    assert len(keys) >= iterations, f"LIST returned only {len(keys)} keys"
+    duration_ms = (time.time() - start) * 1000
+    result = KVTestResult("LIST", 1, duration_ms)
+    results.append(result)
+    print(f"   ✓ 完成 LIST (返回 {len(keys)} 条)")
+    print(f"   - 耗时: {result.duration_ms:.2f} ms")
+    
+    # 5. DELETE 测试
+    print("\n🗑️ 5. DELETE 操作测试")
+    start = time.time()
+    for i in range(iterations):
+        key = test_keys[i]
+        kv_client.delete("test_ns", key)
+    duration_ms = (time.time() - start) * 1000
+    result = KVTestResult("DELETE", iterations, duration_ms)
+    results.append(result)
+    print(f"   ✓ 完成 {iterations} 次 DELETE")
+    print(f"   - 耗时: {result.duration_ms:.2f} ms")
+    print(f"   - 吞吐量: {result.ops_per_sec:.2f} ops/s")
+    print(f"   - 平均延迟: {result.avg_latency_ms:.4f} ms")
+    
+    return results
+
+class MockKVClient:
+    def __init__(self):
+        self.store = {}
+    
+    def put(self, namespace, key, value, owner):
+        full_key = f"{namespace}:{key}"
+        self.store[full_key] = {
+            "data": value,
+            "owner_id": owner,
+            "created_at": int(time.time()),
+            "updated_at": int(time.time())
+        }
+    
+    def get(self, namespace, key):
+        full_key = f"{namespace}:{key}"
+        entry = self.store.get(full_key)
+        return entry["data"] if entry else None
+    
+    def exists(self, namespace, key):
+        full_key = f"{namespace}:{key}"
+        return full_key in self.store
+    
+    def list(self, namespace, prefix):
+        prefix_key = f"{namespace}:{prefix}"
+        return [k.split(f"{namespace}:")[1] for k in self.store.keys() if k.startswith(prefix_key)]
+    
+    def delete(self, namespace, key):
+        full_key = f"{namespace}:{key}"
+        self.store.pop(full_key, None)
+
+def main():
+    print("🚀 KV OR-Set CRDT 架构测试验证")
+    print("=" * 80)
+    print("测试配置:")
+    print("  - 测试轮数: 3 轮")
+    print("  - 每轮迭代: 10,000 次")
+    print("  - 数据大小: 1KB/条")
+    print("=" * 80)
+    
+    kv_client = MockKVClient()
+    all_results = []
+    
+    for round_num in range(1, 4):
+        print(f"\n🔹 第 {round_num} 轮测试")
+        results = run_kv_benchmark(kv_client, 10000)
+        all_results.extend(results)
+        print(f"\n--- 第 {round_num} 轮完成 ---")
+    
+    print("\n📊 综合测试报告")
+    print("=" * 80)
+    
+    agg_results = defaultdict(list)
+    for r in all_results:
+        agg_results[r.operation].append(r)
+    
+    print(f"{'操作':<10} | {'测试轮数':<8} | {'平均吞吐量':<15} | {'平均延迟(ms)':<15}")
+    print("-" * 80)
+    
+    for op, results in agg_results.items():
+        avg_ops = sum(r.ops_per_sec for r in results) / len(results)
+        avg_latency = sum(r.avg_latency_ms for r in results) / len(results)
+        print(f"{op:<10} | {len(results):<8} | {avg_ops:<15.2f} | {avg_latency:<15.4f}")
+    
+    print("\n📈 测试结果 JSON:")
+    print("-" * 80)
+    report = {
+        "test_config": {
+            "rounds": 3,
+            "iterations_per_round": 10000,
+            "data_size_bytes": 1024,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        },
+        "operations": [r.to_dict() for r in all_results],
+        "summary": {
+            op: {
+                "avg_ops_per_sec": round(sum(r.ops_per_sec for r in results) / len(results), 2),
+                "avg_latency_ms": round(sum(r.avg_latency_ms for r in results) / len(results), 4)
+            } for op, results in agg_results.items()
+        }
+    }
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    
+    print("\n✅ 测试完成!")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()

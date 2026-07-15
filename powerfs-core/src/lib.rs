@@ -1,4 +1,5 @@
 pub mod bitrot_scanner;
+pub mod crdt;
 pub mod ec_thread;
 pub mod gc_thread;
 pub mod hpc;

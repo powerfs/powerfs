@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::client::SyncFuseClient;
 use crate::error::FsError;
@@ -149,31 +149,50 @@ impl MetadataManager {
     ///
     /// 返回 POSIX 投影后的条目列表（同名只返回主版本）。
     pub fn list_dir(&self, dir_ino: u64) -> Result<Vec<VisibleEntry>, FsError> {
-        // 确保目录缓存存在
-        let orset_arc = self.ensure_dir_cache(dir_ino);
-
-        // 如果本地为空，尝试从 Master 拉取（仅首次）
-        {
-            let orset = orset_arc.read().unwrap();
-            if !orset.is_empty() {
-                let listing = self.projection.project_listing(&orset);
-                return Ok(listing);
-            }
+        // 第一次尝试：检查本地缓存是否有数据
+        // 注意：这里不调用 ensure_dir_cache，避免过早持有 dir_cache 锁
+        let local_listing = self.try_list_dir_local(dir_ino);
+        if let Some(listing) = local_listing {
+            return Ok(listing);
         }
 
-        // 本地为空，尝试 Master（但避免重复调用）
+        // 本地为空，尝试从 Master 拉取
+        // 关键：此时不持有任何锁，可以安全地获取 dir_cache 写锁
         if self.client.is_some() {
-            let orset = orset_arc.write().unwrap();
-            if !orset.is_empty() {
-                return Ok(self.projection.project_listing(&orset));
+            match self.fetch_dir_from_master_without_deadlock(dir_ino) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("fetch_dir_from_master failed: {}", e);
+                }
             }
-            drop(orset);
-            self.fetch_dir_from_master(dir_ino)?;
         }
 
+        // 第二次尝试：再次读取本地缓存
+        let local_listing = self.try_list_dir_local(dir_ino);
+        if let Some(listing) = local_listing {
+            return Ok(listing);
+        }
+
+        // 返回空列表
         let orset_arc = self.ensure_dir_cache(dir_ino);
         let orset = orset_arc.read().unwrap();
         Ok(self.projection.project_listing(&orset))
+    }
+
+    /// 尝试从本地缓存列出目录（不触发 Master 拉取）
+    ///
+    /// 返回 None 表示需要从 Master 拉取
+    fn try_list_dir_local(&self, dir_ino: u64) -> Option<Vec<VisibleEntry>> {
+        // 先尝试读锁
+        let dir_cache = self.dir_cache.read().ok()?;
+        let orset_arc = dir_cache.get(&dir_ino)?;
+
+        let orset = orset_arc.read().ok()?;
+        if orset.is_empty() {
+            return None;
+        }
+
+        Some(self.projection.project_listing(&orset))
     }
 
     /// 按 inode 获取条目（getattr 用）
@@ -546,7 +565,7 @@ impl MetadataManager {
     // ==================== 内部辅助 ====================
 
     /// 本地 lookup（不触发 Master 回退）
-    fn lookup_local(&self, dir_ino: u64, name: &str) -> Option<DirEntry> {
+    pub fn lookup_local(&self, dir_ino: u64, name: &str) -> Option<DirEntry> {
         let dir_cache = self.dir_cache.read().unwrap();
         if let Some(orset_arc) = dir_cache.get(&dir_ino) {
             let orset = orset_arc.read().unwrap();
@@ -630,6 +649,38 @@ impl MetadataManager {
         index.get(&ino).map(|(_, id)| id.name.clone())
     }
 
+    /// 失效本地缓存条目（用于接收远程删除通知时）
+    pub fn invalidate_local_cache_entry(&self, parent_ino: u64, name: &str) {
+        // 1. 查找本地条目
+        if let Some(entry) = self.lookup_local(parent_ino, name) {
+            let entry_id = entry.id.clone();
+            let inode_to_remove = entry.inode;
+
+            // 2. 从父目录 OR-Set 中移除
+            if let Some(orset_arc) = self.dir_cache.read().unwrap().get(&parent_ino) {
+                let mut orset = orset_arc.write().unwrap();
+                orset.remove(&entry_id);
+            }
+
+            // 3. 清理子目录的 OR-Set 缓存
+            self.dir_cache.write().unwrap().remove(&inode_to_remove);
+
+            // 4. 清理 inode 索引和路径
+            self.inode_index.write().unwrap().remove(&inode_to_remove);
+            self.inode_paths.write().unwrap().remove(&inode_to_remove);
+
+            info!(
+                "Invalidated local cache entry: parent_ino={}, name={}, inode={}",
+                parent_ino, name, inode_to_remove
+            );
+        } else {
+            debug!(
+                "Entry not found in local cache: parent_ino={}, name={}",
+                parent_ino, name
+            );
+        }
+    }
+
     /// 更新 inode 的路径映射
     fn update_path_for_inode(&self, ino: u64, parent_ino: u64, name: &str) {
         let parent_path = self.get_path(parent_ino).unwrap_or_else(|| "/".to_string());
@@ -665,6 +716,75 @@ impl MetadataManager {
     }
 
     // ==================== Master 同步（best-effort） ====================
+
+    /// 无死锁版本的目录拉取
+    ///
+    /// 问题分析：list_dir 调用 ensure_dir_cache 获取 dir_cache 读锁，然后获取 orset_arc 锁
+    /// 如果在持有 orset_arc 锁的情况下再调用 fetch_dir_from_master，而 fetch_dir_from_master
+    /// 内部又调用 ensure_dir_cache（可能需要升级到写锁），就会导致死锁。
+    ///
+    /// 解决方案：先释放 orset_arc 锁，再调用此函数，此函数内部不假设任何锁已被持有。
+    fn fetch_dir_from_master_without_deadlock(&self, dir_ino: u64) -> Result<(), FsError> {
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        // 先获取目录内容（不持有任何锁）
+        let entries = client
+            .list_entries(dir_ino, 10000, "")
+            .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
+
+        let num_entries = entries.len();
+        if num_entries == 0 {
+            return Ok(());
+        }
+
+        // 获取父路径（需要短暂持有锁）
+        let parent_path = {
+            let inode_paths = self.inode_paths.read().unwrap();
+            inode_paths
+                .get(&dir_ino)
+                .cloned()
+                .unwrap_or_else(|| "/".to_string())
+        };
+
+        // 批量更新：获取 OR-Set 锁
+        let orset_arc = {
+            let mut dir_cache = self.dir_cache.write().unwrap();
+            dir_cache
+                .entry(dir_ino)
+                .or_insert_with(|| Arc::new(RwLock::new(DirORSet::new(dir_ino))))
+                .clone()
+        };
+
+        let mut orset = orset_arc.write().unwrap();
+        let mut inode_index = self.inode_index.write().unwrap();
+        let mut inode_paths = self.inode_paths.write().unwrap();
+
+        for proto_entry in entries {
+            let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
+            let ino = dir_entry.inode;
+            let entry_id = dir_entry.id.clone();
+
+            orset.add(dir_entry);
+            inode_index.insert(ino, (dir_ino, entry_id));
+
+            let child_path = if parent_path == "/" {
+                format!("/{}", proto_entry.name)
+            } else {
+                format!("{}/{}", parent_path, proto_entry.name)
+            };
+            inode_paths.insert(ino, child_path);
+        }
+
+        debug!(
+            "fetch_dir_from_master_without_deadlock: dir_ino={}, entries={}",
+            dir_ino, num_entries
+        );
+
+        Ok(())
+    }
 
     /// 从 Master 拉取目录内容，填充本地 OR-Set
     fn fetch_dir_from_master(&self, dir_ino: u64) -> Result<(), FsError> {
