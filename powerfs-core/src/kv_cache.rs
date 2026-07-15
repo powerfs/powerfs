@@ -474,7 +474,7 @@ impl KVCacheEngine {
         let block_id_map = self.block_id_map.read().unwrap();
         if let Some(fid_str) = block_id_map.get(&block_id) {
             let sessions = self.sessions.read().unwrap();
-            for (_, sess) in sessions.iter() {
+            for sess in sessions.values() {
                 let expected_fid_prefix = format!("{},", sess.session_id.len() % 1000 + 1);
                 if fid_str.starts_with(&expected_fid_prefix) {
                     return Some(sess.clone());

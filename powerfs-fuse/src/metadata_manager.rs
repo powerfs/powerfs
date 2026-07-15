@@ -15,8 +15,9 @@
 //! Phase 1A：单客户端场景，每个 name 只有一个 entry，无冲突
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
@@ -35,6 +36,25 @@ const MASTER_CLIENT_ID: u64 = 0;
 
 /// 目录 OR-Set 缓存类型（简化复杂类型）
 type DirCache = HashMap<u64, Arc<RwLock<DirORSet>>>;
+
+/// 变更操作类型
+#[derive(Debug, Clone)]
+enum ChangeOp {
+    Create(DirEntry),
+    Delete(u64, bool),
+    Rename(u64, String, u64, String),
+    SetAttr(DirEntry),
+}
+
+/// 变更缓存结构
+struct ChangeCache {
+    pending_changes: Vec<ChangeOp>,
+    last_flush_time: u64,
+}
+
+/// 变更缓存配置
+const CHANGE_CACHE_BATCH_SIZE: usize = 64;
+const CHANGE_CACHE_FLUSH_INTERVAL_S: f64 = 0.05;
 
 pub struct MetadataManager {
     /// 本地 OR-Set 缓存：dir_inode -> DirORSet
@@ -57,6 +77,10 @@ pub struct MetadataManager {
     client: Option<Arc<SyncFuseClient>>,
     /// 客户端 VectorClock（用于 Delta Sync）
     client_vclock: Arc<RwLock<VectorClock>>,
+    /// 变更缓存（收集多个变更后异步批量发送）
+    change_cache: Arc<Mutex<ChangeCache>>,
+    /// 变更缓存是否有数据
+    has_pending_changes: Arc<AtomicBool>,
 }
 
 impl MetadataManager {
@@ -73,6 +97,11 @@ impl MetadataManager {
             seq_counter: AtomicU64::new(1),
             client: None,
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
+            change_cache: Arc::new(Mutex::new(ChangeCache {
+                pending_changes: Vec::new(),
+                last_flush_time: 0,
+            })),
+            has_pending_changes: Arc::new(AtomicBool::new(false)),
         };
         mgr.init_root();
         mgr
@@ -80,6 +109,12 @@ impl MetadataManager {
 
     /// 创建带 Master 连接的 MetadataManager
     pub fn new_with_master(client: Arc<SyncFuseClient>, client_id: u64) -> Self {
+        let change_cache = Arc::new(Mutex::new(ChangeCache {
+            pending_changes: Vec::new(),
+            last_flush_time: 0,
+        }));
+        let has_pending_changes = Arc::new(AtomicBool::new(false));
+
         let mgr = Self {
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             inode_index: Arc::new(RwLock::new(HashMap::new())),
@@ -91,8 +126,11 @@ impl MetadataManager {
             seq_counter: AtomicU64::new(1),
             client: Some(client),
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
+            change_cache: change_cache.clone(),
+            has_pending_changes: has_pending_changes.clone(),
         };
         mgr.init_root();
+        mgr.start_change_cache_flusher(change_cache, has_pending_changes);
         mgr
     }
 
@@ -207,18 +245,23 @@ impl MetadataManager {
     /// 按 inode 获取条目（getattr 用）
     pub fn get_entry_by_inode(&self, ino: u64) -> Result<Option<DirEntry>, FsError> {
         // 先查本地索引
-        {
-            let index = self.inode_index.read().unwrap();
-            if let Some((dir_ino, entry_id)) = index.get(&ino) {
-                let dir_cache = self.dir_cache.read().unwrap();
+        let index = self.inode_index.read().unwrap();
+        if let Some((dir_ino, entry_id)) = index.get(&ino) {
+            let dir_cache_result = self.dir_cache.try_read();
+            if let Ok(dir_cache) = dir_cache_result {
                 if let Some(orset_arc) = dir_cache.get(dir_ino) {
-                    let orset = orset_arc.read().unwrap();
-                    if let Some(entry) = orset.entries.get(entry_id) {
-                        return Ok(Some(entry.clone()));
+                    let orset_result = orset_arc.try_read();
+                    if let Ok(orset) = orset_result {
+                        if let Some(entry) = orset.entries.get(entry_id) {
+                            return Ok(Some(entry.clone()));
+                        }
                     }
                 }
             }
+            // 索引存在但 OR-Set 中找不到，标记为需要清理
+            let _ = self.try_cleanup_stale_inode(ino);
         }
+        drop(index);
 
         // 根目录特殊处理
         if ino == ROOT_INO {
@@ -321,8 +364,8 @@ impl MetadataManager {
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // best-effort 同步到 Master
-        self.sync_create_to_master(&entry);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Create(entry.clone()));
 
         Ok(entry)
     }
@@ -343,8 +386,8 @@ impl MetadataManager {
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // best-effort 同步到 Master
-        self.sync_create_to_master(&entry);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Create(entry.clone()));
 
         Ok(entry)
     }
@@ -364,8 +407,8 @@ impl MetadataManager {
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // best-effort 同步到 Master
-        self.sync_create_to_master(&entry);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Create(entry.clone()));
 
         Ok(entry)
     }
@@ -391,7 +434,8 @@ impl MetadataManager {
 
         let inode = entry.inode;
         self.remove_from_local_orset(dir_ino, &entry.id)?;
-        self.sync_delete_to_master(entry.inode, false);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Delete(entry.inode, false));
         Ok(inode)
     }
 
@@ -449,7 +493,8 @@ impl MetadataManager {
             paths.remove(&child_inode);
         }
 
-        self.sync_delete_to_master(child_inode, true);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Delete(child_inode, true));
         Ok(())
     }
 
@@ -489,7 +534,8 @@ impl MetadataManager {
                     }
                     // tombstone 旧目标
                     let _ = self.remove_from_local_orset(new_dir, &dest.id);
-                    self.sync_delete_to_master(dest.inode, false);
+                    // best-effort 同步到 Master（使用变更缓存）
+                    self.add_change(ChangeOp::Delete(dest.inode, false));
                     Some(dest.inode)
                 })
         };
@@ -522,8 +568,13 @@ impl MetadataManager {
             orset.dir_ino = new_entry.inode;
         }
 
-        // best-effort 同步到 Master
-        self.sync_rename_to_master(old_dir, old_name, new_dir, new_name);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Rename(
+            old_dir,
+            old_name.to_string(),
+            new_dir,
+            new_name.to_string(),
+        ));
 
         Ok(overwritten_inode)
     }
@@ -565,8 +616,8 @@ impl MetadataManager {
         let updated = entry.clone();
         drop(orset);
 
-        // best-effort 同步到 Master
-        self.sync_setattr_to_master(&updated);
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::SetAttr(updated.clone()));
 
         Ok(updated)
     }
@@ -697,6 +748,24 @@ impl MetadataManager {
         );
     }
 
+    /// 非阻塞方式清理失效的 inode 条目
+    fn try_cleanup_stale_inode(&self, ino: u64) -> bool {
+        let mut inode_index = self.inode_index.try_write();
+        if inode_index.is_err() {
+            return false;
+        }
+        inode_index.as_mut().unwrap().remove(&ino);
+
+        let mut inode_paths = self.inode_paths.try_write();
+        if inode_paths.is_err() {
+            return false;
+        }
+        inode_paths.as_mut().unwrap().remove(&ino);
+
+        debug!("try_cleanup_stale_inode: removed inode {}", ino);
+        true
+    }
+
     /// 非阻塞方式失效缓存（用于订阅线程，避免死锁）
     pub fn try_invalidate_local_cache_entry(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -808,6 +877,175 @@ impl MetadataManager {
             chunks: vec![],
             symlink_target: None,
         }
+    }
+
+    // ==================== 变更缓存（Change Cache） ====================
+
+    /// 添加变更到变更缓存
+    fn add_change(&self, op: ChangeOp) {
+        let mut cache = self.change_cache.lock().unwrap();
+        cache.pending_changes.push(op);
+        cache.last_flush_time = now_unix();
+        self.has_pending_changes.store(true, Ordering::Relaxed);
+
+        // 如果达到批量大小，立即触发一次 flush（非阻塞）
+        if cache.pending_changes.len() >= CHANGE_CACHE_BATCH_SIZE {
+            let _ = self.flush_changes();
+        }
+    }
+
+    /// 启动变更缓存 flush 线程
+    fn start_change_cache_flusher(
+        &self,
+        change_cache: Arc<Mutex<ChangeCache>>,
+        has_pending_changes: Arc<AtomicBool>,
+    ) {
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let client_id_str = self.client_id_str.clone();
+        let inode_paths = self.inode_paths.clone();
+
+        thread::spawn(move || {
+            info!("Change cache flusher thread started");
+
+            loop {
+                thread::sleep(Duration::from_millis(10));
+
+                if !has_pending_changes.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                let now = now_unix();
+
+                let should_flush = {
+                    let cache = change_cache.lock().unwrap();
+                    if cache.pending_changes.is_empty() {
+                        false
+                    } else {
+                        let cache_time_since_flush = (now - cache.last_flush_time) as f64 / 1000.0;
+                        cache.pending_changes.len() >= CHANGE_CACHE_BATCH_SIZE
+                            || cache_time_since_flush >= CHANGE_CACHE_FLUSH_INTERVAL_S
+                    }
+                };
+
+                if should_flush {
+                    let mut cache = change_cache.lock().unwrap();
+                    if cache.pending_changes.is_empty() {
+                        continue;
+                    }
+
+                    let changes: Vec<ChangeOp> = cache.pending_changes.drain(..).collect();
+                    drop(cache);
+
+                    info!("Flushing {} pending changes to Master", changes.len());
+
+                    for change in changes {
+                        match change {
+                            ChangeOp::Create(entry) => {
+                                if let Err(e) = sync_create_to_master_helper(
+                                    &client,
+                                    &client_id_str,
+                                    &entry,
+                                    &inode_paths,
+                                ) {
+                                    warn!("Failed to sync create to master: {}", e);
+                                }
+                            }
+                            ChangeOp::Delete(ino, is_dir) => {
+                                if let Err(e) = client.delete_entry(ino, is_dir, &client_id_str) {
+                                    warn!("Failed to sync delete to master: {}", e);
+                                }
+                            }
+                            ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
+                                if let Err(e) = client.rename_entry(
+                                    old_dir,
+                                    &old_name,
+                                    new_dir,
+                                    &new_name,
+                                    &client_id_str,
+                                ) {
+                                    warn!("Failed to sync rename to master: {}", e);
+                                }
+                            }
+                            ChangeOp::SetAttr(entry) => {
+                                if let Err(e) = sync_setattr_to_master_helper(
+                                    &client,
+                                    &client_id_str,
+                                    &entry,
+                                    &inode_paths,
+                                ) {
+                                    warn!("Failed to sync setattr to master: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    has_pending_changes.store(false, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
+    /// 手动触发一次变更缓存 flush
+    fn flush_changes(&self) -> Result<(), FsError> {
+        let mut cache = self.change_cache.lock().unwrap();
+        if cache.pending_changes.is_empty() {
+            return Ok(());
+        }
+
+        let changes: Vec<ChangeOp> = cache.pending_changes.drain(..).collect();
+        drop(cache);
+
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        for change in changes {
+            match change {
+                ChangeOp::Create(entry) => {
+                    if let Err(e) = sync_create_to_master_helper(
+                        &client,
+                        &self.client_id_str,
+                        &entry,
+                        &self.inode_paths,
+                    ) {
+                        warn!("Failed to sync create to master: {}", e);
+                    }
+                }
+                ChangeOp::Delete(ino, is_dir) => {
+                    if let Err(e) = client.delete_entry(ino, is_dir, &self.client_id_str) {
+                        warn!("Failed to sync delete to master: {}", e);
+                    }
+                }
+                ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
+                    if let Err(e) = client.rename_entry(
+                        old_dir,
+                        &old_name,
+                        new_dir,
+                        &new_name,
+                        &self.client_id_str,
+                    ) {
+                        warn!("Failed to sync rename to master: {}", e);
+                    }
+                }
+                ChangeOp::SetAttr(entry) => {
+                    if let Err(e) = sync_setattr_to_master_helper(
+                        &client,
+                        &self.client_id_str,
+                        &entry,
+                        &self.inode_paths,
+                    ) {
+                        warn!("Failed to sync setattr to master: {}", e);
+                    }
+                }
+            }
+        }
+
+        self.has_pending_changes.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     // ==================== Master 同步（best-effort） ====================
@@ -984,108 +1222,6 @@ impl MetadataManager {
         }
         // 默认根目录
         ROOT_INO
-    }
-
-    /// 同步创建到 Master（best-effort）
-    fn sync_create_to_master(&self, entry: &DirEntry) {
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        let path = match self.get_path(entry.inode) {
-            Some(p) => p,
-            None => {
-                warn!(
-                    "sync_create_to_master: no path for inode {}, skip sync",
-                    entry.inode
-                );
-                return;
-            }
-        };
-
-        let parent_path = if let Some(last_slash) = path.rfind('/') {
-            if last_slash == 0 {
-                "/".to_string()
-            } else {
-                path[..last_slash].to_string()
-            }
-        } else {
-            "/".to_string()
-        };
-
-        let proto_entry = dir_entry_to_proto(entry, &parent_path);
-
-        if let Err(e) = client.create_entry(proto_entry, &self.client_id_str) {
-            warn!(
-                "sync_create_to_master failed for inode {} ({}): {}, local entry still valid",
-                entry.inode, path, e
-            );
-        }
-    }
-
-    /// 同步删除到 Master（best-effort）
-    fn sync_delete_to_master(&self, ino: u64, is_dir: bool) {
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        if let Err(e) = client.delete_entry(ino, is_dir, &self.client_id_str) {
-            warn!(
-                "sync_delete_to_master failed for inode {}: {}, local deletion still valid",
-                ino, e
-            );
-        }
-    }
-
-    /// 同步重命名到 Master（best-effort）
-    fn sync_rename_to_master(&self, old_dir: u64, old_name: &str, new_dir: u64, new_name: &str) {
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        if let Err(e) =
-            client.rename_entry(old_dir, old_name, new_dir, new_name, &self.client_id_str)
-        {
-            warn!(
-                "sync_rename_to_master failed ({} -> {}): {}, local rename still valid",
-                old_name, new_name, e
-            );
-        }
-    }
-
-    /// 同步属性变更到 Master（best-effort）
-    fn sync_setattr_to_master(&self, entry: &DirEntry) {
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        let path = match self.get_path(entry.inode) {
-            Some(p) => p,
-            None => return,
-        };
-
-        let parent_path = if let Some(last_slash) = path.rfind('/') {
-            if last_slash == 0 {
-                "/".to_string()
-            } else {
-                path[..last_slash].to_string()
-            }
-        } else {
-            "/".to_string()
-        };
-
-        let proto_entry = dir_entry_to_proto(entry, &parent_path);
-
-        if let Err(e) = client.update_entry(&proto_entry, &self.client_id_str) {
-            warn!(
-                "sync_setattr_to_master failed for inode {}: {}, local change still valid",
-                entry.inode, e
-            );
-        }
     }
 
     // ==================== Delta Sync ====================
@@ -1715,17 +1851,101 @@ impl MetadataManager {
 
     pub fn dir_orset_len(&self, dir_ino: u64) -> usize {
         let dir_cache = self.dir_cache.read().unwrap();
-        if let Some(arc) = dir_cache.get(&dir_ino) {
-            let orset = arc.read().unwrap();
-            orset.len()
-        } else {
-            0
-        }
+        dir_cache
+            .get(&dir_ino)
+            .map(|arc| {
+                let orset = arc.read().unwrap();
+                orset.len()
+            })
+            .unwrap_or(0)
     }
 
     pub fn inode_index_size(&self) -> usize {
-        self.inode_index.read().unwrap().len()
+        let inode_index = self.inode_index.read().unwrap();
+        inode_index.len()
     }
+}
+
+/// 同步创建到 Master 的辅助函数
+fn sync_create_to_master_helper(
+    client: &SyncFuseClient,
+    client_id_str: &str,
+    entry: &DirEntry,
+    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+) -> Result<(), String> {
+    let path = {
+        let paths = inode_paths.read().expect("inode_paths lock poisoned");
+        paths.get(&entry.inode).cloned()
+    };
+
+    let path = match path {
+        Some(p) => p,
+        None => {
+            return Err(format!(
+                "sync_create_to_master: no path for inode {}",
+                entry.inode
+            ));
+        }
+    };
+
+    let parent_path = if let Some(last_slash) = path.rfind('/') {
+        if last_slash == 0 {
+            "/".to_string()
+        } else {
+            path[..last_slash].to_string()
+        }
+    } else {
+        "/".to_string()
+    };
+
+    let proto_entry = dir_entry_to_proto(entry, &parent_path);
+
+    client
+        .create_entry(proto_entry, client_id_str)
+        .map_err(|e| format!("sync_create_to_master failed: {}", e))?;
+
+    Ok(())
+}
+
+/// 同步属性变更到 Master 的辅助函数
+fn sync_setattr_to_master_helper(
+    client: &SyncFuseClient,
+    client_id_str: &str,
+    entry: &DirEntry,
+    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+) -> Result<(), String> {
+    let path = {
+        let paths = inode_paths.read().expect("inode_paths lock poisoned");
+        paths.get(&entry.inode).cloned()
+    };
+
+    let path = match path {
+        Some(p) => p,
+        None => {
+            return Err(format!(
+                "sync_setattr_to_master: no path for inode {}",
+                entry.inode
+            ));
+        }
+    };
+
+    let parent_path = if let Some(last_slash) = path.rfind('/') {
+        if last_slash == 0 {
+            "/".to_string()
+        } else {
+            path[..last_slash].to_string()
+        }
+    } else {
+        "/".to_string()
+    };
+
+    let proto_entry = dir_entry_to_proto(entry, &parent_path);
+
+    client
+        .update_entry(&proto_entry, client_id_str)
+        .map_err(|e| format!("sync_setattr_to_master failed: {}", e))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
