@@ -4,7 +4,7 @@ PowerFS
 
 **Next-Gen Zero-Jitter Unified Storage for HPC + AI Converged Clusters**
 
-[Introduction](https://github.com/powerfs/powerfs/tree/master#introduction) • [Architecture](https://github.com/powerfs/powerfs/tree/master#architecture) • [Core Features](https://github.com/powerfs/powerfs/tree/master#core-features) • [Roadmap](https://github.com/powerfs/powerfs/tree/master#roadmap) • [Scenarios](https://github.com/powerfs/powerfs/tree/master#application-scenarios) • [Benchmark](https://github.com/powerfs/powerfs/tree/master#benchmark) • [License](https://github.com/powerfs/powerfs/tree/master#license)
+[Introduction](#introduction) • [Architecture](#architecture) • [Core Features](#core-features) • [Roadmap](#🚀-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [License](#license)
 
 ---
 
