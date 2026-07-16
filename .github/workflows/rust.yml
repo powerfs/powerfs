@@ -59,6 +59,23 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-target-
     
+    - name: Create stub for enterprise edition if not present
+      run: |
+        if [ ! -d "powerfs-fuse-enterprise" ]; then
+          mkdir -p powerfs-fuse-enterprise/src
+          cat > powerfs-fuse-enterprise/Cargo.toml << 'EOF'
+[package]
+name = "powerfs-fuse-enterprise"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+powerfs-orset = { path = "../powerfs-orset" }
+crossbeam = "0.8"
+EOF
+          echo "pub struct EnterpriseDirCache;" > powerfs-fuse-enterprise/src/lib.rs
+        fi
+    
     - name: Check formatting
       run: cargo fmt --all -- --check
     
