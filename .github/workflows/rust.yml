@@ -63,16 +63,7 @@ jobs:
       run: |
         if [ ! -d "powerfs-fuse-enterprise" ]; then
           mkdir -p powerfs-fuse-enterprise/src
-          cat > powerfs-fuse-enterprise/Cargo.toml << 'EOF'
-[package]
-name = "powerfs-fuse-enterprise"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-powerfs-orset = { path = "../powerfs-orset" }
-crossbeam = "0.8"
-EOF
+          printf '[package]\nname = "powerfs-fuse-enterprise"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\npowerfs-orset = { path = "../powerfs-orset" }\ncrossbeam = "0.8"\n' > powerfs-fuse-enterprise/Cargo.toml
           echo "pub struct EnterpriseDirCache;" > powerfs-fuse-enterprise/src/lib.rs
         fi
     
