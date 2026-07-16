@@ -1,4 +1,5 @@
 target/
+powerfs-fuse-enterprise/
 **/*.rs.bk
 *.state
 Cargo.lock

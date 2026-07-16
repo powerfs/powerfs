@@ -1219,6 +1219,7 @@ impl DirectoryTree {
                     let dir_entry = powerfs_orset::DirEntry {
                         id: entry_id,
                         inode: entry.inode,
+                        generation: 0,
                         file_type,
                         mode: entry.mode,
                         size: entry.size,
@@ -1261,6 +1262,7 @@ impl DirectoryTree {
                         powerfs_orset::DirEntry {
                             id: entry_id,
                             inode: entry.inode,
+                            generation: 0,
                             file_type: powerfs_orset::FileType::RegularFile,
                             mode: entry.mode,
                             size: entry.size,

@@ -100,6 +100,7 @@ pub struct CachedFileChunk {
 pub struct DirEntry {
     pub id: EntryId,
     pub inode: u64,
+    pub generation: u64,
     pub file_type: FileType,
     pub mode: u32,
     pub size: u64,
@@ -117,6 +118,7 @@ impl DirEntry {
         Self {
             id,
             inode,
+            generation: 0,
             file_type: FileType::RegularFile,
             mode,
             size: 0,
@@ -134,6 +136,7 @@ impl DirEntry {
         Self {
             id,
             inode,
+            generation: 0,
             file_type: FileType::Directory,
             mode,
             size: 0,
@@ -157,6 +160,7 @@ impl DirEntry {
         Self {
             id,
             inode,
+            generation: 0,
             file_type: FileType::Symlink,
             mode,
             size: 0,
@@ -1038,6 +1042,18 @@ impl DirORSet {
     pub fn clear_delta_log(&mut self) {
         self.delta_log.clear();
     }
+}
+
+use std::sync::{Arc, RwLock};
+
+pub trait DirCacheProvider: Sync + Send + 'static {
+    fn get(&self, dir_ino: u64) -> Option<Arc<RwLock<DirORSet>>>;
+    fn insert(&self, dir_ino: u64, orset: Arc<RwLock<DirORSet>>);
+    fn remove(&self, dir_ino: u64) -> Option<Arc<RwLock<DirORSet>>>;
+    fn ensure_dir_cache(&self, dir_ino: u64) -> Arc<RwLock<DirORSet>>;
+    #[allow(clippy::result_unit_err)]
+    fn try_read(&self, dir_ino: u64) -> Result<Option<Arc<RwLock<DirORSet>>>, ()>;
+    fn shard_index(&self, dir_ino: u64) -> usize;
 }
 
 #[cfg(test)]

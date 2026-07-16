@@ -12,7 +12,13 @@ name = "fs_bench"
 path = "benches/fs_bench.rs"
 harness = false
 
+[features]
+default = ["community"]
+community = []
+enterprise = ["dep:powerfs-fuse-enterprise"]
+
 [dependencies]
+powerfs-fuse-enterprise = { path = "../powerfs-fuse-enterprise", optional = true }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }

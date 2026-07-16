@@ -120,6 +120,7 @@ impl MetadataManager {
                     let dir_entry = DirEntry {
                         id: entry_id,
                         inode,
+                        generation: 0,
                         file_type,
                         mode,
                         size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
@@ -238,6 +239,7 @@ impl MetadataManager {
                             let new_entry = DirEntry {
                                 id: EntryId::new(new_name.clone(), client_id_num, 0),
                                 inode,
+                                generation: 0,
                                 file_type: FileType::RegularFile,
                                 mode: 0o644,
                                 size: 0,
