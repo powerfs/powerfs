@@ -1,11 +1,17 @@
 pub mod error;
+pub mod factory;
 pub mod local_fs;
 pub mod migration;
+#[cfg(feature = "spdk")]
+pub mod spdk_backend;
 pub mod types;
 
 pub use error::StorageBackendError;
+pub use factory::BackendFactory;
 pub use local_fs::LocalFsBackend;
 pub use migration::*;
+#[cfg(feature = "spdk")]
+pub use spdk_backend::SpdkBackend;
 pub use types::*;
 
 use bytes::Bytes;

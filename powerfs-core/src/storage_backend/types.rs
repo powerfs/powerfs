@@ -195,3 +195,59 @@ impl fmt::Display for ChecksumAlgorithm {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BackendType {
+    LocalFile,
+    Spdk,
+}
+
+impl fmt::Display for BackendType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BackendType::LocalFile => write!(f, "LocalFile"),
+            BackendType::Spdk => write!(f, "Spdk"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalFileBackendConfig {
+    pub data_dir: String,
+    pub devices: Vec<LocalFileDeviceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalFileDeviceConfig {
+    pub name: String,
+    pub total_capacity: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpdkBackendConfig {
+    pub devices: Vec<SpdkDeviceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpdkDeviceConfig {
+    pub name: String,
+    pub transport_string: String,
+    pub capacity: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendConfig {
+    pub backend_type: BackendType,
+    pub node_id: String,
+    #[serde(flatten)]
+    pub config: BackendConfigDetails,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum BackendConfigDetails {
+    #[serde(rename = "local_file")]
+    LocalFile(LocalFileBackendConfig),
+    #[serde(rename = "spdk")]
+    Spdk(SpdkBackendConfig),
+}

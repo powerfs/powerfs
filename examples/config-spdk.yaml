@@ -1,0 +1,58 @@
+node:
+  node_id: "volume-spdk-001"
+  node_type: "Volume"
+  zone: "zone-a"
+  rack: "rack-01"
+
+storage:
+  backend:
+    backend_type: "Spdk"
+    node_id: "volume-spdk-001"
+    type: "spdk"
+    devices:
+      - name: "nvme0"
+        transport_string: "trtype:tcp traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1"
+      - name: "nvme1"
+        transport_string: "trtype:tcp traddr:127.0.0.1 trsvcid:4421 subnqn:nqn.2016-06.io.spdk:cnode2 ns:1"
+      - name: "nvme2"
+        transport_string: "trtype:rdma traddr:10.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode3 ns:1"
+      - name: "nvme3"
+        transport_string: "trtype:rdma traddr:10.0.0.2 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode4 ns:1"
+  checksum_algorithm: "Crc32c"
+  volume_size_gib: 100
+  max_volumes_per_device: 100
+  compact_threshold_percent: 30.0
+  compact_interval_seconds: 3600
+
+network:
+  grpc_port: 8080
+  grpc_threads: 8
+  grpc_conn_timeout_seconds: 30
+  grpc_enable_tcp_no_delay: true
+  master_addresses:
+    - "http://master1:9333"
+    - "http://master2:9333"
+    - "http://master3:9333"
+
+reliability:
+  bitrot_scan_interval_seconds: 3600
+  bitrot_scan_enabled: true
+  ec_data_shards: 8
+  ec_parity_shards: 4
+  recycle_bin_retention_seconds: 2592000
+  ha_enabled: false
+
+performance:
+  metadata_cache_size_gib: 32
+  needle_index_cache_size_gib: 16
+  ec_thread_count: 16
+  io_thread_count: 32
+  write_buffer_size_mib: 128
+  read_ahead_size_kib: 2048
+
+logging:
+  level: "info"
+  format: "Json"
+  file_path: "/var/log/powerfs/powerfs.log"
+  max_file_size_mib: 100
+  max_file_count: 10

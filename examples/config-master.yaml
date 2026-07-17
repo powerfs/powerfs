@@ -1,0 +1,52 @@
+node:
+  node_id: "master-001"
+  node_type: "Master"
+  zone: "zone-a"
+  rack: "rack-01"
+  data_center: "dc-01"
+
+storage:
+  backend:
+    backend_type: "LocalFile"
+    node_id: "master-001"
+    type: "local_file"
+    data_dir: "/data/powerfs/master"
+    devices:
+      - name: "master-disk"
+        total_capacity: 10737418240
+  checksum_algorithm: "Crc32c"
+  volume_size_gib: 10
+
+network:
+  grpc_port: 9333
+  grpc_threads: 4
+  grpc_conn_timeout_seconds: 30
+  grpc_enable_tcp_no_delay: true
+  master_addresses:
+    - "http://master1:9333"
+    - "http://master2:9333"
+    - "http://master3:9333"
+  raft_port: 9334
+
+reliability:
+  bitrot_scan_interval_seconds: 3600
+  bitrot_scan_enabled: false
+  ec_data_shards: 8
+  ec_parity_shards: 4
+  recycle_bin_retention_seconds: 2592000
+  ha_enabled: true
+
+performance:
+  metadata_cache_size_gib: 32
+  needle_index_cache_size_gib: 1
+  ec_thread_count: 4
+  io_thread_count: 4
+  write_buffer_size_mib: 64
+  read_ahead_size_kib: 1024
+
+logging:
+  level: "info"
+  format: "Json"
+  file_path: "/var/log/powerfs/powerfs-master.log"
+  max_file_size_mib: 100
+  max_file_count: 10

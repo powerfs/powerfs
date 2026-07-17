@@ -30,6 +30,9 @@ pub enum StorageBackendError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    #[error("SPDK IO error: {0}")]
+    SpdkIoError(String),
+
     #[error("Checksum mismatch")]
     ChecksumMismatch,
 

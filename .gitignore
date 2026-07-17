@@ -1,7 +1,9 @@
 target/
+spdk/
 powerfs-fuse-enterprise/
 **/*.rs.bk
 *.state
+github.sh
 Cargo.lock
 beegfs/
 articles/
