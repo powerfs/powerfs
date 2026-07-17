@@ -17,7 +17,10 @@ async fn setup_server_and_client() -> (VolumeServiceClient<Channel>, TempDir) {
     let data_path = temp_dir.path().to_str().unwrap().to_string();
     let node_id = NodeId("test-node".to_string());
 
-    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), data_path.clone()));
+    let storage_manager = Arc::new(
+        StorageManager::new(node_id.clone(), data_path.clone())
+            .expect("Failed to create storage manager"),
+    );
     let server = VolumeServer::new(
         storage_manager,
         node_id,

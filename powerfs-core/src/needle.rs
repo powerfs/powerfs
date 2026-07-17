@@ -65,7 +65,12 @@ impl Needle {
         Bytes::from(buf)
     }
 
-    pub fn from_bytes(bytes: &[u8], volume_id: VolumeId, offset: u64) -> Result<Self> {
+    pub fn from_bytes(
+        bytes: &[u8],
+        volume_id: VolumeId,
+        offset: u64,
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<Self> {
         if bytes.len() < NEEDLE_HEADER_SIZE + NEEDLE_FOOTER_SIZE {
             return Err(PowerFsError::InvalidRequest(
                 "needle data too short".to_string(),
@@ -97,7 +102,7 @@ impl Needle {
             .copy_from_slice(&bytes[checksum_start..checksum_start + NEEDLE_CHECKSUM_SIZE]);
         let checksum = u64::from_be_bytes(checksum_bytes);
 
-        let calculated_checksum = Checksum::compute(&data, ChecksumAlgorithm::default());
+        let calculated_checksum = Checksum::compute(&data, algorithm);
         if checksum != calculated_checksum.as_u64() {
             return Err(PowerFsError::ChecksumMismatch);
         }
@@ -108,7 +113,7 @@ impl Needle {
             data,
             offset,
             checksum,
-            checksum_algorithm: ChecksumAlgorithm::default(),
+            checksum_algorithm: algorithm,
         })
     }
 
@@ -116,6 +121,7 @@ impl Needle {
         reader: &mut R,
         offset: u64,
         volume_id: VolumeId,
+        algorithm: ChecksumAlgorithm,
     ) -> Result<Self> {
         reader.seek(SeekFrom::Start(offset))?;
 
@@ -134,7 +140,7 @@ impl Needle {
         reader.read_exact(&mut checksum_bytes)?;
         let checksum = u64::from_be_bytes(checksum_bytes);
 
-        let calculated_checksum = Checksum::compute(&data, ChecksumAlgorithm::default());
+        let calculated_checksum = Checksum::compute(&data, algorithm);
         if checksum != calculated_checksum.as_u64() {
             return Err(PowerFsError::ChecksumMismatch);
         }
@@ -145,7 +151,7 @@ impl Needle {
             data: Bytes::from(data),
             offset,
             checksum,
-            checksum_algorithm: ChecksumAlgorithm::default(),
+            checksum_algorithm: algorithm,
         })
     }
 

@@ -9,4 +9,5 @@ pub mod kv_cache_persist;
 pub mod needle;
 pub mod repair_thread;
 pub mod storage;
+pub mod storage_backend;
 pub mod volume;

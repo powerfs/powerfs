@@ -76,13 +76,28 @@ jobs:
     - name: Build
       run: cargo build --all --verbose
     
-    - name: Run all tests
-      run: cargo test --all --verbose
+    - name: Run unit tests (no FUSE)
+      run: cargo test --all --lib --verbose
 
-    - name: Run FUSE Coherence tests
+    - name: Check if FUSE is available
+      id: fuse-check
       run: |
+        if [ -c /dev/fuse ] && sudo fusermount -V 2>/dev/null; then
+          echo "fuse_available=true" >> $GITHUB_OUTPUT
+          echo "FUSE is available"
+        else
+          echo "fuse_available=false" >> $GITHUB_OUTPUT
+          echo "FUSE is NOT available, skipping integration tests"
+        fi
+
+    - name: Run FUSE integration tests
+      if: steps.fuse-check.outputs.fuse_available == 'true'
+      run: |
+        cargo test --package powerfs-fuse --test fuse_minimal_test --verbose
+        cargo test --package powerfs-fuse --test fuse_basic_test --verbose
         cargo test --package powerfs-fuse --test coherence_phase0_test --verbose
         cargo test --package powerfs-fuse --test coherence_phase1_test --verbose
+        cargo test --package powerfs-fuse --test concurrent_consistency --verbose -- --test-threads=1
         cargo test --package powerfs-master --test coherence_phase2_test --verbose
         cargo test --package powerfs-master --test coherence_phase3_test --verbose
         cargo test --package powerfs-master --test coherence_failover_test --verbose

@@ -60,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_id = NodeId(args.node_id.clone());
     let data_dir = args.data_dir.clone();
-    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), args.data_dir));
+    let storage_manager = Arc::new(
+        StorageManager::new(node_id.clone(), args.data_dir)
+            .expect("Failed to create storage manager"),
+    );
 
     let grpc_port = args
         .grpc_address

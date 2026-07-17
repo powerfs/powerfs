@@ -1,11 +1,10 @@
 use powerfs_common::types::{NodeId, VolumeId, VolumeState};
 use powerfs_core::storage::StorageManager;
 
-// Helper: create a StorageManager with a temp directory
 fn create_storage_manager() -> (tempfile::TempDir, StorageManager) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let mgr = StorageManager::new(NodeId("test-node".to_string()), path);
+    let mgr = StorageManager::new(NodeId("test-node".to_string()), path).unwrap();
     (dir, mgr)
 }
 
@@ -194,7 +193,7 @@ fn test_find_available_volume_skips_read_only() {
 fn test_load_volumes_empty_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let mgr = StorageManager::new(NodeId("node".to_string()), path);
+    let mgr = StorageManager::new(NodeId("node".to_string()), path).unwrap();
     assert!(mgr.load_volumes().is_ok());
     assert_eq!(mgr.volume_count(), 0);
 }
@@ -204,17 +203,16 @@ fn test_load_volumes_with_existing() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
 
-    // Create a volume manually
+    let backend;
     {
-        let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone());
+        let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone()).unwrap();
+        backend = mgr1.backend();
         mgr1.create_volume(VolumeId(5), 1024 * 1024).unwrap();
     }
 
-    // Load with a new manager
-    let mgr2 = StorageManager::new(NodeId("node".to_string()), path);
+    let mgr2 = StorageManager::new_with_backend(NodeId("node".to_string()), path, backend);
     mgr2.load_volumes().unwrap();
 
-    // Should find the existing volume
     assert_eq!(mgr2.volume_count(), 1);
     let vol = mgr2.get_volume(&VolumeId(5));
     assert!(vol.is_some());

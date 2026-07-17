@@ -12,6 +12,58 @@ export interface NodeInfo {
   network_tx: number
   uptime: number
   volume_count: number
+  device_count?: number
+}
+
+export interface DeviceLocation {
+  node_id: string
+  device_id: string
+  zone: string
+  rack?: string
+  data_center?: string
+}
+
+export type DeviceType = 'local_file' | 'spdk' | 'nvmeof'
+export type DeviceStatus = 'online' | 'offline' | 'excluded' | 'draining' | 'faulty'
+export type DeviceHealth = 'healthy' | 'warning' | 'critical'
+
+export interface StorageDevice {
+  device_id: string
+  device_type: DeviceType
+  total_capacity: number
+  used_space: number
+  free_space: number
+  location: DeviceLocation
+  status: DeviceStatus
+  health?: DeviceHealth
+  volume_count?: number
+  last_check?: string
+}
+
+export type MigrationStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+export type MigrationType = 'volume_migration' | 'drain_device'
+
+export interface DataMigrationTask {
+  task_id: string
+  source_volume_id: number
+  target_volume_id?: number
+  source_device_id: string
+  target_device_id?: string
+  migration_type: MigrationType
+  status: MigrationStatus
+  progress_percent: number
+  created_at: string
+  started_at?: string
+  completed_at?: string
+  error_message?: string
+  data_transferred?: number
+  total_data?: number
 }
 
 export interface VolumeInfo {
@@ -257,4 +309,33 @@ export interface S3AccessKey {
   access_key: string
   secret_key: string
   created_at: string
+}
+
+export type ScrubState = 'idle' | 'running' | 'paused' | 'completed' | 'failed'
+
+export interface VolumeScrubStatus {
+  volume_id: number
+  state: ScrubState
+  progress: number
+  total_needles: number
+  verified_needles: number
+  corrupted_needles: number
+  skipped_needles: number
+  error_needles: number
+  last_scrub_at?: string
+  started_at?: string
+  completed_at?: string
+  error?: string
+  corrupted_needle_ids?: number[]
+}
+
+export interface ScrubSummary {
+  total_volumes: number
+  scanned_volumes: number
+  healthy_volumes: number
+  corrupted_volumes: number
+  total_needles: number
+  verified_needles: number
+  corrupted_needles: number
+  last_scan_time?: string
 }

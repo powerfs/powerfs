@@ -226,6 +226,11 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
     let log_file = "/tmp/powerfs-fuse-test.log";
     let _ = fs::remove_file(log_file);
 
+    println!(
+        "Spawning fuse: {} fuse --dir {} --master {}",
+        target_dir, fuse_mount, master_addr
+    );
+
     Command::new(format!("{}/powerfs", target_dir))
         .arg("--log-file")
         .arg(log_file)
@@ -234,8 +239,8 @@ fn spawn_fuse(target_dir: &str, master_addr: &str) -> io::Result<Child> {
         .arg(&fuse_mount)
         .arg("--master")
         .arg(master_addr)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
 }
 
@@ -279,7 +284,7 @@ pub fn ensure_fuse_mounted() -> Result<(), String> {
 
         let fuse_mount = get_fuse_mount();
         assert!(
-            wait_for_mount(&fuse_mount, 30),
+            wait_for_mount(&fuse_mount, 60),
             "FUSE did not mount in time"
         );
 

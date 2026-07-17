@@ -19,6 +19,8 @@ import {
   SafetyCertificateOutlined,
   LockOutlined,
   WarningOutlined,
+  HddOutlined,
+  SafetyOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -50,7 +52,9 @@ function AppLayout() {
       ? [
           { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
           { key: '/nodes', icon: <SaveOutlined />, label: '节点管理' },
+          { key: '/storage-devices', icon: <HddOutlined />, label: '存储设备' },
           { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume管理' },
+          { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot扫描' },
           { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE管理' },
           { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
         ]

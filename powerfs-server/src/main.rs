@@ -339,7 +339,10 @@ async fn run_volume(
     let address = format!("{}:{}", bind_ip, port);
 
     let node_id = generate_node_id();
-    let storage_manager = Arc::new(StorageManager::new(node_id.clone(), data_dir.clone()));
+    let storage_manager = Arc::new(
+        StorageManager::new(node_id.clone(), data_dir.clone())
+            .expect("Failed to create storage manager"),
+    );
 
     storage_manager.load_volumes()?;
 

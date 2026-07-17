@@ -5,6 +5,8 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Nodes from './pages/Nodes'
 import Volumes from './pages/Volumes'
+import StorageDevices from './pages/StorageDevices'
+import BitrotScrub from './pages/BitrotScrub'
 import KV from './pages/KV'
 import Alerts from './pages/Alerts'
 import S3 from './pages/S3'
@@ -43,10 +45,26 @@ function App() {
           }
         />
         <Route
+          path="storage-devices"
+          element={
+            <ProtectedRoute requireAdmin>
+              <StorageDevices />
+            </ProtectedRoute>
+          }
+        />
+        <Route
           path="volumes"
           element={
             <ProtectedRoute requireAdmin>
               <Volumes />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="bitrot-scrub"
+          element={
+            <ProtectedRoute requireAdmin>
+              <BitrotScrub />
             </ProtectedRoute>
           }
         />

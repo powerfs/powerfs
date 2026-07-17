@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use powerfs_common::types::{NeedleId, VolumeId};
+use powerfs_common::types::{ChecksumAlgorithm, NeedleId, VolumeId};
 use powerfs_core::needle::Needle;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
@@ -84,7 +84,8 @@ fn test_needle_to_bytes_and_from_bytes_roundtrip() {
     );
     let bytes = needle.to_bytes();
 
-    let restored = Needle::from_bytes(&bytes, VolumeId(7), 1024).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(7), 1024, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(42));
     assert_eq!(restored.volume_id, VolumeId(7));
     assert_eq!(restored.data, Bytes::from("round-trip test data"));
@@ -99,7 +100,8 @@ fn test_needle_to_bytes_empty_data() {
     // header(12) + empty data + footer(8) = 20
     assert_eq!(bytes.len(), 20);
 
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.data, Bytes::from(""));
     assert_eq!(restored.data_size(), 0);
 }
@@ -110,7 +112,8 @@ fn test_needle_to_bytes_single_byte() {
     let bytes = needle.to_bytes();
     assert_eq!(bytes.len(), 21); // 12 + 1 + 8
 
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 500).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 500, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.data, Bytes::from(vec![0xAB]));
 }
 
@@ -119,7 +122,8 @@ fn test_needle_to_bytes_binary_data() {
     let data = vec![0x00, 0xFF, 0xAB, 0xCD, 0x12, 0x34];
     let needle = Needle::new(NeedleId(1), VolumeId(1), Bytes::from(data.clone()));
     let bytes = needle.to_bytes();
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.data, Bytes::from(data));
 }
 
@@ -127,7 +131,8 @@ fn test_needle_to_bytes_binary_data() {
 fn test_needle_to_bytes_max_id() {
     let needle = Needle::new(NeedleId(u64::MAX), VolumeId(1), Bytes::from("max"));
     let bytes = needle.to_bytes();
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(u64::MAX));
 }
 
@@ -135,7 +140,8 @@ fn test_needle_to_bytes_max_id() {
 fn test_needle_to_bytes_zero_id() {
     let needle = Needle::new(NeedleId(0), VolumeId(0), Bytes::from("zero"));
     let bytes = needle.to_bytes();
-    let restored = Needle::from_bytes(&bytes, VolumeId(0), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(0), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(0));
 }
 
@@ -146,7 +152,7 @@ fn test_needle_to_bytes_zero_id() {
 #[test]
 fn test_needle_from_bytes_too_short() {
     let bytes = vec![0u8; 10]; // Less than NEEDLE_HEADER_SIZE + NEEDLE_FOOTER_SIZE (20)
-    let result = Needle::from_bytes(&bytes, VolumeId(1), 0);
+    let result = Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default());
     assert!(result.is_err());
 }
 
@@ -160,7 +166,7 @@ fn test_needle_from_bytes_exactly_min_size() {
                                                   // no data
     bytes.extend_from_slice(&calculate_test_checksum(b"").to_be_bytes()); // checksum
 
-    let result = Needle::from_bytes(&bytes, VolumeId(1), 0);
+    let result = Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default());
     assert!(result.is_ok());
     let needle = result.unwrap();
     assert_eq!(needle.data_size(), 0);
@@ -174,7 +180,7 @@ fn test_needle_from_bytes_size_mismatch() {
     bytes.extend_from_slice(b"hello"); // only 5 bytes
     bytes.extend_from_slice(&0u64.to_be_bytes()); // checksum placeholder
 
-    let result = Needle::from_bytes(&bytes, VolumeId(1), 0);
+    let result = Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default());
     assert!(result.is_err());
 }
 
@@ -186,7 +192,7 @@ fn test_needle_from_bytes_checksum_mismatch() {
     // Corrupt the data portion (bytes after header, before footer)
     bytes[12] ^= 0xFF; // flip bits in first data byte
 
-    let result = Needle::from_bytes(&bytes, VolumeId(1), 0);
+    let result = Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default());
     assert!(result.is_err());
 }
 
@@ -198,7 +204,7 @@ fn test_needle_from_bytes_corrupted_checksum() {
     let last = bytes.len() - 1;
     bytes[last] ^= 0xFF;
 
-    let result = Needle::from_bytes(&bytes, VolumeId(1), 0);
+    let result = Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default());
     assert!(result.is_err());
 }
 
@@ -213,7 +219,8 @@ fn test_needle_read_from_basic() {
     needle.write_to(&mut cursor, 0).unwrap();
 
     cursor.seek(SeekFrom::Start(0)).unwrap();
-    let restored = Needle::read_from(&mut cursor, 0, VolumeId(5)).unwrap();
+    let restored =
+        Needle::read_from(&mut cursor, 0, VolumeId(5), ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(100));
     assert_eq!(restored.data, Bytes::from("read test"));
     assert_eq!(restored.checksum, needle.checksum);
@@ -228,7 +235,8 @@ fn test_needle_read_from_nonzero_offset() {
     let needle = Needle::new(NeedleId(42), VolumeId(3), Bytes::from("offset test"));
     needle.write_to(&mut cursor, 100).unwrap();
 
-    let restored = Needle::read_from(&mut cursor, 100, VolumeId(3)).unwrap();
+    let restored =
+        Needle::read_from(&mut cursor, 100, VolumeId(3), ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(42));
     assert_eq!(restored.data, Bytes::from("offset test"));
     assert_eq!(restored.offset, 100);
@@ -245,7 +253,7 @@ fn test_needle_read_from_checksum_mismatch() {
     vec[12] ^= 0xFF;
     let mut cursor = Cursor::new(vec);
 
-    let result = Needle::read_from(&mut cursor, 0, VolumeId(1));
+    let result = Needle::read_from(&mut cursor, 0, VolumeId(1), ChecksumAlgorithm::default());
     assert!(result.is_err());
 }
 
@@ -287,11 +295,18 @@ fn test_needle_write_to_multiple() {
     n2.write_to(&mut cursor, n1.size() as u64).unwrap();
 
     let vec = cursor.into_inner();
-    let r1 = Needle::from_bytes(&vec[0..n1.size()], VolumeId(1), 0).unwrap();
+    let r1 = Needle::from_bytes(
+        &vec[0..n1.size()],
+        VolumeId(1),
+        0,
+        ChecksumAlgorithm::default(),
+    )
+    .unwrap();
     let r2 = Needle::from_bytes(
         &vec[n1.size()..n1.size() + n2.size()],
         VolumeId(1),
         n1.size() as u64,
+        ChecksumAlgorithm::default(),
     )
     .unwrap();
 
@@ -322,7 +337,8 @@ fn test_needle_to_info_with_offset() {
     needle.write_to(&mut cursor, 0).unwrap();
 
     // Read back with offset
-    let restored = Needle::read_from(&mut cursor, 0, VolumeId(1)).unwrap();
+    let restored =
+        Needle::read_from(&mut cursor, 0, VolumeId(1), ChecksumAlgorithm::default()).unwrap();
     let info = restored.to_info();
     assert_eq!(info.offset, 0);
 }
@@ -357,7 +373,8 @@ fn test_needle_boundary_large_data() {
     let bytes = needle.to_bytes();
     assert_eq!(bytes.len(), needle.size());
 
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.data, data);
 }
 
@@ -369,7 +386,8 @@ fn test_needle_boundary_special_chars() {
     ];
     let needle = Needle::new(NeedleId(1), VolumeId(1), Bytes::from(data.clone()));
     let bytes = needle.to_bytes();
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.data, Bytes::from(data));
 }
 
@@ -377,7 +395,8 @@ fn test_needle_boundary_special_chars() {
 fn test_needle_boundary_empty_id() {
     let needle = Needle::new(NeedleId(0), VolumeId(1), Bytes::from("empty id"));
     let bytes = needle.to_bytes();
-    let restored = Needle::from_bytes(&bytes, VolumeId(1), 0).unwrap();
+    let restored =
+        Needle::from_bytes(&bytes, VolumeId(1), 0, ChecksumAlgorithm::default()).unwrap();
     assert_eq!(restored.id, NeedleId(0));
 }
 
@@ -397,6 +416,12 @@ fn test_needle_boundary_large_offset() {
     let mut cursor = Cursor::new(vec![0u8; large_offset as usize + needle.size()]);
     needle.write_to(&mut cursor, large_offset).unwrap();
 
-    let restored = Needle::read_from(&mut cursor, large_offset, VolumeId(1)).unwrap();
+    let restored = Needle::read_from(
+        &mut cursor,
+        large_offset,
+        VolumeId(1),
+        ChecksumAlgorithm::default(),
+    )
+    .unwrap();
     assert_eq!(restored.offset, large_offset);
 }

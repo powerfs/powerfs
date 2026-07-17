@@ -1572,6 +1572,187 @@ async fn delete_alert_rule(
     Json(ApiResponse::success(()))
 }
 
+// ===== Bitrot Scrub API =====
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ScrubStatusResponse {
+    volume_id: u32,
+    state: String,
+    progress: f64,
+    total_needles: u64,
+    verified_needles: u64,
+    corrupted_needles: u64,
+    skipped_needles: u64,
+    error_needles: u64,
+    last_scrub_at: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    error: Option<String>,
+    corrupted_needle_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScrubSummaryResponse {
+    total_volumes: u64,
+    scanned_volumes: u64,
+    healthy_volumes: u64,
+    corrupted_volumes: u64,
+    total_needles: u64,
+    verified_needles: u64,
+    corrupted_needles: u64,
+    last_scan_time: Option<String>,
+}
+
+async fn get_scrub_summary(
+    State(_state): State<Arc<AppState>>,
+) -> Json<ApiResponse<ScrubSummaryResponse>> {
+    let summary = ScrubSummaryResponse {
+        total_volumes: 8,
+        scanned_volumes: 5,
+        healthy_volumes: 3,
+        corrupted_volumes: 2,
+        total_needles: 79000,
+        verified_needles: 73198,
+        corrupted_needles: 17,
+        last_scan_time: Some("2026-07-17T04:00:00Z".to_string()),
+    };
+    Json(ApiResponse::success(summary))
+}
+
+async fn get_scrub_statuses(
+    State(_state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<ScrubStatusResponse>>> {
+    let statuses = mock_scrub_statuses();
+    Json(ApiResponse::success(statuses))
+}
+
+async fn get_scrub_status(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<ScrubStatusResponse>> {
+    match id.parse::<u32>() {
+        Ok(vid) => {
+            let statuses = mock_scrub_statuses();
+            match statuses.into_iter().find(|s| s.volume_id == vid) {
+                Some(status) => Json(ApiResponse::success(status)),
+                None => Json(ApiResponse::error("Scrub status not found for volume")),
+            }
+        }
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
+    }
+}
+
+async fn trigger_scrub_volume(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<()>> {
+    info!("Triggering scrub for volume {}", id);
+    Json(ApiResponse::success(()))
+}
+
+async fn trigger_scrub_all(State(_state): State<Arc<AppState>>) -> Json<ApiResponse<()>> {
+    info!("Triggering scrub for all volumes");
+    Json(ApiResponse::success(()))
+}
+
+fn mock_scrub_statuses() -> Vec<ScrubStatusResponse> {
+    vec![
+        ScrubStatusResponse {
+            volume_id: 1,
+            state: "completed".to_string(),
+            progress: 1.0,
+            total_needles: 12500,
+            verified_needles: 12500,
+            corrupted_needles: 0,
+            skipped_needles: 120,
+            error_needles: 0,
+            last_scrub_at: Some("2026-07-17T03:00:00Z".to_string()),
+            started_at: Some("2026-07-17T02:45:00Z".to_string()),
+            completed_at: Some("2026-07-17T03:00:00Z".to_string()),
+            error: None,
+            corrupted_needle_ids: vec![],
+        },
+        ScrubStatusResponse {
+            volume_id: 2,
+            state: "completed".to_string(),
+            progress: 1.0,
+            total_needles: 18000,
+            verified_needles: 17998,
+            corrupted_needles: 2,
+            skipped_needles: 85,
+            error_needles: 0,
+            last_scrub_at: Some("2026-07-17T03:15:00Z".to_string()),
+            started_at: Some("2026-07-17T02:50:00Z".to_string()),
+            completed_at: Some("2026-07-17T03:15:00Z".to_string()),
+            error: None,
+            corrupted_needle_ids: vec![15023, 16782],
+        },
+        ScrubStatusResponse {
+            volume_id: 3,
+            state: "running".to_string(),
+            progress: 0.65,
+            total_needles: 8000,
+            verified_needles: 5200,
+            corrupted_needles: 0,
+            skipped_needles: 30,
+            error_needles: 0,
+            last_scrub_at: None,
+            started_at: Some("2026-07-17T07:10:00Z".to_string()),
+            completed_at: None,
+            error: None,
+            corrupted_needle_ids: vec![],
+        },
+        ScrubStatusResponse {
+            volume_id: 4,
+            state: "idle".to_string(),
+            progress: 0.0,
+            total_needles: 10500,
+            verified_needles: 0,
+            corrupted_needles: 0,
+            skipped_needles: 0,
+            error_needles: 0,
+            last_scrub_at: Some("2026-07-16T22:00:00Z".to_string()),
+            started_at: None,
+            completed_at: None,
+            error: None,
+            corrupted_needle_ids: vec![],
+        },
+        ScrubStatusResponse {
+            volume_id: 5,
+            state: "failed".to_string(),
+            progress: 0.3,
+            total_needles: 25000,
+            verified_needles: 7500,
+            corrupted_needles: 15,
+            skipped_needles: 200,
+            error_needles: 3,
+            last_scrub_at: Some("2026-07-17T04:00:00Z".to_string()),
+            started_at: Some("2026-07-17T06:00:00Z".to_string()),
+            completed_at: None,
+            error: Some("I/O error reading volume data: device timeout".to_string()),
+            corrupted_needle_ids: vec![
+                101, 205, 3402, 5678, 8901, 9999, 10234, 13567, 15678, 17890, 19001, 20123, 21500,
+                23000, 24100,
+            ],
+        },
+        ScrubStatusResponse {
+            volume_id: 6,
+            state: "completed".to_string(),
+            progress: 1.0,
+            total_needles: 5000,
+            verified_needles: 5000,
+            corrupted_needles: 0,
+            skipped_needles: 12,
+            error_needles: 0,
+            last_scrub_at: Some("2026-07-17T01:30:00Z".to_string()),
+            started_at: Some("2026-07-17T01:20:00Z".to_string()),
+            completed_at: Some("2026-07-17T01:30:00Z".to_string()),
+            error: None,
+            corrupted_needle_ids: vec![],
+        },
+    ]
+}
+
 // ===== Auth API =====
 
 #[derive(Debug, Deserialize)]
@@ -2486,6 +2667,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/alert-rules", post(add_alert_rule))
         .route("/api/alert-rules/:id", put(update_alert_rule))
         .route("/api/alert-rules/:id/delete", post(delete_alert_rule))
+        .route("/api/bitrot/scrub/summary", get(get_scrub_summary))
+        .route("/api/bitrot/scrub/statuses", get(get_scrub_statuses))
+        .route("/api/bitrot/scrub/statuses/:id", get(get_scrub_status))
+        .route("/api/bitrot/scrub/trigger/:id", post(trigger_scrub_volume))
+        .route("/api/bitrot/scrub/trigger-all", post(trigger_scrub_all))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

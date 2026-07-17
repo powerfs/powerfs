@@ -1,5 +1,6 @@
 use crate::index::{NeedleIndex, PersistentIndex};
 use crate::needle::Needle;
+use crate::storage_backend::{StorageBackend, StorageBackendError};
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use powerfs_common::{
@@ -9,74 +10,40 @@ use powerfs_common::{
         ChecksumAlgorithm, Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo,
         VolumeState,
     },
-    utils::Checksum,
 };
-use std::fs::{File, OpenOptions};
-use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+
+fn backend_err(e: StorageBackendError) -> PowerFsError {
+    PowerFsError::Storage(e.to_string())
+}
 
 pub struct Volume {
     info: RwLock<VolumeInfo>,
-    file: RwLock<File>,
     index: Box<dyn NeedleIndex>,
     free_space: RwLock<u64>,
     next_offset: RwLock<u64>,
     checksum_algorithm: ChecksumAlgorithm,
+    backend: Arc<dyn StorageBackend>,
+    backend_volume_id: u64,
 }
 
 #[allow(clippy::result_large_err)]
 impl Volume {
-    pub fn new(id: VolumeId, node_id: &str, path: &str, size: u64) -> Result<Self> {
-        let volume_path = Path::new(path).join(format!("volume_{}", id.0));
-
-        if !volume_path.exists() {
-            std::fs::create_dir_all(&volume_path)?;
-        }
-
-        let data_file_path = volume_path.join("data");
-        let index_path = volume_path.join("index");
-
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&data_file_path)?;
-
-        let file_size = file.metadata()?.len();
-        if file_size < size {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_file_path)?
-                .set_len(size)?;
-        }
-
-        let index: Box<dyn NeedleIndex> =
-            Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
-
-        let info = VolumeInfo {
+    pub fn new(
+        id: VolumeId,
+        node_id: &str,
+        path: &str,
+        size: u64,
+        backend: Arc<dyn StorageBackend>,
+    ) -> Result<Self> {
+        Self::new_with_algorithm(
             id,
-            node_id: powerfs_common::types::NodeId(node_id.to_string()),
-            collection: Collection::default(),
+            node_id,
+            path,
             size,
-            used: 0,
-            replica_count: 3,
-            ttl: Ttl::default(),
-            disk_type: DiskType::default(),
-            state: VolumeState::Available,
-            created_at: Utc::now(),
-            modified_at: Utc::now(),
-            next_file_key: 1,
-        };
-
-        Ok(Volume {
-            info: RwLock::new(info),
-            file: RwLock::new(file),
-            index,
-            free_space: RwLock::new(size),
-            next_offset: RwLock::new(VOLUME_DATA_OFFSET),
-            checksum_algorithm: ChecksumAlgorithm::default(),
-        })
+            ChecksumAlgorithm::default(),
+            backend,
+        )
     }
 
     pub fn new_with_algorithm(
@@ -85,40 +52,40 @@ impl Volume {
         path: &str,
         size: u64,
         algorithm: ChecksumAlgorithm,
+        backend: Arc<dyn StorageBackend>,
     ) -> Result<Self> {
-        let volume_path = Path::new(path).join(format!("volume_{}", id.0));
+        let volume_path = std::path::Path::new(path).join(format!("volume_{}", id.0));
 
         if !volume_path.exists() {
             std::fs::create_dir_all(&volume_path)?;
         }
 
-        let data_file_path = volume_path.join("data");
         let index_path = volume_path.join("index");
-
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&data_file_path)?;
-
-        let file_size = file.metadata()?.len();
-        if file_size < size {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&data_file_path)?
-                .set_len(size)?;
-        }
 
         let index: Box<dyn NeedleIndex> =
             Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
+
+        let backend_volume_id = id.0 as u64;
+        let physical_size = size + VOLUME_DATA_OFFSET;
+        match backend.get_volume_info(backend_volume_id) {
+            Ok(_) => {}
+            Err(StorageBackendError::VolumeNotFound(_)) => {
+                backend
+                    .allocate_volume(backend_volume_id, physical_size, None)
+                    .map_err(backend_err)?;
+            }
+            Err(e) => return Err(backend_err(e)),
+        }
+
+        let (used, next_offset) = Self::rebuild_metadata_from_index(index.as_ref(), size);
+        let free_space = size.saturating_sub(used);
 
         let info = VolumeInfo {
             id,
             node_id: powerfs_common::types::NodeId(node_id.to_string()),
             collection: Collection::default(),
             size,
-            used: 0,
+            used,
             replica_count: 3,
             ttl: Ttl::default(),
             disk_type: DiskType::default(),
@@ -130,12 +97,35 @@ impl Volume {
 
         Ok(Volume {
             info: RwLock::new(info),
-            file: RwLock::new(file),
             index,
-            free_space: RwLock::new(size),
-            next_offset: RwLock::new(VOLUME_DATA_OFFSET),
+            free_space: RwLock::new(free_space),
+            next_offset: RwLock::new(next_offset),
             checksum_algorithm: algorithm,
+            backend,
+            backend_volume_id,
         })
+    }
+
+    fn rebuild_metadata_from_index(index: &dyn NeedleIndex, volume_size: u64) -> (u64, u64) {
+        let mut max_end: u64 = VOLUME_DATA_OFFSET;
+
+        for (_needle_id, info) in index.iter() {
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+            let end = info.offset.saturating_add(needle_size);
+            if end > max_end {
+                max_end = end;
+            }
+        }
+
+        let used = max_end.saturating_sub(VOLUME_DATA_OFFSET);
+        let used = if used > volume_size {
+            volume_size
+        } else {
+            used
+        };
+
+        (used, max_end)
     }
 
     pub fn id(&self) -> VolumeId {
@@ -185,8 +175,10 @@ impl Volume {
         let mut next_offset_guard = self.next_offset.write().unwrap();
         let offset = *next_offset_guard;
 
-        let mut file_guard = self.file.write().unwrap();
-        needle.write_to(&mut *file_guard, offset)?;
+        let needle_bytes = needle.to_bytes();
+        self.backend
+            .write_needle(self.backend_volume_id, offset, &needle_bytes)
+            .map_err(backend_err)?;
 
         *next_offset_guard += required_space;
         *free_space_guard -= required_space;
@@ -212,7 +204,6 @@ impl Volume {
             ec_shards: Vec::new(),
         };
 
-        drop(file_guard);
         drop(next_offset_guard);
         drop(free_space_guard);
         drop(info_guard);
@@ -228,9 +219,13 @@ impl Volume {
                 return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
             }
 
-            let mut file_guard = self.file.write().unwrap();
-            let needle = Needle::read_from(&mut *file_guard, info.offset, self.id())?;
-            drop(file_guard);
+            let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let data = self
+                .backend
+                .read_needle(self.backend_volume_id, info.offset, data_size)
+                .map_err(backend_err)?;
+            let needle =
+                Needle::from_bytes(&data, self.id(), info.offset, info.checksum_algorithm)?;
 
             info.last_verified_at = Some(Utc::now());
             info.verification_count += 1;
@@ -327,20 +322,10 @@ impl Volume {
         let needles = self.index.iter();
         for (needle_id, info) in needles {
             if let Some(retention_until) = info.delete_retention_until {
-                if retention_until < now {
-                    if let Some(removed_info) = self.index.remove(&needle_id) {
-                        let mut info_guard = self.info.write().unwrap();
-                        let mut free_space_guard = self.free_space.write().unwrap();
-
-                        let needle_size = (NEEDLE_HEADER_SIZE
-                            + removed_info.data_size as usize
-                            + NEEDLE_FOOTER_SIZE) as u64;
-                        info_guard.used -= needle_size;
-                        *free_space_guard += needle_size;
-                        info_guard.modified_at = Utc::now();
-
-                        cleaned_count += 1;
-                    }
+                if retention_until < now && self.index.remove(&needle_id).is_some() {
+                    let mut info_guard = self.info.write().unwrap();
+                    info_guard.modified_at = Utc::now();
+                    cleaned_count += 1;
                 }
             }
         }
@@ -388,6 +373,141 @@ impl Volume {
         self.index.as_ref()
     }
 
+    pub fn compact(&self) -> Result<(u64, u64)> {
+        let mut active_needles: Vec<NeedleInfo> = Vec::new();
+
+        for (_id, info) in self.index.iter() {
+            if info.deleted_at.is_none() {
+                active_needles.push(info);
+            }
+        }
+
+        active_needles.sort_by_key(|info| info.offset);
+
+        let mut new_offset = VOLUME_DATA_OFFSET;
+        let mut reclaimed: u64 = 0;
+        let mut updated_count: u64 = 0;
+
+        for info in &active_needles {
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+
+            if info.offset == new_offset {
+                new_offset += needle_size;
+                continue;
+            }
+
+            let data_size_u32 =
+                NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let raw_data = self
+                .backend
+                .read_needle(self.backend_volume_id, info.offset, data_size_u32)
+                .map_err(backend_err)?;
+
+            self.backend
+                .write_needle(self.backend_volume_id, new_offset, &raw_data)
+                .map_err(backend_err)?;
+
+            let mut new_info = info.clone();
+            new_info.offset = new_offset;
+            self.index.insert(info.id.clone(), new_info);
+
+            new_offset += needle_size;
+            updated_count += 1;
+        }
+
+        let old_used = self.used();
+        let new_used = new_offset.saturating_sub(VOLUME_DATA_OFFSET);
+        if new_used < old_used {
+            reclaimed = old_used - new_used;
+        }
+
+        {
+            let mut info_guard = self.info.write().unwrap();
+            info_guard.used = new_used;
+            info_guard.modified_at = Utc::now();
+        }
+        *self.next_offset.write().unwrap() = new_offset;
+        *self.free_space.write().unwrap() = self.size().saturating_sub(new_used);
+
+        self.backend
+            .truncate_volume(self.backend_volume_id, new_offset)
+            .map_err(backend_err)?;
+
+        Ok((reclaimed, updated_count))
+    }
+
+    fn append_needle_version(
+        &self,
+        needle_id: NeedleId,
+        new_data: Bytes,
+        old_info: NeedleInfo,
+    ) -> Result<()> {
+        let mut info_guard = self.info.write().unwrap();
+        if info_guard.state != VolumeState::Available {
+            return Err(PowerFsError::InvalidVolumeState(
+                "volume not available".to_string(),
+            ));
+        }
+
+        let new_needle = Needle::new_with_algorithm(
+            needle_id.clone(),
+            info_guard.id,
+            new_data,
+            self.checksum_algorithm,
+        );
+        let new_size = new_needle.size() as u64;
+
+        let mut free_space_guard = self.free_space.write().unwrap();
+        if *free_space_guard < new_size {
+            info_guard.state = VolumeState::Full;
+            return Err(PowerFsError::OutOfSpace);
+        }
+
+        let mut next_offset_guard = self.next_offset.write().unwrap();
+        let new_offset = *next_offset_guard;
+
+        let needle_bytes = new_needle.to_bytes();
+        self.backend
+            .write_needle(self.backend_volume_id, new_offset, &needle_bytes)
+            .map_err(backend_err)?;
+
+        *next_offset_guard += new_size;
+        *free_space_guard -= new_size;
+        info_guard.used += new_size;
+        info_guard.modified_at = Utc::now();
+
+        let mut old_updated = old_info.clone();
+        old_updated.deleted_at = Some(Utc::now());
+        drop(next_offset_guard);
+        drop(free_space_guard);
+        drop(info_guard);
+
+        self.index.insert(needle_id.clone(), old_updated);
+
+        let new_info = NeedleInfo {
+            id: needle_id.clone(),
+            volume_id: old_info.volume_id,
+            data_size: new_needle.data.len() as u32,
+            offset: new_offset,
+            checksum: new_needle.checksum,
+            checksum_algorithm: self.checksum_algorithm,
+            last_verified_at: None,
+            verification_count: 0,
+            deleted_at: None,
+            delete_retention_until: old_info.delete_retention_until,
+            worm_retention_until: old_info.worm_retention_until,
+            created_at: old_info.created_at,
+            ec_enabled: old_info.ec_enabled,
+            ec_k: old_info.ec_k,
+            ec_m: old_info.ec_m,
+            ec_shards: old_info.ec_shards.clone(),
+        };
+        self.index.insert(needle_id, new_info);
+
+        Ok(())
+    }
+
     pub fn write_needle_blob(
         &self,
         file_key: u64,
@@ -398,8 +518,18 @@ impl Volume {
     ) -> Result<()> {
         let needle_id = NeedleId(file_key);
         if let Some(existing_info) = self.index.get(&needle_id) {
-            let mut file_guard = self.file.write().unwrap();
-            let needle = Needle::read_from(&mut *file_guard, existing_info.offset, self.id())?;
+            let data_size =
+                NEEDLE_HEADER_SIZE as u32 + existing_info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let raw_data = self
+                .backend
+                .read_needle(self.backend_volume_id, existing_info.offset, data_size)
+                .map_err(backend_err)?;
+            let needle = Needle::from_bytes(
+                &raw_data,
+                self.id(),
+                existing_info.offset,
+                existing_info.checksum_algorithm,
+            )?;
             let data_offset = offset as usize;
             let data_end = data_offset + size as usize;
             let mut data_vec = needle.data.to_vec();
@@ -407,39 +537,8 @@ impl Volume {
                 data_vec.resize(data_end, 0);
             }
             data_vec[data_offset..data_end].copy_from_slice(&data);
-            let checksum_val = Checksum::compute(&data_vec, self.checksum_algorithm);
-            let updated_needle = Needle {
-                id: needle.id,
-                volume_id: needle.volume_id,
-                data: Bytes::from(data_vec),
-                offset: needle.offset,
-                checksum: checksum_val.as_u64(),
-                checksum_algorithm: self.checksum_algorithm,
-            };
-            updated_needle.write_to(&mut *file_guard, existing_info.offset)?;
-            let mut info_guard = self.info.write().unwrap();
-            info_guard.modified_at = Utc::now();
-            drop(file_guard);
-            let updated_info = NeedleInfo {
-                id: needle_id,
-                volume_id: info_guard.id,
-                data_size: updated_needle.data.len() as u32,
-                offset: existing_info.offset,
-                checksum: updated_needle.checksum,
-                checksum_algorithm: self.checksum_algorithm,
-                last_verified_at: None,
-                verification_count: 0,
-                deleted_at: existing_info.deleted_at,
-                delete_retention_until: existing_info.delete_retention_until,
-                worm_retention_until: existing_info.worm_retention_until,
-                created_at: existing_info.created_at,
-                ec_enabled: existing_info.ec_enabled,
-                ec_k: existing_info.ec_k,
-                ec_m: existing_info.ec_m,
-                ec_shards: existing_info.ec_shards.clone(),
-            };
-            drop(info_guard);
-            self.index.insert(NeedleId(file_key), updated_info);
+
+            self.append_needle_version(needle_id, Bytes::from(data_vec), existing_info)?;
         } else {
             let data_size = (offset as u64 + size as u64) as usize;
             let mut full_data = vec![0u8; data_size];
@@ -454,9 +553,13 @@ impl Volume {
     pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
         let needle_id = NeedleId(file_key);
         if let Some(mut info) = self.index.get(&needle_id) {
-            let mut file_guard = self.file.write().unwrap();
-            let needle = Needle::read_from(&mut *file_guard, info.offset, self.id())?;
-            drop(file_guard);
+            let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let raw_data = self
+                .backend
+                .read_needle(self.backend_volume_id, info.offset, data_size)
+                .map_err(backend_err)?;
+            let needle =
+                Needle::from_bytes(&raw_data, self.id(), info.offset, info.checksum_algorithm)?;
 
             info.last_verified_at = Some(Utc::now());
             info.verification_count += 1;
@@ -485,4 +588,68 @@ impl Volume {
     pub fn deleted_count(&self) -> usize {
         0
     }
+
+    pub fn verify_needle(&self, needle_id: &NeedleId) -> Result<bool> {
+        if let Some(mut info) = self.index.get(needle_id) {
+            if info.deleted_at.is_some() {
+                return Ok(true);
+            }
+
+            let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let data = self
+                .backend
+                .read_needle(self.backend_volume_id, info.offset, data_size)
+                .map_err(backend_err)?;
+
+            let result = Needle::from_bytes(&data, self.id(), info.offset, info.checksum_algorithm);
+            let valid = result.is_ok();
+
+            info.last_verified_at = Some(Utc::now());
+            info.verification_count += 1;
+            self.index.insert(needle_id.clone(), info);
+
+            Ok(valid)
+        } else {
+            Err(PowerFsError::NeedleNotFound(needle_id.clone()))
+        }
+    }
+
+    pub fn scrub_volume(&self) -> ScrubResult {
+        let mut result = ScrubResult::default();
+        let all_needles = self.index.iter();
+
+        for (needle_id, info) in &all_needles {
+            if info.deleted_at.is_some() {
+                result.skipped += 1;
+                continue;
+            }
+
+            result.total += 1;
+            match self.verify_needle(needle_id) {
+                Ok(true) => {
+                    result.verified += 1;
+                }
+                Ok(false) => {
+                    result.corrupted += 1;
+                    result.corrupted_needles.push(needle_id.clone());
+                }
+                Err(_) => {
+                    result.errors += 1;
+                    result.corrupted_needles.push(needle_id.clone());
+                }
+            }
+        }
+
+        result
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScrubResult {
+    pub total: u64,
+    pub verified: u64,
+    pub corrupted: u64,
+    pub skipped: u64,
+    pub errors: u64,
+    pub corrupted_needles: Vec<NeedleId>,
 }

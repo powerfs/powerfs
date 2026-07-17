@@ -1,6 +1,6 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult } from '@/types'
-import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics } from '@/utils/mockData'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary } from '@/types'
+import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
 const api = axios.create({
@@ -524,4 +524,116 @@ export async function deleteKVKey(id: string): Promise<void> {
     return
   }
   await api.delete(`/kv/keys/${id}`)
+}
+
+export async function getDevices(nodeId?: string): Promise<StorageDevice[]> {
+  if (useMock) {
+    if (nodeId) {
+      return mockDevices.filter(d => d.location.node_id === nodeId)
+    }
+    return mockDevices
+  }
+  const url = nodeId ? `/storage/devices?node_id=${nodeId}` : '/storage/devices'
+  const response = await api.get(url)
+  return response.data.data
+}
+
+export async function getDevice(deviceId: string): Promise<StorageDevice> {
+  if (useMock) {
+    return mockDevices.find(d => d.device_id === deviceId) || mockDevices[0]
+  }
+  const response = await api.get(`/storage/devices/${deviceId}`)
+  return response.data.data
+}
+
+export async function excludeDevice(deviceId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/devices/${deviceId}/exclude`)
+}
+
+export async function restoreDevice(deviceId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/devices/${deviceId}/restore`)
+}
+
+export async function drainDevice(deviceId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/devices/${deviceId}/drain`)
+}
+
+export async function getMigrationTasks(deviceId?: string): Promise<DataMigrationTask[]> {
+  if (useMock) {
+    if (deviceId) {
+      return mockMigrationTasks.filter(t => t.source_device_id === deviceId || t.target_device_id === deviceId)
+    }
+    return mockMigrationTasks
+  }
+  const url = deviceId ? `/storage/migrations?device_id=${deviceId}` : '/storage/migrations'
+  const response = await api.get(url)
+  return response.data.data
+}
+
+export async function cancelMigration(taskId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/migrations/${taskId}/cancel`)
+}
+
+export async function pauseMigration(taskId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/migrations/${taskId}/pause`)
+}
+
+export async function resumeMigration(taskId: string): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/storage/migrations/${taskId}/resume`)
+}
+
+export async function getScrubSummary(): Promise<ScrubSummary> {
+  if (useMock) {
+    return mockScrubSummary
+  }
+  const response = await api.get('/bitrot/scrub/summary')
+  return response.data.data
+}
+
+export async function getScrubStatuses(): Promise<VolumeScrubStatus[]> {
+  if (useMock) {
+    return mockScrubStatuses
+  }
+  const response = await api.get('/bitrot/scrub/statuses')
+  return response.data.data
+}
+
+export async function getScrubStatus(volumeId: number): Promise<VolumeScrubStatus> {
+  if (useMock) {
+    return mockScrubStatuses.find(s => s.volume_id === volumeId) || mockScrubStatuses[0]
+  }
+  const response = await api.get(`/bitrot/scrub/statuses/${volumeId}`)
+  return response.data.data
+}
+
+export async function triggerScrubVolume(volumeId: number): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post(`/bitrot/scrub/trigger/${volumeId}`)
+}
+
+export async function triggerScrubAll(): Promise<void> {
+  if (useMock) {
+    return
+  }
+  await api.post('/bitrot/scrub/trigger-all')
 }

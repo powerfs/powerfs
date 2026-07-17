@@ -1,12 +1,16 @@
 use bytes::Bytes;
 use powerfs_common::types::{NeedleId, VolumeId, VolumeState};
+use powerfs_core::storage_backend::LocalFsBackend;
 use powerfs_core::volume::Volume;
+use std::sync::Arc;
 
-// Helper: create a temporary directory and volume
 fn create_test_volume(vol_id: u32, size: u64) -> (tempfile::TempDir, Volume) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let volume = Volume::new(VolumeId(vol_id), "test-node", path, size).unwrap();
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "test-node", "default", 100 * 1024 * 1024 * 1024).unwrap(),
+    );
+    let volume = Volume::new(VolumeId(vol_id), "test-node", path, size, backend).unwrap();
     (dir, volume)
 }
 
@@ -45,9 +49,11 @@ fn test_volume_info() {
 fn test_volume_multiple_volumes_different_ids() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
+    let backend =
+        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
 
-    let v1 = Volume::new(VolumeId(1), "node", path, 1024 * 1024).unwrap();
-    let v2 = Volume::new(VolumeId(2), "node", path, 1024 * 1024).unwrap();
+    let v1 = Volume::new(VolumeId(1), "node", path, 1024 * 1024, backend.clone()).unwrap();
+    let v2 = Volume::new(VolumeId(2), "node", path, 1024 * 1024, backend).unwrap();
 
     assert_eq!(v1.id(), VolumeId(1));
     assert_eq!(v2.id(), VolumeId(2));
@@ -286,19 +292,335 @@ fn test_volume_empty_data_round_trip() {
 fn test_volume_reopen_persists_data() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
+    let backend =
+        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
 
-    // Write data
     {
-        let volume = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024).unwrap();
+        let volume =
+            Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024, backend.clone()).unwrap();
         volume
             .write_needle(1, Bytes::from("persistent data"))
             .unwrap();
     }
 
-    // Reopen
-    let volume2 = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024).unwrap();
+    let volume2 = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024, backend).unwrap();
 
-    // Data should be readable from persistent index
     let read_data = volume2.read_needle(&NeedleId(1)).unwrap();
     assert_eq!(read_data, Bytes::from("persistent data"));
+}
+
+// ============================================================================
+// Bitrot scrub tests
+// ============================================================================
+
+#[test]
+fn test_volume_verify_needle_valid() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume
+        .write_needle(1, Bytes::from("test data for verification"))
+        .unwrap();
+
+    let result = volume.verify_needle(&NeedleId(1)).unwrap();
+    assert!(result);
+
+    let info = volume.read_needle_meta(1).unwrap();
+    assert!(info.last_verified_at.is_some());
+    assert_eq!(info.verification_count, 1);
+}
+
+#[test]
+fn test_volume_verify_nonexistent_needle() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    let result = volume.verify_needle(&NeedleId(999));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_volume_scrub_empty() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    let result = volume.scrub_volume();
+    assert_eq!(result.total, 0);
+    assert_eq!(result.verified, 0);
+    assert_eq!(result.corrupted, 0);
+    assert_eq!(result.skipped, 0);
+    assert_eq!(result.errors, 0);
+    assert!(result.corrupted_needles.is_empty());
+}
+
+#[test]
+fn test_volume_scrub_all_valid() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume.write_needle(1, Bytes::from("first needle")).unwrap();
+    volume
+        .write_needle(2, Bytes::from("second needle"))
+        .unwrap();
+    volume.write_needle(3, Bytes::from("third needle")).unwrap();
+
+    let result = volume.scrub_volume();
+    assert_eq!(result.total, 3);
+    assert_eq!(result.verified, 3);
+    assert_eq!(result.corrupted, 0);
+    assert_eq!(result.errors, 0);
+    assert!(result.corrupted_needles.is_empty());
+}
+
+#[test]
+fn test_volume_scrub_skips_deleted() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume.write_needle(1, Bytes::from("keep this")).unwrap();
+    volume.write_needle(2, Bytes::from("delete this")).unwrap();
+    volume.delete_needle(&NeedleId(2)).unwrap();
+
+    let result = volume.scrub_volume();
+    assert_eq!(result.total, 1);
+    assert_eq!(result.verified, 1);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.corrupted, 0);
+}
+
+#[test]
+fn test_storage_manager_scrub_volume() {
+    use powerfs_common::types::NodeId;
+    use powerfs_core::storage::StorageManager;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+
+    manager
+        .create_volume(VolumeId(1), 10 * 1024 * 1024)
+        .unwrap();
+    let volume = manager.get_volume(&VolumeId(1)).unwrap();
+    volume.write_needle(1, Bytes::from("sm test data")).unwrap();
+
+    let result = manager.scrub_volume(&VolumeId(1)).unwrap();
+    assert_eq!(result.total, 1);
+    assert_eq!(result.verified, 1);
+    assert_eq!(result.corrupted, 0);
+}
+
+#[test]
+fn test_storage_manager_verify_needle() {
+    use powerfs_common::types::NodeId;
+    use powerfs_core::storage::StorageManager;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+
+    manager
+        .create_volume(VolumeId(1), 10 * 1024 * 1024)
+        .unwrap();
+    let volume = manager.get_volume(&VolumeId(1)).unwrap();
+    volume.write_needle(42, Bytes::from("verify me")).unwrap();
+
+    let valid = manager.verify_needle(&VolumeId(1), &NeedleId(42)).unwrap();
+    assert!(valid);
+}
+
+#[test]
+fn test_storage_manager_scrub_all_volumes() {
+    use powerfs_common::types::NodeId;
+    use powerfs_core::storage::StorageManager;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+
+    manager
+        .create_volume(VolumeId(1), 10 * 1024 * 1024)
+        .unwrap();
+    manager
+        .create_volume(VolumeId(2), 10 * 1024 * 1024)
+        .unwrap();
+
+    let v1 = manager.get_volume(&VolumeId(1)).unwrap();
+    v1.write_needle(1, Bytes::from("v1 needle")).unwrap();
+
+    let v2 = manager.get_volume(&VolumeId(2)).unwrap();
+    v2.write_needle(10, Bytes::from("v2 needle a")).unwrap();
+    v2.write_needle(11, Bytes::from("v2 needle b")).unwrap();
+
+    let results = manager.scrub_all_volumes();
+    assert_eq!(results.len(), 2);
+
+    for (vid, result) in &results {
+        if vid.0 == 1 {
+            assert_eq!(result.total, 1);
+            assert_eq!(result.verified, 1);
+        } else if vid.0 == 2 {
+            assert_eq!(result.total, 2);
+            assert_eq!(result.verified, 2);
+        }
+    }
+}
+
+// ============================================================================
+// Append-only & compact tests
+// ============================================================================
+
+#[test]
+fn test_volume_reopen_restores_used() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let backend =
+        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
+
+    let used_before;
+    {
+        let volume =
+            Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024, backend.clone()).unwrap();
+        volume.write_needle(1, Bytes::from("hello world")).unwrap();
+        volume
+            .write_needle(2, Bytes::from("second needle"))
+            .unwrap();
+        used_before = volume.used();
+        assert!(used_before > 0);
+    }
+
+    let volume2 = Volume::new(VolumeId(1), "node", path, 10 * 1024 * 1024, backend).unwrap();
+    assert_eq!(volume2.used(), used_before);
+    assert_eq!(volume2.free_space(), 10 * 1024 * 1024 - used_before);
+}
+
+#[test]
+fn test_write_needle_blob_growth_updates_used() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume
+        .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
+        .unwrap();
+    let used_after_first = volume.used();
+    assert!(used_after_first > 0);
+
+    volume
+        .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
+        .unwrap();
+    let used_after_second = volume.used();
+    assert!(used_after_second > used_after_first);
+}
+
+#[test]
+fn test_write_needle_blob_append_only_offset() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume
+        .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
+        .unwrap();
+
+    let info1 = volume.get_needle_info(&NeedleId(1)).unwrap();
+    let offset1 = info1.offset;
+
+    volume
+        .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
+        .unwrap();
+
+    let info2 = volume.get_needle_info(&NeedleId(1)).unwrap();
+    let offset2 = info2.offset;
+
+    assert!(offset2 > offset1);
+}
+
+#[test]
+fn test_write_needle_blob_data_integrity_after_growth() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume
+        .write_needle_blob(1, 0, 4, Bytes::from(b"abcd".to_vec()), 0)
+        .unwrap();
+
+    volume
+        .write_needle_blob(1, 4, 4, Bytes::from(b"efgh".to_vec()), 0)
+        .unwrap();
+
+    let data = volume.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(&data[..8], b"abcdefgh");
+}
+
+#[test]
+fn test_compact_reclaims_space_after_deletes() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume.write_needle(1, Bytes::from("needle one")).unwrap();
+    volume.write_needle(2, Bytes::from("needle two")).unwrap();
+    volume.write_needle(3, Bytes::from("needle three")).unwrap();
+
+    let used_before = volume.used();
+    volume.delete_needle(&NeedleId(2)).unwrap();
+    let used_after_delete = volume.used();
+    assert_eq!(used_after_delete, used_before);
+
+    let (reclaimed, moved) = volume.compact().unwrap();
+    assert!(reclaimed > 0);
+    assert!(moved > 0);
+
+    let used_after_compact = volume.used();
+    assert!(used_after_compact < used_before);
+    assert_eq!(used_after_compact, used_before - reclaimed);
+
+    let data1 = volume.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(data1, Bytes::from("needle one"));
+    let data3 = volume.read_needle(&NeedleId(3)).unwrap();
+    assert_eq!(data3, Bytes::from("needle three"));
+}
+
+#[test]
+fn test_compact_after_append_only_growth() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    volume
+        .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
+        .unwrap();
+    volume
+        .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
+        .unwrap();
+
+    let used_before = volume.used();
+    let (reclaimed, moved) = volume.compact().unwrap();
+    assert!(reclaimed > 0);
+    assert!(moved > 0);
+
+    let used_after = volume.used();
+    assert!(used_after < used_before);
+
+    let data = volume.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(data.len(), 2048);
+    assert_eq!(data[0], 0);
+    assert_eq!(data[1024], 1);
+}
+
+#[test]
+fn test_compact_empty_volume() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    let (reclaimed, moved) = volume.compact().unwrap();
+    assert_eq!(reclaimed, 0);
+    assert_eq!(moved, 0);
+    assert_eq!(volume.used(), 0);
+}
+
+#[test]
+fn test_storage_manager_compact_volume() {
+    use powerfs_common::types::NodeId;
+    use powerfs_core::storage::StorageManager;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+
+    manager
+        .create_volume(VolumeId(1), 10 * 1024 * 1024)
+        .unwrap();
+    let v1 = manager.get_volume(&VolumeId(1)).unwrap();
+    v1.write_needle(1, Bytes::from("test")).unwrap();
+    v1.write_needle(2, Bytes::from("delete me")).unwrap();
+    v1.delete_needle(&NeedleId(2)).unwrap();
+
+    let (reclaimed, _moved) = manager.compact_volume(&VolumeId(1)).unwrap();
+    assert!(reclaimed > 0);
 }
