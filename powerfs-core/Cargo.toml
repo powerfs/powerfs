@@ -5,8 +5,8 @@ edition = "2021"
 
 [features]
 default = []
-spdk = ["dep:libc", "dep:cc"]
-spdk-stub = ["spdk", "dep:libc", "dep:cc"]
+spdk = ["dep:libc", "dep:pkg-config"]
+spdk-stub = ["dep:libc", "dep:cc"]
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
@@ -35,8 +35,17 @@ cc = { version = "1.0", optional = true }
 
 [build-dependencies]
 cc = { version = "1.0", optional = true }
+pkg-config = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
 crc32c = "0.6"
 criterion = "0.4"
+
+[[example]]
+name = "spdk_bdev_test"
+path = "../examples/spdk_bdev_test.rs"
+
+[[example]]
+name = "spdk_simple_test"
+path = "../examples/spdk_simple_test.rs"

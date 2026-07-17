@@ -46,7 +46,7 @@ impl BackendFactory {
                         }
                     };
 
-                    let backend = SpdkBackend::new(&config.node_id)?;
+                    let backend = SpdkBackend::new(&config.node_id, None)?;
                     for device in &details.devices {
                         backend.add_device(
                             &device.name,
