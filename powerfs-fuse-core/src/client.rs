@@ -22,7 +22,7 @@ use tonic::transport::Channel;
 
 use powerfs_master::proto::powerfs::Location;
 
-type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
+pub type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
 
 #[derive(Debug)]
 pub struct WriteBlobParams {
@@ -1429,7 +1429,7 @@ impl PowerFuseClient {
         replication: &str,
         pid: u64,
         host: &str,
-        chunk_cache: Arc<crate::cache::ChunkCache>,
+        chunk_cache: Arc<dyn ChunkCacheLike>,
     ) -> Result<(), String> {
         debug!(
             "keep_connected: client_type={}, mount_point={}, collection={}",
@@ -1651,6 +1651,11 @@ impl PowerFuseClient {
     }
 }
 
+pub trait ChunkCacheLike: Send + Sync {
+    fn dirty_chunks(&self) -> u64;
+    fn dirty_bytes(&self) -> u64;
+}
+
 pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
@@ -1850,16 +1855,16 @@ impl SyncFuseClient {
     pub fn pull_delta(
         &self,
         client_id: &str,
-        client_vclock: &powerfs_master::proto::powerfs::VectorClock,
-    ) -> Result<powerfs_master::proto::powerfs::PullDeltaResponse, String> {
+        client_vclock: &VectorClock,
+    ) -> Result<PullDeltaResponse, String> {
         self.block_with_timeout(self.client.pull_delta(client_id, client_vclock))
     }
 
     pub async fn pull_delta_async(
         &self,
         client_id: &str,
-        client_vclock: &powerfs_master::proto::powerfs::VectorClock,
-    ) -> Result<powerfs_master::proto::powerfs::PullDeltaResponse, String> {
+        client_vclock: &VectorClock,
+    ) -> Result<PullDeltaResponse, String> {
         self.client.pull_delta(client_id, client_vclock).await
     }
 
@@ -1897,10 +1902,6 @@ impl SyncFuseClient {
 
     pub fn deregister_job_client(&self, job_id: &str, client_id: &str) -> Result<bool, String> {
         self.block_with_timeout(self.client.deregister_job_client(job_id, client_id))
-    }
-
-    pub fn complete_job(&self, job_id: &str) -> Result<u64, String> {
-        self.block_with_timeout(self.client.complete_job(job_id))
     }
 
     pub fn get_statistics(&self, collection: &str) -> Result<StatisticsResponse, String> {

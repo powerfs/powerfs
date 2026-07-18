@@ -1,6 +1,7 @@
 use log::{debug, warn};
 use lru::LruCache;
 use powerfs_common::types::Fid;
+use powerfs_fuse_core::client::ChunkCacheLike;
 use powerfs_master::proto::FileChunk;
 use powerfs_orset::CachedFileChunk;
 use std::collections::HashMap;
@@ -1185,6 +1186,16 @@ impl ChunkCache {
 impl Default for ChunkCache {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+impl ChunkCacheLike for ChunkCache {
+    fn dirty_chunks(&self) -> u64 {
+        self.dirty_chunks()
+    }
+
+    fn dirty_bytes(&self) -> u64 {
+        self.dirty_bytes()
     }
 }
 

@@ -22,6 +22,8 @@ pub struct NodeInfo {
     pub network_tx: u64,
     pub uptime: u64,
     pub volume_count: u32,
+    pub is_leader: bool,
+    pub raft_term: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

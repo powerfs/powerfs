@@ -23,7 +23,12 @@ pub struct S3TestClient {
 
 impl S3TestClient {
     pub fn new(node_id: &str) -> Result<Self, S3TestClientError> {
-        let backend = Arc::new(LocalFsBackend::new("/tmp/powerfs-test", node_id, "default", 1024 * 1024 * 1024)?);
+        let backend = Arc::new(LocalFsBackend::new(
+            "/tmp/powerfs-test",
+            node_id,
+            "default",
+            1024 * 1024 * 1024,
+        )?);
         Ok(Self {
             backend,
             buckets: HashMap::new(),

@@ -338,6 +338,7 @@ async fn run_master(params: RunMasterParams<'_>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_volume(
     port: u16,
     dir: &str,
@@ -389,12 +390,13 @@ async fn run_volume(
         .unwrap_or_else(generate_node_id);
 
     let storage_manager = if let Some(cfg) = &config {
-        use powerfs_core::storage_backend::{BackendConfigDetails, BackendType};
+        use powerfs_core::storage_backend::BackendType;
 
         match cfg.storage.backend.backend_type {
             BackendType::Spdk => {
                 #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
                 {
+                    use powerfs_core::storage_backend::BackendConfigDetails;
                     // SPDK backend: 直接创建强类型 Arc<SpdkBackend>,保留引用用于后台 attach。
                     // 设备 attach 不在这里同步做 — SPDK subsystem 初始化是异步的,
                     // 需要等服务 ready 后通过 RPC 异步 attach (见下方 spawn 的任务)。
@@ -602,7 +604,8 @@ async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Resul
     info!("Starting PowerFS FUSE client");
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(&vec![master_addr.to_string()], dir, "default", "000", 8, false).await?;
+    let fuse_app =
+        FuserApp::new(&[master_addr.to_string()], dir, "default", "000", 8, false).await?;
 
     info!("Mounting PowerFS at: {}", dir);
     info!("Connected to master: {}", master_addr);
@@ -614,7 +617,8 @@ async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Mounting PowerFS at: {}", dir);
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(&vec![master_addr.to_string()], dir, "default", "000", 8, false).await?;
+    let fuse_app =
+        FuserApp::new(&[master_addr.to_string()], dir, "default", "000", 8, false).await?;
 
     info!("Connected to master: {}", master_addr);
 

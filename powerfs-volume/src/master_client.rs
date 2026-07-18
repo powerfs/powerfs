@@ -39,9 +39,13 @@ pub struct NewMasterClientParams<'a> {
 impl MasterClient {
     pub fn new(params: NewMasterClientParams<'_>) -> Self {
         let (tx, _) = broadcast::channel(10);
-        
+
         MasterClient {
-            master_addresses: params.master_addresses.iter().map(|s| s.to_string()).collect(),
+            master_addresses: params
+                .master_addresses
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             current_master_index: Arc::new(AtomicUsize::new(0)),
             node_id: params.node_id,
             grpc_port: params.grpc_port,
@@ -56,7 +60,8 @@ impl MasterClient {
 
     fn current_master(&self) -> String {
         let idx = self.current_master_index.load(Ordering::Relaxed);
-        self.master_addresses.get(idx)
+        self.master_addresses
+            .get(idx)
             .cloned()
             .unwrap_or_else(|| self.master_addresses[0].clone())
     }
@@ -64,18 +69,22 @@ impl MasterClient {
     fn next_master(&self) {
         let len = self.master_addresses.len();
         let current = self.current_master_index.load(Ordering::Relaxed);
-        self.current_master_index.store((current + 1) % len, Ordering::Relaxed);
+        self.current_master_index
+            .store((current + 1) % len, Ordering::Relaxed);
     }
 
-    async fn try_connect(&self) -> Result<(MasterServiceClient<Channel>, String), Box<dyn std::error::Error + Send + Sync>> {
+    async fn try_connect(
+        &self,
+    ) -> Result<(MasterServiceClient<Channel>, String), Box<dyn std::error::Error + Send + Sync>>
+    {
         let mut tried = 0;
         let max_tries = self.master_addresses.len();
-        
+
         loop {
             let addr = self.current_master();
             let address = format!("http://{}", addr);
             debug!("Trying to connect to master: {}", address);
-            
+
             match Channel::from_shared(address)?.connect().await {
                 Ok(channel) => {
                     info!("Connected to master: {}", addr);
@@ -91,7 +100,7 @@ impl MasterClient {
                 }
             }
         }
-        
+
         Err("Failed to connect to any master node".into())
     }
 
@@ -99,8 +108,7 @@ impl MasterClient {
         let (mut client, addr) = self.try_connect().await?;
 
         let rx = self.heartbeat_tx.subscribe();
-        let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-            .filter_map(|r| r.ok());
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| r.ok());
 
         let response_stream = match client.send_heartbeat(tonic::Request::new(stream)).await {
             Ok(rs) => rs,
@@ -110,7 +118,7 @@ impl MasterClient {
                 return Box::pin(self.start_heartbeat()).await;
             }
         };
-        
+
         let mut responses = response_stream.into_inner();
         let master_addresses = self.master_addresses.clone();
         let current_master_index = self.current_master_index.clone();
@@ -123,9 +131,11 @@ impl MasterClient {
                             "Heartbeat response: leader={}, volume_size_limit={}",
                             resp.leader, resp.volume_size_limit
                         );
-                        
+
                         if !resp.leader.is_empty() {
-                            if let Some(idx) = master_addresses.iter().position(|a| a.eq(&resp.leader)) {
+                            if let Some(idx) =
+                                master_addresses.iter().position(|a| a.eq(&resp.leader))
+                            {
                                 let current = current_master_index.load(Ordering::Relaxed);
                                 if idx != current {
                                     info!("Switching to leader master: {}", resp.leader);
@@ -143,7 +153,7 @@ impl MasterClient {
             warn!("Heartbeat stream ended, reconnecting...");
             current_master_index.store(
                 (current_master_index.load(Ordering::Relaxed) + 1) % master_addresses.len(),
-                Ordering::Relaxed
+                Ordering::Relaxed,
             );
         });
 
@@ -170,7 +180,10 @@ impl MasterClient {
             id: self.node_id.0.clone(),
         };
 
-        self.heartbeat_tx.send(heartbeat).map(|_| ()).map_err(|e| e.into())
+        self.heartbeat_tx
+            .send(heartbeat)
+            .map(|_| ())
+            .map_err(|e| e.into())
     }
 
     pub async fn grow(
@@ -181,7 +194,7 @@ impl MasterClient {
     ) -> Result<VolumeGrowResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut tried = 0;
         let max_tries = self.master_addresses.len();
-        
+
         loop {
             let addr = self.current_master();
             let address = format!("http://{}", addr);
@@ -220,7 +233,7 @@ impl MasterClient {
                     tried += 1;
                 }
             }
-            
+
             if tried >= max_tries {
                 break;
             }
