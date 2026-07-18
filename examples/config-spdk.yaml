@@ -9,15 +9,21 @@ storage:
     backend_type: "Spdk"
     node_id: "volume-spdk-001"
     type: "spdk"
+    # SPDK JSON-RPC Unix socket 路径 (进程内模式下 SPDK 在当前进程启动 RPC server)
+    # 默认 /var/tmp/spdk.sock,可省略此字段
+    rpc_socket_path: "/var/tmp/spdk.sock"
+    # 本地 NVMe 设备 (PCIe transport)
+    # 注意: nvme0n1 上有 target 目录,不可使用;只用 nvme1n1/nvme2n1/nvme3n1
+    # transport_string 填 PCI 地址 (SPDK RPC bdev_nvme_attach_controller 用 PCIe transport)
+    # 可通过 `readlink -f /sys/class/nvme/nvmeN/device` 获取
+    # 设备 attach 是异步的:服务启动 → SPDK init → RPC server ready → 逐个 attach
     devices:
-      - name: "nvme0"
-        transport_string: "trtype:tcp traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1"
-      - name: "nvme1"
-        transport_string: "trtype:tcp traddr:127.0.0.1 trsvcid:4421 subnqn:nqn.2016-06.io.spdk:cnode2 ns:1"
-      - name: "nvme2"
-        transport_string: "trtype:rdma traddr:10.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode3 ns:1"
-      - name: "nvme3"
-        transport_string: "trtype:rdma traddr:10.0.0.2 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode4 ns:1"
+      - name: "nvme1n1"
+        transport_string: "0000:03:00.0"
+      - name: "nvme2n1"
+        transport_string: "0000:04:00.0"
+      - name: "nvme3n1"
+        transport_string: "0000:05:00.0"
   checksum_algorithm: "Crc32c"
   volume_size_gib: 100
   max_volumes_per_device: 100

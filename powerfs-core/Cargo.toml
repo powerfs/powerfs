@@ -5,8 +5,8 @@ edition = "2021"
 
 [features]
 default = []
-spdk = ["dep:libc", "dep:pkg-config"]
-spdk-stub = ["dep:libc", "dep:cc"]
+spdk = []
+spdk-stub = ["dep:cc"]
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
@@ -30,12 +30,10 @@ rocksdb = { workspace = true }
 base64 = "0.22"
 regex = "1.10"
 rayon = "1.10"
-libc = { version = "0.2", optional = true }
 cc = { version = "1.0", optional = true }
 
 [build-dependencies]
 cc = { version = "1.0", optional = true }
-pkg-config = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -45,6 +43,7 @@ criterion = "0.4"
 [[example]]
 name = "spdk_bdev_test"
 path = "../examples/spdk_bdev_test.rs"
+required-features = ["spdk"]
 
 [[example]]
 name = "spdk_simple_test"

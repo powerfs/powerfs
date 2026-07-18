@@ -226,12 +226,58 @@ pub struct LocalFileDeviceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpdkBackendConfig {
     pub devices: Vec<SpdkDeviceConfig>,
+    /// SPDK JSON-RPC Unix socket 路径,默认 `/var/tmp/spdk.sock`。
+    /// 进程内模式下,SPDK 在当前进程启动 RPC server 监听此 socket。
+    #[serde(default)]
+    pub rpc_socket_path: Option<String>,
+}
+
+/// 单个设备的 attach 结果 (由 `SpdkBackend::attach_devices_from_config` 返回)
+#[derive(Debug, Clone)]
+pub struct AttachDeviceResult {
+    /// 配置文件中的设备名
+    pub device_name: String,
+    /// 是否成功
+    pub success: bool,
+    /// 成功时:内部注册的 device_id
+    pub device_id: Option<String>,
+    /// 成功时:SPDK 创建的 bdev 名称 (spdk feature 下有值,stub 下为 None)
+    pub bdev_name: Option<String>,
+    /// 失败时:错误原因
+    pub error: Option<String>,
+}
+
+impl AttachDeviceResult {
+    pub fn ok(device_name: String, device_id: String, bdev_name: Option<String>) -> Self {
+        Self {
+            device_name,
+            success: true,
+            device_id: Some(device_id),
+            bdev_name,
+            error: None,
+        }
+    }
+
+    pub fn failed(device_name: String, error: String) -> Self {
+        Self {
+            device_name,
+            success: false,
+            device_id: None,
+            bdev_name: None,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpdkDeviceConfig {
     pub name: String,
+    /// transport 描述:
+    /// - PCIe 本地设备: 直接填 PCI BDF,如 "0000:03:00.0"
+    /// - NVMe-oF TCP: "trtype:tcp traddr:10.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1"
+    /// - NVMe-oF RDMA: "trtype:rdma traddr:10.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1"
     pub transport_string: String,
+    #[serde(default)]
     pub capacity: Option<u64>,
 }
 

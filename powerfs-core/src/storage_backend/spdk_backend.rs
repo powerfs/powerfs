@@ -1,99 +1,11 @@
-use crate::checksum::ChecksumAlgorithm;
-use crate::error::{PowerFsError, StorageBackendError};
-use crate::Result;
+use crate::storage_backend::*;
+use bytes::Bytes;
+use chrono::Utc;
+use log::{error, info, warn};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_ulonglong, c_void};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
-type SpdkBdev = c_void;
-type SpdkBdevDesc = c_void;
-type SpdkIoChannel = c_void;
-
-struct SpdkEnvOpts {
-    name: [c_char; 64],
-    config_file: *const c_char,
-    master_core: c_int,
-    num_cores: c_int,
-    reactor_mask: u64,
-    mem_channel: c_int,
-    mem_size: u32,
-    hugepage_single_segments: u8,
-    hugepage_dir: [c_char; 256],
-    unlink: u8,
-    log_level: [c_char; 64],
-    log_file: [c_char; 256],
-    panic_on_abort: u8,
-    enable_trace: u8,
-    trace_file: [c_char; 256],
-    enable_core_dump: u8,
-    core_dump_dir: [c_char; 256],
-}
-
-extern "C" {
-    fn spdk_env_opts_init(opts: *mut SpdkEnvOpts);
-    fn spdk_env_init(opts: *const SpdkEnvOpts) -> c_int;
-    fn spdk_env_fini();
-    fn spdk_subsystem_init() -> c_int;
-    fn spdk_subsystem_init_from_json_config(config_file: *const c_char) -> c_int;
-    fn spdk_subsystem_fini();
-    fn spdk_bdev_first() -> *mut SpdkBdev;
-    fn spdk_bdev_next(bdev: *mut SpdkBdev) -> *mut SpdkBdev;
-    fn spdk_bdev_get_name(bdev: *mut SpdkBdev) -> *const c_char;
-    fn spdk_bdev_open_ext(
-        bdev_name: *const c_char,
-        write: bool,
-        event_cb: *const c_void,
-        eventctx: *mut c_void,
-        desc: *mut *mut SpdkBdevDesc,
-    ) -> c_int;
-    fn spdk_bdev_close(desc: *mut SpdkBdevDesc);
-    fn spdk_bdev_get_block_size(desc: *mut SpdkBdevDesc) -> u32;
-    fn spdk_bdev_get_num_blocks(desc: *mut SpdkBdevDesc) -> u64;
-    fn spdk_bdev_get_io_channel(desc: *mut SpdkBdevDesc) -> *mut SpdkIoChannel;
-    fn spdk_put_io_channel(ch: *mut SpdkIoChannel);
-    fn spdk_bdev_read_blocks(
-        desc: *mut SpdkBdevDesc,
-        ch: *mut SpdkIoChannel,
-        buf: *mut u8,
-        lba: c_ulonglong,
-        lba_count: u32,
-        cb: *const c_void,
-        cb_arg: *mut c_void,
-    ) -> c_int;
-    fn spdk_bdev_write_blocks(
-        desc: *mut SpdkBdevDesc,
-        ch: *mut SpdkIoChannel,
-        buf: *mut u8,
-        lba: c_ulonglong,
-        lba_count: u32,
-        cb: *const c_void,
-        cb_arg: *mut c_void,
-    ) -> c_int;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeState {
-    Online,
-    Offline,
-    Degraded,
-}
-
-pub struct StorageDevice {
-    pub device_id: String,
-    pub name: String,
-    pub total_capacity: u64,
-    pub used_space: u64,
-    pub free_space: u64,
-    pub status: String,
-    pub block_size: u32,
-}
-
-struct ExcludedDevice {
-    device_id: String,
-    reason: String,
-    timestamp: u64,
-}
+type Result<T> = StorageResult<T>;
 
 struct VolumeMeta {
     volume_id: u64,
@@ -107,8 +19,7 @@ struct VolumeMeta {
 struct SpdkDevice {
     info: StorageDevice,
     free_offset: u64,
-    desc: *mut SpdkBdevDesc,
-    block_size: u32,
+    bdev_name: String,
 }
 
 unsafe impl Send for SpdkDevice {}
@@ -119,79 +30,35 @@ pub struct SpdkBackend {
     volumes: RwLock<HashMap<u64, VolumeMeta>>,
     excluded_devices: RwLock<HashMap<String, ExcludedDevice>>,
     node_id: String,
+    rpc_socket_path: String,
     _checksum_algo: ChecksumAlgorithm,
 }
 
 impl SpdkBackend {
-    pub fn new(node_id: &str) -> Result<Self> {
-        let mut opts: SpdkEnvOpts = unsafe { std::mem::zeroed() };
-        unsafe {
-            spdk_env_opts_init(&mut opts);
-        }
-
-        let ret = unsafe { spdk_env_init(&opts) };
-        if ret != 0 {
-            return Err(StorageBackendError::InvalidOperation(
-                format!("failed to initialize SPDK environment: {}", ret).to_string(),
-            ));
-        }
-
-        let ret = unsafe { spdk_subsystem_init() };
-        if ret != 0 {
-            unsafe { spdk_env_fini() };
-            return Err(StorageBackendError::InvalidOperation(
-                format!("failed to initialize SPDK subsystems: {}", ret).to_string(),
-            ));
-        }
+    pub fn new(node_id: &str, rpc_socket_path: Option<&str>) -> Result<Self> {
+        let socket_path = rpc_socket_path
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| crate::storage_backend::spdk_rpc::DEFAULT_SPDK_RPC_SOCKET.to_string());
 
         Ok(SpdkBackend {
             devices: RwLock::new(HashMap::new()),
             volumes: RwLock::new(HashMap::new()),
             excluded_devices: RwLock::new(HashMap::new()),
             node_id: node_id.to_string(),
+            rpc_socket_path: socket_path,
             _checksum_algo: ChecksumAlgorithm::default(),
         })
     }
 
-    pub fn attach_nvme_controller(&self, name: &str, traddr: &str) -> Result<()> {
-        let config_json = format!(
-            r#"
-{{
-  "subsystems": [
-    {{
-      "subsystem": "bdev",
-      "config": [
-        {{
-          "method": "bdev_nvme_attach_controller",
-          "params": {{
-            "name": "{}",
-            "trtype": "PCIe",
-            "traddr": "{}"
-          }}
-        }}
-      ]
-    }}
-  ]
-}}
-"#,
-            name, traddr
-        );
-
-        let config_file = "/tmp/powerfs_spdk_config.json";
-        std::fs::write(config_file, config_json)
-            .map_err(|e| StorageBackendError::InvalidOperation(format!("failed to write config: {}", e)))?;
-
-        let config_cstr = CString::new(config_file)
-            .map_err(|e| StorageBackendError::InvalidOperation(format!("invalid config path: {}", e)))?;
-
-        let ret = unsafe { spdk_subsystem_init_from_json_config(config_cstr.as_ptr()) };
-        if ret != 0 {
-            return Err(StorageBackendError::InvalidOperation(
-                format!("failed to attach NVMe controller {} at {}: {}", name, traddr, ret).to_string(),
-            ));
+    pub fn new_with_env(node_id: &str) -> Self {
+        SpdkBackend {
+            devices: RwLock::new(HashMap::new()),
+            volumes: RwLock::new(HashMap::new()),
+            excluded_devices: RwLock::new(HashMap::new()),
+            node_id: node_id.to_string(),
+            rpc_socket_path: crate::storage_backend::spdk_rpc::DEFAULT_SPDK_RPC_SOCKET.to_string(),
+            _checksum_algo: ChecksumAlgorithm::default(),
         }
-
-        Ok(())
     }
 
     pub fn add_device(
@@ -202,80 +69,240 @@ impl SpdkBackend {
     ) -> Result<String> {
         let device_id = format!("spdk_nvme_{}", device_name);
 
-        let bdev_cstr = CString::new(bdev_name)
-            .map_err(|_| {
-                StorageBackendError::InvalidOperation("invalid bdev name".to_string())
-            })?;
-
-        let mut desc: *mut SpdkBdevDesc = std::ptr::null_mut();
-        let ret = unsafe {
-            spdk_bdev_open_ext(
-                bdev_cstr.as_ptr(),
-                true,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                &mut desc,
-            )
-        };
-
-        if ret != 0 || desc.is_null() {
-            return Err(StorageBackendError::InvalidOperation(
-                format!("failed to open bdev {}: {}", bdev_name, ret).to_string(),
-            ));
-        }
-
-        let block_size = unsafe { spdk_bdev_get_block_size(desc) };
-        if block_size == 0 {
-            unsafe { spdk_bdev_close(desc) };
-            return Err(StorageBackendError::InvalidOperation(
-                "invalid block size".to_string(),
-            ));
-        }
-
-        let num_blocks = unsafe { spdk_bdev_get_num_blocks(desc) };
-        let ns_size = num_blocks * block_size as u64;
-        let actual_capacity = total_capacity.unwrap_or(ns_size);
-
+        let actual_capacity = total_capacity.unwrap_or_else(|| {
+            self.get_bdev_size(bdev_name).unwrap_or(0)
+        });
         let used_space = 0u64;
         let free_space = actual_capacity - used_space;
 
-        let device_info = StorageDevice {
+        let device = StorageDevice {
             device_id: device_id.clone(),
-            name: bdev_name.to_string(),
+            device_type: DeviceType::SpdkNvme,
             total_capacity: actual_capacity,
             used_space,
             free_space,
-            status: "online".to_string(),
-            block_size,
+            location: DeviceLocation {
+                node_id: self.node_id.clone(),
+                device_id: device_id.clone(),
+                zone: "default".to_string(),
+                rack: None,
+                data_center: None,
+            },
+            status: DeviceStatus::Online,
         };
 
         let spdk_device = SpdkDevice {
-            info: device_info,
+            info: device,
             free_offset: 0,
-            desc,
-            block_size,
+            bdev_name: bdev_name.to_string(),
         };
 
-        self.devices.write().unwrap().insert(device_id.clone(), spdk_device);
+        self.devices
+            .write()
+            .unwrap()
+            .insert(device_id.clone(), spdk_device);
 
         Ok(device_id)
     }
 
-    pub fn list_bdevs(&self) -> Vec<String> {
-        let mut bdevs: Vec<String> = Vec::new();
+    #[cfg(feature = "spdk")]
+    fn get_bdev_size(&self, bdev_name: &str) -> Result<u64> {
+        use crate::storage_backend::spdk_rpc::SpdkRpcClient;
+        use std::time::Duration;
 
-        unsafe {
-            let mut bdev = spdk_bdev_first();
-            while !bdev.is_null() {
-                let name_ptr = spdk_bdev_get_name(bdev);
-                if !name_ptr.is_null() {
-                    let name = CStr::from_ptr(name_ptr).to_str().unwrap_or("unknown");
-                    bdevs.push(name.to_string());
-                }
-                bdev = spdk_bdev_next(bdev);
+        let client = SpdkRpcClient::new(&self.rpc_socket_path);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bdevs = rt.block_on(async {
+            client.wait_ready(Duration::from_secs(5)).await?;
+            client.list_bdevs().await
+        })?;
+
+        for bdev in bdevs {
+            if bdev == bdev_name {
+                return Ok(0);
             }
         }
-        bdevs
+        Ok(0)
+    }
+
+    #[cfg(feature = "spdk-stub")]
+    fn get_bdev_size(&self, _bdev_name: &str) -> Result<u64> {
+        Ok(1024 * 1024 * 1024)
+    }
+
+    /// 根据配置文件异步 attach 所有设备
+    ///
+    /// # Feature 行为
+    /// - `spdk` feature: 通过 SPDK JSON-RPC (Unix socket) 调用 `bdev_nvme_attach_controller`。
+    /// - `spdk-stub` feature: 不走 RPC,直接调 `add_device`,用于测试 attach 流程逻辑。
+    pub async fn attach_devices_from_config(
+        &self,
+        devices: &[SpdkDeviceConfig],
+        rpc_socket: Option<&str>,
+    ) -> Vec<AttachDeviceResult> {
+        let mut results = Vec::with_capacity(devices.len());
+
+        if devices.is_empty() {
+            warn!("attach_devices_from_config called with empty device list");
+            return results;
+        }
+
+        info!(
+            "Attaching {} SPDK device(s) from config",
+            devices.len()
+        );
+
+        #[cfg(feature = "spdk")]
+        {
+            results = self.attach_devices_via_rpc(devices, rpc_socket).await;
+        }
+
+        #[cfg(feature = "spdk-stub")]
+        {
+            results = self.attach_devices_stub(devices).await;
+        }
+
+        let ok = results.iter().filter(|r| r.success).count();
+        let fail = results.len() - ok;
+        if fail == 0 {
+            info!("All {} device(s) attached successfully", ok);
+        } else {
+            warn!(
+                "{} device(s) attached, {} failed (see previous logs)",
+                ok, fail
+            );
+        }
+
+        results
+    }
+
+    #[cfg(feature = "spdk")]
+    async fn attach_devices_via_rpc(
+        &self,
+        devices: &[SpdkDeviceConfig],
+        rpc_socket: Option<&str>,
+    ) -> Vec<AttachDeviceResult> {
+        use crate::storage_backend::spdk_rpc::SpdkRpcClient;
+        use std::time::Duration;
+
+        let socket = rpc_socket.unwrap_or(&self.rpc_socket_path);
+        let client = SpdkRpcClient::new(socket);
+
+        match client.wait_fully_ready(Duration::from_secs(30)).await {
+            Ok(_) => info!("SPDK RPC server ready at {}, start attaching devices", socket),
+            Err(e) => {
+                error!(
+                    "SPDK RPC server not ready at {} after 30s: {} — skipping all device attach",
+                    socket, e
+                );
+                return devices
+                    .iter()
+                    .map(|d| AttachDeviceResult::failed(d.name.clone(), format!("RPC not ready: {}", e)))
+                    .collect();
+            }
+        }
+
+        let mut results = Vec::with_capacity(devices.len());
+        for device in devices {
+            match self.attach_one_device_via_rpc(&client, device).await {
+                Ok(bdev_name) => {
+                    match self.add_device(&device.name, &bdev_name, device.capacity) {
+                        Ok(device_id) => {
+                            info!(
+                                "Device {} attached via RPC: bdev={}, device_id={}",
+                                device.name, bdev_name, device_id
+                            );
+                            results.push(AttachDeviceResult::ok(
+                                device.name.clone(),
+                                device_id,
+                                Some(bdev_name),
+                            ));
+                        }
+                        Err(e) => {
+                            error!(
+                                "Device {} RPC attach succeeded (bdev={}) but add_device failed: {}",
+                                device.name, bdev_name, e
+                            );
+                            results.push(AttachDeviceResult::failed(
+                                device.name.clone(),
+                                format!("add_device failed: {}", e),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Device {} RPC attach failed: {} — skipping (other devices continue)",
+                        device.name, e
+                    );
+                    results.push(AttachDeviceResult::failed(
+                        device.name.clone(),
+                        format!("RPC attach failed: {}", e),
+                    ));
+                }
+            }
+        }
+        results
+    }
+
+    #[cfg(feature = "spdk")]
+    async fn attach_one_device_via_rpc(
+        &self,
+        client: &crate::storage_backend::spdk_rpc::SpdkRpcClient,
+        device: &SpdkDeviceConfig,
+    ) -> Result<String> {
+        use crate::storage_backend::spdk_rpc::parse_transport_string;
+
+        let params = parse_transport_string(&device.transport_string).map_err(|e| {
+            StorageBackendError::InvalidOperation(format!(
+                "invalid transport_string for device {}: {}",
+                device.name, e
+            ))
+        })?;
+
+        let bdev_names = client
+            .attach_nvme_controller(
+                &device.name,
+                &params.trtype,
+                &params.traddr,
+                params.trsvcid.as_deref(),
+                params.subnqn.as_deref(),
+            )
+            .await?;
+
+        bdev_names
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                StorageBackendError::InvalidOperation(format!(
+                    "SPDK RPC attach returned no bdevs for device {}",
+                    device.name
+                ))
+            })
+    }
+
+    #[cfg(feature = "spdk-stub")]
+    async fn attach_devices_stub(&self, devices: &[SpdkDeviceConfig]) -> Vec<AttachDeviceResult> {
+        let mut results = Vec::with_capacity(devices.len());
+        for device in devices {
+            match self.add_device(&device.name, &device.transport_string, device.capacity) {
+                Ok(device_id) => {
+                    info!(
+                        "[stub] Device {} attached: device_id={}",
+                        device.name, device_id
+                    );
+                    results.push(AttachDeviceResult::ok(device.name.clone(), device_id, None));
+                }
+                Err(e) => {
+                    warn!("[stub] Device {} attach failed: {}", device.name, e);
+                    results.push(AttachDeviceResult::failed(
+                        device.name.clone(),
+                        format!("add_device failed: {}", e),
+                    ));
+                }
+            }
+        }
+        results
     }
 
     fn align_up(value: u64, align: u64) -> u64 {
@@ -285,215 +312,145 @@ impl SpdkBackend {
             value + align - (value % align)
         }
     }
-
-    fn sync_read(
-        &self,
-        desc: *mut SpdkBdevDesc,
-        buf: *mut u8,
-        lba: u64,
-        lba_count: u32,
-    ) -> Result<()> {
-        let ch = unsafe { spdk_bdev_get_io_channel(desc) };
-        if ch.is_null() {
-            return Err(StorageBackendError::SpdkIoError(
-                "failed to get IO channel".to_string(),
-            ));
-        }
-
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = Arc::new(std::sync::atomic::AtomicI32::new(0));
-
-        let completed_clone = completed.clone();
-        let result_clone = result.clone();
-
-        unsafe extern "C" fn read_cb(
-            _ch: *mut SpdkIoChannel,
-            ctx: *mut c_void,
-            rc: c_int,
-        ) {
-            let (completed, result) = &*(ctx as *const (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicI32>));
-            result.store(rc, std::sync::atomic::Ordering::Relaxed);
-            completed.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let ctx = Box::new((completed_clone, result_clone));
-        let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
-
-        let ret = unsafe {
-            spdk_bdev_read_blocks(desc, ch, buf, lba as c_ulonglong, lba_count, read_cb as *const c_void, ctx_ptr)
-        };
-
-        if ret != 0 {
-            unsafe { spdk_put_io_channel(ch) };
-            unsafe { Box::from_raw(ctx_ptr) };
-            return Err(StorageBackendError::SpdkIoError(
-                format!("read failed: {}", ret).to_string(),
-            ));
-        }
-
-        while !completed.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
-
-        let rc = result.load(std::sync::atomic::Ordering::Relaxed);
-        unsafe { spdk_put_io_channel(ch) };
-        unsafe { Box::from_raw(ctx_ptr) };
-
-        if rc != 0 {
-            return Err(StorageBackendError::SpdkIoError(
-                format!("read callback failed: {}", rc).to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn sync_write(
-        &self,
-        desc: *mut SpdkBdevDesc,
-        buf: *mut u8,
-        lba: u64,
-        lba_count: u32,
-    ) -> Result<()> {
-        let ch = unsafe { spdk_bdev_get_io_channel(desc) };
-        if ch.is_null() {
-            return Err(StorageBackendError::SpdkIoError(
-                "failed to get IO channel".to_string(),
-            ));
-        }
-
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = Arc::new(std::sync::atomic::AtomicI32::new(0));
-
-        let completed_clone = completed.clone();
-        let result_clone = result.clone();
-
-        unsafe extern "C" fn write_cb(
-            _ch: *mut SpdkIoChannel,
-            ctx: *mut c_void,
-            rc: c_int,
-        ) {
-            let (completed, result) = &*(ctx as *const (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicI32>));
-            result.store(rc, std::sync::atomic::Ordering::Relaxed);
-            completed.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let ctx = Box::new((completed_clone, result_clone));
-        let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
-
-        let ret = unsafe {
-            spdk_bdev_write_blocks(desc, ch, buf, lba as c_ulonglong, lba_count, write_cb as *const c_void, ctx_ptr)
-        };
-
-        if ret != 0 {
-            unsafe { spdk_put_io_channel(ch) };
-            unsafe { Box::from_raw(ctx_ptr) };
-            return Err(StorageBackendError::SpdkIoError(
-                format!("write failed: {}", ret).to_string(),
-            ));
-        }
-
-        while !completed.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
-
-        let rc = result.load(std::sync::atomic::Ordering::Relaxed);
-        unsafe { spdk_put_io_channel(ch) };
-        unsafe { Box::from_raw(ctx_ptr) };
-
-        if rc != 0 {
-            return Err(StorageBackendError::SpdkIoError(
-                format!("write callback failed: {}", rc).to_string(),
-            ));
-        }
-
-        Ok(())
-    }
 }
 
 impl Drop for SpdkBackend {
-    fn drop(&mut self) {
-        for (_, device) in self.devices.write().unwrap().drain() {
-            unsafe { spdk_bdev_close(device.desc) };
-        }
-        unsafe { spdk_subsystem_fini() };
-        unsafe { spdk_env_fini() };
-    }
+    fn drop(&mut self) {}
 }
 
-impl crate::storage_backend::StorageBackend for SpdkBackend {
-    fn create_volume(
+impl StorageBackend for SpdkBackend {
+    fn list_devices(&self) -> Result<Vec<StorageDevice>> {
+        let devices = self.devices.read().unwrap();
+        Ok(devices.values().map(|d| d.info.clone()).collect())
+    }
+
+    fn get_device(&self, device_id: &str) -> Result<StorageDevice> {
+        let devices = self.devices.read().unwrap();
+        devices
+            .get(device_id)
+            .map(|d| d.info.clone())
+            .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id.to_string()))
+    }
+
+    fn get_device_health(&self, device_id: &str) -> Result<DeviceHealth> {
+        let device = self.get_device(device_id)?;
+        let utilization = if device.total_capacity > 0 {
+            (device.used_space as f64 / device.total_capacity as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let health_status = if utilization >= 95.0 {
+            HealthStatus::Critical
+        } else if utilization >= 85.0 {
+            HealthStatus::Warning
+        } else {
+            HealthStatus::Healthy
+        };
+
+        Ok(DeviceHealth {
+            device_id: device.device_id.clone(),
+            device_type: device.device_type,
+            capacity_bytes: device.total_capacity,
+            used_bytes: device.used_space,
+            available_bytes: device.free_space,
+            utilization_percent: utilization,
+            read_iops: 0.0,
+            write_iops: 0.0,
+            read_bandwidth_bps: 0,
+            write_bandwidth_bps: 0,
+            avg_latency_us: 0.0,
+            p99_latency_us: 0.0,
+            smart_info: None,
+            health_status,
+            last_checked_at: Utc::now(),
+        })
+    }
+
+    fn allocate_volume(
         &self,
-        device_id: &str,
         volume_id: u64,
         size: u64,
-    ) -> Result<()> {
-        let device = self.devices.read().unwrap().get(device_id)
-            .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id.to_string()))?;
-
-        let aligned_size = Self::align_up(size, 4096);
-        if aligned_size > device.info.free_space {
-            return Err(StorageBackendError::InsufficientSpace(
-                device.info.free_space,
-                aligned_size,
-            ));
+        preferred_device_id: Option<&str>,
+    ) -> Result<AllocateVolumeResult> {
+        {
+            let volumes = self.volumes.read().unwrap();
+            if volumes.contains_key(&volume_id) {
+                return Err(StorageBackendError::VolumeExists(volume_id));
+            }
         }
 
-        let mut devices = self.devices.write().unwrap();
-        let device = devices.get_mut(device_id).unwrap();
-        let physical_offset = device.free_offset;
-        device.free_offset += aligned_size;
-        device.info.used_space += aligned_size;
-        device.info.free_space -= aligned_size;
+        let aligned_size = Self::align_up(size, 4096);
+
+        let excluded = self.excluded_devices.read().unwrap();
+
+        let candidate_device_ids: Vec<String> = {
+            let devices = self.devices.read().unwrap();
+            if let Some(pref) = preferred_device_id {
+                vec![pref.to_string()]
+            } else {
+                devices
+                    .keys()
+                    .filter(|id| !excluded.contains_key(*id))
+                    .cloned()
+                    .collect()
+            }
+        };
+
+        let mut selected_device_id: Option<String> = None;
+        let mut physical_offset: u64 = 0;
+
+        {
+            let mut devices = self.devices.write().unwrap();
+            for device_id in candidate_device_ids {
+                if let Some(device) = devices.get_mut(&device_id) {
+                    if device.info.free_space >= aligned_size {
+                        physical_offset = device.free_offset;
+                        device.free_offset += aligned_size;
+                        device.info.used_space += aligned_size;
+                        device.info.free_space -= aligned_size;
+                        selected_device_id = Some(device_id);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let device_id = selected_device_id
+            .ok_or_else(|| StorageBackendError::NoAvailableDevice(aligned_size))?;
 
         let volume_meta = VolumeMeta {
             volume_id,
-            device_id: device_id.to_string(),
+            device_id: device_id.clone(),
             total_size: aligned_size,
             used_size: 0,
             physical_offset,
-            state: VolumeState::Online,
+            state: VolumeState::Active,
         };
 
         self.volumes.write().unwrap().insert(volume_id, volume_meta);
 
-        Ok(())
-    }
-
-    fn open_volume(&self, volume_id: u64) -> Result<()> {
-        let volume = self.volumes.read().unwrap().get(&volume_id)
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
-
-        let mut volumes = self.volumes.write().unwrap();
-        if let Some(v) = volumes.get_mut(&volume_id) {
-            v.state = VolumeState::Online;
-        }
-
-        Ok(())
-    }
-
-    fn close_volume(&self, volume_id: u64) -> Result<()> {
-        let volume = self.volumes.read().unwrap().get(&volume_id)
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
-
-        let mut volumes = self.volumes.write().unwrap();
-        if let Some(v) = volumes.get_mut(&volume_id) {
-            v.state = VolumeState::Offline;
-        }
-
-        Ok(())
+        Ok(AllocateVolumeResult {
+            volume_id,
+            device_id,
+            allocated_size: aligned_size,
+            volume_offset: physical_offset,
+        })
     }
 
     fn delete_volume(&self, volume_id: u64) -> Result<()> {
-        let volume = self.volumes.read().unwrap().get(&volume_id)
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
-
-        let device_id = volume.device_id.clone();
+        let (device_id, total_size) = {
+            let volumes = self.volumes.read().unwrap();
+            let volume = volumes
+                .get(&volume_id)
+                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+            (volume.device_id.clone(), volume.total_size)
+        };
 
         let mut devices = self.devices.write().unwrap();
         if let Some(device) = devices.get_mut(&device_id) {
-            device.info.used_space -= volume.total_size;
-            device.info.free_space += volume.total_size;
+            device.info.used_space -= total_size;
+            device.info.free_space += total_size;
         }
 
         self.volumes.write().unwrap().remove(&volume_id);
@@ -501,138 +458,237 @@ impl crate::storage_backend::StorageBackend for SpdkBackend {
         Ok(())
     }
 
-    fn read_volume(
-        &self,
-        volume_id: u64,
-        offset: u64,
-        length: u64,
-        buffer: &mut [u8],
-    ) -> Result<()> {
-        let volume = self.volumes.read().unwrap().get(&volume_id)
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
-
-        if volume.state != VolumeState::Online {
-            return Err(StorageBackendError::InvalidOperation(
-                "volume is not online".to_string(),
-            ));
-        }
-
-        let device = self.devices.read().unwrap().get(&volume.device_id)
-            .ok_or_else(|| StorageBackendError::DeviceNotFound(volume.device_id.clone()))?;
-
-        let physical_offset = volume.physical_offset + offset;
-        let lba = physical_offset / device.block_size as u64;
-        let lba_count = ((length + device.block_size as u64 - 1) / device.block_size as u64) as u32;
-
-        if buffer.len() < (lba_count * device.block_size) as usize {
-            return Err(StorageBackendError::InvalidOperation(
-                "buffer too small".to_string(),
-            ));
-        }
-
-        self.sync_read(device.desc, buffer.as_mut_ptr(), lba, lba_count)?;
-
-        Ok(())
+    fn get_volume_info(&self, volume_id: u64) -> Result<VolumeStorageInfo> {
+        let volumes = self.volumes.read().unwrap();
+        volumes
+            .get(&volume_id)
+            .map(|v| VolumeStorageInfo {
+                volume_id: v.volume_id,
+                device_id: v.device_id.clone(),
+                total_size: v.total_size,
+                used_size: v.used_size,
+                physical_offset: v.physical_offset,
+                volume_state: v.state,
+            })
+            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))
     }
 
-    fn write_volume(
-        &self,
-        volume_id: u64,
-        offset: u64,
-        length: u64,
-        buffer: &[u8],
-    ) -> Result<()> {
-        let volume = self.volumes.read().unwrap().get(&volume_id)
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+    fn get_volume_device(&self, volume_id: u64) -> Result<String> {
+        let volumes = self.volumes.read().unwrap();
+        volumes
+            .get(&volume_id)
+            .map(|v| v.device_id.clone())
+            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))
+    }
 
-        if volume.state != VolumeState::Online {
+    fn read_needle(&self, volume_id: u64, offset: u64, size: u32) -> Result<Bytes> {
+        let (device_id, physical_offset, state) = {
+            let volumes = self.volumes.read().unwrap();
+            let volume = volumes
+                .get(&volume_id)
+                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+            (
+                volume.device_id.clone(),
+                volume.physical_offset,
+                volume.state,
+            )
+        };
+
+        if state != VolumeState::Active {
             return Err(StorageBackendError::InvalidOperation(
-                "volume is not online".to_string(),
+                "volume is not active".to_string(),
             ));
         }
 
-        let device = self.devices.read().unwrap().get(&volume.device_id)
-            .ok_or_else(|| StorageBackendError::DeviceNotFound(volume.device_id.clone()))?;
+        let bdev_name = {
+            let devices = self.devices.read().unwrap();
+            let device = devices
+                .get(&device_id)
+                .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id))?;
+            device.bdev_name.clone()
+        };
 
-        let physical_offset = volume.physical_offset + offset;
-        let lba = physical_offset / device.block_size as u64;
-        let lba_count = ((length + device.block_size as u64 - 1) / device.block_size as u64) as u32;
+        let physical_offset = physical_offset + offset;
 
-        if buffer.len() < (lba_count * device.block_size) as usize {
+        #[cfg(feature = "spdk")]
+        {
+            use crate::storage_backend::spdk_rpc::SpdkRpcClient;
+            use std::time::Duration;
+
+            let client = SpdkRpcClient::new(&self.rpc_socket_path);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let data = rt.block_on(async {
+                client.wait_ready(Duration::from_secs(5)).await?;
+                client.read_bdev(&bdev_name, physical_offset, size as u64).await
+            })?;
+            return Ok(Bytes::copy_from_slice(&data));
+        }
+
+        #[cfg(feature = "spdk-stub")]
+        {
+            let mut buf = vec![0u8; size as usize];
+            return Ok(Bytes::copy_from_slice(&buf));
+        }
+    }
+
+    fn write_needle(&self, volume_id: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        let (device_id, physical_offset, state) = {
+            let volumes = self.volumes.read().unwrap();
+            let volume = volumes
+                .get(&volume_id)
+                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+            (
+                volume.device_id.clone(),
+                volume.physical_offset,
+                volume.state,
+            )
+        };
+
+        if state != VolumeState::Active {
             return Err(StorageBackendError::InvalidOperation(
-                "buffer too small".to_string(),
+                "volume is not active".to_string(),
             ));
         }
 
-        let mut aligned_buf = vec![0u8; (lba_count * device.block_size) as usize];
-        aligned_buf[..buffer.len()].copy_from_slice(buffer);
+        let bdev_name = {
+            let devices = self.devices.read().unwrap();
+            let device = devices
+                .get(&device_id)
+                .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id))?;
+            device.bdev_name.clone()
+        };
 
-        self.sync_write(device.desc, aligned_buf.as_mut_ptr(), lba, lba_count)?;
+        let physical_offset = physical_offset + offset;
+
+        #[cfg(feature = "spdk")]
+        {
+            use crate::storage_backend::spdk_rpc::SpdkRpcClient;
+            use std::time::Duration;
+
+            let aligned_size = Self::align_up(data.len() as u64, 512);
+            let mut aligned_buf = vec![0u8; aligned_size as usize];
+            aligned_buf[..data.len()].copy_from_slice(data);
+
+            let client = SpdkRpcClient::new(&self.rpc_socket_path);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                client.wait_ready(Duration::from_secs(5)).await?;
+                client.write_bdev(&bdev_name, physical_offset, &aligned_buf).await
+            })?;
+        }
+
+        #[cfg(feature = "spdk-stub")]
+        {}
 
         let mut volumes = self.volumes.write().unwrap();
         if let Some(v) = volumes.get_mut(&volume_id) {
-            let new_end = offset + length;
+            let new_end = offset + data.len() as u64;
             if new_end > v.used_size {
                 v.used_size = new_end;
             }
         }
 
+        Ok(data.len() as u32)
+    }
+
+    fn sync_volume(&self, _volume_id: u64) -> Result<()> {
         Ok(())
     }
 
-    fn list_devices(&self) -> Result<Vec<StorageDevice>> {
-        let devices = self.devices.read().unwrap();
-        Ok(devices.values().map(|d| d.info.clone()).collect())
+    fn truncate_volume(&self, volume_id: u64, new_size: u64) -> Result<()> {
+        let total_size = {
+            let volumes = self.volumes.read().unwrap();
+            let volume = volumes
+                .get(&volume_id)
+                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+            volume.total_size
+        };
+
+        if new_size > total_size {
+            return Err(StorageBackendError::InvalidOperation(
+                "truncate size exceeds volume size".to_string(),
+            ));
+        }
+
+        let mut volumes = self.volumes.write().unwrap();
+        if let Some(v) = volumes.get_mut(&volume_id) {
+            v.used_size = new_size;
+        }
+
+        Ok(())
     }
 
-    fn list_volumes(&self) -> Result<Vec<(u64, String, u64, u64, VolumeState)>> {
+    fn get_volumes_on_device(&self, device_id: &str) -> Result<Vec<u64>> {
         let volumes = self.volumes.read().unwrap();
-        Ok(volumes.values().map(|v| {
-            (v.volume_id, v.device_id.clone(), v.total_size, v.used_size, v.state)
-        }).collect())
+        Ok(volumes
+            .values()
+            .filter(|v| v.device_id == device_id)
+            .map(|v| v.volume_id)
+            .collect())
     }
 
-    fn get_device_info(&self, device_id: &str) -> Result<StorageDevice> {
-        let devices = self.devices.read().unwrap();
-        devices.get(device_id)
-            .map(|d| d.info.clone())
-            .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id.to_string()))
+    fn get_volume_set(&self, device_id: &str) -> Result<VolumeSet> {
+        let device = self.get_device(device_id)?;
+        let volumes = self.get_volumes_on_device(device_id)?;
+
+        Ok(VolumeSet {
+            device_id: device_id.to_string(),
+            volumes,
+            total_capacity: device.total_capacity,
+            total_used: device.used_space,
+            total_free: device.free_space,
+            health_status: HealthStatus::Healthy,
+        })
     }
 
-    fn get_volume_info(&self, volume_id: u64) -> Result<(u64, u64, VolumeState)> {
-        let volumes = self.volumes.read().unwrap();
-        volumes.get(&volume_id)
-            .map(|v| (v.total_size, v.used_size, v.state))
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))
-    }
-
-    fn exclude_device(&self, device_id: &str, reason: &str) -> Result<()> {
-        let device = self.devices.read().unwrap().get(device_id)
-            .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id.to_string()))?;
+    fn exclude_device(&self, device_id: &str, reason: String) -> Result<()> {
+        let _ = self.get_device(device_id)?;
 
         let excluded = ExcludedDevice {
             device_id: device_id.to_string(),
-            reason: reason.to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            reason,
+            excluded_at: Utc::now(),
+            excluded_by: "powerfs".to_string(),
+            auto_drain: false,
         };
 
-        self.excluded_devices.write().unwrap().insert(device_id.to_string(), excluded);
+        self.excluded_devices
+            .write()
+            .unwrap()
+            .insert(device_id.to_string(), excluded);
 
         Ok(())
     }
 
-    fn restore_device(&self, device_id: &str) -> Result<()> {
+    fn include_device(&self, device_id: &str) -> Result<()> {
         self.excluded_devices.write().unwrap().remove(device_id);
         Ok(())
     }
 
-    fn get_excluded_devices(&self) -> Result<Vec<(String, String, u64)>> {
+    fn is_device_excluded(&self, device_id: &str) -> bool {
+        self.excluded_devices
+            .read()
+            .unwrap()
+            .contains_key(device_id)
+    }
+
+    fn list_excluded_devices(&self) -> Vec<ExcludedDevice> {
         let excluded = self.excluded_devices.read().unwrap();
-        Ok(excluded.values().map(|e| {
-            (e.device_id.clone(), e.reason.clone(), e.timestamp)
-        }).collect())
+        excluded.values().cloned().collect()
+    }
+
+    fn health_check(&self) -> Result<HealthStatus> {
+        let devices = self.devices.read().unwrap();
+        if devices.is_empty() {
+            return Ok(HealthStatus::Warning);
+        }
+
+        for device in devices.values() {
+            if device.info.status != DeviceStatus::Online {
+                return Ok(HealthStatus::Degraded);
+            }
+        }
+
+        Ok(HealthStatus::Healthy)
     }
 }

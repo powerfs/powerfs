@@ -7,6 +7,12 @@ edition = "2021"
 name = "powerfs"
 path = "src/main.rs"
 
+[features]
+# 启用真实 SPDK backend (需要 SPDK 环境和 libpowerfs-spdk-wrapper.so)
+spdk = ["powerfs-core/spdk"]
+# 启用 SPDK stub backend (无 SPDK 环境时测试用,空实现)
+spdk-stub = ["powerfs-core/spdk-stub"]
+
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }

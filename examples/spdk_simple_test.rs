@@ -1,6 +1,6 @@
 #[cfg(feature = "spdk")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::ffi::{CString, CStr};
+    use std::ffi::{CStr, CString};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     extern "C" fn spdk_start_fn(ctx: *mut std::os::raw::c_void) {
         let init_done = unsafe { &*(ctx as *const AtomicBool) };
-        
+
         println!("SPDK app started on reactor thread");
 
         let bdevs = list_bdevs();
@@ -36,7 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     extern "C" {
-        fn spdk_app_start(opts: *const std::os::raw::c_void, start_fn: *const std::os::raw::c_void, ctx: *mut std::os::raw::c_void) -> i32;
+        fn spdk_app_start(
+            opts: *const std::os::raw::c_void,
+            start_fn: *const std::os::raw::c_void,
+            ctx: *mut std::os::raw::c_void,
+        ) -> i32;
         fn spdk_app_fini();
         fn spdk_bdev_first() -> *const std::os::raw::c_void;
         fn spdk_bdev_next(bdev: *const std::os::raw::c_void) -> *const std::os::raw::c_void;
@@ -55,7 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("SPDK app start returned");
 
-    unsafe { spdk_app_fini(); }
+    unsafe {
+        spdk_app_fini();
+    }
 
     Ok(())
 }

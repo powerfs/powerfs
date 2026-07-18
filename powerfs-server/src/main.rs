@@ -1,7 +1,15 @@
 use clap::{Parser, Subcommand};
 use log::{info, warn};
-use powerfs_common::{error::Result, utils::generate_node_id};
+use powerfs_common::{
+    error::{PowerFsError, Result},
+    types::NodeId,
+    utils::generate_node_id,
+};
+use powerfs_core::config::Config;
 use powerfs_core::storage::StorageManager;
+use powerfs_core::storage_backend::factory::BackendFactory;
+#[cfg(any(feature = "spdk", feature = "spdk-stub"))]
+use powerfs_core::storage_backend::SpdkBackend;
 use powerfs_fuse::FuserApp;
 use powerfs_master::{
     master::MasterNode,
@@ -98,6 +106,11 @@ enum Commands {
         /// Max volume size in bytes
         #[arg(long, short = 's', default_value = "1073741824")]
         max_volume_size: u64,
+
+        /// 配置文件路径 (YAML)。提供后将从配置加载后端 (LocalFile/Spdk) 和节点参数,
+        /// 覆盖命令行默认值。示例: --config examples/config-spdk.yaml
+        #[arg(long, short = 'c')]
+        config: Option<String>,
     },
 
     Filer {
@@ -234,7 +247,8 @@ async fn main() -> Result<()> {
             master,
             ip,
             max_volume_size,
-        } => run_volume(port, &dir, meta_dir, data_dir, &master, ip, max_volume_size).await,
+            config,
+        } => run_volume(port, &dir, meta_dir, data_dir, &master, ip, max_volume_size, config.as_deref()).await,
 
         Commands::Filer { port, master, ip } => run_filer(port, &master, ip).await,
 
@@ -320,8 +334,24 @@ async fn run_volume(
     master: &str,
     ip: Option<String>,
     _max_volume_size: u64,
+    config_path: Option<&str>,
 ) -> Result<()> {
     info!("Starting PowerFS Volume node");
+
+    // 加载配置文件 (如果提供)
+    let config = if let Some(path) = config_path {
+        let cfg = Config::load_from_file(path)
+            .map_err(|e| PowerFsError::Internal(format!("Failed to load config: {}", e)))?;
+        cfg.validate()
+            .map_err(|e| PowerFsError::Internal(format!("Config validation failed: {}", e)))?;
+        info!(
+            "Loaded config from {} (node={}, backend={:?})",
+            path, cfg.node.node_id, cfg.storage.backend.backend_type
+        );
+        Some(cfg)
+    } else {
+        None
+    };
 
     // Calculate subdirectories
     let meta_dir = meta_dir.unwrap_or_else(|| format!("{}/meta", dir));
@@ -338,11 +368,85 @@ async fn run_volume(
 
     let address = format!("{}:{}", bind_ip, port);
 
-    let node_id = generate_node_id();
-    let storage_manager = Arc::new(
-        StorageManager::new(node_id.clone(), data_dir.clone())
-            .expect("Failed to create storage manager"),
-    );
+    // 创建 storage_manager:
+    // - 有配置文件: 用 BackendFactory 从配置创建 backend (LocalFile/Spdk),node_id 从配置读
+    // - 无配置文件: 用默认 LocalFsBackend,node_id 自动生成
+    let node_id = config
+        .as_ref()
+        .map(|c| NodeId(c.node.node_id.clone()))
+        .unwrap_or_else(generate_node_id);
+
+    let storage_manager = if let Some(cfg) = &config {
+        use powerfs_core::storage_backend::{BackendConfigDetails, BackendType};
+
+        match cfg.storage.backend.backend_type {
+            BackendType::Spdk => {
+                #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
+                {
+                    // SPDK backend: 直接创建强类型 Arc<SpdkBackend>,保留引用用于后台 attach。
+                    // 设备 attach 不在这里同步做 — SPDK subsystem 初始化是异步的,
+                    // 需要等服务 ready 后通过 RPC 异步 attach (见下方 spawn 的任务)。
+                    let spdk_details = match &cfg.storage.backend.config {
+                        BackendConfigDetails::Spdk(d) => d.clone(),
+                        _ => {
+                            return Err(PowerFsError::Internal(
+                                "config mismatch: backend_type=Spdk but config is not Spdk".into(),
+                            ));
+                        }
+                    };
+
+                    let rpc_path = spdk_details.rpc_socket_path.as_deref();
+                    let spdk_backend = Arc::new(SpdkBackend::new(&cfg.node.node_id, rpc_path)
+                        .map_err(|e| PowerFsError::Storage(e.to_string()))?);
+                    info!("Created SpdkBackend (node_id={}), devices will be attached async after SPDK ready",
+                          cfg.node.node_id);
+
+                    // spawn 后台任务:等服务 ready 后异步 attach 所有设备
+                    // 不阻塞主流程,失败设备跳过并记录日志
+                    let backend_for_attach = Arc::clone(&spdk_backend);
+                    let node_id_for_log = node_id.clone();
+                    tokio::spawn(async move {
+                        info!("[{}] Background SPDK device attach task started", node_id_for_log);
+                        let results = backend_for_attach
+                            .attach_devices_from_config(
+                                &spdk_details.devices,
+                                spdk_details.rpc_socket_path.as_deref(),
+                            )
+                            .await;
+                        // 结果已在方法内汇总日志,这里无需重复
+                        let _ = results;
+                    });
+
+                    Arc::new(StorageManager::new_with_backend(
+                        node_id.clone(),
+                        data_dir.clone(),
+                        spdk_backend,
+                    ))
+                }
+                #[cfg(not(any(feature = "spdk", feature = "spdk-stub")))]
+                {
+                    return Err(PowerFsError::Internal(
+                        "SPDK backend not compiled. Enable 'spdk' or 'spdk-stub' feature.".into(),
+                    ));
+                }
+            }
+            BackendType::LocalFile => {
+                let backend = BackendFactory::create_from_config(cfg)
+                    .map_err(|e| PowerFsError::Storage(e.to_string()))?;
+                info!("Created LocalFile backend from config");
+                Arc::new(StorageManager::new_with_backend(
+                    node_id.clone(),
+                    data_dir.clone(),
+                    backend,
+                ))
+            }
+        }
+    } else {
+        Arc::new(
+            StorageManager::new(node_id.clone(), data_dir.clone())
+                .expect("Failed to create storage manager"),
+        )
+    };
 
     storage_manager.load_volumes()?;
 

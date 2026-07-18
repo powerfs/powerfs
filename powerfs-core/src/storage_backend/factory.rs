@@ -35,8 +35,12 @@ impl BackendFactory {
                 Ok(Arc::new(backend))
             }
             BackendType::Spdk => {
-                #[cfg(feature = "spdk")]
+                #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
                 {
+                    // 只校验配置 + 创建 SpdkBackend (内部调 powerfs_spdk_init 初始化 SPDK 环境)。
+                    // 设备 attach 不在这里做 — SPDK subsystem 初始化是异步的,
+                    // 需要等服务 ready 后通过 RPC 异步 attach。
+                    // 见 SpdkBackend::attach_devices_from_config 和 main.rs 的后台任务。
                     let details = match &config.config {
                         BackendConfigDetails::Spdk(d) => d,
                         _ => {
@@ -46,17 +50,11 @@ impl BackendFactory {
                         }
                     };
 
-                    let backend = SpdkBackend::new(&config.node_id, None)?;
-                    for device in &details.devices {
-                        backend.add_device(
-                            &device.name,
-                            &device.transport_string,
-                            device.capacity,
-                        )?;
-                    }
+                    let rpc_path = details.rpc_socket_path.as_deref();
+                    let backend = SpdkBackend::new(&config.node_id, rpc_path)?;
                     Ok(Arc::new(backend))
                 }
-                #[cfg(not(feature = "spdk"))]
+                #[cfg(not(any(feature = "spdk", feature = "spdk-stub")))]
                 {
                     Err(StorageBackendError::InvalidOperation(
                         "SPDK backend not compiled. Enable 'spdk' or 'spdk-stub' feature."
@@ -99,7 +97,10 @@ impl BackendFactory {
         let config = BackendConfig {
             backend_type: BackendType::Spdk,
             node_id: node_id.to_string(),
-            config: BackendConfigDetails::Spdk(SpdkBackendConfig { devices }),
+            config: BackendConfigDetails::Spdk(SpdkBackendConfig {
+                devices,
+                rpc_socket_path: None,
+            }),
         };
         Self::create(&config)
     }

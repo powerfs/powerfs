@@ -4,6 +4,10 @@ pub mod local_fs;
 pub mod migration;
 #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
 pub mod spdk_backend;
+/// SPDK JSON-RPC client,只在真实 `spdk` feature 下编译。
+/// `spdk-stub` 模式下不编译 (stub 无真实 RPC server)。
+#[cfg(feature = "spdk")]
+pub mod spdk_rpc;
 pub mod types;
 
 pub use error::StorageBackendError;
@@ -12,6 +16,8 @@ pub use local_fs::LocalFsBackend;
 pub use migration::*;
 #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
 pub use spdk_backend::SpdkBackend;
+#[cfg(feature = "spdk")]
+pub use spdk_rpc::{SpdkRpcClient, DEFAULT_SPDK_RPC_SOCKET};
 pub use types::*;
 
 use bytes::Bytes;

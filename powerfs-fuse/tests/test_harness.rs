@@ -12,7 +12,14 @@ const DEFAULT_FUSE_MOUNT: &str = "/tmp/powerfs-posix-test";
 const DEFAULT_TEST_DATA_DIR: &str = "/tmp/powerfs-test-data";
 
 pub fn get_fuse_mount() -> String {
-    env::var("POWERFS_MOUNT").unwrap_or_else(|_| DEFAULT_FUSE_MOUNT.to_string())
+    if let Ok(mount) = env::var("POWERFS_MOUNT") {
+        return mount;
+    }
+    // Use process-specific path to avoid mount conflicts when multiple test
+    // binaries run in parallel (e.g. `cargo test --all --tests`). Each test
+    // binary process gets its own mount point, while the in-process `OnceLock`
+    // serializes tests within a single binary.
+    format!("{}-{}", DEFAULT_FUSE_MOUNT, std::process::id())
 }
 
 #[allow(dead_code)]
@@ -53,7 +60,12 @@ pub fn assert_powerfs_mounted() {
 }
 
 pub fn get_test_data_dir() -> String {
-    env::var("POWERFS_TEST_DATA_DIR").unwrap_or_else(|_| DEFAULT_TEST_DATA_DIR.to_string())
+    if let Ok(dir) = env::var("POWERFS_TEST_DATA_DIR") {
+        return dir;
+    }
+    // Use process-specific path to avoid data dir conflicts when multiple
+    // test binaries run in parallel. See get_fuse_mount() for rationale.
+    format!("{}-{}", DEFAULT_TEST_DATA_DIR, std::process::id())
 }
 
 #[allow(dead_code)]
@@ -65,6 +77,16 @@ struct TestEnvironment {
 
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
+        // Kill our own child processes directly instead of using `pkill -f`,
+        // which would also kill processes belonging to other test binaries
+        // running in parallel.
+        let _ = self.fuse_process.kill();
+        let _ = self.volume_process.kill();
+        let _ = self.master_process.kill();
+        // Reap children to avoid zombies.
+        let _ = self.fuse_process.wait();
+        let _ = self.volume_process.wait();
+        let _ = self.master_process.wait();
         force_cleanup();
     }
 }
@@ -89,27 +111,11 @@ fn force_cleanup() {
         .stderr(Stdio::null())
         .status();
 
-    let _ = Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg("powerfs master")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg("powerfs-volume")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg("powerfs fuse")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // Note: previously this function used `pkill -f "powerfs master"` etc to
+    // clean up stray processes. That pattern is process-global and would kill
+    // processes owned by other test binaries running in parallel. We now rely
+    // on `TestEnvironment::drop` to kill the children it owns, and on the
+    // per-process mount/data dirs to isolate leftovers from prior runs.
 
     thread::sleep(Duration::from_secs(2));
 
