@@ -2,12 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// 默认的 SPDK RPC Unix socket 路径
+pub const DEFAULT_SPDK_RPC_SOCKET: &str = "/var/tmp/spdk.sock";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
     LocalFile,
     SpdkNvme,
-    NvmeOfRdma,
-    NvmeOfTcp,
 }
 
 impl fmt::Display for DeviceType {
@@ -15,8 +16,6 @@ impl fmt::Display for DeviceType {
         match self {
             DeviceType::LocalFile => write!(f, "local_file"),
             DeviceType::SpdkNvme => write!(f, "spdk_nvme"),
-            DeviceType::NvmeOfRdma => write!(f, "nvmeof_rdma"),
-            DeviceType::NvmeOfTcp => write!(f, "nvmeof_tcp"),
         }
     }
 }
@@ -230,6 +229,49 @@ pub struct SpdkBackendConfig {
     /// 进程内模式下,SPDK 在当前进程启动 RPC server 监听此 socket。
     #[serde(default)]
     pub rpc_socket_path: Option<String>,
+    /// 本地 spdk-tgt 控制配置
+    #[serde(default)]
+    pub local_tgt: Option<LocalTgtConfig>,
+    /// NVMe-oF Subsystem 配置
+    #[serde(default)]
+    pub nvmf: Option<NvmfConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTgtConfig {
+    /// 是否启用本地 spdk-tgt 管理
+    pub enabled: bool,
+    /// CPU core mask for spdk-tgt
+    #[serde(default = "default_cpu_mask")]
+    pub cpu_mask: String,
+    /// hugepages 大小 (MB)
+    #[serde(default = "default_hugepages_size")]
+    pub hugepages_size_mb: u64,
+}
+
+fn default_cpu_mask() -> String {
+    "0x7".to_string()
+}
+
+fn default_hugepages_size() -> u64 {
+    4096
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvmfConfig {
+    /// NVMe-oF Subsystem NQN
+    pub subsystem_nqn: String,
+    /// Listener 传输地址
+    pub listener_traddr: String,
+    /// Listener 传输端口
+    pub listener_trsvcid: String,
+    /// 传输类型: "tcp" 或 "rdma"
+    #[serde(default = "default_transport_type")]
+    pub transport_type: String,
+}
+
+fn default_transport_type() -> String {
+    "tcp".to_string()
 }
 
 /// 单个设备的 attach 结果 (由 `SpdkBackend::attach_devices_from_config` 返回)

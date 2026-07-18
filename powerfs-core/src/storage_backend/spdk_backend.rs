@@ -1,7 +1,7 @@
 use crate::storage_backend::*;
 use bytes::Bytes;
 use chrono::Utc;
-use log::{error, info, warn};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -16,6 +16,7 @@ struct VolumeMeta {
     state: VolumeState,
 }
 
+#[derive(Clone)]
 struct SpdkDevice {
     info: StorageDevice,
     free_offset: u64,
@@ -30,6 +31,7 @@ pub struct SpdkBackend {
     volumes: RwLock<HashMap<u64, VolumeMeta>>,
     excluded_devices: RwLock<HashMap<String, ExcludedDevice>>,
     node_id: String,
+    #[allow(dead_code)]
     rpc_socket_path: String,
     _checksum_algo: ChecksumAlgorithm,
 }
@@ -38,7 +40,7 @@ impl SpdkBackend {
     pub fn new(node_id: &str, rpc_socket_path: Option<&str>) -> Result<Self> {
         let socket_path = rpc_socket_path
             .map(|s| s.to_string())
-            .unwrap_or_else(|| crate::storage_backend::spdk_rpc::DEFAULT_SPDK_RPC_SOCKET.to_string());
+            .unwrap_or_else(|| DEFAULT_SPDK_RPC_SOCKET.to_string());
 
         Ok(SpdkBackend {
             devices: RwLock::new(HashMap::new()),
@@ -56,7 +58,7 @@ impl SpdkBackend {
             volumes: RwLock::new(HashMap::new()),
             excluded_devices: RwLock::new(HashMap::new()),
             node_id: node_id.to_string(),
-            rpc_socket_path: crate::storage_backend::spdk_rpc::DEFAULT_SPDK_RPC_SOCKET.to_string(),
+            rpc_socket_path: DEFAULT_SPDK_RPC_SOCKET.to_string(),
             _checksum_algo: ChecksumAlgorithm::default(),
         }
     }
@@ -138,7 +140,7 @@ impl SpdkBackend {
     pub async fn attach_devices_from_config(
         &self,
         devices: &[SpdkDeviceConfig],
-        rpc_socket: Option<&str>,
+        _rpc_socket: Option<&str>,
     ) -> Vec<AttachDeviceResult> {
         let mut results = Vec::with_capacity(devices.len());
 
@@ -417,7 +419,7 @@ impl StorageBackend for SpdkBackend {
         }
 
         let device_id = selected_device_id
-            .ok_or_else(|| StorageBackendError::NoAvailableDevice(aligned_size))?;
+            .ok_or(StorageBackendError::NoAvailableDevice(aligned_size))?;
 
         let volume_meta = VolumeMeta {
             volume_id,
@@ -443,7 +445,7 @@ impl StorageBackend for SpdkBackend {
             let volumes = self.volumes.read().unwrap();
             let volume = volumes
                 .get(&volume_id)
-                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+                .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
             (volume.device_id.clone(), volume.total_size)
         };
 
@@ -470,7 +472,7 @@ impl StorageBackend for SpdkBackend {
                 physical_offset: v.physical_offset,
                 volume_state: v.state,
             })
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))
+            .ok_or(StorageBackendError::VolumeNotFound(volume_id))
     }
 
     fn get_volume_device(&self, volume_id: u64) -> Result<String> {
@@ -478,7 +480,7 @@ impl StorageBackend for SpdkBackend {
         volumes
             .get(&volume_id)
             .map(|v| v.device_id.clone())
-            .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))
+            .ok_or(StorageBackendError::VolumeNotFound(volume_id))
     }
 
     fn read_needle(&self, volume_id: u64, offset: u64, size: u32) -> Result<Bytes> {
@@ -486,7 +488,7 @@ impl StorageBackend for SpdkBackend {
             let volumes = self.volumes.read().unwrap();
             let volume = volumes
                 .get(&volume_id)
-                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+                .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
             (
                 volume.device_id.clone(),
                 volume.physical_offset,
@@ -500,15 +502,15 @@ impl StorageBackend for SpdkBackend {
             ));
         }
 
-        let bdev_name = {
+        let _bdev_name = {
             let devices = self.devices.read().unwrap();
             let device = devices
                 .get(&device_id)
-                .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id))?;
+                .ok_or(StorageBackendError::DeviceNotFound(device_id))?;
             device.bdev_name.clone()
         };
 
-        let physical_offset = physical_offset + offset;
+        let _physical_offset = physical_offset + offset;
 
         #[cfg(feature = "spdk")]
         {
@@ -519,15 +521,15 @@ impl StorageBackend for SpdkBackend {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let data = rt.block_on(async {
                 client.wait_ready(Duration::from_secs(5)).await?;
-                client.read_bdev(&bdev_name, physical_offset, size as u64).await
+                client.read_bdev(&_bdev_name, _physical_offset, size as u64).await
             })?;
             return Ok(Bytes::copy_from_slice(&data));
         }
 
         #[cfg(feature = "spdk-stub")]
         {
-            let mut buf = vec![0u8; size as usize];
-            return Ok(Bytes::copy_from_slice(&buf));
+            let buf = vec![0u8; size as usize];
+            Ok(Bytes::copy_from_slice(&buf))
         }
     }
 
@@ -536,7 +538,7 @@ impl StorageBackend for SpdkBackend {
             let volumes = self.volumes.read().unwrap();
             let volume = volumes
                 .get(&volume_id)
-                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+                .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
             (
                 volume.device_id.clone(),
                 volume.physical_offset,
@@ -550,15 +552,15 @@ impl StorageBackend for SpdkBackend {
             ));
         }
 
-        let bdev_name = {
+        let _bdev_name = {
             let devices = self.devices.read().unwrap();
             let device = devices
                 .get(&device_id)
-                .ok_or_else(|| StorageBackendError::DeviceNotFound(device_id))?;
+                .ok_or(StorageBackendError::DeviceNotFound(device_id))?;
             device.bdev_name.clone()
         };
 
-        let physical_offset = physical_offset + offset;
+        let _physical_offset = physical_offset + offset;
 
         #[cfg(feature = "spdk")]
         {
@@ -573,7 +575,7 @@ impl StorageBackend for SpdkBackend {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 client.wait_ready(Duration::from_secs(5)).await?;
-                client.write_bdev(&bdev_name, physical_offset, &aligned_buf).await
+                client.write_bdev(&_bdev_name, _physical_offset, &aligned_buf).await
             })?;
         }
 
@@ -600,7 +602,7 @@ impl StorageBackend for SpdkBackend {
             let volumes = self.volumes.read().unwrap();
             let volume = volumes
                 .get(&volume_id)
-                .ok_or_else(|| StorageBackendError::VolumeNotFound(volume_id))?;
+                .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
             volume.total_size
         };
 
@@ -690,5 +692,120 @@ impl StorageBackend for SpdkBackend {
         }
 
         Ok(HealthStatus::Healthy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_spdk_config_deser() {
+        let config_json = r#"
+        {
+            "devices": [
+                {"name": "Nvme1", "transport_string": "0000:03:00.0"},
+                {"name": "Nvme2", "transport_string": "trtype:tcp traddr:192.168.1.10 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1"}
+            ],
+            "rpc_socket_path": "/var/tmp/spdk.sock",
+            "local_tgt": {
+                "enabled": true,
+                "cpu_mask": "0x7",
+                "hugepages_size_mb": 4096
+            },
+            "nvmf": {
+                "subsystem_nqn": "nqn.2016-06.io.spdk:powerfs",
+                "listener_traddr": "127.0.0.1",
+                "listener_trsvcid": "4420",
+                "transport_type": "tcp"
+            }
+        }
+        "#;
+
+        let config: SpdkBackendConfig = serde_json::from_str(config_json).unwrap();
+        
+        assert_eq!(config.devices.len(), 2);
+        assert_eq!(config.devices[0].name, "Nvme1");
+        assert_eq!(config.devices[0].transport_string, "0000:03:00.0");
+        assert_eq!(config.devices[1].name, "Nvme2");
+        assert_eq!(config.devices[1].transport_string, "trtype:tcp traddr:192.168.1.10 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1");
+        
+        assert_eq!(config.rpc_socket_path, Some("/var/tmp/spdk.sock".to_string()));
+        
+        assert!(config.local_tgt.is_some());
+        let local_tgt = config.local_tgt.unwrap();
+        assert!(local_tgt.enabled);
+        assert_eq!(local_tgt.cpu_mask, "0x7");
+        assert_eq!(local_tgt.hugepages_size_mb, 4096);
+        
+        assert!(config.nvmf.is_some());
+        let nvmf = config.nvmf.unwrap();
+        assert_eq!(nvmf.subsystem_nqn, "nqn.2016-06.io.spdk:powerfs");
+        assert_eq!(nvmf.listener_traddr, "127.0.0.1");
+        assert_eq!(nvmf.listener_trsvcid, "4420");
+        assert_eq!(nvmf.transport_type, "tcp");
+    }
+
+    #[test]
+    fn test_spdk_device_transport_string() {
+        let pci_config = SpdkDeviceConfig {
+            name: "TestDevice".to_string(),
+            transport_string: "0000:03:00.0".to_string(),
+            capacity: None,
+        };
+        assert!(pci_config.transport_string.starts_with("0000:"));
+
+        let nvmeof_config = SpdkDeviceConfig {
+            name: "RemoteDevice".to_string(),
+            transport_string: "trtype:tcp traddr:10.0.0.1 trsvcid:4420".to_string(),
+            capacity: None,
+        };
+        assert!(nvmeof_config.transport_string.contains("trtype:"));
+    }
+
+    #[test]
+    fn test_nvmf_config_fields() {
+        let config = NvmfConfig {
+            subsystem_nqn: "nqn.2016-06.io.spdk:test".to_string(),
+            listener_traddr: "192.168.1.1".to_string(),
+            listener_trsvcid: "4420".to_string(),
+            transport_type: "tcp".to_string(),
+        };
+        
+        assert!(!config.subsystem_nqn.is_empty());
+        assert!(!config.listener_traddr.is_empty());
+        assert!(!config.listener_trsvcid.is_empty());
+        assert!(["tcp", "rdma"].contains(&config.transport_type.as_str()));
+    }
+
+    #[test]
+    fn test_device_type_variants() {
+        assert_eq!(DeviceType::LocalFile.to_string(), "local_file");
+        assert_eq!(DeviceType::SpdkNvme.to_string(), "spdk_nvme");
+    }
+
+    #[test]
+    fn test_spdk_backend_stub_init() {
+        let backend = SpdkBackend::new_with_env("test-node");
+        
+        assert_eq!(backend.node_id, "test-node");
+        assert_eq!(backend.rpc_socket_path, DEFAULT_SPDK_RPC_SOCKET);
+    }
+
+    #[test]
+    fn test_spdk_backend_new_with_socket() {
+        let backend = SpdkBackend::new("test-node", Some("/tmp/custom.sock")).unwrap();
+        
+        assert_eq!(backend.node_id, "test-node");
+        assert_eq!(backend.rpc_socket_path, "/tmp/custom.sock");
+    }
+
+    #[test]
+    fn test_spdk_backend_new_default_socket() {
+        let backend = SpdkBackend::new("test-node", None).unwrap();
+        
+        assert_eq!(backend.node_id, "test-node");
+        assert_eq!(backend.rpc_socket_path, DEFAULT_SPDK_RPC_SOCKET);
     }
 }
