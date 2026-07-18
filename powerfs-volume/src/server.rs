@@ -124,6 +124,8 @@ impl VolumeServer {
                     network_tx: metrics.network_tx,
                     uptime: metrics.uptime,
                     volume_count: storage_manager.volume_count() as u32,
+                    is_leader: false,
+                    raft_term: 0,
                 });
 
                 if let Err(e) = publisher.publish(event, &node_id_str).await {

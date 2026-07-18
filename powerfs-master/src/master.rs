@@ -40,6 +40,7 @@ pub struct MasterNode {
     raft_address: String,
     is_leader: RwLock<bool>,
     leader_address: RwLock<String>,
+    raft_term: RwLock<u64>,
     next_volume_id: RwLock<u32>,
     max_file_key: RwLock<u64>,
     heartbeat_tx: mpsc::Sender<NodeId>,
@@ -300,6 +301,7 @@ impl MasterNode {
             raft_address: raft_address.to_string(),
             is_leader: RwLock::new(true),
             leader_address: RwLock::new(raft_address.to_string()),
+            raft_term: RwLock::new(1),
             next_volume_id: RwLock::new(1),
             max_file_key: RwLock::new(0),
             heartbeat_tx,
@@ -388,6 +390,26 @@ impl MasterNode {
 
     pub fn set_leader(&self, leader_addr: String) {
         *self.leader_address.write().unwrap() = leader_addr;
+    }
+
+    pub fn raft_term(&self) -> u64 {
+        *self.raft_term.read().unwrap()
+    }
+
+    pub fn set_raft_term(&self, term: u64) {
+        *self.raft_term.write().unwrap() = term;
+    }
+
+    pub fn raft_id(&self) -> u64 {
+        self.raft_id
+    }
+
+    pub fn raft_address(&self) -> &str {
+        &self.raft_address
+    }
+
+    pub fn set_is_leader(&self, is_leader: bool) {
+        *self.is_leader.write().unwrap() = is_leader;
     }
 
     /// Propose a command to the Raft cluster
@@ -1467,7 +1489,7 @@ impl MasterNode {
             node_id: self.raft_id,
             address: self.raft_address.clone(),
             is_leader: *self.is_leader.read().unwrap(),
-            term: 1,
+            term: *self.raft_term.read().unwrap(),
             peers: Vec::new(),
         }
     }
@@ -1518,6 +1540,8 @@ impl MasterNode {
         let grpc_port = self.address.port() as u32;
         let event_publisher = self.event_publisher.clone();
         let address = self.address.to_string();
+        let is_leader = *self.is_leader.read().unwrap();
+        let raft_term = *self.raft_term.read().unwrap();
 
         tokio::spawn(async move {
             let mut sys = sysinfo::System::new_all();
@@ -1534,7 +1558,11 @@ impl MasterNode {
                         address: address.clone(),
                         grpc_port,
                         http_port: grpc_port,
-                        status: "healthy".to_string(),
+                        status: if is_leader {
+                            "leader".to_string()
+                        } else {
+                            "follower".to_string()
+                        },
                         cpu_usage: metrics.cpu_usage,
                         mem_usage: metrics.mem_usage,
                         disk_usage: metrics.disk_usage,
@@ -1542,6 +1570,8 @@ impl MasterNode {
                         network_tx: metrics.network_tx,
                         uptime: metrics.uptime,
                         volume_count: 0,
+                        is_leader,
+                        raft_term,
                     });
 
                     if let Err(e) = publisher.publish(event, &node_id_str).await {
@@ -1579,6 +1609,7 @@ impl Clone for MasterNode {
             raft_address: self.raft_address.clone(),
             is_leader: RwLock::new(*self.is_leader.read().unwrap()),
             leader_address: RwLock::new(self.leader_address.read().unwrap().clone()),
+            raft_term: RwLock::new(*self.raft_term.read().unwrap()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),
             max_file_key: RwLock::new(*self.max_file_key.read().unwrap()),
             heartbeat_tx: self.heartbeat_tx.clone(),

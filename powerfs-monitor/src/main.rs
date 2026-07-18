@@ -371,6 +371,83 @@ async fn get_node(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct MasterStatus {
+    nodes: Vec<NodeInfo>,
+    leader: Option<NodeInfo>,
+    raft_term: u64,
+    total_masters: usize,
+    healthy_masters: usize,
+}
+
+async fn get_master_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<MasterStatus>> {
+    let nodes = state.metric_store.get_nodes().await;
+    let master_nodes: Vec<NodeInfo> = nodes
+        .iter()
+        .filter(|n| n.node_type == "master")
+        .cloned()
+        .collect();
+
+    let leader = master_nodes.iter().find(|n| n.is_leader).cloned();
+    let raft_term = leader.as_ref().map(|n| n.raft_term).unwrap_or(0);
+    let healthy_masters = master_nodes
+        .iter()
+        .filter(|n| n.status == "online" || n.status == "healthy" || n.status == "leader")
+        .count();
+    let total_masters = master_nodes.len();
+
+    Json(ApiResponse::success(MasterStatus {
+        nodes: master_nodes,
+        leader,
+        raft_term,
+        total_masters,
+        healthy_masters,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferLeaderRequest {
+    target_node_id: u64,
+}
+
+async fn transfer_leader(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<TransferLeaderRequest>,
+) -> Json<ApiResponse<()>> {
+    // 仅 admin 可执行 leader 切换
+    if !user.is_admin() {
+        return Json(ApiResponse::error("Permission denied: admin only"));
+    }
+
+    info!(
+        "Admin {} requested leader transfer to node {}",
+        user.id, req.target_node_id
+    );
+
+    // 通过 gRPC 调用 master 的 transfer_leader 接口
+    let mut client = state.master_client.lock().await;
+    let request = powerfs_master::proto::powerfs::TransferLeaderRequest {
+        target_node_id: req.target_node_id,
+    };
+
+    match client.transfer_leader(tonic::Request::new(request)).await {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if resp.success {
+                info!("Leader transfer initiated to node {}", req.target_node_id);
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error(&resp.error))
+            }
+        }
+        Err(e) => {
+            warn!("Leader transfer failed: {}", e);
+            Json(ApiResponse::error(&format!("gRPC error: {}", e)))
+        }
+    }
+}
+
 async fn get_volumes(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<VolumeInfo>>> {
     let volumes = state.metric_store.get_volumes().await;
     Json(ApiResponse::success(volumes))
@@ -2672,6 +2749,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/bitrot/scrub/statuses/:id", get(get_scrub_status))
         .route("/api/bitrot/scrub/trigger/:id", post(trigger_scrub_volume))
         .route("/api/bitrot/scrub/trigger-all", post(trigger_scrub_all))
+        .route("/api/master/status", get(get_master_status))
+        .route("/api/master/transfer-leader", post(transfer_leader))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

@@ -84,6 +84,8 @@ impl MetricStore {
                     network_tx: event.network_tx,
                     uptime: event.uptime,
                     volume_count: event.volume_count,
+                    is_leader: event.is_leader,
+                    raft_term: event.raft_term,
                 },
             );
         }

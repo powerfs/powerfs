@@ -1165,6 +1165,66 @@ impl MasterService for MasterGrpcServer {
         Ok(Response::new(cluster_info))
     }
 
+    async fn get_master_status(
+        &self,
+        _request: Request<MasterStatusRequest>,
+    ) -> Result<Response<MasterStatusResponse>, Status> {
+        let is_leader = self.master.is_leader().await;
+        let raft_term = self.master.raft_term();
+        let address = self.master.raft_address().to_string();
+
+        let node_info = MasterNodeInfo {
+            node_id: address.clone(),
+            address: address.clone(),
+            grpc_port: self.master.address().port() as u32,
+            is_leader,
+            status: if is_leader {
+                "leader".to_string()
+            } else {
+                "follower".to_string()
+            },
+            raft_term,
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            disk_usage: 0.0,
+            uptime: 0,
+        };
+
+        Ok(Response::new(MasterStatusResponse {
+            nodes: vec![node_info],
+            leader_id: if is_leader { address } else { String::new() },
+            raft_term,
+            total_masters: 1,
+            healthy_masters: 1,
+        }))
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: Request<TransferLeaderRequest>,
+    ) -> Result<Response<TransferLeaderResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            "Received transfer_leader request to node {}",
+            req.target_node_id
+        );
+
+        // 单节点模式下不支持 leader 转移
+        match self.master.raft_transfer_leader(req.target_node_id) {
+            Ok(()) => Ok(Response::new(TransferLeaderResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => {
+                warn!("Leader transfer failed: {}", e);
+                Ok(Response::new(TransferLeaderResponse {
+                    success: false,
+                    error: e,
+                }))
+            }
+        }
+    }
+
     type StreamMutateEntryStream =
         Pin<Box<dyn Stream<Item = Result<MutateEntryResponse, Status>> + Send + 'static>>;
 

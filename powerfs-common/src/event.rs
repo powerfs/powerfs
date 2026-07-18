@@ -60,6 +60,10 @@ pub struct NodeStatusEvent {
     pub network_tx: u64,
     pub uptime: u64,
     pub volume_count: u32,
+    #[serde(default)]
+    pub is_leader: bool,
+    #[serde(default)]
+    pub raft_term: u64,
 }
 
 fn default_node_type() -> String {

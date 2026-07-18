@@ -18,6 +18,7 @@ community = []
 enterprise = ["dep:powerfs-fuse-enterprise"]
 
 [dependencies]
+powerfs-fuse-core = { path = "../powerfs-fuse-core" }
 powerfs-fuse-enterprise = { path = "../powerfs-fuse-enterprise", optional = true }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }

@@ -67,6 +67,10 @@ service MasterService {
     rpc BatchResolveConflicts(BatchResolveConflictsRequest) returns (BatchResolveConflictsResponse);
     rpc GetConflictStats(GetConflictStatsRequest) returns (GetConflictStatsResponse);
     rpc BatchIgnoreConflicts(BatchIgnoreConflictsRequest) returns (BatchIgnoreConflictsResponse);
+
+    // Master HA management
+    rpc GetMasterStatus(MasterStatusRequest) returns (MasterStatusResponse);
+    rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
 }
 
 message Heartbeat {
@@ -518,6 +522,30 @@ message RemoveNodeRequest {
 message RemoveNodeResponse {
     bool success = 1;
     string error = 2;
+}
+
+message MasterStatusRequest {
+}
+
+message MasterNodeInfo {
+    string node_id = 1;
+    string address = 2;
+    uint32 grpc_port = 3;
+    bool is_leader = 4;
+    string status = 5;
+    uint64 raft_term = 6;
+    double cpu_usage = 7;
+    double mem_usage = 8;
+    double disk_usage = 9;
+    uint64 uptime = 10;
+}
+
+message MasterStatusResponse {
+    repeated MasterNodeInfo nodes = 1;
+    string leader_id = 2;
+    uint64 raft_term = 3;
+    uint32 total_masters = 4;
+    uint32 healthy_masters = 5;
 }
 
 message TransferLeaderRequest {
