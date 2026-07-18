@@ -489,8 +489,8 @@ async fn run_volume(
         }
     });
 
-    let mut master_client = MasterClient::new(NewMasterClientParams {
-        master_address: master,
+    let master_client = MasterClient::new(NewMasterClientParams {
+        master_addresses: &[master],
         node_id: node_id.clone(),
         grpc_port: grpc_port.into(),
         http_port: http_port.into(),
@@ -602,7 +602,7 @@ async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Resul
     info!("Starting PowerFS FUSE client");
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(master_addr, dir, "default", "000", 8, false).await?;
+    let fuse_app = FuserApp::new(&vec![master_addr.to_string()], dir, "default", "000", 8, false).await?;
 
     info!("Mounting PowerFS at: {}", dir);
     info!("Connected to master: {}", master_addr);
@@ -614,7 +614,7 @@ async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Mounting PowerFS at: {}", dir);
 
     let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(master_addr, dir, "default", "000", 8, false).await?;
+    let fuse_app = FuserApp::new(&vec![master_addr.to_string()], dir, "default", "000", 8, false).await?;
 
     info!("Connected to master: {}", master_addr);
 

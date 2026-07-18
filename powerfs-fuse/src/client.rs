@@ -58,7 +58,8 @@ impl Default for GrpcConfig {
 }
 
 pub struct PowerFuseClient {
-    master_addr: String,
+    master_addresses: Arc<Vec<String>>,
+    current_master_index: std::sync::atomic::AtomicUsize,
     master_channel: RwLock<Option<Channel>>,
     volume_channels: RwLock<HashMap<String, Channel>>,
     runtime_handle: Handle,
@@ -66,9 +67,10 @@ pub struct PowerFuseClient {
 }
 
 impl PowerFuseClient {
-    pub fn new(master_addr: &str, runtime_handle: Handle) -> Arc<Self> {
+    pub fn new(master_addrs: &[&str], runtime_handle: Handle) -> Arc<Self> {
         Arc::new(PowerFuseClient {
-            master_addr: master_addr.to_string(),
+            master_addresses: Arc::new(master_addrs.iter().map(|s| s.to_string()).collect()),
+            current_master_index: std::sync::atomic::AtomicUsize::new(0),
             master_channel: RwLock::new(None),
             volume_channels: RwLock::new(HashMap::new()),
             runtime_handle,
@@ -76,14 +78,22 @@ impl PowerFuseClient {
         })
     }
 
-    pub fn with_config(master_addr: &str, runtime_handle: Handle, config: GrpcConfig) -> Arc<Self> {
+    pub fn with_config(master_addrs: &[&str], runtime_handle: Handle, config: GrpcConfig) -> Arc<Self> {
         Arc::new(PowerFuseClient {
-            master_addr: master_addr.to_string(),
+            master_addresses: Arc::new(master_addrs.iter().map(|s| s.to_string()).collect()),
+            current_master_index: std::sync::atomic::AtomicUsize::new(0),
             master_channel: RwLock::new(None),
             volume_channels: RwLock::new(HashMap::new()),
             runtime_handle,
             config,
         })
+    }
+
+    fn next_master_index(&self) -> usize {
+        let current = self.current_master_index.load(std::sync::atomic::Ordering::Relaxed);
+        let next = (current + 1) % self.master_addresses.len();
+        self.current_master_index.store(next, std::sync::atomic::Ordering::Relaxed);
+        next
     }
 
     async fn get_or_create_master_channel(&self) -> Result<Channel, String> {
@@ -94,13 +104,38 @@ impl PowerFuseClient {
             }
         }
 
-        info!("Creating new master channel to: {}", self.master_addr);
-        let channel = self.create_channel(&self.master_addr).await?;
+        let channel = self.try_connect_to_master().await?;
 
         let mut master_channel = self.master_channel.write().await;
         *master_channel = Some(channel.clone());
 
         Ok(channel)
+    }
+
+    async fn try_connect_to_master(&self) -> Result<Channel, String> {
+        let mut first_error: Option<String> = None;
+        
+        for _ in 0..self.master_addresses.len() {
+            let idx = self.current_master_index.load(std::sync::atomic::Ordering::Relaxed);
+            let addr = &self.master_addresses[idx];
+            
+            info!("Trying to connect to master: {}", addr);
+            match self.create_channel(addr).await {
+                Ok(ch) => {
+                    info!("Connected to master: {}", addr);
+                    return Ok(ch);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to master {}: {}", addr, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    self.next_master_index();
+                }
+            }
+        }
+
+        Err(first_error.unwrap_or_else(|| "No master available".to_string()))
     }
 
     async fn get_or_create_volume_channel(&self, addr: &str) -> Result<Channel, String> {

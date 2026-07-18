@@ -12,9 +12,9 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[command(name = "powerfs-fuse")]
 #[command(about = "PowerFS FUSE client - mount PowerFS as a filesystem")]
 struct Args {
-    /// Master server gRPC address (e.g. localhost:9334)
+    /// Master server gRPC addresses (e.g. localhost:9334 localhost:9335)
     #[arg(long, default_value = "localhost:9334")]
-    master: String,
+    master: Vec<String>,
 
     /// Mount point path
     #[arg(long)]
@@ -135,7 +135,7 @@ fn main() {
     builder.init();
 
     info!("PowerFS FUSE Client starting...");
-    info!("  Master: {}", args.master);
+    info!("  Masters: {}", args.master.join(", "));
     info!("  Mount point: {}", args.mount_point);
     info!("  Collection: {}", args.collection);
     info!("  Replication: {}", args.replication);

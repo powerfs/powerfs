@@ -26,7 +26,7 @@ const FUSE_APPEND: u32 = 0x400;
 /// FUSE application that manages the mount lifecycle
 pub struct FuseApp {
     mount_point: String,
-    master_addr: String,
+    master_addresses: Vec<String>,
     collection: String,
     replication: String,
     runtime_handle: Handle,
@@ -34,7 +34,7 @@ pub struct FuseApp {
 
 impl FuseApp {
     pub async fn new(
-        master_addr: &str,
+        master_addrs: &[String],
         mount_point: &str,
         collection: &str,
         replication: &str,
@@ -44,7 +44,7 @@ impl FuseApp {
 
         Ok(FuseApp {
             mount_point: mount_point.to_string(),
-            master_addr: master_addr.to_string(),
+            master_addresses: master_addrs.to_vec(),
             collection: collection.to_string(),
             replication: replication.to_string(),
             runtime_handle,
@@ -53,11 +53,13 @@ impl FuseApp {
 
     pub async fn run(&self) -> Result<()> {
         info!(
-            "Starting FUSE session on {} with master {}",
-            self.mount_point, self.master_addr
+            "Starting FUSE session on {} with masters {}",
+            self.mount_point,
+            self.master_addresses.join(", ")
         );
 
-        let grpc_client = PowerFuseClient::new(&self.master_addr, self.runtime_handle.clone());
+        let master_addrs_ref: Vec<&str> = self.master_addresses.iter().map(|s| s.as_str()).collect();
+        let grpc_client = PowerFuseClient::new(&master_addrs_ref, self.runtime_handle.clone());
         let sync_client = Arc::new(SyncFuseClient::new(grpc_client));
 
         let cache = Arc::new(MetadataCache::new());

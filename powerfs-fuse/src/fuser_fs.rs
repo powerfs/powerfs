@@ -1233,7 +1233,7 @@ impl Clone for PowerFsFuserFs {
 
 pub struct FuserApp {
     mount_point: String,
-    master_addr: String,
+    master_addresses: Vec<String>,
     collection: String,
     replication: String,
     num_threads: usize,
@@ -1243,7 +1243,7 @@ pub struct FuserApp {
 
 impl FuserApp {
     pub async fn new(
-        master_addr: &str,
+        master_addrs: &[String],
         mount_point: &str,
         collection: &str,
         replication: &str,
@@ -1255,7 +1255,7 @@ impl FuserApp {
 
         Ok(Self {
             mount_point: mount_point.to_string(),
-            master_addr: master_addr.to_string(),
+            master_addresses: master_addrs.to_vec(),
             collection: collection.to_string(),
             replication: replication.to_string(),
             num_threads,
@@ -1266,12 +1266,14 @@ impl FuserApp {
 
     pub async fn run(&self) -> Result<()> {
         info!(
-            "Starting FUSE session on {} with master {} ({} threads)",
-            self.mount_point, self.master_addr, self.num_threads
+            "Starting FUSE session on {} with masters {} ({} threads)",
+            self.mount_point,
+            self.master_addresses.join(", "),
+            self.num_threads
         );
 
-        // 创建 gRPC 客户端
-        let grpc_client = PowerFuseClient::new(&self.master_addr, self.runtime_handle.clone());
+        let master_addrs_ref: Vec<&str> = self.master_addresses.iter().map(|s| s.as_str()).collect();
+        let grpc_client = PowerFuseClient::new(&master_addrs_ref, self.runtime_handle.clone());
         let sync_client = Arc::new(SyncFuseClient::new(grpc_client.clone()));
 
         // 生成 client_id

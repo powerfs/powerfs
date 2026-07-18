@@ -129,7 +129,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-1
+    command: /app/powerfs-volume --grpc-address 172.20.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-1
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.21 8080 || exit 1"]
       interval: 5s
@@ -156,7 +156,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-2
+    command: /app/powerfs-volume --grpc-address 172.20.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-2
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.22 8080 || exit 1"]
       interval: 5s
@@ -183,7 +183,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.20.0.11:9333 --node-id volume-server-3
+    command: /app/powerfs-volume --grpc-address 172.20.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-3
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.23 8080 || exit 1"]
       interval: 5s
@@ -292,6 +292,10 @@ services:
       - /app/powerfs-fuse
       - --master
       - 172.20.0.11:9333
+      - --master
+      - 172.20.0.12:9333
+      - --master
+      - 172.20.0.13:9333
       - --mount-point
       - /mnt/powerfs
       - --collection
@@ -339,6 +343,10 @@ services:
       - /app/powerfs-fuse
       - --master
       - 172.20.0.11:9333
+      - --master
+      - 172.20.0.12:9333
+      - --master
+      - 172.20.0.13:9333
       - --mount-point
       - /mnt/powerfs
       - --collection

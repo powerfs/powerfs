@@ -28,8 +28,8 @@ struct Args {
     #[arg(long, default_value = "default")]
     rack: String,
 
-    #[arg(long, default_value = "localhost:9333")]
-    master_address: String,
+    #[arg(long, default_values = ["localhost:9333"])]
+    master_address: Vec<String>,
 
     #[arg(long, default_value = "./data")]
     data_dir: String,
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Node ID: {}", args.node_id);
     info!("  Data Center: {}", args.data_center);
     info!("  Rack: {}", args.rack);
-    info!("  Master: {}", args.master_address);
+    info!("  Masters: {}", args.master_address.join(", "));
     info!("  Data Dir: {}", args.data_dir);
 
     let node_id = NodeId(args.node_id.clone());
@@ -88,8 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &data_dir,
     );
 
-    let mut master_client = MasterClient::new(NewMasterClientParams {
-        master_address: &args.master_address,
+    let master_addrs: Vec<&str> = args.master_address.iter().map(|s| s.as_str()).collect();
+    let master_client = MasterClient::new(NewMasterClientParams {
+        master_addresses: &master_addrs,
         node_id,
         grpc_port,
         http_port: args.http_port,
@@ -181,8 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if master_client.send_heartbeat(proto_volumes).await.is_err() {
                     warn!("Failed to send heartbeat, reconnecting...");
-                    // stream 断开后 sender 通道已关闭，必须重建 gRPC stream，
-                    // 否则后续 send_heartbeat 会一直报 "channel closed"
                     if let Err(e) = master_client.start_heartbeat().await {
                         warn!("Failed to restart heartbeat: {}", e);
                     }
