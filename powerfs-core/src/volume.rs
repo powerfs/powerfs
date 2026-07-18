@@ -567,13 +567,15 @@ impl Volume {
 
             let data_offset = offset as usize;
             let data_size = size as usize;
-            if data_offset + data_size <= needle.data.len() {
-                Ok(Bytes::from(
-                    needle.data[data_offset..data_offset + data_size].to_vec(),
-                ))
+            if data_offset >= needle.data.len() {
+                // offset 超出数据范围，返回空数据（短读）
+                Ok(Bytes::new())
             } else {
-                Err(PowerFsError::InvalidRequest(
-                    "invalid offset or size".to_string(),
+                // 短读：只返回实际可用的数据，避免最后一个 chunk 读取失败
+                let available = needle.data.len() - data_offset;
+                let read_size = data_size.min(available);
+                Ok(Bytes::from(
+                    needle.data[data_offset..data_offset + read_size].to_vec(),
                 ))
             }
         } else {

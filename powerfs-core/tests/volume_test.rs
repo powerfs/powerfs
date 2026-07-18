@@ -542,6 +542,126 @@ fn test_write_needle_blob_data_integrity_after_growth() {
     assert_eq!(&data[..8], b"abcdefgh");
 }
 
+/// 回归测试：read_needle_blob 在请求 size 超出实际数据时应返回短读，而不是错误。
+///
+/// 场景：cp /usr/bin/bash testfile（bash 约 1.2MB，chunk_size = 1MB）
+/// - chunk 0: write_needle_blob(offset=0, size=1MB)
+/// - chunk 1: write_needle_blob(offset=1MB, size=200KB) → needle.data 扩容到 1.2MB
+/// - 读取 chunk 1: read_needle_blob(offset=1MB, size=1MB)  ← 请求 chunk_size 字节
+///
+/// 修复前：1MB + 1MB = 2MB > 1.2MB → 返回 InvalidRequest 错误 → FUSE 返回 EIO
+/// 修复后：返回短读（200KB 可用数据）
+#[test]
+fn test_read_needle_blob_short_read_beyond_data_end() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    // 写入 chunk 0：1MB 数据
+    let chunk0_data = vec![0xAAu8; 1024 * 1024];
+    volume
+        .write_needle_blob(1, 0, chunk0_data.len() as i32, Bytes::from(chunk0_data), 0)
+        .unwrap();
+
+    // 写入 chunk 1：200KB 数据（offset = 1MB）
+    let chunk1_data = vec![0xBBu8; 200 * 1024];
+    volume
+        .write_needle_blob(
+            1,
+            1024 * 1024,
+            chunk1_data.len() as i32,
+            Bytes::from(chunk1_data),
+            0,
+        )
+        .unwrap();
+
+    // 读取 chunk 0：请求 1MB，应完整返回 1MB
+    let data0 = volume
+        .read_needle_blob(1, 0, 1024 * 1024)
+        .expect("read chunk 0 should succeed");
+    assert_eq!(data0.len(), 1024 * 1024);
+    assert!(data0.iter().all(|&b| b == 0xAA));
+
+    // 读取 chunk 1：请求 1MB（chunk_size），但实际只有 200KB
+    // 修复前会返回错误，修复后应返回短读（200KB）
+    let data1 = volume
+        .read_needle_blob(1, 1024 * 1024, 1024 * 1024)
+        .expect("read chunk 1 should succeed with short read");
+    assert_eq!(
+        data1.len(),
+        200 * 1024,
+        "short read should return only available data"
+    );
+    assert!(data1.iter().all(|&b| b == 0xBB));
+}
+
+/// 回归测试：read_needle_blob 在 offset 超出数据范围时应返回空数据，而不是错误。
+#[test]
+fn test_read_needle_blob_offset_beyond_data_end() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    // 只写入 100 字节
+    volume
+        .write_needle_blob(1, 0, 100, Bytes::from(vec![0u8; 100]), 0)
+        .unwrap();
+
+    // offset 超出数据范围，应返回空数据（短读）
+    let data = volume
+        .read_needle_blob(1, 200, 100)
+        .expect("offset beyond data end should return empty data");
+    assert!(
+        data.is_empty(),
+        "offset beyond data end should return empty data, not error"
+    );
+}
+
+/// 回归测试：模拟 cp /usr/bin/bash testfile 的完整流程
+///
+/// 验证多 chunk 写入后，按 chunk_size 读取每个 chunk 都能成功，
+/// 且拼起来的数据与原始数据一致。
+#[test]
+fn test_blob_multi_chunk_round_trip_like_cp_bash() {
+    let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
+
+    // 模拟 bash 文件：1.2MB（跨 2 个 chunk，chunk_size = 1MB）
+    let chunk_size = 1024 * 1024;
+    let file_size = chunk_size + 200 * 1024; // 1.2MB
+    let original_data: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+
+    // 按 chunk 边界切分写入
+    let chunk0_data = original_data[0..chunk_size].to_vec();
+    let chunk1_data = original_data[chunk_size..file_size].to_vec();
+
+    volume
+        .write_needle_blob(1, 0, chunk0_data.len() as i32, Bytes::from(chunk0_data), 0)
+        .unwrap();
+    volume
+        .write_needle_blob(
+            1,
+            chunk_size as i64,
+            chunk1_data.len() as i32,
+            Bytes::from(chunk1_data),
+            0,
+        )
+        .unwrap();
+
+    // 按 chunk_size 读取每个 chunk（FUSE 客户端的读取方式）
+    let data0 = volume
+        .read_needle_blob(1, 0, chunk_size as i32)
+        .expect("read chunk 0");
+    let data1 = volume
+        .read_needle_blob(1, chunk_size as i64, chunk_size as i32)
+        .expect("read chunk 1 should short-read");
+
+    // 拼接读取的数据
+    let mut reconstructed = Vec::with_capacity(file_size);
+    reconstructed.extend_from_slice(&data0);
+    reconstructed.extend_from_slice(&data1);
+
+    assert_eq!(
+        reconstructed, original_data,
+        "reconstructed data must match original after multi-chunk round trip"
+    );
+}
+
 #[test]
 fn test_compact_reclaims_space_after_deletes() {
     let (_dir, volume) = create_test_volume(1, 10 * 1024 * 1024);
