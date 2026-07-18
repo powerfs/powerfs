@@ -1,3 +1,4 @@
+./powerfs-fuse/Cargo.toml
 target/
 core
 spdk/
