@@ -15,6 +15,7 @@ harness = false
 [features]
 default = ["community"]
 community = []
+enterprise = []
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }

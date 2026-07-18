@@ -78,7 +78,11 @@ impl PowerFuseClient {
         })
     }
 
-    pub fn with_config(master_addrs: &[&str], runtime_handle: Handle, config: GrpcConfig) -> Arc<Self> {
+    pub fn with_config(
+        master_addrs: &[&str],
+        runtime_handle: Handle,
+        config: GrpcConfig,
+    ) -> Arc<Self> {
         Arc::new(PowerFuseClient {
             master_addresses: Arc::new(master_addrs.iter().map(|s| s.to_string()).collect()),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
@@ -90,9 +94,12 @@ impl PowerFuseClient {
     }
 
     fn next_master_index(&self) -> usize {
-        let current = self.current_master_index.load(std::sync::atomic::Ordering::Relaxed);
+        let current = self
+            .current_master_index
+            .load(std::sync::atomic::Ordering::Relaxed);
         let next = (current + 1) % self.master_addresses.len();
-        self.current_master_index.store(next, std::sync::atomic::Ordering::Relaxed);
+        self.current_master_index
+            .store(next, std::sync::atomic::Ordering::Relaxed);
         next
     }
 
@@ -114,11 +121,13 @@ impl PowerFuseClient {
 
     async fn try_connect_to_master(&self) -> Result<Channel, String> {
         let mut first_error: Option<String> = None;
-        
+
         for _ in 0..self.master_addresses.len() {
-            let idx = self.current_master_index.load(std::sync::atomic::Ordering::Relaxed);
+            let idx = self
+                .current_master_index
+                .load(std::sync::atomic::Ordering::Relaxed);
             let addr = &self.master_addresses[idx];
-            
+
             info!("Trying to connect to master: {}", addr);
             match self.create_channel(addr).await {
                 Ok(ch) => {

@@ -1272,7 +1272,8 @@ impl FuserApp {
             self.num_threads
         );
 
-        let master_addrs_ref: Vec<&str> = self.master_addresses.iter().map(|s| s.as_str()).collect();
+        let master_addrs_ref: Vec<&str> =
+            self.master_addresses.iter().map(|s| s.as_str()).collect();
         let grpc_client = PowerFuseClient::new(&master_addrs_ref, self.runtime_handle.clone());
         let sync_client = Arc::new(SyncFuseClient::new(grpc_client.clone()));
 
