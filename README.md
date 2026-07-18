@@ -270,10 +270,25 @@ sudo yum install -y \
 
 ### Build
 
+PowerFS 分为**社区版**与**企业版**两个版本。两者共用同一份代码主体，
+区别在于是否包含 `powerfs-fuse-enterprise` 目录（企业版通过 git submodule
+单独引入，社区版仓库中不存在该目录）。
+
+构建前请先运行 `prep.sh` 生成与当前版本匹配的配置（`powerfs-fuse/Cargo.toml`
+以及 workspace `Cargo.toml` 的 `members`）。脚本会根据
+`powerfs-fuse-enterprise` 目录是否存在自动判定版本，也支持手动指定：
+
 ```bash
 # Clone the repository
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
+
+# 准备构建配置（自动检测版本：社区版不输出企业版信息）
+./prep.sh
+
+# 也可手动指定版本
+# ./prep.sh community      # 强制社区版
+# ./prep.sh enterprise     # 强制企业版（需已检出 powerfs-fuse-enterprise）
 
 # Build all packages
 cargo build --all
@@ -284,6 +299,11 @@ cargo build --all --release
 # Build and install to PATH
 cargo install --path powerfs-server
 ```
+
+> **注意**：`prep.sh` 必须在 `cargo build` 之前运行。若直接执行
+> `cargo build` 而未运行 `prep.sh`，社区版会因为缺少 `powerfs-fuse/Cargo.toml`
+> 而报错；切换版本后也需要重新运行 `prep.sh` 以刷新配置。
+
 
 ### Quick Start
 

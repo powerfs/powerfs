@@ -17,9 +17,6 @@ tifs/
 node_modules/
 log
 *.log
-p*.sh
-u*.sh
-setp.sh
 !kernel/**/test_*.sh
 .cargo
 vendor/
