@@ -248,7 +248,19 @@ async fn main() -> Result<()> {
             ip,
             max_volume_size,
             config,
-        } => run_volume(port, &dir, meta_dir, data_dir, &master, ip, max_volume_size, config.as_deref()).await,
+        } => {
+            run_volume(
+                port,
+                &dir,
+                meta_dir,
+                data_dir,
+                &master,
+                ip,
+                max_volume_size,
+                config.as_deref(),
+            )
+            .await
+        }
 
         Commands::Filer { port, master, ip } => run_filer(port, &master, ip).await,
 
@@ -396,8 +408,10 @@ async fn run_volume(
                     };
 
                     let rpc_path = spdk_details.rpc_socket_path.as_deref();
-                    let spdk_backend = Arc::new(SpdkBackend::new(&cfg.node.node_id, rpc_path)
-                        .map_err(|e| PowerFsError::Storage(e.to_string()))?);
+                    let spdk_backend = Arc::new(
+                        SpdkBackend::new(&cfg.node.node_id, rpc_path)
+                            .map_err(|e| PowerFsError::Storage(e.to_string()))?,
+                    );
                     info!("Created SpdkBackend (node_id={}), devices will be attached async after SPDK ready",
                           cfg.node.node_id);
 
@@ -406,7 +420,10 @@ async fn run_volume(
                     let backend_for_attach = Arc::clone(&spdk_backend);
                     let node_id_for_log = node_id.clone();
                     tokio::spawn(async move {
-                        info!("[{}] Background SPDK device attach task started", node_id_for_log);
+                        info!(
+                            "[{}] Background SPDK device attach task started",
+                            node_id_for_log
+                        );
                         let results = backend_for_attach
                             .attach_devices_from_config(
                                 &spdk_details.devices,

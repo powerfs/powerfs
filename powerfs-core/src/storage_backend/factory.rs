@@ -100,6 +100,8 @@ impl BackendFactory {
             config: BackendConfigDetails::Spdk(SpdkBackendConfig {
                 devices,
                 rpc_socket_path: None,
+                local_tgt: None,
+                nvmf: None,
             }),
         };
         Self::create(&config)

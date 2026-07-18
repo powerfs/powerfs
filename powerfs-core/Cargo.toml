@@ -48,3 +48,13 @@ required-features = ["spdk"]
 [[example]]
 name = "spdk_simple_test"
 path = "../examples/spdk_simple_test.rs"
+
+[[example]]
+name = "spdk_kv_test"
+path = "../examples/spdk_kv_test.rs"
+required-features = ["spdk"]
+
+[[example]]
+name = "spdk_full_test"
+path = "../examples/spdk_full_test.rs"
+required-features = ["spdk"]

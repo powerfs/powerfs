@@ -6,6 +6,10 @@ authors.workspace = true
 description.workspace = true
 license.workspace = true
 
+[features]
+default = []
+spdk-stub = ["powerfs-core/spdk-stub"]
+
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }

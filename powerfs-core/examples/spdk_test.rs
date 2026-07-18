@@ -1,5 +1,5 @@
 #[cfg(feature = "spdk")]
-use powerfs_core::storage_backend::{SpdkBackend, StorageBackend, SpdkDeviceConfig};
+use powerfs_core::storage_backend::{SpdkBackend, SpdkDeviceConfig, StorageBackend};
 
 #[cfg(feature = "spdk")]
 #[tokio::main]
@@ -30,13 +30,21 @@ async fn main() {
             ];
 
             println!("\nAttaching devices via RPC...");
-            let results = backend.attach_devices_from_config(&devices, Some("/var/tmp/spdk.sock")).await;
-            
+            let results = backend
+                .attach_devices_from_config(&devices, Some("/var/tmp/spdk.sock"))
+                .await;
+
             for result in results {
                 if result.success {
-                    println!("  Device {} attached successfully: {:?}", result.device_name, result.device_id);
+                    println!(
+                        "  Device {} attached successfully: {:?}",
+                        result.device_name, result.device_id
+                    );
                 } else {
-                    println!("  Device {} attach failed: {:?}", result.device_name, result.error);
+                    println!(
+                        "  Device {} attach failed: {:?}",
+                        result.device_name, result.error
+                    );
                 }
             }
 

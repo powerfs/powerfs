@@ -8,8 +8,8 @@
 
 #![cfg(feature = "spdk")]
 
-use base64::Engine;
 use crate::storage_backend::{StorageBackendError, StorageResult};
+use base64::Engine;
 use log::{debug, info, warn};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -94,13 +94,13 @@ impl SpdkRpcClient {
             "params": params,
         });
 
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| StorageBackendError::InvalidOperation(format!(
+        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
+            StorageBackendError::InvalidOperation(format!(
                 "failed to connect to SPDK RPC socket {}: {}",
                 self.socket_path.display(),
                 e
-            )))?;
+            ))
+        })?;
 
         let mut request_bytes = serde_json::to_vec(&request).map_err(|e| {
             StorageBackendError::InvalidOperation(format!("failed to serialize RPC request: {}", e))
@@ -143,15 +143,12 @@ impl SpdkRpcClient {
         }
 
         // 返回 result 字段
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| {
-                StorageBackendError::InvalidOperation(format!(
-                    "SPDK RPC '{}' returned no result field",
-                    method
-                ))
-            })
+        response.get("result").cloned().ok_or_else(|| {
+            StorageBackendError::InvalidOperation(format!(
+                "SPDK RPC '{}' returned no result field",
+                method
+            ))
+        })
     }
 
     /// 调用 `bdev_nvme_attach_controller` attach 一个 NVMe 控制器
@@ -203,7 +200,11 @@ impl SpdkRpcClient {
         } else if let Some(bdevs_obj) = result.get("bdevs").and_then(|b| b.as_array()) {
             bdevs_obj
                 .iter()
-                .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter_map(|b| {
+                    b.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect()
         } else {
             return Err(StorageBackendError::InvalidOperation(format!(
@@ -235,7 +236,7 @@ impl SpdkRpcClient {
     pub async fn list_bdevs(&self) -> StorageResult<Vec<String>> {
         let params = json!({});
         let result = self.call_rpc("bdev_get_bdevs", params).await?;
-        
+
         let bdevs = if let Some(arr) = result.as_array() {
             arr
         } else if let Some(obj) = result.get("bdevs").and_then(|b| b.as_array()) {
@@ -246,10 +247,14 @@ impl SpdkRpcClient {
                 result
             )));
         };
-        
+
         Ok(bdevs
             .iter()
-            .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .filter_map(|b| {
+                b.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect())
     }
 
@@ -278,7 +283,10 @@ impl SpdkRpcClient {
                     if Instant::now() >= deadline {
                         return Err(e);
                     }
-                    warn!("SPDK RPC server connected but not responding, retrying: {}", e);
+                    warn!(
+                        "SPDK RPC server connected but not responding, retrying: {}",
+                        e
+                    );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -376,20 +384,30 @@ impl SpdkRpcClient {
     /// ⚠️ **DEPRECATED - 仅测试用，生产环境必须使用 NVMe-oF 数据面**
     /// 此方法通过 JSON-RPC 传输 IO 数据，性能损失高达 85% 以上，仅用于功能验证。
     /// 生产环境业务 IO 必须通过 NVMe-oF TCP/RDMA 数据通道执行。
-    #[deprecated(note = "Use NVMe-oF data plane for production IO. This method is for testing only.")]
+    #[deprecated(
+        note = "Use NVMe-oF data plane for production IO. This method is for testing only."
+    )]
     pub async fn read_bdev(&self, name: &str, offset: u64, size: u64) -> StorageResult<Vec<u8>> {
         let params = json!({
             "name": name,
             "offset": offset,
             "size": size,
         });
-        debug!("Reading bdev via SPDK RPC: name={} offset={} size={}", name, offset, size);
+        debug!(
+            "Reading bdev via SPDK RPC: name={} offset={} size={}",
+            name, offset, size
+        );
         let result = self.call_rpc("bdev_read", params).await?;
-        
+
         if let Some(data_str) = result.get("data").and_then(|d| d.as_str()) {
-            let data = base64::engine::general_purpose::STANDARD.decode(data_str).map_err(|e| {
-                StorageBackendError::InvalidOperation(format!("failed to decode bdev_read result: {}", e))
-            })?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data_str)
+                .map_err(|e| {
+                    StorageBackendError::InvalidOperation(format!(
+                        "failed to decode bdev_read result: {}",
+                        e
+                    ))
+                })?;
             Ok(data)
         } else {
             Err(StorageBackendError::InvalidOperation(
@@ -409,7 +427,9 @@ impl SpdkRpcClient {
     /// ⚠️ **DEPRECATED - 仅测试用，生产环境必须使用 NVMe-oF 数据面**
     /// 此方法通过 JSON-RPC 传输 IO 数据，性能损失高达 85% 以上，仅用于功能验证。
     /// 生产环境业务 IO 必须通过 NVMe-oF TCP/RDMA 数据通道执行。
-    #[deprecated(note = "Use NVMe-oF data plane for production IO. This method is for testing only.")]
+    #[deprecated(
+        note = "Use NVMe-oF data plane for production IO. This method is for testing only."
+    )]
     pub async fn write_bdev(&self, name: &str, offset: u64, data: &[u8]) -> StorageResult<()> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(data);
         let params = json!({
@@ -417,7 +437,12 @@ impl SpdkRpcClient {
             "offset": offset,
             "data": encoded,
         });
-        debug!("Writing bdev via SPDK RPC: name={} offset={} size={}", name, offset, data.len());
+        debug!(
+            "Writing bdev via SPDK RPC: name={} offset={} size={}",
+            name,
+            offset,
+            data.len()
+        );
         self.call_rpc("bdev_write", params).await?;
         Ok(())
     }
