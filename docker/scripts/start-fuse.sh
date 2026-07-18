@@ -4,6 +4,7 @@ set -e
 
 BUILD_IMAGES=false
 VERBOSE_LOG=false
+ENTERPRISE_FUSE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13,6 +14,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --verbose|-v)
             VERBOSE_LOG=true
+            shift
+            ;;
+        --enterprise)
+            ENTERPRISE_FUSE=true
             shift
             ;;
         *)
@@ -52,6 +57,7 @@ log_info "Configuration:"
 log_info "  Host IP:         $HOST_IP"
 log_info "  Build images:    $BUILD_IMAGES"
 log_info "  Verbose mode:    $VERBOSE_LOG"
+log_info "  Enterprise FUSE: $ENTERPRISE_FUSE"
 log_info "  Docker dir:      $DOCKER_DIR"
 log_info "  Project dir:     $PROJECT_DIR"
 log_info ""
@@ -101,9 +107,18 @@ if [ "$BUILD_IMAGES" = true ]; then
 
     log_info "  Step 1: Building Rust binaries..."
     cd "$PROJECT_DIR"
-    log_debug "  Running: cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse"
     
-    if cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse 2>&1 | tail -10; then
+    BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor"
+    
+    if [ "$ENTERPRISE_FUSE" = true ]; then
+        log_debug "  Running: $BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
+        BUILD_CMD="$BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
+    else
+        log_debug "  Running: $BUILD_CMD --bin powerfs-fuse"
+        BUILD_CMD="$BUILD_CMD --bin powerfs-fuse"
+    fi
+    
+    if $BUILD_CMD 2>&1 | tail -10; then
         log_info "  [OK] Rust binaries built successfully"
     else
         log_error "  [FAIL] Failed to build Rust binaries"
@@ -117,6 +132,11 @@ if [ "$BUILD_IMAGES" = true ]; then
 
     if docker compose -f "$DOCKER_DIR/docker-compose.yml" build 2>&1 | tail -10; then
         log_info "[OK] Docker images built successfully"
+        
+        log_info "  Step 3: Stopping existing containers before restart..."
+        docker compose -f "$DOCKER_DIR/docker-compose.yml" down 2>&1 | tail -5
+        
+        log_info "  [OK] Existing containers stopped"
     else
         log_error "[FAIL] Failed to build Docker images"
         log_error "Check docker compose build output for detailed errors"
@@ -529,10 +549,13 @@ log_info "  Access Key:      powerfs"
 log_info "  Secret Key:      powerfs123"
 log_info ""
 log_info "=== Quick Commands ==="
-log_info "  Stop environment:   docker/scripts/stop-cluster.sh"
-log_info "  Test FUSE:          echo 'Hello PowerFS' > /tmp/powerfs/fuse1/test.txt"
-log_info "  Verify cross-client: cat /tmp/powerfs/fuse2/test.txt"
-log_info "  Check all logs:     docker compose logs"
-log_info "  Check specific:     docker logs <container_name>"
+log_info "  Stop environment:         docker/scripts/stop-cluster.sh"
+log_info "  Test FUSE:                echo 'Hello PowerFS' > /tmp/powerfs/fuse1/test.txt"
+log_info "  Verify cross-client:      cat /tmp/powerfs/fuse2/test.txt"
+log_info "  Check all logs:           docker compose logs"
+log_info "  Check specific:           docker logs <container_name>"
+log_info ""
+log_info "=== Build Options ==="
+log_info "  Build with enterprise FUSE:  docker/scripts/start-fuse.sh -b --enterprise"
 log_info ""
 log_info "========================================"
