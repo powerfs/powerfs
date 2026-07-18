@@ -3,11 +3,20 @@
 set -e
 
 BUILD_IMAGES=false
+SPDK_FEATURE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build|-b)
             BUILD_IMAGES=true
+            shift
+            ;;
+        --spdk)
+            SPDK_FEATURE="--features spdk"
+            shift
+            ;;
+        --spdk-stub)
+            SPDK_FEATURE="--features spdk-stub"
             shift
             ;;
         *)
@@ -34,7 +43,7 @@ if [ "$BUILD_IMAGES" = true ]; then
 
     echo "  Building Rust binaries..."
     cd "$PROJECT_DIR"
-    cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor 2>&1 | tail -5
+    cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor $SPDK_FEATURE 2>&1 | tail -5
     echo "  [OK] Binaries built"
 
     echo "  Building Docker image..."

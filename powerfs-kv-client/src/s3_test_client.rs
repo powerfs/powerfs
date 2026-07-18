@@ -1,6 +1,7 @@
 use bytes::Bytes;
-use powerfs_core::storage_backend::{SpdkBackend, StorageBackend, StorageBackendError};
+use powerfs_core::storage_backend::{LocalFsBackend, StorageBackend, StorageBackendError};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum S3TestClientError {
@@ -15,19 +16,27 @@ pub enum S3TestClientError {
 }
 
 pub struct S3TestClient {
-    backend: SpdkBackend,
+    backend: Arc<dyn StorageBackend>,
     buckets: HashMap<String, u64>,
     next_volume_id: u64,
 }
 
 impl S3TestClient {
     pub fn new(node_id: &str) -> Result<Self, S3TestClientError> {
-        let backend = SpdkBackend::new(node_id, None)?;
+        let backend = Arc::new(LocalFsBackend::new("/tmp/powerfs-test", node_id, "default", 1024 * 1024 * 1024)?);
         Ok(Self {
             backend,
             buckets: HashMap::new(),
             next_volume_id: 1,
         })
+    }
+
+    pub fn new_with_backend(backend: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            backend,
+            buckets: HashMap::new(),
+            next_volume_id: 1,
+        }
     }
 
     pub fn create_bucket(&mut self, name: &str) -> Result<(), S3TestClientError> {
