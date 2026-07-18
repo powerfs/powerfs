@@ -3,25 +3,17 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-# pnpm v11 在 CI 环境中需要设置 CI=true 以避免交互式提示
 ENV CI=true
 
-# Enable pnpm via corepack
-RUN corepack enable && corepack prepare pnpm@latest --activate
-
 # Copy manifest files first for better layer caching
-COPY powerfs-monitor-frontend/package.json powerfs-monitor-frontend/pnpm-lock.yaml ./
-
-# pnpm v11 默认启用 strictDepBuilds,要求所有构建脚本依赖必须显式许可。
-# 创建 pnpm-workspace.yaml 显式允许 @parcel/watcher 的构建脚本
-RUN printf "allowBuilds:\n  '@parcel/watcher': true\n" > pnpm-workspace.yaml
+COPY powerfs-monitor-frontend/package.json ./
 
 # Install dependencies
-RUN pnpm install --frozen-lockfile
+RUN npm install
 
 # Copy source code and build
 COPY powerfs-monitor-frontend/ ./
-RUN pnpm build
+RUN npm run build
 
 # Stage 2: Serve static files with nginx
 FROM nginx:alpine

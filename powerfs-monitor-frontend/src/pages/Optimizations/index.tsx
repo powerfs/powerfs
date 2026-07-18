@@ -1,39 +1,27 @@
-
 import React, { useState, useEffect } from 'react';
 import {
   Card,
-  CardContent,
   Typography,
-  Grid,
-  Paper,
+  Row,
+  Col,
   Button,
   Switch,
-  FormControlLabel,
   Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  CircularProgress,
+  Spin,
   Alert,
-  AlertTitle,
-  Box,
-  Chip,
-  Tooltip,
-} from '@mui/material';
+  Space,
+  Tag,
+} from 'antd';
 import {
-  TrendingUp,
-  TrendingDown,
-  PlayCircle,
-  RotateCcw,
-  Database,
-  Cpu,
-  Memory,
-  Activity,
-} from '@mui/icons-material';
+  ArrowUpOutlined,
+  ArrowDownOutlined,
+  PlayCircleOutlined,
+  RotateLeftOutlined,
+  DatabaseOutlined,
+  DesktopOutlined,
+  DashboardOutlined,
+} from '@ant-design/icons';
 
-// API 类型定义
 interface OptimizationFlags {
   ec_simd_enabled: boolean;
   ec_parallel_encoding: boolean;
@@ -97,7 +85,6 @@ interface ComparisonReport {
   data_balance_improvement: number;
 }
 
-// 优化开关名称映射
 const flagNames: Record<string, string> = {
   ec_simd_enabled: 'EC SIMD 编码',
   ec_parallel_encoding: 'EC 并行编码',
@@ -112,15 +99,12 @@ const flagNames: Record<string, string> = {
   hierarchical_index: '分层索引',
 };
 
-// 主组件
 const OptimizationDashboard: React.FC = () => {
   const [flags, setFlags] = useState<OptimizationFlags | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [results, setResults] = useState<BenchmarkResult[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // 获取当前优化开关状态
   const fetchFlags = async () => {
     try {
       const response = await fetch('/api/optimizations');
@@ -131,7 +115,6 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 获取历史测试结果
   const fetchResults = async () => {
     try {
       const response = await fetch('/api/benchmark/results?limit=20');
@@ -142,13 +125,11 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 初始化加载
   useEffect(() => {
     fetchFlags();
     fetchResults();
   }, []);
 
-  // 更新单个开关
   const handleFlagChange = async (flagName: string, value: boolean) => {
     if (!flags) return;
 
@@ -169,7 +150,6 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 重置为默认值
   const handleReset = async () => {
     try {
       await fetch('/api/optimizations/reset', { method: 'POST' });
@@ -179,7 +159,6 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 重置为基线
   const handleBaseline = async () => {
     try {
       await fetch('/api/optimizations/baseline', { method: 'POST' });
@@ -189,7 +168,6 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 运行基准测试
   const handleRunBenchmark = async () => {
     setIsRunning(true);
     try {
@@ -212,7 +190,6 @@ const OptimizationDashboard: React.FC = () => {
     }
   };
 
-  // 格式化时间
   const formatTime = (timestamp: string) => {
     return new Date(timestamp).toLocaleString('zh-CN', {
       year: 'numeric',
@@ -224,7 +201,6 @@ const OptimizationDashboard: React.FC = () => {
     });
   };
 
-  // 渲染指标卡片
   const MetricCard: React.FC<{
     title: string;
     value: string | number;
@@ -234,319 +210,299 @@ const OptimizationDashboard: React.FC = () => {
     color: 'primary' | 'secondary' | 'success' | 'warning';
   }> = ({ title, value, unit, improvement, icon, color }) => {
     const colorMap = {
-      primary: { bg: 'rgba(59, 130, 246, 0.1)', text: 'text-blue-600' },
-      secondary: { bg: 'rgba(139, 92, 246, 0.1)', text: 'text-purple-600' },
-      success: { bg: 'rgba(34, 197, 94, 0.1)', text: 'text-green-600' },
-      warning: { bg: 'rgba(249, 115, 22, 0.1)', text: 'text-orange-600' },
+      primary: { border: '2px solid #1890ff', iconColor: '#1890ff' },
+      secondary: { border: '2px solid #722ED1', iconColor: '#722ED1' },
+      success: { border: '2px solid #52c41a', iconColor: '#52c41a' },
+      warning: { border: '2px solid #fa8c16', iconColor: '#fa8c16' },
     };
 
     return (
-      <Card sx={{ bgcolor: colorMap[color].bg }}>
-        <CardContent>
-          <Grid container spacing={2} alignItems="center">
-            <Grid item>
-              <Box sx={{ display: 'flex', alignItems: 'center', color: colorMap[color].text }}>
-                {icon}
-              </Box>
-            </Grid>
-            <Grid item xs>
-              <Typography variant="body2" color="text.secondary" gutterBottom>
-                {title}
-              </Typography>
-              <Typography variant="h4" component="div" fontWeight="bold">
-                {value}
-                {unit && <span className="ml-1 text-sm font-normal text-gray-500">{unit}</span>}
-              </Typography>
-              {improvement !== undefined && (
-                <Box sx={{ mt: 1 }}>
-                  {improvement >= 0 ? (
-                    <Chip
-                      icon={<TrendingUp style={{ fontSize: 14 }} />}
-                      label={`+${improvement.toFixed(1)}%`}
-                      size="small"
-                      color="success"
-                      variant="outlined"
-                    />
-                  ) : (
-                    <Chip
-                      icon={<TrendingDown style={{ fontSize: 14 }} />}
-                      label={`${improvement.toFixed(1)}%`}
-                      size="small"
-                      color="error"
-                      variant="outlined"
-                    />
-                  )}
-                </Box>
-              )}
-            </Grid>
-          </Grid>
-        </CardContent>
+      <Card style={{ borderLeft: colorMap[color].border }}>
+        <Space direction="horizontal" size="middle" align="center">
+          <div style={{ fontSize: 28, color: colorMap[color].iconColor }}>
+            {icon}
+          </div>
+          <div>
+            <Typography.Text type="secondary">{title}</Typography.Text>
+            <div style={{ fontSize: 24, fontWeight: 'bold', marginTop: 4 }}>
+              {value}
+              {unit && <span style={{ fontSize: 14, fontWeight: 'normal', color: '#999', marginLeft: 4 }}>{unit}</span>}
+            </div>
+            {improvement !== undefined && (
+              <div style={{ marginTop: 4 }}>
+                {improvement >= 0 ? (
+                  <Tag color="green" icon={<ArrowUpOutlined />}>
+                    +{improvement.toFixed(1)}%
+                  </Tag>
+                ) : (
+                  <Tag color="red" icon={<ArrowDownOutlined />}>
+                    {improvement.toFixed(1)}%
+                  </Tag>
+                )}
+              </div>
+            )}
+          </div>
+        </Space>
       </Card>
     );
   };
 
-  // 获取最新结果
   const latestResult = results[0];
 
-  return (
-    <div className="p-6">
-      <Typography variant="h4" component="h1" gutterBottom>
-        优化效果监控面板
-      </Typography>
+  const flagColumns = [
+    {
+      title: '优化项',
+      dataIndex: 'name',
+      key: 'name',
+    },
+    {
+      title: '状态',
+      dataIndex: 'value',
+      key: 'value',
+      render: (value: boolean) => (
+        <Tag color={value ? 'green' : 'default'}>
+          {value ? '启用' : '禁用'}
+        </Tag>
+      ),
+    },
+    {
+      title: '操作',
+      dataIndex: 'key',
+      key: 'action',
+      render: (_: string, record: { key: string; value: boolean }) => (
+        <Switch
+          checked={record.value}
+          onChange={(checked) => handleFlagChange(record.key, checked)}
+        />
+      ),
+    },
+  ];
 
-      {/* 错误提示 */}
+  const flagDataSource = flags ? Object.entries(flags).map(([key, value]) => ({
+    key,
+    name: flagNames[key] || key,
+    value,
+  })) : [];
+
+  const resultColumns = [
+    {
+      title: '测试 ID',
+      dataIndex: 'id',
+      key: 'id',
+      ellipsis: true,
+    },
+    {
+      title: '时间',
+      dataIndex: 'timestamp',
+      key: 'timestamp',
+      render: (ts: string) => formatTime(ts),
+    },
+    {
+      title: 'EC 吞吐量 (MB/s)',
+      dataIndex: ['metrics', 'ec_throughput_mbps'],
+      key: 'ec_throughput',
+      render: (v: number) => v.toFixed(1),
+    },
+    {
+      title: 'EC 延迟 (ms)',
+      dataIndex: ['metrics', 'ec_latency_ms'],
+      key: 'ec_latency',
+      render: (v: number) => v.toFixed(2),
+    },
+    {
+      title: 'Raft 选举 (ms)',
+      dataIndex: ['metrics', 'raft_election_time_ms'],
+      key: 'raft_election',
+      render: (v: number) => v.toFixed(0),
+    },
+    {
+      title: 'KV 命中率',
+      dataIndex: ['metrics', 'kv_cache_hit_rate'],
+      key: 'kv_hit_rate',
+      render: (v: number) => `${(v * 100).toFixed(1)}%`,
+    },
+    {
+      title: '持续时间',
+      dataIndex: 'duration_seconds',
+      key: 'duration',
+      render: (v: number) => `${v} 秒`,
+    },
+  ];
+
+  return (
+    <div style={{ padding: 24 }}>
+      <Typography.Title level={4}>优化效果监控面板</Typography.Title>
+
       {error && (
-        <Alert severity="error" sx={{ mb: 4 }}>
-          <AlertTitle>错误</AlertTitle>
-          {error}
-        </Alert>
+        <Alert
+          message="错误"
+          description={error}
+          type="error"
+          style={{ marginBottom: 16 }}
+        />
       )}
 
-      {/* 操作按钮 */}
-      <Box sx={{ mb: 6 }}>
+      <Space style={{ marginBottom: 24 }}>
         <Button
-          variant="contained"
-          color="primary"
+          type="primary"
           onClick={handleRunBenchmark}
           disabled={isRunning}
-          startIcon={isRunning ? <CircularProgress size={20} /> : <PlayCircle />}
-          sx={{ mr: 2 }}
+          icon={isRunning ? <Spin size="small" /> : <PlayCircleOutlined />}
         >
           {isRunning ? '运行中...' : '运行基准测试'}
         </Button>
-        <Button
-          variant="outlined"
-          onClick={handleReset}
-          startIcon={<RotateCcw />}
-          sx={{ mr: 2 }}
-        >
+        <Button onClick={handleReset} icon={<RotateLeftOutlined />}>
           重置为默认值
         </Button>
-        <Button variant="outlined" onClick={handleBaseline}>
-          设置为基线（全关）
-        </Button>
-      </Box>
+        <Button onClick={handleBaseline}>设置为基线（全关）</Button>
+      </Space>
 
-      {/* 优化开关状态 */}
-      <Paper sx={{ p: 4, mb: 6 }}>
-        <Typography variant="h6" gutterBottom>
-          优化开关状态
-        </Typography>
-        <Grid container spacing={3}>
-          {flags ? (
-            Object.entries(flags).map(([key, value]) => (
-              <Grid item xs={12} sm={6} md={4} key={key}>
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={value as boolean}
-                      onChange={(e) => handleFlagChange(key, e.target.checked)}
-                      name={key}
-                    />
-                  }
-                  label={flagNames[key] || key}
-                />
-              </Grid>
-            ))
-          ) : (
-            <CircularProgress />
-          )}
-        </Grid>
-      </Paper>
+      <Card title="优化开关状态" style={{ marginBottom: 24 }}>
+        {flags ? (
+          <Table
+            dataSource={flagDataSource}
+            columns={flagColumns}
+            pagination={false}
+            rowKey="key"
+          />
+        ) : (
+          <Spin />
+        )}
+      </Card>
 
-      {/* 最新测试结果指标 */}
       {latestResult && (
-        <div sx={{ mb: 6 }}>
-          <Typography variant="h6" gutterBottom>
+        <div style={{ marginBottom: 24 }}>
+          <Typography.Title level={5} style={{ marginBottom: 16 }}>
             最新测试结果 - {formatTime(latestResult.timestamp)}
-          </Typography>
-          <Grid container spacing={3}>
-            <Grid item xs={12} sm={6} md={3}>
+          </Typography.Title>
+          <Row gutter={[16, 16]}>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="EC 吞吐量"
                 value={latestResult.metrics.ec_throughput_mbps.toFixed(1)}
                 unit="MB/s"
                 improvement={latestResult.comparison?.ec_throughput_improvement}
-                icon={<Activity style={{ fontSize: 28 }} />}
+                icon={<DashboardOutlined />}
                 color="primary"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="EC 延迟"
                 value={latestResult.metrics.ec_latency_ms.toFixed(2)}
                 unit="ms"
                 improvement={latestResult.comparison?.ec_latency_improvement}
-                icon={<Activity style={{ fontSize: 28 }} />}
+                icon={<DashboardOutlined />}
                 color="secondary"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="Raft 选举时间"
                 value={latestResult.metrics.raft_election_time_ms.toFixed(0)}
                 unit="ms"
                 improvement={latestResult.comparison?.raft_election_improvement}
-                icon={<Database style={{ fontSize: 28 }} />}
+                icon={<DatabaseOutlined />}
                 color="success"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="KV 缓存命中率"
                 value={(latestResult.metrics.kv_cache_hit_rate * 100).toFixed(1)}
                 unit="%"
                 improvement={latestResult.comparison?.kv_cache_hit_rate_improvement}
-                icon={<Memory style={{ fontSize: 28 }} />}
+                icon={<DatabaseOutlined />}
                 color="warning"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="KV 读吞吐"
                 value={latestResult.metrics.kv_read_throughput_ops.toFixed(0)}
                 unit="ops/s"
                 improvement={latestResult.comparison?.kv_read_throughput_improvement}
-                icon={<Cpu style={{ fontSize: 28 }} />}
+                icon={<DesktopOutlined />}
                 color="primary"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="KV 写吞吐"
                 value={latestResult.metrics.kv_write_throughput_ops.toFixed(0)}
                 unit="ops/s"
                 improvement={latestResult.comparison?.kv_write_throughput_improvement}
-                icon={<Cpu style={{ fontSize: 28 }} />}
+                icon={<DesktopOutlined />}
                 color="secondary"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="S3 读吞吐"
                 value={latestResult.metrics.s3_read_throughput_mbps.toFixed(1)}
                 unit="MB/s"
                 improvement={latestResult.comparison?.s3_read_throughput_improvement}
-                icon={<Database style={{ fontSize: 28 }} />}
+                icon={<DatabaseOutlined />}
                 color="success"
               />
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
               <MetricCard
                 title="数据均衡度"
                 value={(latestResult.metrics.data_balance_score * 100).toFixed(1)}
                 unit="%"
                 improvement={latestResult.comparison?.data_balance_improvement}
-                icon={<Activity style={{ fontSize: 28 }} />}
+                icon={<DashboardOutlined />}
                 color="warning"
               />
-            </Grid>
-          </Grid>
+            </Col>
+          </Row>
         </div>
       )}
 
-      {/* 环境信息 */}
       {latestResult && (
-        <Paper sx={{ p: 4, mb: 6 }}>
-          <Typography variant="h6" gutterBottom>
-            测试环境信息
-          </Typography>
-          <Grid container spacing={4}>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">CPU 型号</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.cpu_model}
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">CPU 核心数</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.cpu_cores} 核
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">内存</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.memory_gb.toFixed(1)} GB
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">节点数</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.node_count} 节点
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">操作系统</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.os_version}
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">Rust 版本</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.rust_version}
-              </Typography>
-            </Grid>
-            <Grid item xs={12} sm={6} md={3}>
-              <Typography variant="body2" color="text.secondary">PowerFS 版本</Typography>
-              <Typography variant="body1" fontWeight="bold">
-                {latestResult.environment.powerfs_version}
-              </Typography>
-            </Grid>
-          </Grid>
-        </Paper>
+        <Card title="测试环境信息" style={{ marginBottom: 24 }}>
+          <Row gutter={[16, 16]}>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">CPU 型号</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.cpu_model}</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">CPU 核心数</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.cpu_cores} 核</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">内存</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.memory_gb.toFixed(1)} GB</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">节点数</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.node_count} 节点</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">操作系统</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.os_version}</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">Rust 版本</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.rust_version}</div>
+            </Col>
+            <Col xs={24} sm={12} md={6}>
+              <Typography.Text type="secondary">PowerFS 版本</Typography.Text>
+              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.powerfs_version}</div>
+            </Col>
+          </Row>
+        </Card>
       )}
 
-      {/* 历史测试结果表格 */}
-      <Paper sx={{ p: 4 }}>
-        <Typography variant="h6" gutterBottom>
-          历史测试结果
-        </Typography>
-        <TableContainer>
-          <Table>
-            <TableHead>
-              <TableRow>
-                <TableCell>测试 ID</TableCell>
-                <TableCell>时间</TableCell>
-                <TableCell>EC 吞吐量 (MB/s)</TableCell>
-                <TableCell>EC 延迟 (ms)</TableCell>
-                <TableCell>Raft 选举 (ms)</TableCell>
-                <TableCell>KV 命中率</TableCell>
-                <TableCell>持续时间</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {results.map((result) => (
-                <TableRow key={result.id} hover>
-                  <TableCell>
-                    <Tooltip title={result.id}>
-                      <Typography noWrap>{result.id.slice(0, 20)}...</Typography>
-                    </Tooltip>
-                  </TableCell>
-                  <TableCell>{formatTime(result.timestamp)}</TableCell>
-                  <TableCell>{result.metrics.ec_throughput_mbps.toFixed(1)}</TableCell>
-                  <TableCell>{result.metrics.ec_latency_ms.toFixed(2)}</TableCell>
-                  <TableCell>{result.metrics.raft_election_time_ms.toFixed(0)}</TableCell>
-                  <TableCell>{(result.metrics.kv_cache_hit_rate * 100).toFixed(1)}%</TableCell>
-                  <TableCell>{result.duration_seconds} 秒</TableCell>
-                </TableRow>
-              ))}
-              {results.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={7} align="center">
-                    {isLoading ? (
-                      <CircularProgress size={24} />
-                    ) : (
-                      <Typography color="text.secondary">暂无测试结果</Typography>
-                    )}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </TableContainer>
-      </Paper>
+      <Card title="历史测试结果">
+        <Table
+          dataSource={results}
+          columns={resultColumns}
+          rowKey="id"
+          pagination={{ pageSize: 10 }}
+        />
+      </Card>
     </div>
   );
 };
