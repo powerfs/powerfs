@@ -23,6 +23,10 @@ pub struct BuildInfo {
     pub git_branch: &'static str,
     /// Build timestamp in UTC RFC3339.
     pub build_time: &'static str,
+    /// Unique build identifier (timestamp + pid, or the value exported by
+    /// the build wrapper via `POWERFS_BUILD_ID`). Lets two binaries produced
+    /// by the same commit be distinguished.
+    pub build_id: &'static str,
     /// Build host name.
     pub build_host: &'static str,
     /// Rustc version string.
@@ -43,6 +47,7 @@ impl BuildInfo {
             git_commit: env!("GIT_COMMIT"),
             git_branch: env!("GIT_BRANCH"),
             build_time: env!("BUILD_TIME"),
+            build_id: env!("POWERFS_BUILD_ID"),
             build_host: env!("BUILD_HOST"),
             rustc_version: env!("RUSTC_VERSION"),
         }
@@ -59,6 +64,7 @@ impl BuildInfo {
             self.git_branch
         );
         log::info!("  Build Time:   {}", self.build_time);
+        log::info!("  Build ID:     {}", self.build_id);
         log::info!("  Build Host:   {}", self.build_host);
         log::info!("  Rustc:        {}", self.rustc_version);
         log::info!("================================");
@@ -93,6 +99,18 @@ mod tests {
             info.build_time.contains('T'),
             "build_time should be RFC3339, got: {}",
             info.build_time
+        );
+    }
+
+    #[test]
+    fn build_info_current_has_non_empty_build_id() {
+        let info = BuildInfo::current("test-crate", "0.0.0-test");
+        // build_id is either the value exported by the build wrapper or a
+        // timestamp+pid fallback; it must never be empty.
+        assert!(
+            !info.build_id.is_empty(),
+            "build_id should not be empty, got: {:?}",
+            info.build_id
         );
     }
 }

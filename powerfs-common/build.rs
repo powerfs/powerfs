@@ -7,6 +7,21 @@
 use std::process::Command;
 
 fn main() {
+    let now = chrono::Utc::now();
+
+    // Build identifier — unique per build invocation. Prefer the value
+    // exported by the build wrapper (scripts/build.sh) so CI/deploys can
+    // force build.rs to re-run and stamp a fresh id even on incremental
+    // builds. Fall back to a timestamp+pid derived id for direct `cargo build`.
+    let build_id = std::env::var("POWERFS_BUILD_ID").unwrap_or_else(|_| {
+        let ts = now
+            .timestamp_nanos_opt()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| now.timestamp().to_string());
+        format!("{}-{}", ts, std::process::id())
+    });
+    println!("cargo:rustc-env=POWERFS_BUILD_ID={}", build_id);
+
     // Git commit hash (short form for readability)
     let commit = run_command("git", &["rev-parse", "--short", "HEAD"])
         .unwrap_or_else(|| "unknown".to_string());
@@ -19,7 +34,6 @@ fn main() {
 
     // Build timestamp in UTC RFC3339 (workspace-wide, same for all crates
     // built in the same `cargo build` invocation).
-    let now = chrono::Utc::now();
     println!("cargo:rustc-env=BUILD_TIME={}", now.to_rfc3339());
 
     // Build host: prefer HOSTNAME (Linux), fall back to COMPUTERNAME (Windows),
@@ -34,10 +48,13 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RUSTC_VERSION={}", rustc);
 
-    // Re-run build.rs only when these env vars change or when Cargo.toml
-    // changes. We intentionally do NOT add `cargo:rerun-if-changed=.git/HEAD`
-    // because `.git` may not exist (e.g. in Docker builds without VCS history)
-    // and that emits a noisy warning. Build info updates on every clean build.
+    // Re-run build.rs when POWERFS_BUILD_ID changes (the build wrapper
+    // scripts/build.sh exports a fresh value per invocation to force a new
+    // build id + timestamp on incremental builds) or when Cargo.toml changes.
+    // We intentionally do NOT add `cargo:rerun-if-changed=.git/HEAD` because
+    // `.git` may not exist (e.g. in Docker builds without VCS history) and
+    // that emits a noisy warning. Direct `cargo build` without the wrapper
+    // still gets a fresh id on clean builds via the timestamp fallback above.
     println!("cargo:rerun-if-env-changed=POWERFS_BUILD_ID");
     println!("cargo:rerun-if-changed=Cargo.toml");
 }

@@ -13,6 +13,7 @@ use powerfs_core::storage_backend::SpdkBackend;
 use powerfs_fuse::FuserApp;
 use powerfs_master::{
     master::MasterNode,
+    raft_storage::{RaftVerifyReport, RocksDbStorage},
     s3::directory_tree_api::{DirectoryTreeApi, RemoteDirectoryTree},
     s3::master_client::S3MasterClient,
     s3::MasterApi,
@@ -48,6 +49,16 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum RaftAction {
+    /// Inspect the Raft DB and report integrity without modifying anything.
+    Verify,
+    /// Delete corrupt log entries and re-normalize applied_index.
+    Repair,
+    /// Wipe the Raft directory and re-initialize as a fresh single node.
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -179,6 +190,21 @@ enum Commands {
         /// S3 secret key
         #[arg(long, default_value = "powerfs123")]
         secret_key: String,
+    },
+
+    /// Offline Raft maintenance: verify, repair, or reset the Raft log.
+    /// Use when the master cannot boot because of a damaged Raft DB.
+    Raft {
+        /// Raft directory (same path passed to `master --raft-dir` / `-r`).
+        #[arg(long, short = 'D')]
+        dir: String,
+
+        /// Raft node ID. Only used by `reset` to re-init as this single node.
+        #[arg(long, short = 'i', default_value = "1")]
+        raft_id: u64,
+
+        #[command(subcommand)]
+        action: RaftAction,
     },
 }
 
@@ -313,7 +339,91 @@ async fn main() -> Result<()> {
             access_key,
             secret_key,
         } => run_s3(port, &master, ip, &dir, &access_key, &secret_key).await,
+
+        Commands::Raft {
+            dir,
+            raft_id,
+            action,
+        } => run_raft(&dir, raft_id, action),
     }
+}
+
+/// Offline Raft maintenance entry point. Dispatches to `verify`/`repair`/`reset`
+/// on the master's Raft directory. Runs synchronously (no tokio runtime needed
+/// beyond the main one) and exits with an error if any operation fails.
+fn run_raft(dir: &str, raft_id: u64, action: RaftAction) -> Result<()> {
+    info!("Raft maintenance: dir={}, action={:?}, raft_id={}", dir, action, raft_id);
+
+    match action {
+        RaftAction::Verify => {
+            let report = RocksDbStorage::verify(dir);
+            print_verify_report(&report);
+            if !report.ok {
+                return Err(PowerFsError::Internal(format!(
+                    "raft verify reported issues: {} corrupt entries",
+                    report.corrupt_log_entries
+                )));
+            }
+        }
+        RaftAction::Repair => {
+            let report = RocksDbStorage::repair(dir).map_err(PowerFsError::Internal)?;
+            print_verify_report(&report);
+            info!(
+                "raft repair completed; re-verify ok={} (corrupt={})",
+                report.ok, report.corrupt_log_entries
+            );
+        }
+        RaftAction::Reset => {
+            RocksDbStorage::reset(dir, raft_id).map_err(PowerFsError::Internal)?;
+            info!("raft reset completed for node {}", raft_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Human-readable dump of a [`RaftVerifyReport`]. Used by both `verify` and
+/// `repair` so the operator sees consistent output.
+fn print_verify_report(report: &RaftVerifyReport) {
+    println!("==================== Raft Verify Report ====================");
+    println!("  Path:                 {}", report.path);
+    println!("  Exists:               {}", report.exists);
+    if let Some(err) = &report.error {
+        println!("  Open error:           {}", err);
+    }
+    if let Some((term, vote, commit)) = report.hard_state {
+        println!("  Hard state:           term={}, vote={}, commit={}", term, vote, commit);
+    } else {
+        println!("  Hard state:           <missing or unreadable>");
+    }
+    println!(
+        "  Conf state voters:    {:?}",
+        report.conf_state_voters
+    );
+    println!(
+        "  Applied index:        {:?}",
+        report.applied_index
+    );
+    println!(
+        "  Log entries:          total={}, valid={}, corrupt={}",
+        report.total_log_entries, report.valid_log_entries, report.corrupt_log_entries
+    );
+    println!(
+        "  Last valid index:     {:?}",
+        report.last_valid_index
+    );
+    println!(
+        "  Snapshot:             index={:?}, term={:?}",
+        report.snapshot_index, report.snapshot_term
+    );
+    if !report.corrupt_keys.is_empty() {
+        println!("  Corrupt keys (up to 50):");
+        for k in &report.corrupt_keys {
+            println!("    - {}", k);
+        }
+    }
+    println!("  OK:                   {}", report.ok);
+    println!("===========================================================");
 }
 
 struct RunMasterParams<'a> {

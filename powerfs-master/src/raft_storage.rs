@@ -3,7 +3,7 @@
 //! This module provides RocksDbStorage which implements the raft::Storage trait
 //! for persistent storage of Raft state and logs.
 
-use log::info;
+use log::{info, warn};
 use protobuf::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::storage::{RaftState, Storage};
@@ -256,17 +256,30 @@ impl RocksDbStorage {
         Ok(())
     }
 
-    /// Load hard state and conf state from RocksDB
+    /// Load hard state and conf state from RocksDB.
+    ///
+    /// This is best-effort: corrupt or missing state is logged and skipped
+    /// rather than propagated as an error, so a partially-damaged Raft DB can
+    /// still boot (and then be repaired via the `Raft` CLI subcommand) instead
+    /// of bricking the master on startup.
     fn load_state(&self) -> Result<(), String> {
-        // Load hard state
-        let cf = self
-            .db
-            .cf_handle(CF_RAFT_STATE)
-            .ok_or("column family not found")?;
+        // Load hard state. If the state CF is missing (freshly created or
+        // corrupted DB), fall back to in-memory defaults instead of aborting.
+        let cf = match self.db.cf_handle(CF_RAFT_STATE) {
+            Some(cf) => cf,
+            None => {
+                warn!(
+                    "raft_state column family not found; using default hard/conf state"
+                );
+                return Ok(());
+            }
+        };
         if let Ok(Some(data)) = self.db.get_cf(cf, b"hard_state") {
             if let Ok(hs) = <HardState as Message>::parse_from_bytes(&data) {
                 *self.hard_state.write().unwrap() = hs.clone();
                 info!("Loaded hard state: term={}, commit={}", hs.term, hs.commit);
+            } else {
+                warn!("Failed to parse hard_state; keeping default");
             }
         }
 
@@ -275,6 +288,8 @@ impl RocksDbStorage {
             if let Ok(cs) = <ConfState as Message>::parse_from_bytes(&data) {
                 *self.conf_state.write().unwrap() = cs.clone();
                 info!("Loaded conf state: voters={:?}", cs.voters);
+            } else {
+                warn!("Failed to parse conf_state; keeping default");
             }
         }
 
@@ -287,30 +302,52 @@ impl RocksDbStorage {
             }
         }
 
-        // Load log entries
-        let log_cf = self
-            .db
-            .cf_handle(CF_RAFT_LOG)
-            .ok_or("column family not found")?;
+        // Load log entries. Missing CF → no entries to load; skip silently.
+        let log_cf = match self.db.cf_handle(CF_RAFT_LOG) {
+            Some(cf) => cf,
+            None => {
+                warn!(
+                    "raft_log column family not found; starting with empty log"
+                );
+                return Ok(());
+            }
+        };
         let mut entries = self.entries.write().unwrap();
 
-        // Use iterator to load all entries
+        // Use iterator to load all entries. Skip any entry whose key/value
+        // fails to parse (corrupt UTF-8 key, bad protobuf, or index mismatch)
+        // instead of failing the whole load.
         let mut it = self.db.raw_iterator_cf(log_cf);
         it.seek_to_first();
 
+        let mut skipped = 0u64;
         while it.valid() {
             if let (Some(key), Some(value)) = (it.key(), it.value()) {
-                if let Ok(entry) = <Entry as Message>::parse_from_bytes(value) {
-                    // Verify index matches key
-                    let key_str = String::from_utf8(key.to_vec()).map_err(|e| e.to_string())?;
-                    if let Ok(idx) = key_str.parse::<u64>() {
+                let parsed = <Entry as Message>::parse_from_bytes(value)
+                    .ok()
+                    .and_then(|entry| {
+                        let key_str = String::from_utf8(key.to_vec()).ok()?;
+                        let idx = key_str.parse::<u64>().ok()?;
                         if idx == entry.index {
-                            entries.push_back(entry);
+                            Some(entry)
+                        } else {
+                            None
                         }
-                    }
+                    });
+                match parsed {
+                    Some(entry) => entries.push_back(entry),
+                    None => skipped += 1,
                 }
             }
             it.next();
+        }
+
+        if skipped > 0 {
+            warn!(
+                "Skipped {} corrupt/unreadable raft log entries during load_state \
+                 (use `powerfs raft verify` to inspect, `powerfs raft repair` to clean)",
+                skipped
+            );
         }
 
         info!("Loaded {} log entries", entries.len());
@@ -477,6 +514,240 @@ impl RocksDbStorage {
         }
         None
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Offline maintenance: verify / repair / reset.
+    //
+    // These associated functions open the Raft DB directly (bypassing
+    // `new_with_peers`, which runs the best-effort `load_state` and would
+    // mask corruption). They back the `powerfs raft` CLI subcommand for
+    // recovering a master that cannot boot because of a damaged Raft log.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Open an existing Raft DB without creating it. Missing column families
+    /// are created empty so a partially-initialized DB can still be inspected.
+    fn open_existing(path: &str) -> Result<DB, String> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(false);
+        opts.create_missing_column_families(true);
+        let cf_descriptors = vec![
+            ColumnFamilyDescriptor::new(CF_RAFT_LOG, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_RAFT_STATE, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_SNAPSHOT, rocksdb::Options::default()),
+        ];
+        DB::open_cf_descriptors(&opts, path, cf_descriptors)
+            .map_err(|e| format!("failed to open rocksdb at {}: {}", path, e))
+    }
+
+    /// Read-only integrity report. Does not modify the DB.
+    pub fn verify(path: &str) -> RaftVerifyReport {
+        let mut report = RaftVerifyReport {
+            path: path.to_string(),
+            exists: false,
+            hard_state: None,
+            conf_state_voters: Vec::new(),
+            applied_index: None,
+            total_log_entries: 0,
+            valid_log_entries: 0,
+            corrupt_log_entries: 0,
+            corrupt_keys: Vec::new(),
+            last_valid_index: None,
+            snapshot_index: None,
+            snapshot_term: None,
+            ok: false,
+            error: None,
+        };
+
+        let db = match Self::open_existing(path) {
+            Ok(db) => db,
+            Err(e) => {
+                warn!("verify: {}", e);
+                report.error = Some(e);
+                return report;
+            }
+        };
+        report.exists = true;
+
+        if let Some(cf) = db.cf_handle(CF_RAFT_STATE) {
+            if let Ok(Some(data)) = db.get_cf(cf, b"hard_state") {
+                if let Ok(hs) = <HardState as Message>::parse_from_bytes(&data) {
+                    report.hard_state = Some((hs.term, hs.vote, hs.commit));
+                }
+            }
+            if let Ok(Some(data)) = db.get_cf(cf, b"conf_state") {
+                if let Ok(cs) = <ConfState as Message>::parse_from_bytes(&data) {
+                    report.conf_state_voters = cs.voters.clone();
+                }
+            }
+            if let Ok(Some(data)) = db.get_cf(cf, b"applied_index") {
+                if let Ok(s) = String::from_utf8(data) {
+                    if let Ok(idx) = s.parse::<u64>() {
+                        report.applied_index = Some(idx);
+                    }
+                }
+            }
+        }
+
+        if let Some(cf) = db.cf_handle(CF_SNAPSHOT) {
+            if let Ok(Some(data)) = db.get_cf(cf, b"latest_snapshot") {
+                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                    report.snapshot_index = Some(snap.get_metadata().index);
+                    report.snapshot_term = Some(snap.get_metadata().term);
+                }
+            }
+        }
+
+        if let Some(log_cf) = db.cf_handle(CF_RAFT_LOG) {
+            let mut it = db.raw_iterator_cf(log_cf);
+            it.seek_to_first();
+            while it.valid() {
+                if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                    report.total_log_entries += 1;
+                    let parsed = <Entry as Message>::parse_from_bytes(value)
+                        .ok()
+                        .and_then(|entry| {
+                            let key_str = String::from_utf8(key.to_vec()).ok()?;
+                            let idx = key_str.parse::<u64>().ok()?;
+                            if idx == entry.index {
+                                Some(entry)
+                            } else {
+                                None
+                            }
+                        });
+                    match parsed {
+                        Some(entry) => {
+                            report.valid_log_entries += 1;
+                            report.last_valid_index = Some(entry.index);
+                        }
+                        None => {
+                            report.corrupt_log_entries += 1;
+                            if report.corrupt_keys.len() < 50 {
+                                let key_disp = String::from_utf8(key.to_vec())
+                                    .unwrap_or_else(|_| format!("{:?}", key));
+                                report.corrupt_keys.push(key_disp);
+                            }
+                        }
+                    }
+                }
+                it.next();
+            }
+        }
+
+        report.ok = report.corrupt_log_entries == 0 && report.hard_state.is_some();
+        report
+    }
+
+    /// Delete corrupt/unreadable log entries and re-normalize `applied_index`
+    /// so the master can boot. Returns the post-repair verify report.
+    pub fn repair(path: &str) -> Result<RaftVerifyReport, String> {
+        let db = Self::open_existing(path)?;
+        let log_cf = db
+            .cf_handle(CF_RAFT_LOG)
+            .ok_or_else(|| "raft_log CF not found after open".to_string())?;
+
+        // First pass: collect keys of corrupt entries (iterator borrows the
+        // DB, so we cannot delete while iterating).
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut last_valid: Option<u64> = None;
+        {
+            let mut it = db.raw_iterator_cf(log_cf);
+            it.seek_to_first();
+            while it.valid() {
+                if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                    let valid = <Entry as Message>::parse_from_bytes(value)
+                        .ok()
+                        .and_then(|entry| {
+                            let key_str = String::from_utf8(key.to_vec()).ok()?;
+                            let idx = key_str.parse::<u64>().ok()?;
+                            if idx == entry.index {
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        });
+                    match valid {
+                        Some(idx) => last_valid = Some(idx),
+                        None => to_delete.push(key.to_vec()),
+                    }
+                }
+                it.next();
+            }
+        }
+
+        let removed = to_delete.len();
+        for key in &to_delete {
+            let _ = db.delete_cf(log_cf, key);
+        }
+
+        // Re-normalize applied_index: cap it at the last valid entry index so
+        // the raft node does not try to apply entries that no longer exist.
+        if let Some(cf) = db.cf_handle(CF_RAFT_STATE) {
+            if let Ok(Some(data)) = db.get_cf(cf, b"applied_index") {
+                if let Ok(s) = String::from_utf8(data) {
+                    if let Ok(idx) = s.parse::<u64>() {
+                        let capped = last_valid.map_or(0, |last| idx.min(last));
+                        if capped != idx {
+                            let _ = db.put_cf(cf, b"applied_index", capped.to_string().as_bytes());
+                            info!(
+                                "repair: capped applied_index {} -> {} (last valid entry)",
+                                idx, capped
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("repair: removed {} corrupt entries from {}", removed, path);
+        drop(db);
+
+        Ok(Self::verify(path))
+    }
+
+    /// Wipe the entire Raft directory and re-initialize it as a fresh
+    /// single-node store. Use only when `repair` cannot recover the DB —
+    /// all Raft log/snapshot state is lost. The meta DB is untouched.
+    pub fn reset(path: &str, node_id: u64) -> Result<(), String> {
+        let p = std::path::Path::new(path);
+        if p.exists() {
+            std::fs::remove_dir_all(p)
+                .map_err(|e| format!("failed to remove raft dir {}: {}", path, e))?;
+            warn!("reset: removed existing raft dir {}", path);
+        }
+        // Re-initialize as a fresh single-node store (writes initial state).
+        let _ = Self::new_with_single_node(path, node_id)?;
+        info!(
+            "reset: re-initialized raft dir {} as single node {}",
+            path, node_id
+        );
+        Ok(())
+    }
+}
+
+/// Integrity report for a Raft DB, produced by [`RocksDbStorage::verify`] and
+/// [`RocksDbStorage::repair`]. Serialized by the CLI for human-readable output.
+#[derive(Debug, Clone, Serialize)]
+pub struct RaftVerifyReport {
+    pub path: String,
+    /// Whether the DB directory could be opened at all.
+    pub exists: bool,
+    /// (term, vote, commit) of the persisted hard state, if parseable.
+    pub hard_state: Option<(u64, u64, u64)>,
+    pub conf_state_voters: Vec<u64>,
+    pub applied_index: Option<u64>,
+    pub total_log_entries: u64,
+    pub valid_log_entries: u64,
+    pub corrupt_log_entries: u64,
+    /// Up to 50 keys of corrupt entries (for diagnostics).
+    pub corrupt_keys: Vec<String>,
+    pub last_valid_index: Option<u64>,
+    pub snapshot_index: Option<u64>,
+    pub snapshot_term: Option<u64>,
+    /// True when no corruption was found and hard_state is readable.
+    pub ok: bool,
+    /// Open error message, if the DB could not be opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl Storage for RocksDbStorage {
