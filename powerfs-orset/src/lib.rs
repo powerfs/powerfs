@@ -28,6 +28,10 @@ pub enum FileType {
     RegularFile,
     Directory,
     Symlink,
+    Fifo,
+    CharDevice,
+    BlockDevice,
+    Socket,
 }
 
 impl FileType {
@@ -45,6 +49,10 @@ impl FileType {
             FileType::RegularFile => libc::DT_REG as u32,
             FileType::Directory => libc::DT_DIR as u32,
             FileType::Symlink => libc::DT_LNK as u32,
+            FileType::Fifo => libc::DT_FIFO as u32,
+            FileType::CharDevice => libc::DT_CHR as u32,
+            FileType::BlockDevice => libc::DT_BLK as u32,
+            FileType::Socket => libc::DT_SOCK as u32,
         }
     }
 
@@ -53,6 +61,10 @@ impl FileType {
         match mode & libc::S_IFMT {
             m if m == libc::S_IFDIR => FileType::Directory,
             m if m == libc::S_IFLNK => FileType::Symlink,
+            m if m == libc::S_IFIFO => FileType::Fifo,
+            m if m == libc::S_IFCHR => FileType::CharDevice,
+            m if m == libc::S_IFBLK => FileType::BlockDevice,
+            m if m == libc::S_IFSOCK => FileType::Socket,
             _ => FileType::RegularFile,
         }
     }
@@ -103,10 +115,14 @@ pub struct DirEntry {
     pub generation: u64,
     pub file_type: FileType,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
     pub mtime: u64,
     pub atime: u64,
     pub ctime: u64,
+    pub nlink: u32,
+    pub rdev: u64,
     pub parent_ino: u64,
     pub chunks: Vec<CachedFileChunk>,
     pub symlink_target: Option<String>,
@@ -121,10 +137,14 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::RegularFile,
             mode,
+            uid: 0,
+            gid: 0,
             size: 0,
             mtime: now,
             atime: now,
             ctime: now,
+            nlink: 1,
+            rdev: 0,
             parent_ino,
             chunks: vec![],
             symlink_target: None,
@@ -139,10 +159,14 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::Directory,
             mode,
+            uid: 0,
+            gid: 0,
             size: 0,
             mtime: now,
             atime: now,
             ctime: now,
+            nlink: 2,
+            rdev: 0,
             parent_ino,
             chunks: vec![],
             symlink_target: None,
@@ -163,13 +187,117 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::Symlink,
             mode,
+            uid: 0,
+            gid: 0,
             size: 0,
             mtime: now,
             atime: now,
             ctime: now,
+            nlink: 1,
+            rdev: 0,
             parent_ino,
             chunks: vec![],
             symlink_target: Some(target),
+        }
+    }
+
+    pub fn new_fifo(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            generation: 0,
+            file_type: FileType::Fifo,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            nlink: 1,
+            rdev: 0,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
+        }
+    }
+
+    pub fn new_chrdev(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        rdev: u64,
+    ) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            generation: 0,
+            file_type: FileType::CharDevice,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            nlink: 1,
+            rdev,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
+        }
+    }
+
+    pub fn new_blkdev(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        rdev: u64,
+    ) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            generation: 0,
+            file_type: FileType::BlockDevice,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            nlink: 1,
+            rdev,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
+        }
+    }
+
+    pub fn new_socket(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+        let now = now_unix();
+        Self {
+            id,
+            inode,
+            generation: 0,
+            file_type: FileType::Socket,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            nlink: 1,
+            rdev: 0,
+            parent_ino,
+            chunks: vec![],
+            symlink_target: None,
         }
     }
 
@@ -387,8 +515,11 @@ pub enum DeltaOp {
     SetAttr {
         inode: u64,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         mtime: Option<u64>,
+        nlink: Option<u32>,
         vclock: VectorClock,
     },
 }
@@ -489,8 +620,11 @@ impl DirORSet {
         &mut self,
         inode: u64,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         mtime: Option<u64>,
+        nlink: Option<u32>,
         client_id: u64,
     ) {
         self.vclock.increment(client_id);
@@ -500,19 +634,31 @@ impl DirORSet {
             if let Some(m) = mode {
                 entry.mode = m;
             }
+            if let Some(u) = uid {
+                entry.uid = u;
+            }
+            if let Some(g) = gid {
+                entry.gid = g;
+            }
             if let Some(s) = size {
                 entry.size = s;
             }
             if let Some(t) = mtime {
                 entry.mtime = t;
             }
+            if let Some(n) = nlink {
+                entry.nlink = n;
+            }
         }
 
         self.delta_log.push(DeltaOp::SetAttr {
             inode,
             mode,
+            uid,
+            gid,
             size,
             mtime,
+            nlink,
             vclock,
         });
     }
@@ -587,8 +733,11 @@ impl DirORSet {
             DeltaOp::SetAttr {
                 inode,
                 mode,
+                uid,
+                gid,
                 size,
                 mtime,
+                nlink,
                 vclock,
             } => {
                 self.detect_write_write_conflict(*inode, vclock);
@@ -596,11 +745,20 @@ impl DirORSet {
                     if let Some(m) = mode {
                         entry.mode = *m;
                     }
+                    if let Some(u) = uid {
+                        entry.uid = *u;
+                    }
+                    if let Some(g) = gid {
+                        entry.gid = *g;
+                    }
                     if let Some(s) = size {
                         entry.size = *s;
                     }
                     if let Some(t) = mtime {
                         entry.mtime = *t;
+                    }
+                    if let Some(n) = nlink {
+                        entry.nlink = *n;
                     }
                 }
                 self.vclock.merge(vclock);
@@ -1342,8 +1500,11 @@ mod tests {
         let delta = DeltaOp::SetAttr {
             inode: 100,
             mode: Some(0o600 | libc::S_IFREG),
+            uid: None,
+            gid: None,
             size: Some(1024),
             mtime: Some(99999),
+            nlink: None,
             vclock: vc,
         };
 
@@ -1457,15 +1618,21 @@ mod tests {
         orset.apply_delta(&DeltaOp::SetAttr {
             inode: 100,
             mode: None,
+            uid: None,
+            gid: None,
             size: Some(100),
             mtime: Some(1000),
+            nlink: None,
             vclock: vc1,
         });
         orset.apply_delta(&DeltaOp::SetAttr {
             inode: 100,
             mode: None,
+            uid: None,
+            gid: None,
             size: Some(200),
             mtime: Some(2000),
+            nlink: None,
             vclock: vc2,
         });
 
@@ -1490,8 +1657,11 @@ mod tests {
         orset.apply_delta(&DeltaOp::SetAttr {
             inode: 100,
             mode: None,
+            uid: None,
+            gid: None,
             size: Some(100),
             mtime: Some(1000),
+            nlink: None,
             vclock: vc1,
         });
         orset.apply_delta(&DeltaOp::Remove { id, vclock: vc2 });
@@ -1868,8 +2038,11 @@ mod tests {
         orset.apply_delta(&DeltaOp::SetAttr {
             inode: 100,
             mode: None,
+            uid: None,
+            gid: None,
             size: Some(100),
             mtime: Some(1000),
+            nlink: None,
             vclock: vc1,
         });
         orset.apply_delta(&DeltaOp::Remove { id, vclock: vc2 });
@@ -1896,8 +2069,11 @@ mod tests {
         orset.apply_delta(&DeltaOp::SetAttr {
             inode: 100,
             mode: None,
+            uid: None,
+            gid: None,
             size: Some(100),
             mtime: Some(1000),
+            nlink: None,
             vclock: vc1,
         });
         orset.apply_delta(&DeltaOp::Remove { id, vclock: vc2 });

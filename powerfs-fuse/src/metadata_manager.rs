@@ -402,6 +402,91 @@ impl MetadataManager {
         Ok(entry)
     }
 
+    /// 创建特殊文件（mknod）
+    pub fn mknod(
+        &self,
+        dir_ino: u64,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<DirEntry, FsError> {
+        let inode = self.inode_allocator.allocate();
+        let seq = self.next_seq();
+        let entry_id = EntryId::new(name, self.client_id, seq);
+        let file_type = FileType::from_mode(mode);
+        let entry = match file_type {
+            FileType::Fifo => DirEntry::new_fifo(entry_id, inode, dir_ino, mode),
+            FileType::CharDevice => DirEntry::new_chrdev(entry_id, inode, dir_ino, mode, rdev),
+            FileType::BlockDevice => DirEntry::new_blkdev(entry_id, inode, dir_ino, mode, rdev),
+            FileType::Socket => DirEntry::new_socket(entry_id, inode, dir_ino, mode),
+            _ => DirEntry::new_file(entry_id, inode, dir_ino, mode),
+        };
+
+        self.apply_to_local_orset(dir_ino, entry.clone())?;
+
+        // best-effort 同步到 Master（使用变更缓存）
+        self.add_change(ChangeOp::Create(entry.clone()));
+
+        Ok(entry)
+    }
+
+    /// 创建硬链接（link）
+    pub fn link(
+        &self,
+        inode: u64,
+        new_dir: u64,
+        new_name: &str,
+    ) -> Result<DirEntry, FsError> {
+        let (old_dir_ino, old_entry_id) = {
+            let index = self.inode_index.read().unwrap();
+            index
+                .get(&inode)
+                .cloned()
+                .ok_or_else(|| FsError::NotFound(format!("link: inode {} not found", inode)))?
+        };
+
+        let old_entry = {
+            let orset_arc = self.ensure_dir_cache(old_dir_ino);
+            let orset = orset_arc.read().unwrap();
+            orset
+                .entries
+                .get(&old_entry_id)
+                .cloned()
+                .ok_or_else(|| FsError::NotFound(format!("link: entry {:?} not found", old_entry_id)))?
+        };
+
+        if old_entry.file_type == FileType::Directory {
+            return Err(FsError::IsDirectory(format!(
+                "link: cannot link directory {}",
+                new_name
+            )));
+        }
+
+        let seq = self.next_seq();
+        let new_entry_id = EntryId::new(new_name, self.client_id, seq);
+        let mut new_entry = old_entry.clone();
+        new_entry.id = new_entry_id;
+        new_entry.parent_ino = new_dir;
+        new_entry.nlink += 1;
+        new_entry.mtime = now_unix();
+
+        let old_entry_for_update = new_entry.clone();
+
+        {
+            let orset_arc = self.ensure_dir_cache(old_dir_ino);
+            let mut orset = orset_arc.write().unwrap();
+            if let Some(entry) = orset.entries.get_mut(&old_entry_id) {
+                entry.nlink = old_entry_for_update.nlink;
+            }
+        }
+
+        self.apply_to_local_orset(new_dir, new_entry.clone())?;
+
+        self.add_change(ChangeOp::Create(new_entry.clone()));
+
+        Ok(new_entry)
+    }
+
     /// 删除文件（unlink）
     ///
     /// 1. 从本地 OR-Set 查找并移除
@@ -677,6 +762,8 @@ impl MetadataManager {
         &self,
         ino: u64,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         mtime: Option<u64>,
     ) -> Result<DirEntry, FsError> {
@@ -700,6 +787,12 @@ impl MetadataManager {
 
         if let Some(m) = mode {
             entry.mode = m;
+        }
+        if let Some(u) = uid {
+            entry.uid = u;
+        }
+        if let Some(g) = gid {
+            entry.gid = g;
         }
         if let Some(s) = size {
             entry.size = s;
@@ -912,10 +1005,14 @@ impl MetadataManager {
             generation: 0,
             file_type: FileType::Directory,
             mode: 0o755 | libc::S_IFDIR,
+            uid: 0,
+            gid: 0,
             size: 4096,
             mtime: now,
             atime: now,
             ctime: now,
+            nlink: 2,
+            rdev: 0,
             parent_ino: ROOT_INO,
             chunks: vec![],
             symlink_target: None,
@@ -1497,6 +1594,10 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
     let mtime = attrs.map(|a| a.mtime).unwrap_or(0);
     let atime = attrs.map(|a| a.atime).unwrap_or(0);
     let ctime = attrs.map(|a| a.ctime).unwrap_or(0);
+    let uid = attrs.map(|a| a.uid).unwrap_or(0);
+    let gid = attrs.map(|a| a.gid).unwrap_or(0);
+    let nlink = attrs.map(|a| a.nlink).unwrap_or(1);
+    let rdev = attrs.map(|a| a.rdev as u64).unwrap_or(0);
 
     let file_type = FileType::from_mode(mode_val);
     let chunks: Vec<crate::orset::CachedFileChunk> = proto
@@ -1518,10 +1619,14 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
         generation: 0,
         file_type,
         mode: mode_val,
+        uid,
+        gid,
         size,
         mtime,
         atime,
         ctime,
+        nlink,
+        rdev,
         parent_ino,
         chunks,
         symlink_target: if proto.symlink_target.is_empty() {
@@ -1537,12 +1642,6 @@ pub fn dir_entry_to_proto(
     entry: &DirEntry,
     parent_path: &str,
 ) -> powerfs_master::proto::powerfs::Entry {
-    let nlink = if entry.file_type == FileType::Directory {
-        2u32
-    } else {
-        1u32
-    };
-
     let chunks: Vec<powerfs_master::proto::powerfs::FileChunk> = entry
         .chunks
         .iter()
@@ -1562,10 +1661,10 @@ pub fn dir_entry_to_proto(
         attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
             ino: entry.inode,
             mode: entry.mode,
-            nlink,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
+            nlink: entry.nlink,
+            uid: entry.uid,
+            gid: entry.gid,
+            rdev: entry.rdev,
             size: entry.size,
             blksize: 4096,
             blocks: entry.size.div_ceil(512),
@@ -1599,6 +1698,10 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         0 => FileType::RegularFile,
         1 => FileType::Directory,
         2 => FileType::Symlink,
+        3 => FileType::Fifo,
+        4 => FileType::CharDevice,
+        5 => FileType::BlockDevice,
+        6 => FileType::Socket,
         _ => FileType::RegularFile,
     };
 
@@ -1608,10 +1711,14 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         generation: 0,
         file_type,
         mode: entry.mode,
+        uid: 0,
+        gid: 0,
         size: entry.size,
         mtime: entry.mtime,
         atime: entry.atime,
         ctime: entry.ctime,
+        nlink: entry.nlink,
+        rdev: 0,
         parent_ino: entry.parent_ino,
         chunks: vec![],
         symlink_target: if entry.symlink_target.is_empty() {

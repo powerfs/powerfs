@@ -505,11 +505,53 @@ impl DirectoryTree {
         let client_id_num: u64 = client_id.parse().unwrap_or(0);
         let mut orset = self.orset.write().unwrap();
         let entry_id = powerfs_orset::EntryId::new(entry.name.clone(), client_id_num, 0);
-        let dir_entry = if (mode_val & 0o40000) != 0 {
+        let file_type_bits = mode_val & 0o170000;
+        let mut dir_entry = if file_type_bits == 0o40000 {
             powerfs_orset::DirEntry::new_dir(entry_id, inode, parent_ino, mode_val)
+        } else if file_type_bits == 0o120000 {
+            powerfs_orset::DirEntry::new_symlink(
+                entry_id,
+                inode,
+                parent_ino,
+                mode_val,
+                entry.symlink_target.clone(),
+            )
+        } else if file_type_bits == 0o10000 {
+            powerfs_orset::DirEntry::new_fifo(entry_id, inode, parent_ino, mode_val)
+        } else if file_type_bits == 0o20000 {
+            let rdev = entry.attributes.as_ref().map(|a| a.rdev).unwrap_or(0);
+            powerfs_orset::DirEntry::new_chrdev(entry_id, inode, parent_ino, mode_val, rdev)
+        } else if file_type_bits == 0o60000 {
+            let rdev = entry.attributes.as_ref().map(|a| a.rdev).unwrap_or(0);
+            powerfs_orset::DirEntry::new_blkdev(entry_id, inode, parent_ino, mode_val, rdev)
+        } else if file_type_bits == 0o140000 {
+            powerfs_orset::DirEntry::new_socket(entry_id, inode, parent_ino, mode_val)
         } else {
             powerfs_orset::DirEntry::new_file(entry_id, inode, parent_ino, mode_val)
         };
+
+        // 保留客户端传来的 uid/gid/nlink/rdev
+        if let Some(attrs) = entry.attributes.as_ref() {
+            dir_entry.uid = attrs.uid;
+            dir_entry.gid = attrs.gid;
+            if attrs.nlink > 0 {
+                dir_entry.nlink = attrs.nlink;
+            }
+            dir_entry.rdev = attrs.rdev;
+            if attrs.size > 0 {
+                dir_entry.size = attrs.size;
+            }
+            if attrs.mtime > 0 {
+                dir_entry.mtime = attrs.mtime;
+            }
+            if attrs.atime > 0 {
+                dir_entry.atime = attrs.atime;
+            }
+            if attrs.ctime > 0 {
+                dir_entry.ctime = attrs.ctime;
+            }
+        }
+
         orset.add(dir_entry);
 
         Ok(inode)
@@ -632,9 +674,14 @@ impl DirectoryTree {
         let client_id_num: u64 = client_id.parse().unwrap_or(0);
         let mut orset = self.orset.write().unwrap();
         let mode_val = entry.attributes.as_ref().map(|a| a.mode);
+        let uid_val = entry.attributes.as_ref().map(|a| a.uid);
+        let gid_val = entry.attributes.as_ref().map(|a| a.gid);
         let size_val = Some(final_size);
         let mtime_val = entry.attributes.as_ref().map(|a| a.mtime);
-        orset.update_attr(ino, mode_val, size_val, mtime_val, client_id_num);
+        let nlink_val = entry.attributes.as_ref().map(|a| a.nlink);
+        orset.update_attr(
+            ino, mode_val, uid_val, gid_val, size_val, mtime_val, nlink_val, client_id_num,
+        );
 
         Ok(final_size)
     }
@@ -1246,6 +1293,11 @@ impl DirectoryTree {
                     let file_type = match entry.file_type {
                         0 => powerfs_orset::FileType::RegularFile,
                         1 => powerfs_orset::FileType::Directory,
+                        2 => powerfs_orset::FileType::Symlink,
+                        3 => powerfs_orset::FileType::Fifo,
+                        4 => powerfs_orset::FileType::CharDevice,
+                        5 => powerfs_orset::FileType::BlockDevice,
+                        6 => powerfs_orset::FileType::Socket,
                         _ => powerfs_orset::FileType::RegularFile,
                     };
                     let dir_entry = powerfs_orset::DirEntry {
@@ -1254,10 +1306,14 @@ impl DirectoryTree {
                         generation: 0,
                         file_type,
                         mode: entry.mode,
+                        uid: 0,
+                        gid: 0,
                         size: entry.size,
                         mtime: entry.mtime,
                         atime: entry.atime,
                         ctime: entry.ctime,
+                        nlink: entry.nlink,
+                        rdev: 0,
                         parent_ino: entry.parent_ino,
                         chunks: Vec::new(),
                         symlink_target: if entry.symlink_target.is_empty() {
@@ -1297,10 +1353,14 @@ impl DirectoryTree {
                             generation: 0,
                             file_type: powerfs_orset::FileType::RegularFile,
                             mode: entry.mode,
+                            uid: 0,
+                            gid: 0,
                             size: entry.size,
                             mtime: entry.mtime,
                             atime: entry.atime,
                             ctime: entry.ctime,
+                            nlink: entry.nlink,
+                            rdev: 0,
                             parent_ino: entry.parent_ino,
                             chunks: Vec::new(),
                             symlink_target: None,
@@ -1318,8 +1378,11 @@ impl DirectoryTree {
                     Some(powerfs_orset::DeltaOp::SetAttr {
                         inode: op.inode,
                         mode: if op.mode > 0 { Some(op.mode) } else { None },
+                        uid: if op.uid > 0 { Some(op.uid) } else { None },
+                        gid: if op.gid > 0 { Some(op.gid) } else { None },
                         size: if op.size > 0 { Some(op.size) } else { None },
                         mtime: if op.mtime > 0 { Some(op.mtime) } else { None },
+                        nlink: if op.nlink > 0 { Some(op.nlink) } else { None },
                         vclock: powerfs_orset::VectorClock::new(),
                     })
                 }
@@ -1600,6 +1663,10 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 powerfs_orset::FileType::RegularFile => 0,
                 powerfs_orset::FileType::Directory => 1,
                 powerfs_orset::FileType::Symlink => 2,
+                powerfs_orset::FileType::Fifo => 3,
+                powerfs_orset::FileType::CharDevice => 4,
+                powerfs_orset::FileType::BlockDevice => 5,
+                powerfs_orset::FileType::Socket => 6,
             };
             Some(crate::proto::powerfs::delta_op::Op::Add(
                 crate::proto::powerfs::DirEntryOrset {
@@ -1615,9 +1682,12 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                     mtime: entry.mtime,
                     atime: entry.atime,
                     ctime: entry.ctime,
-                    nlink: if entry.file_type.is_dir() { 2 } else { 1 },
+                    nlink: entry.nlink,
                     symlink_target: entry.symlink_target.clone().unwrap_or_default(),
                     file_type: file_type_val,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    rdev: entry.rdev,
                 },
             ))
         }
@@ -1635,6 +1705,10 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 powerfs_orset::FileType::RegularFile => 0,
                 powerfs_orset::FileType::Directory => 1,
                 powerfs_orset::FileType::Symlink => 2,
+                powerfs_orset::FileType::Fifo => 3,
+                powerfs_orset::FileType::CharDevice => 4,
+                powerfs_orset::FileType::BlockDevice => 5,
+                powerfs_orset::FileType::Socket => 6,
             };
             Some(crate::proto::powerfs::delta_op::Op::Rename(
                 crate::proto::powerfs::RenameOp {
@@ -1656,9 +1730,12 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                         mtime: new_entry.mtime,
                         atime: new_entry.atime,
                         ctime: new_entry.ctime,
-                        nlink: if new_entry.file_type.is_dir() { 2 } else { 1 },
+                        nlink: new_entry.nlink,
                         symlink_target: new_entry.symlink_target.clone().unwrap_or_default(),
                         file_type: file_type_val,
+                        uid: new_entry.uid,
+                        gid: new_entry.gid,
+                        rdev: new_entry.rdev,
                     }),
                 },
             ))
@@ -1666,8 +1743,11 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
         powerfs_orset::DeltaOp::SetAttr {
             inode,
             mode,
+            uid,
+            gid,
             size,
             mtime,
+            nlink,
             ..
         } => Some(crate::proto::powerfs::delta_op::Op::SetAttr(
             crate::proto::powerfs::SetAttrOp {
@@ -1675,6 +1755,9 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 size: size.unwrap_or(0),
                 mtime: mtime.unwrap_or(0),
                 mode: mode.unwrap_or(0),
+                uid: uid.unwrap_or(0),
+                gid: gid.unwrap_or(0),
+                nlink: nlink.unwrap_or(0),
             },
         )),
     };

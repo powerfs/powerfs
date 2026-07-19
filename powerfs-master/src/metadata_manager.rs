@@ -111,11 +111,7 @@ impl MetadataManager {
                     let dir_ino = parent_ino;
                     let entry_id = EntryId::new(entry.name.clone(), client_id_num, 0);
                     let mode = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
-                    let file_type = if (mode & 0o40000) != 0 {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
+                    let file_type = FileType::from_mode(mode);
 
                     let dir_entry = DirEntry {
                         id: entry_id,
@@ -123,13 +119,21 @@ impl MetadataManager {
                         generation: 0,
                         file_type,
                         mode,
+                        uid: entry.attributes.as_ref().map(|a| a.uid).unwrap_or(0),
+                        gid: entry.attributes.as_ref().map(|a| a.gid).unwrap_or(0),
                         size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
                         mtime: entry.attributes.as_ref().map(|a| a.mtime).unwrap_or(0),
                         atime: entry.attributes.as_ref().map(|a| a.atime).unwrap_or(0),
                         ctime: entry.attributes.as_ref().map(|a| a.ctime).unwrap_or(0),
+                        nlink: entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1),
+                        rdev: entry.attributes.as_ref().map(|a| a.rdev).unwrap_or(0),
                         parent_ino: dir_ino,
                         chunks: Vec::new(),
-                        symlink_target: None,
+                        symlink_target: if entry.symlink_target.is_empty() {
+                            None
+                        } else {
+                            Some(entry.symlink_target.clone())
+                        },
                     };
 
                     let policy = policies
@@ -179,8 +183,11 @@ impl MetadataManager {
                             let delta = powerfs_orset::DeltaOp::SetAttr {
                                 inode,
                                 mode: None,
+                                uid: entry.attributes.as_ref().map(|a| a.uid),
+                                gid: entry.attributes.as_ref().map(|a| a.gid),
                                 size: entry.attributes.as_ref().map(|a| a.size),
                                 mtime: entry.attributes.as_ref().map(|a| a.mtime),
+                                nlink: entry.attributes.as_ref().map(|a| a.nlink),
                                 vclock,
                             };
                             orset.apply_delta(&delta);
@@ -242,10 +249,14 @@ impl MetadataManager {
                                 generation: 0,
                                 file_type: FileType::RegularFile,
                                 mode: 0o644,
+                                uid: 0,
+                                gid: 0,
                                 size: 0,
                                 mtime: 0,
                                 atime: 0,
                                 ctime: 0,
+                                nlink: 1,
+                                rdev: 0,
                                 parent_ino: *dir_ino,
                                 chunks: Vec::new(),
                                 symlink_target: None,

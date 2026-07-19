@@ -888,17 +888,20 @@ impl MasterService for MasterGrpcServer {
                     mtime: branch.mtime,
                     atime: branch.atime,
                     ctime: branch.ctime,
-                    nlink: if branch.file_type == powerfs_orset::FileType::Directory {
-                        2
-                    } else {
-                        1
-                    },
+                    nlink: branch.nlink,
                     symlink_target: branch.symlink_target.clone().unwrap_or_default(),
                     file_type: match branch.file_type {
                         powerfs_orset::FileType::RegularFile => 0,
                         powerfs_orset::FileType::Directory => 1,
                         powerfs_orset::FileType::Symlink => 2,
+                        powerfs_orset::FileType::Fifo => 3,
+                        powerfs_orset::FileType::CharDevice => 4,
+                        powerfs_orset::FileType::BlockDevice => 5,
+                        powerfs_orset::FileType::Socket => 6,
                     },
+                    uid: branch.uid,
+                    gid: branch.gid,
+                    rdev: branch.rdev,
                 });
             }
             proto_conflicts.push(powerfs::ConflictRecord {

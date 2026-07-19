@@ -120,6 +120,10 @@ impl PowerFsFuserFs {
             crate::orset::FileType::RegularFile => FileType::RegularFile,
             crate::orset::FileType::Directory => FileType::Directory,
             crate::orset::FileType::Symlink => FileType::Symlink,
+            crate::orset::FileType::Fifo => FileType::NamedPipe,
+            crate::orset::FileType::CharDevice => FileType::CharDevice,
+            crate::orset::FileType::BlockDevice => FileType::BlockDevice,
+            crate::orset::FileType::Socket => FileType::Socket,
         };
 
         FileAttr {
@@ -132,14 +136,10 @@ impl PowerFsFuserFs {
             crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(entry.ctime),
             kind,
             perm: (entry.mode & 0o7777) as u16,
-            nlink: if entry.file_type == crate::orset::FileType::Directory {
-                2
-            } else {
-                1
-            },
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
+            nlink: entry.nlink,
+            uid: entry.uid,
+            gid: entry.gid,
+            rdev: entry.rdev as u32,
             blksize: 4096,
             flags: 0,
         }
@@ -613,6 +613,10 @@ impl PowerFsFuserFs {
                         crate::orset::FileType::RegularFile => FileType::RegularFile,
                         crate::orset::FileType::Directory => FileType::Directory,
                         crate::orset::FileType::Symlink => FileType::Symlink,
+                        crate::orset::FileType::Fifo => FileType::NamedPipe,
+                        crate::orset::FileType::CharDevice => FileType::CharDevice,
+                        crate::orset::FileType::BlockDevice => FileType::BlockDevice,
+                        crate::orset::FileType::Socket => FileType::Socket,
                     };
 
                     let next_offset = (entry_idx + 1) as i64;
@@ -780,7 +784,7 @@ impl Filesystem for PowerFsFuserFs {
         });
 
         // 更新 MetadataManager
-        match self.meta.setattr(inode, mode, size, mtime_secs) {
+        match self.meta.setattr(inode, mode, uid, gid, size, mtime_secs) {
             Ok(entry) => {
                 // 实际大小
                 let actual_size = self.get_file_size(inode);
@@ -854,6 +858,10 @@ impl Filesystem for PowerFsFuserFs {
                         crate::orset::FileType::RegularFile => FileType::RegularFile,
                         crate::orset::FileType::Directory => FileType::Directory,
                         crate::orset::FileType::Symlink => FileType::Symlink,
+                        crate::orset::FileType::Fifo => FileType::NamedPipe,
+                        crate::orset::FileType::CharDevice => FileType::CharDevice,
+                        crate::orset::FileType::BlockDevice => FileType::BlockDevice,
+                        crate::orset::FileType::Socket => FileType::Socket,
                     };
 
                     let next_offset = (entry_idx + 1) as i64;
@@ -1035,6 +1043,66 @@ impl Filesystem for PowerFsFuserFs {
                 error!(
                     "symlink: FAILED parent={}, name={}, target={}, error={:?}",
                     parent, name_str, target_str, e
+                );
+                reply.error(e.to_errno());
+            }
+        }
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name_str = name.to_str().unwrap_or("");
+        debug!(
+            "mknod: parent={}, name={}, mode={:o}, rdev={}",
+            parent, name_str, mode, rdev
+        );
+
+        match self.meta.mknod(parent, name_str, mode, rdev as u64) {
+            Ok(entry) => {
+                let attr = Self::dir_entry_to_file_attr(&entry);
+                reply.entry(&TTL, &attr, 0);
+                self.invalidate_kernel_dentry(parent, name_str);
+            }
+            Err(e) => {
+                error!("mknod: parent={}, name={}, error={}", parent, name_str, e);
+                reply.error(e.to_errno());
+            }
+        }
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let new_name_str = new_name.to_str().unwrap_or("");
+        debug!(
+            "link: inode={}, new_parent={}, new_name={}",
+            inode, new_parent, new_name_str
+        );
+
+        match self.meta.link(inode, new_parent, new_name_str) {
+            Ok(entry) => {
+                let attr = Self::dir_entry_to_file_attr(&entry);
+                reply.entry(&TTL, &attr, 0);
+                self.invalidate_kernel_dentry(new_parent, new_name_str);
+                self.invalidate_kernel_inode(inode);
+            }
+            Err(e) => {
+                error!(
+                    "link: inode={}, new_parent={}, new_name={}, error={}",
+                    inode, new_parent, new_name_str, e
                 );
                 reply.error(e.to_errno());
             }
