@@ -515,17 +515,23 @@ impl DirectoryTree {
         Ok(inode)
     }
 
-    pub fn update_entry(&self, mut entry: Entry, client_id: &str) -> Result<(), rocksdb::Error> {
+    pub fn update_entry(
+        &self,
+        mut entry: Entry,
+        client_id: &str,
+        expected_size: u64,
+        is_truncate: bool,
+    ) -> Result<u64, rocksdb::Error> {
         let ino = match entry.attributes.as_ref().map(|a| a.ino) {
             Some(ino) => ino,
-            None => return Ok(()),
+            None => return Ok(0),
         };
 
         let received_mode = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
         let received_file_type = received_mode & 0o170000;
         info!(
-            "[DIR_TREE] update_entry: ino={}, received_mode={:o}, received_file_type={:o}, name={}, directory={}",
-            ino, received_mode, received_file_type, entry.name, entry.directory
+            "[DIR_TREE] update_entry: ino={}, received_mode={:o}, received_file_type={:o}, name={}, directory={}, expected_size={}, is_truncate={}",
+            ino, received_mode, received_file_type, entry.name, entry.directory, expected_size, is_truncate
         );
 
         let generation = self.allocate_generation();
@@ -534,14 +540,14 @@ impl DirectoryTree {
         let inode_key = Self::inode_key(ino);
         let existing_data = self.db.get(&inode_key)?;
         if existing_data.is_none() {
-            return Ok(());
+            return Ok(0);
         }
 
         let decode_result: Result<InodeEntry, _> =
             prost::Message::decode(existing_data.unwrap().as_ref());
         let existing_entry = match decode_result {
             Ok(e) => e,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(0),
         };
 
         let existing_mode = existing_entry
@@ -550,18 +556,44 @@ impl DirectoryTree {
             .map(|a| a.mode)
             .unwrap_or(0);
         let existing_file_type = existing_mode & 0o170000;
+        let existing_size = existing_entry
+            .attributes
+            .as_ref()
+            .map(|a| a.size)
+            .unwrap_or(0);
         info!(
-            "[DIR_TREE] update_entry: ino={}, existing_mode={:o}, existing_file_type={:o}",
-            ino, existing_mode, existing_file_type
+            "[DIR_TREE] update_entry: ino={}, existing_mode={:o}, existing_file_type={:o}, existing_size={}",
+            ino, existing_mode, existing_file_type, existing_size
         );
+
+        let new_size = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
+        let final_size = if expected_size > 0 && existing_size != expected_size {
+            if is_truncate {
+                info!("[DIR_TREE] update_entry: ino={}, CAS mismatch but truncate=true, using new_size={}", ino, new_size);
+                new_size
+            } else {
+                let max_size = std::cmp::max(existing_size, new_size);
+                info!("[DIR_TREE] update_entry: ino={}, CAS mismatch, taking max(existing_size={}, new_size={})={}", ino, existing_size, new_size, max_size);
+                max_size
+            }
+        } else {
+            info!("[DIR_TREE] update_entry: ino={}, CAS match (expected_size={}, existing_size={}), using new_size={}", ino, expected_size, existing_size, new_size);
+            new_size
+        };
+
+        if let Some(attrs) = entry.attributes.as_mut() {
+            attrs.size = final_size;
+        }
+        entry.content_size = final_size;
+        entry.disk_size = final_size;
 
         let inode_entry = self.entry_to_inode_entry(&entry, existing_entry.parent_ino);
 
         let stored_mode = inode_entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
         let stored_file_type = stored_mode & 0o170000;
         info!(
-            "[DIR_TREE] update_entry: ino={}, stored_mode={:o}, stored_file_type={:o}",
-            ino, stored_mode, stored_file_type
+            "[DIR_TREE] update_entry: ino={}, stored_mode={:o}, stored_file_type={:o}, final_size={}",
+            ino, stored_mode, stored_file_type, final_size
         );
 
         let mut inode_data = Vec::new();
@@ -580,7 +612,7 @@ impl DirectoryTree {
                 0
             },
             mode: entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
-            size: entry.attributes.as_ref().map(|a| a.size).unwrap_or(0),
+            size: final_size,
             mtime: entry.attributes.as_ref().map(|a| a.mtime).unwrap_or(0),
             nlink: entry.attributes.as_ref().map(|a| a.nlink).unwrap_or(1),
         };
@@ -600,11 +632,11 @@ impl DirectoryTree {
         let client_id_num: u64 = client_id.parse().unwrap_or(0);
         let mut orset = self.orset.write().unwrap();
         let mode_val = entry.attributes.as_ref().map(|a| a.mode);
-        let size_val = entry.attributes.as_ref().map(|a| a.size);
+        let size_val = Some(final_size);
         let mtime_val = entry.attributes.as_ref().map(|a| a.mtime);
         orset.update_attr(ino, mode_val, size_val, mtime_val, client_id_num);
 
-        Ok(())
+        Ok(final_size)
     }
 
     pub fn delete_entry(&self, ino: u64, client_id: &str) -> Result<bool, rocksdb::Error> {
@@ -1401,7 +1433,7 @@ impl DirectoryTree {
                         entry.disk_size = op.size.max(entry.disk_size);
                         entry.generation = self.allocate_generation();
 
-                        if let Err(e) = self.update_entry(entry, client_id) {
+                        if let Err(e) = self.update_entry(entry, client_id, 0, false) {
                             warn!("push_delta: update_entry failed: {}", e);
                         }
                     }

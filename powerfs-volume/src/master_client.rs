@@ -162,9 +162,42 @@ impl MasterClient {
             match response {
                 Ok(resp) => {
                     debug!(
-                        "Heartbeat response: leader={}, volume_size_limit={}",
-                        resp.leader, resp.volume_size_limit
+                        "Heartbeat response: leader={}, volume_size_limit={}, error={}, error_code={}",
+                        resp.leader, resp.volume_size_limit, resp.error, resp.error_code
                     );
+
+                    if !resp.error.is_empty() {
+                        warn!(
+                            "Heartbeat error from master: {} (code: {})",
+                            resp.error, resp.error_code
+                        );
+                        match resp.error_code.as_str() {
+                            "LEADER_CHANGED" => {
+                                if !resp.leader.is_empty() {
+                                    if let Some(idx) =
+                                        master_addresses.iter().position(|a| a.eq(&resp.leader))
+                                    {
+                                        let current = current_master_index.load(Ordering::Relaxed);
+                                        if idx != current {
+                                            info!("Switching to leader master: {}", resp.leader);
+                                            current_master_index.store(idx, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                return Err("Leader changed, reconnecting".into());
+                            }
+                            "RETRYABLE" => {
+                                continue;
+                            }
+                            "RATE_LIMITED" => {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            _ => {
+                                return Err(format!("Heartbeat failed: {}", resp.error).into());
+                            }
+                        }
+                    }
 
                     if !resp.leader.is_empty() {
                         if let Some(idx) = master_addresses.iter().position(|a| a.eq(&resp.leader))
@@ -173,6 +206,7 @@ impl MasterClient {
                             if idx != current {
                                 info!("Switching to leader master: {}", resp.leader);
                                 current_master_index.store(idx, Ordering::Relaxed);
+                                return Err("Leader changed, reconnecting".into());
                             }
                         }
                     }
@@ -220,8 +254,8 @@ impl MasterClient {
         collection: &str,
         count: u32,
     ) -> Result<VolumeGrowResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let mut tried = 0;
-        let max_tries = self.master_addresses.len();
+        let max_retries = 3;
+        let mut attempt = 0;
 
         loop {
             let addr = self.current_master();
@@ -238,34 +272,66 @@ impl MasterClient {
                         ttl: "".to_string(),
                         data_center: self.data_center.clone(),
                         rack: self.rack.clone(),
-                        data_node: "".to_string(),
+                        data_node: self.node_id.0.clone(),
                         disk_type: "".to_string(),
                         count,
                     };
 
                     match client.volume_grow(request).await {
                         Ok(response) => {
-                            return Ok(response.into_inner());
+                            let resp = response.into_inner();
+                            if !resp.error.is_empty() {
+                                return Err(resp.error.into());
+                            }
+                            return Ok(resp);
                         }
                         Err(e) => {
-                            warn!("Failed to grow volumes via {}: {}", addr, e);
-                            tried += 1;
-                            if tried >= max_tries {
-                                return Err(e.into());
+                            attempt += 1;
+                            let msg = format!("{}", e);
+                            warn!(
+                                "Failed to grow volumes via {} (attempt {}): {}",
+                                addr, attempt, e
+                            );
+                            if msg.contains("not leader") {
+                                if let Some(start) = msg.find("current leader is ") {
+                                    let leader_addr = msg[start + 18..].trim();
+                                    if !leader_addr.is_empty() {
+                                        info!("Trying to switch to leader: {}", leader_addr);
+                                        if let Some((index, _)) = self
+                                            .master_addresses
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(_, a)| **a == leader_addr)
+                                        {
+                                            self.current_master_index
+                                                .store(index, Ordering::Relaxed);
+                                            info!("Switched to leader at index {}", index);
+                                        }
+                                    }
+                                }
+                            }
+                            if attempt >= max_retries {
+                                return Err(msg.into());
                             }
                             self.next_master();
-                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            tokio::time::sleep(Duration::from_millis(
+                                500 * (1u64 << (attempt - 1)),
+                            ))
+                            .await;
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to connect to master {}: {}", addr, e);
-                    tried += 1;
-                    if tried >= max_tries {
+                    attempt += 1;
+                    warn!(
+                        "Failed to connect to master {} (attempt {}): {}",
+                        addr, attempt, e
+                    );
+                    if attempt >= max_retries {
                         return Err(e.into());
                     }
                     self.next_master();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
                 }
             }
         }

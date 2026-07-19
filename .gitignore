@@ -1,6 +1,7 @@
 ./powerfs-fuse/Cargo.toml
 target/
 core
+raft-rs/
 spdk/
 powerfs-fuse-enterprise/
 **/*.rs.bk

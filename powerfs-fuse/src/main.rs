@@ -5,6 +5,12 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(feature = "enterprise")]
+use powerfs_fuse_enterprise::FuserApp;
+
+#[cfg(not(feature = "enterprise"))]
+use powerfs_fuse::FuserApp;
+
 static MOUNT_POINT_PATH: OnceLock<CString> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -164,7 +170,7 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     let result = runtime.block_on(async {
-        let fuse_client = powerfs_fuse::FuserApp::new(
+        let fuse_client = FuserApp::new(
             &args.master,
             &args.mount_point,
             &args.collection,

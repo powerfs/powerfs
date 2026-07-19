@@ -145,15 +145,15 @@ impl PowerFsFuserFs {
         }
     }
 
-    /// 获取文件实际大小（取 max(meta_size, data_size)）
+    /// 获取文件实际大小（以 Master 元数据为准）
     fn get_file_size(&self, ino: u64) -> u64 {
-        let data_size = self.data.current_file_size(ino);
         let meta_size = self
             .meta
             .get_entry_by_inode(ino)
             .map(|e| e.map(|e| e.size).unwrap_or(0))
             .unwrap_or(0);
-        data_size.max(meta_size)
+        self.data.set_file_size(ino, meta_size);
+        meta_size
     }
 
     /// 将脏 chunk 写入 Volume Server 并更新 Master 元数据
@@ -184,7 +184,7 @@ impl PowerFsFuserFs {
             return Ok(());
         }
 
-        let file_size = self.data.current_file_size(inode);
+        let file_size = self.get_file_size(inode);
         let chunk_size = self.data.chunk_cache().chunk_size();
 
         debug!(
@@ -376,6 +376,13 @@ impl PowerFsFuserFs {
         // 按 offset 排序
         updated_entry.chunks.sort_by_key(|c| c.offset);
 
+        let old_size = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
+        let is_truncate = file_size > 0 && file_size < old_size;
+        debug!(
+            "flush_dirty_chunks: inode={}, old_size={}, new_size={}, is_truncate={}",
+            inode, old_size, file_size, is_truncate
+        );
+
         // 更新 size
         if file_size > 0 {
             if let Some(attrs) = updated_entry.attributes.as_mut() {
@@ -386,9 +393,26 @@ impl PowerFsFuserFs {
             updated_entry.disk_size = file_size;
         }
 
-        if let Err(e) = self.client.update_entry(&updated_entry, &client_id_str) {
-            warn!("flush_dirty_chunks: update_entry failed: {}", e);
-            // 不返回错误，数据已写入 Volume，元数据稍后可重试
+        match self
+            .client
+            .update_entry(&updated_entry, &client_id_str, old_size, is_truncate)
+        {
+            Ok(actual_size) => {
+                debug!(
+                    "flush_dirty_chunks: update_entry succeeded, actual_size={}",
+                    actual_size
+                );
+                if actual_size > 0 && actual_size != file_size {
+                    info!(
+                        "flush_dirty_chunks: inode={}, size changed during flush (expected={}, actual={}), updating local cache",
+                        inode, file_size, actual_size
+                    );
+                    self.data.set_file_size(inode, actual_size);
+                }
+            }
+            Err(e) => {
+                warn!("flush_dirty_chunks: update_entry failed: {}", e);
+            }
         }
 
         // 数据完整性验证（可选，默认关闭）：读取刚刚写入的 chunk 并与本地数据比较

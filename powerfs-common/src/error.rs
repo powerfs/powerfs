@@ -90,6 +90,67 @@ pub enum PowerFsError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error("rate limited")]
+    RateLimited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorKind {
+    NonRetryable(String),
+    Retryable(String),
+    LeaderChanged(String),
+    RateLimited(std::time::Duration),
+}
+
+impl PowerFsError {
+    pub fn error_kind(&self) -> ErrorKind {
+        match self {
+            PowerFsError::NotLeader => ErrorKind::LeaderChanged(String::new()),
+            PowerFsError::InvalidRequest(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::InvalidVolumeState(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::InvalidMasterState(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::VolumeNotFound(_) => {
+                ErrorKind::NonRetryable("volume not found".to_string())
+            }
+            PowerFsError::NeedleNotFound(_) => {
+                ErrorKind::NonRetryable("needle not found".to_string())
+            }
+            PowerFsError::VolumeExists(_) => {
+                ErrorKind::NonRetryable("volume already exists".to_string())
+            }
+            PowerFsError::FileNotFound(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::DirectoryNotFound(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::FileExists(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::InvalidPath(msg) => ErrorKind::NonRetryable(msg.clone()),
+            PowerFsError::PathTooLong => ErrorKind::NonRetryable("path too long".to_string()),
+            PowerFsError::PermissionDenied => {
+                ErrorKind::NonRetryable("permission denied".to_string())
+            }
+            PowerFsError::ChecksumMismatch => {
+                ErrorKind::NonRetryable("checksum mismatch".to_string())
+            }
+            PowerFsError::OutOfSpace => ErrorKind::NonRetryable("out of space".to_string()),
+            PowerFsError::Timeout => ErrorKind::Retryable("timeout".to_string()),
+            PowerFsError::ConnectionRefused => {
+                ErrorKind::Retryable("connection refused".to_string())
+            }
+            PowerFsError::RateLimited => ErrorKind::RateLimited(std::time::Duration::from_secs(5)),
+            PowerFsError::QuorumNotReached => {
+                ErrorKind::Retryable("quorum not reached".to_string())
+            }
+            PowerFsError::TonicTransport(_) => ErrorKind::Retryable("transport error".to_string()),
+            PowerFsError::TonicStatus(status) => {
+                let msg = status.message().to_string();
+                if msg.contains("not leader") {
+                    ErrorKind::LeaderChanged(String::new())
+                } else {
+                    ErrorKind::Retryable(msg)
+                }
+            }
+            _ => ErrorKind::Retryable(self.to_string()),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, PowerFsError>;

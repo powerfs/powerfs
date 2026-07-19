@@ -1944,7 +1944,7 @@ fn sync_setattr_to_master_helper(
     let proto_entry = dir_entry_to_proto(entry, &parent_path);
 
     client
-        .update_entry(&proto_entry, client_id_str)
+        .update_entry(&proto_entry, client_id_str, 0, false)
         .map_err(|e| format!("sync_setattr_to_master failed: {}", e))?;
 
     Ok(())

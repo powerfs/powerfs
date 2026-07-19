@@ -163,9 +163,9 @@ impl MasterService for MasterGrpcServer {
                     && heartbeat.deleted_volumes.is_empty()
                 {
                     info!("GRPC_DEBUG: calling add_node for node {}", node_id.0);
-                    let _ = master
+                    let add_result = master
                         .add_node(AddNodeParams {
-                            node_id,
+                            node_id: node_id.clone(),
                             address: heartbeat.ip.clone(),
                             rack: heartbeat.rack.clone(),
                             data_center: heartbeat.data_center.clone(),
@@ -174,14 +174,36 @@ impl MasterService for MasterGrpcServer {
                             public_url: heartbeat.public_url.clone(),
                         })
                         .await;
+                    if let Err(e) = add_result {
+                        warn!("GRPC_DEBUG: add_node failed for {}: {}", node_id.0, e);
+                        let leader = master.get_leader().await;
+                        let (error_code, error_msg) = match e {
+                            powerfs_common::error::PowerFsError::NotLeader => {
+                                ("LEADER_CHANGED".to_string(), e.to_string())
+                            }
+                            _ => ("NON_RETRYABLE".to_string(), e.to_string()),
+                        };
+                        let _ = tx
+                            .send(Ok(HeartbeatResponse {
+                                volume_size_limit: DEFAULT_VOLUME_SIZE,
+                                leader,
+                                metrics_address: String::new(),
+                                metrics_interval_seconds: 0,
+                                preallocate: false,
+                                error: error_msg,
+                                error_code,
+                            }))
+                            .await;
+                        continue;
+                    }
                 } else {
                     info!(
                         "GRPC_DEBUG: calling update_node_volumes for node {}",
                         node_id.0
                     );
-                    let _ = master
+                    let update_result = master
                         .update_node_volumes(UpdateNodeVolumesParams {
-                            node_id,
+                            node_id: node_id.clone(),
                             volumes: heartbeat.volumes.clone(),
                             new_volumes: heartbeat.new_volumes.clone(),
                             deleted_volumes: heartbeat.deleted_volumes.clone(),
@@ -190,6 +212,31 @@ impl MasterService for MasterGrpcServer {
                             http_port: heartbeat.port,
                         })
                         .await;
+                    if let Err(e) = update_result {
+                        warn!(
+                            "GRPC_DEBUG: update_node_volumes failed for {}: {}",
+                            node_id.0, e
+                        );
+                        let leader = master.get_leader().await;
+                        let (error_code, error_msg) = match e {
+                            powerfs_common::error::PowerFsError::NotLeader => {
+                                ("LEADER_CHANGED".to_string(), e.to_string())
+                            }
+                            _ => ("NON_RETRYABLE".to_string(), e.to_string()),
+                        };
+                        let _ = tx
+                            .send(Ok(HeartbeatResponse {
+                                volume_size_limit: DEFAULT_VOLUME_SIZE,
+                                leader,
+                                metrics_address: String::new(),
+                                metrics_interval_seconds: 0,
+                                preallocate: false,
+                                error: error_msg,
+                                error_code,
+                            }))
+                            .await;
+                        continue;
+                    }
                 }
 
                 let leader = master.get_leader().await;
@@ -206,6 +253,8 @@ impl MasterService for MasterGrpcServer {
                         metrics_address: String::new(),
                         metrics_interval_seconds: 0,
                         preallocate: false,
+                        error: String::new(),
+                        error_code: String::new(),
                     }))
                     .await
                     .is_err()
@@ -298,16 +347,11 @@ impl MasterService for MasterGrpcServer {
         ASSIGN_REQUEST_COUNT.inc();
 
         if !self.master.is_leader().await {
-            if let Some(mut client) = self.get_leader_client().await {
-                let req = request.into_inner();
-                match client.assign(Request::new(req)).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(Status::unavailable(
-                "not leader and no leader client available",
-            ));
+            let leader = self.master.get_leader().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
         }
 
         let req = request.into_inner();
@@ -538,49 +582,42 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<VolumeGrowRequest>,
     ) -> Result<Response<VolumeGrowResponse>, Status> {
-        // Forward to leader if not leader
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
-
-            // Check if we're trying to forward to ourselves - this indicates a leader state sync issue
-            let my_address = self.master.raft_address().to_string();
-            if leader == my_address {
-                warn!("VOL_GROW_DEBUG: Detected self-forwarding loop - local is_leader=false but leader address is ourselves. Treating as leader to break loop.");
-                // Continue processing as leader to break the infinite loop
-            } else if let Some(mut client) = self.get_leader_client().await {
-                let req = request.into_inner();
-                match client.volume_grow(Request::new(req)).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => return Err(e),
-                }
-            } else {
-                return Err(Status::unavailable(
-                    "not leader and no leader client available",
-                ));
-            }
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
         }
 
         let req = request.into_inner();
 
-        // Use assign_volume logic to allocate new volumes
         let mut new_volume_ids = Vec::new();
         let mut locations = Vec::new();
+        let mut created_count = 0;
+        let max_retries = req.count * 10;
 
-        for _ in 0..req.count {
+        while new_volume_ids.len() < req.count as usize && created_count < max_retries {
             match self
                 .master
                 .create_new_volume(&req.replication, &req.collection)
                 .await
             {
                 Ok((fid, nodes)) => {
-                    new_volume_ids.push(fid.volume_id.0);
-                    for node in nodes {
-                        locations.push(Location {
-                            url: node.url(),
-                            public_url: node.public_url.clone(),
-                            grpc_port: node.grpc_port,
-                            data_center: node.data_center_id.to_string(),
-                        });
+                    created_count += 1;
+                    if let Some(primary_node) = nodes.first() {
+                        if !req.data_node.is_empty() && primary_node.id.0 != req.data_node {
+                            continue;
+                        }
+                        new_volume_ids.push(fid.volume_id.0);
+                        for node in nodes {
+                            locations.push(Location {
+                                url: node.url(),
+                                public_url: node.public_url.clone(),
+                                grpc_port: node.grpc_port,
+                                data_center: node.data_center_id.to_string(),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -1446,23 +1483,30 @@ impl MasterService for MasterGrpcServer {
         let entry = req.entry.unwrap_or_default();
         let entry_clone = entry.clone();
         let entry_ref = &entry;
+        let expected_size = req.expected_size;
+        let is_truncate = req.is_truncate;
         info!(
-            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}, mode={:o}, symlink_target='{}'",
+            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}, mode={:o}, symlink_target='{}', expected_size={}, is_truncate={}",
             entry_ref.name.as_str(),
             entry_ref.directory.as_str(),
             client_id,
             entry_ref.content_size,
             entry_ref.attributes.as_ref().map(|a| a.size).unwrap_or(0),
             entry_ref.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
-            entry_ref.symlink_target
+            entry_ref.symlink_target,
+            expected_size,
+            is_truncate
         );
 
-        let result =
-            tokio::task::spawn_blocking(move || dir_tree.update_entry(entry, &client_id_clone))
-                .await
-                .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            dir_tree.update_entry(entry, &client_id_clone, expected_size, is_truncate)
+        })
+        .await
+        .unwrap();
 
-        if result.is_ok() {
+        let actual_size = if let Ok(s) = &result { *s } else { 0 };
+
+        if result.is_ok() && actual_size > 0 {
             let inode = entry_clone.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
             let client_id_num: u64 = client_id.parse().unwrap_or(0);
             metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Update {
@@ -1474,13 +1518,15 @@ impl MasterService for MasterGrpcServer {
         }
 
         match result {
-            Ok(_) => Ok(Response::new(UpdateEntryResponse {
-                success: true,
+            Ok(actual_size) => Ok(Response::new(UpdateEntryResponse {
+                success: actual_size > 0,
                 error: String::new(),
+                actual_size,
             })),
             Err(e) => Ok(Response::new(UpdateEntryResponse {
                 success: false,
                 error: e.to_string(),
+                actual_size: 0,
             })),
         }
     }
@@ -1648,7 +1694,7 @@ impl MasterService for MasterGrpcServer {
                         let entry = update_req.entry.unwrap_or_default();
                         let entry_clone = entry.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.update_entry(entry, &client_id_clone)
+                            dir_tree_clone.update_entry(entry, &client_id_clone, 0, false)
                         })
                         .await
                         .unwrap();
@@ -1666,7 +1712,7 @@ impl MasterService for MasterGrpcServer {
                             );
                         }
 
-                        result.map_err(|e| e.to_string())
+                        result.map(|_| ()).map_err(|e| e.to_string())
                     }
                     Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
                         delete_req,

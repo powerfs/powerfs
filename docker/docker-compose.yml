@@ -308,6 +308,8 @@ services:
       - --container
       - --log-file
       - /var/log/powerfs-fuse.log
+    volumes:
+      - /tmp/powerfs/fuse1:/mnt/powerfs
     depends_on:
       volume-1:
         condition: service_healthy
@@ -359,6 +361,8 @@ services:
       - --container
       - --log-file
       - /var/log/powerfs-fuse.log
+    volumes:
+      - /tmp/powerfs/fuse2:/mnt/powerfs
     depends_on:
       volume-1:
         condition: service_healthy

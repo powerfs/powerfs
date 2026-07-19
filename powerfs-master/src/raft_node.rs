@@ -59,6 +59,8 @@ pub struct RaftNode {
     applied_index: Arc<StdRwLock<u64>>,
     /// Shared leader state with Master (updated on raft role change)
     leader_state: Arc<AtomicBool>,
+    /// Shared leader address (updated on raft role change)
+    leader_address: Arc<StdRwLock<String>>,
 }
 
 /// Outgoing Raft message to a peer
@@ -90,11 +92,22 @@ impl RaftNode {
         peers: Vec<Peer>,
         storage_path: &str,
         leader_state: Arc<AtomicBool>,
+        leader_address: Arc<StdRwLock<String>>,
     ) -> Result<Self, String> {
-        Self::new_with_config(id, address, peers, storage_path, 10, 3, leader_state)
+        Self::new_with_config(
+            id,
+            address,
+            peers,
+            storage_path,
+            10,
+            3,
+            leader_state,
+            leader_address,
+        )
     }
 
     /// Create a new RaftNode with custom election/heartbeat ticks
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         id: u64,
         address: String,
@@ -103,6 +116,7 @@ impl RaftNode {
         election_tick: usize,
         heartbeat_tick: usize,
         leader_state: Arc<AtomicBool>,
+        leader_address: Arc<StdRwLock<String>>,
     ) -> Result<Self, String> {
         let storage = if peers.is_empty() {
             RocksDbStorage::new_with_single_node(storage_path, id)
@@ -127,7 +141,7 @@ impl RaftNode {
             max_size_per_msg: 1 << 20, // 1MB
             max_inflight_msgs: 256,
             check_quorum: !peers.is_empty(),
-            pre_vote: true,
+            pre_vote: false,
             ..Default::default()
         };
         cfg.validate()
@@ -181,6 +195,7 @@ impl RaftNode {
             running: Arc::new(RwLock::new(true)),
             applied_index: Arc::new(StdRwLock::new(0)),
             leader_state,
+            leader_address,
         })
     }
 
@@ -226,9 +241,6 @@ impl RaftNode {
     pub fn process_ready(&mut self) {
         static PROCESS_READY_COUNT: AtomicU64 = AtomicU64::new(0);
         let count = PROCESS_READY_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(1000) {
-            info!("RAFT_DEBUG: process_ready called #{}", count);
-        }
 
         if !self.node.has_ready() {
             return;
@@ -236,27 +248,48 @@ impl RaftNode {
 
         let mut ready = self.node.ready();
 
-        if ready.entries().is_empty()
-            && ready.committed_entries().is_empty()
-            && ready.ss().is_none()
-            && ready.hs().is_none()
-            && ready.snapshot().is_empty()
-        {
-            static MSG_ONLY_COUNT: AtomicU64 = AtomicU64::new(0);
-            let count = MSG_ONLY_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count.is_multiple_of(1000) {
-                info!("RAFT_DEBUG: message-only process_ready #{}", count);
-            }
-            for msg in ready.take_messages() {
-                self.send_message(&msg);
-            }
-            self.node.advance(ready);
-            return;
+        let msg_count = ready.messages().len();
+        let committed_entries = ready.committed_entries().len();
+        let has_ss = ready.ss().is_some();
+        let has_hs = ready.hs().is_some();
+        let has_snapshot = !ready.snapshot().is_empty();
+
+        info!(
+            "RAFT_DEBUG: process_ready #{} - msgs={}, committed={}, has_ss={}, has_hs={}, has_snapshot={}",
+            count, msg_count, committed_entries, has_ss, has_hs, has_snapshot
+        );
+
+        let mut messages_to_send = Vec::new();
+
+        if !ready.messages().is_empty() {
+            info!(
+                "RAFT_DEBUG: collecting {} messages from ready.messages()",
+                ready.messages().len()
+            );
+            messages_to_send.extend(ready.take_messages());
         }
 
         if let Some(ss) = ready.ss() {
             let is_leader_now = ss.raft_state == StateRole::Leader;
             let prev = self.leader_state.swap(is_leader_now, Ordering::Relaxed);
+
+            let new_leader_addr = if is_leader_now {
+                self.address.clone()
+            } else {
+                let leader_id = self.node.raft.leader_id;
+                if leader_id == 0 {
+                    String::new()
+                } else if leader_id == self.id {
+                    self.address.clone()
+                } else {
+                    match self.peers.get(&leader_id) {
+                        Some(peer) => peer.address.clone(),
+                        None => String::new(),
+                    }
+                }
+            };
+            *self.leader_address.write().unwrap() = new_leader_addr;
+
             if prev != is_leader_now {
                 info!(
                     "Raft role changed: node {} is now {:?} (was {})",
@@ -265,11 +298,6 @@ impl RaftNode {
                     if prev { "Leader" } else { "Non-Leader" }
                 );
             }
-        }
-
-        // Send messages to peers
-        for msg in ready.take_messages() {
-            self.send_message(&msg);
         }
 
         // Handle snapshot
@@ -296,14 +324,12 @@ impl RaftNode {
         let committed = ready.take_committed_entries();
         if !committed.is_empty() {
             for entry in committed {
-                // Skip empty entries (e.g., from leader election)
                 if entry.data.is_empty() {
                     let mut applied = self.applied_index.write().unwrap();
                     *applied = entry.index;
                     continue;
                 }
 
-                // Parse the command
                 match RaftCommand::deserialize(&entry.data) {
                     Ok(cmd) => {
                         let apply_entry = ApplyEntry {
@@ -328,13 +354,71 @@ impl RaftNode {
             }
         }
 
+        // Handle persisted messages
+        if !ready.persisted_messages().is_empty() {
+            info!(
+                "RAFT_DEBUG: collecting {} messages from ready.persisted_messages()",
+                ready.persisted_messages().len()
+            );
+            messages_to_send.extend(ready.take_persisted_messages());
+        }
+
         // Check if we need to create a snapshot (leader only)
         if self.is_leader() {
             self.try_create_snapshot();
         }
 
         // Advance the state machine
-        self.node.advance(ready);
+        let mut light_rd = self.node.advance(ready);
+
+        // Handle messages from light_rd
+        if !light_rd.messages().is_empty() {
+            info!(
+                "RAFT_DEBUG: collecting {} messages from light_rd.messages()",
+                light_rd.messages().len()
+            );
+            messages_to_send.extend(light_rd.take_messages());
+        }
+
+        // Apply committed entries from light_rd
+        let committed = light_rd.take_committed_entries();
+        if !committed.is_empty() {
+            for entry in committed {
+                if !entry.data.is_empty() {
+                    match RaftCommand::deserialize(&entry.data) {
+                        Ok(cmd) => {
+                            let apply_entry = ApplyEntry {
+                                index: entry.index,
+                                command: cmd,
+                            };
+                            let tx = self.apply_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(apply_entry).await;
+                            });
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to deserialize command at index {}: {}",
+                                entry.index, e
+                            );
+                        }
+                    }
+                }
+                let mut applied = self.applied_index.write().unwrap();
+                *applied = entry.index;
+            }
+        }
+
+        // Advance apply index
+        self.node.advance_apply();
+
+        // Send all collected messages
+        if !messages_to_send.is_empty() {
+            info!("RAFT_DEBUG: sending {} messages", messages_to_send.len());
+            for msg in messages_to_send {
+                self.send_message(&msg);
+            }
+        }
     }
 
     /// Send a Raft message to a peer
@@ -343,6 +427,17 @@ impl RaftNode {
 
         // Don't send to self
         if to_id == self.id {
+            info!("RAFT_DEBUG: skip sending message to self (id={})", self.id);
+            return;
+        }
+
+        // Check if peer exists
+        if !self.peers.contains_key(&to_id) {
+            info!(
+                "RAFT_DEBUG: peer {} not found in peers map (peers: {:?})",
+                to_id,
+                self.peers.keys()
+            );
             return;
         }
 
@@ -357,6 +452,13 @@ impl RaftNode {
             to_id,
             message: bytes::Bytes::from(buf),
         };
+
+        static SEND_MSG_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = SEND_MSG_COUNT.fetch_add(1, Ordering::Relaxed);
+        info!(
+            "RAFT_DEBUG: sending message #{} to peer {}: type={:?}, from={}",
+            count, to_id, msg.msg_type, self.id
+        );
 
         if self.message_tx.send(outgoing).is_err() {
             warn!("Failed to send message to {}", to_id);
@@ -412,6 +514,11 @@ impl RaftNode {
     /// Get a clone of the peers
     pub fn get_peers(&self) -> Vec<Peer> {
         self.peers.values().cloned().collect()
+    }
+
+    /// Get the current leader address
+    pub fn get_leader_address(&self) -> String {
+        self.leader_address.read().unwrap().clone()
     }
 
     /// Get a clone of the message broadcast sender
@@ -470,6 +577,23 @@ impl RaftNode {
     /// Get the leader id (0 if no leader)
     pub fn leader_id(&self) -> u64 {
         self.node.raft.leader_id
+    }
+
+    /// Get the leader address (empty string if no leader)
+    pub fn leader_address(&self) -> String {
+        let leader_id = self.node.raft.leader_id;
+        if leader_id == 0 {
+            return String::new();
+        }
+        if leader_id == self.id {
+            return self.address.clone();
+        }
+        for peer in &self.peers {
+            if *peer.0 == leader_id {
+                return peer.1.address.clone();
+            }
+        }
+        String::new()
     }
 
     /// Get the current commit index
@@ -615,19 +739,7 @@ impl RaftNode {
                 "Log entries exceed threshold ({}), triggering automatic snapshot",
                 SNAPSHOT_THRESHOLD
             );
-
-            // Create an empty snapshot data (the actual state should be provided by the caller)
-            // In a real implementation, you would pass the actual state machine data
-            let snapshot_data = RaftSnapshotData {
-                nodes: Vec::new(),
-                volumes: Vec::new(),
-                next_volume_id: 0,
-                max_file_key: 0,
-            };
-
-            if let Err(e) = self.trigger_snapshot(&snapshot_data) {
-                warn!("Automatic snapshot creation failed: {}", e);
-            }
+            warn!("Automatic snapshot creation is disabled - snapshot data should be provided by the master state machine");
         }
     }
 

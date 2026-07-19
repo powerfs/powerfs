@@ -289,7 +289,7 @@ impl PowerFsFs {
                 generation: entry.generation,
             };
 
-            if let Err(e) = self.client.update_entry(&filer_entry, "") {
+            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
                 warn!("Failed to update entry on master: {}", e);
             }
         }
@@ -1197,7 +1197,7 @@ impl FileSystem for PowerFsFs {
                 generation: entry.generation,
             };
 
-            if let Err(e) = self.client.update_entry(&filer_entry, "") {
+            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
                 warn!("Failed to update entry on master: {}", e);
             }
         }

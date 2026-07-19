@@ -19,11 +19,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 pub use crate::proto::VolumeShortInfo;
+pub use crate::volume_assigner::{RoundRobinAssigner, VolumeAssigner};
 
 pub struct MasterNode {
     id: NodeId,
@@ -34,13 +35,14 @@ pub struct MasterNode {
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
+    peers: Vec<crate::raft_node::Peer>,
     propose_tx: mpsc::Sender<ProposeRequest>,
     step_tx: mpsc::Sender<raft::eraftpb::Message>,
     message_tx: broadcast::Sender<OutgoingMessage>,
     raft_id: u64,
     raft_address: String,
     is_leader: Arc<AtomicBool>,
-    leader_address: RwLock<String>,
+    leader_address: Arc<StdRwLock<String>>,
     raft_term: RwLock<u64>,
     next_volume_id: RwLock<u32>,
     max_file_key: RwLock<u64>,
@@ -209,12 +211,20 @@ impl MasterNode {
         // 单节点模式（无 peers）初始为 true，多节点模式初始为 false
         let leader_state = Arc::new(AtomicBool::new(peer_list.is_empty()));
 
+        // 共享 leader 地址：RaftNode 在角色变更时更新，Master 读取
+        let leader_address = Arc::new(StdRwLock::new(if peer_list.is_empty() {
+            raft_address.to_string()
+        } else {
+            String::new()
+        }));
+
         let mut raft_node = RaftNode::new(
             raft_id,
             raft_address.to_string(),
-            peer_list,
+            peer_list.clone(),
             raft_path,
             leader_state.clone(),
+            leader_address.clone(),
         )
         .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
 
@@ -305,13 +315,14 @@ impl MasterNode {
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
             raft_config,
+            peers: peer_list,
             propose_tx,
             step_tx,
             message_tx,
             raft_id,
             raft_address: raft_address.to_string(),
             is_leader: leader_state,
-            leader_address: RwLock::new(raft_address.to_string()),
+            leader_address,
             raft_term: RwLock::new(1),
             next_volume_id: RwLock::new(1),
             max_file_key: RwLock::new(0),
@@ -872,6 +883,20 @@ impl MasterNode {
 
         self.propose_command(cmd).await?;
 
+        let dc_id = DataCenterId(params.data_center);
+        let rack_id = RackId(params.rack);
+        let node = DataNodeInfo::new(
+            params.node_id,
+            params.address,
+            rack_id,
+            dc_id,
+            params.http_port,
+            params.grpc_port,
+            params.public_url,
+        );
+        let mut topology = self.topology.write().unwrap();
+        topology.get_or_create_node(node);
+
         Ok(())
     }
 
@@ -1022,7 +1047,13 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let nodes = self.topology.read().unwrap().list_all_nodes();
+        let mut nodes = self.topology.read().unwrap().list_all_nodes();
+        nodes.sort_by_key(|n| n.id.0.clone());
+        info!(
+            "VOL_DEBUG: found {} nodes in topology: {:?}",
+            nodes.len(),
+            nodes.iter().map(|n| n.id.0.clone()).collect::<Vec<_>>()
+        );
         if nodes.is_empty() {
             return Err(PowerFsError::InvalidRequest(
                 "no nodes available".to_string(),
@@ -1123,14 +1154,20 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let nodes = self.topology.read().unwrap().list_all_nodes();
+        let mut nodes = self.topology.read().unwrap().list_all_nodes();
+        nodes.sort_by_key(|n| n.id.0.clone());
+        info!(
+            "VOL_DEBUG: found {} nodes in topology: {:?}",
+            nodes.len(),
+            nodes.iter().map(|n| n.id.0.clone()).collect::<Vec<_>>()
+        );
         if nodes.is_empty() {
             return Err(PowerFsError::InvalidRequest(
                 "no nodes available".to_string(),
             ));
         }
 
-        let (volume_size_limit, rack_awareness_enabled) = {
+        let (volume_size_limit, _rack_awareness_enabled) = {
             let config = self.cluster_config.read().unwrap();
             (config.volume_size_limit, config.rack_awareness_enabled)
         };
@@ -1143,33 +1180,21 @@ impl MasterNode {
 
         let replica_count = replica_placement.get_copy_count();
 
-        // No existing writable volume found - create a new one
-        let selected_nodes = if rack_awareness_enabled && nodes.len() > 1 {
-            Self::select_nodes_by_rack(&nodes, replica_count)
-        } else {
-            let volumes = self.volumes.read().unwrap();
-            let total_volumes = volumes.len();
-            let start_index = total_volumes % nodes.len();
-            let mut selected = Vec::new();
-            for i in 0..replica_count as usize {
-                let idx = (start_index + i) % nodes.len();
-                selected.push(nodes[idx].clone());
-            }
-            selected
-        };
-
-        if selected_nodes.len() < replica_count as usize {
-            return Err(PowerFsError::InvalidRequest(
-                "not enough nodes available for replication".to_string(),
-            ));
-        }
-
         let volume_id = {
             let mut next_id = self.next_volume_id.write().unwrap();
             let vid = VolumeId(*next_id);
             *next_id += 1;
             vid
         };
+
+        let assigner = RoundRobinAssigner;
+        let assigned_nodes = assigner.assign(volume_id.0, &nodes, replica_count as usize);
+
+        if assigned_nodes.is_empty() {
+            return Err(PowerFsError::InvalidRequest(
+                "not enough nodes available for replication".to_string(),
+            ));
+        }
 
         {
             let mut layouts = self.volume_layouts.write().unwrap();
@@ -1183,10 +1208,9 @@ impl MasterNode {
             });
         }
 
-        // Propose to Raft for replication (this will apply the command to state machine)
-        if let Some(first_node) = selected_nodes.first() {
+        if let Some(primary_node) = assigned_nodes.first() {
             let cmd = RaftCommand::AssignVolume {
-                node_id: first_node.id.0.clone(),
+                node_id: primary_node.id.0.clone(),
                 volume_id: volume_id.0,
                 collection: collection_obj.0.clone(),
                 replica_count,
@@ -1197,10 +1221,8 @@ impl MasterNode {
             self.propose_command(cmd).await?;
         }
 
-        // Wait for volume to be applied to state machine
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Get file_key from this volume's next_file_key counter
         let file_key = {
             let mut volumes = self.volumes.write().unwrap();
             if let Some(vol_info) = volumes.get_mut(&volume_id) {
@@ -1212,7 +1234,6 @@ impl MasterNode {
             }
         };
 
-        // Generate random cookie to prevent FID collision
         let cookie = rand::random::<u32>() as u64;
 
         let fid = Fid {
@@ -1224,7 +1245,7 @@ impl MasterNode {
         info!(
             "Assigned volume: {} to nodes: {:?}, fid: {},{},{}",
             volume_id,
-            selected_nodes
+            assigned_nodes
                 .iter()
                 .map(|n| n.id.clone())
                 .collect::<Vec<_>>(),
@@ -1233,9 +1254,10 @@ impl MasterNode {
             file_key
         );
 
-        Ok((fid, selected_nodes))
+        Ok((fid, assigned_nodes))
     }
 
+    #[allow(dead_code)]
     fn select_nodes_by_rack(nodes: &[DataNodeInfo], count: u32) -> Vec<DataNodeInfo> {
         let mut selected = Vec::new();
         let mut used_racks = HashMap::new();
@@ -1718,11 +1740,70 @@ impl MasterNode {
             }
         });
 
-        let server = crate::server::MasterGrpcServer::new(self.clone(), self.kv_cache.clone());
-        server
-            .start(self.address)
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("Failed to start server: {}", e)))?;
+        let master_clone = self.clone();
+        let kv_cache_clone = self.kv_cache.clone();
+        let server_address = self.address;
+
+        tokio::spawn(async move {
+            let raft_server = crate::raft_server::RaftGrpcServer::new(master_clone.clone());
+            let master_server = crate::server::MasterGrpcServer::new(master_clone, kv_cache_clone);
+
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::powerfs::raft_service_server::RaftServiceServer::new(raft_server),
+                )
+                .add_service(
+                    crate::proto::powerfs::master_service_server::MasterServiceServer::new(
+                        master_server,
+                    ),
+                )
+                .serve(server_address)
+                .await
+                .map_err(|e| {
+                    error!("Failed to start gRPC server: {}", e);
+                    e
+                })
+                .ok();
+        });
+
+        // Start Raft message forwarder
+        let message_rx = self.message_tx.subscribe();
+        let raft_peers = self.peers.clone();
+        let my_raft_id = self.raft_id;
+
+        tokio::spawn(async move {
+            let raft_client = crate::raft_client::RaftGrpcClient::new(3, 1000);
+            let mut message_rx = message_rx;
+
+            info!(
+                "RAFT_DEBUG: Raft message forwarder started for node {}",
+                my_raft_id
+            );
+
+            while let Ok(msg) = message_rx.recv().await {
+                // Find the peer address for this message
+                if let Some(peer) = raft_peers.iter().find(|p| p.id == msg.to_id) {
+                    info!(
+                        "RAFT_DEBUG: forwarding message to peer {} at {}",
+                        msg.to_id, peer.address
+                    );
+                    if let Err(e) = raft_client.send_raft_message(&peer.address, msg).await {
+                        warn!(
+                            "RAFT_DEBUG: failed to send message to {}: {}",
+                            peer.address, e
+                        );
+                    }
+                } else {
+                    warn!("RAFT_DEBUG: no peer found for id {}", msg.to_id);
+                }
+            }
+
+            info!("RAFT_DEBUG: Raft message forwarder stopped");
+        });
+
+        // Keep the master running
+        tokio::signal::ctrl_c().await?;
+        info!("Received shutdown signal, stopping master node");
 
         Ok(())
     }
@@ -1739,13 +1820,14 @@ impl Clone for MasterNode {
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),
+            peers: self.peers.clone(),
             propose_tx: self.propose_tx.clone(),
             step_tx: self.step_tx.clone(),
             message_tx: self.message_tx.clone(),
             raft_id: self.raft_id,
             raft_address: self.raft_address.clone(),
             is_leader: self.is_leader.clone(),
-            leader_address: RwLock::new(self.leader_address.read().unwrap().clone()),
+            leader_address: self.leader_address.clone(),
             raft_term: RwLock::new(*self.raft_term.read().unwrap()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),
             max_file_key: RwLock::new(*self.max_file_key.read().unwrap()),

@@ -95,6 +95,8 @@ message HeartbeatResponse {
     string metrics_address = 3;
     uint32 metrics_interval_seconds = 4;
     bool preallocate = 7;
+    string error = 8;
+    string error_code = 9;
 }
 
 message VolumeShortInfo {
@@ -730,11 +732,14 @@ message CreateEntryResponse {
 message UpdateEntryRequest {
     Entry entry = 1;
     string client_id = 2;
+    uint64 expected_size = 3;
+    bool is_truncate = 4;
 }
 
 message UpdateEntryResponse {
     bool success = 1;
     string error = 2;
+    uint64 actual_size = 3;
 }
 
 message DeleteEntryRequest {

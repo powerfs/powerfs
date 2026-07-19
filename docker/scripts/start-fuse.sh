@@ -3,12 +3,18 @@
 set -e
 
 BUILD_IMAGES=false
+REBUILD_CODE=false
 VERBOSE_LOG=false
 ENTERPRISE_FUSE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build|-b)
+            BUILD_IMAGES=true
+            shift
+            ;;
+        --rebuild|-bb)
+            REBUILD_CODE=true
             BUILD_IMAGES=true
             shift
             ;;
@@ -56,6 +62,7 @@ log_info ""
 log_info "Configuration:"
 log_info "  Host IP:         $HOST_IP"
 log_info "  Build images:    $BUILD_IMAGES"
+log_info "  Rebuild code:    $REBUILD_CODE"
 log_info "  Verbose mode:    $VERBOSE_LOG"
 log_info "  Enterprise FUSE: $ENTERPRISE_FUSE"
 log_info "  Docker dir:      $DOCKER_DIR"
@@ -105,38 +112,61 @@ if [ "$BUILD_IMAGES" = true ]; then
     cd "$DOCKER_DIR"
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
-    log_info "  Step 1: Building Rust binaries..."
-    cd "$PROJECT_DIR"
-    
-    BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor"
-    
-    if [ "$ENTERPRISE_FUSE" = true ]; then
-        log_debug "  Running: $BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
-        BUILD_CMD="$BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
+    log_info "  Step 1: Cleaning up old containers and volumes..."
+    docker compose -f "$DOCKER_DIR/docker-compose.yml" down -v 2>&1 | tail -5 || true
+    log_info "  [OK] Old containers and volumes cleaned up"
+
+    log_info "  Step 2: Removing old Docker images..."
+    IMAGES_TO_REMOVE=("powerfs:latest" "powerfs-frontend:latest")
+    for img in "${IMAGES_TO_REMOVE[@]}"; do
+        if docker images -q "$img" | grep -q .; then
+            log_debug "  Removing $img..."
+            docker rmi -f "$img" 2>&1 | tail -1 || true
+        fi
+    done
+    log_info "  [OK] Old Docker images removed"
+
+    if [ "$REBUILD_CODE" = true ]; then
+        log_info "  Step 3: Building Rust binaries..."
+        cd "$PROJECT_DIR"
+        
+        log_info "  Step 3a: Cleaning old build artifacts..."
+        if cargo clean 2>&1 | tail -2; then
+            log_info "  [OK] Build artifacts cleaned"
+        else
+            log_warn "  [WARN] Failed to clean build artifacts (may be in use)"
+        fi
+        
+        BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+        log_info "  Step 3b: Starting build at $BUILD_TIME..."
+        
+        BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor"
+        
+        if [ "$ENTERPRISE_FUSE" = true ]; then
+            log_debug "  Running: $BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
+            BUILD_CMD="$BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
+        else
+            log_debug "  Running: $BUILD_CMD --bin powerfs-fuse"
+            BUILD_CMD="$BUILD_CMD --bin powerfs-fuse"
+        fi
+        
+        if $BUILD_CMD 2>&1 | tail -10; then
+            log_info "  [OK] Rust binaries built successfully"
+        else
+            log_error "  [FAIL] Failed to build Rust binaries"
+            log_error "  Check cargo build output for detailed errors"
+            exit 2
+        fi
     else
-        log_debug "  Running: $BUILD_CMD --bin powerfs-fuse"
-        BUILD_CMD="$BUILD_CMD --bin powerfs-fuse"
-    fi
-    
-    if $BUILD_CMD 2>&1 | tail -10; then
-        log_info "  [OK] Rust binaries built successfully"
-    else
-        log_error "  [FAIL] Failed to build Rust binaries"
-        log_error "  Check cargo build output for detailed errors"
-        exit 2
+        log_info "  Step 3: Skipping Rust code rebuild (use -bb flag to rebuild)"
     fi
 
-    log_info "  Step 2: Building Docker image..."
+    log_info "  Step 4: Building Docker image..."
     cd "$DOCKER_DIR"
     log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml build"
 
     if docker compose -f "$DOCKER_DIR/docker-compose.yml" build 2>&1 | tail -10; then
         log_info "[OK] Docker images built successfully"
-        
-        log_info "  Step 3: Stopping existing containers before restart..."
-        docker compose -f "$DOCKER_DIR/docker-compose.yml" down 2>&1 | tail -5
-        
-        log_info "  [OK] Existing containers stopped"
     else
         log_error "[FAIL] Failed to build Docker images"
         log_error "Check docker compose build output for detailed errors"
@@ -482,6 +512,9 @@ log_info "    FUSE Test Environment Started!"
 log_info "========================================"
 log_info ""
 log_info "Total startup time: $ELAPSED_TIME seconds"
+if [ -n "$BUILD_TIME" ]; then
+    log_info "Build timestamp:    $BUILD_TIME"
+fi
 log_info ""
 log_info "=== Service Status Summary ==="
 
@@ -556,6 +589,8 @@ log_info "  Check all logs:           docker compose logs"
 log_info "  Check specific:           docker logs <container_name>"
 log_info ""
 log_info "=== Build Options ==="
-log_info "  Build with enterprise FUSE:  docker/scripts/start-fuse.sh -b --enterprise"
+log_info "  Build images (cleanup + build):  docker/scripts/start-fuse.sh -b"
+log_info "  Rebuild code + images:           docker/scripts/start-fuse.sh -bb"
+log_info "  Build with enterprise FUSE:      docker/scripts/start-fuse.sh -bb --enterprise"
 log_info ""
 log_info "========================================"

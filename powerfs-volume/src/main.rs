@@ -131,11 +131,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(20)).await;
 
             info!("Requesting initial volumes from master...");
             match master_client.grow("001", "default", 2).await {
                 Ok(response) => {
+                    info!(
+                        "grow response: new_volume_ids={:?}, locations={}, error={}",
+                        response.new_volume_ids,
+                        response.locations.len(),
+                        response.error
+                    );
                     if !response.new_volume_ids.is_empty() {
                         info!(
                             "Received {} new volume IDs from master",

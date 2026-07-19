@@ -222,15 +222,19 @@ impl PowerFuseClient {
             collection, replication
         );
 
-        for attempt in 1..=self.config.max_retry_count {
+        let max_retries = 3;
+        let mut attempt = 0;
+
+        loop {
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
-                    if attempt == self.config.max_retry_count {
+                    attempt += 1;
+                    if attempt >= max_retries {
                         return Err(e);
                     }
                     warn!("Failed to get master channel (attempt {}): {}", attempt, e);
-                    tokio::time::sleep(self.config.retry_delay).await;
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
                     continue;
                 }
             };
@@ -261,32 +265,57 @@ impl PowerFuseClient {
                     return Ok((fid, resp.location, resp.stripe_fids, resp.stripe_locations));
                 }
                 Err(e) => {
+                    attempt += 1;
                     let msg = format!("assign_fid failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
-                    if attempt == self.config.max_retry_count {
+                    if msg.contains("not leader") {
+                        self.try_switch_leader(&msg).await;
+                    }
+                    if attempt >= max_retries {
                         return Err(msg);
                     }
-                    tokio::time::sleep(self.config.retry_delay).await;
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
                 }
             }
         }
+    }
 
-        Err("assign_fid failed after max retries".to_string())
+    async fn try_switch_leader(&self, error_msg: &str) {
+        if let Some(start) = error_msg.find("current leader is ") {
+            let leader_addr = error_msg[start + 18..].trim();
+            if !leader_addr.is_empty() {
+                info!("Trying to switch to leader: {}", leader_addr);
+                if let Some((index, _)) = self
+                    .master_addresses
+                    .iter()
+                    .enumerate()
+                    .find(|(_, addr)| **addr == leader_addr)
+                {
+                    self.current_master_index
+                        .store(index, std::sync::atomic::Ordering::Relaxed);
+                    info!("Switched to leader at index {}", index);
+                }
+            }
+        }
     }
 
     pub async fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
         debug!("lookup_volume: volume_id={}", volume_id.0);
 
-        for attempt in 1..=self.config.max_retry_count {
+        let max_retries = 3;
+        let mut attempt = 0;
+
+        loop {
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
-                    if attempt == self.config.max_retry_count {
+                    attempt += 1;
+                    if attempt >= max_retries {
                         return Err(e);
                     }
                     warn!("Failed to get master channel (attempt {}): {}", attempt, e);
-                    tokio::time::sleep(self.config.retry_delay).await;
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
                     continue;
                 }
             };
@@ -309,18 +338,20 @@ impl PowerFuseClient {
                     return Ok(locations);
                 }
                 Err(e) => {
+                    attempt += 1;
                     let msg = format!("lookup_volume failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
-                    if attempt == self.config.max_retry_count {
+                    if msg.contains("not leader") {
+                        self.try_switch_leader(&msg).await;
+                    }
+                    if attempt >= max_retries {
                         return Err(msg);
                     }
-                    tokio::time::sleep(self.config.retry_delay).await;
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
                 }
             }
         }
-
-        Err("lookup_volume failed after max retries".to_string())
     }
 
     pub async fn write_data(
@@ -786,10 +817,16 @@ impl PowerFuseClient {
         Err("create_entry failed after max retries".to_string())
     }
 
-    pub async fn update_entry(&self, entry: &Entry, client_id: &str) -> Result<(), String> {
+    pub async fn update_entry(
+        &self,
+        entry: &Entry,
+        client_id: &str,
+        expected_size: u64,
+        is_truncate: bool,
+    ) -> Result<u64, String> {
         debug!(
-            "update_entry: name={}, directory={}",
-            entry.name, entry.directory
+            "update_entry: name={}, directory={}, expected_size={}, is_truncate={}",
+            entry.name, entry.directory, expected_size, is_truncate
         );
 
         for attempt in 1..=self.config.max_retry_count {
@@ -809,6 +846,8 @@ impl PowerFuseClient {
             let request = UpdateEntryRequest {
                 entry: Some(entry.clone()),
                 client_id: client_id.to_string(),
+                expected_size,
+                is_truncate,
             };
 
             match client.update_entry(tonic::Request::new(request)).await {
@@ -819,8 +858,8 @@ impl PowerFuseClient {
                             "update_entry failed: master server returned failure".to_string()
                         );
                     }
-                    debug!("update_entry succeeded");
-                    return Ok(());
+                    debug!("update_entry succeeded, actual_size={}", resp.actual_size);
+                    return Ok(resp.actual_size);
                 }
                 Err(e) => {
                     let msg = format!("update_entry failed (attempt {}): {}", attempt, e);
@@ -1797,8 +1836,19 @@ impl SyncFuseClient {
         self.block_with_timeout(self.client.create_entry(entry, client_id))
     }
 
-    pub fn update_entry(&self, entry: &Entry, client_id: &str) -> Result<(), String> {
-        self.block_with_timeout(self.client.update_entry(entry, client_id))
+    pub fn update_entry(
+        &self,
+        entry: &Entry,
+        client_id: &str,
+        expected_size: u64,
+        is_truncate: bool,
+    ) -> Result<u64, String> {
+        self.block_with_timeout(self.client.update_entry(
+            entry,
+            client_id,
+            expected_size,
+            is_truncate,
+        ))
     }
 
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
