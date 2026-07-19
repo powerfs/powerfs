@@ -9,9 +9,22 @@ pub struct Config {
     pub node: NodeConfig,
     pub storage: StorageConfig,
     pub network: NetworkConfig,
+    pub raft: RaftConfig,
     pub reliability: ReliabilityConfig,
     pub performance: PerformanceConfig,
     pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RaftConfig {
+    pub enabled: bool,
+    pub node_id: u64,
+    pub dir: Option<String>,
+    pub peers: Vec<String>,
+    pub advertise_addr: Option<String>,
+    pub election_tick: usize,
+    pub heartbeat_tick: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,9 +114,24 @@ impl Default for Config {
             node: NodeConfig::default(),
             storage: StorageConfig::default(),
             network: NetworkConfig::default(),
+            raft: RaftConfig::default(),
             reliability: ReliabilityConfig::default(),
             performance: PerformanceConfig::default(),
             logging: LoggingConfig::default(),
+        }
+    }
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            node_id: 1,
+            dir: None,
+            peers: Vec::new(),
+            advertise_addr: None,
+            election_tick: 10,
+            heartbeat_tick: 3,
         }
     }
 }

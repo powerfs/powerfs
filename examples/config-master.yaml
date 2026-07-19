@@ -26,7 +26,17 @@ network:
     - "http://master1:9333"
     - "http://master2:9333"
     - "http://master3:9333"
-  raft_port: 9334
+
+raft:
+  enabled: true
+  node_id: 1
+  dir: "/data/powerfs/master/raft"
+  peers:
+    - "master2:9333"
+    - "master3:9333"
+  advertise_addr: "master1:9333"
+  election_tick: 10
+  heartbeat_tick: 3
 
 reliability:
   bitrot_scan_interval_seconds: 3600

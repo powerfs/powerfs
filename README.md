@@ -304,6 +304,27 @@ cargo install --path powerfs-server
 > `cargo build` 而未运行 `scripts/prep.sh`，社区版会因为缺少 `powerfs-fuse/Cargo.toml`
 > 而报错；切换版本后也需要重新运行 `scripts/prep.sh` 以刷新配置。
 
+#### Build with a fresh timestamp and build ID
+
+By default, incremental builds re-use the cached build timestamp from the
+previous run. To force a fresh build timestamp (and a unique build ID) on every
+invocation, use the provided wrapper script:
+
+```bash
+# Defaults to `cargo build` with release-equivalent defaults
+./scripts/build.sh
+
+# Forward arbitrary flags / subcommands
+./scripts/build.sh --release
+./scripts/build.sh build --features enterprise
+./scripts/build.sh test -p powerfs-common
+```
+
+The script exports a unique `POWERFS_BUILD_ID` before invoking cargo, which
+triggers `powerfs-common/build.rs` to re-run and stamp a new `BUILD_TIME` +
+`build_id` into the binary. The build ID is printed in the startup log and can
+be used to distinguish two binaries built from the same commit.
+
 
 ### Quick Start
 
@@ -329,14 +350,51 @@ powerfs mount -d /mnt/powerfs -m localhost:9333
 powerfs master
 
 # Start with custom port and directory
-powerfs master -p 9333 -d /data/master
+powerfs master -P 9333 -D /data/master
 
 # Separate raft and meta directories (for production)
-powerfs master -d /data/master -r /fast-ssd/raft -m /fast-ssd/meta
+powerfs master -D /data/master -r /fast-ssd/raft -m /fast-ssd/meta
 
 # Bind to specific IP
-powerfs master -p 9333 -i 192.168.1.100
+powerfs master -P 9333 --ip 192.168.1.100
+
+# Multi-node Raft cluster (3 masters)
+powerfs master -P 9333 -D /data/master -r /fast-ssd/raft \
+    -i 1 --peer 192.168.1.101:9333 --peer 192.168.1.102:9333 \
+    --advertise-addr 192.168.1.100:9333
 ```
+
+#### Raft Maintenance (Offline Repair Tools)
+
+If the master cannot boot because of a corrupted Raft log, use the offline
+`raft` subcommand to inspect, repair, or reset the Raft DB. **Always stop the
+master node before running these tools.**
+
+```bash
+# Inspect Raft DB integrity (read-only, safe to run anytime)
+powerfs raft --dir /data/master/raft verify
+
+# Repair: delete corrupt log entries and re-normalize applied_index
+# Use this when verify reports corrupt entries and the master won't boot
+powerfs raft --dir /data/master/raft repair
+
+# Reset: wipe the Raft directory and re-initialize as a fresh single node
+# WARNING: all Raft log / snapshot state is lost; meta DB is untouched
+# Only use when repair cannot recover the DB
+powerfs raft --dir /data/master/raft --raft-id 1 reset
+```
+
+**When to use each action:**
+
+| Action | Modifies DB? | Use when | Data loss |
+|--------|-------------|----------|-----------|
+| `verify` | No | Routine health check, diagnosing boot failures | None |
+| `repair` | Yes (deletes corrupt entries) | `verify` reports `corrupt_log_entries > 0` and master won't start | Corrupt log entries only |
+| `reset` | Yes (full wipe + re-init) | `repair` cannot recover, or DB is completely unusable | All Raft state (log + snapshot) |
+
+> **Tip:** After a multi-node failure, reset one node's Raft DB and let the
+> other healthy nodes replicate the state to it. Do not reset all nodes at
+> once — that would permanently lose all cluster state.
 
 #### Start Volume Node
 
@@ -484,34 +542,45 @@ Commands:
   volume   Start volume node (port: 8080, dir: ./data/volume)
   fuse     Mount FUSE filesystem
   mount    Mount filesystem (alias for fuse)
+  raft     Offline Raft maintenance: verify, repair, or reset the Raft log
   help     Print this message or the help of the given subcommand(s)
 
 Options:
       --log-level <LOG_LEVEL>  Log level [default: info]
+      --log-file <LOG_FILE>    Log file path (optional)
   -h, --help                   Print help
   -V, --version                Print version
 
 Master Options:
-  -p, --port <PORT>    Master port [default: 9333]
-  -d, --dir <DIR>      Data directory [default: ./data/master]
-  -r, --raft-dir       Raft log directory [default: <dir>/raft]
-  -m, --meta-dir       Meta storage directory [default: <dir>/meta]
-  -i, --ip <IP>        Bind IP address
-      --s3-port <PORT> S3 Gateway port [default: 9000]
-      --s3-ip <IP>     S3 Gateway bind IP
+  -P, --port <PORT>                Master port [default: 9333]
+  -D, --dir <DIR>                  Data directory (meta, raft will be created inside) [default: ./data/master]
+  -r, --raft-dir <RAFT_DIR>        Raft log directory (default: <dir>/raft)
+  -m, --meta-dir <META_DIR>        Meta storage directory (default: <dir>/meta)
+      --ip <IP>                    Bind IP address
+      --advertise-addr <ADDR>      Advertise address for Raft communication [default: same as bind address]
+  -i, --raft-id <RAFT_ID>          Raft node ID [default: 1]
+  -p, --peer <PEER>                Raft peer addresses (repeatable)
 
 Volume Options:
-  -p, --port <PORT>           Volume port [default: 8080]
-  -d, --dir <DIR>             Data directory [default: ./data/volume]
-  -m, --meta-dir              Meta storage directory [default: <dir>/meta]
-  -d, --data-dir              Data storage directory [default: <dir>/data]
-      --master <MASTER>       Master address
-  -i, --ip <IP>               Bind IP address
-  -s, --max-volume-size <MAX_VOLUME_SIZE>  Max volume size in bytes [default: 1073741824]
+  -P, --port <PORT>           Volume port [default: 8080]
+  -D, --dir <DIR>             Data directory [default: ./data/volume]
+  -m, --meta-dir <META_DIR>   Meta storage directory [default: <dir>/meta]
+  -d, --data-dir <DATA_DIR>   Data storage directory [default: <dir>/data]
+  -M, --master <MASTER>       Master address
+      --ip <IP>               Bind IP address
+  -s, --max-volume-size <S>   Max volume size in bytes [default: 1073741824]
+  -c, --config <CONFIG>       Config file path (YAML) – loads backend type and node params
 
 Mount/Fuse Options:
-  -d, --dir <DIR>      Mount directory
-      --master <MASTER>  Master address
+  -d, --dir <DIR>        Mount directory
+  -m, --master <MASTER>  Master address
+
+Raft Options (Offline Maintenance):
+  -D, --dir <DIR>              Raft directory (same as `master --raft-dir`)
+  -i, --raft-id <RAFT_ID>      Raft node ID (used by `reset`) [default: 1]
+  verify                       Inspect Raft DB integrity (read-only)
+  repair                       Delete corrupt log entries and re-normalize applied_index
+  reset                        Wipe Raft dir and re-initialize as a fresh single node
 ```
 
 ### Run Tests

@@ -40,6 +40,15 @@ network:
     - "http://master2:9333"
     - "http://master3:9333"
 
+raft:
+  enabled: false
+  node_id: 0
+  dir: null
+  peers: []
+  advertise_addr: null
+  election_tick: 10
+  heartbeat_tick: 3
+
 reliability:
   bitrot_scan_interval_seconds: 3600
   bitrot_scan_enabled: true
