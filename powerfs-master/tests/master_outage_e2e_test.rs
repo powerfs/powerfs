@@ -637,7 +637,7 @@ async fn test_generation_increments_on_metadata_changes() {
     }
     updated_entry.generation = 0; // update_entry will assign a new generation
     dir_tree
-        .update_entry(updated_entry, "test_client")
+        .update_entry(updated_entry, "test_client", 0, false)
         .expect("update_entry failed");
 
     let stored_after_update = dir_tree

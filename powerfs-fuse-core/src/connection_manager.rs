@@ -212,7 +212,9 @@ impl MasterConnectionManager {
             health.next_allowed_at = Instant::now() + health.current_backoff;
             log::debug!(
                 "Master {} failure #{}: backing off for {:?}",
-                addr, health.consecutive_failures, health.current_backoff
+                addr,
+                health.consecutive_failures,
+                health.current_backoff
             );
         }
     }
@@ -380,10 +382,6 @@ mod tests {
         let s2 = mgr.health_snapshot().await;
         let b2 = s2.get("m1:9333").unwrap().current_backoff;
         // Second backoff should be ~2x the first.
-        assert!(
-            b2 > b1,
-            "backoff should grow: b1={:?}, b2={:?}",
-            b1, b2
-        );
+        assert!(b2 > b1, "backoff should grow: b1={:?}, b2={:?}", b1, b2);
     }
 }

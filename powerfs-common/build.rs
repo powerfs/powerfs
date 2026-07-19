@@ -44,8 +44,7 @@ fn main() {
     println!("cargo:rustc-env=BUILD_HOST={}", hostname);
 
     // Rustc version
-    let rustc = run_command("rustc", &["--version"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let rustc = run_command("rustc", &["--version"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RUSTC_VERSION={}", rustc);
 
     // Re-run build.rs when POWERFS_BUILD_ID changes (the build wrapper

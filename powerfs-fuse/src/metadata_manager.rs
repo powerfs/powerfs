@@ -431,12 +431,7 @@ impl MetadataManager {
     }
 
     /// 创建硬链接（link）
-    pub fn link(
-        &self,
-        inode: u64,
-        new_dir: u64,
-        new_name: &str,
-    ) -> Result<DirEntry, FsError> {
+    pub fn link(&self, inode: u64, new_dir: u64, new_name: &str) -> Result<DirEntry, FsError> {
         let (old_dir_ino, old_entry_id) = {
             let index = self.inode_index.read().unwrap();
             index
@@ -448,11 +443,9 @@ impl MetadataManager {
         let old_entry = {
             let orset_arc = self.ensure_dir_cache(old_dir_ino);
             let orset = orset_arc.read().unwrap();
-            orset
-                .entries
-                .get(&old_entry_id)
-                .cloned()
-                .ok_or_else(|| FsError::NotFound(format!("link: entry {:?} not found", old_entry_id)))?
+            orset.entries.get(&old_entry_id).cloned().ok_or_else(|| {
+                FsError::NotFound(format!("link: entry {:?} not found", old_entry_id))
+            })?
         };
 
         if old_entry.file_type == FileType::Directory {
@@ -1597,7 +1590,7 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
     let uid = attrs.map(|a| a.uid).unwrap_or(0);
     let gid = attrs.map(|a| a.gid).unwrap_or(0);
     let nlink = attrs.map(|a| a.nlink).unwrap_or(1);
-    let rdev = attrs.map(|a| a.rdev as u64).unwrap_or(0);
+    let rdev = attrs.map(|a| a.rdev).unwrap_or(0);
 
     let file_type = FileType::from_mode(mode_val);
     let chunks: Vec<crate::orset::CachedFileChunk> = proto
@@ -2310,7 +2303,14 @@ mod tests {
             .unwrap();
 
         let updated = mgr
-            .setattr(entry.inode, Some(0o600 | libc::S_IFREG), None, None)
+            .setattr(
+                entry.inode,
+                Some(0o600 | libc::S_IFREG),
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(updated.mode, 0o600 | libc::S_IFREG);
     }
@@ -2323,7 +2323,9 @@ mod tests {
             .unwrap();
         assert_eq!(entry.size, 0);
 
-        let updated = mgr.setattr(entry.inode, None, Some(1024), None).unwrap();
+        let updated = mgr
+            .setattr(entry.inode, None, None, None, Some(1024), None)
+            .unwrap();
         assert_eq!(updated.size, 1024);
     }
 
@@ -2335,7 +2337,7 @@ mod tests {
             .unwrap();
 
         let updated = mgr
-            .setattr(entry.inode, None, None, Some(1234567890))
+            .setattr(entry.inode, None, None, None, None, Some(1234567890))
             .unwrap();
         assert_eq!(updated.mtime, 1234567890);
     }
@@ -2343,7 +2345,7 @@ mod tests {
     #[test]
     fn test_setattr_not_found() {
         let mgr = create_mgr();
-        let result = mgr.setattr(99999, Some(0o644), None, None);
+        let result = mgr.setattr(99999, Some(0o644), None, None, None, None);
         assert!(matches!(result, Err(FsError::NotFound(_))));
     }
 
@@ -2450,7 +2452,8 @@ mod tests {
             .unwrap();
         assert!(mgr.lookup(ROOT_INO, "lifecycle.txt").unwrap().is_some());
 
-        mgr.setattr(entry.inode, None, Some(2048), None).unwrap();
+        mgr.setattr(entry.inode, None, None, None, Some(2048), None)
+            .unwrap();
         let found = mgr.get_entry_by_inode(entry.inode).unwrap().unwrap();
         assert_eq!(found.size, 2048);
 
@@ -2503,6 +2506,9 @@ mod tests {
                     nlink: 1,
                     symlink_target: "".to_string(),
                     file_type: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
@@ -2537,6 +2543,9 @@ mod tests {
                     nlink: 1,
                     symlink_target: "".to_string(),
                     file_type: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
@@ -2582,6 +2591,9 @@ mod tests {
                     nlink: 1,
                     symlink_target: "".to_string(),
                     file_type: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
@@ -2595,6 +2607,9 @@ mod tests {
                     mode: 0o755,
                     size: 200,
                     mtime: 2000,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 0,
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),

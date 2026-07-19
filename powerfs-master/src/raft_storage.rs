@@ -268,9 +268,7 @@ impl RocksDbStorage {
         let cf = match self.db.cf_handle(CF_RAFT_STATE) {
             Some(cf) => cf,
             None => {
-                warn!(
-                    "raft_state column family not found; using default hard/conf state"
-                );
+                warn!("raft_state column family not found; using default hard/conf state");
                 return Ok(());
             }
         };
@@ -306,9 +304,7 @@ impl RocksDbStorage {
         let log_cf = match self.db.cf_handle(CF_RAFT_LOG) {
             Some(cf) => cf,
             None => {
-                warn!(
-                    "raft_log column family not found; starting with empty log"
-                );
+                warn!("raft_log column family not found; starting with empty log");
                 return Ok(());
             }
         };
@@ -603,17 +599,18 @@ impl RocksDbStorage {
             while it.valid() {
                 if let (Some(key), Some(value)) = (it.key(), it.value()) {
                     report.total_log_entries += 1;
-                    let parsed = <Entry as Message>::parse_from_bytes(value)
-                        .ok()
-                        .and_then(|entry| {
-                            let key_str = String::from_utf8(key.to_vec()).ok()?;
-                            let idx = key_str.parse::<u64>().ok()?;
-                            if idx == entry.index {
-                                Some(entry)
-                            } else {
-                                None
-                            }
-                        });
+                    let parsed =
+                        <Entry as Message>::parse_from_bytes(value)
+                            .ok()
+                            .and_then(|entry| {
+                                let key_str = String::from_utf8(key.to_vec()).ok()?;
+                                let idx = key_str.parse::<u64>().ok()?;
+                                if idx == entry.index {
+                                    Some(entry)
+                                } else {
+                                    None
+                                }
+                            });
                     match parsed {
                         Some(entry) => {
                             report.valid_log_entries += 1;
@@ -654,17 +651,18 @@ impl RocksDbStorage {
             it.seek_to_first();
             while it.valid() {
                 if let (Some(key), Some(value)) = (it.key(), it.value()) {
-                    let valid = <Entry as Message>::parse_from_bytes(value)
-                        .ok()
-                        .and_then(|entry| {
-                            let key_str = String::from_utf8(key.to_vec()).ok()?;
-                            let idx = key_str.parse::<u64>().ok()?;
-                            if idx == entry.index {
-                                Some(idx)
-                            } else {
-                                None
-                            }
-                        });
+                    let valid =
+                        <Entry as Message>::parse_from_bytes(value)
+                            .ok()
+                            .and_then(|entry| {
+                                let key_str = String::from_utf8(key.to_vec()).ok()?;
+                                let idx = key_str.parse::<u64>().ok()?;
+                                if idx == entry.index {
+                                    Some(idx)
+                                } else {
+                                    None
+                                }
+                            });
                     match valid {
                         Some(idx) => last_valid = Some(idx),
                         None => to_delete.push(key.to_vec()),

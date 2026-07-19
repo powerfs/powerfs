@@ -58,11 +58,7 @@ impl BuildInfo {
         log::info!("====== PowerFS Build Info ======");
         log::info!("  Component:    {}", self.component);
         log::info!("  Version:      {}", self.version);
-        log::info!(
-            "  Git Commit:   {} ({})",
-            self.git_commit,
-            self.git_branch
-        );
+        log::info!("  Git Commit:   {} ({})", self.git_commit, self.git_branch);
         log::info!("  Build Time:   {}", self.build_time);
         log::info!("  Build ID:     {}", self.build_id);
         log::info!("  Build Host:   {}", self.build_host);

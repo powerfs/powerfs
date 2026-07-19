@@ -242,9 +242,7 @@ impl PowerFuseClient {
     /// error should extract the leader address from the error message and
     /// pass it here so the next connection attempt targets it directly.
     pub async fn set_leader_hint(&self, leader_addr: Option<String>) {
-        self.connection_manager
-            .set_leader_hint(leader_addr)
-            .await;
+        self.connection_manager.set_leader_hint(leader_addr).await;
     }
 
     pub async fn invalidate_volume_channel(&self, addr: &str) {

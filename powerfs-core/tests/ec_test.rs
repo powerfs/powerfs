@@ -2,8 +2,10 @@ use powerfs_core::ec_thread::{EcConfig, EcEncoder, EcThreadPool};
 
 #[tokio::test]
 async fn test_ec_encoder_encode_basic() {
-    let mut config = EcConfig::default();
-    config.min_small_file_size = 0;
+    let config = EcConfig {
+        min_small_file_size: 0,
+        ..Default::default()
+    };
     let encoder = EcEncoder::new(config);
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -69,8 +71,10 @@ async fn test_ec_encoder_can_recover() {
 
 #[tokio::test]
 async fn test_ec_thread_pool_encode() {
-    let mut config = EcConfig::default();
-    config.min_small_file_size = 0;
+    let config = EcConfig {
+        min_small_file_size: 0,
+        ..Default::default()
+    };
     let ec_pool = EcThreadPool::start(config.clone());
 
     let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];

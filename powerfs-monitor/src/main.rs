@@ -2584,11 +2584,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder.init();
 
     // Emit build info (version, git commit, build time, etc.) at startup.
-    powerfs_common::BuildInfo::current(
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-    )
-    .log_startup();
+    powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        .log_startup();
 
     info!("Starting PowerFS Monitor Service...");
     info!("Listening on: {}", args.addr);

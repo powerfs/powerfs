@@ -53,9 +53,11 @@ async fn test_ec_performance_benchmark() {
     let mut results = Vec::new();
 
     for (name, backend) in backends {
-        let mut config = EcConfig::default();
-        config.simd_backend = backend.clone();
-        config.min_small_file_size = 0;
+        let config = EcConfig {
+            simd_backend: backend.clone(),
+            min_small_file_size: 0,
+            ..Default::default()
+        };
 
         let effective = backend.effective_backend();
 
@@ -105,13 +107,17 @@ async fn test_ec_parallel_vs_serial() {
     let data_size = 4 * 1024 * 1024;
     let iterations = 3;
 
-    let mut parallel_config = EcConfig::default();
-    parallel_config.min_small_file_size = 0;
-    parallel_config.parallel_encoding = true;
+    let parallel_config = EcConfig {
+        min_small_file_size: 0,
+        parallel_encoding: true,
+        ..Default::default()
+    };
 
-    let mut serial_config = EcConfig::default();
-    serial_config.min_small_file_size = 0;
-    serial_config.parallel_encoding = false;
+    let serial_config = EcConfig {
+        min_small_file_size: 0,
+        parallel_encoding: false,
+        ..Default::default()
+    };
 
     let (parallel_time, parallel_throughput, _) =
         benchmark_encode_single(data_size, iterations, &parallel_config);
@@ -157,9 +163,11 @@ async fn test_ec_thread_pool_benchmark() {
     println!("Iterations: {}\n", iterations);
 
     for (name, backend) in configs {
-        let mut config = EcConfig::default();
-        config.simd_backend = backend;
-        config.min_small_file_size = 0;
+        let config = EcConfig {
+            simd_backend: backend,
+            min_small_file_size: 0,
+            ..Default::default()
+        };
 
         let ec_pool = EcThreadPool::start(config.clone());
         let data: Vec<u8> = (0..data_size).map(|i| i as u8).collect();

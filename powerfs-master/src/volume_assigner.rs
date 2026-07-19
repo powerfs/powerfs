@@ -177,8 +177,7 @@ impl SmartVolumeAssigner {
                 let remaining_candidates = scored
                     .iter()
                     .filter(|(n, _)| {
-                        !selected.iter().any(|s| s.id == n.id)
-                            && !used_racks.contains(&n.rack_id.0)
+                        !selected.iter().any(|s| s.id == n.id) && !used_racks.contains(&n.rack_id.0)
                     })
                     .count();
                 let needed = replica_count - selected.len();
@@ -526,12 +525,10 @@ mod tests {
     #[test]
     fn test_smart_failslow_severity() {
         let assigner = SmartVolumeAssigner;
-        let mut low_severity =
-            make_node("low", "r1", "dc1", NodeState::FailSlow, 10, 100, 0);
+        let mut low_severity = make_node("low", "r1", "dc1", NodeState::FailSlow, 10, 100, 0);
         low_severity.degrade_severity = 20;
         low_severity.degrade_type = Some(DegradeType::NetworkDegrade);
-        let mut high_severity =
-            make_node("high", "r1", "dc1", NodeState::FailSlow, 10, 100, 0);
+        let mut high_severity = make_node("high", "r1", "dc1", NodeState::FailSlow, 10, 100, 0);
         high_severity.degrade_severity = 90;
         high_severity.degrade_type = Some(DegradeType::NetworkDegrade);
         let healthy = make_node("healthy", "r1", "dc1", NodeState::Healthy, 10, 100, 0);
@@ -557,8 +554,7 @@ mod tests {
     #[test]
     fn test_smart_soft_error_deprioritized() {
         let assigner = SmartVolumeAssigner;
-        let mut soft =
-            make_node("soft", "r1", "dc1", NodeState::SoftError, 10, 100, 0);
+        let mut soft = make_node("soft", "r1", "dc1", NodeState::SoftError, 10, 100, 0);
         soft.soft_error_type = Some(SoftErrorType::CpuPressure);
         let healthy = make_node("healthy", "r1", "dc1", NodeState::Healthy, 10, 100, 0);
         let nodes = vec![soft, healthy];

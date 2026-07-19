@@ -106,7 +106,7 @@ fn test_filer_update_entry() {
     }
     file_entry.content_size = 1024;
 
-    let result = tree.update_entry(file_entry, "test_client");
+    let result = tree.update_entry(file_entry, "test_client", 0, false);
     assert!(result.is_ok());
 
     let found = tree.lookup(1, "update_test.txt");

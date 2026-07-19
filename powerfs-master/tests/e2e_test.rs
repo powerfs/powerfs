@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -9,12 +9,14 @@ async fn test_raft_grpc_basic() {
     std::fs::create_dir_all(&db_path).unwrap();
 
     let leader_state = Arc::new(AtomicBool::new(true));
+    let leader_address = Arc::new(RwLock::new(String::new()));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
         leader_state,
+        leader_address,
     )
     .unwrap();
 
@@ -23,18 +25,20 @@ async fn test_raft_grpc_basic() {
 }
 
 #[tokio::test]
-async fn test_cluster_info_endpoint() {
+async fn test_raft_grpc_with_peer() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("cluster_info");
     std::fs::create_dir_all(&db_path).unwrap();
 
     let leader_state = Arc::new(AtomicBool::new(true));
+    let leader_address = Arc::new(RwLock::new(String::new()));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
         leader_state,
+        leader_address,
     )
     .unwrap();
 
@@ -136,12 +140,14 @@ async fn test_raft_node_lifecycle() {
     std::fs::create_dir_all(&db_path).unwrap();
 
     let leader_state = Arc::new(AtomicBool::new(true));
+    let leader_address = Arc::new(RwLock::new(String::new()));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
         leader_state,
+        leader_address,
     )
     .unwrap();
 

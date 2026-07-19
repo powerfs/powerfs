@@ -1313,12 +1313,8 @@ impl MasterNode {
             preferred_node: preferred_node.map(|s| s.to_string()),
         };
         let assigner = SmartVolumeAssigner;
-        let assigned_nodes = assigner.assign_with_context(
-            volume_id.0,
-            &nodes,
-            replica_count as usize,
-            &ctx,
-        );
+        let assigned_nodes =
+            assigner.assign_with_context(volume_id.0, &nodes, replica_count as usize, &ctx);
 
         if assigned_nodes.is_empty() {
             return Err(PowerFsError::InvalidRequest(
@@ -1374,7 +1370,10 @@ impl MasterNode {
         info!(
             "Assigned volume (smart): {} to nodes: {:?}, fid: {},{},{}, preferred={:?}",
             volume_id,
-            assigned_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            assigned_nodes
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>(),
             volume_id.0,
             cookie,
             file_key,

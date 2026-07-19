@@ -223,13 +223,7 @@ impl DirEntry {
         }
     }
 
-    pub fn new_chrdev(
-        id: EntryId,
-        inode: u64,
-        parent_ino: u64,
-        mode: u32,
-        rdev: u64,
-    ) -> Self {
+    pub fn new_chrdev(id: EntryId, inode: u64, parent_ino: u64, mode: u32, rdev: u64) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -251,13 +245,7 @@ impl DirEntry {
         }
     }
 
-    pub fn new_blkdev(
-        id: EntryId,
-        inode: u64,
-        parent_ino: u64,
-        mode: u32,
-        rdev: u64,
-    ) -> Self {
+    pub fn new_blkdev(id: EntryId, inode: u64, parent_ino: u64, mode: u32, rdev: u64) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -616,6 +604,7 @@ impl DirORSet {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_attr(
         &mut self,
         inode: u64,

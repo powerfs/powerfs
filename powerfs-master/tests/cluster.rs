@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use log::info;
@@ -339,12 +339,14 @@ impl ClusterBuilder {
             }
 
             let leader_state = Arc::new(AtomicBool::new(peers.is_empty()));
+            let leader_address = Arc::new(RwLock::new(String::new()));
             let node = RaftNode::new(
                 id,
                 address.clone(),
                 peers,
                 db_path.to_str().unwrap(),
                 leader_state,
+                leader_address,
             )
             .expect("Failed to create Raft node");
 

@@ -310,7 +310,7 @@ fn test_update_notification_contains_epoch() {
         }),
         ..Entry::default()
     };
-    tree.update_entry(updated_entry, "test_client")
+    tree.update_entry(updated_entry, "test_client", 0, false)
         .expect("update_entry failed");
 
     let notif = rx.try_recv().expect("Should receive UPDATE notification");
@@ -688,7 +688,7 @@ fn test_all_event_types_carry_epoch() {
     if let Some(ref mut attrs) = updated_entry.attributes {
         attrs.size = 42;
     }
-    tree.update_entry(updated_entry, "test_client")
+    tree.update_entry(updated_entry, "test_client", 0, false)
         .expect("update failed");
     let notif_update = rx.try_recv().expect("Should receive UPDATE");
     assert_eq!(notif_update.event_type, EventType::Update as i32);

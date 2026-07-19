@@ -462,8 +462,8 @@ mod stress_test {
         let mut file = File::create(&file_path).expect("Failed to create large file");
 
         let mut buffer = vec![0u8; 64 * 1024];
-        for i in 0..buffer.len() {
-            buffer[i] = (i % 256) as u8;
+        for (i, b) in buffer.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
         }
 
         for _ in 0..(TEST_FILE_SIZE / (64 * 1024)) {
@@ -487,13 +487,8 @@ mod stress_test {
         for i in 0..(TEST_FILE_SIZE / (64 * 1024)) {
             file.read_exact(&mut verify_buf)
                 .expect("Failed to read chunk");
-            for j in 0..verify_buf.len() {
-                assert_eq!(
-                    verify_buf[j],
-                    (j % 256) as u8,
-                    "Data corruption in chunk {}",
-                    i
-                );
+            for (j, &b) in verify_buf.iter().enumerate() {
+                assert_eq!(b, (j % 256) as u8, "Data corruption in chunk {}", i);
             }
         }
 

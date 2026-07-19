@@ -268,11 +268,8 @@ async fn main() -> Result<()> {
     builder.init();
 
     // Emit build info (version, git commit, build time, etc.) at startup.
-    powerfs_common::BuildInfo::current(
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-    )
-    .log_startup();
+    powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        .log_startup();
 
     match cli.command {
         Commands::Master {
@@ -352,7 +349,10 @@ async fn main() -> Result<()> {
 /// on the master's Raft directory. Runs synchronously (no tokio runtime needed
 /// beyond the main one) and exits with an error if any operation fails.
 fn run_raft(dir: &str, raft_id: u64, action: RaftAction) -> Result<()> {
-    info!("Raft maintenance: dir={}, action={:?}, raft_id={}", dir, action, raft_id);
+    info!(
+        "Raft maintenance: dir={}, action={:?}, raft_id={}",
+        dir, action, raft_id
+    );
 
     match action {
         RaftAction::Verify => {
@@ -392,26 +392,20 @@ fn print_verify_report(report: &RaftVerifyReport) {
         println!("  Open error:           {}", err);
     }
     if let Some((term, vote, commit)) = report.hard_state {
-        println!("  Hard state:           term={}, vote={}, commit={}", term, vote, commit);
+        println!(
+            "  Hard state:           term={}, vote={}, commit={}",
+            term, vote, commit
+        );
     } else {
         println!("  Hard state:           <missing or unreadable>");
     }
-    println!(
-        "  Conf state voters:    {:?}",
-        report.conf_state_voters
-    );
-    println!(
-        "  Applied index:        {:?}",
-        report.applied_index
-    );
+    println!("  Conf state voters:    {:?}", report.conf_state_voters);
+    println!("  Applied index:        {:?}", report.applied_index);
     println!(
         "  Log entries:          total={}, valid={}, corrupt={}",
         report.total_log_entries, report.valid_log_entries, report.corrupt_log_entries
     );
-    println!(
-        "  Last valid index:     {:?}",
-        report.last_valid_index
-    );
+    println!("  Last valid index:     {:?}", report.last_valid_index);
     println!(
         "  Snapshot:             index={:?}, term={:?}",
         report.snapshot_index, report.snapshot_term

@@ -680,7 +680,14 @@ impl DirectoryTree {
         let mtime_val = entry.attributes.as_ref().map(|a| a.mtime);
         let nlink_val = entry.attributes.as_ref().map(|a| a.nlink);
         orset.update_attr(
-            ino, mode_val, uid_val, gid_val, size_val, mtime_val, nlink_val, client_id_num,
+            ino,
+            mode_val,
+            uid_val,
+            gid_val,
+            size_val,
+            mtime_val,
+            nlink_val,
+            client_id_num,
         );
 
         Ok(final_size)
