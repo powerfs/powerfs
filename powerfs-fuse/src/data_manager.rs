@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use log::debug;
+use log::{debug, warn};
 
 use crate::cache::ChunkCache;
 
@@ -150,6 +150,22 @@ impl DataManager {
     /// 写入 chunk 缓存 + write buffer，并更新本地文件大小。
     /// 返回实际写入的字节数。
     pub fn write(&self, ino: u64, offset: u64, data: &[u8]) -> u64 {
+        // 调试：检测全 0 写入（cp 正常写入不会全 0）
+        if !data.is_empty() && data.iter().all(|&b| b == 0) {
+            warn!(
+                "DataManager::write: ALL ZEROS! ino={}, offset={}, size={}",
+                ino,
+                offset,
+                data.len()
+            );
+        } else {
+            debug!(
+                "DataManager::write: ino={}, offset={}, size={}",
+                ino,
+                offset,
+                data.len()
+            );
+        }
         let end = offset + data.len() as u64;
 
         // 修复：本地维护文件大小，无需 RPC

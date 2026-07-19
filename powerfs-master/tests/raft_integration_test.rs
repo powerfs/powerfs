@@ -1,5 +1,7 @@
 //! Multi-node Raft integration tests
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use log::info;
@@ -20,11 +22,13 @@ async fn test_single_node_is_leader() {
     let db_path = temp_dir.path().join("raft_1");
     std::fs::create_dir_all(&db_path).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
         vec![],
         db_path.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node");
 
@@ -69,6 +73,7 @@ async fn test_two_node_election() {
     let db_path2 = temp_dir2.path().join("raft_2");
     std::fs::create_dir_all(&db_path2).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(false));
     let node1 = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
@@ -77,9 +82,11 @@ async fn test_two_node_election() {
             address: "127.0.0.1:10002".to_string(),
         }],
         db_path1.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 1");
 
+    let leader_state = Arc::new(AtomicBool::new(false));
     let node2 = RaftNode::new(
         2,
         "127.0.0.1:10002".to_string(),
@@ -88,6 +95,7 @@ async fn test_two_node_election() {
             address: "127.0.0.1:10001".to_string(),
         }],
         db_path2.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 2");
 
@@ -138,11 +146,13 @@ async fn test_snapshot_creation() {
     let db_path = temp_dir.path().join("raft_1");
     std::fs::create_dir_all(&db_path).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
         vec![],
         db_path.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node");
 
@@ -211,11 +221,13 @@ async fn test_snapshot_creation() {
     let db_path2 = temp_dir2.path().join("raft_2");
     std::fs::create_dir_all(&db_path2).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node2 = RaftNode::new(
         1,
         "127.0.0.1:10002".to_string(),
         vec![],
         db_path2.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node");
 
@@ -255,27 +267,33 @@ async fn test_three_node_failover() {
     let db_path3 = temp_dir3.path().join("raft_3");
     std::fs::create_dir_all(&db_path3).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node1 = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
         vec![],
         db_path1.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 1");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node2 = RaftNode::new(
         2,
         "127.0.0.1:10002".to_string(),
         vec![],
         db_path2.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 2");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node3 = RaftNode::new(
         3,
         "127.0.0.1:10003".to_string(),
         vec![],
         db_path3.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 3");
 
@@ -398,27 +416,33 @@ async fn test_state_machine_consistency() {
     let db_path3 = temp_dir3.path().join("raft_3");
     std::fs::create_dir_all(&db_path3).expect("Failed to create db dir");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node1 = RaftNode::new(
         1,
         "127.0.0.1:10001".to_string(),
         vec![],
         db_path1.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 1");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node2 = RaftNode::new(
         2,
         "127.0.0.1:10002".to_string(),
         vec![],
         db_path2.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 2");
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let mut node3 = RaftNode::new(
         3,
         "127.0.0.1:10003".to_string(),
         vec![],
         db_path3.to_str().unwrap(),
+        leader_state,
     )
     .expect("Failed to create Raft node 3");
 

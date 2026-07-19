@@ -4,8 +4,9 @@ use powerfs_master::proto::{
     powerfs::master_service_client::MasterServiceClient, Heartbeat, VolumeGrowRequest,
     VolumeGrowResponse, VolumeShortInfo,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 use tonic::transport::Channel;
@@ -22,6 +23,7 @@ pub struct MasterClient {
     public_url: String,
     ip: String,
     heartbeat_tx: Arc<broadcast::Sender<Heartbeat>>,
+    heartbeat_running: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -38,7 +40,7 @@ pub struct NewMasterClientParams<'a> {
 
 impl MasterClient {
     pub fn new(params: NewMasterClientParams<'_>) -> Self {
-        let (tx, _) = broadcast::channel(10);
+        let (tx, _) = broadcast::channel(100);
 
         MasterClient {
             master_addresses: params
@@ -55,6 +57,7 @@ impl MasterClient {
             public_url: params.public_url.to_string(),
             ip: params.ip.to_string(),
             heartbeat_tx: Arc::new(tx),
+            heartbeat_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -67,10 +70,9 @@ impl MasterClient {
     }
 
     fn next_master(&self) {
-        let len = self.master_addresses.len();
         let current = self.current_master_index.load(Ordering::Relaxed);
-        self.current_master_index
-            .store((current + 1) % len, Ordering::Relaxed);
+        let next = (current + 1) % self.master_addresses.len();
+        self.current_master_index.store(next, Ordering::Relaxed);
     }
 
     async fn try_connect(
@@ -87,76 +89,102 @@ impl MasterClient {
 
             match Channel::from_shared(address)?.connect().await {
                 Ok(channel) => {
-                    info!("Connected to master: {}", addr);
                     return Ok((MasterServiceClient::new(channel), addr));
                 }
                 Err(e) => {
                     warn!("Failed to connect to master {}: {}", addr, e);
-                    self.next_master();
                     tried += 1;
                     if tried >= max_tries {
-                        break;
+                        return Err("Failed to connect to any master node".into());
                     }
+                    self.next_master();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
         }
-
-        Err("Failed to connect to any master node".into())
     }
 
     pub async fn start_heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self
+            .heartbeat_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            info!("VOLUME_HEARTBEAT: heartbeat already running, skipping");
+            return Ok(());
+        }
+
+        info!("VOLUME_HEARTBEAT: initializing heartbeat connection");
+
+        let client_clone = self.clone();
+
+        tokio::spawn(async move {
+            client_clone.run_heartbeat_daemon().await;
+            client_clone
+                .heartbeat_running
+                .store(false, Ordering::Release);
+        });
+
+        Ok(())
+    }
+
+    async fn run_heartbeat_daemon(&self) {
+        loop {
+            match self.run_heartbeat_session().await {
+                Ok(_) => {
+                    info!("VOLUME_HEARTBEAT: heartbeat session completed");
+                }
+                Err(e) => {
+                    warn!("VOLUME_HEARTBEAT: session error: {}", e);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.next_master();
+        }
+    }
+
+    async fn run_heartbeat_session(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (mut client, addr) = self.try_connect().await?;
 
         let rx = self.heartbeat_tx.subscribe();
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| r.ok());
 
-        let response_stream = match client.send_heartbeat(tonic::Request::new(stream)).await {
-            Ok(rs) => rs,
-            Err(e) => {
-                warn!("Failed to send heartbeat stream to {}: {}", addr, e);
-                self.next_master();
-                return Box::pin(self.start_heartbeat()).await;
-            }
-        };
+        info!("VOLUME_HEARTBEAT: connected to master at {}", addr);
 
+        let response_stream = client.send_heartbeat(tonic::Request::new(stream)).await?;
         let mut responses = response_stream.into_inner();
+
         let master_addresses = self.master_addresses.clone();
         let current_master_index = self.current_master_index.clone();
 
-        tokio::spawn(async move {
-            while let Some(response) = responses.next().await {
-                match response {
-                    Ok(resp) => {
-                        debug!(
-                            "Heartbeat response: leader={}, volume_size_limit={}",
-                            resp.leader, resp.volume_size_limit
-                        );
+        while let Some(response) = responses.next().await {
+            match response {
+                Ok(resp) => {
+                    debug!(
+                        "Heartbeat response: leader={}, volume_size_limit={}",
+                        resp.leader, resp.volume_size_limit
+                    );
 
-                        if !resp.leader.is_empty() {
-                            if let Some(idx) =
-                                master_addresses.iter().position(|a| a.eq(&resp.leader))
-                            {
-                                let current = current_master_index.load(Ordering::Relaxed);
-                                if idx != current {
-                                    info!("Switching to leader master: {}", resp.leader);
-                                    current_master_index.store(idx, Ordering::Relaxed);
-                                }
+                    if !resp.leader.is_empty() {
+                        if let Some(idx) = master_addresses.iter().position(|a| a.eq(&resp.leader))
+                        {
+                            let current = current_master_index.load(Ordering::Relaxed);
+                            if idx != current {
+                                info!("Switching to leader master: {}", resp.leader);
+                                current_master_index.store(idx, Ordering::Relaxed);
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("Heartbeat error: {}", e);
-                        break;
-                    }
+                }
+                Err(e) => {
+                    warn!("Heartbeat stream error: {}", e);
+                    return Err(e.into());
                 }
             }
-            warn!("Heartbeat stream ended, reconnecting...");
-            current_master_index.store(
-                (current_master_index.load(Ordering::Relaxed) + 1) % master_addresses.len(),
-                Ordering::Relaxed,
-            );
-        });
+        }
 
+        warn!("Heartbeat stream closed by master");
         Ok(())
     }
 
@@ -207,38 +235,39 @@ impl MasterClient {
                     let request = VolumeGrowRequest {
                         replication: replication.to_string(),
                         collection: collection.to_string(),
-                        ttl: String::new(),
+                        ttl: "".to_string(),
                         data_center: self.data_center.clone(),
                         rack: self.rack.clone(),
-                        data_node: self.node_id.0.clone(),
-                        disk_type: String::new(),
+                        data_node: "".to_string(),
+                        disk_type: "".to_string(),
                         count,
                     };
 
-                    match client.volume_grow(tonic::Request::new(request)).await {
+                    match client.volume_grow(request).await {
                         Ok(response) => {
-                            info!("Volume grow successful via master: {}", addr);
                             return Ok(response.into_inner());
                         }
                         Err(e) => {
-                            warn!("Volume grow failed on master {}: {}", addr, e);
-                            self.next_master();
+                            warn!("Failed to grow volumes via {}: {}", addr, e);
                             tried += 1;
+                            if tried >= max_tries {
+                                return Err(e.into());
+                            }
+                            self.next_master();
+                            tokio::time::sleep(Duration::from_secs(3)).await;
                         }
                     }
                 }
                 Err(e) => {
                     warn!("Failed to connect to master {}: {}", addr, e);
-                    self.next_master();
                     tried += 1;
+                    if tried >= max_tries {
+                        return Err(e.into());
+                    }
+                    self.next_master();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
-
-            if tried >= max_tries {
-                break;
-            }
         }
-
-        Err("Failed to grow volumes via any master node".into())
     }
 }

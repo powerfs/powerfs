@@ -9,9 +9,9 @@
 #      （企业版包含 powerfs-fuse-enterprise，社区版不包含）
 #
 # 用法：
-#   ./prep.sh              # 自动检测版本并配置
-#   ./prep.sh community    # 强制按社区版配置
-#   ./prep.sh enterprise   # 强制按企业版配置
+#   ./scripts/prep.sh              # 自动检测版本并配置
+#   ./scripts/prep.sh community    # 强制按社区版配置
+#   ./scripts/prep.sh enterprise   # 强制按企业版配置
 
 set -euo pipefail
 

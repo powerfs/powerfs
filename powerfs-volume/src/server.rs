@@ -67,6 +67,47 @@ impl VolumeServer {
 
         self.start_node_status_publisher().await;
 
+        // 内存泄漏诊断任务：每 30 秒打印一次关键指标
+        tokio::spawn(async move {
+            let mut prev_snapshot: Option<powerfs_master::tracking_allocator::AllocSnapshot> = None;
+            let mut prev_vm_rss: u64 = 0;
+            let mut tick = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                tick += 1;
+
+                let snap = powerfs_master::tracking_allocator::ALLOC_STATS.snapshot();
+                let vm = powerfs_master::tracking_allocator::read_self_vm();
+                let (rss_kb, data_kb, peak_kb) = vm.unwrap_or((0, 0, 0));
+
+                let (delta_live_kb, delta_alloc_mb) = if let Some(prev) = prev_snapshot {
+                    let d_live = snap.live_bytes().saturating_sub(prev.live_bytes());
+                    let d_alloc = snap.alloc_bytes.saturating_sub(prev.alloc_bytes);
+                    (d_live / 1024, d_alloc / 1024 / 1024)
+                } else {
+                    (0, 0)
+                };
+                let delta_rss_kb = rss_kb.saturating_sub(prev_vm_rss);
+
+                info!(
+                    "MEM_DIAG_VOLUME tick={} rss_mb={} data_mb={} peak_mb={} live_mb={} live_cnt={} \
+                     delta_live_kb={} delta_rss_kb={} delta_alloc_mb={}",
+                    tick,
+                    rss_kb / 1024,
+                    data_kb / 1024,
+                    peak_kb / 1024,
+                    snap.live_bytes() / 1024 / 1024,
+                    snap.live_count(),
+                    delta_live_kb,
+                    delta_rss_kb,
+                    delta_alloc_mb,
+                );
+
+                prev_snapshot = Some(snap);
+                prev_vm_rss = rss_kb;
+            }
+        });
+
         Server::builder()
             .http2_keepalive_timeout(Some(Duration::from_secs(30)))
             .http2_keepalive_interval(Some(Duration::from_secs(10)))

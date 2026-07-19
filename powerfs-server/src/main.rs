@@ -17,12 +17,18 @@ use powerfs_master::{
     s3::master_client::S3MasterClient,
     s3::MasterApi,
     s3::S3Server,
+    tracking_allocator::TrackingAllocator,
 };
 use powerfs_volume::{
     master_client::{MasterClient, NewMasterClientParams},
     server::VolumeServer,
 };
 use std::fs::{self, File};
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator {
+    inner: tikv_jemallocator::Jemalloc,
+};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -179,6 +185,26 @@ enum Commands {
 #[tokio::main]
 #[allow(clippy::result_large_err)]
 async fn main() -> Result<()> {
+    let test_vec: Vec<u8> = vec![0u8; 1024];
+    let snap = powerfs_master::tracking_allocator::ALLOC_STATS.snapshot();
+    println!(
+        "ALLOCATOR_TEST: alloc_bytes={}, alloc_count={}, live_bytes={}, live_cnt={}",
+        snap.alloc_bytes,
+        snap.alloc_count,
+        snap.live_bytes(),
+        snap.live_count()
+    );
+
+    drop(test_vec);
+    let snap2 = powerfs_master::tracking_allocator::ALLOC_STATS.snapshot();
+    println!(
+        "ALLOCATOR_TEST_AFTER_DROP: alloc_bytes={}, alloc_count={}, live_bytes={}, live_cnt={}",
+        snap2.alloc_bytes,
+        snap2.alloc_count,
+        snap2.live_bytes(),
+        snap2.live_count()
+    );
+
     let cli = Cli::parse();
 
     let mut builder = env_logger::Builder::from_env(

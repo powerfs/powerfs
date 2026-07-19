@@ -4,6 +4,7 @@ use log::{info, warn};
 use powerfs_common::types::NodeId;
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::Message as EraftpbMessage;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -55,6 +56,10 @@ impl RaftService for RaftGrpcServer {
         &self,
         request: Request<Streaming<RaftMessage>>,
     ) -> Result<Response<Self::RaftMessageStreamStream>, Status> {
+        static RAFT_STREAM_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = RAFT_STREAM_COUNT.fetch_add(1, Ordering::Relaxed);
+        info!("RAFT_STREAM_DEBUG: raft_message_stream call #{}", count);
+
         let mut incoming_stream = request.into_inner();
         let step_tx = self.master.raft_step_tx();
         let message_tx = self.master.raft_message_tx();
@@ -80,17 +85,25 @@ impl RaftService for RaftGrpcServer {
         let tx_clone = tx.clone();
         tokio::spawn(async move {
             let mut message_rx = message_tx.subscribe();
+            info!(
+                "RAFT_STREAM_DEBUG: subscribed to broadcast channel for stream #{}",
+                count
+            );
             while let Ok(msg) = message_rx.recv().await {
                 let raft_msg = RaftMessage {
                     from_id: master_clone.id().to_string().parse().unwrap_or(0),
                     to_id: msg.to_id,
-                    message: msg.message,
+                    message: msg.message.to_vec(),
                 };
                 if tx_clone.send(Ok(raft_msg)).await.is_err() {
                     warn!("Failed to send raft message to stream");
                     break;
                 }
             }
+            info!(
+                "RAFT_STREAM_DEBUG: unsubscribed from broadcast channel for stream #{}",
+                count
+            );
         });
 
         let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

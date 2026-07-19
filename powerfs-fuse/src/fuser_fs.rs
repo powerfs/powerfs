@@ -328,6 +328,13 @@ impl PowerFsFuserFs {
 
         for (_chunk_idx, chunk_offset, data, mtime, crc32) in &dirty_chunk_data {
             let data_len = data.len();
+            // 调试：检测全 0 chunk（正常 flush 不应全 0）
+            if !data.is_empty() && data.iter().all(|&b| b == 0) {
+                warn!(
+                    "flush_dirty_chunks: ALL ZEROS chunk! ino={}, chunk_offset={}, size={}",
+                    inode, chunk_offset, data_len
+                );
+            }
             blob_entries.push((*chunk_offset as i64, data_len as i32, data.clone(), 0u32));
 
             new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
@@ -675,11 +682,11 @@ impl Filesystem for PowerFsFuserFs {
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => {
-                error!("getattr: inode {} not found", inode);
+                warn!("getattr: inode {} not found (ENOENT)", inode);
                 reply.error(libc::ENOENT);
             }
             Err(e) => {
-                error!("getattr: inode={}, error={}", inode, e);
+                error!("getattr: inode={}, error={:?}", inode, e);
                 reply.error(e.to_errno());
             }
         }
@@ -710,6 +717,19 @@ impl Filesystem for PowerFsFuserFs {
 
         // 处理 truncate（size 变更）
         if let Some(new_size) = size {
+            // 调试：记录 truncate 操作（cp -p 不应触发 size 变更）
+            let current_size = self.get_file_size(inode);
+            if new_size < current_size {
+                warn!(
+                    "setattr: TRUNCATE shrinking! inode={}, current={}, new={}",
+                    inode, current_size, new_size
+                );
+            } else if new_size == 0 {
+                warn!(
+                    "setattr: TRUNCATE to ZERO! inode={}, current={}",
+                    inode, current_size
+                );
+            }
             self.data.truncate(inode, new_size);
         }
 
@@ -969,13 +989,17 @@ impl Filesystem for PowerFsFuserFs {
 
         match self.meta.symlink(parent, name_str, target_str) {
             Ok(entry) => {
+                debug!(
+                    "symlink: created name={} -> target={}, inode={}, parent={}",
+                    name_str, target_str, entry.inode, parent
+                );
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
                 self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
                 error!(
-                    "symlink: parent={}, name={}, target={}, error={}",
+                    "symlink: FAILED parent={}, name={}, target={}, error={:?}",
                     parent, name_str, target_str, e
                 );
                 reply.error(e.to_errno());
@@ -1031,6 +1055,15 @@ impl Filesystem for PowerFsFuserFs {
         // 先尝试从 DataManager 本地缓存读
         match self.data.read(inode, offset_u64, size_usize) {
             Some(data) => {
+                // 调试：检测全 0 读取
+                if !data.is_empty() && data.iter().all(|&b| b == 0) {
+                    warn!(
+                        "read: ALL ZEROS from cache! inode={}, offset={}, size={}",
+                        inode,
+                        offset_u64,
+                        data.len()
+                    );
+                }
                 reply.data(&data);
                 return;
             }
@@ -1080,7 +1113,18 @@ impl Filesystem for PowerFsFuserFs {
 
         // 重试从本地缓存读
         match self.data.read(inode, offset_u64, size_usize) {
-            Some(data) => reply.data(&data),
+            Some(data) => {
+                // 调试：检测从 Volume Server 拉取后的全 0 读取
+                if !data.is_empty() && data.iter().all(|&b| b == 0) {
+                    warn!(
+                        "read: ALL ZEROS from volume! inode={}, offset={}, size={}",
+                        inode,
+                        offset_u64,
+                        data.len()
+                    );
+                }
+                reply.data(&data)
+            }
             None => {
                 // 仍然失败，返回空数据
                 warn!("read: still no data after fetch for inode={}", inode);
@@ -1271,6 +1315,47 @@ impl FuserApp {
             self.master_addresses.join(", "),
             self.num_threads
         );
+
+        // 内存泄漏诊断任务：每 30 秒打印一次关键指标
+        tokio::spawn(async move {
+            let mut prev_snapshot: Option<powerfs_master::tracking_allocator::AllocSnapshot> = None;
+            let mut prev_vm_rss: u64 = 0;
+            let mut tick = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                tick += 1;
+
+                let snap = powerfs_master::tracking_allocator::ALLOC_STATS.snapshot();
+                let vm = powerfs_master::tracking_allocator::read_self_vm();
+                let (rss_kb, data_kb, peak_kb) = vm.unwrap_or((0, 0, 0));
+
+                let (delta_live_kb, delta_alloc_mb) = if let Some(prev) = prev_snapshot {
+                    let d_live = snap.live_bytes().saturating_sub(prev.live_bytes());
+                    let d_alloc = snap.alloc_bytes.saturating_sub(prev.alloc_bytes);
+                    (d_live / 1024, d_alloc / 1024 / 1024)
+                } else {
+                    (0, 0)
+                };
+                let delta_rss_kb = rss_kb.saturating_sub(prev_vm_rss);
+
+                info!(
+                    "MEM_DIAG_FUSE tick={} rss_mb={} data_mb={} peak_mb={} live_mb={} live_cnt={} \
+                     delta_live_kb={} delta_rss_kb={} delta_alloc_mb={}",
+                    tick,
+                    rss_kb / 1024,
+                    data_kb / 1024,
+                    peak_kb / 1024,
+                    snap.live_bytes() / 1024 / 1024,
+                    snap.live_count(),
+                    delta_live_kb,
+                    delta_rss_kb,
+                    delta_alloc_mb,
+                );
+
+                prev_snapshot = Some(snap);
+                prev_vm_rss = rss_kb;
+            }
+        });
 
         let master_addrs_ref: Vec<&str> =
             self.master_addresses.iter().map(|s| s.as_str()).collect();

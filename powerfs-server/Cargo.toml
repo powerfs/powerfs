@@ -27,3 +27,4 @@ env_logger = { workspace = true }
 clap = { version = "4.4", features = ["derive"] }
 bytes = { workspace = true }
 chrono = { workspace = true }
+tikv-jemallocator = "0.5"

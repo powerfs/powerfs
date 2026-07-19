@@ -11,6 +11,7 @@ use powerfs_core::kv_cache::KVCacheEngine;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::StreamExt;
@@ -86,6 +87,12 @@ impl MasterGrpcServer {
         };
 
         let mut channels = self.leader_channels.write().await;
+        // Check again after acquiring write lock to avoid duplicate insertions
+        if let Some(ch) = channels.get(&leader) {
+            return Some(
+                crate::proto::powerfs::master_service_client::MasterServiceClient::new(ch.clone()),
+            );
+        }
         channels.insert(leader, channel.clone());
         Some(crate::proto::powerfs::master_service_client::MasterServiceClient::new(channel))
     }
@@ -103,22 +110,60 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<Streaming<Heartbeat>>,
     ) -> Result<Response<Self::SendHeartbeatStream>, Status> {
+        static HB_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = HB_COUNT.fetch_add(1, Ordering::Relaxed);
+        info!("GRPC_DEBUG: send_heartbeat call #{}", count);
+
         let mut stream = request.into_inner();
         let master = self.master.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         tokio::spawn(async move {
-            while let Some(heartbeat) = stream.message().await.unwrap_or(None) {
-                debug!("Received heartbeat from: {}", heartbeat.id);
+            info!("GRPC_DEBUG: heartbeat task started for call #{}", count);
+            let mut iteration = 0;
+            loop {
+                let heartbeat = match stream.message().await {
+                    Ok(Some(hb)) => hb,
+                    Ok(None) => {
+                        info!(
+                            "GRPC_DEBUG: heartbeat stream closed normally for call #{}",
+                            count
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "GRPC_DEBUG: heartbeat stream error for call #{}: {}",
+                            count, e
+                        );
+                        break;
+                    }
+                };
+
+                iteration += 1;
+                if iteration % 100 == 0 {
+                    info!(
+                        "GRPC_DEBUG: heartbeat loop iteration #{} for call #{}",
+                        iteration, count
+                    );
+                }
 
                 let node_id = powerfs_common::types::NodeId(heartbeat.id.clone());
+                let node_id_clone = node_id.clone();
+
+                info!(
+                    "GRPC_DEBUG: processing heartbeat from node {} with {} volumes",
+                    node_id.0,
+                    heartbeat.volumes.len()
+                );
 
                 if heartbeat.volumes.is_empty()
                     && heartbeat.new_volumes.is_empty()
                     && heartbeat.deleted_volumes.is_empty()
                 {
-                    if let Err(e) = master
+                    info!("GRPC_DEBUG: calling add_node for node {}", node_id.0);
+                    let _ = master
                         .add_node(AddNodeParams {
                             node_id,
                             address: heartbeat.ip.clone(),
@@ -128,12 +173,13 @@ impl MasterService for MasterGrpcServer {
                             grpc_port: heartbeat.grpc_port,
                             public_url: heartbeat.public_url.clone(),
                         })
-                        .await
-                    {
-                        debug!("Failed to add node: {}", e);
-                    }
+                        .await;
                 } else {
-                    if let Err(e) = master
+                    info!(
+                        "GRPC_DEBUG: calling update_node_volumes for node {}",
+                        node_id.0
+                    );
+                    let _ = master
                         .update_node_volumes(UpdateNodeVolumesParams {
                             node_id,
                             volumes: heartbeat.volumes.clone(),
@@ -143,13 +189,15 @@ impl MasterService for MasterGrpcServer {
                             grpc_port: heartbeat.grpc_port,
                             http_port: heartbeat.port,
                         })
-                        .await
-                    {
-                        debug!("Failed to update node volumes: {}", e);
-                    }
+                        .await;
                 }
 
                 let leader = master.get_leader().await;
+
+                info!(
+                    "GRPC_DEBUG: sending heartbeat response to node {}",
+                    node_id_clone.0
+                );
 
                 if tx
                     .send(Ok(HeartbeatResponse {
@@ -492,16 +540,24 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<VolumeGrowResponse>, Status> {
         // Forward to leader if not leader
         if !self.master.is_leader().await {
-            if let Some(mut client) = self.get_leader_client().await {
+            let leader = self.master.get_leader().await;
+
+            // Check if we're trying to forward to ourselves - this indicates a leader state sync issue
+            let my_address = self.master.raft_address().to_string();
+            if leader == my_address {
+                warn!("VOL_GROW_DEBUG: Detected self-forwarding loop - local is_leader=false but leader address is ourselves. Treating as leader to break loop.");
+                // Continue processing as leader to break the infinite loop
+            } else if let Some(mut client) = self.get_leader_client().await {
                 let req = request.into_inner();
                 match client.volume_grow(Request::new(req)).await {
                     Ok(resp) => return Ok(resp),
                     Err(e) => return Err(e),
                 }
+            } else {
+                return Err(Status::unavailable(
+                    "not leader and no leader client available",
+                ));
             }
-            return Err(Status::unavailable(
-                "not leader and no leader client available",
-            ));
         }
 
         let req = request.into_inner();

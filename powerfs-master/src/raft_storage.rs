@@ -69,7 +69,7 @@ pub enum RaftCommand {
 }
 
 /// Volume info for Raft serialization (serde-compatible)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RaftVolumeShortInfo {
     pub volume_id: u32,
     pub size: u64,

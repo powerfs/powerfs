@@ -11,6 +11,7 @@ pub mod raft_server;
 pub mod raft_storage;
 pub mod s3;
 pub mod server;
+pub mod tracking_allocator;
 pub mod volume_client;
 pub mod volume_proto;
 // pub mod volume_router; // Temporarily disabled due to compilation issues

@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -6,11 +8,13 @@ async fn test_raft_grpc_basic() {
     let db_path = temp_dir.path().join("raft_e2e");
     std::fs::create_dir_all(&db_path).unwrap();
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
+        leader_state,
     )
     .unwrap();
 
@@ -24,11 +28,13 @@ async fn test_cluster_info_endpoint() {
     let db_path = temp_dir.path().join("cluster_info");
     std::fs::create_dir_all(&db_path).unwrap();
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
+        leader_state,
     )
     .unwrap();
 
@@ -129,11 +135,13 @@ async fn test_raft_node_lifecycle() {
     let db_path = temp_dir.path().join("lifecycle");
     std::fs::create_dir_all(&db_path).unwrap();
 
+    let leader_state = Arc::new(AtomicBool::new(true));
     let node = powerfs_master::raft_node::RaftNode::new(
         1,
         "127.0.0.1:9335".to_string(),
         vec![],
         db_path.to_str().unwrap(),
+        leader_state,
     )
     .unwrap();
 

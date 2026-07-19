@@ -1,6 +1,7 @@
 //! Raft test cluster infrastructure
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -337,8 +338,15 @@ impl ClusterBuilder {
                 }
             }
 
-            let node = RaftNode::new(id, address.clone(), peers, db_path.to_str().unwrap())
-                .expect("Failed to create Raft node");
+            let leader_state = Arc::new(AtomicBool::new(peers.is_empty()));
+            let node = RaftNode::new(
+                id,
+                address.clone(),
+                peers,
+                db_path.to_str().unwrap(),
+                leader_state,
+            )
+            .expect("Failed to create Raft node");
 
             let test_node = RaftTestNode::new(id, address.clone(), node);
 

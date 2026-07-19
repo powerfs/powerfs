@@ -84,7 +84,7 @@ impl RaftGrpcClient {
         let request = RaftMessage {
             from_id: 0,
             to_id: message.to_id,
-            message: message.message,
+            message: message.message.to_vec(),
         };
 
         for attempt in 0..=self.max_retries {

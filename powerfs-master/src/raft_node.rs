@@ -4,13 +4,14 @@
 //! using the tikv/raft-rs library.
 
 use crate::raft_storage::{RaftCommand, RaftSnapshotData, RocksDbStorage};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeType, Message as RaftMessage};
 use raft::storage::Storage;
 use raft::{Config, RawNode, StateRole};
 use slog::{Discard, Logger};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -56,13 +57,15 @@ pub struct RaftNode {
     running: Arc<RwLock<bool>>,
     /// Applied index tracker (std::sync::RwLock for blocking read)
     applied_index: Arc<StdRwLock<u64>>,
+    /// Shared leader state with Master (updated on raft role change)
+    leader_state: Arc<AtomicBool>,
 }
 
 /// Outgoing Raft message to a peer
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {
     pub to_id: u64,
-    pub message: Vec<u8>,
+    pub message: bytes::Bytes,
 }
 
 /// Request to propose a command
@@ -86,8 +89,9 @@ impl RaftNode {
         address: String,
         peers: Vec<Peer>,
         storage_path: &str,
+        leader_state: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        Self::new_with_config(id, address, peers, storage_path, 10, 3)
+        Self::new_with_config(id, address, peers, storage_path, 10, 3, leader_state)
     }
 
     /// Create a new RaftNode with custom election/heartbeat ticks
@@ -98,6 +102,7 @@ impl RaftNode {
         storage_path: &str,
         election_tick: usize,
         heartbeat_tick: usize,
+        leader_state: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let storage = if peers.is_empty() {
             RocksDbStorage::new_with_single_node(storage_path, id)
@@ -148,11 +153,16 @@ impl RaftNode {
             peer_map.insert(peer.id, peer.clone());
         }
 
+        // 单节点模式（无 peers）立即成为 leader；多节点模式初始为 follower
+        let is_single_node = peers.is_empty();
+        leader_state.store(is_single_node, Ordering::Relaxed);
+
         info!(
-            "Created RaftNode: id={}, address={}, peers={:?}",
+            "Created RaftNode: id={}, address={}, peers={:?}, single_node={}",
             id,
             address,
-            peers.iter().map(|p| p.id).collect::<Vec<_>>()
+            peers.iter().map(|p| p.id).collect::<Vec<_>>(),
+            is_single_node
         );
 
         Ok(Self {
@@ -170,6 +180,7 @@ impl RaftNode {
             _apply_rx: apply_rx,
             running: Arc::new(RwLock::new(true)),
             applied_index: Arc::new(StdRwLock::new(0)),
+            leader_state,
         })
     }
 
@@ -181,20 +192,24 @@ impl RaftNode {
 
         while *self.running.read().await {
             tokio::select! {
-                // Handle tick events
                 _ = tick_interval.tick() => {
                     self.node.tick();
-                    self.process_ready();
+                    let mut ready_count = 0;
+                    while self.node.has_ready() {
+                        ready_count += 1;
+                        self.process_ready();
+                    }
+                    if ready_count > 1 {
+                        info!("RAFT_DEBUG: tick triggered {} process_ready calls", ready_count);
+                    }
                 }
 
-                // Handle propose requests
                 req = self.propose_rx.recv() => {
                     if let Some(req) = req {
                         self.handle_propose(req).await;
                     }
                 }
 
-                // Handle incoming Raft messages from peers
                 msg = self.step_rx.recv() => {
                     if let Some(msg) = msg {
                         self.handle_step(msg);
@@ -209,17 +224,48 @@ impl RaftNode {
 
     /// Process ready state from Raft
     pub fn process_ready(&mut self) {
+        static PROCESS_READY_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = PROCESS_READY_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(1000) {
+            info!("RAFT_DEBUG: process_ready called #{}", count);
+        }
+
         if !self.node.has_ready() {
             return;
         }
 
         let mut ready = self.node.ready();
 
-        debug!(
-            "Processing ready: has_entries={}, messages={}",
-            ready.entries().len(),
-            ready.messages().len()
-        );
+        if ready.entries().is_empty()
+            && ready.committed_entries().is_empty()
+            && ready.ss().is_none()
+            && ready.hs().is_none()
+            && ready.snapshot().is_empty()
+        {
+            static MSG_ONLY_COUNT: AtomicU64 = AtomicU64::new(0);
+            let count = MSG_ONLY_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count.is_multiple_of(1000) {
+                info!("RAFT_DEBUG: message-only process_ready #{}", count);
+            }
+            for msg in ready.take_messages() {
+                self.send_message(&msg);
+            }
+            self.node.advance(ready);
+            return;
+        }
+
+        if let Some(ss) = ready.ss() {
+            let is_leader_now = ss.raft_state == StateRole::Leader;
+            let prev = self.leader_state.swap(is_leader_now, Ordering::Relaxed);
+            if prev != is_leader_now {
+                info!(
+                    "Raft role changed: node {} is now {:?} (was {})",
+                    self.id,
+                    ss.raft_state,
+                    if prev { "Leader" } else { "Non-Leader" }
+                );
+            }
+        }
 
         // Send messages to peers
         for msg in ready.take_messages() {
@@ -249,7 +295,6 @@ impl RaftNode {
         // Apply committed entries to state machine
         let committed = ready.take_committed_entries();
         if !committed.is_empty() {
-            debug!("Applying {} committed entries", committed.len());
             for entry in committed {
                 // Skip empty entries (e.g., from leader election)
                 if entry.data.is_empty() {
@@ -265,7 +310,6 @@ impl RaftNode {
                             index: entry.index,
                             command: cmd,
                         };
-                        // Send to apply channel (best effort, don't block)
                         let tx = self.apply_tx.clone();
                         tokio::spawn(async move {
                             let _ = tx.send(apply_entry).await;
@@ -311,7 +355,7 @@ impl RaftNode {
 
         let outgoing = OutgoingMessage {
             to_id,
-            message: buf,
+            message: bytes::Bytes::from(buf),
         };
 
         if self.message_tx.send(outgoing).is_err() {

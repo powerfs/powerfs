@@ -181,10 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
 
                 if master_client.send_heartbeat(proto_volumes).await.is_err() {
-                    warn!("Failed to send heartbeat, reconnecting...");
-                    if let Err(e) = master_client.start_heartbeat().await {
-                        warn!("Failed to restart heartbeat: {}", e);
-                    }
+                    warn!("Failed to send heartbeat (no active connection)");
                 }
             }
         });

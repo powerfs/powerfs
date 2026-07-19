@@ -18,6 +18,7 @@ use powerfs_core::kv_cache_persist::KVPersistStore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -38,7 +39,7 @@ pub struct MasterNode {
     message_tx: broadcast::Sender<OutgoingMessage>,
     raft_id: u64,
     raft_address: String,
-    is_leader: RwLock<bool>,
+    is_leader: Arc<AtomicBool>,
     leader_address: RwLock<String>,
     raft_term: RwLock<u64>,
     next_volume_id: RwLock<u32>,
@@ -204,8 +205,18 @@ impl MasterNode {
             .filter(|p| p.id != raft_id)
             .collect();
 
-        let mut raft_node = RaftNode::new(raft_id, raft_address.to_string(), peer_list, raft_path)
-            .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
+        // 共享 leader 状态：RaftNode 在角色变更时更新，Master 读取
+        // 单节点模式（无 peers）初始为 true，多节点模式初始为 false
+        let leader_state = Arc::new(AtomicBool::new(peer_list.is_empty()));
+
+        let mut raft_node = RaftNode::new(
+            raft_id,
+            raft_address.to_string(),
+            peer_list,
+            raft_path,
+            leader_state.clone(),
+        )
+        .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(100);
         let (notify_tx, mut notify_rx) = mpsc::channel(1000);
@@ -299,7 +310,7 @@ impl MasterNode {
             message_tx,
             raft_id,
             raft_address: raft_address.to_string(),
-            is_leader: RwLock::new(true),
+            is_leader: leader_state,
             leader_address: RwLock::new(raft_address.to_string()),
             raft_term: RwLock::new(1),
             next_volume_id: RwLock::new(1),
@@ -381,7 +392,7 @@ impl MasterNode {
     }
 
     pub async fn is_leader(&self) -> bool {
-        *self.is_leader.read().unwrap()
+        self.is_leader.load(Ordering::Relaxed)
     }
 
     pub async fn get_leader(&self) -> String {
@@ -409,7 +420,7 @@ impl MasterNode {
     }
 
     pub fn set_is_leader(&self, is_leader: bool) {
-        *self.is_leader.write().unwrap() = is_leader;
+        self.is_leader.store(is_leader, Ordering::Relaxed);
     }
 
     /// Propose a command to the Raft cluster
@@ -845,6 +856,10 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
+        if self.get_node(&params.node_id).is_some() {
+            return Ok(());
+        }
+
         let cmd = RaftCommand::AddNode {
             node_id: params.node_id.0.clone(),
             address: params.address.clone(),
@@ -856,10 +871,6 @@ impl MasterNode {
         };
 
         self.propose_command(cmd).await?;
-        info!(
-            "Proposed AddNode: {} at {}:{}",
-            params.node_id, params.address, params.http_port
-        );
 
         Ok(())
     }
@@ -942,6 +953,54 @@ impl MasterNode {
                 collection: v.collection.clone(),
             })
             .collect();
+
+        info!(
+            "HEARTBEAT_DEBUG: update_node_volumes called for node={}, volumes={}, new_volumes={}, deleted_volumes={}",
+            params.node_id,
+            params.volumes.len(),
+            params.new_volumes.len(),
+            params.deleted_volumes.len()
+        );
+
+        let current_volumes = self.get_node_volumes(&params.node_id);
+        info!(
+            "HEARTBEAT_DEBUG: current volumes for node={}: {}",
+            params.node_id,
+            current_volumes.len()
+        );
+
+        let current_short: Vec<crate::raft_storage::RaftVolumeShortInfo> = current_volumes
+            .into_iter()
+            .map(|v| crate::raft_storage::RaftVolumeShortInfo {
+                volume_id: v.id.0,
+                size: v.size,
+                read_only: v.state == VolumeState::ReadOnly,
+                used: 0,
+                collection: v.collection.0.clone(),
+            })
+            .collect();
+
+        let short_volumes_no_used: Vec<crate::raft_storage::RaftVolumeShortInfo> = short_volumes
+            .iter()
+            .cloned()
+            .map(|mut v| {
+                v.used = 0;
+                v
+            })
+            .collect();
+
+        if short_volumes_no_used == current_short {
+            info!(
+                "HEARTBEAT_DEBUG: volumes unchanged for node={}, skipping propose",
+                params.node_id
+            );
+            return Ok(());
+        }
+
+        info!(
+            "HEARTBEAT_DEBUG: proposing UpdateNodeVolumes for node={}",
+            params.node_id
+        );
 
         let cmd = RaftCommand::UpdateNodeVolumes {
             node_id: params.node_id.0.clone(),
@@ -1053,6 +1112,13 @@ impl MasterNode {
         replication: &str,
         collection: &str,
     ) -> Result<(Fid, Vec<DataNodeInfo>)> {
+        static CREATE_VOL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = CREATE_VOL_COUNT.fetch_add(1, Ordering::Relaxed);
+        info!(
+            "VOL_DEBUG: create_new_volume called #{}: replication={}, collection={}",
+            count, replication, collection
+        );
+
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
@@ -1105,33 +1171,6 @@ impl MasterNode {
             vid
         };
 
-        for (i, node) in selected_nodes.iter().enumerate() {
-            let state = if i == 0 {
-                VolumeState::Creating
-            } else {
-                VolumeState::Available
-            };
-
-            let mut volumes = self.volumes.write().unwrap();
-            volumes.insert(
-                volume_id,
-                VolumeInfo {
-                    id: volume_id,
-                    node_id: node.id.clone(),
-                    collection: collection_obj.clone(),
-                    size: volume_size_limit,
-                    used: 0,
-                    replica_count,
-                    ttl: ttl.clone(),
-                    disk_type: disk_type.clone(),
-                    state,
-                    created_at: Utc::now(),
-                    modified_at: Utc::now(),
-                    next_file_key: 1,
-                },
-            );
-        }
-
         {
             let mut layouts = self.volume_layouts.write().unwrap();
             let key = Self::get_volume_layout_key(&collection_obj, replica_count, &ttl, &disk_type);
@@ -1143,6 +1182,23 @@ impl MasterNode {
                 volumes: Vec::new(),
             });
         }
+
+        // Propose to Raft for replication (this will apply the command to state machine)
+        if let Some(first_node) = selected_nodes.first() {
+            let cmd = RaftCommand::AssignVolume {
+                node_id: first_node.id.0.clone(),
+                volume_id: volume_id.0,
+                collection: collection_obj.0.clone(),
+                replica_count,
+                ttl: ttl.0,
+                disk_type: disk_type.0.clone(),
+                size: volume_size_limit,
+            };
+            self.propose_command(cmd).await?;
+        }
+
+        // Wait for volume to be applied to state machine
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Get file_key from this volume's next_file_key counter
         let file_key = {
@@ -1176,21 +1232,6 @@ impl MasterNode {
             cookie,
             file_key
         );
-
-        // Propose to Raft for replication
-        if let Some(first_node) = selected_nodes.first() {
-            let cmd = RaftCommand::AssignVolume {
-                node_id: first_node.id.0.clone(),
-                volume_id: volume_id.0,
-                collection: collection_obj.0.clone(),
-                replica_count,
-                ttl: ttl.0,
-                disk_type: disk_type.0.clone(),
-                size: volume_size_limit,
-            };
-            // Best effort - don't fail the request if propose fails in single-node mode
-            let _ = self.propose_command(cmd).await;
-        }
 
         Ok((fid, selected_nodes))
     }
@@ -1488,7 +1529,7 @@ impl MasterNode {
         crate::proto::ClusterInfoResponse {
             node_id: self.raft_id,
             address: self.raft_address.clone(),
-            is_leader: *self.is_leader.read().unwrap(),
+            is_leader: self.is_leader.load(Ordering::Relaxed),
             term: *self.raft_term.read().unwrap(),
             peers: Vec::new(),
         }
@@ -1521,7 +1562,7 @@ impl MasterNode {
 
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
         info!("Starting Raft (single node mode, always leader)");
-        *self.is_leader.write().unwrap() = true;
+        self.is_leader.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1540,7 +1581,8 @@ impl MasterNode {
         let grpc_port = self.address.port() as u32;
         let event_publisher = self.event_publisher.clone();
         let address = self.address.to_string();
-        let is_leader = *self.is_leader.read().unwrap();
+        // 持有 Arc 引用以在事件发布循环中读取实时的 leader 状态
+        let master_ref = self.clone();
         let raft_term = *self.raft_term.read().unwrap();
 
         tokio::spawn(async move {
@@ -1550,6 +1592,9 @@ impl MasterNode {
                 sys.refresh_all();
 
                 let metrics = collect_system_metrics(&mut sys, ".");
+
+                // 每次循环读取实时的 leader 状态（反映 raft 角色变更）
+                let is_leader = master_ref.is_leader.load(Ordering::Relaxed);
 
                 if let Some(publisher) = &event_publisher {
                     let event = Event::NodeStatus(NodeStatusEvent {
@@ -1581,6 +1626,98 @@ impl MasterNode {
             }
         });
 
+        // 内存泄漏诊断任务：每 30 秒打印一次关键指标
+        let diag_master = self.clone();
+        tokio::spawn(async move {
+            let mut prev_snapshot: Option<crate::tracking_allocator::AllocSnapshot> = None;
+            let mut prev_vm_rss: u64 = 0;
+            let mut tick = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                tick += 1;
+
+                let snap = crate::tracking_allocator::ALLOC_STATS.snapshot();
+
+                if tick.is_multiple_of(30) {
+                    let vm = crate::tracking_allocator::read_self_vm();
+                    let (rss_kb, data_kb, peak_kb) = vm.unwrap_or((0, 0, 0));
+
+                    let (
+                        jemalloc_res_mb,
+                        jemalloc_active_mb,
+                        jemalloc_mapped_mb,
+                        jemalloc_retained_mb,
+                    ) = match crate::tracking_allocator::read_jemalloc_stats() {
+                        Some((res, act, map, ret)) => (
+                            res / 1024 / 1024,
+                            act / 1024 / 1024,
+                            map / 1024 / 1024,
+                            ret / 1024 / 1024,
+                        ),
+                        None => (0, 0, 0, 0),
+                    };
+
+                    // 关键数据结构大小
+                    let topology_n = diag_master.topology.read().unwrap().data_centers.len();
+                    let volumes_n = diag_master.volumes.read().unwrap().len();
+                    let collections_n = diag_master.collections.read().unwrap().len();
+                    let volume_layouts_n = diag_master.volume_layouts.read().unwrap().len();
+                    let client_mgr = diag_master.client_manager.read().unwrap();
+                    let clients_n = client_mgr.clients.len();
+                    let fuse_clients_n = client_mgr.fuse_clients.len();
+                    drop(client_mgr);
+
+                    // 增量计算
+                    let (delta_live_kb, delta_alloc_mb) = if let Some(prev) = prev_snapshot {
+                        let d_live = snap.live_bytes().saturating_sub(prev.live_bytes());
+                        let d_alloc = snap.alloc_bytes.saturating_sub(prev.alloc_bytes);
+                        (d_live / 1024, d_alloc / 1024 / 1024)
+                    } else {
+                        (0, 0)
+                    };
+                    let delta_rss_kb = rss_kb.saturating_sub(prev_vm_rss);
+
+                    info!(
+                        "MEM_DIAG tick={} rss_mb={} data_mb={} peak_mb={} live_mb={} live_cnt={} \
+                         delta_live_kb={} delta_rss_kb={} delta_alloc_mb={} \
+                         jemalloc_res_mb={} jemalloc_active_mb={} jemalloc_mapped_mb={} jemalloc_retained_mb={} \
+                         topo={} vols={} cols={} layouts={} clients={} fuse_clients={}",
+                        tick,
+                        rss_kb / 1024,
+                        data_kb / 1024,
+                        peak_kb / 1024,
+                        snap.live_bytes() / 1024 / 1024,
+                        snap.live_count(),
+                        delta_live_kb,
+                        delta_rss_kb,
+                        delta_alloc_mb,
+                        jemalloc_res_mb,
+                        jemalloc_active_mb,
+                        jemalloc_mapped_mb,
+                        jemalloc_retained_mb,
+                        topology_n,
+                        volumes_n,
+                        collections_n,
+                        volume_layouts_n,
+                        clients_n,
+                        fuse_clients_n,
+                    );
+
+                    prev_snapshot = Some(snap);
+                    prev_vm_rss = rss_kb;
+                } else if tick.is_multiple_of(5) {
+                    info!(
+                        "MEM_DIAG_FAST tick={} alloc_bytes={} alloc_count={} live_bytes={} live_cnt={}",
+                        tick,
+                        snap.alloc_bytes,
+                        snap.alloc_count,
+                        snap.live_bytes(),
+                        snap.live_count(),
+                    );
+                }
+            }
+        });
+
         let server = crate::server::MasterGrpcServer::new(self.clone(), self.kv_cache.clone());
         server
             .start(self.address)
@@ -1607,7 +1744,7 @@ impl Clone for MasterNode {
             message_tx: self.message_tx.clone(),
             raft_id: self.raft_id,
             raft_address: self.raft_address.clone(),
-            is_leader: RwLock::new(*self.is_leader.read().unwrap()),
+            is_leader: self.is_leader.clone(),
             leader_address: RwLock::new(self.leader_address.read().unwrap().clone()),
             raft_term: RwLock::new(*self.raft_term.read().unwrap()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),
