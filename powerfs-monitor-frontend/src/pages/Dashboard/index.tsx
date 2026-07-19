@@ -1,37 +1,95 @@
-import { useEffect, useState } from 'react'
-import { Card, Row, Col, Statistic, Table, Tag, Progress, Space } from 'antd'
+import { useEffect, useState, useCallback } from 'react'
+import { Card, Row, Col, Table, Progress, Space, Typography, Button } from 'antd'
 import {
   SaveOutlined,
   DatabaseOutlined,
   KeyOutlined,
   CheckCircleOutlined,
-  DatabaseOutlined as HardDriveOutlined,
+  CloudServerOutlined,
+  ThunderboltOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
-import ReactECharts from 'echarts-for-react'
+import { useNavigate } from 'react-router-dom'
+import type { EChartsOption } from 'echarts'
 import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData } from '@/types'
-import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory } from '@/services/api'
+import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes } from '@/services/api'
 import { connectWebSocket, disconnectWebSocket, type MetricUpdate } from '@/services/websocket'
 import { formatBytes, formatPercent, formatUptime, formatNumber } from '@/utils/format'
+import { KpiBar, MetricChart, EmptyState, RefreshControl, RealtimeChart, StatusTag } from '@/components/pro'
+
+const { Text, Title } = Typography
 
 function Dashboard() {
+  const navigate = useNavigate()
   const [clusterMetrics, setClusterMetrics] = useState<ClusterMetrics | null>(null)
   const [kvMetrics, setKVMetrics] = useState<KVMetrics | null>(null)
   const [alerts, setAlerts] = useState<AlertInfo[]>([])
   const [storageTrend, setStorageTrend] = useState<TimeSeriesData[]>([])
   const [cpuTrend, setCpuTrend] = useState<TimeSeriesData[]>([])
+  const [loading, setLoading] = useState(false)
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    try {
+      const [cluster, kv, alertList] = await Promise.all([
+        getClusterMetrics(),
+        getKVMetrics(),
+        getAlerts(),
+      ])
+      setClusterMetrics(cluster)
+      setKVMetrics(kv)
+      setAlerts(alertList)
+    } catch (e) {
+      console.error('Failed to load dashboard data:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  const loadHistoryData = useCallback(async () => {
+    try {
+      const [storageData, cpuData] = await Promise.all([
+        getMetricHistory('powerfs_node_disk_usage'),
+        getMetricHistory('powerfs_node_cpu_usage'),
+      ])
+      setStorageTrend(storageData)
+      setCpuTrend(cpuData)
+    } catch (e) {
+      console.error('Failed to load history data:', e)
+    }
+  }, [])
+
+  /** Real-time fetcher: average CPU + memory across online nodes. */
+  const realtimeFetcher = useCallback(async () => {
+    const nodes = await getNodes()
+    const online = nodes.filter(n => n.status !== 'offline')
+    if (online.length === 0) return { cpu: 0, memory: 0 }
+    const sum = online.reduce(
+      (acc, n) => ({
+        cpu: acc.cpu + (n.cpu_usage || 0),
+        memory: acc.memory + (n.mem_usage || 0),
+      }),
+      { cpu: 0, memory: 0 },
+    )
+    return {
+      cpu: Number((sum.cpu / online.length).toFixed(1)),
+      memory: Number((sum.memory / online.length).toFixed(1)),
+    }
+  }, [])
 
   useEffect(() => {
-    loadData()
-    loadHistoryData()
-    
+    void loadData()
+    void loadHistoryData()
     connectWebSocket(onMetricUpdate)
-
-    const interval = setInterval(loadData, 10000)
-
+    const interval = setInterval(() => {
+      void loadData()
+      void loadHistoryData()
+    }, 10000)
     return () => {
       clearInterval(interval)
       disconnectWebSocket()
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const onMetricUpdate = (data: MetricUpdate) => {
@@ -44,66 +102,148 @@ function Dashboard() {
     }
   }
 
-  const loadHistoryData = async () => {
-    try {
-      const [storageData, cpuData] = await Promise.all([
-        getMetricHistory('powerfs_node_disk_usage'),
-        getMetricHistory('powerfs_node_cpu_usage'),
-      ])
-      setStorageTrend(storageData)
-      setCpuTrend(cpuData)
-    } catch (e) {
-      console.error('Failed to load history data:', e)
-    }
-  }
-
-  const loadData = async () => {
-    try {
-      const [cluster, kv, alertList] = await Promise.all([
-        getClusterMetrics(),
-        getKVMetrics(),
-        getAlerts(),
-      ])
-      setClusterMetrics(cluster)
-      setKVMetrics(kv)
-      setAlerts(alertList)
-    } catch (error) {
-      console.error('Failed to load dashboard data:', error)
-    }
-  }
-
   const storagePercent = clusterMetrics && clusterMetrics.total_storage > 0
     ? (clusterMetrics.used_storage / clusterMetrics.total_storage) * 100
     : 0
+  const firingAlerts = alerts.filter(a => a.status === 'firing')
+  const recentAlerts = firingAlerts.slice(0, 5)
 
-  const recentAlerts = alerts.filter(a => a.status === 'firing').slice(0, 5)
+  const kpiItems = [
+    {
+      title: '集群节点',
+      value: clusterMetrics?.node_count || 0,
+      suffix: '个',
+      status: 'active',
+      icon: <CloudServerOutlined />,
+      sparkline: storageTrend.slice(-12).map(d => d.value),
+      onClick: () => navigate('/nodes'),
+      loading,
+      footer: (
+        <Space size={4} style={{ color: 'var(--pf-color-success)', fontSize: 12 }}>
+          <CheckCircleOutlined /> 全部在线
+        </Space>
+      ),
+    },
+    {
+      title: 'Volume 数量',
+      value: clusterMetrics?.volume_count || 0,
+      suffix: '个',
+      status: 'active',
+      icon: <DatabaseOutlined />,
+      onClick: () => navigate('/volumes'),
+      loading,
+      footer: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {formatNumber(clusterMetrics?.file_count || 0)} 个文件
+        </Text>
+      ),
+    },
+    {
+      title: 'KV 会话',
+      value: kvMetrics?.session_count || 0,
+      suffix: '个',
+      status: 'pending',
+      icon: <KeyOutlined />,
+      onClick: () => navigate('/kv'),
+      loading,
+      footer: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {formatNumber(kvMetrics?.block_count || 0)} 个 Block
+        </Text>
+      ),
+    },
+    {
+      title: '存储使用率',
+      value: Number(storagePercent.toFixed(1)),
+      precision: 1,
+      suffix: '%',
+      status: storagePercent > 85 ? 'unreachable' : storagePercent > 70 ? 'draining' : 'active',
+      invertDelta: true,
+      icon: <ThunderboltOutlined />,
+      onClick: () => navigate('/storage-devices'),
+      loading,
+      footer: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {formatBytes(clusterMetrics?.used_storage || 0)} / {formatBytes(clusterMetrics?.total_storage || 0)}
+        </Text>
+      ),
+    },
+  ]
+
+  const storageChartOption: EChartsOption = {
+    tooltip: { trigger: 'axis', formatter: '{b}<br/>存储使用率: {c}%' },
+    xAxis: {
+      type: 'category',
+      data: storageTrend.map(d => {
+        const date = new Date(d.time)
+        return `${date.getHours()}:00`
+      }),
+    },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value}%' } },
+    series: [
+      {
+        name: '存储使用率',
+        type: 'line',
+        smooth: true,
+        data: storageTrend.map(d => d.value),
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(235, 47, 150, 0.3)' },
+              { offset: 1, color: 'rgba(235, 47, 150, 0.05)' },
+            ],
+          },
+        },
+        lineStyle: { color: '#eb2f96', width: 3 },
+        itemStyle: { color: '#eb2f96' },
+      },
+    ],
+  }
+
+  const cpuChartOption: EChartsOption = {
+    tooltip: { trigger: 'axis', formatter: '{b}<br/>CPU使用率: {c}%' },
+    xAxis: {
+      type: 'category',
+      data: cpuTrend.map(d => {
+        const date = new Date(d.time)
+        return `${date.getHours()}:00`
+      }),
+    },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value}%' } },
+    series: [
+      {
+        name: 'CPU使用率',
+        type: 'line',
+        smooth: true,
+        data: cpuTrend.map(d => d.value),
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(22, 119, 255, 0.3)' },
+              { offset: 1, color: 'rgba(22, 119, 255, 0.05)' },
+            ],
+          },
+        },
+        lineStyle: { color: '#1677ff', width: 3 },
+        itemStyle: { color: '#1677ff' },
+      },
+    ],
+  }
 
   const alertColumns = [
-    {
-      title: '告警名称',
-      dataIndex: 'name',
-      key: 'name',
-    },
+    { title: '告警名称', dataIndex: 'name', key: 'name' },
     {
       title: '级别',
       dataIndex: 'severity',
       key: 'severity',
-      render: (severity: string) => (
-        <Tag color={severity === 'critical' ? 'red' : severity === 'warning' ? 'orange' : 'blue'}>
-          {severity === 'critical' ? '严重' : severity === 'warning' ? '警告' : '信息'}
-        </Tag>
-      ),
+      render: (severity: string) => <StatusTag kind="alert" status={severity} pulse={severity === 'critical'} />,
     },
-    {
-      title: '来源',
-      dataIndex: 'source',
-      key: 'source',
-    },
-    {
-      title: '消息',
-      dataIndex: 'message',
-      key: 'message',
-    },
+    { title: '来源', dataIndex: 'source', key: 'source' },
+    { title: '消息', dataIndex: 'message', key: 'message' },
     {
       title: '时间',
       dataIndex: 'created_at',
@@ -114,262 +254,93 @@ function Dashboard() {
 
   return (
     <div>
-      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
-        <Col span={6}>
-          <Card
-            hoverable
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ background: '#e6f7ff', padding: 8, borderRadius: 8 }}>
-                  <SaveOutlined style={{ fontSize: 24, color: '#1890ff' }} />
-                </div>
-                <span style={{ color: '#8c8c8c' }}>集群节点</span>
-              </div>
-              <Statistic
-                value={clusterMetrics?.node_count || 0}
-                suffix="个"
-                valueStyle={{ fontSize: 32, fontWeight: 'bold', color: '#1890ff' }}
-              />
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#52c41a' }}>
-                <CheckCircleOutlined />
-                <span style={{ fontSize: 12 }}>全部在线</span>
-              </div>
-            </Space>
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card
-            hoverable
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ background: '#f6ffed', padding: 8, borderRadius: 8 }}>
-                  <DatabaseOutlined style={{ fontSize: 24, color: '#52c41a' }} />
-                </div>
-                <span style={{ color: '#8c8c8c' }}>Volume数量</span>
-              </div>
-              <Statistic
-                value={clusterMetrics?.volume_count || 0}
-                suffix="个"
-                valueStyle={{ fontSize: 32, fontWeight: 'bold', color: '#52c41a' }}
-              />
-              <div style={{ fontSize: 12, color: '#8c8c8c' }}>
-                {formatNumber(clusterMetrics?.file_count || 0)} 个文件
-              </div>
-            </Space>
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card
-            hoverable
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ background: '#fff7e6', padding: 8, borderRadius: 8 }}>
-                  <KeyOutlined style={{ fontSize: 24, color: '#fa8c16' }} />
-                </div>
-                <span style={{ color: '#8c8c8c' }}>KV会话</span>
-              </div>
-              <Statistic
-                value={kvMetrics?.session_count || 0}
-                suffix="个"
-                valueStyle={{ fontSize: 32, fontWeight: 'bold', color: '#fa8c16' }}
-              />
-              <div style={{ fontSize: 12, color: '#8c8c8c' }}>
-                {formatNumber(kvMetrics?.block_count || 0)} 个Block
-              </div>
-            </Space>
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card
-            hoverable
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ background: '#fff0f6', padding: 8, borderRadius: 8 }}>
-                  <HardDriveOutlined style={{ fontSize: 24, color: '#eb2f96' }} />
-                </div>
-                <span style={{ color: '#8c8c8c' }}>存储使用</span>
-              </div>
-              <Statistic
-                value={formatPercent(storagePercent)}
-                valueStyle={{ fontSize: 32, fontWeight: 'bold', color: '#eb2f96' }}
-              />
-              <div style={{ fontSize: 12, color: '#8c8c8c' }}>
-                {formatBytes(clusterMetrics?.used_storage || 0)} / {formatBytes(clusterMetrics?.total_storage || 0)}
-              </div>
-            </Space>
-          </Card>
-        </Col>
-      </Row>
+      {/* Page header with refresh control */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+        <div>
+          <Title level={4} style={{ margin: 0 }}>集群总览</Title>
+          <Text type="secondary">PowerFS 集群实时状态与关键指标</Text>
+        </div>
+        <RefreshControl onRefresh={loadData} loading={loading} />
+      </div>
 
-      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
-        <Col span={12}>
+      {/* KPI Bar */}
+      <div style={{ marginBottom: 24 }}>
+        <KpiBar items={kpiItems} />
+      </div>
+
+      {/* Trend charts */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24} lg={12}>
           <Card
             title="存储使用趋势"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: 20 } }}
           >
-            <ReactECharts
-              option={{
-                tooltip: {
-                  trigger: 'axis',
-                  formatter: '{b}<br/>存储使用率: {c}%',
-                },
-                grid: {
-                  left: '3%',
-                  right: '4%',
-                  bottom: '3%',
-                  containLabel: true,
-                },
-                xAxis: {
-                  type: 'category',
-                  data: storageTrend.map(d => {
-                    const date = new Date(d.time)
-                    return `${date.getHours()}:00`
-                  }),
-                  axisLine: { lineStyle: { color: '#d9d9d9' } },
-                  axisLabel: { color: '#8c8c8c' },
-                },
-                yAxis: {
-                  type: 'value',
-                  axisLine: { show: false },
-                  axisTick: { show: false },
-                  splitLine: { lineStyle: { color: '#f0f0f0' } },
-                  axisLabel: { color: '#8c8c8c', formatter: '{value}%' },
-                },
-                series: [
-                  {
-                    name: '存储使用率',
-                    type: 'line',
-                    smooth: true,
-                    data: storageTrend.map(d => d.value),
-                    areaStyle: {
-                      color: {
-                        type: 'linear',
-                        x: 0,
-                        y: 0,
-                        x2: 0,
-                        y2: 1,
-                        colorStops: [
-                          { offset: 0, color: 'rgba(235, 47, 150, 0.3)' },
-                          { offset: 1, color: 'rgba(235, 47, 150, 0.05)' },
-                        ],
-                      },
-                    },
-                    lineStyle: { color: '#eb2f96', width: 3 },
-                    itemStyle: { color: '#eb2f96' },
-                  },
-                ],
-              }}
-              style={{ height: 300 }}
-            />
+            <MetricChart option={storageChartOption} height={300} loading={loading} />
           </Card>
         </Col>
-        <Col span={12}>
+        <Col xs={24} lg={12}>
           <Card
-            title="CPU使用趋势"
+            title="CPU 使用趋势"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: 20 } }}
           >
-            <ReactECharts
-              option={{
-                tooltip: {
-                  trigger: 'axis',
-                  formatter: '{b}<br/>CPU使用率: {c}%',
-                },
-                grid: {
-                  left: '3%',
-                  right: '4%',
-                  bottom: '3%',
-                  containLabel: true,
-                },
-                xAxis: {
-                  type: 'category',
-                  data: cpuTrend.map(d => {
-                    const date = new Date(d.time)
-                    return `${date.getHours()}:00`
-                  }),
-                  axisLine: { lineStyle: { color: '#d9d9d9' } },
-                  axisLabel: { color: '#8c8c8c' },
-                },
-                yAxis: {
-                  type: 'value',
-                  axisLine: { show: false },
-                  axisTick: { show: false },
-                  splitLine: { lineStyle: { color: '#f0f0f0' } },
-                  axisLabel: { color: '#8c8c8c', formatter: '{value}%' },
-                },
-                series: [
-                  {
-                    name: 'CPU使用率',
-                    type: 'line',
-                    smooth: true,
-                    data: cpuTrend.map(d => d.value),
-                    areaStyle: {
-                      color: {
-                        type: 'linear',
-                        x: 0,
-                        y: 0,
-                        x2: 0,
-                        y2: 1,
-                        colorStops: [
-                          { offset: 0, color: 'rgba(24, 144, 255, 0.3)' },
-                          { offset: 1, color: 'rgba(24, 144, 255, 0.05)' },
-                        ],
-                      },
-                    },
-                    lineStyle: { color: '#1890ff', width: 3 },
-                    itemStyle: { color: '#1890ff' },
-                  },
-                ],
-              }}
-              style={{ height: 300 }}
-            />
+            <MetricChart option={cpuChartOption} height={300} loading={loading} />
           </Card>
         </Col>
       </Row>
 
-      <Row gutter={[16, 16]}>
-        <Col span={12}>
+      {/* Real-time node performance (live scrolling chart) */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <RealtimeChart
+            title={<Space><ThunderboltOutlined />实时节点性能</Space>}
+            fetcher={realtimeFetcher}
+            interval={5000}
+            maxPoints={60}
+            height={240}
+            yAxis={{ min: 0, max: 100, unit: '%' }}
+            series={[
+              { key: 'cpu', name: 'CPU 使用率', color: '#1677ff' },
+              { key: 'memory', name: '内存使用率', color: '#722ed1' },
+            ]}
+          />
+        </Col>
+      </Row>
+
+      {/* Cluster status + KV stats */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24} lg={12}>
           <Card
-            title="集群状态"
+            title={<Space><SaveOutlined />集群状态</Space>}
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: 20 } }}
           >
             <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>运行时间</span>
-                <span style={{ fontWeight: 500 }}>{formatUptime(clusterMetrics?.uptime || 0)}</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">运行时间</Text>
+                <Text strong className="tabular-nums">{formatUptime(clusterMetrics?.uptime || 0)}</Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>Leader状态</span>
-                <Tag color={clusterMetrics?.is_leader ? 'green' : 'red'}>
-                  {clusterMetrics?.is_leader ? 'Leader' : 'Follower'}
-                </Tag>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">Leader 状态</Text>
+                {clusterMetrics?.is_leader ? (
+                  <StatusTag kind="node" status="active" label="Leader" pulse />
+                ) : (
+                  <StatusTag kind="node" status="draining" label="Follower" />
+                )}
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>Raft Term</span>
-                <span style={{ fontWeight: 500 }}>{clusterMetrics?.raft_term || 0}</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">Raft Term</Text>
+                <Text strong className="tabular-nums">{clusterMetrics?.raft_term || 0}</Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>Collection数量</span>
-                <span style={{ fontWeight: 500 }}>{clusterMetrics?.collection_count || 0} 个</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">Collection 数量</Text>
+                <Text strong>{clusterMetrics?.collection_count || 0} 个</Text>
               </div>
               <div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <span style={{ color: '#8c8c8c' }}>存储使用</span>
-                  <span style={{ fontWeight: 500 }}>{formatPercent(storagePercent)}</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <Text type="secondary">存储使用</Text>
+                  <Text strong>{formatPercent(storagePercent)}</Text>
                 </div>
                 <Progress
                   percent={storagePercent}
@@ -384,44 +355,54 @@ function Dashboard() {
             </Space>
           </Card>
         </Col>
-        <Col span={12}>
+        <Col xs={24} lg={12}>
           <Card
-            title="KV缓存统计"
+            title={<Space><KeyOutlined />KV 缓存统计</Space>}
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: 20 } }}
           >
             <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>内存使用</span>
-                <span style={{ fontWeight: 500 }}>{formatBytes(kvMetrics?.memory_used || 0)}</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">内存使用</Text>
+                <Text strong className="tabular-nums">{formatBytes(kvMetrics?.memory_used || 0)}</Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>命中率</span>
-                <span style={{ fontWeight: 500, color: kvMetrics?.hit_ratio && kvMetrics.hit_ratio >= 90 ? '#52c41a' : '#faad14' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">命中率</Text>
+                <Text
+                  strong
+                  className="tabular-nums"
+                  style={{ color: (kvMetrics?.hit_ratio ?? 0) >= 90 ? 'var(--pf-color-success)' : 'var(--pf-color-warning)' }}
+                >
                   {formatPercent(kvMetrics?.hit_ratio || 0)}
-                </span>
+                </Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>驱逐次数</span>
-                <span style={{ fontWeight: 500 }}>{kvMetrics?.eviction_count || 0} 次</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">驱逐次数</Text>
+                <Text strong className="tabular-nums">{kvMetrics?.eviction_count || 0} 次</Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>平均延迟</span>
-                <span style={{ fontWeight: 500 }}>{(kvMetrics?.avg_latency || 0).toFixed(2)} ms</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">平均延迟</Text>
+                <Text strong className="tabular-nums">{(kvMetrics?.avg_latency || 0).toFixed(2)} ms</Text>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#8c8c8c' }}>总请求数</span>
-                <span style={{ fontWeight: 500 }}>{formatNumber((kvMetrics?.put_count || 0) + (kvMetrics?.get_count || 0))} 次</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">总请求数</Text>
+                <Text strong className="tabular-nums">
+                  {formatNumber((kvMetrics?.put_count || 0) + (kvMetrics?.get_count || 0))} 次
+                </Text>
               </div>
             </Space>
           </Card>
         </Col>
       </Row>
 
+      {/* Recent alerts */}
       <Card
-        title="最近告警"
-        style={{ borderRadius: 12, marginTop: 16 }}
-        bodyStyle={{ padding: '20px' }}
+        title={<Space><WarningOutlined />最近告警</Space>}
+        extra={
+          <Button type="link" onClick={() => navigate('/alerts')}>查看全部</Button>
+        }
+        style={{ borderRadius: 12 }}
+        styles={{ body: { padding: 20 } }}
       >
         {recentAlerts.length > 0 ? (
           <Table
@@ -432,12 +413,11 @@ function Dashboard() {
             size="small"
           />
         ) : (
-          <div style={{ textAlign: 'center', padding: '40px 0', color: '#8c8c8c' }}>
-            <Space direction="vertical" align="center">
-              <CheckCircleOutlined style={{ fontSize: 48, color: '#52c41a' }} />
-              <span>暂无告警</span>
-            </Space>
-          </div>
+          <EmptyState
+            title="暂无告警"
+            description="集群当前运行正常"
+            icon={<CheckCircleOutlined style={{ color: 'var(--pf-color-success)' }} />}
+          />
         )}
       </Card>
     </div>

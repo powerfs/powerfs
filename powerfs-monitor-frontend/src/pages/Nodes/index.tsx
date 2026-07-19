@@ -1,21 +1,53 @@
-import React, { useEffect, useState, useMemo } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, message, Tabs } from 'antd'
+import { useEffect, useState, useMemo, useCallback } from 'react'
 import {
-  SaveOutlined,
+  Card,
+  Table,
+  Button,
+  Space,
+  Progress,
+  message,
+  Tabs,
+  Drawer,
+  Input,
+  Segmented,
+  Tooltip,
+  Typography,
+  Modal,
+  Descriptions,
+  Tag,
+} from 'antd'
+import {
   DeleteOutlined,
   EyeOutlined,
   PlusOutlined,
-  CheckCircleOutlined,
-  CloseCircleOutlined,
-  LeftCircleOutlined,
-  DatabaseOutlined,
-  CloudServerOutlined,
   HddOutlined,
-  ExclamationCircleOutlined,
+  CloudServerOutlined,
+  DatabaseOutlined,
+  ReloadOutlined,
+  SearchOutlined,
+  ThunderboltOutlined,
+  ApiOutlined,
 } from '@ant-design/icons'
+import type { SizeType } from 'antd/es/config-provider/SizeContext'
 import type { NodeInfo, StorageDevice } from '@/types'
 import { getNodes, deleteNode, getDevices } from '@/services/api'
 import { formatBytes, formatPercent, formatUptime, formatTime } from '@/utils/format'
+import {
+  KpiBar,
+  StatusTag,
+  EmptyState,
+  SkeletonCard,
+  type StatCardProps,
+} from '@/components/pro'
+import { resolveNodeStatus } from '@/styles/status'
+
+const { Text, Title } = Typography
+
+/** Derive a coarse K8s-style status key from a NodeInfo for aggregation. */
+function classifyNode(n: NodeInfo): string {
+  // Prefer the raw status; resolveNodeStatus normalizes legacy values.
+  return n.status
+}
 
 function Nodes() {
   const [nodes, setNodes] = useState<NodeInfo[]>([])
@@ -23,27 +55,41 @@ function Nodes() {
   const [showDetail, setShowDetail] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [nodeDevices, setNodeDevices] = useState<StorageDevice[]>([])
+  const [loading, setLoading] = useState(true)
+  const [density, setDensity] = useState<SizeType>('middle')
+  const [search, setSearch] = useState('')
 
-  useEffect(() => {
-    loadNodes()
-    const interval = setInterval(loadNodes, 10000)
-    return () => clearInterval(interval)
+  const loadNodes = useCallback(async () => {
+    try {
+      const data = await getNodes()
+      setNodes(data)
+    } catch (e) {
+      console.error('Failed to load nodes:', e)
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
-  const loadNodes = async () => {
-    const data = await getNodes()
-    setNodes(data)
-  }
+  useEffect(() => {
+    void loadNodes()
+    const interval = setInterval(() => void loadNodes(), 10000)
+    return () => clearInterval(interval)
+  }, [loadNodes])
 
-  const loadNodeDevices = async (nodeId: string) => {
-    const data = await getDevices(nodeId)
-    setNodeDevices(data)
-  }
+  const loadNodeDevices = useCallback(async (nodeId: string) => {
+    try {
+      const data = await getDevices(nodeId)
+      setNodeDevices(data)
+    } catch (e) {
+      console.error('Failed to load devices:', e)
+      setNodeDevices([])
+    }
+  }, [])
 
   const handleViewDetail = (node: NodeInfo) => {
     setSelectedNode(node)
     setShowDetail(true)
-    loadNodeDevices(node.id)
+    void loadNodeDevices(node.id)
   }
 
   const handleDelete = (node: NodeInfo) => {
@@ -53,128 +99,168 @@ function Nodes() {
 
   const confirmDelete = async () => {
     if (selectedNode) {
-      await deleteNode(selectedNode.id)
-      message.success('节点删除成功')
-      setShowDeleteConfirm(false)
-      loadNodes()
+      try {
+        await deleteNode(selectedNode.id)
+        message.success('节点删除成功')
+        setShowDeleteConfirm(false)
+        void loadNodes()
+      } catch (e) {
+        message.error('节点删除失败')
+        console.error(e)
+      }
     }
   }
 
+  // ── KPI summary ──
+  const kpiItems: StatCardProps[] = useMemo(() => {
+    const total = nodes.length
+    const active = nodes.filter(n => resolveNodeStatus(classifyNode(n)).tag === 'success').length
+    const cordoned = nodes.filter(n => {
+      const t = resolveNodeStatus(classifyNode(n)).tag
+      return t === 'purple' || t === 'blue'
+    }).length
+    const unreachable = nodes.filter(
+      n => resolveNodeStatus(classifyNode(n)).tag === 'red',
+    ).length
+    return [
+      {
+        title: '节点总数',
+        value: total,
+        suffix: '个',
+        status: 'active',
+        icon: <CloudServerOutlined />,
+        loading,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>Master {nodes.filter(n => n.node_type === 'master').length} · Volume {nodes.filter(n => n.node_type === 'volume').length}</Text>,
+      },
+      {
+        title: '运行中',
+        value: active,
+        suffix: '个',
+        status: 'active',
+        icon: <ThunderboltOutlined />,
+        loading,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>健康节点</Text>,
+      },
+      {
+        title: '维护中',
+        value: cordoned,
+        suffix: '个',
+        status: 'cordoned',
+        icon: <HddOutlined />,
+        loading,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>封锁/驱逐</Text>,
+      },
+      {
+        title: '不可达',
+        value: unreachable,
+        suffix: '个',
+        status: unreachable > 0 ? 'unreachable' : 'active',
+        icon: <ApiOutlined />,
+        loading,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>{unreachable > 0 ? '需排查' : '全部可达'}</Text>,
+      },
+    ]
+  }, [nodes, loading])
+
+  // ── Filtered data ──
+  const filterBySearch = (list: NodeInfo[]) => {
+    if (!search.trim()) return list
+    const q = search.toLowerCase()
+    return list.filter(
+      n => n.id.toLowerCase().includes(q) || n.address.toLowerCase().includes(q),
+    )
+  }
+
+  const masterNodes = useMemo(
+    () => filterBySearch(nodes.filter(n => n.node_type === 'master')),
+    [nodes, search],
+  )
+  const volumeNodes = useMemo(
+    () => filterBySearch(nodes.filter(n => n.node_type === 'volume')),
+    [nodes, search],
+  )
+
+  // ── Table columns ──
   const columns = [
     {
       title: '节点ID',
       dataIndex: 'id',
       key: 'id',
-      width: 120,
+      width: 140,
+      render: (id: string) => <Text strong className="tabular-nums">{id}</Text>,
     },
     {
       title: '地址',
       dataIndex: 'address',
       key: 'address',
       render: (address: string, record: NodeInfo) => (
-        <span>{address}:{record.grpc_port}</span>
+        <Text type="secondary" className="font-mono" style={{ fontSize: 12 }}>
+          {address}:{record.grpc_port}
+        </Text>
       ),
     },
     {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 100,
-      render: (status: string) => {
-        const config: Record<string, { color: string; icon: React.ReactNode; text: string }> = {
-          online: { color: 'green', icon: <CheckCircleOutlined />, text: '在线' },
-          offline: { color: 'red', icon: <CloseCircleOutlined />, text: '离线' },
-          warning: { color: 'orange', icon: <LeftCircleOutlined />, text: '告警' },
-          healthy: { color: 'green', icon: <CheckCircleOutlined />, text: '健康' },
-        }
-        const { color, icon, text } = config[status] || { color: 'default', icon: null, text: status }
-        return (
-          <Tag color={color}>
-            {icon} {text}
-          </Tag>
-        )
-      },
+      width: 110,
+      render: (status: string) => (
+        <StatusTag kind="node" status={status} pulse={resolveNodeStatus(status).tag === 'success'} />
+      ),
     },
     {
       title: 'CPU',
       key: 'cpu',
-      width: 120,
+      width: 130,
       render: (_: unknown, record: NodeInfo) => (
-        <div>
-          <Progress
-            percent={record.cpu_usage}
-            size="small"
-            strokeColor={record.cpu_usage > 80 ? '#f5222d' : record.cpu_usage > 60 ? '#faad14' : '#52c41a'}
-            showInfo={false}
-          />
-          <span style={{ marginLeft: 8, fontSize: 12 }}>{formatPercent(record.cpu_usage)}</span>
-        </div>
+        <ResourceBar value={record.cpu_usage} />
       ),
     },
     {
       title: '内存',
       key: 'mem',
-      width: 120,
+      width: 130,
       render: (_: unknown, record: NodeInfo) => (
-        <div>
-          <Progress
-            percent={record.mem_usage}
-            size="small"
-            strokeColor={record.mem_usage > 80 ? '#f5222d' : record.mem_usage > 60 ? '#faad14' : '#52c41a'}
-            showInfo={false}
-          />
-          <span style={{ marginLeft: 8, fontSize: 12 }}>{formatPercent(record.mem_usage)}</span>
-        </div>
+        <ResourceBar value={record.mem_usage} />
       ),
     },
     {
       title: '磁盘',
       key: 'disk',
-      width: 120,
+      width: 130,
       render: (_: unknown, record: NodeInfo) => (
-        <div>
-          <Progress
-            percent={record.disk_usage}
-            size="small"
-            strokeColor={record.disk_usage > 80 ? '#f5222d' : record.disk_usage > 60 ? '#faad14' : '#52c41a'}
-            showInfo={false}
-          />
-          <span style={{ marginLeft: 8, fontSize: 12 }}>{formatPercent(record.disk_usage)}</span>
-        </div>
+        <ResourceBar value={record.disk_usage} />
       ),
     },
     {
-      title: 'Volume数',
+      title: 'Volume',
       dataIndex: 'volume_count',
       key: 'volume_count',
       width: 80,
+      render: (v: number) => <span className="tabular-nums">{v}</span>,
     },
     {
       title: '运行时间',
       dataIndex: 'uptime',
       key: 'uptime',
-      width: 150,
-      render: (uptime: number) => formatUptime(uptime),
+      width: 120,
+      render: (uptime: number) => (
+        <Text type="secondary" className="tabular-nums" style={{ fontSize: 12 }}>
+          {formatUptime(uptime)}
+        </Text>
+      ),
     },
     {
       title: '操作',
       key: 'action',
-      width: 120,
+      width: 130,
+      fixed: 'right' as const,
       render: (_: unknown, record: NodeInfo) => (
-        <Space>
-          <Button
-            type="text"
-            icon={<EyeOutlined />}
-            onClick={() => handleViewDetail(record)}
-          >
+        <Space size={0}>
+          <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => handleViewDetail(record)}>
             详情
           </Button>
-          <Button
-            type="text"
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDelete(record)}
-          >
+          <Button type="text" size="small" danger icon={<DeleteOutlined />} onClick={() => handleDelete(record)}>
             删除
           </Button>
         </Space>
@@ -182,55 +268,180 @@ function Nodes() {
     },
   ]
 
-  const masterNodes = useMemo(() => nodes.filter(n => n.node_type === 'master'), [nodes])
-  const volumeNodes = useMemo(() => nodes.filter(n => n.node_type === 'volume'), [nodes])
+  const deviceColumns = [
+    {
+      title: '设备ID',
+      dataIndex: 'device_id',
+      key: 'device_id',
+      width: 120,
+      render: (id: string) => <Text className="font-mono" style={{ fontSize: 12 }}>{id}</Text>,
+    },
+    {
+      title: '类型',
+      dataIndex: 'device_type',
+      key: 'device_type',
+      width: 110,
+      render: (type: string) => {
+        const typeMap: Record<string, string> = {
+          local_file: '本地文件',
+          spdk: 'SPDK',
+          nvmeof: 'NVMe-oF',
+        }
+        return <Tag>{typeMap[type] || type}</Tag>
+      },
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 100,
+      render: (status: string) => <StatusTag kind="device" status={status} />,
+    },
+    {
+      title: '健康度',
+      dataIndex: 'health',
+      key: 'health',
+      width: 90,
+      render: (health?: string) => {
+        if (!health) return <Text type="secondary">-</Text>
+        const map: Record<string, string> = {
+          healthy: 'active',
+          warning: 'cordoned',
+          critical: 'unreachable',
+        }
+        return <StatusTag kind="node" status={map[health] ?? health} label={health} />
+      },
+    },
+    {
+      title: '总容量',
+      dataIndex: 'total_capacity',
+      key: 'total_capacity',
+      width: 100,
+      render: (val: number) => <span className="tabular-nums">{formatBytes(val)}</span>,
+    },
+    {
+      title: '已用空间',
+      key: 'used',
+      width: 170,
+      render: (_: unknown, record: StorageDevice) => {
+        const percent = record.total_capacity > 0
+          ? (record.used_space / record.total_capacity) * 100
+          : 0
+        return <ResourceBar value={percent} suffix={formatBytes(record.used_space)} />
+      },
+    },
+    {
+      title: 'Volume',
+      dataIndex: 'volume_count',
+      key: 'volume_count',
+      width: 80,
+      render: (v?: number) => <span className="tabular-nums">{v ?? '-'}</span>,
+    },
+    {
+      title: '最后检查',
+      dataIndex: 'last_check',
+      key: 'last_check',
+      width: 150,
+      render: (val?: string) => val ? <Text type="secondary" style={{ fontSize: 12 }}>{formatTime(val)}</Text> : <Text type="secondary">-</Text>,
+    },
+  ]
 
   return (
     <div>
+      {/* Page header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div>
+          <Title level={4} style={{ margin: 0 }}>节点管理</Title>
+          <Text type="secondary">PowerFS 集群节点状态与资源监控</Text>
+        </div>
+        <Space>
+          <Tooltip title="刷新">
+            <Button icon={<ReloadOutlined />} onClick={() => void loadNodes()} loading={loading} />
+          </Tooltip>
+          <Button type="primary" icon={<PlusOutlined />}>添加节点</Button>
+        </Space>
+      </div>
+
+      {/* KPI summary */}
+      <div style={{ marginBottom: 16 }}>
+        <KpiBar items={kpiItems} />
+      </div>
+
       <Card
-        title="节点管理"
-        style={{ borderRadius: 12, marginBottom: 16 }}
+        style={{ borderRadius: 12 }}
+        styles={{ body: { padding: 16 } }}
         extra={
-          <Button type="primary" icon={<PlusOutlined />}>
-            添加节点
-          </Button>
+          <Space size={12} wrap>
+            <Input
+              allowClear
+              size="middle"
+              prefix={<SearchOutlined style={{ color: 'var(--pf-color-text-tertiary)' }} />}
+              placeholder="搜索节点 ID / 地址"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              style={{ width: 220 }}
+            />
+            <Segmented
+              size="small"
+              value={density}
+              onChange={v => setDensity(v as SizeType)}
+              options={[
+                { label: '紧凑', value: 'small' },
+                { label: '默认', value: 'middle' },
+                { label: '宽松', value: 'large' },
+              ]}
+            />
+          </Space>
         }
       >
         <Tabs
+          defaultActiveKey="volume"
           items={[
             {
               key: 'master',
               label: (
-                <span>
-                  <CloudServerOutlined /> Master节点 ({masterNodes.length})
-                </span>
+                <span><CloudServerOutlined /> Master 节点 ({masterNodes.length})</span>
               ),
-              children: (
+              children: loading && masterNodes.length === 0 ? (
+                <SkeletonCard height={320} />
+              ) : masterNodes.length === 0 ? (
+                <EmptyState
+                  title="暂无 Master 节点"
+                  description="集群中尚未注册 Master 节点"
+                  icon={<CloudServerOutlined style={{ color: 'var(--pf-color-text-tertiary)' }} />}
+                />
+              ) : (
                 <Table
                   columns={columns}
                   dataSource={masterNodes}
                   rowKey="id"
-                  pagination={{ pageSize: 10 }}
-                  scroll={{ x: 1000 }}
-                  locale={{ emptyText: '暂无Master节点' }}
+                  size={density}
+                  pagination={{ pageSize: 10, showSizeChanger: true }}
+                  scroll={{ x: 1100 }}
                 />
               ),
             },
             {
               key: 'volume',
               label: (
-                <span>
-                  <DatabaseOutlined /> Volume节点 ({volumeNodes.length})
-                </span>
+                <span><DatabaseOutlined /> Volume 节点 ({volumeNodes.length})</span>
               ),
-              children: (
+              children: loading && volumeNodes.length === 0 ? (
+                <SkeletonCard height={320} />
+              ) : volumeNodes.length === 0 ? (
+                <EmptyState
+                  title="暂无 Volume 节点"
+                  description={search ? '没有匹配的节点，请调整搜索条件' : '集群中尚未注册 Volume 节点'}
+                  icon={<DatabaseOutlined style={{ color: 'var(--pf-color-text-tertiary)' }} />}
+                />
+              ) : (
                 <Table
                   columns={columns}
                   dataSource={volumeNodes}
                   rowKey="id"
-                  pagination={{ pageSize: 10 }}
-                  scroll={{ x: 1000 }}
-                  locale={{ emptyText: '暂无Volume节点' }}
+                  size={density}
+                  pagination={{ pageSize: 10, showSizeChanger: true }}
+                  scroll={{ x: 1100 }}
                 />
               ),
             },
@@ -238,231 +449,102 @@ function Nodes() {
         />
       </Card>
 
-      <Modal
+      {/* Detail Drawer */}
+      <Drawer
         title="节点详情"
         open={showDetail}
-        onCancel={() => setShowDetail(false)}
-        footer={null}
-        width={900}
+        onClose={() => setShowDetail(false)}
+        width={640}
         destroyOnClose
       >
         {selectedNode && (
-          <Tabs
-            items={[
-              {
-                key: 'basic',
-                label: '基本信息',
-                children: (
-                  <Space direction="vertical" style={{ width: '100%', gap: 20, paddingTop: 8 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <div style={{ background: '#e6f7ff', padding: 12, borderRadius: 12 }}>
-                        <SaveOutlined style={{ fontSize: 32, color: '#1890ff' }} />
-                      </div>
-                      <div>
-                        <h3 style={{ margin: 0 }}>{selectedNode.id}</h3>
-                        <p style={{ margin: '4px 0', color: '#8c8c8c' }}>
-                          {selectedNode.address}:{selectedNode.grpc_port}
-                        </p>
-                      </div>
-                    </div>
+          <Space direction="vertical" style={{ width: '100%', gap: 20 }}>
+            {/* Header card */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: 16, borderRadius: 12, background: 'var(--pf-gradient-brand-soft)' }}>
+              <div style={{
+                width: 56, height: 56, borderRadius: 14,
+                background: 'var(--pf-gradient-brand)',
+                color: '#fff', display: 'inline-flex',
+                alignItems: 'center', justifyContent: 'center', fontSize: 26,
+              }}>
+                {selectedNode.node_type === 'master' ? <CloudServerOutlined /> : <DatabaseOutlined />}
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Text strong style={{ fontSize: 18 }}>{selectedNode.id}</Text>
+                  <StatusTag kind="node" status={selectedNode.status} pulse={resolveNodeStatus(selectedNode.status).tag === 'success'} />
+                </div>
+                <Text type="secondary" className="font-mono" style={{ fontSize: 12 }}>
+                  {selectedNode.address}:{selectedNode.grpc_port}
+                </Text>
+              </div>
+            </div>
 
-                    <div>
-                      <h4 style={{ margin: '0 0 12px' }}>资源使用</h4>
-                      <Space direction="vertical" style={{ width: '100%', gap: 12 }}>
-                        <div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                            <span style={{ color: '#8c8c8c' }}>CPU使用率</span>
-                            <span>{formatPercent(selectedNode.cpu_usage)}</span>
-                          </div>
-                          <Progress
-                            percent={selectedNode.cpu_usage}
-                            strokeColor={selectedNode.cpu_usage > 80 ? '#f5222d' : selectedNode.cpu_usage > 60 ? '#faad14' : '#52c41a'}
-                          />
-                        </div>
-                        <div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                            <span style={{ color: '#8c8c8c' }}>内存使用率</span>
-                            <span>{formatPercent(selectedNode.mem_usage)}</span>
-                          </div>
-                          <Progress
-                            percent={selectedNode.mem_usage}
-                            strokeColor={selectedNode.mem_usage > 80 ? '#f5222d' : selectedNode.mem_usage > 60 ? '#faad14' : '#52c41a'}
-                          />
-                        </div>
-                        <div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                            <span style={{ color: '#8c8c8c' }}>磁盘使用率</span>
-                            <span>{formatPercent(selectedNode.disk_usage)}</span>
-                          </div>
-                          <Progress
-                            percent={selectedNode.disk_usage}
-                            strokeColor={selectedNode.disk_usage > 80 ? '#f5222d' : selectedNode.disk_usage > 60 ? '#faad14' : '#52c41a'}
-                          />
-                        </div>
-                      </Space>
-                    </div>
+            {/* Basic info */}
+            <Descriptions
+              title="基本信息"
+              column={2}
+              size="small"
+              bordered
+              items={[
+                { key: 'type', label: '节点类型', children: selectedNode.node_type === 'master' ? 'Master' : 'Volume' },
+                { key: 'addr', label: 'gRPC 地址', children: `${selectedNode.address}:${selectedNode.grpc_port}` },
+                { key: 'http', label: 'HTTP 端口', children: selectedNode.http_port },
+                { key: 'uptime', label: '运行时间', children: formatUptime(selectedNode.uptime) },
+                { key: 'vols', label: 'Volume 数量', children: `${selectedNode.volume_count} 个` },
+                { key: 'devs', label: '设备数量', children: `${selectedNode.device_count ?? nodeDevices.length} 个` },
+              ]}
+            />
 
-                    <div>
-                      <h4 style={{ margin: '0 0 12px' }}>网络IO</h4>
-                      <div style={{ display: 'flex', gap: 24 }}>
-                        <div>
-                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>接收</span>
-                          <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatBytes(selectedNode.network_rx)}</p>
-                        </div>
-                        <div>
-                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>发送</span>
-                          <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatBytes(selectedNode.network_tx)}</p>
-                        </div>
-                      </div>
-                    </div>
+            {/* Resource usage */}
+            <div>
+              <Title level={5} style={{ margin: '0 0 12px' }}>资源使用</Title>
+              <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+                <ResourceRow label="CPU 使用率" value={selectedNode.cpu_usage} />
+                <ResourceRow label="内存使用率" value={selectedNode.mem_usage} />
+                <ResourceRow label="磁盘使用率" value={selectedNode.disk_usage} />
+              </Space>
+            </div>
 
-                    <div>
-                      <h4 style={{ margin: '0 0 12px' }}>状态信息</h4>
-                      <div style={{ display: 'flex', gap: 24 }}>
-                        <div>
-                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>状态</span>
-                          <Tag color={selectedNode.status === 'online' ? 'green' : selectedNode.status === 'warning' ? 'orange' : 'red'}>
-                            {selectedNode.status === 'online' ? '在线' : selectedNode.status === 'warning' ? '告警' : '离线'}
-                          </Tag>
-                        </div>
-                        <div>
-                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>Volume数量</span>
-                          <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedNode.volume_count} 个</p>
-                        </div>
-                        <div>
-                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>运行时间</span>
-                          <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatUptime(selectedNode.uptime)}</p>
-                        </div>
-                      </div>
-                    </div>
-                  </Space>
-                ),
-              },
-              {
-                key: 'devices',
-                label: (
-                  <span>
-                    <HddOutlined /> 存储设备 ({nodeDevices.length})
-                  </span>
-                ),
-                children: (
-                  <Table
-                    columns={[
-                      {
-                        title: '设备ID',
-                        dataIndex: 'device_id',
-                        key: 'device_id',
-                        width: 100,
-                      },
-                      {
-                        title: '类型',
-                        dataIndex: 'device_type',
-                        key: 'device_type',
-                        width: 100,
-                        render: (type: string) => {
-                          const typeMap: Record<string, string> = {
-                            local_file: '本地文件',
-                            spdk: 'SPDK',
-                            nvmeof: 'NVMe-oF',
-                          }
-                          return typeMap[type] || type
-                        },
-                      },
-                      {
-                        title: '状态',
-                        dataIndex: 'status',
-                        key: 'status',
-                        width: 90,
-                        render: (status: string) => {
-                          const statusConfig: Record<string, { color: string; text: string }> = {
-                            online: { color: 'green', text: '在线' },
-                            offline: { color: 'red', text: '离线' },
-                            excluded: { color: 'orange', text: '已排除' },
-                            draining: { color: 'blue', text: '排空中' },
-                            faulty: { color: 'red', text: '故障' },
-                          }
-                          const cfg = statusConfig[status] || { color: 'default', text: status }
-                          return <Tag color={cfg.color}>{cfg.text}</Tag>
-                        },
-                      },
-                      {
-                        title: '健康度',
-                        dataIndex: 'health',
-                        key: 'health',
-                        width: 90,
-                        render: (health?: string) => {
-                          if (!health) return '-'
-                          const healthConfig: Record<string, { color: string; icon: React.ReactNode; text: string }> = {
-                            healthy: { color: 'green', icon: <CheckCircleOutlined />, text: '健康' },
-                            warning: { color: 'orange', icon: <ExclamationCircleOutlined />, text: '警告' },
-                            critical: { color: 'red', icon: <CloseCircleOutlined />, text: '严重' },
-                          }
-                          const cfg = healthConfig[health] || { color: 'default', icon: null, text: health }
-                          return (
-                            <Tag color={cfg.color}>
-                              {cfg.icon} {cfg.text}
-                            </Tag>
-                          )
-                        },
-                      },
-                      {
-                        title: '总容量',
-                        dataIndex: 'total_capacity',
-                        key: 'total_capacity',
-                        width: 100,
-                        render: (val: number) => formatBytes(val),
-                      },
-                      {
-                        title: '已用空间',
-                        key: 'used',
-                        width: 160,
-                        render: (_: unknown, record: StorageDevice) => {
-                          const percent = record.total_capacity > 0
-                            ? (record.used_space / record.total_capacity) * 100
-                            : 0
-                          return (
-                            <div>
-                              <Progress
-                                percent={parseFloat(percent.toFixed(1))}
-                                size="small"
-                                strokeColor={percent > 80 ? '#f5222d' : percent > 60 ? '#faad14' : '#52c41a'}
-                                showInfo={false}
-                              />
-                              <span style={{ marginLeft: 8, fontSize: 12, color: '#8c8c8c' }}>
-                                {formatBytes(record.used_space)}
-                              </span>
-                            </div>
-                          )
-                        },
-                      },
-                      {
-                        title: 'Volume数',
-                        dataIndex: 'volume_count',
-                        key: 'volume_count',
-                        width: 80,
-                      },
-                      {
-                        title: '最后检查',
-                        dataIndex: 'last_check',
-                        key: 'last_check',
-                        width: 150,
-                        render: (val?: string) => val ? formatTime(val) : '-',
-                      },
-                    ]}
-                    dataSource={nodeDevices}
-                    rowKey="device_id"
-                    pagination={{ pageSize: 5 }}
-                    scroll={{ x: 800 }}
-                    size="small"
-                    locale={{ emptyText: '暂无存储设备' }}
-                  />
-                ),
-              },
-            ]}
-          />
+            {/* Network IO */}
+            <Descriptions
+              title="网络 IO"
+              column={2}
+              size="small"
+              bordered
+              items={[
+                { key: 'rx', label: '接收', children: formatBytes(selectedNode.network_rx) },
+                { key: 'tx', label: '发送', children: formatBytes(selectedNode.network_tx) },
+              ]}
+            />
+
+            {/* Storage devices */}
+            <div>
+              <Title level={5} style={{ margin: '0 0 12px' }}>
+                <Space><HddOutlined /> 存储设备 ({nodeDevices.length})</Space>
+              </Title>
+              {nodeDevices.length > 0 ? (
+                <Table
+                  columns={deviceColumns}
+                  dataSource={nodeDevices}
+                  rowKey="device_id"
+                  pagination={{ pageSize: 5 }}
+                  scroll={{ x: 900 }}
+                  size="small"
+                />
+              ) : (
+                <EmptyState
+                  title="暂无存储设备"
+                  description="该节点尚未挂载存储设备"
+                  icon={<HddOutlined style={{ color: 'var(--pf-color-text-tertiary)' }} />}
+                />
+              )}
+            </div>
+          </Space>
         )}
-      </Modal>
+      </Drawer>
 
+      {/* Delete confirm */}
       <Modal
         title="确认删除"
         open={showDeleteConfirm}
@@ -473,8 +555,43 @@ function Nodes() {
         okButtonProps={{ danger: true }}
       >
         <p>确定要删除节点 <strong>{selectedNode?.id}</strong> 吗？</p>
-        <p style={{ color: '#8c8c8c', fontSize: 12 }}>删除前请确保该节点上的Volume已迁移到其他节点。</p>
+        <p style={{ color: 'var(--pf-color-text-tertiary)', fontSize: 12 }}>
+          删除前请确保该节点上的 Volume 已迁移到其他节点。
+        </p>
       </Modal>
+    </div>
+  )
+}
+
+/** Compact resource bar with percent label and threshold-based color. */
+function ResourceBar({ value, suffix }: { value: number; suffix?: string }) {
+  const color = value > 80 ? '#ff4d4f' : value > 60 ? '#faad14' : '#52c41a'
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <Progress
+        percent={Math.min(100, value)}
+        size="small"
+        strokeColor={color}
+        showInfo={false}
+        style={{ flex: 1, minWidth: 60, margin: 0 }}
+      />
+      <span className="tabular-nums" style={{ fontSize: 12, minWidth: 42, textAlign: 'right' }}>
+        {suffix ?? formatPercent(value)}
+      </span>
+    </div>
+  )
+}
+
+/** Labeled resource row for the detail drawer. */
+function ResourceRow({ label, value }: { label: string; value: number }) {
+  const color = value > 80 ? '#ff4d4f' : value > 60 ? '#faad14' : '#52c41a'
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+        <Text type="secondary" style={{ fontSize: 13 }}>{label}</Text>
+        <Text strong className="tabular-nums" style={{ color }}>{formatPercent(value)}</Text>
+      </div>
+      <Progress percent={Math.min(100, value)} strokeColor={color} showInfo={false} />
     </div>
   )
 }

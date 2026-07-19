@@ -1,0 +1,196 @@
+/**
+ * PowerFS Monitor global CSS variables & font setup.
+ *
+ * Variables are scoped under [data-theme="light"] and [data-theme="dark"]
+ * selectors; components consume them via `var(--pf-color-bg)` etc.
+ */
+
+/* ============== Font faces (Inter + JetBrains Mono) ============== */
+/* Loaded from Google Fonts CDN at runtime; falls back gracefully. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ============== Light theme variables ============== */
+[data-theme='light'] {
+  --pf-color-bg: #f5f7fa;
+  --pf-color-bg-container: #ffffff;
+  --pf-color-bg-elevated: #ffffff;
+  --pf-color-bg-hover: #f3f4f6;
+  --pf-color-bg-active: #e5e7eb;
+
+  --pf-color-text: #1f2937;
+  --pf-color-text-secondary: #4b5563;
+  --pf-color-text-tertiary: #6b7280;
+  --pf-color-text-inverse: #ffffff;
+
+  --pf-color-border: #e5e7eb;
+  --pf-color-border-secondary: #f3f4f6;
+
+  --pf-color-brand: #1677ff;
+  --pf-color-brand-hover: #4096ff;
+  --pf-color-success: #52c41a;
+  --pf-color-warning: #faad14;
+  --pf-color-danger: #ff4d4f;
+
+  --pf-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --pf-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --pf-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.12), 0 4px 8px rgba(0, 0, 0, 0.06);
+
+  --pf-gradient-brand: linear-gradient(135deg, #1677ff 0%, #722ed1 100%);
+  --pf-gradient-brand-soft: linear-gradient(
+    135deg,
+    rgba(22, 119, 255, 0.08) 0%,
+    rgba(114, 46, 209, 0.08) 100%
+  );
+
+  --pf-sider-bg: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
+  --pf-sider-border: #e5e7eb;
+}
+
+/* ============== Dark theme variables ============== */
+[data-theme='dark'] {
+  --pf-color-bg: #0f172a;
+  --pf-color-bg-container: #1e293b;
+  --pf-color-bg-elevated: #1e293b;
+  --pf-color-bg-hover: #334155;
+  --pf-color-bg-active: #334155;
+
+  --pf-color-text: #f1f5f9;
+  --pf-color-text-secondary: #cbd5e1;
+  --pf-color-text-tertiary: #94a3b8;
+  --pf-color-text-inverse: #0f172a;
+
+  --pf-color-border: #334155;
+  --pf-color-border-secondary: #1e293b;
+
+  --pf-color-brand: #1677ff;
+  --pf-color-brand-hover: #4096ff;
+  --pf-color-success: #52c41a;
+  --pf-color-warning: #faad14;
+  --pf-color-danger: #ff4d4f;
+
+  --pf-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --pf-shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --pf-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.6);
+
+  --pf-gradient-brand: linear-gradient(135deg, #1677ff 0%, #722ed1 100%);
+  --pf-gradient-brand-soft: linear-gradient(
+    135deg,
+    rgba(22, 119, 255, 0.16) 0%,
+    rgba(114, 46, 209, 0.16) 100%
+  );
+
+  --pf-sider-bg: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+  --pf-sider-border: #1e293b;
+}
+
+/* ============== Global resets ============== */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-feature-settings: 'cv11', 'ss01';
+  font-variant-numeric: tabular-nums;
+  background-color: var(--pf-color-bg);
+  color: var(--pf-color-text);
+  transition: background-color 0.25s ease, color 0.25s ease;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Monospace numerics for data display */
+.font-mono,
+.tabular-nums {
+  font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', 'Fira Code',
+    Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============== Scrollbars ============== */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pf-color-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pf-color-text-tertiary);
+}
+
+/* ============== Utility classes ============== */
+.pf-gradient-text {
+  background: var(--pf-gradient-brand);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.pf-glass {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.pf-card-hover {
+  transition: box-shadow 0.25s ease, transform 0.25s ease;
+}
+
+.pf-card-hover:hover {
+  box-shadow: var(--pf-shadow-hover);
+  transform: translateY(-2px);
+}
+
+/* Status pulse animation for live indicators */
+@keyframes pf-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.pf-pulse {
+  animation: pf-pulse 2s ease-in-out infinite;
+}
+
+/* Skeleton shimmer */
+@keyframes pf-shimmer {
+  0% {
+    background-position: -468px 0;
+  }
+  100% {
+    background-position: 468px 0;
+  }
+}
+
+.pf-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--pf-color-bg-hover) 25%,
+    var(--pf-color-bg-active) 50%,
+    var(--pf-color-bg-hover) 75%
+  );
+  background-size: 936px 100%;
+  animation: pf-shimmer 1.4s ease-in-out infinite;
+}

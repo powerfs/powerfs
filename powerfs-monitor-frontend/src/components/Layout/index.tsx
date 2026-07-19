@@ -1,6 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { Layout, Menu, Button, Space, Dropdown, Avatar, Typography, message } from 'antd'
+import {
+  Layout,
+  Menu,
+  Button,
+  Space,
+  Dropdown,
+  Avatar,
+  Typography,
+  message,
+  Tooltip,
+  Tag,
+} from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DashboardOutlined,
@@ -10,9 +21,9 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   RocketOutlined,
-  SaveOutlined,
   CloudOutlined,
   FolderOpenOutlined,
+  SearchOutlined,
   UserOutlined,
   LogoutOutlined,
   TeamOutlined,
@@ -21,6 +32,10 @@ import {
   WarningOutlined,
   HddOutlined,
   SafetyOutlined,
+  BulbOutlined,
+  BulbFilled,
+  DesktopOutlined,
+  AppstoreOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -28,15 +43,21 @@ import {
   logout as authLogout,
   type CurrentUser,
 } from '@/services/auth'
+import { useTheme, type ThemeMode } from '@/styles/ThemeContext'
+import GlobalSearch, { type GlobalSearchHandle } from '@/components/GlobalSearch'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
+
+type MenuItem = Required<MenuProps>['items'][number]
 
 function AppLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const location = useLocation()
   const navigate = useNavigate()
   const [user, setUser] = useState<CurrentUser | null>(getCurrentUser())
+  const { mode, setMode } = useTheme()
+  const searchRef = useRef<GlobalSearchHandle>(null)
 
   useEffect(() => {
     const unsubscribe = subscribe(() => {
@@ -47,28 +68,79 @@ function AppLayout() {
 
   const isAdmin = user?.role === 'admin'
 
-  const menuItems = [
+  // Group menu items into 5 categories
+  const menuItems: MenuItem[] = [
+    // ── 总览 ──
+    {
+      key: 'grp-overview',
+      type: 'group',
+      label: '总览',
+      children: [
+        { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
+        { key: '/alerts', icon: <BellOutlined />, label: '告警中心' },
+      ],
+    },
+    // ── 基础设施 ──
     ...(isAdmin
-      ? [
-          { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
-          { key: '/nodes', icon: <SaveOutlined />, label: '节点管理' },
-          { key: '/storage-devices', icon: <HddOutlined />, label: '存储设备' },
-          { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume管理' },
-          { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot扫描' },
-          { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE管理' },
-          { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
-        ]
+      ? [{
+          key: 'grp-infra',
+          type: 'group' as const,
+          label: '基础设施',
+          children: [
+            { key: '/nodes', icon: <HddOutlined />, label: '节点管理' },
+            { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
+            { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
+          ],
+        }]
       : []),
-    { key: '/kv', icon: <KeyOutlined />, label: 'KV管理' },
-    { key: '/s3', icon: <CloudOutlined />, label: 'S3管理' },
-    { key: '/alerts', icon: <BellOutlined />, label: '告警中心' },
-    { key: '/access-keys', icon: <LockOutlined />, label: '我的密钥' },
+    // ── 存储 ──
+    {
+      key: 'grp-storage',
+      type: 'group',
+      label: '存储',
+      children: [
+        ...(isAdmin
+          ? [
+              { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume 管理' },
+              { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot 扫描' },
+            ]
+          : []),
+        { key: '/s3', icon: <CloudOutlined />, label: 'S3 管理' },
+      ],
+    },
+    // ── 元数据 ──
     ...(isAdmin
-      ? [
-          { key: '/users', icon: <TeamOutlined />, label: '用户管理' },
-          { key: '/roles', icon: <SafetyCertificateOutlined />, label: '角色管理' },
-        ]
+      ? [{
+          key: 'grp-meta',
+          type: 'group' as const,
+          label: '元数据',
+          children: [
+            { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
+          ],
+        }]
       : []),
+    // ── 性能 ──
+    {
+      key: 'grp-perf',
+      type: 'group',
+      label: '性能',
+      children: [{ key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' }],
+    },
+    // ── 安全 ──
+    {
+      key: 'grp-security',
+      type: 'group',
+      label: '安全',
+      children: [
+        { key: '/access-keys', icon: <LockOutlined />, label: '我的密钥' },
+        ...(isAdmin
+          ? [
+              { key: '/users', icon: <TeamOutlined />, label: '用户管理' },
+              { key: '/roles', icon: <SafetyCertificateOutlined />, label: '角色管理' },
+            ]
+          : []),
+      ],
+    },
   ]
 
   const handleLogout = () => {
@@ -99,24 +171,64 @@ function AppLayout() {
     },
   ]
 
+  const themeMenuItems: MenuProps['items'] = [
+    {
+      key: 'light',
+      icon: <BulbOutlined />,
+      label: '明亮',
+      onClick: () => setMode('light' as ThemeMode),
+    },
+    {
+      key: 'dark',
+      icon: <BulbFilled />,
+      label: '暗黑',
+      onClick: () => setMode('dark' as ThemeMode),
+    },
+    {
+      key: 'auto',
+      icon: <DesktopOutlined />,
+      label: '跟随系统',
+      onClick: () => setMode('auto' as ThemeMode),
+    },
+  ]
+
+  const themeLabel = mode === 'light' ? '明亮' : mode === 'dark' ? '暗黑' : '自动'
+
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Sider
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
-        theme="dark"
+        width={240}
         style={{
-          background: 'linear-gradient(180deg, #1a1a2e 0%, #16213e 100%)',
+          background: 'var(--pf-sider-bg)',
+          borderRight: '1px solid var(--pf-sider-border)',
+          position: 'sticky',
+          top: 0,
+          height: '100vh',
         }}
       >
-        <div style={{ padding: '20px 16px', textAlign: 'center', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-          <Space align="center" style={{ justifyContent: 'center' }}>
-            <RocketOutlined style={{ fontSize: 24, color: '#1890ff' }} />
-            {!collapsed && (
-              <span style={{ color: '#fff', fontSize: 18, fontWeight: 'bold' }}>PowerFS</span>
-            )}
-          </Space>
+        <div
+          style={{
+            padding: '20px 16px',
+            textAlign: 'center',
+            borderBottom: '1px solid var(--pf-sider-border)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 10,
+          }}
+        >
+          <RocketOutlined style={{ fontSize: 24, color: 'var(--pf-color-brand)' }} />
+          {!collapsed && (
+            <span
+              className="pf-gradient-text"
+              style={{ fontSize: 20, fontWeight: 700, letterSpacing: 0.5 }}
+            >
+              PowerFS
+            </span>
+          )}
         </div>
         <Menu
           mode="inline"
@@ -126,29 +238,84 @@ function AppLayout() {
           style={{
             background: 'transparent',
             borderRight: 'none',
+            paddingTop: 8,
           }}
         />
       </Sider>
+
       <Layout>
         <Header
           style={{
-            background: '#fff',
+            background: 'var(--pf-color-bg-container)',
             padding: '0 24px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+            borderBottom: '1px solid var(--pf-color-border)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            position: 'sticky',
+            top: 0,
+            zIndex: 10,
           }}
         >
-          <Button
-            type="text"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed(!collapsed)}
-            style={{ marginRight: 16 }}
-          />
-          <span style={{ fontSize: 18, fontWeight: 500 }}>监控管理平台</span>
-          <Space>
-            <span style={{ color: '#52c41a' }}>● 系统运行正常</span>
+          <Space size={16}>
+            <Button
+              type="text"
+              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+              onClick={() => setCollapsed(!collapsed)}
+            />
+            <Text strong style={{ fontSize: 16 }}>监控管理平台</Text>
+          </Space>
+
+          <Space size={16}>
+            {/* Cluster health badge */}
+            <Tooltip title="集群当前健康状态">
+              <Tag
+                color="success"
+                style={{
+                  margin: 0,
+                  padding: '2px 12px',
+                  borderRadius: 12,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <span
+                  className="pf-pulse"
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    background: 'var(--pf-color-success)',
+                    display: 'inline-block',
+                  }}
+                />
+                系统运行正常
+              </Tag>
+            </Tooltip>
+
+            {/* Global search trigger */}
+            <Tooltip title="全局搜索 (Ctrl+K)">
+              <Button
+                type="text"
+                icon={<SearchOutlined />}
+                onClick={() => searchRef.current?.open()}
+              />
+            </Tooltip>
+
+            {/* Theme switcher */}
+            <Dropdown menu={{ items: themeMenuItems }} placement="bottomRight">
+              <Tooltip title={`主题: ${themeLabel}`}>
+                <Button type="text">
+                  <Space size={4}>
+                    {mode === 'dark' ? <BulbFilled /> : <BulbOutlined />}
+                    {themeLabel}
+                  </Space>
+                </Button>
+              </Tooltip>
+            </Dropdown>
+
+            {/* User menu */}
             <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
               <Space style={{ cursor: 'pointer', padding: '0 8px' }}>
                 <Avatar size="small" icon={<UserOutlined />} />
@@ -157,18 +324,22 @@ function AppLayout() {
             </Dropdown>
           </Space>
         </Header>
+
         <Content
           style={{
             margin: '24px 16px',
             padding: 24,
             minHeight: 280,
-            background: '#f0f2f5',
-            borderRadius: 8,
+            background: 'var(--pf-color-bg)',
+            borderRadius: 12,
           }}
         >
           <Outlet />
         </Content>
       </Layout>
+
+      {/* Global command palette (Cmd+K / Ctrl+K) */}
+      <GlobalSearch ref={searchRef} isAdmin={isAdmin} />
     </Layout>
   )
 }
