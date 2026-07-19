@@ -5,7 +5,6 @@ members = [
     "powerfs-volume",
     "powerfs-fuse",
     "powerfs-fuse-core",
-    "powerfs-fuse-enterprise",
     "powerfs-common",
     "powerfs-server",
     "powerfs-cli",
