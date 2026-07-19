@@ -419,8 +419,14 @@ fn test_node_state_default() {
 #[test]
 fn test_node_state_all_variants() {
     let states = [
+        NodeState::Init,
+        NodeState::Ready,
         NodeState::Healthy,
+        NodeState::SoftError,
+        NodeState::FailSlow,
         NodeState::Degraded,
+        NodeState::Fault,
+        NodeState::Maintenance,
         NodeState::Unavailable,
     ];
     for i in 0..states.len() {
@@ -428,6 +434,36 @@ fn test_node_state_all_variants() {
             assert_ne!(states[i], states[j]);
         }
     }
+}
+
+#[test]
+fn test_node_state_helpers() {
+    // assignable: only Ready/Healthy/SoftError/FailSlow
+    assert!(NodeState::Ready.is_assignable());
+    assert!(NodeState::Healthy.is_assignable());
+    assert!(NodeState::SoftError.is_assignable());
+    assert!(NodeState::FailSlow.is_assignable());
+    assert!(!NodeState::Init.is_assignable());
+    assert!(!NodeState::Degraded.is_assignable());
+    assert!(!NodeState::Fault.is_assignable());
+    assert!(!NodeState::Maintenance.is_assignable());
+    assert!(!NodeState::Unavailable.is_assignable());
+
+    // readable: includes Degraded
+    assert!(NodeState::Degraded.is_readable());
+    assert!(!NodeState::Fault.is_readable());
+
+    // writable: excludes Degraded
+    assert!(!NodeState::Degraded.is_writable());
+    assert!(NodeState::Healthy.is_writable());
+
+    // is_unhealthy: blocks scheduling
+    assert!(NodeState::Init.is_unhealthy());
+    assert!(NodeState::Degraded.is_unhealthy());
+    assert!(NodeState::Fault.is_unhealthy());
+    assert!(NodeState::Maintenance.is_unhealthy());
+    assert!(NodeState::Unavailable.is_unhealthy());
+    assert!(!NodeState::Healthy.is_unhealthy());
 }
 
 // ============================================================================
@@ -450,8 +486,31 @@ fn test_data_node_info_url() {
         http_port: 8081,
         public_url: "".to_string(),
         maintenance_mode: false,
+        soft_error_type: None,
+        degrade_type: None,
+        degrade_severity: 0,
+        state_since: 0,
     };
     assert_eq!(node.url(), "192.168.1.1:8081");
+}
+
+#[test]
+fn test_data_node_info_new_defaults() {
+    let node = DataNodeInfo::new(
+        NodeId("n1".to_string()),
+        "192.168.1.1".to_string(),
+        RackId("r1".to_string()),
+        DataCenterId("dc1".to_string()),
+        8081,
+        8080,
+        "http://n1:8081".to_string(),
+    );
+    assert_eq!(node.state, NodeState::Healthy);
+    assert_eq!(node.soft_error_type, None);
+    assert_eq!(node.degrade_type, None);
+    assert_eq!(node.degrade_severity, 0);
+    assert_eq!(node.state_since, 0);
+    assert!(!node.maintenance_mode);
 }
 
 // ============================================================================

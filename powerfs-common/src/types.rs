@@ -337,6 +337,23 @@ pub struct DataNodeInfo {
     pub http_port: u32,
     pub public_url: String,
     pub maintenance_mode: bool,
+    /// When `state == SoftError`, the specific soft-error sub-type. `None`
+    /// otherwise. Set by the node itself in its heartbeat and propagated
+    /// through the master.
+    #[serde(default)]
+    pub soft_error_type: Option<SoftErrorType>,
+    /// When `state == FailSlow`, the specific degradation sub-type. `None`
+    /// otherwise.
+    #[serde(default)]
+    pub degrade_type: Option<DegradeType>,
+    /// When `state == FailSlow`, a severity score in 0..=100 (100 = most
+    /// severe). Ignored for other states.
+    #[serde(default)]
+    pub degrade_severity: u8,
+    /// Unix-epoch nanoseconds when the current state was entered. 0 means
+    /// unknown / not reported.
+    #[serde(default)]
+    pub state_since: u64,
 }
 
 impl DataNodeInfo {
@@ -367,6 +384,10 @@ impl DataNodeInfo {
             http_port,
             public_url,
             maintenance_mode: false,
+            soft_error_type: None,
+            degrade_type: None,
+            degrade_severity: 0,
+            state_since: 0,
         }
     }
 }
@@ -463,10 +484,94 @@ impl Topology {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NodeState {
+    /// Node just started, initialization not yet complete.
+    Init,
+    /// Initialization complete, registered with master, awaiting heartbeat confirmation.
+    Ready,
+    /// Fully healthy.
     #[default]
     Healthy,
+    /// Soft error: recoverable, slight performance degradation, still servable.
+    /// Use `DataNodeInfo.soft_error_type` for details.
+    SoftError,
+    /// Fail-slow: network degradation or resource pressure causing slow responses.
+    /// Use `DataNodeInfo.degrade_type` and `degrade_severity` for details.
+    FailSlow,
+    /// Degraded: read-only mode (writes rejected).
     Degraded,
+    /// Completely faulty, cannot serve.
+    Fault,
+    /// Under maintenance (manually taken offline).
+    Maintenance,
+    /// Lost contact (heartbeat timeout).
     Unavailable,
+}
+
+impl NodeState {
+    /// Returns true if the node can be assigned new volumes.
+    pub fn is_assignable(self) -> bool {
+        matches!(
+            self,
+            NodeState::Ready | NodeState::Healthy | NodeState::SoftError | NodeState::FailSlow
+        )
+    }
+
+    /// Returns true if the node can serve read requests.
+    pub fn is_readable(self) -> bool {
+        matches!(
+            self,
+            NodeState::Ready
+                | NodeState::Healthy
+                | NodeState::SoftError
+                | NodeState::FailSlow
+                | NodeState::Degraded
+        )
+    }
+
+    /// Returns true if the node can serve write requests.
+    pub fn is_writable(self) -> bool {
+        matches!(
+            self,
+            NodeState::Ready | NodeState::Healthy | NodeState::SoftError | NodeState::FailSlow
+        )
+    }
+
+    /// Returns true if this state should block scheduling decisions (a
+    /// transient or terminal unhealthy state). Used by the smart assigner to
+    /// skip candidates whose state is one of these.
+    pub fn is_unhealthy(self) -> bool {
+        matches!(
+            self,
+            NodeState::Init
+                | NodeState::Degraded
+                | NodeState::Fault
+                | NodeState::Unavailable
+                | NodeState::Maintenance
+        )
+    }
+}
+
+/// Specific sub-type of soft error (recoverable, performance-related).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SoftErrorType {
+    #[default]
+    MemoryPressure,
+    DiskAlmostFull,
+    CpuPressure,
+    TooManyOpenFiles,
+}
+
+/// Specific sub-type of fail-slow degradation (network/resource-induced
+/// latency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum DegradeType {
+    #[default]
+    NetworkDegrade,
+    NetworkError,
+    MemoryError,
+    CpuError,
+    DiskError,
+    LatencySpike,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

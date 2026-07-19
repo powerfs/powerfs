@@ -99,6 +99,10 @@ impl S3MasterClient {
                     http_port: 8080,
                     public_url: loc.public_url,
                     maintenance_mode: false,
+                    soft_error_type: None,
+                    degrade_type: None,
+                    degrade_severity: 0,
+                    state_since: 0,
                 }
             })
             .collect();
@@ -172,6 +176,10 @@ impl S3MasterClient {
             http_port: 8080,
             public_url: String::new(),
             maintenance_mode: false,
+            soft_error_type: None,
+            degrade_type: None,
+            degrade_severity: 0,
+            state_since: 0,
         })
     }
 }

@@ -594,23 +594,35 @@ impl MasterService for MasterGrpcServer {
 
         let mut new_volume_ids = Vec::new();
         let mut locations = Vec::new();
-        let mut created_count = 0;
-        let max_retries = req.count * 10;
 
-        while new_volume_ids.len() < req.count as usize && created_count < max_retries {
-            match self
-                .master
-                .create_new_volume(&req.replication, &req.collection)
-                .await
-            {
-                Ok((fid, nodes)) => {
-                    created_count += 1;
-                    if let Some(primary_node) = nodes.first() {
-                        if !req.data_node.is_empty() && primary_node.id.0 != req.data_node {
-                            continue;
-                        }
+        // Use the smart assigner with optional preferred primary node.
+        // This replaces the previous create-and-discard retry loop that
+        // created up to `count * 10` volumes and threw away mismatches.
+        let preferred_node: Option<&str> = if req.data_node.is_empty() {
+            None
+        } else {
+            Some(req.data_node.as_str())
+        };
+
+        // Small bounded retry for transient Raft conflicts only (e.g. another
+        // leader proposal racing us). Node-targeting is handled by the smart
+        // assigner directly, so we do not need the old `* 10` multiplier.
+        const MAX_TRANSIENT_RETRIES: u32 = 3;
+
+        for attempt in 1..=MAX_TRANSIENT_RETRIES {
+            while (new_volume_ids.len() as u32) < req.count {
+                match self
+                    .master
+                    .create_new_volume_with_preference(
+                        &req.replication,
+                        &req.collection,
+                        preferred_node,
+                    )
+                    .await
+                {
+                    Ok((fid, nodes)) => {
                         new_volume_ids.push(fid.volume_id.0);
-                        for node in nodes {
+                        for node in &nodes {
                             locations.push(Location {
                                 url: node.url(),
                                 public_url: node.public_url.clone(),
@@ -619,15 +631,39 @@ impl MasterService for MasterGrpcServer {
                             });
                         }
                     }
-                }
-                Err(e) => {
-                    return Ok(Response::new(VolumeGrowResponse {
-                        new_volume_ids,
-                        locations,
-                        error: e.to_string(),
-                    }));
+                    Err(e) => {
+                        // If we already produced some volumes, return them
+                        // with the error rather than discarding progress.
+                        if !new_volume_ids.is_empty() {
+                            return Ok(Response::new(VolumeGrowResponse {
+                                new_volume_ids,
+                                locations,
+                                error: e.to_string(),
+                            }));
+                        }
+                        // Hard-fail on the first attempt's error unless it
+                        // looks like a transient Raft conflict.
+                        let msg = e.to_string();
+                        let is_transient = msg.contains("not leader")
+                            || msg.contains("raft")
+                            || msg.contains("timeout");
+                        if attempt == MAX_TRANSIENT_RETRIES || !is_transient {
+                            return Ok(Response::new(VolumeGrowResponse {
+                                new_volume_ids,
+                                locations,
+                                error: msg,
+                            }));
+                        }
+                        // Transient: break inner loop and retry from the top.
+                        break;
+                    }
                 }
             }
+            if (new_volume_ids.len() as u32) >= req.count {
+                break;
+            }
+            // Brief backoff before a transient retry.
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         Ok(Response::new(VolumeGrowResponse {
@@ -1519,7 +1555,7 @@ impl MasterService for MasterGrpcServer {
 
         match result {
             Ok(actual_size) => Ok(Response::new(UpdateEntryResponse {
-                success: actual_size > 0,
+                success: true,
                 error: String::new(),
                 actual_size,
             })),

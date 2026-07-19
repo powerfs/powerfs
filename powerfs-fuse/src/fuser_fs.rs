@@ -145,15 +145,25 @@ impl PowerFsFuserFs {
         }
     }
 
-    /// 获取文件实际大小（以 Master 元数据为准）
+    /// 获取文件实际大小（取 meta server 与本地脏数据的较大值）
+    ///
+    /// 以 meta server 的 size 为准（CAS 策略，可能有其他 client 写入），
+    /// 但如果本地有未 flush 的脏数据，本地写入端代表了已知的文件最远端，
+    /// 取 max 确保 flush 时不会把 size 传小了。
+    /// 如果 meta_size 更大（其他 client 写入），同步到本地 data_manager，
+    /// 确保读路径的边界检查正确。
     fn get_file_size(&self, ino: u64) -> u64 {
         let meta_size = self
             .meta
             .get_entry_by_inode(ino)
             .map(|e| e.map(|e| e.size).unwrap_or(0))
             .unwrap_or(0);
-        self.data.set_file_size(ino, meta_size);
-        meta_size
+        let local_size = self.data.current_file_size(ino);
+        let effective = meta_size.max(local_size);
+        if meta_size > local_size {
+            self.data.set_file_size(ino, meta_size);
+        }
+        effective
     }
 
     /// 将脏 chunk 写入 Volume Server 并更新 Master 元数据
@@ -1076,7 +1086,12 @@ impl Filesystem for PowerFsFuserFs {
             inode, offset_u64, size_usize
         );
 
-        // 先尝试从 DataManager 本地缓存读
+        let file_size = self.get_file_size(inode);
+        if offset_u64 >= file_size {
+            reply.data(&[]);
+            return;
+        }
+
         match self.data.read(inode, offset_u64, size_usize) {
             Some(data) => {
                 // 调试：检测全 0 读取

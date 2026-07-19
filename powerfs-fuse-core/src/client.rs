@@ -22,6 +22,8 @@ use tonic::transport::Channel;
 
 use powerfs_master::proto::powerfs::Location;
 
+use crate::connection_manager::{ConnectionConfig, MasterConnectionManager};
+
 pub type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
 
 #[derive(Debug)]
@@ -61,21 +63,20 @@ pub struct PowerFuseClient {
     master_addresses: Arc<Vec<String>>,
     current_master_index: std::sync::atomic::AtomicUsize,
     master_channel: RwLock<Option<Channel>>,
+    /// Address of the master that the cached `master_channel` is currently
+    /// connected to. Used to feed success/failure signals back to the
+    /// connection manager. `None` when no channel is cached.
+    current_master_addr: RwLock<Option<String>>,
     volume_channels: RwLock<HashMap<String, Channel>>,
     runtime_handle: Handle,
     config: GrpcConfig,
+    /// Per-node health tracking, circuit breaker, leader cache.
+    connection_manager: Arc<MasterConnectionManager>,
 }
 
 impl PowerFuseClient {
     pub fn new(master_addrs: &[&str], runtime_handle: Handle) -> Arc<Self> {
-        Arc::new(PowerFuseClient {
-            master_addresses: Arc::new(master_addrs.iter().map(|s| s.to_string()).collect()),
-            current_master_index: std::sync::atomic::AtomicUsize::new(0),
-            master_channel: RwLock::new(None),
-            volume_channels: RwLock::new(HashMap::new()),
-            runtime_handle,
-            config: GrpcConfig::default(),
-        })
+        Self::with_config(master_addrs, runtime_handle, GrpcConfig::default())
     }
 
     pub fn with_config(
@@ -83,24 +84,28 @@ impl PowerFuseClient {
         runtime_handle: Handle,
         config: GrpcConfig,
     ) -> Arc<Self> {
+        let addrs: Vec<String> = master_addrs.iter().map(|s| s.to_string()).collect();
+        let connection_manager = Arc::new(MasterConnectionManager::new(
+            addrs.clone(),
+            ConnectionConfig::default(),
+        ));
         Arc::new(PowerFuseClient {
-            master_addresses: Arc::new(master_addrs.iter().map(|s| s.to_string()).collect()),
+            master_addresses: Arc::new(addrs),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
             master_channel: RwLock::new(None),
+            current_master_addr: RwLock::new(None),
             volume_channels: RwLock::new(HashMap::new()),
             runtime_handle,
             config,
+            connection_manager,
         })
     }
 
-    fn next_master_index(&self) -> usize {
-        let current = self
-            .current_master_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let next = (current + 1) % self.master_addresses.len();
-        self.current_master_index
-            .store(next, std::sync::atomic::Ordering::Relaxed);
-        next
+    /// Expose the underlying connection manager for callers (e.g. the
+    /// metadata subscription loop) that want to inspect per-node health or
+    /// update the leader hint directly.
+    pub fn connection_manager(&self) -> &MasterConnectionManager {
+        &self.connection_manager
     }
 
     async fn get_or_create_master_channel(&self) -> Result<Channel, String> {
@@ -111,35 +116,43 @@ impl PowerFuseClient {
             }
         }
 
-        let channel = self.try_connect_to_master().await?;
+        let (channel, addr) = self.try_connect_to_master().await?;
 
         let mut master_channel = self.master_channel.write().await;
         *master_channel = Some(channel.clone());
+        let mut current_addr = self.current_master_addr.write().await;
+        *current_addr = Some(addr);
 
         Ok(channel)
     }
 
-    async fn try_connect_to_master(&self) -> Result<Channel, String> {
+    async fn try_connect_to_master(&self) -> Result<(Channel, String), String> {
+        // Consult the connection manager for the ordered candidate list.
+        // The manager skips nodes whose circuit breaker is open or whose
+        // per-node backoff has not elapsed, and tries the cached leader first.
+        let candidates = self.connection_manager.select_masters().await;
+
         let mut first_error: Option<String> = None;
-
-        for _ in 0..self.master_addresses.len() {
-            let idx = self
-                .current_master_index
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let addr = &self.master_addresses[idx];
-
+        for addr in &candidates {
             info!("Trying to connect to master: {}", addr);
             match self.create_channel(addr).await {
                 Ok(ch) => {
                     info!("Connected to master: {}", addr);
-                    return Ok(ch);
+                    self.connection_manager.record_success(addr).await;
+                    // Keep current_master_index in sync for diagnostic
+                    // purposes (e.g. reading it in logs).
+                    if let Some(pos) = self.master_addresses.iter().position(|a| a == addr) {
+                        self.current_master_index
+                            .store(pos, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok((ch, addr.clone()));
                 }
                 Err(e) => {
                     warn!("Failed to connect to master {}: {}", addr, e);
+                    self.connection_manager.record_failure(addr).await;
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
-                    self.next_master_index();
                 }
             }
         }
@@ -203,7 +216,35 @@ impl PowerFuseClient {
     pub async fn invalidate_master_channel(&self) {
         let mut master_channel = self.master_channel.write().await;
         *master_channel = None;
-        warn!("Invalidated master channel");
+        let mut current_addr = self.current_master_addr.write().await;
+        if let Some(addr) = current_addr.take() {
+            // Feed the failure back to the connection manager so the node's
+            // backoff/circuit-breaker state advances.
+            self.connection_manager.record_failure(&addr).await;
+            warn!("Invalidated master channel to {}", addr);
+        } else {
+            warn!("Invalidated master channel (no cached address)");
+        }
+    }
+
+    /// Record that the most recent gRPC call against the current master
+    /// channel succeeded. Callers should invoke this after any successful
+    /// RPC response so the connection manager can reset the node's failure
+    /// counter and clear any pending backoff.
+    pub async fn record_master_success(&self) {
+        let current_addr = self.current_master_addr.read().await;
+        if let Some(addr) = &*current_addr {
+            self.connection_manager.record_success(addr).await;
+        }
+    }
+
+    /// Update the cached leader hint. Callers that observe a "not leader"
+    /// error should extract the leader address from the error message and
+    /// pass it here so the next connection attempt targets it directly.
+    pub async fn set_leader_hint(&self, leader_addr: Option<String>) {
+        self.connection_manager
+            .set_leader_hint(leader_addr)
+            .await;
     }
 
     pub async fn invalidate_volume_channel(&self, addr: &str) {
@@ -1198,31 +1239,45 @@ impl PowerFuseClient {
     ) -> Result<tonic::Streaming<MetadataNotification>, String> {
         debug!("subscribe_metadata: path_prefix={}", path_prefix);
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = SubscribeMetadataRequest {
-            path_prefix: path_prefix.to_string(),
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = SubscribeMetadataRequest {
+                path_prefix: path_prefix.to_string(),
+            };
 
-        match client
-            .subscribe_metadata(tonic::Request::new(request))
-            .await
-        {
-            Ok(response) => {
-                debug!("subscribe_metadata succeeded");
-                Ok(response.into_inner())
-            }
-            Err(e) => {
-                let msg = format!("subscribe_metadata failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
+            match client
+                .subscribe_metadata(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    debug!("subscribe_metadata succeeded");
+                    return Ok(response.into_inner());
+                }
+                Err(e) => {
+                    let msg = format!("subscribe_metadata failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
             }
         }
+
+        Err("subscribe_metadata failed after max retries".to_string())
     }
 
     pub async fn acquire_lease(
@@ -1236,68 +1291,96 @@ impl PowerFuseClient {
             path, client_id, duration_ms
         );
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = LeaseRequest {
-            path: path.to_string(),
-            client_id: client_id.to_string(),
-            duration_ms,
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = LeaseRequest {
+                path: path.to_string(),
+                client_id: client_id.to_string(),
+                duration_ms,
+            };
 
-        match client.acquire_lease(tonic::Request::new(request)).await {
-            Ok(response) => {
-                let resp = response.into_inner();
-                if resp.success {
-                    debug!(
-                        "acquire_lease succeeded: lease_id={}, epoch={}",
-                        resp.lease_id, resp.epoch
-                    );
-                    Ok((resp.lease_id, resp.epoch))
-                } else {
-                    let msg = format!("acquire_lease failed: {}", resp.error);
-                    error!("{}", msg);
-                    Err(msg)
+            match client.acquire_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!(
+                            "acquire_lease succeeded: lease_id={}, epoch={}",
+                            resp.lease_id, resp.epoch
+                        );
+                        return Ok((resp.lease_id, resp.epoch));
+                    } else {
+                        let msg = format!("acquire_lease failed: {}", resp.error);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("acquire_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
                 }
             }
-            Err(e) => {
-                let msg = format!("acquire_lease failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
-            }
         }
+
+        Err("acquire_lease failed after max retries".to_string())
     }
 
     pub async fn release_lease(&self, lease_id: &str) -> Result<bool, String> {
         debug!("release_lease: lease_id={}", lease_id);
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = LeaseReleaseRequest {
-            lease_id: lease_id.to_string(),
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = LeaseReleaseRequest {
+                lease_id: lease_id.to_string(),
+            };
 
-        match client.release_lease(tonic::Request::new(request)).await {
-            Ok(response) => {
-                let resp = response.into_inner();
-                debug!("release_lease succeeded: success={}", resp.success);
-                Ok(resp.success)
-            }
-            Err(e) => {
-                let msg = format!("release_lease failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
+            match client.release_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("release_lease succeeded: success={}", resp.success);
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("release_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
             }
         }
+
+        Err("release_lease failed after max retries".to_string())
     }
 
     pub async fn renew_lease(
@@ -1310,33 +1393,47 @@ impl PowerFuseClient {
             lease_id, duration_ms
         );
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = LeaseRenewRequest {
-            lease_id: lease_id.to_string(),
-            duration_ms,
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = LeaseRenewRequest {
+                lease_id: lease_id.to_string(),
+                duration_ms,
+            };
 
-        match client.renew_lease(tonic::Request::new(request)).await {
-            Ok(response) => {
-                let resp = response.into_inner();
-                debug!(
-                    "renew_lease succeeded: success={}, epoch={}",
-                    resp.success, resp.epoch
-                );
-                Ok((resp.success, resp.epoch))
-            }
-            Err(e) => {
-                let msg = format!("renew_lease failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
+            match client.renew_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!(
+                        "renew_lease succeeded: success={}, epoch={}",
+                        resp.success, resp.epoch
+                    );
+                    return Ok((resp.success, resp.epoch));
+                }
+                Err(e) => {
+                    let msg = format!("renew_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
             }
         }
+
+        Err("renew_lease failed after max retries".to_string())
     }
 
     pub async fn register_job_client(
@@ -1350,40 +1447,54 @@ impl PowerFuseClient {
             job_id, job_name, client_id
         );
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = JobRegistrationRequest {
-            job_id: job_id.to_string(),
-            job_name: job_name.to_string(),
-            client_id: client_id.to_string(),
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = JobRegistrationRequest {
+                job_id: job_id.to_string(),
+                job_name: job_name.to_string(),
+                client_id: client_id.to_string(),
+            };
 
-        match client
-            .register_job_client(tonic::Request::new(request))
-            .await
-        {
-            Ok(response) => {
-                let resp = response.into_inner();
-                if resp.success {
-                    debug!("register_job_client succeeded: job_id={}", job_id);
-                    Ok(true)
-                } else {
-                    let msg = format!("register_job_client failed: {}", resp.error);
-                    error!("{}", msg);
-                    Err(msg)
+            match client
+                .register_job_client(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!("register_job_client succeeded: job_id={}", job_id);
+                        return Ok(true);
+                    } else {
+                        let msg = format!("register_job_client failed: {}", resp.error);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("register_job_client failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
                 }
             }
-            Err(e) => {
-                let msg = format!("register_job_client failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
-            }
         }
+
+        Err("register_job_client failed after max retries".to_string())
     }
 
     pub async fn deregister_job_client(
@@ -1396,67 +1507,95 @@ impl PowerFuseClient {
             job_id, client_id
         );
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = JobDeregistrationRequest {
-            job_id: job_id.to_string(),
-            client_id: client_id.to_string(),
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = JobDeregistrationRequest {
+                job_id: job_id.to_string(),
+                client_id: client_id.to_string(),
+            };
 
-        match client
-            .deregister_job_client(tonic::Request::new(request))
-            .await
-        {
-            Ok(response) => {
-                let resp = response.into_inner();
-                if resp.success {
-                    debug!("deregister_job_client succeeded: job_id={}", job_id);
-                    Ok(true)
-                } else {
-                    let msg = format!("deregister_job_client failed: {}", resp.error);
-                    error!("{}", msg);
-                    Err(msg)
+            match client
+                .deregister_job_client(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!("deregister_job_client succeeded: job_id={}", job_id);
+                        return Ok(true);
+                    } else {
+                        let msg = format!("deregister_job_client failed: {}", resp.error);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("deregister_job_client failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
                 }
             }
-            Err(e) => {
-                let msg = format!("deregister_job_client failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
-            }
         }
+
+        Err("deregister_job_client failed after max retries".to_string())
     }
 
     pub async fn complete_job(&self, job_id: &str) -> Result<u64, String> {
         debug!("complete_job: job_id={}", job_id);
 
-        let channel = match self.get_or_create_master_channel().await {
-            Ok(ch) => ch,
-            Err(e) => return Err(e),
-        };
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
 
-        let mut client = MasterServiceClient::new(channel);
-        let request = JobCompletionRequest {
-            job_id: job_id.to_string(),
-        };
+            let mut client = MasterServiceClient::new(channel);
+            let request = JobCompletionRequest {
+                job_id: job_id.to_string(),
+            };
 
-        match client.complete_job(tonic::Request::new(request)).await {
-            Ok(response) => {
-                let resp = response.into_inner();
-                debug!("complete_job succeeded: job_id={}", job_id);
-                Ok(resp.invalidated_entries)
-            }
-            Err(e) => {
-                let msg = format!("complete_job failed: {}", e);
-                error!("{}", msg);
-                self.invalidate_master_channel().await;
-                Err(msg)
+            match client.complete_job(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("complete_job succeeded: job_id={}", job_id);
+                    return Ok(resp.invalidated_entries);
+                }
+                Err(e) => {
+                    let msg = format!("complete_job failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
             }
         }
+
+        Err("complete_job failed after max retries".to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1699,7 +1838,7 @@ pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
 
-const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl SyncFuseClient {
     pub fn new(client: Arc<PowerFuseClient>) -> Self {

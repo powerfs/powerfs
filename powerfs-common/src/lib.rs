@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod config;
 pub mod constants;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod system_metrics;
 pub mod types;
 pub mod utils;
 
+pub use build_info::BuildInfo;
 pub use error::{ErrorKind, PowerFsError};
 pub use event::{
     AlertTriggerEvent, Event, EventEnvelope, EventPublisher, KVBlockEvent, KVSessionEvent,

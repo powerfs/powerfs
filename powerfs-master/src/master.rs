@@ -24,7 +24,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 pub use crate::proto::VolumeShortInfo;
-pub use crate::volume_assigner::{RoundRobinAssigner, VolumeAssigner};
+pub use crate::volume_assigner::{
+    AssignContext, RoundRobinAssigner, SmartVolumeAssigner, VolumeAssigner,
+};
 
 pub struct MasterNode {
     id: NodeId,
@@ -1252,6 +1254,131 @@ impl MasterNode {
             volume_id.0,
             cookie,
             file_key
+        );
+
+        Ok((fid, assigned_nodes))
+    }
+
+    /// Create a new volume using the [`SmartVolumeAssigner`] with explicit
+    /// control over the assignment context (rack/DC awareness, preferred
+    /// primary node).
+    ///
+    /// When `preferred_node` is `Some`, the smart assigner attempts to pin
+    /// the primary replica on that node. If the preferred node is unhealthy
+    /// or missing, the assigner falls back to the next-best candidate
+    /// instead of failing.
+    ///
+    /// This replaces the previous create-and-discard retry loop in
+    /// `volume_grow` that created up to `count * 10` volumes and threw away
+    /// the ones whose primary did not match `data_node`.
+    pub async fn create_new_volume_with_preference(
+        &self,
+        replication: &str,
+        collection: &str,
+        preferred_node: Option<&str>,
+    ) -> Result<(Fid, Vec<DataNodeInfo>)> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let mut nodes = self.topology.read().unwrap().list_all_nodes();
+        nodes.sort_by_key(|n| n.id.0.clone());
+        if nodes.is_empty() {
+            return Err(PowerFsError::InvalidRequest(
+                "no nodes available".to_string(),
+            ));
+        }
+
+        let (volume_size_limit, rack_awareness_enabled) = {
+            let config = self.cluster_config.read().unwrap();
+            (config.volume_size_limit, config.rack_awareness_enabled)
+        };
+
+        let replica_placement = ReplicaPlacement::from_string(replication).unwrap_or_default();
+        let collection_obj = Collection(collection.to_string());
+        let ttl = Ttl::default();
+        let disk_type = DiskType::default();
+        let replica_count = replica_placement.get_copy_count();
+
+        let volume_id = {
+            let mut next_id = self.next_volume_id.write().unwrap();
+            let vid = VolumeId(*next_id);
+            *next_id += 1;
+            vid
+        };
+
+        let ctx = AssignContext {
+            rack_awareness_enabled,
+            data_center_awareness_enabled: false,
+            preferred_node: preferred_node.map(|s| s.to_string()),
+        };
+        let assigner = SmartVolumeAssigner;
+        let assigned_nodes = assigner.assign_with_context(
+            volume_id.0,
+            &nodes,
+            replica_count as usize,
+            &ctx,
+        );
+
+        if assigned_nodes.is_empty() {
+            return Err(PowerFsError::InvalidRequest(
+                "not enough nodes available for replication".to_string(),
+            ));
+        }
+
+        {
+            let mut layouts = self.volume_layouts.write().unwrap();
+            let key = Self::get_volume_layout_key(&collection_obj, replica_count, &ttl, &disk_type);
+            layouts.entry(key).or_insert_with(|| VolumeLayout {
+                collection: collection_obj.clone(),
+                replica_placement: replica_placement.clone(),
+                ttl: ttl.clone(),
+                disk_type: disk_type.clone(),
+                volumes: Vec::new(),
+            });
+        }
+
+        if let Some(primary_node) = assigned_nodes.first() {
+            let cmd = RaftCommand::AssignVolume {
+                node_id: primary_node.id.0.clone(),
+                volume_id: volume_id.0,
+                collection: collection_obj.0.clone(),
+                replica_count,
+                ttl: ttl.0,
+                disk_type: disk_type.0.clone(),
+                size: volume_size_limit,
+            };
+            self.propose_command(cmd).await?;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let file_key = {
+            let mut volumes = self.volumes.write().unwrap();
+            if let Some(vol_info) = volumes.get_mut(&volume_id) {
+                let key = vol_info.next_file_key;
+                vol_info.next_file_key += 1;
+                key
+            } else {
+                1
+            }
+        };
+
+        let cookie = rand::random::<u32>() as u64;
+        let fid = Fid {
+            volume_id,
+            cookie,
+            file_key,
+        };
+
+        info!(
+            "Assigned volume (smart): {} to nodes: {:?}, fid: {},{},{}, preferred={:?}",
+            volume_id,
+            assigned_nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            volume_id.0,
+            cookie,
+            file_key,
+            preferred_node
         );
 
         Ok((fid, assigned_nodes))

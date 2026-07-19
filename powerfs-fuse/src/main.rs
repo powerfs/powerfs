@@ -140,6 +140,13 @@ fn main() {
 
     builder.init();
 
+    // Emit build info (version, git commit, build time, etc.) at startup.
+    powerfs_common::BuildInfo::current(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .log_startup();
+
     info!("PowerFS FUSE Client starting...");
     info!("  Masters: {}", args.master.join(", "));
     info!("  Mount point: {}", args.mount_point);
