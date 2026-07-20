@@ -10,7 +10,6 @@
 import React from 'react'
 import { Card, Typography } from 'antd'
 import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons'
-import CountUp from 'react-countup'
 import ReactECharts from 'echarts-for-react'
 import type { EChartsOption } from 'echarts'
 import type { NodeStatus } from '@/styles/status'
@@ -169,7 +168,7 @@ const StatCard: React.FC<StatCardProps> = ({
             color: 'var(--pf-color-text)',
           }}
         >
-          <CountUp end={value} duration={0.8} decimals={precision} separator="," />
+          {value.toLocaleString('zh-CN', { minimumFractionDigits: precision, maximumFractionDigits: precision })}
         </span>
         {suffix && (
           <Text type="secondary" style={{ fontSize: 14 }}>

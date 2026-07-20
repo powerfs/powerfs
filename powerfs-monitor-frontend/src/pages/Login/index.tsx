@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Form, Input, Button, Card, message, Typography } from 'antd'
+import { Form, Input, Button, Card, Typography, App } from 'antd'
 import { UserOutlined, LockOutlined, RocketOutlined } from '@ant-design/icons'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { login } from '@/services/auth'
@@ -12,6 +12,7 @@ interface LocationState {
 
 export default function Login() {
   const [loading, setLoading] = useState(false)
+  const { message } = App.useApp()
   const navigate = useNavigate()
   const location = useLocation()
   const redirectTo = (location.state as LocationState)?.from || '/'

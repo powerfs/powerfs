@@ -8,7 +8,7 @@ import {
   Dropdown,
   Avatar,
   Typography,
-  message,
+  App,
   Tooltip,
   Tag,
 } from 'antd'
@@ -58,6 +58,7 @@ function AppLayout() {
   const [user, setUser] = useState<CurrentUser | null>(getCurrentUser())
   const { mode, setMode } = useTheme()
   const searchRef = useRef<GlobalSearchHandle>(null)
+  const { message } = App.useApp()
 
   useEffect(() => {
     const unsubscribe = subscribe(() => {
