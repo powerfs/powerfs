@@ -2,6 +2,11 @@ import { useTheme } from '@/styles/ThemeContext'
 import logoLight from '../../../logo-light.svg'
 import logoDark from '../../../logo-dark.svg'
 
+const logos: Record<string, string> = {
+  light: logoLight,
+  dark: logoDark,
+}
+
 interface LogoProps {
   size?: number
   className?: string
@@ -14,7 +19,7 @@ function Logo({ size = 24, className, style }: LogoProps) {
 
   return (
     <img
-      src={isDark ? logoDark : logoLight}
+      src={isDark ? logos.dark : logos.light}
       alt="PowerFS"
       style={{
         width: size,

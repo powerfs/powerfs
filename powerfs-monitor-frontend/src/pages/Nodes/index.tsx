@@ -39,15 +39,9 @@ import {
   SkeletonCard,
   type StatCardProps,
 } from '@/components/pro'
-import { resolveNodeStatus } from '@/styles/status'
+import { resolveNodeStatus, raftRolePalette } from '@/styles/status'
 
 const { Text, Title } = Typography
-
-/** Derive a coarse K8s-style status key from a NodeInfo for aggregation. */
-function classifyNode(n: NodeInfo): string {
-  // Prefer the raw status; resolveNodeStatus normalizes legacy values.
-  return n.status
-}
 
 function Nodes() {
   const [nodes, setNodes] = useState<NodeInfo[]>([])
@@ -114,14 +108,12 @@ function Nodes() {
   // ── KPI summary ──
   const kpiItems: StatCardProps[] = useMemo(() => {
     const total = nodes.length
-    const active = nodes.filter(n => resolveNodeStatus(classifyNode(n)).tag === 'success').length
-    const cordoned = nodes.filter(n => {
-      const t = resolveNodeStatus(classifyNode(n)).tag
-      return t === 'purple' || t === 'blue'
-    }).length
-    const unreachable = nodes.filter(
-      n => resolveNodeStatus(classifyNode(n)).tag === 'red',
-    ).length
+    const online = nodes.filter(n => n.status === 'online').length
+    const maintenance = nodes.filter(n => n.status === 'maintenance').length
+    const degraded = nodes.filter(n => n.status === 'degraded').length
+    const isolated = nodes.filter(n => n.status === 'isolated').length
+    const offline = nodes.filter(n => n.status === 'offline').length
+    const abnormal = degraded + isolated + offline
     return [
       {
         title: '节点总数',
@@ -134,7 +126,7 @@ function Nodes() {
       },
       {
         title: '运行中',
-        value: active,
+        value: online,
         suffix: '个',
         status: 'active',
         icon: <ThunderboltOutlined />,
@@ -143,21 +135,21 @@ function Nodes() {
       },
       {
         title: '维护中',
-        value: cordoned,
+        value: maintenance,
         suffix: '个',
         status: 'cordoned',
         icon: <HddOutlined />,
         loading,
-        footer: <Text type="secondary" style={{ fontSize: 12 }}>封锁/驱逐</Text>,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>主动维护</Text>,
       },
       {
-        title: '不可达',
-        value: unreachable,
+        title: '异常',
+        value: abnormal,
         suffix: '个',
-        status: unreachable > 0 ? 'unreachable' : 'active',
+        status: abnormal > 0 ? 'unreachable' : 'active',
         icon: <ApiOutlined />,
         loading,
-        footer: <Text type="secondary" style={{ fontSize: 12 }}>{unreachable > 0 ? '需排查' : '全部可达'}</Text>,
+        footer: <Text type="secondary" style={{ fontSize: 12 }}>{abnormal > 0 ? `降级${degraded} · 隔离${isolated} · 离线${offline}` : '全部正常'}</Text>,
       },
     ]
   }, [nodes, loading])
@@ -207,6 +199,22 @@ function Nodes() {
       render: (status: string) => (
         <StatusTag kind="node" status={status} pulse={resolveNodeStatus(status).tag === 'success'} />
       ),
+    },
+    {
+      title: 'Raft 角色',
+      key: 'raft_role',
+      width: 100,
+      render: (_: unknown, record: NodeInfo) => {
+        if (record.node_type !== 'master') return <Text type="secondary">-</Text>
+        const role = record.raft_role
+        if (!role) return <Text type="secondary">-</Text>
+        const palette = raftRolePalette[role]
+        return (
+          <Tag color={palette.tag} style={{ borderRadius: 6 }}>
+            {palette.label}
+          </Tag>
+        )
+      },
     },
     {
       title: 'CPU',

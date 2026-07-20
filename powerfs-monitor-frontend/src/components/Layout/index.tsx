@@ -212,20 +212,20 @@ function AppLayout() {
       >
         <div
           style={{
-            padding: '20px 16px',
+            padding: '16px',
             textAlign: 'center',
             borderBottom: '1px solid var(--pf-sider-border)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            gap: 10,
+            gap: collapsed ? 0 : 10,
           }}
         >
-          <Logo size={28} style={{ flexShrink: 0 }} />
+          <Logo size={collapsed ? 28 : 32} style={{ flexShrink: 0 }} />
           {!collapsed && (
             <span
               className="pf-gradient-text"
-              style={{ fontSize: 20, fontWeight: 700, letterSpacing: 0.5 }}
+              style={{ fontSize: 18, fontWeight: 700, letterSpacing: 0.5 }}
             >
               PowerFS
             </span>

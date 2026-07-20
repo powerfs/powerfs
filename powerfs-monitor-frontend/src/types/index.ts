@@ -1,10 +1,20 @@
+export type NodeStatus =
+  | 'online'
+  | 'degraded'
+  | 'maintenance'
+  | 'isolated'
+  | 'offline'
+  | 'initializing'
+
+export type RaftRole = 'leader' | 'follower'
+
 export interface NodeInfo {
   id: string
   node_type: 'master' | 'volume'
   address: string
   grpc_port: number
   http_port: number
-  status: 'online' | 'offline' | 'warning' | 'healthy'
+  status: NodeStatus
   cpu_usage: number
   mem_usage: number
   disk_usage: number
@@ -13,6 +23,8 @@ export interface NodeInfo {
   uptime: number
   volume_count: number
   device_count?: number
+  is_leader?: boolean
+  raft_role?: RaftRole
 }
 
 export interface DeviceLocation {

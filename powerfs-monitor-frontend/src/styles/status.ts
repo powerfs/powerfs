@@ -5,17 +5,17 @@
  * Each status has 4 levels (bg / border / text / dot) to keep visual
  * consistency across Tag, Badge, TopologyNode, and Table columns.
  *
- * Aligned with the K8s-style state machine on the backend
- * (Pending | Active | Cordoned | Draining | Removed | Unreachable).
+ * Node status follows PowerFS native state machine:
+ * (online | degraded | maintenance | isolated | offline | initializing)
  */
 
 export type NodeStatus =
-  | 'pending'
-  | 'active'
-  | 'cordoned'
-  | 'draining'
-  | 'removed'
-  | 'unreachable'
+  | 'online'
+  | 'degraded'
+  | 'maintenance'
+  | 'isolated'
+  | 'offline'
+  | 'initializing'
 
 export type DeviceStatus =
   | 'online'
@@ -53,55 +53,76 @@ interface StatusPalette {
   label: string
 }
 
-/** Node status palette (K8s-style state machine) */
+/** Node status palette (PowerFS native state machine) */
 export const nodeStatusPalette: Record<NodeStatus, StatusPalette> = {
-  pending: {
-    bg: '#FFF7E6',
-    border: '#FFD591',
-    text: '#D46B08',
-    dot: '#FAAD14',
-    tag: 'orange',
-    label: '待激活',
-  },
-  active: {
+  online: {
     bg: '#F6FFED',
     border: '#B7EB8F',
     text: '#389E0D',
     dot: '#52C41A',
     tag: 'success',
-    label: '运行中',
+    label: '在线',
   },
-  cordoned: {
-    bg: '#F9F0FF',
-    border: '#D3ADF7',
-    text: '#531DAB',
-    dot: '#722ED1',
-    tag: 'purple',
-    label: '已封锁',
+  degraded: {
+    bg: '#FFF7E6',
+    border: '#FFD591',
+    text: '#D46B08',
+    dot: '#FAAD14',
+    tag: 'orange',
+    label: '降级',
   },
-  draining: {
-    bg: '#E6F7FF',
-    border: '#91D5FF',
-    text: '#096DD9',
-    dot: '#1890FF',
+  maintenance: {
+    bg: '#F0F5FF',
+    border: '#ADC6FF',
+    text: '#1F3B94',
+    dot: '#4080FF',
     tag: 'blue',
-    label: '驱逐中',
+    label: '维护中',
   },
-  removed: {
-    bg: '#F5F5F5',
-    border: '#D9D9D9',
-    text: '#595959',
-    dot: '#8C8C8C',
-    tag: 'default',
-    label: '已移除',
-  },
-  unreachable: {
+  isolated: {
     bg: '#FFF1F0',
     border: '#FFA39E',
     text: '#CF1322',
     dot: '#FF4D4F',
     tag: 'red',
-    label: '不可达',
+    label: '已隔离',
+  },
+  offline: {
+    bg: '#F5F5F5',
+    border: '#D9D9D9',
+    text: '#595959',
+    dot: '#8C8C8C',
+    tag: 'default',
+    label: '离线',
+  },
+  initializing: {
+    bg: '#E6F7FF',
+    border: '#91D5FF',
+    text: '#096DD9',
+    dot: '#1890FF',
+    tag: 'cyan',
+    label: '初始化',
+  },
+}
+
+export type RaftRole = 'leader' | 'follower'
+
+export const raftRolePalette: Record<RaftRole, StatusPalette> = {
+  leader: {
+    bg: '#F6FFED',
+    border: '#B7EB8F',
+    text: '#389E0D',
+    dot: '#52C41A',
+    tag: 'success',
+    label: 'Leader',
+  },
+  follower: {
+    bg: '#E6F7FF',
+    border: '#91D5FF',
+    text: '#096DD9',
+    dot: '#1890FF',
+    tag: 'blue',
+    label: 'Follower',
   },
 }
 
@@ -294,28 +315,11 @@ export const alertSeverityPalette: Record<AlertSeverity, StatusPalette> = {
 }
 
 /**
- * Legacy status aliases — maps older backend values to the K8s-style state
- * machine so the UI stays consistent during the rollout of the new statuses.
- * Once the backend emits only the new statuses, this map can be removed.
- */
-const NODE_STATUS_ALIASES: Record<string, NodeStatus> = {
-  online: 'active',
-  healthy: 'active',
-  offline: 'unreachable',
-  warning: 'cordoned',
-}
-
-/**
  * Resolve a status string (possibly unknown) to a palette.
- * Normalizes legacy values (online/healthy/offline/warning) to the closest
- * K8s-style state first, then falls back to a neutral gray palette.
+ * Directly maps PowerFS native status values to their color palettes.
  */
 export function resolveNodeStatus(status: string): StatusPalette {
-  const direct = (nodeStatusPalette as Record<string, StatusPalette>)[status]
-  if (direct) return direct
-  const aliased = NODE_STATUS_ALIASES[status]
-  if (aliased) return nodeStatusPalette[aliased]
-  return {
+  return (nodeStatusPalette as Record<string, StatusPalette>)[status] ?? {
     bg: '#F5F5F5',
     border: '#D9D9D9',
     text: '#595959',
