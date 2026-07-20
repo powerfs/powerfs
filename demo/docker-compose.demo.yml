@@ -1,0 +1,397 @@
+networks:
+  powerfs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+          gateway: 172.21.0.1
+
+volumes:
+  master-1-data:
+  master-2-data:
+  master-3-data:
+  volume-1-data:
+  volume-2-data:
+  volume-3-data:
+  redis-data:
+  s3-data:
+  demo-data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: demo-redis
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.50
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  master-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-master-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.11
+    volumes:
+      - master-1-data:/data
+    ports:
+      - "9333:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.11:9333 --raft-id 1 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  master-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-master-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.12
+    volumes:
+      - master-2-data:/data
+    ports:
+      - "9334:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.12:9333 --raft-id 2 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  master-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-master-3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.13
+    volumes:
+      - master-3-data:/data
+    ports:
+      - "9335:9333"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.13:9333 --raft-id 3 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-2:
+        condition: service_healthy
+
+  volume-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-volume-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.21
+    volumes:
+      - volume-1-data:/data
+    ports:
+      - "8080:8080"
+      - "8091:8091"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs-volume --grpc-address 172.21.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-1
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.21.0.21 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-volume-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.22
+    volumes:
+      - volume-2-data:/data
+    ports:
+      - "8081:8080"
+      - "8092:8092"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs-volume --grpc-address 172.21.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-2
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.21.0.22 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-volume-3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.23
+    volumes:
+      - volume-3-data:/data
+    ports:
+      - "8082:8080"
+      - "8093:8093"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs-volume --grpc-address 172.21.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-3
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.21.0.23 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  s3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-s3
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.32
+    volumes:
+      - s3-data:/data
+    ports:
+      - "9000:9000"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://demo-redis:6379
+    command: /app/powerfs s3 --port 9000 --master 172.21.0.11:9333 --dir /data/s3 --access-key powerfs --secret-key powerfs123
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  monitor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-monitor
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.30
+    ports:
+      - "8083:8081"
+    environment:
+      - RUST_LOG=info
+      - REDIS_ADDR=demo-redis:6379
+    command: /app/powerfs-monitor --redis-url redis://172.21.0.50:6379 --s3-endpoint http://172.21.0.32:9000 --s3-backend-endpoint http://172.21.0.32:9000 --master-endpoint 172.21.0.11:9333
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile-frontend
+    image: powerfs-frontend:demo
+    container_name: demo-frontend
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.31
+    ports:
+      - "8084:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      monitor:
+        condition: service_healthy
+
+  fuse-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-fuse-1
+    cpus: '1.0'
+    mem_limit: 512m
+    init: true
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.41
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=debug
+    command:
+      - /app/powerfs-fuse
+      - --master
+      - 172.21.0.11:9333
+      - --master
+      - 172.21.0.12:9333
+      - --master
+      - 172.21.0.13:9333
+      - --mount-point
+      - /mnt/powerfs
+      - --collection
+      - default
+      - --replication
+      - "000"
+      - --threads
+      - "8"
+      - --verbose
+      - --container
+      - --log-file
+      - /var/log/powerfs-fuse.log
+    volumes:
+      - /tmp/powerfs-demo/fuse1:/mnt/powerfs
+    depends_on:
+      volume-1:
+        condition: service_healthy
+      volume-2:
+        condition: service_healthy
+      volume-3:
+        condition: service_healthy
+
+  fuse-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:demo
+    container_name: demo-fuse-2
+    cpus: '1.0'
+    mem_limit: 512m
+    init: true
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.42
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=debug
+    command:
+      - /app/powerfs-fuse
+      - --master
+      - 172.21.0.11:9333
+      - --master
+      - 172.21.0.12:9333
+      - --master
+      - 172.21.0.13:9333
+      - --mount-point
+      - /mnt/powerfs
+      - --collection
+      - default
+      - --replication
+      - "000"
+      - --threads
+      - "8"
+      - --verbose
+      - --container
+      - --log-file
+      - /var/log/powerfs-fuse.log
+    volumes:
+      - /tmp/powerfs-demo/fuse2:/mnt/powerfs
+    depends_on:
+      volume-1:
+        condition: service_healthy
+      volume-2:
+        condition: service_healthy
+      volume-3:
+        condition: service_healthy
+
+  benchmark:
+    image: python:3.11-slim
+    container_name: demo-benchmark
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.60
+    volumes:
+      - ./benchmarks:/benchmarks
+      - ./results:/results
+      - /tmp/powerfs-demo/fuse1:/mnt/fuse1
+      - /tmp/powerfs-demo/fuse2:/mnt/fuse2
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MASTER_ENDPOINT=172.21.0.11:9333
+      - S3_ENDPOINT=http://172.21.0.32:9000
+      - S3_ACCESS_KEY=powerfs
+      - S3_SECRET_KEY=powerfs123
+    command: sleep infinity
+    depends_on:
+      master-1:
+        condition: service_healthy
+      volume-1:
+        condition: service_healthy
