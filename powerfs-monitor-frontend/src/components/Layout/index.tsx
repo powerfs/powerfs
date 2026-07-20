@@ -20,7 +20,6 @@ import {
   BellOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
-  RocketOutlined,
   CloudOutlined,
   FolderOpenOutlined,
   SearchOutlined,
@@ -45,6 +44,7 @@ import {
 } from '@/services/auth'
 import { useTheme, type ThemeMode } from '@/styles/ThemeContext'
 import GlobalSearch, { type GlobalSearchHandle } from '@/components/GlobalSearch'
+import Logo from '@/components/Logo'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
@@ -221,7 +221,7 @@ function AppLayout() {
             gap: 10,
           }}
         >
-          <RocketOutlined style={{ fontSize: 24, color: 'var(--pf-color-brand)' }} />
+          <Logo size={28} style={{ flexShrink: 0 }} />
           {!collapsed && (
             <span
               className="pf-gradient-text"

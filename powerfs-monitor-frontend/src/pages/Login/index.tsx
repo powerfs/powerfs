@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { Form, Input, Button, Card, Typography, App } from 'antd'
-import { UserOutlined, LockOutlined, RocketOutlined } from '@ant-design/icons'
+import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { login } from '@/services/auth'
+import Logo from '@/components/Logo'
 
 const { Title, Text } = Typography
 
@@ -50,7 +51,7 @@ export default function Login() {
         bodyStyle={{ padding: '32px 32px 24px' }}
       >
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
-          <RocketOutlined style={{ fontSize: 40, color: '#1890ff' }} />
+          <Logo size={48} />
           <Title level={3} style={{ marginTop: 12, marginBottom: 4 }}>
             PowerFS
           </Title>
