@@ -1,0 +1,193 @@
+{
+  "benchmark": "fs",
+  "timestamp": "2026-07-20 02:53:16",
+  "config": {
+    "rounds": 2,
+    "test_sizes": [
+      65536,
+      262144,
+      1048576
+    ],
+    "test_path": "/tmp/fs_bench"
+  },
+  "operations": [
+    {
+      "operation": "WRITE_64KB",
+      "count": 10,
+      "size_bytes": 655360,
+      "duration_ms": 0.72,
+      "ops_per_sec": 13819.78,
+      "bandwidth_mbps": 7245.55,
+      "avg_latency_ms": 0.0724
+    },
+    {
+      "operation": "READ_64KB",
+      "count": 10,
+      "size_bytes": 655360,
+      "duration_ms": 0.21,
+      "ops_per_sec": 48099.82,
+      "bandwidth_mbps": 25218.16,
+      "avg_latency_ms": 0.0208
+    },
+    {
+      "operation": "WRITE_256KB",
+      "count": 10,
+      "size_bytes": 2621440,
+      "duration_ms": 2.14,
+      "ops_per_sec": 4669.16,
+      "bandwidth_mbps": 9791.93,
+      "avg_latency_ms": 0.2142
+    },
+    {
+      "operation": "READ_256KB",
+      "count": 10,
+      "size_bytes": 2621440,
+      "duration_ms": 0.73,
+      "ops_per_sec": 13626.72,
+      "bandwidth_mbps": 28577.3,
+      "avg_latency_ms": 0.0734
+    },
+    {
+      "operation": "WRITE_1024KB",
+      "count": 10,
+      "size_bytes": 10485760,
+      "duration_ms": 8.67,
+      "ops_per_sec": 1152.88,
+      "bandwidth_mbps": 9671.08,
+      "avg_latency_ms": 0.8674
+    },
+    {
+      "operation": "READ_1024KB",
+      "count": 10,
+      "size_bytes": 10485760,
+      "duration_ms": 3.02,
+      "ops_per_sec": 3307.55,
+      "bandwidth_mbps": 27745.74,
+      "avg_latency_ms": 0.3023
+    },
+    {
+      "operation": "CREATE_SMALL",
+      "count": 1000,
+      "size_bytes": 4000,
+      "duration_ms": 24.04,
+      "ops_per_sec": 41598.6,
+      "bandwidth_mbps": 1.33,
+      "avg_latency_ms": 0.024
+    },
+    {
+      "operation": "DELETE_SMALL",
+      "count": 1000,
+      "size_bytes": 0,
+      "duration_ms": 9.5,
+      "ops_per_sec": 105291.93,
+      "bandwidth_mbps": 0.0,
+      "avg_latency_ms": 0.0095
+    },
+    {
+      "operation": "WRITE_64KB",
+      "count": 10,
+      "size_bytes": 655360,
+      "duration_ms": 0.61,
+      "ops_per_sec": 16390.4,
+      "bandwidth_mbps": 8593.29,
+      "avg_latency_ms": 0.061
+    },
+    {
+      "operation": "READ_64KB",
+      "count": 10,
+      "size_bytes": 655360,
+      "duration_ms": 0.19,
+      "ops_per_sec": 52560.2,
+      "bandwidth_mbps": 27556.68,
+      "avg_latency_ms": 0.019
+    },
+    {
+      "operation": "WRITE_256KB",
+      "count": 10,
+      "size_bytes": 2621440,
+      "duration_ms": 1.98,
+      "ops_per_sec": 5049.12,
+      "bandwidth_mbps": 10588.77,
+      "avg_latency_ms": 0.1981
+    },
+    {
+      "operation": "READ_256KB",
+      "count": 10,
+      "size_bytes": 2621440,
+      "duration_ms": 0.57,
+      "ops_per_sec": 17396.53,
+      "bandwidth_mbps": 36483.17,
+      "avg_latency_ms": 0.0575
+    },
+    {
+      "operation": "WRITE_1024KB",
+      "count": 10,
+      "size_bytes": 10485760,
+      "duration_ms": 8.29,
+      "ops_per_sec": 1206.51,
+      "bandwidth_mbps": 10120.92,
+      "avg_latency_ms": 0.8288
+    },
+    {
+      "operation": "READ_1024KB",
+      "count": 10,
+      "size_bytes": 10485760,
+      "duration_ms": 2.63,
+      "ops_per_sec": 3805.05,
+      "bandwidth_mbps": 31919.05,
+      "avg_latency_ms": 0.2628
+    },
+    {
+      "operation": "CREATE_SMALL",
+      "count": 1000,
+      "size_bytes": 4000,
+      "duration_ms": 23.03,
+      "ops_per_sec": 43417.05,
+      "bandwidth_mbps": 1.39,
+      "avg_latency_ms": 0.023
+    },
+    {
+      "operation": "DELETE_SMALL",
+      "count": 1000,
+      "size_bytes": 0,
+      "duration_ms": 8.87,
+      "ops_per_sec": 112768.3,
+      "bandwidth_mbps": 0.0,
+      "avg_latency_ms": 0.0089
+    }
+  ],
+  "summary": {
+    "WRITE_64KB": {
+      "avg_bandwidth_mbps": 7919.42,
+      "avg_latency_ms": 0.0667
+    },
+    "READ_64KB": {
+      "avg_bandwidth_mbps": 26387.42,
+      "avg_latency_ms": 0.0199
+    },
+    "WRITE_256KB": {
+      "avg_bandwidth_mbps": 10190.35,
+      "avg_latency_ms": 0.2061
+    },
+    "READ_256KB": {
+      "avg_bandwidth_mbps": 32530.24,
+      "avg_latency_ms": 0.0654
+    },
+    "WRITE_1024KB": {
+      "avg_bandwidth_mbps": 9896.0,
+      "avg_latency_ms": 0.8481
+    },
+    "READ_1024KB": {
+      "avg_bandwidth_mbps": 29832.4,
+      "avg_latency_ms": 0.2826
+    },
+    "CREATE_SMALL": {
+      "avg_bandwidth_mbps": 1.36,
+      "avg_latency_ms": 0.0235
+    },
+    "DELETE_SMALL": {
+      "avg_bandwidth_mbps": 0.0,
+      "avg_latency_ms": 0.0092
+    }
+  }
+}

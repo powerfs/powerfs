@@ -1,0 +1,138 @@
+{
+  "benchmark": "kv",
+  "timestamp": "2026-07-20 02:53:16",
+  "config": {
+    "rounds": 3,
+    "iterations_per_round": 10000,
+    "data_size_bytes": 1024
+  },
+  "operations": [
+    {
+      "operation": "PUT",
+      "count": 10000,
+      "duration_ms": 671.1,
+      "ops_per_sec": 14901.01,
+      "avg_latency_ms": 0.0671
+    },
+    {
+      "operation": "GET",
+      "count": 10000,
+      "duration_ms": 2.01,
+      "ops_per_sec": 4982542.17,
+      "avg_latency_ms": 0.0002
+    },
+    {
+      "operation": "EXISTS",
+      "count": 10000,
+      "duration_ms": 1.32,
+      "ops_per_sec": 7590126.67,
+      "avg_latency_ms": 0.0001
+    },
+    {
+      "operation": "LIST",
+      "count": 1,
+      "duration_ms": 2.12,
+      "ops_per_sec": 471.27,
+      "avg_latency_ms": 2.1219
+    },
+    {
+      "operation": "DELETE",
+      "count": 10000,
+      "duration_ms": 2.14,
+      "ops_per_sec": 4673319.22,
+      "avg_latency_ms": 0.0002
+    },
+    {
+      "operation": "PUT",
+      "count": 10000,
+      "duration_ms": 660.84,
+      "ops_per_sec": 15132.2,
+      "avg_latency_ms": 0.0661
+    },
+    {
+      "operation": "GET",
+      "count": 10000,
+      "duration_ms": 2.01,
+      "ops_per_sec": 4981358.67,
+      "avg_latency_ms": 0.0002
+    },
+    {
+      "operation": "EXISTS",
+      "count": 10000,
+      "duration_ms": 1.31,
+      "ops_per_sec": 7632946.31,
+      "avg_latency_ms": 0.0001
+    },
+    {
+      "operation": "LIST",
+      "count": 1,
+      "duration_ms": 2.09,
+      "ops_per_sec": 478.8,
+      "avg_latency_ms": 2.0885
+    },
+    {
+      "operation": "DELETE",
+      "count": 10000,
+      "duration_ms": 2.09,
+      "ops_per_sec": 4792942.52,
+      "avg_latency_ms": 0.0002
+    },
+    {
+      "operation": "PUT",
+      "count": 10000,
+      "duration_ms": 664.91,
+      "ops_per_sec": 15039.73,
+      "avg_latency_ms": 0.0665
+    },
+    {
+      "operation": "GET",
+      "count": 10000,
+      "duration_ms": 2.05,
+      "ops_per_sec": 4887896.52,
+      "avg_latency_ms": 0.0002
+    },
+    {
+      "operation": "EXISTS",
+      "count": 10000,
+      "duration_ms": 1.32,
+      "ops_per_sec": 7592874.73,
+      "avg_latency_ms": 0.0001
+    },
+    {
+      "operation": "LIST",
+      "count": 1,
+      "duration_ms": 2.1,
+      "ops_per_sec": 475.38,
+      "avg_latency_ms": 2.1036
+    },
+    {
+      "operation": "DELETE",
+      "count": 10000,
+      "duration_ms": 2.04,
+      "ops_per_sec": 4908489.17,
+      "avg_latency_ms": 0.0002
+    }
+  ],
+  "summary": {
+    "PUT": {
+      "avg_ops_per_sec": 15024.31,
+      "avg_latency_ms": 0.0666
+    },
+    "GET": {
+      "avg_ops_per_sec": 4950599.12,
+      "avg_latency_ms": 0.0002
+    },
+    "EXISTS": {
+      "avg_ops_per_sec": 7605315.91,
+      "avg_latency_ms": 0.0001
+    },
+    "LIST": {
+      "avg_ops_per_sec": 475.15,
+      "avg_latency_ms": 2.1047
+    },
+    "DELETE": {
+      "avg_ops_per_sec": 4791583.64,
+      "avg_latency_ms": 0.0002
+    }
+  }
+}

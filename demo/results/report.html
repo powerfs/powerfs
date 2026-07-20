@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PowerFS Benchmark Report</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #fff; padding: 40px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; font-size: 32px; margin-bottom: 10px; background: linear-gradient(90deg, #00d9ff, #00ff88); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 40px; }
+        .benchmark-card { background: rgba(255,255,255,0.05); border-radius: 16px; padding: 24px; margin-bottom: 24px; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
+        .benchmark-title { font-size: 20px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; }
+        .benchmark-title::before { content: ''; width: 4px; height: 24px; background: linear-gradient(180deg, #00d9ff, #00ff88); border-radius: 2px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        th { background: rgba(255,255,255,0.05); font-weight: 600; color: #aaa; font-size: 14px; }
+        td { font-size: 14px; }
+        .ops-value { color: #00ff88; font-weight: 600; }
+        .latency-value { color: #00d9ff; }
+        .bw-value { color: #ffd700; }
+        .config { background: rgba(0,217,255,0.1); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #aaa; }
+        .config span { color: #00d9ff; }
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .summary-card { background: rgba(255,255,255,0.05); border-radius: 12px; padding: 20px; text-align: center; }
+        .summary-label { font-size: 12px; color: #888; margin-bottom: 8px; }
+        .summary-value { font-size: 28px; font-weight: 700; }
+        .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 12px; border-radius: 20px; background: rgba(0,255,136,0.15); color: #00ff88; margin-top: 16px; }
+        .status::before { content: ''; width: 6px; height: 6px; background: #00ff88; border-radius: 50%; }
+        .timestamp { text-align: center; color: #666; font-size: 12px; margin-top: 40px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ PowerFS Benchmark Report</h1>
+        <p class="subtitle">Performance Testing Results</p>
+
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-label">Benchmarks</div>
+                <div class="summary-value" style="color: #00d9ff;">3</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Operations</div>
+                <div class="summary-value" style="color: #00ff88;">45</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Status</div>
+                <div class="summary-value" style="color: #ffd700;">Completed</div>
+            </div>
+        </div>
+        <div class="benchmark-card">
+            <div class="benchmark-title>METADATA Benchmark</div>
+            <div class="config">
+                <span>Config:</span> {<br>  'rounds': 2,<br>  'iterations_per_round': 500,<br>  'test_path': '/tmp/benchmark'<br>}
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Operation</th>
+                        <th>Rounds</th>
+                        <th>AVG OPS/S</th>
+                        <th>Avg Latency (ms)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CREATE_DIR</td>
+                        <td>2</td>
+                        <td class= + value_class + >43419.62</td>
+                        <td class="latency-value">0.0231</td>
+                    </tr>
+                    <tr>
+                        <td>CREATE_FILE</td>
+                        <td>2</td>
+                        <td class= + value_class + >10709.68</td>
+                        <td class="latency-value">0.0934</td>
+                    </tr>
+                    <tr>
+                        <td>READ_FILE</td>
+                        <td>2</td>
+                        <td class= + value_class + >58591.53</td>
+                        <td class="latency-value">0.0171</td>
+                    </tr>
+                    <tr>
+                        <td>RENAME</td>
+                        <td>2</td>
+                        <td class= + value_class + >43904.07</td>
+                        <td class="latency-value">0.0239</td>
+                    </tr>
+                    <tr>
+                        <td>LIST_PREP</td>
+                        <td>2</td>
+                        <td class= + value_class + >44238.63</td>
+                        <td class="latency-value">0.0226</td>
+                    </tr>
+                    <tr>
+                        <td>LIST_DIR</td>
+                        <td>2</td>
+                        <td class= + value_class + >91832.51</td>
+                        <td class="latency-value">0.0109</td>
+                    </tr>
+                    <tr>
+                        <td>DELETE</td>
+                        <td>2</td>
+                        <td class= + value_class + >95914.32</td>
+                        <td class="latency-value">0.0104</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="status">✓ Benchmark completed successfully</div>
+        </div>
+        <div class="benchmark-card">
+            <div class="benchmark-title>FS Benchmark</div>
+            <div class="config">
+                <span>Config:</span> {<br>  'rounds': 2,<br>  'test_sizes': [<br>&nbsp;&nbsp;&nbsp;&nbsp;65536,<br>&nbsp;&nbsp;&nbsp;&nbsp;262144,<br>&nbsp;&nbsp;&nbsp;&nbsp;1048576<br>  ],<br>  'test_path': '/tmp/fs_bench'<br>}
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Operation</th>
+                        <th>Rounds</th>
+                        <th>BW (MB/s)</th>
+                        <th>Avg Latency (ms)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>WRITE_64KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >7919.42</td>
+                        <td class="latency-value">0.0667</td>
+                    </tr>
+                    <tr>
+                        <td>READ_64KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >26387.42</td>
+                        <td class="latency-value">0.0199</td>
+                    </tr>
+                    <tr>
+                        <td>WRITE_256KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >10190.35</td>
+                        <td class="latency-value">0.2061</td>
+                    </tr>
+                    <tr>
+                        <td>READ_256KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >32530.24</td>
+                        <td class="latency-value">0.0654</td>
+                    </tr>
+                    <tr>
+                        <td>WRITE_1024KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >9896.00</td>
+                        <td class="latency-value">0.8481</td>
+                    </tr>
+                    <tr>
+                        <td>READ_1024KB</td>
+                        <td>2</td>
+                        <td class= + value_class + >29832.40</td>
+                        <td class="latency-value">0.2826</td>
+                    </tr>
+                    <tr>
+                        <td>CREATE_SMALL</td>
+                        <td>2</td>
+                        <td class= + value_class + >1.36</td>
+                        <td class="latency-value">0.0235</td>
+                    </tr>
+                    <tr>
+                        <td>DELETE_SMALL</td>
+                        <td>2</td>
+                        <td class= + value_class + >0.00</td>
+                        <td class="latency-value">0.0092</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="status">✓ Benchmark completed successfully</div>
+        </div>
+        <div class="benchmark-card">
+            <div class="benchmark-title>KV Benchmark</div>
+            <div class="config">
+                <span>Config:</span> {<br>  'rounds': 3,<br>  'iterations_per_round': 10000,<br>  'data_size_bytes': 1024<br>}
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Operation</th>
+                        <th>Rounds</th>
+                        <th>AVG OPS/S</th>
+                        <th>Avg Latency (ms)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>PUT</td>
+                        <td>3</td>
+                        <td class= + value_class + >15024.31</td>
+                        <td class="latency-value">0.0666</td>
+                    </tr>
+                    <tr>
+                        <td>GET</td>
+                        <td>3</td>
+                        <td class= + value_class + >4950599.12</td>
+                        <td class="latency-value">0.0002</td>
+                    </tr>
+                    <tr>
+                        <td>EXISTS</td>
+                        <td>3</td>
+                        <td class= + value_class + >7605315.91</td>
+                        <td class="latency-value">0.0001</td>
+                    </tr>
+                    <tr>
+                        <td>LIST</td>
+                        <td>3</td>
+                        <td class= + value_class + >475.15</td>
+                        <td class="latency-value">2.1047</td>
+                    </tr>
+                    <tr>
+                        <td>DELETE</td>
+                        <td>3</td>
+                        <td class= + value_class + >4791583.64</td>
+                        <td class="latency-value">0.0002</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="status">✓ Benchmark completed successfully</div>
+        </div>
+        <div class="timestamp">Generated at 2026-07-20 02:55:21</div>
+    </div>
+</body>
+</html>
