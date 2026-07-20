@@ -7,8 +7,11 @@ import App from './App'
 import { ThemeProvider, useTheme } from '@/styles/ThemeContext'
 import { getTheme } from '@/styles/theme'
 import { registerEChartsTheme } from '@/styles/echarts.theme'
+import { setUseMock } from '@/services/api'
 import './styles/theme.css'
 import './index.css'
+
+setUseMock(true)
 
 // Register custom ECharts themes once at startup.
 registerEChartsTheme(echarts)
