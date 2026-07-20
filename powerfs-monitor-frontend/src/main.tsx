@@ -11,7 +11,7 @@ import { setUseMock } from '@/services/api'
 import './styles/theme.css'
 import './index.css'
 
-setUseMock(true)
+setUseMock(false)
 
 // Register custom ECharts themes once at startup.
 registerEChartsTheme(echarts)
