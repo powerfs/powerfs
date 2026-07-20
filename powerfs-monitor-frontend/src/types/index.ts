@@ -351,3 +351,41 @@ export interface ScrubSummary {
   corrupted_needles: number
   last_scan_time?: string
 }
+
+export interface BenchmarkOperation {
+  operation: string
+  count: number
+  duration_ms: number
+  ops_per_sec: number
+  avg_latency_ms: number
+  bandwidth_mbps?: number
+}
+
+export interface BenchmarkSummary {
+  avg_ops_per_sec?: number
+  avg_latency_ms?: number
+  avg_bandwidth_mbps?: number
+}
+
+export interface BenchmarkReport {
+  benchmark: string
+  timestamp: string
+  config: {
+    rounds: number
+    iterations_per_round: number
+    data_size_bytes?: number
+    test_sizes?: number[]
+  }
+  operations: BenchmarkOperation[]
+  summary: Record<string, BenchmarkSummary>
+}
+
+export interface BenchmarkResult {
+  id: string
+  type: 'kv' | 'metadata' | 'fs'
+  status: 'running' | 'completed' | 'failed'
+  started_at: string
+  completed_at?: string
+  result?: BenchmarkReport
+  error?: string
+}

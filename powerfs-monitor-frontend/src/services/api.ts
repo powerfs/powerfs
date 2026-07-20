@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -636,4 +636,145 @@ export async function triggerScrubAll(): Promise<void> {
     return
   }
   await api.post('/bitrot/scrub/trigger-all')
+}
+
+export async function getBenchmarkResults(): Promise<BenchmarkResult[]> {
+  if (useMock) {
+    return [
+      {
+        id: 'kv-1',
+        type: 'kv',
+        status: 'completed',
+        started_at: new Date(Date.now() - 3600000).toISOString(),
+        completed_at: new Date(Date.now() - 3500000).toISOString(),
+        result: {
+          benchmark: 'kv',
+          timestamp: new Date().toISOString(),
+          config: { rounds: 3, iterations_per_round: 10000, data_size_bytes: 1024 },
+          operations: [],
+          summary: {
+            PUT: { avg_ops_per_sec: 15024.31, avg_latency_ms: 0.0666 },
+            GET: { avg_ops_per_sec: 4950599.12, avg_latency_ms: 0.0002 },
+            EXISTS: { avg_ops_per_sec: 7605315.91, avg_latency_ms: 0.0001 },
+            LIST: { avg_ops_per_sec: 475.15, avg_latency_ms: 2.1047 },
+            DELETE: { avg_ops_per_sec: 4791583.64, avg_latency_ms: 0.0002 },
+          },
+        },
+      },
+      {
+        id: 'metadata-1',
+        type: 'metadata',
+        status: 'completed',
+        started_at: new Date(Date.now() - 3400000).toISOString(),
+        completed_at: new Date(Date.now() - 3300000).toISOString(),
+        result: {
+          benchmark: 'metadata',
+          timestamp: new Date().toISOString(),
+          config: { rounds: 2, iterations_per_round: 500 },
+          operations: [],
+          summary: {
+            CREATE_DIR: { avg_ops_per_sec: 43419.62, avg_latency_ms: 0.0231 },
+            CREATE_FILE: { avg_ops_per_sec: 10709.68, avg_latency_ms: 0.0934 },
+            READ_FILE: { avg_ops_per_sec: 58591.53, avg_latency_ms: 0.0171 },
+            RENAME: { avg_ops_per_sec: 43904.07, avg_latency_ms: 0.0239 },
+            LIST_DIR: { avg_ops_per_sec: 91832.51, avg_latency_ms: 0.0109 },
+            DELETE: { avg_ops_per_sec: 95914.32, avg_latency_ms: 0.0104 },
+          },
+        },
+      },
+      {
+        id: 'fs-1',
+        type: 'fs',
+        status: 'completed',
+        started_at: new Date(Date.now() - 3200000).toISOString(),
+        completed_at: new Date(Date.now() - 3100000).toISOString(),
+        result: {
+          benchmark: 'fs',
+          timestamp: new Date().toISOString(),
+          config: { rounds: 2, iterations_per_round: 100, test_sizes: [65536, 262144, 1048576] },
+          operations: [],
+          summary: {
+            WRITE_64KB: { avg_bandwidth_mbps: 7919.42, avg_latency_ms: 0.0667 },
+            READ_64KB: { avg_bandwidth_mbps: 26387.42, avg_latency_ms: 0.0199 },
+            WRITE_256KB: { avg_bandwidth_mbps: 10190.35, avg_latency_ms: 0.2061 },
+            READ_256KB: { avg_bandwidth_mbps: 32530.24, avg_latency_ms: 0.0654 },
+            WRITE_1024KB: { avg_bandwidth_mbps: 9896.00, avg_latency_ms: 0.8481 },
+            READ_1024KB: { avg_bandwidth_mbps: 29832.40, avg_latency_ms: 0.2826 },
+            CREATE_SMALL: { avg_ops_per_sec: 42507.82, avg_latency_ms: 0.0235 },
+            DELETE_SMALL: { avg_ops_per_sec: 109030.11, avg_latency_ms: 0.0092 },
+          },
+        },
+      },
+    ]
+  }
+  const response = await api.get('/benchmarks')
+  return response.data.data
+}
+
+export async function getBenchmarkReport(type: string): Promise<BenchmarkReport> {
+  if (useMock) {
+    const mockReports: Record<string, BenchmarkReport> = {
+      kv: {
+        benchmark: 'kv',
+        timestamp: new Date().toISOString(),
+        config: { rounds: 3, iterations_per_round: 10000, data_size_bytes: 1024 },
+        operations: [],
+        summary: {
+          PUT: { avg_ops_per_sec: 15024.31, avg_latency_ms: 0.0666 },
+          GET: { avg_ops_per_sec: 4950599.12, avg_latency_ms: 0.0002 },
+          EXISTS: { avg_ops_per_sec: 7605315.91, avg_latency_ms: 0.0001 },
+          LIST: { avg_ops_per_sec: 475.15, avg_latency_ms: 2.1047 },
+          DELETE: { avg_ops_per_sec: 4791583.64, avg_latency_ms: 0.0002 },
+        },
+      },
+      metadata: {
+        benchmark: 'metadata',
+        timestamp: new Date().toISOString(),
+        config: { rounds: 2, iterations_per_round: 500 },
+        operations: [],
+        summary: {
+          CREATE_DIR: { avg_ops_per_sec: 43419.62, avg_latency_ms: 0.0231 },
+          CREATE_FILE: { avg_ops_per_sec: 10709.68, avg_latency_ms: 0.0934 },
+          READ_FILE: { avg_ops_per_sec: 58591.53, avg_latency_ms: 0.0171 },
+          RENAME: { avg_ops_per_sec: 43904.07, avg_latency_ms: 0.0239 },
+          LIST_DIR: { avg_ops_per_sec: 91832.51, avg_latency_ms: 0.0109 },
+          DELETE: { avg_ops_per_sec: 95914.32, avg_latency_ms: 0.0104 },
+        },
+      },
+      fs: {
+        benchmark: 'fs',
+        timestamp: new Date().toISOString(),
+        config: { rounds: 2, iterations_per_round: 100, test_sizes: [65536, 262144, 1048576] },
+        operations: [],
+        summary: {
+          WRITE_64KB: { avg_bandwidth_mbps: 7919.42, avg_latency_ms: 0.0667 },
+          READ_64KB: { avg_bandwidth_mbps: 26387.42, avg_latency_ms: 0.0199 },
+          WRITE_256KB: { avg_bandwidth_mbps: 10190.35, avg_latency_ms: 0.2061 },
+          READ_256KB: { avg_bandwidth_mbps: 32530.24, avg_latency_ms: 0.0654 },
+          WRITE_1024KB: { avg_bandwidth_mbps: 9896.00, avg_latency_ms: 0.8481 },
+          READ_1024KB: { avg_bandwidth_mbps: 29832.40, avg_latency_ms: 0.2826 },
+          CREATE_SMALL: { avg_ops_per_sec: 42507.82, avg_latency_ms: 0.0235 },
+          DELETE_SMALL: { avg_ops_per_sec: 109030.11, avg_latency_ms: 0.0092 },
+        },
+      },
+    }
+    return mockReports[type] || mockReports.kv
+  }
+  const response = await api.get(`/benchmarks/${type}`)
+  return response.data.data
+}
+
+export async function runBenchmark(type: 'kv' | 'metadata' | 'fs'): Promise<BenchmarkResult> {
+  if (useMock) {
+    return {
+      id: `${type}-${Date.now()}`,
+      type,
+      status: 'completed',
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      result: await getBenchmarkReport(type),
+    }
+  }
+  const response = await api.post(`/benchmarks/${type}/run`)
+  return response.data.data
 }

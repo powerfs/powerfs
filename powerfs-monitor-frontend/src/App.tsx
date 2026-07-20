@@ -15,6 +15,7 @@ import Conflicts from './pages/Conflicts'
 import Users from './pages/Users'
 import Roles from './pages/Roles'
 import AccessKeys from './pages/AccessKeys'
+import Benchmark from './pages/Benchmark'
 
 function App() {
   return (
@@ -69,6 +70,14 @@ function App() {
           }
         />
         <Route path="kv" element={<KV />} />
+        <Route
+          path="benchmark"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Benchmark />
+            </ProtectedRoute>
+          }
+        />
         <Route path="s3" element={<S3 />} />
         <Route
           path="fuse"

@@ -35,6 +35,7 @@ import {
   BulbFilled,
   DesktopOutlined,
   AppstoreOutlined,
+  RocketOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -125,7 +126,12 @@ function AppLayout() {
       key: 'grp-perf',
       type: 'group',
       label: '性能',
-      children: [{ key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' }],
+      children: [
+        { key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' },
+        ...(isAdmin
+          ? [{ key: '/benchmark', icon: <RocketOutlined />, label: '性能测试' }]
+          : []),
+      ],
     },
     // ── 安全 ──
     {
