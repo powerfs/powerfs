@@ -53,7 +53,11 @@ async fn test_raft_grpc_with_peer() {
 async fn test_raft_client_basic() {
     let client = powerfs_master::raft_client::RaftGrpcClient::new(3, 100);
 
-    let result = client.get_cluster_info("127.0.0.1:9335").await;
+    // Use a port that is guaranteed to be free (port 1 is a reserved system
+    // port with no real service), so this test does not depend on the host
+    // environment. Previously 9335 was used, but that collides with the
+    // docker-compose master-3 port mapping.
+    let result = client.get_cluster_info("127.0.0.1:1").await;
     assert!(result.is_err());
 }
 
