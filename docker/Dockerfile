@@ -1,4 +1,6 @@
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:20.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -6,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfuse3-3 \
     fuse3 \
     netcat-openbsd \
+    libssl1.1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
