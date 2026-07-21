@@ -8,6 +8,7 @@ pub mod index;
 pub mod kv_cache;
 pub mod kv_cache_persist;
 pub mod needle;
+pub mod provider_impl;
 pub mod repair_thread;
 pub mod storage;
 pub mod storage_backend;

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::lock_manager::{LockLevel, LockManager};
 use crate::s3::auth::AuthManager;
+use crate::s3::cache::S3Cache;
 use crate::s3::directory_tree_api::DirectoryTreeApi;
 use crate::s3::master_api::MasterApi;
 use crate::volume_client::VolumeClientPool;
@@ -21,6 +22,7 @@ pub struct S3Server {
     lock_manager: Arc<LockManager>,
     auth_manager: Arc<AuthManager>,
     addr: std::net::SocketAddr,
+    cache: Arc<S3Cache>,
 }
 
 #[derive(Clone)]
@@ -48,6 +50,7 @@ pub struct S3State {
     pub auth_manager: Arc<AuthManager>,
     pub multipart_sessions:
         tokio::sync::RwLock<std::collections::HashMap<String, MultipartSession>>,
+    pub cache: Arc<S3Cache>,
 }
 
 fn s3_error(
@@ -84,6 +87,7 @@ impl S3Server {
             lock_manager,
             auth_manager,
             addr,
+            cache: Arc::new(S3Cache::new()),
         }
     }
 
@@ -95,6 +99,7 @@ impl S3Server {
             lock_manager: self.lock_manager,
             auth_manager: self.auth_manager.clone(),
             multipart_sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            cache: self.cache,
         });
 
         let router = Router::new()
@@ -519,7 +524,17 @@ pub mod handlers {
             .acquire(&lock_key, LockLevel::RaftLease)
             .await;
 
-        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
+        // 使用缓存检查bucket是否存在
+        let bucket_exists = match state.cache.bucket_cache.get(&bucket).await {
+            Some(exists) => exists,
+            None => {
+                let exists = state.directory_tree.get_entry(&bucket_path).await.is_some();
+                state.cache.bucket_cache.set(&bucket, exists).await;
+                exists
+            }
+        };
+
+        if !bucket_exists {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
@@ -546,6 +561,13 @@ pub mod handlers {
 
         let node = &nodes[0];
         let node_address = format!("{}:{}", node.address, node.grpc_port);
+
+        // 缓存volume位置
+        state
+            .cache
+            .volume_location_cache
+            .set(fid.volume_id.0, node_address.clone())
+            .await;
 
         if let Err(e) = state
             .volume_client_pool
@@ -628,13 +650,30 @@ pub mod handlers {
         let bucket_path = format!("/{}", bucket);
         let object_path = format!("/{}/{}", bucket, key);
 
-        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
+        // 使用缓存检查bucket是否存在
+        let bucket_exists = match state.cache.bucket_cache.get(&bucket).await {
+            Some(exists) => exists,
+            None => {
+                let exists = state.directory_tree.get_entry(&bucket_path).await.is_some();
+                state.cache.bucket_cache.set(&bucket, exists).await;
+                exists
+            }
+        };
+
+        if !bucket_exists {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
-        let entry = match state.directory_tree.get_entry(&object_path).await {
+        // 使用缓存获取entry
+        let entry = match state.cache.entry_cache.get(&object_path).await {
             Some(e) => e,
-            None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+            None => match state.directory_tree.get_entry(&object_path).await {
+                Some(e) => {
+                    state.cache.entry_cache.set(&object_path, e.clone()).await;
+                    e
+                }
+                None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+            },
         };
 
         if entry.chunks.is_empty() {
@@ -661,21 +700,39 @@ pub mod handlers {
             }
         };
 
-        let volume_info = match state.master.get_volume_info(&VolumeId(volume_id)).await {
-            Some(v) => v,
+        // 使用缓存获取volume位置
+        let node_address = match state.cache.volume_location_cache.get(volume_id).await {
+            Some(addr) => addr,
             None => {
-                return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Volume not found")
+                let volume_info = match state.master.get_volume_info(&VolumeId(volume_id)).await {
+                    Some(v) => v,
+                    None => {
+                        return build_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Volume not found",
+                        )
+                    }
+                };
+
+                let node = match state.master.get_node_info(&volume_info.node_id).await {
+                    Some(n) => n,
+                    None => {
+                        return build_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Node not found",
+                        )
+                    }
+                };
+
+                let addr = format!("{}:{}", node.address, node.grpc_port);
+                state
+                    .cache
+                    .volume_location_cache
+                    .set(volume_id, addr.clone())
+                    .await;
+                addr
             }
         };
-
-        let node = match state.master.get_node_info(&volume_info.node_id).await {
-            Some(n) => n,
-            None => {
-                return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Node not found")
-            }
-        };
-
-        let node_address = format!("{}:{}", node.address, node.grpc_port);
 
         let data = match state
             .volume_client_pool
@@ -1407,6 +1464,7 @@ mod tests {
             lock_manager: Arc::new(LockManager::new()),
             auth_manager: auth,
             multipart_sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            cache: Arc::new(S3Cache::new()),
         })
     }
 

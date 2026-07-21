@@ -11,6 +11,8 @@ import KV from './pages/KV'
 import Alerts from './pages/Alerts'
 import S3 from './pages/S3'
 import Fuse from './pages/Fuse'
+import Filer from './pages/Filer'
+import Shards from './pages/Shards'
 import Conflicts from './pages/Conflicts'
 import Users from './pages/Users'
 import Roles from './pages/Roles'
@@ -92,6 +94,22 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <Conflicts />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="filer"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Filer />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="shards"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Shards />
             </ProtectedRoute>
           }
         />

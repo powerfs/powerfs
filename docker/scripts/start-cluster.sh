@@ -139,7 +139,22 @@ echo "  Waiting for volumes to register..."
 sleep 5
 
 echo ""
-echo "[5/7] Starting S3 Backend..."
+echo "[5/8] Starting Filer..."
+docker compose up -d --no-deps filer
+
+echo "  Waiting for Filer to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if nc -z localhost 9001 >/dev/null 2>&1; then
+        echo "  [OK] Filer ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo ""
+echo "[6/8] Starting S3 Backend..."
 docker compose up -d --no-deps s3
 
 echo "  Waiting for S3 backend to be ready..."
@@ -154,7 +169,7 @@ while [ $timeout -gt 0 ]; do
 done
 
 echo ""
-echo "[6/7] Starting Monitor..."
+echo "[7/8] Starting Monitor..."
 docker compose up -d --no-deps monitor
 
 echo "  Waiting for monitor to be ready..."
@@ -169,7 +184,7 @@ while [ $timeout -gt 0 ]; do
 done
 
 echo ""
-echo "[7/7] Starting Frontend..."
+echo "[8/8] Starting Frontend..."
 docker compose up -d --no-deps frontend
 
 echo "  Waiting for frontend to be ready..."
@@ -196,6 +211,7 @@ echo "  Master 3:        $HOST_IP:9335"
 echo "  Volume 1:        $HOST_IP:8080"
 echo "  Volume 2:        $HOST_IP:8081"
 echo "  Volume 3:        $HOST_IP:8082"
+echo "  Filer:           $HOST_IP:9001"
 echo "  S3 Backend:      $HOST_IP:9000"
 echo "  Monitor API:     $HOST_IP:8083"
 echo "  Monitor UI:      http://$HOST_IP:8084"

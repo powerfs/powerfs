@@ -5,6 +5,7 @@ pub mod master;
 pub mod metadata_manager;
 pub mod metrics;
 pub mod proto;
+pub mod provider_impl;
 pub mod raft_client;
 pub mod raft_node;
 pub mod raft_server;

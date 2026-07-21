@@ -15,6 +15,7 @@ volumes:
   volume-3-data:
   redis-data:
   s3-data:
+  filer-data:
 
 services:
   redis:
@@ -189,6 +190,34 @@ services:
       interval: 5s
       timeout: 3s
       retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  filer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: filer
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.35
+    ports:
+      - "8888:8888"
+      - "8889:8889"
+      - "8890:8890"
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs filer --port 8888 --grpc-port 8889 --master 172.20.0.11:9333 --master 172.20.0.12:9333 --master 172.20.0.13:9333 -D /data/filer --shard-count 4 --raft-id 1
+    volumes:
+      - filer-data:/data/filer
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       master-1:
         condition: service_healthy

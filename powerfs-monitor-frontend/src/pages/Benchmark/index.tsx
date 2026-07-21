@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Card, Row, Col, Table, Button, Space, Typography, Tag, Divider } from 'antd'
+import { Card, Row, Col, Table, Button, Space, Typography, Tag, Divider, Modal, Descriptions } from 'antd'
 import {
   PlayCircleOutlined,
   RestOutlined,
@@ -9,10 +9,11 @@ import {
   RocketOutlined,
   ClockCircleOutlined,
   ApiOutlined,
+  EyeOutlined,
 } from '@ant-design/icons'
 import type { EChartsOption } from 'echarts'
 import type { BenchmarkResult, BenchmarkReport } from '@/types'
-import { getBenchmarkResults, runBenchmark } from '@/services/api'
+import { getBenchmarkResults, runBenchmark, getBenchmarkReportById } from '@/services/api'
 import { MetricChart, StatCard, RefreshControl } from '@/components/pro'
 
 const { Text, Title } = Typography
@@ -21,7 +22,10 @@ function Benchmark() {
   const [results, setResults] = useState<BenchmarkResult[]>([])
   const [loading, setLoading] = useState(false)
   const [runningType, setRunningType] = useState<string | null>(null)
-  const [selectedTab, setSelectedTab] = useState<'kv' | 'metadata' | 'fs'>('kv')
+  const [selectedTab, setSelectedTab] = useState<'kv' | 'metadata' | 'fs' | 's3'>('kv')
+  const [detailModalVisible, setDetailModalVisible] = useState(false)
+  const [detailData, setDetailData] = useState<BenchmarkResult | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -39,7 +43,7 @@ function Benchmark() {
     void loadData()
   }, [loadData])
 
-  const handleRunBenchmark = async (type: 'kv' | 'metadata' | 'fs') => {
+  const handleRunBenchmark = async (type: 'kv' | 'metadata' | 'fs' | 's3') => {
     setRunningType(type)
     try {
       const result = await runBenchmark(type)
@@ -49,6 +53,19 @@ function Benchmark() {
       console.error('Failed to run benchmark:', e)
     } finally {
       setRunningType(null)
+    }
+  }
+
+  const handleViewDetail = async (record: BenchmarkResult) => {
+    setDetailLoading(true)
+    try {
+      const data = await getBenchmarkReportById(record.id)
+      setDetailData(data)
+      setDetailModalVisible(true)
+    } catch (e) {
+      console.error('Failed to load benchmark detail:', e)
+    } finally {
+      setDetailLoading(false)
     }
   }
 
@@ -66,6 +83,8 @@ function Benchmark() {
         return <FileTextOutlined />
       case 'fs':
         return <FolderOpenOutlined />
+      case 's3':
+        return <ApiOutlined />
       default:
         return <RocketOutlined />
     }
@@ -79,6 +98,8 @@ function Benchmark() {
         return '元数据'
       case 'fs':
         return '文件系统'
+      case 's3':
+        return 'S3 存储'
       default:
         return type
     }
@@ -139,6 +160,20 @@ function Benchmark() {
         if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
         return `${(ms / 60000).toFixed(1)}min`
       },
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_: unknown, record: BenchmarkResult) => (
+        <Button
+          type="link"
+          icon={<EyeOutlined />}
+          onClick={() => handleViewDetail(record)}
+          disabled={record.status !== 'completed'}
+        >
+          查看详情
+        </Button>
+      ),
     },
   ]
 
@@ -219,7 +254,7 @@ function Benchmark() {
       </div>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
-        <Col xs={24} sm={8}>
+        <Col xs={24} sm={6}>
           <Button
             type={selectedTab === 'kv' ? 'primary' : 'default'}
             block
@@ -229,7 +264,7 @@ function Benchmark() {
             KV 存储测试
           </Button>
         </Col>
-        <Col xs={24} sm={8}>
+        <Col xs={24} sm={6}>
           <Button
             type={selectedTab === 'metadata' ? 'primary' : 'default'}
             block
@@ -239,7 +274,7 @@ function Benchmark() {
             元数据测试
           </Button>
         </Col>
-        <Col xs={24} sm={8}>
+        <Col xs={24} sm={6}>
           <Button
             type={selectedTab === 'fs' ? 'primary' : 'default'}
             block
@@ -247,6 +282,16 @@ function Benchmark() {
             onClick={() => setSelectedTab('fs')}
           >
             文件系统测试
+          </Button>
+        </Col>
+        <Col xs={24} sm={6}>
+          <Button
+            type={selectedTab === 's3' ? 'primary' : 'default'}
+            block
+            icon={<ApiOutlined />}
+            onClick={() => setSelectedTab('s3')}
+          >
+            S3 存储测试
           </Button>
         </Col>
       </Row>
@@ -441,6 +486,122 @@ function Benchmark() {
           size="small"
         />
       </Card>
+
+      <Modal
+        title={<Space>{detailData && getTypeIcon(detailData.type)} 测试详情</Space>}
+        open={detailModalVisible}
+        onCancel={() => setDetailModalVisible(false)}
+        width={800}
+        footer={null}
+        loading={detailLoading}
+      >
+        {detailData && detailData.result && (
+          <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+            <Descriptions bordered column={2} size="small">
+              <Descriptions.Item label="测试类型">{getTypeName(detailData.type)}</Descriptions.Item>
+              <Descriptions.Item label="测试状态">
+                <Tag color={getStatusColor(detailData.status)}>
+                  {detailData.status === 'completed' ? '已完成' : detailData.status === 'running' ? '运行中' : '失败'}
+                </Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="开始时间">{new Date(detailData.started_at).toLocaleString()}</Descriptions.Item>
+              <Descriptions.Item label="完成时间">
+                {detailData.completed_at ? new Date(detailData.completed_at).toLocaleString() : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="耗时" span={2}>
+                {detailData.completed_at ? (() => {
+                  const start = new Date(detailData.started_at).getTime()
+                  const end = new Date(detailData.completed_at).getTime()
+                  const ms = end - start
+                  if (ms < 1000) return `${ms}ms`
+                  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+                  return `${(ms / 60000).toFixed(1)}min`
+                })() : '-'}
+              </Descriptions.Item>
+            </Descriptions>
+
+            <Divider>测试配置</Divider>
+            <Descriptions bordered column={2} size="small">
+              <Descriptions.Item label="测试轮数">
+                {detailData.result.config.rounds} 轮
+              </Descriptions.Item>
+              <Descriptions.Item label="每轮迭代">
+                {detailData.result.config.iterations_per_round} 次
+              </Descriptions.Item>
+              {detailData.result.config.data_size_bytes && (
+                <Descriptions.Item label="数据大小">
+                  {(detailData.result.config.data_size_bytes / 1024).toFixed(0)} KB
+                </Descriptions.Item>
+              )}
+              {detailData.result.config.test_sizes && (
+                <Descriptions.Item label="测试文件大小" span={2}>
+                  {detailData.result.config.test_sizes.map((size: number, i: number) => (
+                    <Tag key={i} color="blue" style={{ marginRight: 8 }}>
+                      {(size / 1024).toFixed(0)}KB
+                    </Tag>
+                  ))}
+                </Descriptions.Item>
+              )}
+            </Descriptions>
+
+            <Divider>操作详情</Divider>
+            <Table
+              dataSource={detailData.result.operations.map((op, i) => ({
+                key: i,
+                operation: op.operation,
+                count: op.count,
+                duration: op.duration_ms,
+                opsPerSec: op.ops_per_sec,
+                latency: op.avg_latency_ms,
+                bandwidth: op.bandwidth_mbps,
+              }))}
+              columns={[
+                { title: '操作', dataIndex: 'operation', key: 'operation' },
+                { title: '次数', dataIndex: 'count', key: 'count', render: (v: number) => v.toLocaleString() },
+                { title: '耗时 (ms)', dataIndex: 'duration', key: 'duration', render: (v: number) => v.toFixed(4) },
+                { title: '吞吐量 (ops/s)', dataIndex: 'opsPerSec', key: 'opsPerSec', render: (v: number) => v.toLocaleString() },
+                { title: '延迟 (ms)', dataIndex: 'latency', key: 'latency', render: (v: number) => v.toFixed(4) },
+                { title: '带宽 (MB/s)', dataIndex: 'bandwidth', key: 'bandwidth', render: (v: number | undefined) => v ? v.toFixed(2) : '-' },
+              ]}
+              pagination={false}
+              size="small"
+            />
+
+            <Divider>统计摘要</Divider>
+            <Table
+              dataSource={Object.entries(detailData.result.summary).map(([op, data]) => ({
+                key: op,
+                operation: op,
+                ops: data.avg_ops_per_sec,
+                bw: data.avg_bandwidth_mbps,
+                latency: data.avg_latency_ms ?? 0,
+              }))}
+              columns={[
+                { title: '操作', dataIndex: 'operation', key: 'operation' },
+                {
+                  title: detailData.type === 'fs' ? '带宽 (MB/s)' : '吞吐量 (ops/s)',
+                  key: 'value',
+                  render: (_: unknown, record: { ops?: number; bw?: number }) => (
+                    <Text strong style={{ color: '#00ff88', fontSize: 14 }}>
+                      {record.bw ? record.bw.toFixed(2) : record.ops?.toLocaleString()}
+                    </Text>
+                  ),
+                },
+                {
+                  title: '平均延迟 (ms)',
+                  dataIndex: 'latency',
+                  key: 'latency',
+                  render: (latency: number) => (
+                    <Text style={{ color: '#00d9ff' }}>{latency.toFixed(4)}</Text>
+                  ),
+                },
+              ]}
+              pagination={false}
+              size="small"
+            />
+          </Space>
+        )}
+      </Modal>
     </div>
   )
 }

@@ -134,13 +134,33 @@ enum Commands {
         #[arg(long, short, default_value = "8888")]
         port: u16,
 
-        /// Master address
-        #[arg(long, short)]
-        master: String,
+        /// gRPC port for meta service
+        #[arg(long, default_value = "8889")]
+        grpc_port: u16,
+
+        /// Master address (can be specified multiple times)
+        #[arg(long, short, action = clap::ArgAction::Append)]
+        master: Vec<String>,
 
         /// Bind IP address
         #[arg(long)]
         ip: Option<String>,
+
+        /// Data directory for filer (shards, raft, etc.)
+        #[arg(long, short = 'D', default_value = "./data/filer")]
+        data_dir: String,
+
+        /// Number of metadata shards
+        #[arg(long, default_value = "4")]
+        shard_count: u32,
+
+        /// Raft node ID
+        #[arg(long, default_value = "1")]
+        raft_id: u64,
+
+        /// Raft peer addresses
+        #[arg(long, action = clap::ArgAction::Append)]
+        raft_peer: Vec<String>,
     },
 
     Fuse {
@@ -318,7 +338,34 @@ async fn main() -> Result<()> {
             .await
         }
 
-        Commands::Filer { port, master, ip } => run_filer(port, &master, ip).await,
+        #[cfg(feature = "s3")]
+        Commands::Filer {
+            port,
+            grpc_port,
+            master,
+            ip,
+            data_dir,
+            shard_count,
+            raft_id,
+            raft_peer,
+        } => {
+            run_filer(
+                port,
+                grpc_port,
+                &master,
+                ip,
+                &data_dir,
+                shard_count,
+                raft_id,
+                &raft_peer,
+            )
+            .await
+        }
+        #[cfg(not(feature = "s3"))]
+        Commands::Filer { .. } => {
+            warn!("Filer (S3) feature is not enabled. Please build with --features s3");
+            Ok(())
+        }
 
         Commands::Fuse {
             dir,
@@ -720,19 +767,162 @@ async fn run_volume(
     Ok(())
 }
 
-async fn run_filer(port: u16, master: &str, ip: Option<String>) -> Result<()> {
-    info!("Starting PowerFS Filer");
+#[cfg(feature = "s3")]
+#[allow(clippy::too_many_arguments)]
+async fn run_filer(
+    port: u16,
+    grpc_port: u16,
+    masters: &[String],
+    ip: Option<String>,
+    data_dir: &str,
+    shard_count: u32,
+    raft_id: u64,
+    raft_peers: &[String],
+) -> Result<()> {
+    info!("Starting PowerFS Filer with sharding");
 
-    let address = match ip {
-        Some(ip) => format!("{}:{}", ip, port),
-        None => format!("0.0.0.0:{}", port),
+    let bind_ip = ip.as_deref().unwrap_or("0.0.0.0");
+    let s3_address = format!("{}:{}", bind_ip, port);
+    let grpc_address = format!("{}:{}", bind_ip, grpc_port);
+    let raft_address = format!("{}:{}", bind_ip, grpc_port + 1);
+
+    info!("  S3 Address: {}", s3_address);
+    info!("  gRPC Address: {}", grpc_address);
+    info!("  Data Dir: {}", data_dir);
+    info!("  Shard Count: {}", shard_count);
+    info!("  Raft ID: {}", raft_id);
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| PowerFsError::Internal(format!("failed to create data dir: {}", e)))?;
+
+    #[cfg(feature = "redis-event")]
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    #[cfg(feature = "redis-event")]
+    let redis_client =
+        redis::Client::open(redis_url).map_err(|e| PowerFsError::Internal(e.to_string()))?;
+
+    let metadata_store = Arc::new(powerfs_filer::MetadataStore::new(
+        #[cfg(feature = "redis-event")]
+        redis_client,
+        #[cfg(not(feature = "redis-event"))]
+        (),
+    ));
+
+    let default_master = "127.0.0.1:9333".to_string();
+    let master_addr = masters.first().unwrap_or(&default_master);
+    let master_client = Arc::new(powerfs_master::s3::master_client::S3MasterClient::new(
+        master_addr,
+    ));
+    let master_api = Arc::new(powerfs_master::s3::MasterApi::Remote(master_client));
+
+    let bucket_manager = Arc::new(powerfs_filer::BucketManager::new(
+        metadata_store.clone(),
+        master_api,
+    ));
+    let volume_router = Arc::new(powerfs_filer::VolumeRouter::new(metadata_store.clone()));
+    let entry_manager = Arc::new(powerfs_filer::EntryManager::new(
+        metadata_store.clone(),
+        bucket_manager.clone(),
+    ));
+    let volume_client_pool = Arc::new(powerfs_master::volume_client::VolumeClientPool::new());
+
+    // Initialize sharded metadata backend (Raft + RocksDB) before S3 handler
+    // so the handler can route object metadata through the shards.
+    let shard_strategy = Arc::new(powerfs_filer::ShardStrategy::new(shard_count as u64));
+
+    let raft_data_path = format!("{}/raft", data_dir);
+    std::fs::create_dir_all(&raft_data_path)
+        .map_err(|e| PowerFsError::Internal(format!("failed to create raft dir: {}", e)))?;
+
+    let raft_group_manager = Arc::new(powerfs_filer::RaftGroupManager::new(
+        raft_id,
+        raft_address.clone(),
+        raft_data_path,
+    ));
+
+    let shard_data_path = format!("{}/shards", data_dir);
+    std::fs::create_dir_all(&shard_data_path)
+        .map_err(|e| PowerFsError::Internal(format!("failed to create shards dir: {}", e)))?;
+
+    let meta_shard_manager = Arc::new(powerfs_filer::MetaShardManager::new(
+        raft_group_manager.clone(),
+        shard_strategy.clone(),
+        shard_data_path,
+    ));
+
+    info!("Initializing {} metadata shards...", shard_count);
+    let peers: Vec<powerfs_filer::Peer> = if raft_peers.is_empty() {
+        vec![powerfs_filer::Peer {
+            id: raft_id,
+            address: raft_address.clone(),
+        }]
+    } else {
+        raft_peers
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| powerfs_filer::Peer {
+                id: (i + 1) as u64,
+                address: addr.clone(),
+            })
+            .collect()
     };
 
-    info!("Filer initialized");
-    info!("Listening on: {}", address);
-    info!("Connected to master: {}", master);
+    for i in 0..shard_count {
+        let shard_id = powerfs_filer::ShardId(i as u64);
+        meta_shard_manager
+            .create_shard(shard_id, peers.clone())
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("failed to create shard {}: {}", i, e)))?;
+        info!("Shard {} initialized", i);
+    }
 
-    tokio::signal::ctrl_c().await?;
+    let s3_handler = Arc::new(
+        powerfs_filer::S3Handler::new(
+            bucket_manager.clone(),
+            entry_manager.clone(),
+            volume_router.clone(),
+            volume_client_pool.clone(),
+        )
+        .with_meta_shard_manager(meta_shard_manager.clone()),
+    );
+
+    let addr: std::net::SocketAddr = s3_address.parse()?;
+    let filer_server = powerfs_filer::FilerServer::new(
+        addr,
+        metadata_store.clone(),
+        bucket_manager.clone(),
+        entry_manager.clone(),
+        volume_router.clone(),
+        s3_handler.clone(),
+        meta_shard_manager.clone(),
+    );
+
+    let grpc_service = powerfs_filer::FilerMetaServiceImpl::new(
+        meta_shard_manager.clone(),
+        shard_strategy.clone(),
+    );
+
+    let grpc_addr: std::net::SocketAddr = grpc_address.parse()?;
+    info!("Starting gRPC meta service on {}", grpc_address);
+
+    use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
+    tokio::spawn(async move {
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(FilerMetaServiceServer::new(grpc_service))
+            .serve(grpc_addr)
+            .await
+        {
+            log::error!("gRPC server error: {}", e);
+        }
+    });
+
+    info!("Filer initialized");
+    info!("S3 endpoint: {}", s3_address);
+    info!("gRPC endpoint: {}", grpc_address);
+    info!("Connected to master(s): {:?}", masters);
+
+    filer_server.serve().await?;
 
     Ok(())
 }

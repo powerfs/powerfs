@@ -28,6 +28,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
+async-trait = "0.1"
 tokio-util = "0.7"
 tokio-stream = "0.1"
 md5 = "0.7"

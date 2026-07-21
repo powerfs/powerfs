@@ -20,7 +20,8 @@ COPY target/release/powerfs /app/
 COPY target/release/powerfs-volume /app/
 COPY target/release/powerfs-monitor /app/
 COPY target/release/powerfs-fuse /app/
+COPY target/release/powerfs-filer /app/
 
-EXPOSE 9333 8080 8081
+EXPOSE 9333 8080 8081 8888 8889
 
 CMD ["/app/powerfs", "master", "--port", "9333", "--dir", "/data/master"]

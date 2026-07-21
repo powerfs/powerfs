@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{
@@ -1696,16 +1697,14 @@ struct BenchmarkConfig {
     test_sizes: Option<Vec<usize>>,
 }
 
-async fn run_kv_benchmark(
-    state: Arc<AppState>,
-    config: &BenchmarkConfig,
-) -> BenchmarkReport {
+async fn run_kv_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) -> BenchmarkReport {
     let rounds = config.rounds;
     let iterations = config.iterations_per_round;
     let data_size = config.data_size_bytes.unwrap_or(1024);
 
     let mut all_operations: Vec<BenchmarkOperation> = Vec::new();
-    let mut summary: std::collections::HashMap<String, BenchmarkSummary> = std::collections::HashMap::new();
+    let mut summary: std::collections::HashMap<String, BenchmarkSummary> =
+        std::collections::HashMap::new();
 
     let test_data = vec![0u8; data_size];
     let test_value = String::from_utf8_lossy(&test_data).to_string();
@@ -1714,12 +1713,22 @@ async fn run_kv_benchmark(
         info!("KV Benchmark round {}/{}", round + 1, rounds);
 
         let namespace = format!("benchmark_{}", round);
-        let _ = state.kv_client.lock().await.create_namespace(&namespace).await;
+        let _ = state
+            .kv_client
+            .lock()
+            .await
+            .create_namespace(&namespace)
+            .await;
 
         let start = std::time::Instant::now();
         for i in 0..iterations {
             let key = format!("key_{}", i);
-            let _ = state.kv_client.lock().await.put_key(&namespace, &key, &test_value).await;
+            let _ = state
+                .kv_client
+                .lock()
+                .await
+                .put_key(&namespace, &key, &test_value)
+                .await;
         }
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         let ops_per_sec = iterations as f64 / (duration_ms / 1000.0);
@@ -1766,7 +1775,12 @@ async fn run_kv_benchmark(
         let start = std::time::Instant::now();
         for i in 0..iterations {
             let key = format!("key_{}", i);
-            let _ = state.kv_client.lock().await.delete_key(&namespace, &key).await;
+            let _ = state
+                .kv_client
+                .lock()
+                .await
+                .delete_key(&namespace, &key)
+                .await;
         }
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         let ops_per_sec = iterations as f64 / (duration_ms / 1000.0);
@@ -1780,19 +1794,30 @@ async fn run_kv_benchmark(
             bandwidth_mbps: None,
         });
 
-        let _ = state.kv_client.lock().await.delete_namespace(&namespace).await;
+        let _ = state
+            .kv_client
+            .lock()
+            .await
+            .delete_namespace(&namespace)
+            .await;
     }
 
     for op_type in ["PUT", "GET", "LIST", "DELETE"] {
-        let ops: Vec<&BenchmarkOperation> = all_operations.iter().filter(|o| o.operation == op_type).collect();
+        let ops: Vec<&BenchmarkOperation> = all_operations
+            .iter()
+            .filter(|o| o.operation == op_type)
+            .collect();
         if !ops.is_empty() {
             let avg_ops = ops.iter().map(|o| o.ops_per_sec).sum::<f64>() / ops.len() as f64;
             let avg_latency = ops.iter().map(|o| o.avg_latency_ms).sum::<f64>() / ops.len() as f64;
-            summary.insert(op_type.to_string(), BenchmarkSummary {
-                avg_ops_per_sec: Some(avg_ops),
-                avg_latency_ms: Some(avg_latency),
-                avg_bandwidth_mbps: None,
-            });
+            summary.insert(
+                op_type.to_string(),
+                BenchmarkSummary {
+                    avg_ops_per_sec: Some(avg_ops),
+                    avg_latency_ms: Some(avg_latency),
+                    avg_bandwidth_mbps: None,
+                },
+            );
         }
     }
 
@@ -1809,49 +1834,250 @@ async fn run_kv_benchmark(
     }
 }
 
-async fn run_metadata_benchmark(_state: Arc<AppState>, config: &BenchmarkConfig) -> BenchmarkReport {
+async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) -> BenchmarkReport {
     let rounds = config.rounds;
-    let iterations = config.iterations_per_round;
+    let iterations = std::cmp::min(config.iterations_per_round, 100);
 
     let mut all_operations: Vec<BenchmarkOperation> = Vec::new();
-    let mut summary: std::collections::HashMap<String, BenchmarkSummary> = std::collections::HashMap::new();
+    let mut summary: std::collections::HashMap<String, BenchmarkSummary> =
+        std::collections::HashMap::new();
+    let mut created_inodes: Vec<(u64, String, bool)> = Vec::new();
 
-    let operations = [
-        ("CREATE_DIR", 0.02, 43000.0),
-        ("CREATE_FILE", 0.09, 11000.0),
-        ("READ_FILE", 0.02, 55000.0),
-        ("RENAME", 0.02, 45000.0),
-        ("LIST_DIR", 0.01, 95000.0),
-        ("DELETE", 0.01, 90000.0),
-    ];
+    for round in 0..rounds {
+        let bench_prefix = format!("/benchmark_metadata_{}", round);
 
-    for _ in 0..rounds {
-        for (op_name, base_latency_ms, base_ops) in operations {
-            let jitter = rand::random::<f64>() * 0.4 + 0.8;
-            let duration_ms = (base_latency_ms * iterations as f64 * jitter) / 1000.0;
-            let ops_per_sec = (base_ops * jitter) * 0.9 + rand::random::<f64>() * base_ops * 0.2;
+        let start = Instant::now();
+        let mut success_count = 0;
+        for i in 0..iterations {
+            let _dir_name = format!("{}/dir_{}", bench_prefix, i);
+            let entry = powerfs_master::proto::powerfs::Entry {
+                name: format!("dir_{}", i),
+                directory: bench_prefix.clone(),
+                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                    mode: 0o755,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let request = powerfs_master::proto::powerfs::CreateEntryRequest {
+                entry: Some(entry),
+                client_id: "benchmark".to_string(),
+            };
+            match state
+                .master_client
+                .lock()
+                .await
+                .create_entry(tonic::Request::new(request))
+                .await
+            {
+                Ok(_) => success_count += 1,
+                Err(e) => warn!("CREATE_DIR failed: {}", e),
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+        all_operations.push(BenchmarkOperation {
+            operation: "CREATE_DIR".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
 
-            all_operations.push(BenchmarkOperation {
-                operation: op_name.to_string(),
-                count: iterations as u64,
-                duration_ms,
-                ops_per_sec,
-                avg_latency_ms: base_latency_ms * jitter,
-                bandwidth_mbps: None,
-            });
+        let start = Instant::now();
+        success_count = 0;
+        for i in 0..iterations {
+            let file_name = format!("{}/file_{}", bench_prefix, i);
+            let entry = powerfs_master::proto::powerfs::Entry {
+                name: format!("file_{}", i),
+                directory: bench_prefix.clone(),
+                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                    mode: 0o644,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let request = powerfs_master::proto::powerfs::CreateEntryRequest {
+                entry: Some(entry),
+                client_id: "benchmark".to_string(),
+            };
+            match state
+                .master_client
+                .lock()
+                .await
+                .create_entry(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    success_count += 1;
+                    created_inodes.push((response.into_inner().inode, file_name, false));
+                }
+                Err(e) => warn!("CREATE_FILE failed: {}", e),
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+        all_operations.push(BenchmarkOperation {
+            operation: "CREATE_FILE".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        success_count = 0;
+        for entry in created_inodes
+            .iter()
+            .take(std::cmp::min(iterations, created_inodes.len()))
+        {
+            let request = powerfs_master::proto::powerfs::GetEntryRequest {
+                path: entry.1.clone(),
+            };
+            match state
+                .master_client
+                .lock()
+                .await
+                .get_entry(tonic::Request::new(request))
+                .await
+            {
+                Ok(_) => success_count += 1,
+                Err(e) => warn!("GET_ENTRY failed: {}", e),
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+        all_operations.push(BenchmarkOperation {
+            operation: "READ_FILE".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        success_count = 0;
+        for _i in 0..iterations {
+            let request = powerfs_master::proto::powerfs::ListEntriesRequest {
+                parent_ino: 1,
+                limit: 100,
+                last_name: "".to_string(),
+            };
+            match state
+                .master_client
+                .lock()
+                .await
+                .list_entries(tonic::Request::new(request))
+                .await
+            {
+                Ok(_) => success_count += 1,
+                Err(e) => warn!("LIST_DIR failed: {}", e),
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+        all_operations.push(BenchmarkOperation {
+            operation: "LIST_DIR".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        success_count = 0;
+        for entry in created_inodes
+            .iter()
+            .take(std::cmp::min(iterations / 2, created_inodes.len()))
+        {
+            let (ino, _, is_dir) = entry;
+            let request = powerfs_master::proto::powerfs::DeleteEntryRequest {
+                ino: *ino,
+                is_directory: *is_dir,
+                client_id: "benchmark".to_string(),
+            };
+            match state
+                .master_client
+                .lock()
+                .await
+                .delete_entry(tonic::Request::new(request))
+                .await
+            {
+                Ok(_) => success_count += 1,
+                Err(e) => warn!("DELETE failed: {}", e),
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+        all_operations.push(BenchmarkOperation {
+            operation: "DELETE".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        for i in 0..iterations {
+            let dir_name = format!("{}/dir_{}", bench_prefix, i);
+            let request = powerfs_master::proto::powerfs::GetEntryRequest {
+                path: dir_name.clone(),
+            };
+            if let Ok(response) = state
+                .master_client
+                .lock()
+                .await
+                .get_entry(tonic::Request::new(request))
+                .await
+            {
+                let inner = response.into_inner();
+                if inner.found {
+                    let ino = inner
+                        .entry
+                        .map(|e| e.attributes.map(|a| a.ino).unwrap_or(0))
+                        .unwrap_or(0);
+                    let request = powerfs_master::proto::powerfs::DeleteEntryRequest {
+                        ino,
+                        is_directory: true,
+                        client_id: "benchmark".to_string(),
+                    };
+                    let _ = state
+                        .master_client
+                        .lock()
+                        .await
+                        .delete_entry(tonic::Request::new(request))
+                        .await;
+                }
+            }
         }
     }
 
-    for (op_name, _, _) in operations {
-        let ops: Vec<&BenchmarkOperation> = all_operations.iter().filter(|o| o.operation == op_name).collect();
+    for op_type in [
+        "CREATE_DIR",
+        "CREATE_FILE",
+        "READ_FILE",
+        "LIST_DIR",
+        "DELETE",
+    ] {
+        let ops: Vec<&BenchmarkOperation> = all_operations
+            .iter()
+            .filter(|o| o.operation == op_type)
+            .collect();
         if !ops.is_empty() {
             let avg_ops = ops.iter().map(|o| o.ops_per_sec).sum::<f64>() / ops.len() as f64;
             let avg_latency = ops.iter().map(|o| o.avg_latency_ms).sum::<f64>() / ops.len() as f64;
-            summary.insert(op_name.to_string(), BenchmarkSummary {
-                avg_ops_per_sec: Some(avg_ops),
-                avg_latency_ms: Some(avg_latency),
-                avg_bandwidth_mbps: None,
-            });
+            summary.insert(
+                op_type.to_string(),
+                BenchmarkSummary {
+                    avg_ops_per_sec: Some(avg_ops),
+                    avg_latency_ms: Some(avg_latency),
+                    avg_bandwidth_mbps: None,
+                },
+            );
         }
     }
 
@@ -1869,69 +2095,159 @@ async fn run_metadata_benchmark(_state: Arc<AppState>, config: &BenchmarkConfig)
 
 async fn run_fs_benchmark(_state: Arc<AppState>, config: &BenchmarkConfig) -> BenchmarkReport {
     let rounds = config.rounds;
-    let test_sizes = config.test_sizes.clone().unwrap_or(vec![65536, 262144, 1048576]);
+    let test_sizes = config
+        .test_sizes
+        .clone()
+        .unwrap_or(vec![65536, 262144, 1048576]);
+    let iterations = std::cmp::min(config.iterations_per_round, 20);
 
     let mut all_operations: Vec<BenchmarkOperation> = Vec::new();
-    let mut summary: std::collections::HashMap<String, BenchmarkSummary> = std::collections::HashMap::new();
+    let mut summary: std::collections::HashMap<String, BenchmarkSummary> =
+        std::collections::HashMap::new();
+
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let base_path = temp_dir.path();
 
     for _ in 0..rounds {
         for &size in &test_sizes {
             let size_kb = size / 1024;
+            let data = vec![0u8; size];
 
-            let write_jitter = rand::random::<f64>() * 0.3 + 0.85;
-            let write_bw = match size_kb {
-                64 => 8000.0 * write_jitter,
-                256 => 10000.0 * write_jitter,
-                1024 => 9500.0 * write_jitter,
-                _ => 5000.0 * write_jitter,
+            let start = Instant::now();
+            let mut success_count = 0;
+            for i in 0..iterations {
+                let file_path = base_path.join(format!("test_write_{}_{}", size_kb, i));
+                if std::fs::write(&file_path, &data).is_ok() {
+                    success_count += 1;
+                }
+            }
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+            let bandwidth_mbps = if success_count > 0 {
+                Some(
+                    (size as f64 * success_count as f64 * 8.0)
+                        / (1024.0 * 1024.0 * (duration_ms / 1000.0)),
+                )
+            } else {
+                None
             };
-            let write_latency = (size as f64 / 1024.0 / write_bw) * 1000.0;
 
             all_operations.push(BenchmarkOperation {
                 operation: format!("WRITE_{}KB", size_kb),
-                count: 100,
-                duration_ms: write_latency * 100.0,
-                ops_per_sec: 0.0,
-                avg_latency_ms: write_latency,
-                bandwidth_mbps: Some(write_bw),
+                count: success_count as u64,
+                duration_ms,
+                ops_per_sec,
+                avg_latency_ms: duration_ms / iterations as f64,
+                bandwidth_mbps,
             });
 
-            let read_jitter = rand::random::<f64>() * 0.3 + 0.85;
-            let read_bw = match size_kb {
-                64 => 28000.0 * read_jitter,
-                256 => 32000.0 * read_jitter,
-                1024 => 30000.0 * read_jitter,
-                _ => 20000.0 * read_jitter,
+            let start = Instant::now();
+            success_count = 0;
+            for i in 0..iterations {
+                let file_path = base_path.join(format!("test_write_{}_{}", size_kb, i));
+                if std::fs::read(&file_path).is_ok() {
+                    success_count += 1;
+                }
+            }
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+            let bandwidth_mbps = if success_count > 0 {
+                Some(
+                    (size as f64 * success_count as f64 * 8.0)
+                        / (1024.0 * 1024.0 * (duration_ms / 1000.0)),
+                )
+            } else {
+                None
             };
-            let read_latency = (size as f64 / 1024.0 / read_bw) * 1000.0;
 
             all_operations.push(BenchmarkOperation {
                 operation: format!("READ_{}KB", size_kb),
-                count: 100,
-                duration_ms: read_latency * 100.0,
-                ops_per_sec: 0.0,
-                avg_latency_ms: read_latency,
-                bandwidth_mbps: Some(read_bw),
+                count: success_count as u64,
+                duration_ms,
+                ops_per_sec,
+                avg_latency_ms: duration_ms / iterations as f64,
+                bandwidth_mbps,
+            });
+
+            let start = Instant::now();
+            success_count = 0;
+            for i in 0..iterations {
+                let file_path = base_path.join(format!("test_write_{}_{}", size_kb, i));
+                if std::fs::remove_file(&file_path).is_ok() {
+                    success_count += 1;
+                }
+            }
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+            all_operations.push(BenchmarkOperation {
+                operation: format!("DELETE_{}KB", size_kb),
+                count: success_count as u64,
+                duration_ms,
+                ops_per_sec,
+                avg_latency_ms: duration_ms / iterations as f64,
+                bandwidth_mbps: None,
             });
         }
 
-        let create_jitter = rand::random::<f64>() * 0.3 + 0.85;
+        let start = Instant::now();
+        let mut success_count = 0;
+        for i in 0..iterations {
+            let dir_path = base_path.join(format!("test_dir_{}", i));
+            if std::fs::create_dir(&dir_path).is_ok() {
+                success_count += 1;
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
         all_operations.push(BenchmarkOperation {
-            operation: "CREATE_SMALL".to_string(),
-            count: 1000,
-            duration_ms: 0.023 * 1000.0 * create_jitter,
-            ops_per_sec: 43000.0 * create_jitter,
-            avg_latency_ms: 0.023 * create_jitter,
+            operation: "CREATE_DIR".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
             bandwidth_mbps: None,
         });
 
-        let delete_jitter = rand::random::<f64>() * 0.3 + 0.85;
+        let start = Instant::now();
+        success_count = 0;
+        for i in 0..iterations {
+            let dir_path = base_path.join(format!("test_dir_{}", i));
+            if let Ok(entries) = std::fs::read_dir(&dir_path) {
+                let _: Vec<_> = entries.collect();
+                success_count += 1;
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
         all_operations.push(BenchmarkOperation {
-            operation: "DELETE_SMALL".to_string(),
-            count: 1000,
-            duration_ms: 0.009 * 1000.0 * delete_jitter,
-            ops_per_sec: 105000.0 * delete_jitter,
-            avg_latency_ms: 0.009 * delete_jitter,
+            operation: "LIST_DIR".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        success_count = 0;
+        for i in 0..iterations {
+            let dir_path = base_path.join(format!("test_dir_{}", i));
+            if std::fs::remove_dir(&dir_path).is_ok() {
+                success_count += 1;
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+        all_operations.push(BenchmarkOperation {
+            operation: "DELETE_DIR".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
             bandwidth_mbps: None,
         });
     }
@@ -1940,20 +2256,31 @@ async fn run_fs_benchmark(_state: Arc<AppState>, config: &BenchmarkConfig) -> Be
     let unique_ops: std::collections::HashSet<String> = op_names.into_iter().collect();
 
     for op_name in unique_ops {
-        let ops: Vec<&BenchmarkOperation> = all_operations.iter().filter(|o| o.operation == op_name).collect();
+        let ops: Vec<&BenchmarkOperation> = all_operations
+            .iter()
+            .filter(|o| o.operation == op_name)
+            .collect();
         if !ops.is_empty() {
             let avg_ops = ops.iter().map(|o| o.ops_per_sec).sum::<f64>() / ops.len() as f64;
             let avg_latency = ops.iter().map(|o| o.avg_latency_ms).sum::<f64>() / ops.len() as f64;
             let avg_bw = if ops[0].bandwidth_mbps.is_some() {
-                Some(ops.iter().map(|o| o.bandwidth_mbps.unwrap_or(0.0)).sum::<f64>() / ops.len() as f64)
+                Some(
+                    ops.iter()
+                        .map(|o| o.bandwidth_mbps.unwrap_or(0.0))
+                        .sum::<f64>()
+                        / ops.len() as f64,
+                )
             } else {
                 None
             };
-            summary.insert(op_name, BenchmarkSummary {
-                avg_ops_per_sec: Some(avg_ops),
-                avg_latency_ms: Some(avg_latency),
-                avg_bandwidth_mbps: avg_bw,
-            });
+            summary.insert(
+                op_name,
+                BenchmarkSummary {
+                    avg_ops_per_sec: Some(avg_ops),
+                    avg_latency_ms: Some(avg_latency),
+                    avg_bandwidth_mbps: avg_bw,
+                },
+            );
         }
     }
 
@@ -1963,6 +2290,184 @@ async fn run_fs_benchmark(_state: Arc<AppState>, config: &BenchmarkConfig) -> Be
         config: serde_json::json!({
             "rounds": rounds,
             "test_sizes": test_sizes.iter().map(|s| s / 1024).collect::<Vec<_>>(),
+            "iterations_per_round": iterations,
+        }),
+        operations: all_operations,
+        summary,
+    }
+}
+
+async fn run_s3_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) -> BenchmarkReport {
+    let rounds = config.rounds;
+    let iterations = std::cmp::min(config.iterations_per_round, 50);
+    let data_size = config.data_size_bytes.unwrap_or(1024);
+
+    let mut all_operations: Vec<BenchmarkOperation> = Vec::new();
+    let mut summary: std::collections::HashMap<String, BenchmarkSummary> =
+        std::collections::HashMap::new();
+
+    let bucket_name = format!("benchmark-s3-{}", chrono::Utc::now().timestamp());
+    let client = reqwest::Client::new();
+
+    let create_bucket_url = format!("{}/{}", state.s3_endpoint, bucket_name);
+    let _ = client
+        .put(&create_bucket_url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await;
+
+    let data = vec![0u8; data_size];
+
+    for _ in 0..rounds {
+        let start = Instant::now();
+        let mut success_count = 0;
+        for i in 0..iterations {
+            let key = format!("test_key_{}", i);
+            let url = format!("{}/{}/{}", state.s3_endpoint, bucket_name, key);
+            match client
+                .put(&url)
+                .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+                .body(data.clone())
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => success_count += 1,
+                Err(e) => warn!("S3 PUT failed: {}", e),
+                _ => {}
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+        all_operations.push(BenchmarkOperation {
+            operation: "PUT".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        let mut success_count = 0;
+        for i in 0..iterations {
+            let key = format!("test_key_{}", i);
+            let url = format!("{}/{}/{}", state.s3_endpoint, bucket_name, key);
+            match client
+                .get(&url)
+                .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    let _ = response.bytes().await;
+                    success_count += 1;
+                }
+                Err(e) => warn!("S3 GET failed: {}", e),
+                _ => {}
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+        all_operations.push(BenchmarkOperation {
+            operation: "GET".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        let url = format!("{}/{}", state.s3_endpoint, bucket_name);
+        let mut success_count = 0;
+        for _ in 0..std::cmp::min(iterations / 10, 5) {
+            match client
+                .get(&url)
+                .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => success_count += 1,
+                Err(e) => warn!("S3 LIST failed: {}", e),
+                _ => {}
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+        all_operations.push(BenchmarkOperation {
+            operation: "LIST".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+
+        let start = Instant::now();
+        let mut success_count = 0;
+        for i in 0..iterations {
+            let key = format!("test_key_{}", i);
+            let url = format!("{}/{}/{}", state.s3_endpoint, bucket_name, key);
+            match client
+                .delete(&url)
+                .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => success_count += 1,
+                Err(e) => warn!("S3 DELETE failed: {}", e),
+                _ => {}
+            }
+        }
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ops_per_sec = success_count as f64 / (duration_ms / 1000.0);
+
+        all_operations.push(BenchmarkOperation {
+            operation: "DELETE".to_string(),
+            count: success_count as u64,
+            duration_ms,
+            ops_per_sec,
+            avg_latency_ms: duration_ms / iterations as f64,
+            bandwidth_mbps: None,
+        });
+    }
+
+    let delete_bucket_url = format!("{}/{}", state.s3_endpoint, bucket_name);
+    let _ = client
+        .delete(&delete_bucket_url)
+        .headers(s3_auth_headers(&state.s3_access_key, &state.s3_secret_key))
+        .send()
+        .await;
+
+    for op_type in ["PUT", "GET", "LIST", "DELETE"] {
+        let ops: Vec<&BenchmarkOperation> = all_operations
+            .iter()
+            .filter(|o| o.operation == op_type)
+            .collect();
+        if !ops.is_empty() {
+            let avg_ops = ops.iter().map(|o| o.ops_per_sec).sum::<f64>() / ops.len() as f64;
+            let avg_latency = ops.iter().map(|o| o.avg_latency_ms).sum::<f64>() / ops.len() as f64;
+            summary.insert(
+                op_type.to_string(),
+                BenchmarkSummary {
+                    avg_ops_per_sec: Some(avg_ops),
+                    avg_latency_ms: Some(avg_latency),
+                    avg_bandwidth_mbps: None,
+                },
+            );
+        }
+    }
+
+    BenchmarkReport {
+        benchmark: "s3".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        config: serde_json::json!({
+            "rounds": rounds,
+            "iterations_per_round": iterations,
+            "data_size_bytes": data_size,
         }),
         operations: all_operations,
         summary,
@@ -1989,7 +2494,25 @@ async fn get_benchmark_report(
     if let Some(report) = report {
         Json(ApiResponse::success(report))
     } else {
-        Json(ApiResponse::error(&format!("No {} benchmark report found", r#type)))
+        Json(ApiResponse::error(&format!(
+            "No {} benchmark report found",
+            r#type
+        )))
+    }
+}
+
+async fn get_benchmark_report_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<BenchmarkResultRecord>> {
+    let results = get_stored_benchmark_results(state).await;
+    if let Some(record) = results.into_iter().find(|r| r.id == id) {
+        Json(ApiResponse::success(record))
+    } else {
+        Json(ApiResponse::error(&format!(
+            "No benchmark report found with id: {}",
+            id
+        )))
     }
 }
 
@@ -2009,12 +2532,21 @@ async fn run_benchmark_handler(
         },
         iterations_per_round: match r#type.as_str() {
             "kv" => 10000,
-            "metadata" => 500,
-            "fs" => 100,
+            "metadata" => 100,
+            "fs" => 20,
+            "s3" => 50,
             _ => 1000,
         },
-        data_size_bytes: if r#type == "kv" { Some(1024) } else { None },
-        test_sizes: if r#type == "fs" { Some(vec![65536, 262144, 1048576]) } else { None },
+        data_size_bytes: if r#type == "kv" || r#type == "s3" {
+            Some(1024)
+        } else {
+            None
+        },
+        test_sizes: if r#type == "fs" {
+            Some(vec![65536, 262144, 1048576])
+        } else {
+            None
+        },
     };
 
     info!("Starting {} benchmark with config: {:?}", r#type, config);
@@ -2024,6 +2556,7 @@ async fn run_benchmark_handler(
         "kv" => run_kv_benchmark(state.clone(), &config).await,
         "metadata" => run_metadata_benchmark(state.clone(), &config).await,
         "fs" => run_fs_benchmark(state.clone(), &config).await,
+        "s3" => run_s3_benchmark(state.clone(), &config).await,
         _ => {
             return Json(ApiResponse::error("Unknown benchmark type"));
         }
@@ -2045,10 +2578,14 @@ async fn run_benchmark_handler(
     Json(ApiResponse::success(record))
 }
 
-static BENCHMARK_RESULTS: std::sync::OnceLock<std::sync::Mutex<Vec<BenchmarkResultRecord>>> = std::sync::OnceLock::new();
+static BENCHMARK_RESULTS: std::sync::OnceLock<std::sync::Mutex<Vec<BenchmarkResultRecord>>> =
+    std::sync::OnceLock::new();
 
 fn get_benchmark_results_store() -> std::sync::MutexGuard<'static, Vec<BenchmarkResultRecord>> {
-    BENCHMARK_RESULTS.get_or_init(|| std::sync::Mutex::new(Vec::new())).lock().unwrap()
+    BENCHMARK_RESULTS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
 }
 
 async fn get_stored_benchmark_results(_state: Arc<AppState>) -> Vec<BenchmarkResultRecord> {
@@ -3051,10 +3588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         roles: roles.clone(),
         s3_keys: s3_keys.clone(),
         hmac_secret: args.hmac_secret.clone(),
-        rate_limiter: Arc::new(RateLimiter::new(Arc::new(
-            redis::Client::open(args.redis_url.clone())
-                .expect("Failed to create Redis client for rate limiter"),
-        ))),
+        rate_limiter: Arc::new(RateLimiter::new()),
         kv_client,
         master_client,
     });
@@ -3171,6 +3705,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/master/status", get(get_master_status))
         .route("/api/master/transfer-leader", post(transfer_leader))
         .route("/api/benchmarks", get(get_benchmark_results))
+        .route(
+            "/api/benchmarks/report/:id",
+            get(get_benchmark_report_by_id),
+        )
         .route("/api/benchmarks/:type", get(get_benchmark_report))
         .route("/api/benchmarks/:type/run", post(run_benchmark_handler))
         .route_layer(axum::middleware::from_fn_with_state(

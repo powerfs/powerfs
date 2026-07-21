@@ -328,7 +328,43 @@ for i in "${!VOLUME_NODES[@]}"; do
 done
 
 log_info ""
-log_info "[5/8] Starting S3 Backend..."
+log_info "[5/9] Starting Filer..."
+log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps filer"
+
+if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps filer; then
+    log_info "  [OK] Filer container started"
+else
+    log_error "  [FAIL] Failed to start Filer container"
+    exit 2
+fi
+
+log_info "  Waiting for Filer to be ready..."
+timeout=30
+attempt=0
+while [ $timeout -gt 0 ]; do
+    attempt=$((attempt + 1))
+    log_debug "  Attempt $attempt/$timeout: Checking port 8888..."
+    
+    if nc -z localhost 8888 >/dev/null 2>&1; then
+        log_info "  [OK] Filer ready on port 8888 after $attempt attempts"
+        break
+    fi
+    
+    if [ $((attempt % 10)) -eq 0 ]; then
+        log_warn "  [WARN] Filer not ready yet (attempt $attempt/$timeout)"
+    fi
+    
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+if [ $timeout -eq 0 ]; then
+    log_warn "  [WARN] Filer may not be ready"
+    log_warn "  Check: docker logs filer"
+fi
+
+log_info ""
+log_info "[6/9] Starting S3 Backend..."
 log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps s3"
 
 if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps s3; then
@@ -364,7 +400,7 @@ if [ $timeout -eq 0 ]; then
 fi
 
 log_info ""
-log_info "[6/8] Starting Monitor..."
+log_info "[7/9] Starting Monitor..."
 log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps monitor"
 
 if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps monitor; then
@@ -400,7 +436,7 @@ if [ $timeout -eq 0 ]; then
 fi
 
 log_info ""
-log_info "[7/8] Starting Frontend..."
+log_info "[8/9] Starting Frontend..."
 log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps frontend"
 
 if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps frontend; then
@@ -436,7 +472,7 @@ if [ $timeout -eq 0 ]; then
 fi
 
 log_info ""
-log_info "[8/8] Starting FUSE Clients..."
+log_info "[9/9] Starting FUSE Clients..."
 log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps fuse-1 fuse-2"
 
 if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps fuse-1 fuse-2; then
@@ -526,6 +562,7 @@ ALL_SERVICES=(
     "Volume 1|8080|volume-1"
     "Volume 2|8081|volume-2"
     "Volume 3|8082|volume-3"
+    "Filer|8888|filer"
     "S3 Backend|9000|s3"
     "Monitor API|8083|monitor"
     "Frontend|8084|frontend"
@@ -568,6 +605,7 @@ log_info "  Master 3:        $HOST_IP:9335"
 log_info "  Volume 1:        $HOST_IP:8080"
 log_info "  Volume 2:        $HOST_IP:8081"
 log_info "  Volume 3:        $HOST_IP:8082"
+log_info "  Filer:           $HOST_IP:8888"
 log_info "  S3 Backend:      $HOST_IP:9000"
 log_info "  Monitor API:     $HOST_IP:8083"
 log_info "  Monitor UI:      http://$HOST_IP:8084"

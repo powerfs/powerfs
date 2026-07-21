@@ -36,6 +36,8 @@ import {
   DesktopOutlined,
   AppstoreOutlined,
   RocketOutlined,
+  CloudServerOutlined,
+  ClusterOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -117,6 +119,8 @@ function AppLayout() {
           type: 'group' as const,
           label: '元数据',
           children: [
+            { key: '/filer', icon: <CloudServerOutlined />, label: 'Filer 管理' },
+            { key: '/shards', icon: <ClusterOutlined />, label: '分片管理' },
             { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
           ],
         }]

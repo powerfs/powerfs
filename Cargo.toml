@@ -12,6 +12,7 @@ members = [
     "powerfs-kernel",
     "powerfs-monitor",
     "powerfs-orset",
+    "powerfs-filer",
     "rfs_tester",
 ]
 resolver = "2"

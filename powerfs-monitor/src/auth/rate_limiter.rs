@@ -1,77 +1,151 @@
-use redis::{AsyncCommands, Client};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const IP_LIMIT: i64 = 10;
 const USER_LIMIT: i64 = 5;
 const LOCKOUT_ATTEMPTS: i64 = 5;
 const LOCKOUT_DURATION_SECONDS: u64 = 900;
-const WINDOW_SECONDS: i64 = 60;
+const WINDOW_SECONDS: u64 = 60;
+
+struct RateEntry {
+    count: i64,
+    created_at: u64,
+}
+
+struct LockEntry {
+    locked_until: u64,
+}
 
 pub struct RateLimiter {
-    client: Arc<Client>,
+    ip_entries: Arc<RwLock<HashMap<String, RateEntry>>>,
+    user_entries: Arc<RwLock<HashMap<String, RateEntry>>>,
+    lock_entries: Arc<RwLock<HashMap<String, LockEntry>>>,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RateLimiter {
-    pub fn new(client: Arc<Client>) -> Self {
-        Self { client }
+    pub fn new() -> Self {
+        Self {
+            ip_entries: Arc::new(RwLock::new(HashMap::new())),
+            user_entries: Arc::new(RwLock::new(HashMap::new())),
+            lock_entries: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     pub async fn check_login(&self, ip: &str, username: &str) -> Result<bool, String> {
-        let mut conn = match self.client.get_async_connection().await {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("Redis connection failed for rate limiter: {}", e);
-                return Ok(true);
+        let now = Self::now();
+
+        let mut locks = self
+            .lock_entries
+            .write()
+            .map_err(|e| format!("Failed to acquire lock entry lock: {}", e))?;
+        if let Some(lock) = locks.get(username) {
+            if lock.locked_until > now {
+                return Ok(false);
+            } else {
+                locks.remove(username);
+            }
+        }
+        drop(locks);
+
+        let mut ip_entries = self
+            .ip_entries
+            .write()
+            .map_err(|e| format!("Failed to acquire IP entry lock: {}", e))?;
+        let ip_count = match ip_entries.get_mut(ip) {
+            Some(entry) => {
+                if now - entry.created_at > WINDOW_SECONDS {
+                    entry.count = 1;
+                    entry.created_at = now;
+                    1
+                } else {
+                    entry.count += 1;
+                    entry.count
+                }
+            }
+            None => {
+                ip_entries.insert(
+                    ip.to_string(),
+                    RateEntry {
+                        count: 1,
+                        created_at: now,
+                    },
+                );
+                1
             }
         };
+        drop(ip_entries);
 
-        let ip_key = format!("login:ip:{}", ip);
-        let user_key = format!("login:user:{}", username);
-        let lock_key = format!("login:lock:{}", username);
-
-        if let Ok(lock) = conn.get::<_, Option<String>>(&lock_key).await {
-            if lock.is_some() {
-                return Ok(false);
+        let mut user_entries = self
+            .user_entries
+            .write()
+            .map_err(|e| format!("Failed to acquire user entry lock: {}", e))?;
+        let user_count = match user_entries.get_mut(username) {
+            Some(entry) => {
+                if now - entry.created_at > WINDOW_SECONDS {
+                    entry.count = 1;
+                    entry.created_at = now;
+                    1
+                } else {
+                    entry.count += 1;
+                    entry.count
+                }
             }
-        }
-
-        let ip_count: i64 = conn
-            .incr(&ip_key, 1)
-            .await
-            .map_err(|e| format!("Redis incr error: {}", e))?;
-        let user_count: i64 = conn
-            .incr(&user_key, 1)
-            .await
-            .map_err(|e| format!("Redis incr error: {}", e))?;
-
-        if ip_count == 1 {
-            let _: redis::RedisResult<()> = conn.expire(&ip_key, WINDOW_SECONDS).await;
-        }
-        if user_count == 1 {
-            let _: redis::RedisResult<()> = conn.expire(&user_key, WINDOW_SECONDS).await;
-        }
+            None => {
+                user_entries.insert(
+                    username.to_string(),
+                    RateEntry {
+                        count: 1,
+                        created_at: now,
+                    },
+                );
+                1
+            }
+        };
+        drop(user_entries);
 
         if user_count >= LOCKOUT_ATTEMPTS {
-            let _: redis::RedisResult<()> =
-                conn.set_ex(&lock_key, "1", LOCKOUT_DURATION_SECONDS).await;
-            return Ok(false);
+            let mut locks = self
+                .lock_entries
+                .write()
+                .map_err(|e| format!("Failed to acquire lock entry lock: {}", e))?;
+            locks.insert(
+                username.to_string(),
+                LockEntry {
+                    locked_until: now + LOCKOUT_DURATION_SECONDS,
+                },
+            );
         }
 
         Ok(ip_count <= IP_LIMIT && user_count <= USER_LIMIT)
     }
 
     pub async fn reset_login(&self, username: &str) -> Result<(), String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| {
-            log::warn!("Redis connection failed for rate limiter: {}", e);
-            "Rate limit reset failed".to_string()
-        })?;
+        let mut user_entries = self
+            .user_entries
+            .write()
+            .map_err(|e| format!("Failed to acquire user entry lock: {}", e))?;
+        user_entries.remove(username);
+        drop(user_entries);
 
-        let user_key = format!("login:user:{}", username);
-        let lock_key = format!("login:lock:{}", username);
-
-        let _: redis::RedisResult<()> = conn.del(&user_key).await;
-        let _: redis::RedisResult<()> = conn.del(&lock_key).await;
-
+        let mut lock_entries = self
+            .lock_entries
+            .write()
+            .map_err(|e| format!("Failed to acquire lock entry lock: {}", e))?;
+        lock_entries.remove(username);
         Ok(())
     }
 }

@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package powerfs;
+
+service FilerMetaService {
+    rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
+    rpc GetEntryByInode(GetEntryByInodeRequest) returns (GetEntryByInodeResponse);
+    rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
+    rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse);
+    rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
+    rpc RenameEntry(RenameEntryRequest) returns (RenameEntryResponse);
+    rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+    rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
+    
+    rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
+    rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+}
+
+message GetEntryRequest {
+    string path = 1;
+}
+
+message GetEntryResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+}
+
+message GetEntryByInodeRequest {
+    uint64 inode = 1;
+}
+
+message GetEntryByInodeResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string path = 3;
+    string error = 4;
+}
+
+message CreateEntryRequest {
+    Entry entry = 1;
+    string client_id = 2;
+}
+
+message CreateEntryResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 inode = 3;
+}
+
+message UpdateEntryRequest {
+    Entry entry = 1;
+    string client_id = 2;
+    uint64 expected_size = 3;
+    bool is_truncate = 4;
+}
+
+message UpdateEntryResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 actual_size = 3;
+}
+
+message DeleteEntryRequest {
+    uint64 ino = 1;
+    bool is_directory = 2;
+    string client_id = 3;
+}
+
+message DeleteEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RenameEntryRequest {
+    uint64 old_parent_ino = 1;
+    string old_name = 2;
+    uint64 new_parent_ino = 3;
+    string new_name = 4;
+    string client_id = 5;
+}
+
+message RenameEntryResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListEntriesRequest {
+    uint64 parent_ino = 1;
+    uint64 limit = 2;
+    string last_name = 3;
+}
+
+message ListEntriesResponse {
+    repeated Entry entries = 1;
+    bool has_more = 2;
+    string error = 3;
+}
+
+message LookupDirectoryEntryRequest {
+    uint64 parent_ino = 1;
+    string name = 2;
+}
+
+message LookupDirectoryEntryResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+}
+
+message GetShardStatsRequest {
+    uint64 shard_id = 1;
+}
+
+message GetShardStatsResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 shard_id = 3;
+    uint64 inode_count = 4;
+    uint64 file_count = 5;
+    uint64 dir_count = 6;
+}
+
+message ListShardsRequest {}
+
+message ListShardsResponse {
+    repeated uint64 shard_ids = 1;
+    string error = 2;
+}
+
+message FileChunk {
+    uint64 offset = 1;
+    uint64 size = 2;
+    uint64 mtime = 3;
+    string fid = 4;
+    uint32 cookie = 5;
+    uint32 crc32 = 6;
+}
+
+message FuseAttributes {
+    uint64 ino = 1;
+    uint32 mode = 2;
+    uint32 nlink = 3;
+    uint32 uid = 4;
+    uint32 gid = 5;
+    uint64 rdev = 6;
+    uint64 size = 7;
+    uint64 blksize = 8;
+    uint64 blocks = 9;
+    uint64 atime = 10;
+    uint64 mtime = 11;
+    uint64 ctime = 12;
+    uint64 crtime = 13;
+    uint32 perm = 14;
+}
+
+message Entry {
+    string name = 1;
+    string directory = 2;
+    FuseAttributes attributes = 3;
+    repeated FileChunk chunks = 4;
+    string hard_link_id = 5;
+    uint32 hard_link_counter = 6;
+    map<string, bytes> extended = 7;
+    uint64 content_size = 8;
+    uint64 disk_size = 9;
+    string ttl = 10;
+    string symlink_target = 11;
+    string owner = 12;
+    uint64 generation = 13;
+}

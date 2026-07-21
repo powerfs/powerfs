@@ -7,7 +7,8 @@ use log::{debug, error, info, warn};
 use powerfs_common::{
     collect_system_metrics,
     error::{PowerFsError, Result},
-    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
+    event::{Event, NodeStatusEvent, NullEventProvider, VolumeStatusEvent},
+    traits::EventProvider,
     types::{NeedleId, NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
@@ -20,7 +21,7 @@ use tonic::{transport::Server, Request, Response, Status};
 pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
     node_id: NodeId,
-    event_publisher: Option<EventPublisher>,
+    event_provider: Arc<dyn EventProvider>,
     ip: String,
     grpc_port: u32,
     http_port: u32,
@@ -36,21 +37,26 @@ impl VolumeServer {
         http_port: u32,
         data_dir: &str,
     ) -> Self {
-        let event_publisher = match std::env::var("REDIS_URL") {
+        let event_provider: Arc<dyn EventProvider> = match std::env::var("REDIS_URL") {
+            #[cfg(feature = "redis-event")]
             Ok(url) => {
-                info!("Event publisher enabled with Redis: {}", url);
-                Some(EventPublisher::new(&url, "powerfs_events", "volume"))
+                info!("Event provider enabled with Redis: {}", url);
+                Arc::new(powerfs_common::event::RedisEventProvider::new(
+                    &url,
+                    "powerfs_events",
+                    "volume",
+                ))
             }
-            Err(_) => {
-                warn!("REDIS_URL not set, event publishing disabled");
-                None
+            _ => {
+                warn!("REDIS_URL not set, using null event provider");
+                Arc::new(NullEventProvider)
             }
         };
 
         VolumeServer {
             storage_manager,
             node_id,
-            event_publisher,
+            event_provider,
             ip: ip.to_string(),
             grpc_port,
             http_port,
@@ -126,11 +132,7 @@ impl VolumeServer {
     }
 
     async fn start_node_status_publisher(&mut self) {
-        if self.event_publisher.is_none() {
-            return;
-        }
-
-        let publisher = self.event_publisher.clone().unwrap();
+        let provider = self.event_provider.clone();
         let node_id_str = self.node_id.0.clone();
         let ip = self.ip.clone();
         let grpc_port = self.grpc_port;
@@ -169,7 +171,7 @@ impl VolumeServer {
                     raft_term: 0,
                 });
 
-                if let Err(e) = publisher.publish(event, &node_id_str).await {
+                if let Err(e) = provider.publish(event, &node_id_str).await {
                     warn!("Failed to publish node_status event: {}", e);
                 }
 
@@ -192,7 +194,7 @@ impl VolumeServer {
                         collection: volume.collection.0.clone(),
                     });
 
-                    if let Err(e) = publisher
+                    if let Err(e) = provider
                         .publish(volume_event, &format!("{}", volume.id.0))
                         .await
                     {
@@ -228,26 +230,25 @@ impl VolumeService for VolumeServer {
             Ok(info) => {
                 debug!("Created volume {} in {:?}", info.id, start.elapsed());
 
-                if let Some(publisher) = self.event_publisher.clone() {
-                    let vid_clone = info.id.0;
-                    let nid_str = self.node_id.0.clone();
-                    let size = info.size;
-                    let used = info.used;
-                    tokio::spawn(async move {
-                        let event = Event::VolumeStatus(VolumeStatusEvent {
-                            volume_id: vid_clone,
-                            node_id: nid_str,
-                            size,
-                            used,
-                            file_count: 0,
-                            status: "available".to_string(),
-                            collection: "default".to_string(),
-                        });
-                        if let Err(e) = publisher.publish(event, &format!("{}", vid_clone)).await {
-                            warn!("Failed to publish volume_status event: {}", e);
-                        }
+                let provider = self.event_provider.clone();
+                let vid_clone = info.id.0;
+                let nid_str = self.node_id.0.clone();
+                let size = info.size;
+                let used = info.used;
+                tokio::spawn(async move {
+                    let event = Event::VolumeStatus(VolumeStatusEvent {
+                        volume_id: vid_clone,
+                        node_id: nid_str,
+                        size,
+                        used,
+                        file_count: 0,
+                        status: "available".to_string(),
+                        collection: "default".to_string(),
                     });
-                }
+                    if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
+                        warn!("Failed to publish volume_status event: {}", e);
+                    }
+                });
 
                 Ok(Response::new(crate::proto::CreateVolumeResponse {
                     success: true,

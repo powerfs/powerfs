@@ -2,6 +2,7 @@ use crate::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, LookupVolumeRequest,
 };
 use chrono::Utc;
+use log::info;
 use powerfs_common::{
     error::{PowerFsError, Result},
     types::{
@@ -14,14 +15,14 @@ use tonic::transport::Channel;
 
 #[derive(Clone)]
 pub struct S3MasterClient {
-    master_address: String,
+    master_address: Arc<tokio::sync::Mutex<String>>,
     channel: Arc<tokio::sync::Mutex<Option<Channel>>>,
 }
 
 impl S3MasterClient {
     pub fn new(master_address: &str) -> Self {
         Self {
-            master_address: master_address.to_string(),
+            master_address: Arc::new(tokio::sync::Mutex::new(master_address.to_string())),
             channel: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -31,7 +32,7 @@ impl S3MasterClient {
         let channel = if let Some(ch) = &*channel_guard {
             ch.clone()
         } else {
-            let addr = format!("http://{}", self.master_address);
+            let addr = format!("http://{}", self.master_address.lock().await);
             let ch = Channel::from_shared(addr)
                 .map_err(|e| PowerFsError::Internal(format!("Invalid address: {}", e)))?
                 .connect()
@@ -50,7 +51,6 @@ impl S3MasterClient {
         replication: &str,
         collection: &str,
     ) -> Result<(Fid, Vec<DataNodeInfo>)> {
-        let mut client = self.get_client().await?;
         let request = AssignRequest {
             count: 1,
             replication: replication.to_string(),
@@ -63,14 +63,12 @@ impl S3MasterClient {
             stripe_count: 0,
             stripe_size: 0,
         };
-        let response = client
-            .assign(tonic::Request::new(request))
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("Assign failed: {}", e)))?;
-        let response = response.into_inner();
-        if !response.error.is_empty() {
-            return Err(PowerFsError::Internal(response.error));
-        }
+
+        let response = match self.try_assign_with_retry(request).await {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
         let fid = Fid::from_string(&response.fid)
             .map_err(|e| PowerFsError::Internal(format!("Invalid fid format: {}", e)))?;
         let nodes: Vec<DataNodeInfo> = response
@@ -107,6 +105,72 @@ impl S3MasterClient {
             })
             .collect();
         Ok((fid, nodes))
+    }
+
+    async fn try_assign_with_retry(
+        &self,
+        request: AssignRequest,
+    ) -> Result<crate::proto::powerfs::AssignResponse> {
+        let mut client = self.get_client().await?;
+        let response = client.assign(tonic::Request::new(request.clone())).await;
+
+        match response {
+            Ok(r) => {
+                let inner = r.into_inner();
+                if inner.error.contains("not leader") {
+                    if let Some(leader_addr) = extract_leader_addr(&inner.error) {
+                        info!("Detected leader change, switching to: {}", leader_addr);
+                        self.update_master_address(&leader_addr).await;
+                        let mut client = self.get_client().await?;
+                        let response = client
+                            .assign(tonic::Request::new(request))
+                            .await
+                            .map_err(|e| PowerFsError::Internal(format!("Assign failed: {}", e)))?;
+                        let inner = response.into_inner();
+                        if !inner.error.is_empty() {
+                            return Err(PowerFsError::Internal(inner.error));
+                        }
+                        Ok(inner)
+                    } else {
+                        Err(PowerFsError::Internal(inner.error))
+                    }
+                } else if !inner.error.is_empty() {
+                    Err(PowerFsError::Internal(inner.error))
+                } else {
+                    Ok(inner)
+                }
+            }
+            Err(e) => {
+                let error_str = format!("{}", e);
+                if error_str.contains("not leader") {
+                    if let Some(leader_addr) = extract_leader_addr(&error_str) {
+                        info!("Detected leader change, switching to: {}", leader_addr);
+                        self.update_master_address(&leader_addr).await;
+                        let mut client = self.get_client().await?;
+                        let response = client
+                            .assign(tonic::Request::new(request))
+                            .await
+                            .map_err(|e| PowerFsError::Internal(format!("Assign failed: {}", e)))?;
+                        let inner = response.into_inner();
+                        if !inner.error.is_empty() {
+                            return Err(PowerFsError::Internal(inner.error));
+                        }
+                        Ok(inner)
+                    } else {
+                        Err(PowerFsError::Internal(format!("Assign failed: {}", e)))
+                    }
+                } else {
+                    Err(PowerFsError::Internal(format!("Assign failed: {}", e)))
+                }
+            }
+        }
+    }
+
+    async fn update_master_address(&self, new_addr: &str) {
+        let addr = new_addr.strip_prefix("http://").unwrap_or(new_addr);
+        let addr = addr.strip_prefix("https://").unwrap_or(addr);
+        *self.channel.lock().await = None;
+        *self.master_address.lock().await = addr.to_string();
     }
 
     pub async fn get_volume_info(&self, volume_id: &VolumeId) -> Option<VolumeInfo> {
@@ -182,4 +246,36 @@ impl S3MasterClient {
             state_since: 0,
         })
     }
+}
+
+fn extract_leader_addr(error_msg: &str) -> Option<String> {
+    let patterns = [
+        "current leader is ",
+        "leader is ",
+        "leader: ",
+        "redirect to ",
+    ];
+    for pattern in patterns {
+        if let Some(start) = error_msg.find(pattern) {
+            let start = start + pattern.len();
+            let end = error_msg[start..]
+                .find(|c| [',', '\n', ')'].contains(&c))
+                .map(|e| start + e)
+                .unwrap_or(error_msg.len());
+            // Strip surrounding quotes (tonic wraps the message in quotes) and
+            // trim whitespace. An empty/quoted-only value means the leader is
+            // unknown — return None so the caller does not switch to a bogus address.
+            let addr = error_msg[start..end]
+                .trim()
+                .trim_matches('"')
+                .trim()
+                .to_string();
+            // Validate that the address looks like host:port (contains ':' and
+            // no spaces) before accepting it.
+            if !addr.is_empty() && addr.contains(':') && !addr.contains(' ') {
+                return Some(addr);
+            }
+        }
+    }
+    None
 }

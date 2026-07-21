@@ -7,6 +7,10 @@ edition = "2021"
 name = "powerfs-monitor"
 path = "src/main.rs"
 
+[features]
+default = ["redis"]
+redis = ["dep:redis", "powerfs-common/redis-event"]
+
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
@@ -20,7 +24,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 axum = { version = "0.6", features = ["ws", "json", "multipart"] }
-redis = { version = "0.24", features = ["tokio-comp"] }
+redis = { version = "0.24", features = ["tokio-comp"], optional = true }
 tower-http = { version = "0.4", features = ["cors"] }
 futures = { workspace = true }
 futures-util = { version = "0.3" }
@@ -38,6 +42,4 @@ base64 = "0.21"
 rocksdb = { workspace = true }
 tower = { version = "0.4", features = ["util"] }
 tonic = { version = "0.11" }
-
-[dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,43 @@
+[package]
+name = "powerfs-filer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "powerfs-filer"
+path = "src/main.rs"
+
+[features]
+default = []
+redis-event = ["dep:redis", "powerfs-common/redis-event"]
+
+[dependencies]
+axum = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+rand = "0.8"
+redis = { version = "0.23", features = ["tokio-comp"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+powerfs-common = { path = "../powerfs-common" }
+powerfs-master = { path = "../powerfs-master" }
+hex = "0.4"
+sha2 = "0.10"
+raft = { workspace = true }
+protobuf = "2"
+rocksdb = { workspace = true }
+slog = "2.7"
+bytes = "1.0"
+tonic = { workspace = true }
+prost = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

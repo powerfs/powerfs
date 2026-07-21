@@ -3,6 +3,12 @@ name = "powerfs-common"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+
+redis-event = ["dep:redis"]
+redis-metrics = ["dep:redis"]
+
 [dependencies]
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -19,10 +25,12 @@ rocksdb = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 toml = "0.8"
-redis = { version = "0.24", features = ["tokio-comp"] }
+redis = { version = "0.24", features = ["tokio-comp"], optional = true }
 sysinfo = "0.30"
 crc32c = "0.6"
+async-trait = "0.1"
 crc64fast = "1.1"
+protobuf = "2"
 
 [dev-dependencies]
 tempfile = "3.10"

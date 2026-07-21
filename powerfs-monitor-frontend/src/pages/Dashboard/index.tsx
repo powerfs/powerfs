@@ -8,11 +8,12 @@ import {
   CloudServerOutlined,
   ThunderboltOutlined,
   WarningOutlined,
+  FolderOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import type { EChartsOption } from 'echarts'
-import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData } from '@/types'
-import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes } from '@/services/api'
+import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData, FilerStatus } from '@/types'
+import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes, getFilerStatus } from '@/services/api'
 import { connectWebSocket, disconnectWebSocket, type MetricUpdate } from '@/services/websocket'
 import { formatBytes, formatPercent, formatUptime, formatNumber } from '@/utils/format'
 import { KpiBar, MetricChart, EmptyState, RefreshControl, RealtimeChart, StatusTag } from '@/components/pro'
@@ -23,6 +24,7 @@ function Dashboard() {
   const navigate = useNavigate()
   const [clusterMetrics, setClusterMetrics] = useState<ClusterMetrics | null>(null)
   const [kvMetrics, setKVMetrics] = useState<KVMetrics | null>(null)
+  const [filerStatus, setFilerStatus] = useState<FilerStatus | null>(null)
   const [alerts, setAlerts] = useState<AlertInfo[]>([])
   const [storageTrend, setStorageTrend] = useState<TimeSeriesData[]>([])
   const [cpuTrend, setCpuTrend] = useState<TimeSeriesData[]>([])
@@ -31,13 +33,15 @@ function Dashboard() {
   const loadData = useCallback(async () => {
     setLoading(true)
     try {
-      const [cluster, kv, alertList] = await Promise.all([
+      const [cluster, kv, alertList, filer] = await Promise.all([
         getClusterMetrics(),
         getKVMetrics(),
         getAlerts(),
+        getFilerStatus(),
       ])
       setClusterMetrics(cluster)
       setKVMetrics(kv)
+      setFilerStatus(filer)
       setAlerts(alertList)
     } catch (e) {
       console.error('Failed to load dashboard data:', e)
@@ -164,6 +168,35 @@ function Dashboard() {
       footer: (
         <Text type="secondary" style={{ fontSize: 12 }}>
           {formatBytes(clusterMetrics?.used_storage || 0)} / {formatBytes(clusterMetrics?.total_storage || 0)}
+        </Text>
+      ),
+    },
+    {
+      title: 'Filer 分片',
+      value: filerStatus?.shard_count || 0,
+      suffix: '个',
+      status: (filerStatus?.leader_count || 0) === (filerStatus?.shard_count || 0) ? 'active' : 'draining',
+      icon: <DatabaseOutlined />,
+      onClick: () => navigate('/shards'),
+      loading,
+      footer: (
+        <Space size={4} style={{ fontSize: 12 }}>
+          <CheckCircleOutlined style={{ color: 'var(--pf-color-success)' }} />
+          <Text type="secondary">{filerStatus?.leader_count || 0} 个 Leader</Text>
+        </Space>
+      ),
+    },
+    {
+      title: 'Filer Inode',
+      value: filerStatus?.total_inodes || 0,
+      suffix: '',
+      status: 'active',
+      icon: <FolderOutlined />,
+      onClick: () => navigate('/filer'),
+      loading,
+      footer: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {filerStatus?.total_files || 0} 文件 / {filerStatus?.total_dirs || 0} 目录
         </Text>
       ),
     },
@@ -383,6 +416,68 @@ function Dashboard() {
                 <Text strong className="tabular-nums">
                   {formatNumber((kvMetrics?.put_count || 0) + (kvMetrics?.get_count || 0))} 次
                 </Text>
+              </div>
+            </Space>
+          </Card>
+        </Col>
+        <Col xs={24} lg={12}>
+          <Card
+            title={<Space><DatabaseOutlined />Filer 状态</Space>}
+            extra={<Button type="link" onClick={() => navigate('/filer')}>查看全部</Button>}
+            style={{ borderRadius: 12 }}
+            styles={{ body: { padding: 20 } }}
+          >
+            <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">分片数量</Text>
+                <Text strong className="tabular-nums">{filerStatus?.shard_count || 0} 个</Text>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">Leader 状态</Text>
+                {(filerStatus?.leader_count || 0) === (filerStatus?.shard_count || 0) ? (
+                  <StatusTag kind="node" status="active" label="全部正常" pulse />
+                ) : (
+                  <StatusTag kind="node" status="draining" label={`${filerStatus?.leader_count || 0}/${filerStatus?.shard_count || 0}`} />
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">Inode 总数</Text>
+                <Text strong className="tabular-nums">{formatNumber(filerStatus?.total_inodes || 0)}</Text>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Text type="secondary">文件数</Text>
+                <Text strong className="tabular-nums">{formatNumber(filerStatus?.total_files || 0)}</Text>
+              </div>
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <Text type="secondary">Bucket 列表</Text>
+                  <Text strong>{filerStatus?.buckets.length || 0} 个</Text>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {filerStatus?.buckets.length ? (
+                    filerStatus.buckets.slice(0, 5).map((bucket) => (
+                      <span
+                        key={bucket}
+                        style={{
+                          padding: '4px 12px',
+                          background: 'rgba(22, 119, 255, 0.1)',
+                          color: '#1677ff',
+                          borderRadius: 4,
+                          fontSize: 12,
+                        }}
+                      >
+                        {bucket}
+                      </span>
+                    ))
+                  ) : (
+                    <Text type="secondary" style={{ fontSize: 12 }}>暂无 Bucket</Text>
+                  )}
+                  {filerStatus?.buckets.length && filerStatus.buckets.length > 5 && (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      +{filerStatus.buckets.length - 5} 更多
+                    </Text>
+                  )}
+                </div>
               </div>
             </Space>
           </Card>

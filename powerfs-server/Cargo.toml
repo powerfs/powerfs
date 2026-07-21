@@ -8,17 +8,27 @@ name = "powerfs"
 path = "src/main.rs"
 
 [features]
-# 启用真实 SPDK backend (需要 SPDK 环境和 libpowerfs-spdk-wrapper.so)
+default = ["fuse", "kv", "s3", "monitor"]
+
+fuse = ["powerfs-fuse"]
+kv = ["powerfs-master/kv"]
+s3 = ["powerfs-filer"]
+monitor = []
+
 spdk = ["powerfs-core/spdk"]
-# 启用 SPDK stub backend (无 SPDK 环境时测试用,空实现)
 spdk-stub = ["powerfs-core/spdk-stub"]
+
+redis-event = ["powerfs-common/redis-event", "powerfs-monitor/redis", "powerfs-filer/redis-event"]
+redis-metrics = ["powerfs-common/redis-metrics"]
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-volume = { path = "../powerfs-volume" }
-powerfs-fuse = { path = "../powerfs-fuse" }
+powerfs-fuse = { path = "../powerfs-fuse", optional = true }
+powerfs-filer = { path = "../powerfs-filer", optional = true }
+powerfs-monitor = { path = "../powerfs-monitor", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -28,3 +38,4 @@ clap = { version = "4.4", features = ["derive"] }
 bytes = { workspace = true }
 chrono = { workspace = true }
 tikv-jemallocator = "0.5"
+redis = { version = "0.23", features = ["tokio-comp"], optional = true }

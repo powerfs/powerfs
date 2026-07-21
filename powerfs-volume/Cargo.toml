@@ -10,6 +10,9 @@ path = "src/main.rs"
 [build-dependencies]
 tonic-build = { version = "0.11" }
 
+[features]
+redis-event = ["powerfs-common/redis-event"]
+
 [dependencies]
 chrono = { workspace = true }
 powerfs-common = { path = "../powerfs-common" }

@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -764,7 +764,7 @@ export async function getBenchmarkReport(type: string): Promise<BenchmarkReport>
   return response.data.data
 }
 
-export async function runBenchmark(type: 'kv' | 'metadata' | 'fs'): Promise<BenchmarkResult> {
+export async function runBenchmark(type: 'kv' | 'metadata' | 'fs' | 's3'): Promise<BenchmarkResult> {
   if (useMock) {
     return {
       id: `${type}-${Date.now()}`,
@@ -777,4 +777,54 @@ export async function runBenchmark(type: 'kv' | 'metadata' | 'fs'): Promise<Benc
   }
   const response = await api.post(`/benchmarks/${type}/run`)
   return response.data.data
+}
+
+export async function getBenchmarkReportById(id: string): Promise<BenchmarkResult> {
+  if (useMock) {
+    const results = await getBenchmarkResults()
+    return results.find(r => r.id === id) || results[0]
+  }
+  const response = await api.get(`/benchmarks/report/${id}`)
+  return response.data.data
+}
+
+// ===== Filer & Shard management =====
+// Note: Filer admin APIs are proxied via nginx (/api/filer/* -> filer:8888/admin/*)
+// and return data directly (no { data: ... } wrapper), so we access response.data directly.
+
+export async function getFilerStatus(): Promise<FilerStatus> {
+  if (useMock) {
+    return {
+      shard_count: 4,
+      leader_count: 4,
+      total_inodes: 128,
+      total_files: 96,
+      total_dirs: 32,
+      buckets: ['test-bucket', 'prod-data'],
+    }
+  }
+  const response = await api.get('/filer/status')
+  return response.data
+}
+
+export async function getShards(): Promise<ShardDetail[]> {
+  if (useMock) {
+    return [
+      { shard_id: 0, inode_range_start: 0, inode_range_end: 1000000, is_leader: true, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, file_count: 24, dir_count: 8, write_qps: 120, read_qps: 480 },
+      { shard_id: 1, inode_range_start: 1000000, inode_range_end: 2000000, is_leader: true, term: 2, commit_index: 12, applied_index: 12, inode_count: 48, file_count: 36, dir_count: 12, write_qps: 90, read_qps: 360 },
+      { shard_id: 2, inode_range_start: 2000000, inode_range_end: 3000000, is_leader: true, term: 2, commit_index: 8, applied_index: 8, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 60, read_qps: 240 },
+      { shard_id: 3, inode_range_start: 3000000, inode_range_end: 18446744073709551615, is_leader: true, term: 2, commit_index: 5, applied_index: 5, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 30, read_qps: 120 },
+    ]
+  }
+  const response = await api.get('/filer/shards')
+  return response.data
+}
+
+export async function getShardDetail(id: number): Promise<ShardDetail> {
+  if (useMock) {
+    const shards = await getShards()
+    return shards.find(s => s.shard_id === id) || shards[0]
+  }
+  const response = await api.get(`/filer/shards/${id}`)
+  return response.data
 }

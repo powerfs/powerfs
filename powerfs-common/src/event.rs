@@ -1,7 +1,16 @@
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use redis::{AsyncCommands, Client, RedisResult};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use crate::traits::{EventProvider, EventStream};
+
+#[cfg(feature = "redis-event")]
+use redis::streams::StreamRangeReply;
+#[cfg(feature = "redis-event")]
+use redis::{AsyncCommands, Client, RedisResult, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event_type")]
@@ -121,6 +130,7 @@ pub struct AlertTriggerEvent {
     pub source: String,
 }
 
+#[cfg(feature = "redis-event")]
 #[derive(Clone)]
 pub struct EventPublisher {
     client: redis::Client,
@@ -128,6 +138,7 @@ pub struct EventPublisher {
     source: String,
 }
 
+#[cfg(feature = "redis-event")]
 impl EventPublisher {
     pub fn new(redis_url: &str, stream_key: &str, source: &str) -> Self {
         let client = Client::open(redis_url).expect("Failed to create Redis client");
@@ -154,5 +165,204 @@ impl EventPublisher {
         ];
         let _: () = conn.xadd(&self.stream_key, "*", &payload).await?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "redis-event")]
+pub struct RedisEventProvider {
+    client: Arc<Client>,
+    stream_key: String,
+    source: String,
+}
+
+#[cfg(feature = "redis-event")]
+impl RedisEventProvider {
+    pub fn new(redis_url: &str, stream_key: &str, source: &str) -> Self {
+        let client = Client::open(redis_url).expect("Failed to create Redis client");
+        Self {
+            client: Arc::new(client),
+            stream_key: stream_key.to_string(),
+            source: source.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "redis-event")]
+#[async_trait]
+impl EventProvider for RedisEventProvider {
+    async fn publish(&self, event: Event, source_id: &str) -> crate::error::Result<()> {
+        let envelope = EventEnvelope::new(event, &self.source, source_id);
+        let mut conn = self.client.get_async_connection().await.map_err(|e| {
+            crate::error::PowerFsError::Internal(format!("redis connection error: {}", e))
+        })?;
+        let payload: Vec<(String, String)> = vec![
+            ("event_id".to_string(), envelope.event_id.clone()),
+            ("source".to_string(), envelope.source.clone()),
+            ("source_id".to_string(), envelope.source_id.clone()),
+            ("timestamp".to_string(), envelope.timestamp.to_rfc3339()),
+            ("version".to_string(), envelope.version.clone()),
+            (
+                "payload".to_string(),
+                serde_json::to_string(&envelope.event).unwrap(),
+            ),
+        ];
+        let _: () = conn
+            .xadd(&self.stream_key, "*", &payload)
+            .await
+            .map_err(|e| {
+                crate::error::PowerFsError::Internal(format!("redis publish error: {}", e))
+            })?;
+        Ok(())
+    }
+
+    async fn subscribe(&self, stream_key: &str) -> crate::error::Result<EventStream> {
+        let (sender, receiver) = mpsc::channel(100);
+        let client = self.client.clone();
+        let stream_key_clone = stream_key.to_string();
+
+        tokio::spawn(async move {
+            let mut last_id = "0".to_string();
+            let opts = redis::streams::StreamReadOptions::default().count(10);
+
+            loop {
+                let mut conn = match client.get_async_connection().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                let reply: redis::streams::StreamReadReply = match conn
+                    .xread_options(&[&stream_key_clone], &[&last_id], &opts)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                for stream in reply.keys {
+                    for entry in stream.ids {
+                        last_id = entry.id.clone();
+
+                        let mut event_id = String::new();
+                        let mut source = String::new();
+                        let mut source_id = String::new();
+                        let mut payload_str = String::new();
+
+                        for (key, value) in entry.map {
+                            let value_str = match value {
+                                Value::Data(data) => String::from_utf8_lossy(&data).to_string(),
+                                Value::Status(s) => s,
+                                _ => continue,
+                            };
+                            match key.as_str() {
+                                "event_id" => event_id = value_str,
+                                "source" => source = value_str,
+                                "source_id" => source_id = value_str,
+                                "payload" => payload_str = value_str,
+                                _ => {}
+                            }
+                        }
+
+                        if !payload_str.is_empty() {
+                            if let Ok(event) = serde_json::from_str(&payload_str) {
+                                let envelope = EventEnvelope {
+                                    event_id,
+                                    source,
+                                    source_id,
+                                    timestamp: chrono::Utc::now(),
+                                    version: "1.0".to_string(),
+                                    event,
+                                };
+                                let _ = sender.send(envelope).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(EventStream { receiver })
+    }
+
+    async fn read_history(
+        &self,
+        stream_key: &str,
+        start: &str,
+        count: usize,
+    ) -> crate::error::Result<Vec<EventEnvelope>> {
+        let mut conn = self.client.get_async_connection().await.map_err(|e| {
+            crate::error::PowerFsError::Internal(format!("redis connection error: {}", e))
+        })?;
+
+        let reply: StreamRangeReply = conn.xrange(stream_key, start, "+").await.map_err(|e| {
+            crate::error::PowerFsError::Internal(format!("redis read error: {}", e))
+        })?;
+
+        let mut events = Vec::new();
+
+        for entry in reply.ids.into_iter().take(count) {
+            let mut event_id = String::new();
+            let mut source = String::new();
+            let mut source_id = String::new();
+            let mut payload_str = String::new();
+
+            for (key, value) in entry.map {
+                let value_str = match value {
+                    Value::Data(data) => String::from_utf8_lossy(&data).to_string(),
+                    Value::Status(s) => s,
+                    _ => continue,
+                };
+                match key.as_str() {
+                    "event_id" => event_id = value_str,
+                    "source" => source = value_str,
+                    "source_id" => source_id = value_str,
+                    "payload" => payload_str = value_str,
+                    _ => {}
+                }
+            }
+
+            if !payload_str.is_empty() {
+                if let Ok(event) = serde_json::from_str(&payload_str) {
+                    events.push(EventEnvelope {
+                        event_id,
+                        source,
+                        source_id,
+                        timestamp: chrono::Utc::now(),
+                        version: "1.0".to_string(),
+                        event,
+                    });
+                }
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+pub struct NullEventProvider;
+
+#[async_trait]
+impl EventProvider for NullEventProvider {
+    async fn publish(&self, _event: Event, _source_id: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    async fn subscribe(&self, _stream_key: &str) -> crate::error::Result<EventStream> {
+        let (_, receiver) = mpsc::channel(100);
+        Ok(EventStream { receiver })
+    }
+
+    async fn read_history(
+        &self,
+        _stream_key: &str,
+        _start: &str,
+        _count: usize,
+    ) -> crate::error::Result<Vec<EventEnvelope>> {
+        Ok(Vec::new())
     }
 }

@@ -382,10 +382,36 @@ export interface BenchmarkReport {
 
 export interface BenchmarkResult {
   id: string
-  type: 'kv' | 'metadata' | 'fs'
+  type: 'kv' | 'metadata' | 'fs' | 's3'
   status: 'running' | 'completed' | 'failed'
   started_at: string
   completed_at?: string
   result?: BenchmarkReport
   error?: string
+}
+
+// ===== Filer & Shard management =====
+
+export interface FilerStatus {
+  shard_count: number
+  leader_count: number
+  total_inodes: number
+  total_files: number
+  total_dirs: number
+  buckets: string[]
+}
+
+export interface ShardDetail {
+  shard_id: number
+  inode_range_start: number
+  inode_range_end: number
+  is_leader: boolean
+  term: number
+  commit_index: number
+  applied_index: number
+  inode_count: number
+  file_count: number
+  dir_count: number
+  write_qps: number
+  read_qps: number
 }

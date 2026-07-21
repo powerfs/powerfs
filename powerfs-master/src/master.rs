@@ -6,7 +6,8 @@ use log::{debug, error, info, warn};
 use powerfs_common::{
     collect_system_metrics,
     error::{PowerFsError, Result},
-    event::{Event, EventPublisher, NodeStatusEvent, VolumeStatusEvent},
+    event::{Event, NodeStatusEvent, NullEventProvider, VolumeStatusEvent},
+    traits::EventProvider,
     types::{
         ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
         NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
@@ -56,7 +57,7 @@ pub struct MasterNode {
     pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
     pub metadata_manager: Arc<crate::metadata_manager::MetadataManager>,
     pub volume_client_pool: Arc<VolumeClientPool>,
-    event_publisher: Option<EventPublisher>,
+    event_provider: Arc<dyn EventProvider>,
 }
 
 #[derive(Clone)]
@@ -297,14 +298,19 @@ impl MasterNode {
             dir_tree.db.clone(),
         ));
 
-        let event_publisher = match std::env::var("REDIS_URL") {
+        let event_provider: Arc<dyn EventProvider> = match std::env::var("REDIS_URL") {
+            #[cfg(feature = "redis-event")]
             Ok(url) => {
-                info!("Event publisher enabled with Redis: {}", url);
-                Some(EventPublisher::new(&url, "powerfs_events", "master"))
+                info!("Event provider enabled with Redis: {}", url);
+                Arc::new(powerfs_common::event::RedisEventProvider::new(
+                    &url,
+                    "powerfs_events",
+                    "master",
+                ))
             }
-            Err(_) => {
-                warn!("REDIS_URL not set, event publishing disabled");
-                None
+            _ => {
+                warn!("REDIS_URL not set, using null event provider");
+                Arc::new(NullEventProvider)
             }
         };
 
@@ -336,7 +342,7 @@ impl MasterNode {
             directory_tree: dir_tree,
             metadata_manager,
             volume_client_pool,
-            event_publisher,
+            event_provider,
         };
 
         let master_clone = master.clone();
@@ -630,25 +636,24 @@ impl MasterNode {
 
         info!("Applied AssignVolume: vid={}, node={}", vid, nid_clone);
 
-        if let Some(publisher) = self.event_publisher.clone() {
-            let vid_clone = vid.0;
-            let nid_str = nid.0.clone();
-            let coll_str = coll.0.clone();
-            tokio::spawn(async move {
-                let event = Event::VolumeStatus(VolumeStatusEvent {
-                    volume_id: vid_clone,
-                    node_id: nid_str,
-                    size,
-                    used: 0,
-                    file_count: 0,
-                    status: "creating".to_string(),
-                    collection: coll_str,
-                });
-                if let Err(e) = publisher.publish(event, &format!("{}", vid_clone)).await {
-                    warn!("Failed to publish volume_status event: {}", e);
-                }
+        let provider = self.event_provider.clone();
+        let vid_clone = vid.0;
+        let nid_str = nid.0.clone();
+        let coll_str = coll.0.clone();
+        tokio::spawn(async move {
+            let event = Event::VolumeStatus(VolumeStatusEvent {
+                volume_id: vid_clone,
+                node_id: nid_str,
+                size,
+                used: 0,
+                file_count: 0,
+                status: "creating".to_string(),
+                collection: coll_str,
             });
-        }
+            if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
+                warn!("Failed to publish volume_status event: {}", e);
+            }
+        });
 
         Ok(())
     }
@@ -1727,7 +1732,7 @@ impl MasterNode {
             .unwrap_or("0.0.0.0")
             .to_string();
         let grpc_port = self.address.port() as u32;
-        let event_publisher = self.event_publisher.clone();
+        let event_provider = self.event_provider.clone();
         let address = self.address.to_string();
         // 持有 Arc 引用以在事件发布循环中读取实时的 leader 状态
         let master_ref = self.clone();
@@ -1744,32 +1749,30 @@ impl MasterNode {
                 // 每次循环读取实时的 leader 状态（反映 raft 角色变更）
                 let is_leader = master_ref.is_leader.load(Ordering::Relaxed);
 
-                if let Some(publisher) = &event_publisher {
-                    let event = Event::NodeStatus(NodeStatusEvent {
-                        node_id: node_id_str.clone(),
-                        node_type: "master".to_string(),
-                        address: address.clone(),
-                        grpc_port,
-                        http_port: grpc_port,
-                        status: if is_leader {
-                            "leader".to_string()
-                        } else {
-                            "follower".to_string()
-                        },
-                        cpu_usage: metrics.cpu_usage,
-                        mem_usage: metrics.mem_usage,
-                        disk_usage: metrics.disk_usage,
-                        network_rx: metrics.network_rx,
-                        network_tx: metrics.network_tx,
-                        uptime: metrics.uptime,
-                        volume_count: 0,
-                        is_leader,
-                        raft_term,
-                    });
+                let event = Event::NodeStatus(NodeStatusEvent {
+                    node_id: node_id_str.clone(),
+                    node_type: "master".to_string(),
+                    address: address.clone(),
+                    grpc_port,
+                    http_port: grpc_port,
+                    status: if is_leader {
+                        "leader".to_string()
+                    } else {
+                        "follower".to_string()
+                    },
+                    cpu_usage: metrics.cpu_usage,
+                    mem_usage: metrics.mem_usage,
+                    disk_usage: metrics.disk_usage,
+                    network_rx: metrics.network_rx,
+                    network_tx: metrics.network_tx,
+                    uptime: metrics.uptime,
+                    volume_count: 0,
+                    is_leader,
+                    raft_term,
+                });
 
-                    if let Err(e) = publisher.publish(event, &node_id_str).await {
-                        warn!("Failed to publish node_status event: {}", e);
-                    }
+                if let Err(e) = event_provider.publish(event, &node_id_str).await {
+                    warn!("Failed to publish node_status event: {}", e);
                 }
             }
         });
@@ -1965,7 +1968,7 @@ impl Clone for MasterNode {
             directory_tree: self.directory_tree.clone(),
             metadata_manager: self.metadata_manager.clone(),
             volume_client_pool: self.volume_client_pool.clone(),
-            event_publisher: self.event_publisher.clone(),
+            event_provider: self.event_provider.clone(),
         }
     }
 }
