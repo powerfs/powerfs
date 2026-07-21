@@ -1,12 +1,16 @@
 import { useState, useEffect } from 'react'
-import { Card, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message } from 'antd'
+import { Card, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message, Tooltip, Typography, Descriptions } from 'antd'
 import {
   FolderOutlined,
   PlusOutlined,
   DeleteOutlined,
+  ReloadOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import type { FuseMount } from '@/types'
 import { getFuseMounts, createFuseMount, deleteFuseMount } from '@/services/api'
+
+const { Text } = Typography
 
 function Fuse() {
   const [mounts, setMounts] = useState<FuseMount[]>([])
@@ -168,14 +172,29 @@ function Fuse() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            FUSE（Filesystem in Userspace）允许将 PowerFS 作为本地文件系统挂载到客户端。
+            通过 FUSE 挂载，用户可以像操作本地文件一样操作 PowerFS 中的文件。
+          </Text>
+        </div>
+      </Card>
+
       <Card
         title="FUSE 挂载管理"
         style={{ borderRadius: 12 }}
         bodyStyle={{ padding: '20px' }}
         extra={
-          <Button type="primary" onClick={() => setCreateModalVisible(true)}>
-            <PlusOutlined /> 新建挂载
-          </Button>
+          <Space>
+            <Tooltip title="刷新">
+              <Button icon={<ReloadOutlined />} onClick={loadMounts}>刷新</Button>
+            </Tooltip>
+            <Button type="primary" onClick={() => setCreateModalVisible(true)}>
+              <PlusOutlined /> 新建挂载
+            </Button>
+          </Space>
         }
       >
         <Table
@@ -237,6 +256,23 @@ function Fuse() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是 FUSE？">
+            FUSE（Filesystem in Userspace）是一种在用户空间实现文件系统的技术。PowerFS 通过 FUSE 允许用户将分布式文件系统挂载为本地文件系统。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是 Collection？">
+            Collection 是 PowerFS 中的数据集合概念，类似于逻辑卷或文件系统分区。不同 Collection 之间的数据是隔离的。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是脏 Chunks？">
+            脏 Chunks 是指已经写入但尚未持久化到后端存储的数据块。这些数据存储在客户端缓存中，定期会被刷新到后端。
+          </Descriptions.Item>
+          <Descriptions.Item label="副本策略是什么？">
+            副本策略决定了数据在集群中的存储方式。例如 "000" 表示不使用纠删码，仅使用副本；"101" 表示 1 个数据分片、0 个校验分片、1 个副本。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
     </div>
   )
 }

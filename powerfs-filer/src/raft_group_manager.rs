@@ -133,15 +133,16 @@ impl RaftGroup {
             RocksDbRaftStorage::new_with_single_node(&storage_path, id)
                 .map_err(|e| format!("failed to create storage: {}", e))?
         } else {
-            let mut peer_ids = vec![id];
-            for peer in &peers {
-                peer_ids.push(peer.id);
+            let mut peer_ids = peers.iter().map(|p| p.id).collect::<Vec<_>>();
+            if !peer_ids.contains(&id) {
+                peer_ids.push(id);
             }
+            peer_ids.sort_unstable();
             RocksDbRaftStorage::new_with_peers(&storage_path, &peer_ids)
                 .map_err(|e| format!("failed to create storage: {}", e))?
         };
 
-        let _initial_state = storage
+        let initial_state = storage
             .initial_state()
             .map_err(|e| format!("failed to get initial state: {}", e))?;
 
@@ -159,7 +160,14 @@ impl RaftGroup {
             .map_err(|e| format!("invalid raft config: {}", e))?;
 
         if let Ok(last_idx) = storage.last_index() {
-            cfg.applied = last_idx;
+            let commit_index = initial_state.hard_state.commit;
+            cfg.applied = last_idx.min(commit_index);
+            if cfg.applied < last_idx {
+                warn!(
+                    "Clamped applied index from {} to {} (commit={})",
+                    last_idx, cfg.applied, commit_index
+                );
+            }
         }
 
         let logger = Logger::root(Discard, slog::o!());

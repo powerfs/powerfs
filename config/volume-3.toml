@@ -1,0 +1,11 @@
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
+[volume]
+grpc_port = 8080
+http_port = 8093
+data_dir = "/data"
+node_id = "volume-server-3"
+master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
+max_volume_size = 1073741824

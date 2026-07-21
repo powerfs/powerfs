@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message, Tooltip, Typography, Descriptions } from 'antd'
 import {
   DatabaseOutlined,
   DeleteOutlined,
   EyeOutlined,
   FireOutlined,
+  ReloadOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import type { VolumeInfo } from '@/types'
 import { getVolumes, deleteVolume } from '@/services/api'
 import { formatBytes } from '@/utils/format'
+
+const { Text } = Typography
 
 function Volumes() {
   const [volumes, setVolumes] = useState<VolumeInfo[]>([])
@@ -180,10 +184,24 @@ function Volumes() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            Volume 是 PowerFS 的物理存储单元，每个 Volume 位于一个节点上。系统会自动在多个 Volume 之间分配数据，实现数据冗余和负载均衡。
+          </Text>
+        </div>
+      </Card>
+
       <Card
         title="Volume管理"
         style={{ borderRadius: 12, marginBottom: 16 }}
         bodyStyle={{ paddingBottom: 16 }}
+        extra={
+          <Tooltip title="刷新">
+            <Button icon={<ReloadOutlined />} onClick={loadVolumes}>刷新</Button>
+          </Tooltip>
+        }
       >
         <Space style={{ marginBottom: 16 }}>
           <Select
@@ -331,6 +349,23 @@ function Volumes() {
           </Space>
         )}
       </Modal>
+
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是 Volume？">
+            Volume 是 PowerFS 的物理存储单元，每个 Volume 位于一个节点上。Volume 类似于传统文件系统中的磁盘分区或逻辑卷。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是 Collection？">
+            Collection 是逻辑数据集合，用于隔离不同应用或用户的数据。同一个 Collection 的数据会分布在多个 Volume 上。
+          </Descriptions.Item>
+          <Descriptions.Item label="为什么 Volume 会显示只读？">
+            当 Volume 所在节点出现故障或网络中断时，为了保证数据一致性，系统会将该 Volume 标记为只读状态。
+          </Descriptions.Item>
+          <Descriptions.Item label="如何迁移 Volume？">
+            通过"迁移"操作可以将 Volume 从一个节点迁移到另一个节点。迁移过程中数据会被复制到目标节点，原 Volume 会被删除。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
     </div>
   )
 }

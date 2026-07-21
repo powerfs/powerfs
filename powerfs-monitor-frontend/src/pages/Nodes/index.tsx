@@ -27,6 +27,7 @@ import {
   SearchOutlined,
   ThunderboltOutlined,
   ApiOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import type { SizeType } from 'antd/es/config-provider/SizeContext'
 import type { NodeInfo, StorageDevice } from '@/types'
@@ -356,6 +357,15 @@ function Nodes() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            PowerFS 集群由 Master 节点和 Volume 节点组成。Master 节点负责元数据管理和集群协调，Volume 节点负责实际的数据存储。
+          </Text>
+        </div>
+      </Card>
+
       {/* Page header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <div>

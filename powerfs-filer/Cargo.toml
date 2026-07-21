@@ -8,7 +8,7 @@ name = "powerfs-filer"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["redis-event"]
 redis-event = ["dep:redis", "powerfs-common/redis-event"]
 
 [dependencies]

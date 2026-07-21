@@ -1,0 +1,10 @@
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
+[s3]
+port = 9000
+dir = "/data/s3"
+master_address = "172.20.0.11:9333"
+access_key = "powerfs"
+secret_key = "powerfs123"

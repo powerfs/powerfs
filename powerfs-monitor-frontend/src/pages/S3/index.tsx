@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Card, Row, Col, Statistic, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message, Tabs, Alert } from 'antd'
+import { Card, Row, Col, Statistic, Table, Tag, Button, Modal, Form, Input, Space, Popconfirm, message, Tabs, Alert, Tooltip, Typography, Descriptions } from 'antd'
 import {
   FolderOpenOutlined,
   FileOutlined,
@@ -12,7 +12,11 @@ import {
   KeyOutlined,
   CloudServerOutlined,
   DatabaseOutlined,
+  ReloadOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
+
+const { Text } = Typography
 import type { BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, S3AccessKey } from '@/types'
 import { getS3Metrics, getBuckets, createBucket, deleteBucket, getObjects, deleteObject, uploadObject, downloadObject, getMultipartUploads, abortMultipartUpload, getS3AccessKeys, createS3AccessKey, deleteS3AccessKey } from '@/services/api'
 import { formatBytes, formatNumber } from '@/utils/format'
@@ -407,6 +411,15 @@ function S3() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            S3 接口提供与 AWS S3 兼容的对象存储服务。通过标准 S3 API，您可以使用各种 S3 客户端工具和 SDK 访问 PowerFS。
+          </Text>
+        </div>
+      </Card>
+
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col span={6}>
           <Card
@@ -525,9 +538,14 @@ function S3() {
             style={{ borderRadius: 12 }}
             bodyStyle={{ padding: '20px' }}
             extra={
-              <Button type="primary" onClick={() => setCreateModalVisible(true)}>
-                <PlusOutlined /> 创建Bucket
-              </Button>
+              <Space>
+                <Tooltip title="刷新">
+                  <Button icon={<ReloadOutlined />} onClick={loadData}>刷新</Button>
+                </Tooltip>
+                <Button type="primary" onClick={() => setCreateModalVisible(true)}>
+                  <PlusOutlined /> 创建Bucket
+                </Button>
+              </Space>
             }
           >
             <Table
@@ -753,6 +771,23 @@ function S3() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是 Bucket？">
+            Bucket 是 S3 对象存储中的顶层容器，类似于文件系统中的根目录。每个 Bucket 可以存储大量对象（文件），且 Bucket 名称在整个集群中必须唯一。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是对象（Object）？">
+            对象是 S3 存储的基本单元，包含数据和元数据。每个对象由唯一的键（Key）标识，存储在特定的 Bucket 中。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是分片上传？">
+            分片上传允许将大文件分割成多个部分并行上传，上传完成后再合并成完整文件。这对于上传大文件和网络不稳定的场景非常有用。
+          </Descriptions.Item>
+          <Descriptions.Item label="如何使用 S3 客户端？">
+            使用 AWS CLI、S3 Browser、MinIO Client 等工具，配置端点为 http://localhost:9000，使用创建的 Access Key 和 Secret Key 进行认证。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
     </div>
   )
 }

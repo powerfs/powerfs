@@ -1,4 +1,4 @@
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary } from '@/types'
 
 export const mockDevices: StorageDevice[] = [
   {
@@ -393,3 +393,68 @@ export const mockScrubSummary: ScrubSummary = {
   corrupted_needles: 17,
   last_scan_time: '2026-07-17T04:00:00Z',
 }
+
+export const mockFuseMounts: FuseMount[] = [
+  {
+    id: 'fuse-1',
+    mount_point: '/mnt/powerfs/default',
+    collection: 'default',
+    replication: '000',
+    master: '192.168.1.101:9333',
+    threads: 8,
+    status: 'mounted',
+    mounted_at: '2026-07-17T08:00:00Z',
+    pid: 1234,
+    host: 'client-1.example.com',
+    client_type: 'linux',
+    dirty_chunks: 15,
+    dirty_bytes: 125829120,
+    last_heartbeat: '2026-07-17T10:30:00Z',
+  },
+  {
+    id: 'fuse-2',
+    mount_point: '/mnt/powerfs/kv',
+    collection: 'kv',
+    replication: '000',
+    master: '192.168.1.101:9333',
+    threads: 16,
+    status: 'mounted',
+    mounted_at: '2026-07-17T09:30:00Z',
+    pid: 5678,
+    host: 'client-2.example.com',
+    client_type: 'linux',
+    dirty_chunks: 0,
+    dirty_bytes: 0,
+    last_heartbeat: '2026-07-17T10:29:00Z',
+  },
+  {
+    id: 'fuse-3',
+    mount_point: '/mnt/powerfs/backup',
+    collection: 'backup',
+    replication: '101',
+    master: '192.168.1.101:9333',
+    threads: 4,
+    status: 'mounted',
+    mounted_at: '2026-07-16T14:00:00Z',
+    pid: 9012,
+    host: 'backup-server.example.com',
+    client_type: 'linux',
+    dirty_chunks: 42,
+    dirty_bytes: 440401920,
+    last_heartbeat: '2026-07-17T10:28:00Z',
+  },
+  {
+    id: 'fuse-4',
+    mount_point: '/mnt/powerfs/test',
+    collection: 'test',
+    replication: '000',
+    master: '192.168.1.101:9333',
+    threads: 8,
+    status: 'error',
+    mounted_at: '2026-07-17T07:00:00Z',
+    host: 'test-client.example.com',
+    client_type: 'linux',
+    dirty_chunks: 0,
+    dirty_bytes: 0,
+  },
+]

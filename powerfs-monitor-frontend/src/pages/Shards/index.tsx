@@ -4,11 +4,11 @@ import {
 } from 'antd'
 import {
   DatabaseOutlined, ThunderboltOutlined, ReloadOutlined, ApartmentOutlined,
-  RiseOutlined, FallOutlined, NodeIndexOutlined,
+  RiseOutlined, FallOutlined, NodeIndexOutlined, InfoCircleOutlined,
 } from '@ant-design/icons'
-import ReactECharts from 'echarts-for-react'
 import type { ShardDetail } from '@/types'
 import { getShards } from '@/services/api'
+import ReactECharts from 'echarts-for-react'
 
 const { Text, Title } = Typography
 
@@ -52,9 +52,6 @@ function Shards() {
   const totalWriteQps = shards.reduce((sum, s) => sum + s.write_qps, 0)
   const totalReadQps = shards.reduce((sum, s) => sum + s.read_qps, 0)
 
-  // Pie chart option: inode distribution across shards.
-  // When total inodes is 0 (fresh cluster), fall back to showing the inode
-  // range capacity per shard so the chart is still informative.
   const inodePieOption = {
     tooltip: {
       trigger: 'item',
@@ -80,8 +77,6 @@ function Shards() {
     }],
   }
 
-  // Bar chart option: read/write QPS per shard.
-  // Use yAxis min=0 so the chart renders axes/labels even when all values are 0.
   const qpsBarOption = {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
     legend: { bottom: 0, data: ['读 QPS', '写 QPS'] },
@@ -131,28 +126,14 @@ function Shards() {
       ),
     },
     {
-      title: 'Term',
-      dataIndex: 'term',
-      key: 'term',
-      width: 70,
-      render: (term: number) => <Tag color="blue">{term}</Tag>,
-    },
-    {
-      title: 'Commit/Applied',
-      key: 'commit_applied',
-      width: 130,
+      title: '同步状态',
+      key: 'synced',
+      width: 100,
       render: (_: unknown, record: ShardDetail) => {
         const synced = record.commit_index === record.applied_index
-        return (
-          <Space>
-            <Text>{record.commit_index}</Text>
-            <Text type="secondary">/</Text>
-            <Text style={{ color: synced ? 'var(--pf-color-success)' : 'var(--pf-color-warning)' }}>
-              {record.applied_index}
-            </Text>
-            {synced ? <Tag color="success" style={{ margin: 0 }}>同步</Tag> : <Tag color="warning" style={{ margin: 0 }}>滞后</Tag>}
-          </Space>
-        )
+        return synced
+          ? <Tag color="success" style={{ margin: 0 }}>同步</Tag>
+          : <Tag color="warning" style={{ margin: 0 }}>滞后</Tag>
       },
     },
     {
@@ -224,7 +205,17 @@ function Shards() {
         </Tooltip>
       </div>
 
-      {/* Overview cards */}
+      <Card size="small" style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            分片是 PowerFS 的元数据存储单元，每个分片负责管理一定范围的 Inode。系统会自动将元数据分配到不同分片中，
+            并通过 <Text strong>自动均衡器</Text> 平衡各节点的负载。
+            <a href="/shard-balancing" style={{ marginLeft: 8, color: 'var(--pf-color-primary)' }}>查看均衡器 →</a>
+          </Text>
+        </div>
+      </Card>
+
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={12} md={6}>
           <Card><div style={{ textAlign: 'center' }}><div style={{ fontSize: 12, color: 'var(--pf-color-secondary)' }}>分片总数</div><div style={{ fontSize: 28, fontWeight: 700 }}>{shards.length}</div></div></Card>
@@ -240,7 +231,6 @@ function Shards() {
         </Col>
       </Row>
 
-      {/* Charts */}
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} md={10}>
           <Card title={totalInodes > 0 ? 'Inode 分布' : '分片容量分布'} size="small">
@@ -262,7 +252,6 @@ function Shards() {
         </Col>
       </Row>
 
-      {/* Shard table */}
       <Card title="分片列表" size="small">
         <Table
           columns={columns}
@@ -274,7 +263,23 @@ function Shards() {
         />
       </Card>
 
-      {/* Shard detail drawer */}
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是分片？">
+            分片是元数据的存储单元。PowerFS 将文件系统的 Inode 按范围划分到不同分片中，每个分片由一组节点管理。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是 Leader？">
+            每个分片有一个 Leader 节点负责处理写入请求，其他节点作为 Follower 同步数据。Leader 负责决策，Follower 提供冗余。
+          </Descriptions.Item>
+          <Descriptions.Item label="为什么需要多个分片？">
+            多个分片可以分散元数据负载，提高并发处理能力。每个分片独立处理自己范围内的元数据操作。
+          </Descriptions.Item>
+          <Descriptions.Item label="分片如何均衡？">
+            系统内置的均衡器会自动检测各节点的负载，将过载节点的 Leader 迁移到负载较低的节点，保持集群平衡。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
+
       <Drawer
         title={selectedShard ? `分片 ${selectedShard.shard_id} 详情` : ''}
         open={drawerOpen}
@@ -288,22 +293,13 @@ function Shards() {
               <Descriptions.Item label="角色">
                 {selectedShard.is_leader ? <Tag color="gold">Leader</Tag> : <Tag>Follower</Tag>}
               </Descriptions.Item>
-              <Descriptions.Item label="Inode 范围起始">{selectedShard.inode_range_start}</Descriptions.Item>
-              <Descriptions.Item label="Inode 范围结束">{selectedShard.inode_range_end >= 1e15 ? '∞ (最大值)' : selectedShard.inode_range_end}</Descriptions.Item>
+              <Descriptions.Item label="Inode 范围">{formatRange(selectedShard.inode_range_start, selectedShard.inode_range_end)}</Descriptions.Item>
+              <Descriptions.Item label="同步状态">
+                {selectedShard.commit_index === selectedShard.applied_index
+                  ? <Tag color="success">已同步</Tag>
+                  : <Tag color="warning">滞后 {selectedShard.commit_index - selectedShard.applied_index} 条</Tag>}
+              </Descriptions.Item>
             </Descriptions>
-
-            <Card title="Raft 状态" size="small" style={{ marginBottom: 16 }}>
-              <Descriptions column={1} size="small">
-                <Descriptions.Item label="Term">{selectedShard.term}</Descriptions.Item>
-                <Descriptions.Item label="Commit Index">{selectedShard.commit_index}</Descriptions.Item>
-                <Descriptions.Item label="Applied Index">{selectedShard.applied_index}</Descriptions.Item>
-                <Descriptions.Item label="同步状态">
-                  {selectedShard.commit_index === selectedShard.applied_index
-                    ? <Tag color="success">已同步</Tag>
-                    : <Tag color="warning">滞后 {selectedShard.commit_index - selectedShard.applied_index} 条</Tag>}
-                </Descriptions.Item>
-              </Descriptions>
-            </Card>
 
             <Card title="元数据统计" size="small" style={{ marginBottom: 16 }}>
               <Row gutter={16}>
@@ -345,7 +341,7 @@ function Shards() {
               <Descriptions column={1} size="small">
                 <Descriptions.Item label="路由策略">按 Inode 范围分片</Descriptions.Item>
                 <Descriptions.Item label="本分片范围">{formatRange(selectedShard.inode_range_start, selectedShard.inode_range_end)}</Descriptions.Item>
-                <Descriptions.Item label="Bucket 根 Inode">分配在该范围内的 Bucket 根目录将被路由到此分片</Descriptions.Item>
+                <Descriptions.Item label="说明">分配在此范围内的文件和目录元数据将存储在本分片</Descriptions.Item>
               </Descriptions>
             </Card>
           </>

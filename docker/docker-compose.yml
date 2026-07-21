@@ -46,12 +46,10 @@ services:
         ipv4_address: 172.20.0.11
     volumes:
       - master-1-data:/data
+      - ../config/master-1.toml:/etc/powerfs/master-1.toml
     ports:
       - "9333:9333"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.11:9333 --raft-id 1 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
+    command: /app/powerfs master --config /etc/powerfs/master-1.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 5s
@@ -72,12 +70,10 @@ services:
         ipv4_address: 172.20.0.12
     volumes:
       - master-2-data:/data
+      - ../config/master-2.toml:/etc/powerfs/master-2.toml
     ports:
       - "9334:9333"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.12:9333 --raft-id 2 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
+    command: /app/powerfs master --config /etc/powerfs/master-2.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 5s
@@ -98,12 +94,10 @@ services:
         ipv4_address: 172.20.0.13
     volumes:
       - master-3-data:/data
+      - ../config/master-3.toml:/etc/powerfs/master-3.toml
     ports:
       - "9335:9333"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.20.0.13:9333 --raft-id 3 --peer 172.20.0.11:9333 --peer 172.20.0.12:9333 --peer 172.20.0.13:9333
+    command: /app/powerfs master --config /etc/powerfs/master-3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 5s
@@ -124,13 +118,11 @@ services:
         ipv4_address: 172.20.0.21
     volumes:
       - volume-1-data:/data
+      - ../config/volume-1.toml:/etc/powerfs/volume-1.toml
     ports:
       - "8080:8080"
       - "8091:8091"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-1
+    command: /app/powerfs-volume --config /etc/powerfs/volume-1.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.21 8080 || exit 1"]
       interval: 5s
@@ -151,13 +143,11 @@ services:
         ipv4_address: 172.20.0.22
     volumes:
       - volume-2-data:/data
+      - ../config/volume-2.toml:/etc/powerfs/volume-2.toml
     ports:
       - "8081:8080"
       - "8092:8092"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-2
+    command: /app/powerfs-volume --config /etc/powerfs/volume-2.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.22 8080 || exit 1"]
       interval: 5s
@@ -178,13 +168,11 @@ services:
         ipv4_address: 172.20.0.23
     volumes:
       - volume-3-data:/data
+      - ../config/volume-3.toml:/etc/powerfs/volume-3.toml
     ports:
       - "8082:8080"
       - "8093:8093"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs-volume --grpc-address 172.20.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.20.0.11:9333 --master-address 172.20.0.12:9333 --master-address 172.20.0.13:9333 --node-id volume-server-3
+    command: /app/powerfs-volume --config /etc/powerfs/volume-3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.23 8080 || exit 1"]
       interval: 5s
@@ -207,12 +195,10 @@ services:
       - "8888:8888"
       - "8889:8889"
       - "8890:8890"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs filer --port 8888 --grpc-port 8889 --master 172.20.0.11:9333 --master 172.20.0.12:9333 --master 172.20.0.13:9333 -D /data/filer --shard-count 4 --raft-id 1
     volumes:
       - filer-data:/data/filer
+      - ../config/filer.toml:/etc/powerfs/filer.toml
+    command: /app/powerfs filer --config /etc/powerfs/filer.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
       interval: 10s
@@ -233,12 +219,10 @@ services:
         ipv4_address: 172.20.0.32
     volumes:
       - s3-data:/data
+      - ../config/s3.toml:/etc/powerfs/s3.toml
     ports:
       - "9000:9000"
-    environment:
-      - RUST_LOG=info
-      - REDIS_URL=redis://redis:6379
-    command: /app/powerfs s3 --port 9000 --master 172.20.0.11:9333 --dir /data/s3 --access-key powerfs --secret-key powerfs123
+    command: /app/powerfs s3 --config /etc/powerfs/s3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
       interval: 5s
@@ -259,10 +243,9 @@ services:
         ipv4_address: 172.20.0.30
     ports:
       - "8083:8081"
-    environment:
-      - RUST_LOG=info
-      - REDIS_ADDR=redis:6379
-    command: /app/powerfs-monitor --redis-url redis://172.20.0.50:6379 --s3-endpoint http://172.20.0.32:9000 --s3-backend-endpoint http://172.20.0.32:9000 --master-endpoint 172.20.0.11:9333
+    volumes:
+      - ../config/monitor.toml:/etc/powerfs/monitor.toml
+    command: /app/powerfs-monitor --config /etc/powerfs/monitor.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
       interval: 5s
@@ -315,30 +298,10 @@ services:
       - apparmor:unconfined
     privileged: true
     restart: unless-stopped
-    environment:
-      - RUST_LOG=debug
-    command:
-      - /app/powerfs-fuse
-      - --master
-      - 172.20.0.11:9333
-      - --master
-      - 172.20.0.12:9333
-      - --master
-      - 172.20.0.13:9333
-      - --mount-point
-      - /mnt/powerfs
-      - --collection
-      - default
-      - --replication
-      - "000"
-      - --threads
-      - "8"
-      - --verbose
-      - --container
-      - --log-file
-      - /var/log/powerfs-fuse.log
     volumes:
       - /tmp/powerfs/fuse1:/mnt/powerfs
+      - ../config/fuse-1.toml:/etc/powerfs/fuse-1.toml
+    command: /app/powerfs-fuse --config /etc/powerfs/fuse-1.toml
     depends_on:
       volume-1:
         condition: service_healthy
@@ -368,30 +331,10 @@ services:
       - apparmor:unconfined
     privileged: true
     restart: unless-stopped
-    environment:
-      - RUST_LOG=debug
-    command:
-      - /app/powerfs-fuse
-      - --master
-      - 172.20.0.11:9333
-      - --master
-      - 172.20.0.12:9333
-      - --master
-      - 172.20.0.13:9333
-      - --mount-point
-      - /mnt/powerfs
-      - --collection
-      - default
-      - --replication
-      - "000"
-      - --threads
-      - "8"
-      - --verbose
-      - --container
-      - --log-file
-      - /var/log/powerfs-fuse.log
     volumes:
       - /tmp/powerfs/fuse2:/mnt/powerfs
+      - ../config/fuse-2.toml:/etc/powerfs/fuse-2.toml
+    command: /app/powerfs-fuse --config /etc/powerfs/fuse-2.toml
     depends_on:
       volume-1:
         condition: service_healthy

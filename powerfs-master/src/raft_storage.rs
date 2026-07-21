@@ -7,7 +7,7 @@ use log::{info, warn};
 use protobuf::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::storage::{RaftState, Storage};
-use rocksdb::{ColumnFamilyDescriptor, DB};
+use rocksdb::{ColumnFamilyDescriptor, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
@@ -241,16 +241,25 @@ impl RocksDbStorage {
 
     fn save_state(&self) -> Result<(), String> {
         if let Some(cf) = self.db.cf_handle(CF_RAFT_STATE) {
+            let mut batch = WriteBatch::default();
+
             let hs = self.hard_state.read().unwrap();
             let mut buf = Vec::new();
             if hs.write_to_vec(&mut buf).is_ok() {
-                let _ = self.db.put_cf(cf, b"hard_state", &buf);
+                batch.put_cf(cf, b"hard_state", &buf);
             }
 
             let cs = self.conf_state.read().unwrap();
             let mut buf = Vec::new();
             if cs.write_to_vec(&mut buf).is_ok() {
-                let _ = self.db.put_cf(cf, b"conf_state", &buf);
+                batch.put_cf(cf, b"conf_state", &buf);
+            }
+
+            let applied = *self.applied_index.read().unwrap();
+            batch.put_cf(cf, b"applied_index", applied.to_string().as_bytes());
+
+            if let Err(e) = self.db.write(batch) {
+                warn!("Failed to write state batch: {}", e);
             }
         }
         Ok(())
@@ -344,6 +353,27 @@ impl RocksDbStorage {
                  (use `powerfs raft verify` to inspect, `powerfs raft repair` to clean)",
                 skipped
             );
+        }
+
+        let last_log_index = entries.back().map_or(0, |e| e.index);
+
+        let mut hs = self.hard_state.write().unwrap();
+        if hs.commit > last_log_index {
+            warn!(
+                "Hard state commit {} exceeds last log index {}; clamping to {}",
+                hs.commit, last_log_index, last_log_index
+            );
+            hs.commit = last_log_index;
+        }
+
+        let mut applied = self.applied_index.write().unwrap();
+        let max_valid_applied = hs.commit.min(last_log_index);
+        if *applied > max_valid_applied {
+            warn!(
+                "Applied index {} exceeds valid range [0, min(commit={}, last_log={})]; clamping to {}",
+                *applied, hs.commit, last_log_index, max_valid_applied
+            );
+            *applied = max_valid_applied;
         }
 
         info!("Loaded {} log entries", entries.len());

@@ -65,76 +65,45 @@ async fn test_raft_client_basic() {
 async fn test_config_parsing() {
     let config_content = r#"
 [master]
-id = "1"
-http_address = "0.0.0.0:9333"
-grpc_address = "0.0.0.0:9334"
-data_dir = "./data"
-log_level = "info"
+port = 9333
+dir = "./data"
+raft_id = 1
 
 [volume]
-id = "1"
-http_address = "0.0.0.0:8080"
-grpc_address = "0.0.0.0:8081"
+grpc_port = 8080
+http_port = 8081
 data_dir = "./data"
-volume_size = 1073741824
-max_file_count = 1000000
-
-[raft]
-address = "0.0.0.0:9335"
-election_tick = 10
-heartbeat_tick = 3
+node_id = "volume-1"
+max_volume_size = 1073741824
 "#;
 
-    let config = powerfs_common::config::Config::from_string(config_content).unwrap();
+    let config = powerfs_common::config::PowerFsConfig::load_from_string(config_content).unwrap();
 
-    assert!(config.master.is_some());
-    assert!(config.volume.is_some());
-    assert!(config.raft.is_some());
+    assert_eq!(config.master.port, 9333);
+    assert_eq!(config.master.dir, "./data");
+    assert_eq!(config.master.raft_id, 1);
 
-    let master = config.master.unwrap();
-    assert_eq!(master.id, "1");
-    assert_eq!(master.http_address, "0.0.0.0:9333");
-    assert_eq!(master.grpc_address, "0.0.0.0:9334");
-    assert_eq!(master.data_dir, "./data");
-    assert_eq!(master.log_level, "info");
-
-    let volume = config.volume.unwrap();
-    assert_eq!(volume.volume_size, 1073741824);
-    assert_eq!(volume.max_file_count, 1000000);
-
-    let raft = config.raft.unwrap();
-    assert_eq!(raft.election_tick, 10);
-    assert_eq!(raft.heartbeat_tick, 3);
+    assert_eq!(config.volume.grpc_port, 8080);
+    assert_eq!(config.volume.http_port, 8081);
+    assert_eq!(config.volume.data_dir, "./data");
+    assert_eq!(config.volume.node_id, "volume-1");
+    assert_eq!(config.volume.max_volume_size, 1073741824);
 }
 
 #[tokio::test]
 async fn test_config_with_peers() {
     let config_content = r#"
-[raft]
-address = "0.0.0.0:9335"
-election_tick = 10
-heartbeat_tick = 3
-
-[[raft.peers]]
-id = 2
-address = "127.0.0.1:9336"
-
-[[raft.peers]]
-id = 3
-address = "127.0.0.1:9337"
+[master]
+port = 9335
+raft_id = 1
+peers = ["127.0.0.1:9336", "127.0.0.1:9337"]
 "#;
 
-    let config = powerfs_common::config::Config::from_string(config_content).unwrap();
+    let config = powerfs_common::config::PowerFsConfig::load_from_string(config_content).unwrap();
 
-    let raft = config.raft.unwrap();
-    assert!(raft.peers.is_some());
-
-    let peers = raft.peers.unwrap();
-    assert_eq!(peers.len(), 2);
-    assert_eq!(peers[0].id, 2);
-    assert_eq!(peers[0].address, "127.0.0.1:9336");
-    assert_eq!(peers[1].id, 3);
-    assert_eq!(peers[1].address, "127.0.0.1:9337");
+    assert_eq!(config.master.peers.len(), 2);
+    assert_eq!(config.master.peers[0], "127.0.0.1:9336");
+    assert_eq!(config.master.peers[1], "127.0.0.1:9337");
 }
 
 #[tokio::test]

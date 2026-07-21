@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message, Tabs, Statistic, Row, Col } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message, Tabs, Statistic, Row, Col, Typography, Tooltip } from 'antd'
 import {
   HddOutlined,
   EyeOutlined,
@@ -12,6 +12,7 @@ import {
   StopOutlined,
   ReloadOutlined,
   PlusOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import type { StorageDevice, DataMigrationTask } from '@/types'
 import {
@@ -25,6 +26,8 @@ import {
   resumeMigration,
 } from '@/services/api'
 import { formatBytes, formatTime } from '@/utils/format'
+
+const { Text } = Typography
 
 function StorageDevices() {
   const [devices, setDevices] = useState<StorageDevice[]>([])
@@ -129,7 +132,6 @@ function StorageDevices() {
   }
 
   const deviceTypes = [...new Set(devices.map(d => d.device_type))]
-  const nodeIds = [...new Set(devices.map(d => d.location.node_id))]
 
   const filteredDevices = useMemo(() => {
     return devices.filter(d => {
@@ -529,6 +531,15 @@ function StorageDevices() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            存储设备是 PowerFS 集群中的物理存储单元，包括本地磁盘、SPDK、NVMe-oF 等类型。系统会自动在多个设备之间分配数据，实现数据冗余和负载均衡。
+          </Text>
+        </div>
+      </Card>
+
       <Row gutter={16} style={{ marginBottom: 16 }}>
         <Col span={6}>
           <Card style={{ borderRadius: 12 }}>
@@ -583,6 +594,9 @@ function StorageDevices() {
               children: (
                 <div>
                   <Space style={{ marginBottom: 16 }}>
+                    <Tooltip title="刷新">
+                      <Button icon={<ReloadOutlined />} onClick={() => { loadDevices(); loadMigrations(); }}>刷新</Button>
+                    </Tooltip>
                     <Select
                       placeholder="按类型筛选"
                       style={{ width: 150 }}
@@ -614,7 +628,6 @@ function StorageDevices() {
                       onChange={setFilterNode}
                       options={[
                         { value: '', label: '全部节点' },
-                        ...nodeIds.map(n => ({ value: n, label: n })),
                       ]}
                     />
                     <Button type="primary" icon={<PlusOutlined />}>

@@ -11,6 +11,7 @@ import {
   Alert,
   Space,
   Tag,
+  Descriptions,
 } from 'antd';
 import {
   ArrowUpOutlined,
@@ -20,21 +21,45 @@ import {
   DatabaseOutlined,
   DesktopOutlined,
   DashboardOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons';
+import {
+  getOptimizationFlags,
+  updateOptimizationFlag,
+  resetOptimizationFlags,
+  setOptimizationBaseline,
+  runOptimizationBenchmark,
+  getBenchmarkResults,
+  type OptimizationFlags,
+} from '@/services/api';
 
-interface OptimizationFlags {
-  ec_simd_enabled: boolean;
-  ec_parallel_encoding: boolean;
-  ec_dynamic_sharding: boolean;
-  ec_small_file_skip: boolean;
-  raft_log_compression: boolean;
-  raft_pre_vote: boolean;
-  raft_read_scaling: boolean;
-  rack_awareness: boolean;
-  load_balancing: boolean;
-  smart_cache_eviction: boolean;
-  hierarchical_index: boolean;
-}
+const flagNames: Record<string, string> = {
+  ec_simd_enabled: 'EC SIMD 编码',
+  ec_parallel_encoding: 'EC 并行编码',
+  ec_dynamic_sharding: 'EC 动态分片',
+  ec_small_file_skip: 'EC 小文件跳过',
+  raft_log_compression: 'Raft 日志压缩',
+  raft_pre_vote: 'Raft 预投票',
+  raft_read_scaling: 'Raft 读扩展',
+  rack_awareness: '机架感知',
+  load_balancing: '负载均衡',
+  smart_cache_eviction: '智能缓存淘汰',
+  hierarchical_index: '分层索引',
+};
+
+const flagDescriptions: Record<string, string> = {
+  ec_simd_enabled: '使用 CPU SIMD 指令加速纠删码编码计算，可显著提升编码性能',
+  ec_parallel_encoding: '启用并行编码处理，充分利用多核 CPU 资源',
+  ec_dynamic_sharding: '根据数据大小动态选择分片策略，优化小文件处理效率',
+  ec_small_file_skip: '小文件跳过纠删码编码，直接存储原始数据',
+  raft_log_compression: '压缩 Raft 日志，减少网络传输和存储空间占用',
+  raft_pre_vote: '启用预投票机制，减少不必要的选举开销',
+  raft_read_scaling: '启用读扩展，允许 Follower 节点处理读请求',
+  rack_awareness: '机架感知部署，确保副本分布在不同机架',
+  load_balancing: '自动负载均衡，均衡各节点的存储和计算负载',
+  smart_cache_eviction: '智能缓存淘汰策略，基于访问模式优化缓存命中率',
+  hierarchical_index: '分层索引结构，加速元数据查询',
+};
 
 interface BenchmarkMetrics {
   ec_throughput_mbps: number;
@@ -60,7 +85,7 @@ interface EnvironmentInfo {
   powerfs_version: string;
 }
 
-interface BenchmarkResult {
+interface OptimizationBenchmarkResult {
   id: string;
   test_name: string;
   timestamp: string;
@@ -68,60 +93,29 @@ interface BenchmarkResult {
   metrics: BenchmarkMetrics;
   environment: EnvironmentInfo;
   duration_seconds: number;
-  comparison?: ComparisonReport;
 }
-
-interface ComparisonReport {
-  baseline_id: string;
-  target_id: string;
-  ec_throughput_improvement: number;
-  ec_latency_improvement: number;
-  raft_election_improvement: number;
-  kv_cache_hit_rate_improvement: number;
-  kv_read_throughput_improvement: number;
-  kv_write_throughput_improvement: number;
-  s3_read_throughput_improvement: number;
-  s3_write_throughput_improvement: number;
-  data_balance_improvement: number;
-}
-
-const flagNames: Record<string, string> = {
-  ec_simd_enabled: 'EC SIMD 编码',
-  ec_parallel_encoding: 'EC 并行编码',
-  ec_dynamic_sharding: 'EC 动态分片',
-  ec_small_file_skip: 'EC 小文件跳过',
-  raft_log_compression: 'Raft 日志压缩',
-  raft_pre_vote: 'Raft 预投票',
-  raft_read_scaling: 'Raft 读扩展',
-  rack_awareness: '机架感知',
-  load_balancing: '负载均衡',
-  smart_cache_eviction: '智能缓存淘汰',
-  hierarchical_index: '分层索引',
-};
 
 const OptimizationDashboard: React.FC = () => {
   const [flags, setFlags] = useState<OptimizationFlags | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const [results, setResults] = useState<BenchmarkResult[]>([]);
+  const [results, setResults] = useState<OptimizationBenchmarkResult[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const fetchFlags = async () => {
     try {
-      const response = await fetch('/api/optimizations');
-      const data = await response.json();
+      const data = await getOptimizationFlags();
       setFlags(data.flags);
     } catch (err) {
-      setError('Failed to fetch optimization flags');
+      setError('加载优化配置失败');
     }
   };
 
   const fetchResults = async () => {
     try {
-      const response = await fetch('/api/benchmark/results?limit=20');
-      const data = await response.json();
-      setResults(data);
+      const data = await getBenchmarkResults();
+      setResults(data as unknown as OptimizationBenchmarkResult[]);
     } catch (err) {
-      setError('Failed to fetch benchmark results');
+      setError('加载基准测试结果失败');
     }
   };
 
@@ -134,57 +128,39 @@ const OptimizationDashboard: React.FC = () => {
     if (!flags) return;
 
     try {
-      const response = await fetch(`/api/optimizations/${flagName}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value }),
-      });
-
-      if (response.ok) {
-        setFlags((prev) => prev ? { ...prev, [flagName]: value } : null);
-      } else {
-        setError('Failed to update optimization flag');
-      }
+      await updateOptimizationFlag(flagName, value);
+      setFlags((prev) => prev ? { ...prev, [flagName]: value } : null);
     } catch (err) {
-      setError('Failed to update optimization flag');
+      setError('更新优化配置失败');
     }
   };
 
   const handleReset = async () => {
     try {
-      await fetch('/api/optimizations/reset', { method: 'POST' });
+      await resetOptimizationFlags();
       await fetchFlags();
     } catch (err) {
-      setError('Failed to reset flags');
+      setError('重置配置失败');
     }
   };
 
   const handleBaseline = async () => {
     try {
-      await fetch('/api/optimizations/baseline', { method: 'POST' });
+      await setOptimizationBaseline();
       await fetchFlags();
     } catch (err) {
-      setError('Failed to set baseline');
+      setError('设置基线失败');
     }
   };
 
   const handleRunBenchmark = async () => {
     setIsRunning(true);
     try {
-      const response = await fetch('/api/benchmark/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ test_duration_seconds: 30 }),
-      });
-
-      if (response.ok) {
-        await fetchResults();
-      } else {
-        const data = await response.json();
-        setError(data.message || 'Failed to run benchmark');
-      }
+      await runOptimizationBenchmark();
+      await fetchResults();
     } catch (err) {
-      setError('Failed to run benchmark');
+      const errorMsg = err instanceof Error ? err.message : '运行基准测试失败';
+      setError(errorMsg);
     } finally {
       setIsRunning(false);
     }
@@ -254,11 +230,20 @@ const OptimizationDashboard: React.FC = () => {
       title: '优化项',
       dataIndex: 'name',
       key: 'name',
+      width: 150,
+    },
+    {
+      title: '说明',
+      dataIndex: 'description',
+      key: 'description',
+      ellipsis: true,
+      render: (desc: string) => <Typography.Text type="secondary" style={{ fontSize: 12 }}>{desc}</Typography.Text>,
     },
     {
       title: '状态',
       dataIndex: 'value',
       key: 'value',
+      width: 80,
       render: (value: boolean) => (
         <Tag color={value ? 'green' : 'default'}>
           {value ? '启用' : '禁用'}
@@ -269,6 +254,7 @@ const OptimizationDashboard: React.FC = () => {
       title: '操作',
       dataIndex: 'key',
       key: 'action',
+      width: 80,
       render: (_: string, record: { key: string; value: boolean }) => (
         <Switch
           checked={record.value}
@@ -281,6 +267,7 @@ const OptimizationDashboard: React.FC = () => {
   const flagDataSource = flags ? Object.entries(flags).map(([key, value]) => ({
     key,
     name: flagNames[key] || key,
+    description: flagDescriptions[key] || '',
     value,
   })) : [];
 
@@ -329,9 +316,20 @@ const OptimizationDashboard: React.FC = () => {
     },
   ];
 
+  const enabledCount = flags ? Object.values(flags).filter(Boolean).length : 0;
+  const totalCount = flags ? Object.keys(flags).length : 0;
+
   return (
-    <div style={{ padding: 24 }}>
-      <Typography.Title level={4}>优化效果监控面板</Typography.Title>
+    <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+            优化开关用于控制系统各组件的高级功能。这些功能默认已启用，可根据实际需求进行调整。
+            修改后可运行基准测试评估性能变化。
+          </Typography.Text>
+        </div>
+      </Card>
 
       {error && (
         <Alert
@@ -342,28 +340,41 @@ const OptimizationDashboard: React.FC = () => {
         />
       )}
 
-      <Space style={{ marginBottom: 24 }}>
-        <Button
-          type="primary"
-          onClick={handleRunBenchmark}
-          disabled={isRunning}
-          icon={isRunning ? <Spin size="small" /> : <PlayCircleOutlined />}
-        >
-          {isRunning ? '运行中...' : '运行基准测试'}
-        </Button>
-        <Button onClick={handleReset} icon={<RotateLeftOutlined />}>
-          重置为默认值
-        </Button>
-        <Button onClick={handleBaseline}>设置为基线（全关）</Button>
-      </Space>
+      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        <Col xs={24} md={6}>
+          <Card>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 12, color: 'var(--pf-color-secondary)' }}>已启用优化</div>
+              <div style={{ fontSize: 28, fontWeight: 700 }}>{enabledCount}/{totalCount}</div>
+            </div>
+          </Card>
+        </Col>
+        <Col xs={24} md={18}>
+          <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+            <Button
+              type="primary"
+              onClick={handleRunBenchmark}
+              disabled={isRunning}
+              icon={isRunning ? <Spin size="small" /> : <PlayCircleOutlined />}
+            >
+              {isRunning ? '运行中...' : '运行基准测试'}
+            </Button>
+            <Button onClick={handleReset} icon={<RotateLeftOutlined />}>
+              重置为默认值
+            </Button>
+            <Button onClick={handleBaseline}>设置为基线（全关）</Button>
+          </Space>
+        </Col>
+      </Row>
 
       <Card title="优化开关状态" style={{ marginBottom: 24 }}>
         {flags ? (
           <Table
             dataSource={flagDataSource}
             columns={flagColumns}
-            pagination={false}
             rowKey="key"
+            size="small"
+            pagination={false}
           />
         ) : (
           <Spin />
@@ -371,137 +382,88 @@ const OptimizationDashboard: React.FC = () => {
       </Card>
 
       {latestResult && (
-        <div style={{ marginBottom: 24 }}>
-          <Typography.Title level={5} style={{ marginBottom: 16 }}>
-            最新测试结果 - {formatTime(latestResult.timestamp)}
-          </Typography.Title>
+        <Card title="最新基准测试结果" style={{ marginBottom: 24 }}>
           <Row gutter={[16, 16]}>
-            <Col xs={24} sm={12} md={6}>
+            <Col xs={24} sm={8}>
               <MetricCard
                 title="EC 吞吐量"
                 value={latestResult.metrics.ec_throughput_mbps.toFixed(1)}
                 unit="MB/s"
-                improvement={latestResult.comparison?.ec_throughput_improvement}
-                icon={<DashboardOutlined />}
+                icon={<DesktopOutlined />}
                 color="primary"
               />
             </Col>
-            <Col xs={24} sm={12} md={6}>
+            <Col xs={24} sm={8}>
               <MetricCard
                 title="EC 延迟"
                 value={latestResult.metrics.ec_latency_ms.toFixed(2)}
                 unit="ms"
-                improvement={latestResult.comparison?.ec_latency_improvement}
                 icon={<DashboardOutlined />}
                 color="secondary"
               />
             </Col>
-            <Col xs={24} sm={12} md={6}>
+            <Col xs={24} sm={8}>
               <MetricCard
                 title="Raft 选举时间"
                 value={latestResult.metrics.raft_election_time_ms.toFixed(0)}
                 unit="ms"
-                improvement={latestResult.comparison?.raft_election_improvement}
                 icon={<DatabaseOutlined />}
                 color="success"
               />
             </Col>
-            <Col xs={24} sm={12} md={6}>
+            <Col xs={24} sm={8}>
               <MetricCard
                 title="KV 缓存命中率"
-                value={(latestResult.metrics.kv_cache_hit_rate * 100).toFixed(1)}
-                unit="%"
-                improvement={latestResult.comparison?.kv_cache_hit_rate_improvement}
+                value={`${(latestResult.metrics.kv_cache_hit_rate * 100).toFixed(1)}%`}
                 icon={<DatabaseOutlined />}
                 color="warning"
               />
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <MetricCard
-                title="KV 读吞吐"
-                value={latestResult.metrics.kv_read_throughput_ops.toFixed(0)}
-                unit="ops/s"
-                improvement={latestResult.comparison?.kv_read_throughput_improvement}
-                icon={<DesktopOutlined />}
-                color="primary"
-              />
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <MetricCard
-                title="KV 写吞吐"
-                value={latestResult.metrics.kv_write_throughput_ops.toFixed(0)}
-                unit="ops/s"
-                improvement={latestResult.comparison?.kv_write_throughput_improvement}
-                icon={<DesktopOutlined />}
-                color="secondary"
-              />
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <MetricCard
-                title="S3 读吞吐"
-                value={latestResult.metrics.s3_read_throughput_mbps.toFixed(1)}
-                unit="MB/s"
-                improvement={latestResult.comparison?.s3_read_throughput_improvement}
-                icon={<DatabaseOutlined />}
-                color="success"
-              />
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <MetricCard
-                title="数据均衡度"
-                value={(latestResult.metrics.data_balance_score * 100).toFixed(1)}
-                unit="%"
-                improvement={latestResult.comparison?.data_balance_improvement}
-                icon={<DashboardOutlined />}
-                color="warning"
-              />
-            </Col>
-          </Row>
-        </div>
-      )}
-
-      {latestResult && (
-        <Card title="测试环境信息" style={{ marginBottom: 24 }}>
-          <Row gutter={[16, 16]}>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">CPU 型号</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.cpu_model}</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">CPU 核心数</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.cpu_cores} 核</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">内存</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.memory_gb.toFixed(1)} GB</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">节点数</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.node_count} 节点</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">操作系统</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.os_version}</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">Rust 版本</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.rust_version}</div>
-            </Col>
-            <Col xs={24} sm={12} md={6}>
-              <Typography.Text type="secondary">PowerFS 版本</Typography.Text>
-              <div style={{ fontWeight: 'bold' }}>{latestResult.environment.powerfs_version}</div>
             </Col>
           </Row>
         </Card>
       )}
 
-      <Card title="历史测试结果">
+      <Card title="历史测试记录" style={{ marginBottom: 24 }}>
         <Table
           dataSource={results}
           columns={resultColumns}
           rowKey="id"
+          size="small"
           pagination={{ pageSize: 10 }}
+          locale={{ emptyText: '暂无测试记录' }}
         />
+      </Card>
+
+      <Card title="优化项说明" size="small">
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="EC SIMD 编码">
+            使用 CPU 的 SIMD（单指令多数据）指令集加速纠删码编码计算，可显著提升大文件的编码性能。
+            建议在支持 AVX2 或更高版本指令集的 CPU 上启用。
+          </Descriptions.Item>
+          <Descriptions.Item label="EC 并行编码">
+            启用并行编码处理，将编码任务分配到多个 CPU 核心并行执行，充分利用多核 CPU 资源。
+            在多核心服务器上可大幅提升编码吞吐量。
+          </Descriptions.Item>
+          <Descriptions.Item label="EC 动态分片">
+            根据数据大小动态选择分片策略。对于小文件，使用更高效的分片大小，减少元数据开销；
+            对于大文件，使用标准分片大小，优化存储效率。
+          </Descriptions.Item>
+          <Descriptions.Item label="Raft 日志压缩">
+            压缩 Raft 日志条目，减少网络传输带宽和存储空间占用。适用于写入频繁的场景。
+          </Descriptions.Item>
+          <Descriptions.Item label="Raft 预投票">
+            启用预投票机制，在正式选举前先进行预投票，减少不必要的选举开销，提升集群稳定性。
+          </Descriptions.Item>
+          <Descriptions.Item label="Raft 读扩展">
+            允许 Follower 节点处理读请求，分散 Leader 节点的读负载，提升读吞吐量。
+          </Descriptions.Item>
+          <Descriptions.Item label="机架感知">
+            确保副本分布在不同机架，提高数据的容错能力。需要在多机架部署环境中启用。
+          </Descriptions.Item>
+          <Descriptions.Item label="智能缓存淘汰">
+            基于 LRU（最近最少使用）和访问频率的智能缓存淘汰策略，优化缓存命中率。
+          </Descriptions.Item>
+        </Descriptions>
       </Card>
     </div>
   );

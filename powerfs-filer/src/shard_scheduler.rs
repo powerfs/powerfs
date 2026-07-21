@@ -62,16 +62,39 @@ pub struct MigrationPlan {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerConfig {
+    #[serde(
+        serialize_with = "duration_to_secs",
+        deserialize_with = "secs_to_duration"
+    )]
     pub check_interval: Duration,
     pub max_transfers_per_round: usize,
+    #[serde(
+        serialize_with = "duration_to_secs",
+        deserialize_with = "secs_to_duration"
+    )]
     pub transfer_interval: Duration,
     pub cooldown_periods: usize,
     pub leader_imbalance_threshold: f64,
     pub cpu_threshold: f64,
     pub memory_threshold: f64,
     pub disk_threshold: f64,
+}
+
+fn duration_to_secs<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(duration.as_secs())
+}
+
+fn secs_to_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(Duration::from_secs(secs))
 }
 
 impl Default for SchedulerConfig {
@@ -105,7 +128,7 @@ pub struct ShardScheduler {
     raft_group_manager: Arc<RaftGroupManager>,
     shard_strategy: Arc<ShardStrategy>,
     node_metrics: RwLock<HashMap<String, NodeMetrics>>,
-    config: SchedulerConfig,
+    pub config: RwLock<SchedulerConfig>,
     running: Arc<RwLock<bool>>,
     total_migrations: Arc<std::sync::atomic::AtomicU64>,
     successful_migrations: Arc<std::sync::atomic::AtomicU64>,
@@ -122,7 +145,7 @@ impl ShardScheduler {
             raft_group_manager,
             shard_strategy,
             node_metrics: RwLock::new(HashMap::new()),
-            config: SchedulerConfig::default(),
+            config: RwLock::new(SchedulerConfig::default()),
             running: Arc::new(RwLock::new(false)),
             total_migrations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             successful_migrations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -140,7 +163,7 @@ impl ShardScheduler {
             raft_group_manager,
             shard_strategy,
             node_metrics: RwLock::new(HashMap::new()),
-            config,
+            config: RwLock::new(config),
             running: Arc::new(RwLock::new(false)),
             total_migrations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             successful_migrations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -149,8 +172,8 @@ impl ShardScheduler {
         }
     }
 
-    pub fn set_config(&mut self, config: SchedulerConfig) {
-        self.config = config;
+    pub fn set_config(&self, config: SchedulerConfig) {
+        *self.config.write().unwrap() = config;
     }
 
     pub fn register_node(&self, node_id: &str, address: &str) {
@@ -278,7 +301,16 @@ impl ShardScheduler {
         let total_leaders: usize = distribution.values().map(|v| v.len()).sum();
         let node_count = distribution.len();
         let avg_leaders = total_leaders as f64 / node_count as f64;
-        let threshold = avg_leaders * self.config.leader_imbalance_threshold;
+
+        let (leader_imbalance_threshold, max_transfers_per_round) = {
+            let config = self.config.read().unwrap();
+            (
+                config.leader_imbalance_threshold,
+                config.max_transfers_per_round,
+            )
+        };
+
+        let threshold = avg_leaders * leader_imbalance_threshold;
 
         info!(
             "Leader distribution analysis: {} total leaders, {} nodes, avg={:.2}, threshold={:.2}",
@@ -308,7 +340,7 @@ impl ShardScheduler {
 
         for (_high_score, high_addr, high_shards) in high_load_nodes {
             for &shard_id in high_shards {
-                if plans.len() >= self.config.max_transfers_per_round {
+                if plans.len() >= max_transfers_per_round {
                     return plans;
                 }
 
@@ -395,7 +427,11 @@ impl ShardScheduler {
                 }
             }
 
-            tokio::time::sleep(self.config.transfer_interval).await;
+            let transfer_interval = {
+                let config = self.config.read().unwrap();
+                config.transfer_interval
+            };
+            tokio::time::sleep(transfer_interval).await;
         }
     }
 
@@ -429,17 +465,19 @@ impl ShardScheduler {
     }
 
     pub async fn run(&self) {
-        info!(
-            "Starting ShardScheduler with interval {:?}",
-            self.config.check_interval
-        );
+        let check_interval = {
+            let config = self.config.read().unwrap();
+            let interval = config.check_interval;
+            info!("Starting ShardScheduler with interval {:?}", interval);
+            interval
+        };
 
         {
             let mut running = self.running.write().unwrap();
             *running = true;
         }
 
-        let mut tick_interval = interval(self.config.check_interval);
+        let mut tick_interval = interval(check_interval);
 
         while *self.running.read().unwrap() {
             tokio::select! {

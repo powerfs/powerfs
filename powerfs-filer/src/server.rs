@@ -2,7 +2,7 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     response::IntoResponse,
-    routing::{delete, get, head, put},
+    routing::{delete, get, head, post, put},
     Json, Router, Server,
 };
 use log::info;
@@ -15,20 +15,26 @@ use crate::meta_shard_manager::{FilerStatus, MetaShardManager, ShardDetail};
 use crate::metadata_store::MetadataStore;
 use crate::raft_group_manager::ShardId;
 use crate::s3_handler::S3Handler;
+use crate::shard_scheduler::{SchedulerConfig, SchedulerStatus};
 use crate::volume_router::VolumeRouter;
+
+use crate::shard_scheduler::ShardScheduler;
 
 pub struct FilerServer {
     s3_handler: Arc<S3Handler>,
     meta_shard_manager: Arc<MetaShardManager>,
+    shard_scheduler: Arc<ShardScheduler>,
     addr: std::net::SocketAddr,
 }
 
 pub struct FilerState {
     s3_handler: Arc<S3Handler>,
     meta_shard_manager: Arc<MetaShardManager>,
+    shard_scheduler: Arc<ShardScheduler>,
 }
 
 impl FilerServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         addr: std::net::SocketAddr,
         _metadata_store: Arc<MetadataStore>,
@@ -37,10 +43,12 @@ impl FilerServer {
         _volume_router: Arc<VolumeRouter>,
         s3_handler: Arc<S3Handler>,
         meta_shard_manager: Arc<MetaShardManager>,
+        shard_scheduler: Arc<ShardScheduler>,
     ) -> Self {
         Self {
             s3_handler,
             meta_shard_manager,
+            shard_scheduler,
             addr,
         }
     }
@@ -49,6 +57,7 @@ impl FilerServer {
         let state = Arc::new(FilerState {
             s3_handler: self.s3_handler,
             meta_shard_manager: self.meta_shard_manager,
+            shard_scheduler: self.shard_scheduler,
         });
 
         let router = Router::new()
@@ -60,6 +69,12 @@ impl FilerServer {
             .route("/admin/status", get(admin_status))
             .route("/admin/shards", get(admin_list_shards))
             .route("/admin/shards/:id", get(admin_get_shard))
+            .route("/admin/balancer/status", get(admin_balancer_status))
+            .route("/admin/balancer/start", post(admin_balancer_start))
+            .route("/admin/balancer/stop", post(admin_balancer_stop))
+            .route("/admin/balancer/trigger", post(admin_balancer_trigger))
+            .route("/admin/balancer/config", get(admin_balancer_get_config))
+            .route("/admin/balancer/config", put(admin_balancer_set_config))
             .route("/", get(list_buckets))
             .route("/:bucket", put(create_bucket))
             .route("/:bucket", delete(delete_bucket))
@@ -155,4 +170,47 @@ async fn admin_get_shard(
         Some(detail) => Json(detail).into_response(),
         None => (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response(),
     }
+}
+
+async fn admin_balancer_status(State(state): State<Arc<FilerState>>) -> Json<SchedulerStatus> {
+    let status = state.shard_scheduler.get_status().await;
+    Json(status)
+}
+
+async fn admin_balancer_start(State(state): State<Arc<FilerState>>) -> axum::response::Response {
+    tokio::spawn({
+        let scheduler = state.shard_scheduler.clone();
+        async move {
+            scheduler.run().await;
+        }
+    });
+    (axum::http::StatusCode::OK, "Balancer started").into_response()
+}
+
+async fn admin_balancer_stop(State(state): State<Arc<FilerState>>) -> axum::response::Response {
+    state.shard_scheduler.stop().await;
+    (axum::http::StatusCode::OK, "Balancer stopped").into_response()
+}
+
+async fn admin_balancer_trigger(State(state): State<Arc<FilerState>>) -> axum::response::Response {
+    tokio::spawn({
+        let scheduler = state.shard_scheduler.clone();
+        async move {
+            scheduler.trigger_balance().await;
+        }
+    });
+    (axum::http::StatusCode::OK, "Balance triggered").into_response()
+}
+
+async fn admin_balancer_get_config(State(state): State<Arc<FilerState>>) -> Json<SchedulerConfig> {
+    let config = state.shard_scheduler.config.read().unwrap().clone();
+    Json(config)
+}
+
+async fn admin_balancer_set_config(
+    State(state): State<Arc<FilerState>>,
+    Json(config): Json<SchedulerConfig>,
+) -> axum::response::Response {
+    state.shard_scheduler.set_config(config);
+    (axum::http::StatusCode::OK, "Config updated").into_response()
 }

@@ -1,0 +1,8 @@
+[global]
+log_level = "info"
+
+[monitor]
+redis_url = "redis://redis:6379"
+s3_endpoint = "http://172.20.0.32:9000"
+s3_backend_endpoint = "http://172.20.0.32:9000"
+master_endpoint = "172.20.0.11:9333"

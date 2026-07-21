@@ -13,6 +13,7 @@ import S3 from './pages/S3'
 import Fuse from './pages/Fuse'
 import Filer from './pages/Filer'
 import Shards from './pages/Shards'
+import ShardBalancing from './pages/ShardBalancing'
 import Conflicts from './pages/Conflicts'
 import Users from './pages/Users'
 import Roles from './pages/Roles'
@@ -110,6 +111,14 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <Shards />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="shard-balancing"
+          element={
+            <ProtectedRoute requireAdmin>
+              <ShardBalancing />
             </ProtectedRoute>
           }
         />

@@ -1,6 +1,6 @@
 import axios from 'axios'
 import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail } from '@/types'
-import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
+import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
 const api = axios.create({
@@ -78,7 +78,7 @@ api.interceptors.response.use(
   },
 )
 
-let useMock = false
+let useMock = true
 
 let mockKVNamespaces: KVNamespace[] = [
   { id: 'ns-1', name: 'default', owner_id: 'user-1', created_at: Date.now() - 86400000, updated_at: Date.now() - 86400000 },
@@ -338,7 +338,7 @@ export async function deleteS3AccessKey(accessKey: string): Promise<void> {
 
 export async function getFuseMounts(): Promise<FuseMount[]> {
   if (useMock) {
-    return []
+    return mockFuseMounts
   }
   const response = await api.get('/fuse/mounts')
   return response.data.data
@@ -788,6 +788,62 @@ export async function getBenchmarkReportById(id: string): Promise<BenchmarkResul
   return response.data.data
 }
 
+export interface OptimizationFlags {
+  ec_simd_enabled: boolean
+  ec_parallel_encoding: boolean
+  ec_dynamic_sharding: boolean
+  ec_small_file_skip: boolean
+  raft_log_compression: boolean
+  raft_pre_vote: boolean
+  raft_read_scaling: boolean
+  rack_awareness: boolean
+  load_balancing: boolean
+  smart_cache_eviction: boolean
+  hierarchical_index: boolean
+}
+
+export async function getOptimizationFlags(): Promise<{ flags: OptimizationFlags }> {
+  if (useMock) {
+    return {
+      flags: {
+        ec_simd_enabled: true,
+        ec_parallel_encoding: true,
+        ec_dynamic_sharding: true,
+        ec_small_file_skip: false,
+        raft_log_compression: true,
+        raft_pre_vote: true,
+        raft_read_scaling: true,
+        rack_awareness: false,
+        load_balancing: true,
+        smart_cache_eviction: true,
+        hierarchical_index: true,
+      },
+    }
+  }
+  const response = await api.get('/optimizations')
+  return response.data
+}
+
+export async function updateOptimizationFlag(flagName: string, value: boolean): Promise<void> {
+  if (useMock) return
+  await api.put(`/optimizations/${flagName}`, { value })
+}
+
+export async function resetOptimizationFlags(): Promise<void> {
+  if (useMock) return
+  await api.post('/optimizations/reset')
+}
+
+export async function setOptimizationBaseline(): Promise<void> {
+  if (useMock) return
+  await api.post('/optimizations/baseline')
+}
+
+export async function runOptimizationBenchmark(): Promise<void> {
+  if (useMock) return
+  await api.post('/benchmark/run', { test_duration_seconds: 30 })
+}
+
 // ===== Filer & Shard management =====
 // Note: Filer admin APIs are proxied via nginx (/api/filer/* -> filer:8888/admin/*)
 // and return data directly (no { data: ... } wrapper), so we access response.data directly.
@@ -827,4 +883,86 @@ export async function getShardDetail(id: number): Promise<ShardDetail> {
   }
   const response = await api.get(`/filer/shards/${id}`)
   return response.data
+}
+
+// ===== Shard Balancer API =====
+
+export interface SchedulerStatus {
+  is_running: boolean
+  last_check_time: number
+  total_migrations: number
+  successful_migrations: number
+  failed_migrations: number
+  node_count: number
+  shard_count: number
+  leader_distribution: Record<string, number>
+}
+
+export interface SchedulerConfig {
+  check_interval: number
+  max_transfers_per_round: number
+  transfer_interval: number
+  cooldown_periods: number
+  leader_imbalance_threshold: number
+  cpu_threshold: number
+  memory_threshold: number
+  disk_threshold: number
+}
+
+export async function getBalancerStatus(): Promise<SchedulerStatus> {
+  if (useMock) {
+    return {
+      is_running: true,
+      last_check_time: Date.now() / 1000 | 0,
+      total_migrations: 5,
+      successful_migrations: 5,
+      failed_migrations: 0,
+      node_count: 3,
+      shard_count: 4,
+      leader_distribution: {
+        '127.0.0.1:8889': 2,
+        '127.0.0.1:8890': 1,
+        '127.0.0.1:8891': 1,
+      },
+    }
+  }
+  const response = await api.get('/filer/balancer/status')
+  return response.data
+}
+
+export async function startBalancer(): Promise<void> {
+  if (useMock) return
+  await api.post('/filer/balancer/start')
+}
+
+export async function stopBalancer(): Promise<void> {
+  if (useMock) return
+  await api.post('/filer/balancer/stop')
+}
+
+export async function triggerBalance(): Promise<void> {
+  if (useMock) return
+  await api.post('/filer/balancer/trigger')
+}
+
+export async function getBalancerConfig(): Promise<SchedulerConfig> {
+  if (useMock) {
+    return {
+      check_interval: 60,
+      max_transfers_per_round: 2,
+      transfer_interval: 10,
+      cooldown_periods: 5,
+      leader_imbalance_threshold: 1.5,
+      cpu_threshold: 0.8,
+      memory_threshold: 0.85,
+      disk_threshold: 0.1,
+    }
+  }
+  const response = await api.get('/filer/balancer/config')
+  return response.data
+}
+
+export async function setBalancerConfig(config: SchedulerConfig): Promise<void> {
+  if (useMock) return
+  await api.put('/filer/balancer/config', config)
 }

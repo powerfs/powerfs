@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["redis-event"]
 
 redis-event = ["dep:redis"]
 redis-metrics = ["dep:redis"]

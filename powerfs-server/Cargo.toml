@@ -8,7 +8,7 @@ name = "powerfs"
 path = "src/main.rs"
 
 [features]
-default = ["fuse", "kv", "s3", "monitor"]
+default = ["fuse", "kv", "s3", "monitor", "redis-event"]
 
 fuse = ["powerfs-fuse"]
 kv = ["powerfs-master/kv"]
@@ -18,7 +18,7 @@ monitor = []
 spdk = ["powerfs-core/spdk"]
 spdk-stub = ["powerfs-core/spdk-stub"]
 
-redis-event = ["powerfs-common/redis-event", "powerfs-monitor/redis", "powerfs-filer/redis-event"]
+redis-event = ["dep:redis", "powerfs-common/redis-event", "powerfs-monitor/redis", "powerfs-filer/redis-event"]
 redis-metrics = ["powerfs-common/redis-metrics"]
 
 [dependencies]

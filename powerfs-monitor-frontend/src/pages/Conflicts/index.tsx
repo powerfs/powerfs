@@ -16,6 +16,7 @@ import {
   message,
   Tooltip,
   Switch,
+  Typography,
 } from 'antd'
 import {
   WarningOutlined,
@@ -25,7 +26,9 @@ import {
   StopOutlined,
   EyeOutlined,
   FilterOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
+const { Text } = Typography
 import type { ConflictRecord, ConflictStats } from '@/types'
 import {
   getConflicts,
@@ -36,12 +39,12 @@ import {
   batchIgnoreConflicts,
 } from '@/services/api'
 
-const CONFLICT_TYPE_LABELS: Record<number, { label: string; color: string }> = {
-  0: { label: 'CreateCreate', color: 'blue' },
-  1: { label: 'WriteWrite', color: 'orange' },
-  2: { label: 'WriteUnlink', color: 'gold' },
-  3: { label: 'DeleteCreate', color: 'volcano' },
-  4: { label: 'RenameConflict', color: 'magenta' },
+const CONFLICT_TYPE_LABELS: Record<number, { label: string; color: string; desc: string }> = {
+  0: { label: '重复创建', color: 'blue', desc: '多个客户端同时创建了同名文件' },
+  1: { label: '重复写入', color: 'orange', desc: '多个客户端同时修改了同一文件' },
+  2: { label: '写入删除', color: 'gold', desc: '一个客户端写入文件时，另一个客户端删除了该文件' },
+  3: { label: '删除重建', color: 'volcano', desc: '一个客户端删除文件后，另一个客户端又创建了同名文件' },
+  4: { label: '重命名冲突', color: 'magenta', desc: '多个客户端同时对文件进行了重命名操作' },
 }
 
 const RESOLUTION_LABELS: Record<number, string> = {
@@ -304,6 +307,16 @@ function Conflicts() {
 
   return (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            冲突是指多个客户端在离线或网络分区情况下，对同一文件执行了不同操作，导致数据不一致的情况。
+            系统会自动检测冲突并记录，管理员可以选择手动解决或使用自动策略批量处理。
+          </Text>
+        </div>
+      </Card>
+
       {/* Statistics Cards */}
       <Row gutter={16} style={{ marginBottom: 16 }}>
         <Col span={6}>
@@ -640,6 +653,30 @@ function Conflicts() {
           }))}
         />
       </Modal>
+
+      {/* Help Section */}
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是冲突？">
+            当多个客户端在离线或网络分区情况下对同一文件执行不同操作时，就会产生冲突。例如：两个客户端同时修改同一文件、一个客户端删除文件而另一个客户端写入该文件等。
+          </Descriptions.Item>
+          <Descriptions.Item label="冲突类型说明">
+            <ul style={{ margin: 0, paddingLeft: 20 }}>
+              <li><strong>重复创建：</strong>多个客户端同时创建了同名文件</li>
+              <li><strong>重复写入：</strong>多个客户端同时修改了同一文件</li>
+              <li><strong>写入删除：</strong>一个客户端写入文件时，另一个客户端删除了该文件</li>
+              <li><strong>删除重建：</strong>一个客户端删除文件后，另一个客户端又创建了同名文件</li>
+              <li><strong>重命名冲突：</strong>多个客户端同时对文件进行了重命名操作</li>
+            </ul>
+          </Descriptions.Item>
+          <Descriptions.Item label="如何解决冲突？">
+            可以选择手动逐个解决，也可以使用自动解决或批量解决功能。自动解决支持多种策略：最后写入胜出、内容哈希比较、权重优先等。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么时候需要忽略冲突？">
+            忽略冲突会标记冲突为已处理但不做任何实际操作。适用于确认冲突内容不重要或已在其他地方处理过的情况。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
     </div>
   )
 }

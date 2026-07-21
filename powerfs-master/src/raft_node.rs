@@ -130,7 +130,7 @@ impl RaftNode {
                 .map_err(|e| format!("failed to create storage: {}", e))?
         };
 
-        let _initial_state = storage
+        let initial_state = storage
             .initial_state()
             .map_err(|e| format!("failed to get initial state: {}", e))?;
 
@@ -147,9 +147,16 @@ impl RaftNode {
         cfg.validate()
             .map_err(|e| format!("invalid raft config: {}", e))?;
 
-        // Set applied to last index from storage
+        // Set applied to min(last_index, commit_index) to ensure consistency
         if let Ok(last_idx) = storage.last_index() {
-            cfg.applied = last_idx;
+            let commit_index = initial_state.hard_state.commit;
+            cfg.applied = last_idx.min(commit_index);
+            if cfg.applied < last_idx {
+                warn!(
+                    "Clamped applied index from {} to {} (commit={})",
+                    last_idx, cfg.applied, commit_index
+                );
+            }
         }
 
         let logger = Logger::root(Discard, slog::o!());

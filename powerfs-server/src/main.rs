@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use log::{info, warn};
 use powerfs_common::{
+    config::PowerFsConfig,
     error::{PowerFsError, Result},
     types::NodeId,
     utils::generate_node_id,
@@ -94,6 +95,10 @@ enum Commands {
         /// Raft peer addresses (e.g., --peer=172.20.0.11:9333 --peer=172.20.0.12:9333)
         #[arg(long, short = 'p')]
         peer: Vec<String>,
+
+        /// Configuration file path (TOML format)
+        #[arg(long, short = 'c')]
+        config: Option<String>,
     },
 
     Volume {
@@ -161,6 +166,10 @@ enum Commands {
         /// Raft peer addresses
         #[arg(long, action = clap::ArgAction::Append)]
         raft_peer: Vec<String>,
+
+        /// Configuration file path (TOML format)
+        #[arg(long, short = 'c')]
+        config: Option<String>,
     },
 
     Fuse {
@@ -210,6 +219,10 @@ enum Commands {
         /// S3 secret key
         #[arg(long, default_value = "powerfs123")]
         secret_key: String,
+
+        /// Configuration file path (TOML format)
+        #[arg(long, short = 'c')]
+        config: Option<String>,
     },
 
     /// Offline Raft maintenance: verify, repair, or reset the Raft log.
@@ -226,6 +239,27 @@ enum Commands {
         #[command(subcommand)]
         action: RaftAction,
     },
+}
+
+fn load_config(config_path: &Option<String>) -> PowerFsConfig {
+    match config_path {
+        Some(path) => match PowerFsConfig::load_from_file(path) {
+            Ok(cfg) => {
+                if let Err(e) = cfg.validate() {
+                    warn!("Config validation failed: {}, using defaults", e);
+                    PowerFsConfig::default()
+                } else {
+                    info!("Loaded config from: {}", path);
+                    cfg
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load config file: {}, using defaults", e);
+                PowerFsConfig::default()
+            }
+        },
+        None => PowerFsConfig::default(),
+    }
 }
 
 #[tokio::main]
@@ -301,16 +335,31 @@ async fn main() -> Result<()> {
             advertise_addr,
             raft_id,
             peer,
+            config,
         } => {
+            let cfg = load_config(&config);
+            let master_cfg = cfg.master;
             run_master(RunMasterParams {
-                port,
-                dir: &dir,
-                raft_dir,
-                meta_dir,
-                ip,
-                advertise_addr,
-                raft_id,
-                peers: peer,
+                port: if port != 9333 { port } else { master_cfg.port },
+                dir: if !dir.is_empty() && dir != "./data/master" {
+                    &dir
+                } else {
+                    &master_cfg.dir
+                },
+                raft_dir: raft_dir.or(master_cfg.raft_dir),
+                meta_dir: meta_dir.or(master_cfg.meta_dir),
+                ip: ip.or(master_cfg.ip),
+                advertise_addr: advertise_addr.or(master_cfg.advertise_addr),
+                raft_id: if raft_id != 1 {
+                    raft_id
+                } else {
+                    master_cfg.raft_id
+                },
+                peers: if !peer.is_empty() {
+                    peer
+                } else {
+                    master_cfg.peers
+                },
             })
             .await
         }
@@ -325,14 +374,24 @@ async fn main() -> Result<()> {
             max_volume_size,
             config,
         } => {
+            let cfg = load_config(&config);
+            let volume_cfg = cfg.volume;
             run_volume(
-                port,
+                if port != 8080 {
+                    port
+                } else {
+                    volume_cfg.grpc_port
+                },
                 &dir,
                 meta_dir,
                 data_dir,
                 &master,
                 ip,
-                max_volume_size,
+                if max_volume_size != 1073741824 {
+                    max_volume_size
+                } else {
+                    volume_cfg.max_volume_size
+                },
                 config.as_deref(),
             )
             .await
@@ -348,16 +407,43 @@ async fn main() -> Result<()> {
             shard_count,
             raft_id,
             raft_peer,
+            config,
         } => {
+            let cfg = load_config(&config);
+            let filer_cfg = cfg.filer;
             run_filer(
-                port,
-                grpc_port,
-                &master,
-                ip,
-                &data_dir,
-                shard_count,
-                raft_id,
-                &raft_peer,
+                if port != 8888 { port } else { filer_cfg.port },
+                if grpc_port != 8889 {
+                    grpc_port
+                } else {
+                    filer_cfg.grpc_port
+                },
+                if !master.is_empty() {
+                    &master
+                } else {
+                    &filer_cfg.master_addresses
+                },
+                ip.or(filer_cfg.ip),
+                if !data_dir.is_empty() && data_dir != "./data/filer" {
+                    &data_dir
+                } else {
+                    &filer_cfg.data_dir
+                },
+                if shard_count != 4 {
+                    shard_count
+                } else {
+                    filer_cfg.shard_count
+                },
+                if raft_id != 1 {
+                    raft_id
+                } else {
+                    filer_cfg.raft_id
+                },
+                if !raft_peer.is_empty() {
+                    &raft_peer
+                } else {
+                    &filer_cfg.raft_peers
+                },
             )
             .await
         }
@@ -382,7 +468,36 @@ async fn main() -> Result<()> {
             dir,
             access_key,
             secret_key,
-        } => run_s3(port, &master, ip, &dir, &access_key, &secret_key).await,
+            config,
+        } => {
+            let cfg = load_config(&config);
+            let s3_cfg = cfg.s3;
+            run_s3(
+                if port != 9000 { port } else { s3_cfg.port },
+                if !master.is_empty() {
+                    &master
+                } else {
+                    &s3_cfg.master_address
+                },
+                ip.or(s3_cfg.ip),
+                if !dir.is_empty() && dir != "./data/s3" {
+                    &dir
+                } else {
+                    &s3_cfg.dir
+                },
+                if !access_key.is_empty() && access_key != "powerfs" {
+                    &access_key
+                } else {
+                    &s3_cfg.access_key
+                },
+                if !secret_key.is_empty() && secret_key != "powerfs123" {
+                    &secret_key
+                } else {
+                    &s3_cfg.secret_key
+                },
+            )
+            .await
+        }
 
         Commands::Raft {
             dir,
@@ -877,6 +992,24 @@ async fn run_filer(
         info!("Shard {} initialized", i);
     }
 
+    let shard_scheduler = Arc::new(powerfs_filer::ShardScheduler::new(
+        raft_group_manager.clone(),
+        shard_strategy.clone(),
+    ));
+
+    for peer in &peers {
+        shard_scheduler.register_node(&peer.id.to_string(), &peer.address);
+    }
+
+    tokio::spawn({
+        let shard_scheduler = shard_scheduler.clone();
+        async move {
+            shard_scheduler.run().await;
+        }
+    });
+
+    info!("ShardScheduler started with {} nodes", peers.len());
+
     let s3_handler = Arc::new(
         powerfs_filer::S3Handler::new(
             bucket_manager.clone(),
@@ -896,6 +1029,7 @@ async fn run_filer(
         volume_router.clone(),
         s3_handler.clone(),
         meta_shard_manager.clone(),
+        shard_scheduler.clone(),
     );
 
     let grpc_service = powerfs_filer::FilerMetaServiceImpl::new(

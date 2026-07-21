@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, message, Form, Input, Tabs } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, message, Form, Input, Tabs, Descriptions, Typography } from 'antd'
+const { Text } = Typography
 import {
   KeyOutlined,
   DeleteOutlined,
@@ -7,6 +8,7 @@ import {
   WarningOutlined,
   ApiOutlined,
   PlusOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
 import type { KVSessionInfo, KVMetrics, KVNamespace } from '@/types'
@@ -237,6 +239,16 @@ function KV() {
 
   const SessionMonitor = () => (
     <div>
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <InfoCircleOutlined style={{ fontSize: 16, color: 'var(--pf-color-primary)' }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            KV 存储是 PowerFS 的分布式键值存储组件，用于存储文件系统的元数据和索引数据。
+            会话是客户端与 KV 存储之间的连接，命名空间用于隔离不同应用的数据。
+          </Text>
+        </div>
+      </Card>
+
       <div style={{ marginBottom: 16, display: 'flex', gap: 16 }}>
         <div style={{ flex: 1 }}>
           <Card
@@ -548,6 +560,26 @@ function KV() {
           },
         ]}
       />
+
+      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是 KV 存储？">
+            KV（键值）存储是 PowerFS 的分布式存储组件，用于存储文件系统的元数据、索引和配置信息。它提供高性能的读写能力，支持自动分片和数据冗余。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是会话（Session）？">
+            会话是客户端与 KV 存储之间的逻辑连接。每个会话维护自己的缓存空间，包含多个数据层（Layer）和数据块（Block）。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是命名空间（Namespace）？">
+            命名空间用于隔离不同应用或用户的数据。不同命名空间之间的数据是完全隔离的，可用于多租户场景。
+          </Descriptions.Item>
+          <Descriptions.Item label="命中率是什么？">
+            命中率是指缓存命中的比例。较高的命中率（通常 &gt;90%）表示缓存工作正常，大多数请求可以直接从缓存返回，不需要访问后端存储。
+          </Descriptions.Item>
+          <Descriptions.Item label="驱逐次数是什么？">
+            当缓存空间不足时，系统会按照 LRU 策略淘汰最久未使用的数据块，这个过程称为驱逐。频繁的驱逐可能意味着缓存空间不足。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
 
       <Modal
         title="创建命名空间"

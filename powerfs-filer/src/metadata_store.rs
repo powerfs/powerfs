@@ -1,8 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[cfg(feature = "redis-event")]
 use redis::AsyncCommands;
@@ -170,7 +169,6 @@ impl MetadataStore {
     }
 
     pub async fn get_entry(&self, bucket: &str, key: &str) -> Option<EntryInfo> {
-        let entry_key = format!("{}:{}", bucket, key);
         #[cfg(feature = "redis-event")]
         {
             let redis_key = format!("entry:{}/{}", bucket, key);
@@ -186,6 +184,7 @@ impl MetadataStore {
         }
         #[cfg(not(feature = "redis-event"))]
         {
+            let entry_key = format!("{}:{}", bucket, key);
             self.entries
                 .read()
                 .ok()
@@ -194,7 +193,6 @@ impl MetadataStore {
     }
 
     pub async fn put_entry(&self, bucket: &str, key: &str, info: &EntryInfo) -> bool {
-        let entry_key = format!("{}:{}", bucket, key);
         #[cfg(feature = "redis-event")]
         {
             let redis_key = format!("entry:{}/{}", bucket, key);
@@ -211,6 +209,7 @@ impl MetadataStore {
         }
         #[cfg(not(feature = "redis-event"))]
         {
+            let entry_key = format!("{}:{}", bucket, key);
             self.entries
                 .write()
                 .map(|mut e| e.insert(entry_key, info.clone()))
@@ -219,7 +218,6 @@ impl MetadataStore {
     }
 
     pub async fn delete_entry(&self, bucket: &str, key: &str) -> bool {
-        let entry_key = format!("{}:{}", bucket, key);
         #[cfg(feature = "redis-event")]
         {
             let redis_key = format!("entry:{}/{}", bucket, key);
@@ -235,6 +233,7 @@ impl MetadataStore {
         }
         #[cfg(not(feature = "redis-event"))]
         {
+            let entry_key = format!("{}:{}", bucket, key);
             self.entries
                 .write()
                 .map(|mut e| e.remove(&entry_key))

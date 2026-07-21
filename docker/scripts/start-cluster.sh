@@ -43,6 +43,7 @@ if [ "$BUILD_IMAGES" = true ]; then
 
     echo "  Building Rust binaries..."
     cd "$PROJECT_DIR"
+    source "$HOME/.cargo/env" 2>/dev/null || true
     cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor $SPDK_FEATURE 2>&1 | tail -5
     echo "  [OK] Binaries built"
 

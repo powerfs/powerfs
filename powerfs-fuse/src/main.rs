@@ -11,6 +11,8 @@ use powerfs_fuse_enterprise::FuserApp;
 #[cfg(not(feature = "enterprise"))]
 use powerfs_fuse::FuserApp;
 
+use powerfs_common::config::PowerFsConfig;
+
 static MOUNT_POINT_PATH: OnceLock<CString> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -63,6 +65,9 @@ struct Args {
     /// Enable data integrity verification (MD5 check after write, default: false)
     #[arg(long, default_value = "false")]
     verify_data: bool,
+
+    #[arg(long, short = 'c')]
+    config: Option<String>,
 }
 
 /// Async-signal-safe handler: only calls write(2) and umount2(2).
@@ -102,7 +107,53 @@ fn install_signal_handlers(mount_point: &str) {
 fn main() {
     let args = Args::parse();
 
-    let log_level = if args.verbose { "debug" } else { "info" };
+    let cfg = load_config(&args.config);
+    let fuse_cfg = cfg.fuse;
+
+    let master_addrs =
+        if !args.master.is_empty() && args.master != vec!["localhost:9334".to_string()] {
+            args.master.clone()
+        } else {
+            fuse_cfg.master_addresses.clone()
+        };
+
+    let mount_point = if !args.mount_point.is_empty() {
+        args.mount_point.clone()
+    } else {
+        fuse_cfg.mount_point.clone()
+    };
+
+    let collection = if !args.collection.is_empty() && args.collection != "default" {
+        args.collection.clone()
+    } else {
+        fuse_cfg.collection.clone()
+    };
+
+    let replication = if !args.replication.is_empty() && args.replication != "000" {
+        args.replication.clone()
+    } else {
+        fuse_cfg.replication.clone()
+    };
+
+    let threads = if args.threads != 8 {
+        args.threads
+    } else {
+        fuse_cfg.threads
+    };
+    let verbose = if args.verbose { true } else { fuse_cfg.verbose };
+    let container = if args.container {
+        true
+    } else {
+        fuse_cfg.container
+    };
+
+    let log_level = if verbose { "debug" } else { "info" };
+
+    let log_file = if args.log_file.is_some() {
+        args.log_file.clone()
+    } else {
+        fuse_cfg.log_file.clone()
+    };
 
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
@@ -118,46 +169,66 @@ fn main() {
         )
     });
 
-    if let Some(log_file) = &args.log_file {
+    if let Some(log_file_path) = &log_file {
         use std::fs::{self, File};
         use std::path::Path;
 
-        let log_path = Path::new(log_file);
+        let log_path = Path::new(log_file_path);
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).unwrap_or_else(|e| {
                 eprintln!("Failed to create log directory: {}", e);
             });
         }
 
-        let file = File::create(log_file).unwrap_or_else(|e| {
+        let file = File::create(log_file_path).unwrap_or_else(|e| {
             eprintln!("Failed to create log file: {}", e);
             std::process::exit(1);
         });
 
         builder.target(env_logger::Target::Pipe(Box::new(file)));
-        info!("Logging to file: {}", log_file);
+        info!("Logging to file: {}", log_file_path);
     }
 
     builder.init();
 
-    // Emit build info (version, git commit, build time, etc.) at startup.
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
 
     info!("PowerFS FUSE Client starting...");
-    info!("  Masters: {}", args.master.join(", "));
-    info!("  Mount point: {}", args.mount_point);
-    info!("  Collection: {}", args.collection);
-    info!("  Replication: {}", args.replication);
-    info!("  Worker threads: {}", args.threads);
-    info!("  Container mode: {}", args.container);
+    info!("  Masters: {}", master_addrs.join(", "));
+    info!("  Mount point: {}", mount_point);
+    info!("  Collection: {}", collection);
+    info!("  Replication: {}", replication);
+    info!("  Worker threads: {}", threads);
+    info!("  Container mode: {}", container);
     info!("  Data verification: {}", args.verify_data);
 
+    fn load_config(config_path: &Option<String>) -> PowerFsConfig {
+        match config_path {
+            Some(path) => match PowerFsConfig::load_from_file(path) {
+                Ok(cfg) => {
+                    if let Err(e) = cfg.validate() {
+                        warn!("Config validation failed: {}, using defaults", e);
+                        PowerFsConfig::default()
+                    } else {
+                        info!("Loaded config from: {}", path);
+                        cfg
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load config file: {}, using defaults", e);
+                    PowerFsConfig::default()
+                }
+            },
+            None => PowerFsConfig::default(),
+        }
+    }
+
     // Create mount point directory if it doesn't exist
-    let mount_path = std::path::Path::new(&args.mount_point);
+    let mount_path = std::path::Path::new(&mount_point);
     if !mount_path.exists() {
         std::fs::create_dir_all(mount_path).expect("Failed to create mount point directory");
-        info!("Created mount point: {}", args.mount_point);
+        info!("Created mount point: {}", mount_point);
     } else if mount_path.is_file() {
         panic!("Mount point path is a file, not a directory");
     }
@@ -166,8 +237,8 @@ fn main() {
     // processes blocked on FUSE reads/writes are woken instead of staying in
     // D state forever. The session's /dev/fuse read then returns ENODEV and
     // run() returns naturally — no signal-driven termination.
-    if args.container {
-        install_signal_handlers(&args.mount_point);
+    if container {
+        install_signal_handlers(&mount_point);
     }
 
     // Create tokio runtime
@@ -175,17 +246,17 @@ fn main() {
 
     let result = runtime.block_on(async {
         let fuse_client = FuserApp::new(
-            &args.master,
-            &args.mount_point,
-            &args.collection,
-            &args.replication,
-            args.threads,
+            &master_addrs,
+            &mount_point,
+            &collection,
+            &replication,
+            threads,
             args.verify_data,
         )
         .await
         .expect("Failed to create FUSE client");
 
-        info!("Mounting PowerFS at: {}", args.mount_point);
+        info!("Mounting PowerFS at: {}", mount_point);
 
         fuse_client.run().await
     });
@@ -201,7 +272,7 @@ fn main() {
     // Final cleanup: ensure the mount point is unmounted even if the session
     // exited abnormally. This is critical for container mode — without it,
     // blocked FUSE callers stay in D state.
-    let c_path = CString::new(args.mount_point.as_str()).unwrap();
+    let c_path = CString::new(mount_point.as_str()).unwrap();
     let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_FORCE) };
     if ret == 0 {
         info!("Mount point unmounted on exit");

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
+use powerfs_common::config::PowerFsConfig;
 use powerfs_kv_client::KvCacheClient;
 use powerfs_master::proto::powerfs::master_service_client::MasterServiceClient;
 use powerfs_master::proto::powerfs::{
@@ -89,6 +90,9 @@ struct Args {
 
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    #[arg(long, short = 'c')]
+    config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3498,9 +3502,17 @@ async fn delete_kv_access_key(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&args.log_level),
-    );
+    let cfg = load_config(&args.config);
+    let monitor_cfg = cfg.monitor;
+
+    let log_level = if args.log_level != "info" {
+        &args.log_level
+    } else {
+        &monitor_cfg.redis_url
+    };
+
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
 
     builder.format(|buf, record| {
         writeln!(
@@ -3535,13 +3547,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     builder.init();
 
-    // Emit build info (version, git commit, build time, etc.) at startup.
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
 
+    let redis_url = if args.redis_url != "redis://localhost:6379" {
+        &args.redis_url
+    } else {
+        &monitor_cfg.redis_url
+    };
+    let s3_endpoint = if args.s3_endpoint != "http://localhost:9000" {
+        &args.s3_endpoint
+    } else {
+        &monitor_cfg.s3_endpoint
+    };
+    let s3_backend_endpoint = if args.s3_backend_endpoint != "http://localhost:9002" {
+        &args.s3_backend_endpoint
+    } else {
+        &monitor_cfg.s3_backend_endpoint
+    };
+    let master_endpoint = if args.master_endpoint != "localhost:9333" {
+        &args.master_endpoint
+    } else {
+        &monitor_cfg.master_endpoint
+    };
+
     info!("Starting PowerFS Monitor Service...");
     info!("Listening on: {}", args.addr);
-    info!("Redis URL: {}", args.redis_url);
+    info!("Redis URL: {}", redis_url);
+
+    fn load_config(config_path: &Option<String>) -> PowerFsConfig {
+        match config_path {
+            Some(path) => match PowerFsConfig::load_from_file(path) {
+                Ok(cfg) => {
+                    if let Err(e) = cfg.validate() {
+                        warn!("Config validation failed: {}, using defaults", e);
+                        PowerFsConfig::default()
+                    } else {
+                        info!("Loaded config from: {}", path);
+                        cfg
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load config file: {}, using defaults", e);
+                    PowerFsConfig::default()
+                }
+            },
+            None => PowerFsConfig::default(),
+        }
+    }
 
     // Initialize auth store
     let user_store = Arc::new(UserStore::new(&args.auth_db_path)?);
@@ -3566,20 +3619,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_clients = Arc::new(Mutex::new(Vec::new()));
 
-    let kv_client = Arc::new(Mutex::new(
-        KvCacheClient::connect(&args.master_endpoint).await?,
-    ));
+    let kv_client = Arc::new(Mutex::new(KvCacheClient::connect(master_endpoint).await?));
 
     let master_client = Arc::new(Mutex::new(
-        MasterServiceClient::connect(format!("http://{}", args.master_endpoint)).await?,
+        MasterServiceClient::connect(format!("http://{}", master_endpoint)).await?,
     ));
 
     let app_state = Arc::new(AppState {
         metric_store: metric_store.clone(),
         alert_engine: alert_engine.clone(),
         ws_clients,
-        s3_endpoint: args.s3_endpoint,
-        s3_backend_endpoint: args.s3_backend_endpoint,
+        s3_endpoint: s3_endpoint.to_string(),
+        s3_backend_endpoint: s3_backend_endpoint.to_string(),
         s3_access_key: args.s3_access_key,
         s3_secret_key: args.s3_secret_key,
         fuse_mounts: Arc::new(Mutex::new(Vec::new())),
@@ -3593,7 +3644,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         master_client,
     });
 
-    let event_bus = EventBus::new(&args.redis_url, &args.stream_key);
+    let event_bus = EventBus::new(redis_url, &args.stream_key);
 
     tokio::spawn(start_event_processor(
         event_bus,

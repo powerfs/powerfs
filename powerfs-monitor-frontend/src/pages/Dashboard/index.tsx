@@ -13,7 +13,8 @@ import {
 import { useNavigate } from 'react-router-dom'
 import type { EChartsOption } from 'echarts'
 import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData, FilerStatus } from '@/types'
-import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes, getFilerStatus } from '@/services/api'
+import type { SchedulerStatus } from '@/services/api'
+import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes, getFilerStatus, getBalancerStatus } from '@/services/api'
 import { connectWebSocket, disconnectWebSocket, type MetricUpdate } from '@/services/websocket'
 import { formatBytes, formatPercent, formatUptime, formatNumber } from '@/utils/format'
 import { KpiBar, MetricChart, EmptyState, RefreshControl, RealtimeChart, StatusTag } from '@/components/pro'
@@ -25,6 +26,7 @@ function Dashboard() {
   const [clusterMetrics, setClusterMetrics] = useState<ClusterMetrics | null>(null)
   const [kvMetrics, setKVMetrics] = useState<KVMetrics | null>(null)
   const [filerStatus, setFilerStatus] = useState<FilerStatus | null>(null)
+  const [balancerStatus, setBalancerStatus] = useState<SchedulerStatus | null>(null)
   const [alerts, setAlerts] = useState<AlertInfo[]>([])
   const [storageTrend, setStorageTrend] = useState<TimeSeriesData[]>([])
   const [cpuTrend, setCpuTrend] = useState<TimeSeriesData[]>([])
@@ -33,15 +35,17 @@ function Dashboard() {
   const loadData = useCallback(async () => {
     setLoading(true)
     try {
-      const [cluster, kv, alertList, filer] = await Promise.all([
+      const [cluster, kv, alertList, filer, balancer] = await Promise.all([
         getClusterMetrics(),
         getKVMetrics(),
         getAlerts(),
         getFilerStatus(),
+        getBalancerStatus(),
       ])
       setClusterMetrics(cluster)
       setKVMetrics(kv)
       setFilerStatus(filer)
+      setBalancerStatus(balancer)
       setAlerts(alertList)
     } catch (e) {
       console.error('Failed to load dashboard data:', e)
@@ -197,6 +201,20 @@ function Dashboard() {
       footer: (
         <Text type="secondary" style={{ fontSize: 12 }}>
           {filerStatus?.total_files || 0} 文件 / {filerStatus?.total_dirs || 0} 目录
+        </Text>
+      ),
+    },
+    {
+      title: '分片均衡',
+      value: balancerStatus?.is_running ? 1 : 0,
+      suffix: '',
+      status: balancerStatus?.is_running ? 'active' : 'draining',
+      icon: <ThunderboltOutlined />,
+      onClick: () => navigate('/shard-balancing'),
+      loading,
+      footer: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {balancerStatus?.is_running ? '运行中' : '已停止'} · 迁移 {balancerStatus?.successful_migrations || 0}/{balancerStatus?.total_migrations || 0}
         </Text>
       ),
     },

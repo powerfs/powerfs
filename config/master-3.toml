@@ -1,0 +1,10 @@
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
+[master]
+port = 9333
+dir = "/data/master"
+advertise_addr = "172.20.0.13:9333"
+raft_id = 3
+peers = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
