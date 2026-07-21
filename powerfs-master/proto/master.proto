@@ -71,6 +71,12 @@ service MasterService {
     // Master HA management
     rpc GetMasterStatus(MasterStatusRequest) returns (MasterStatusResponse);
     rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
+
+    // Filer routing service
+    rpc GetFilerForInode(GetFilerForInodeRequest) returns (GetFilerForInodeResponse);
+    rpc ListFilers(ListFilersRequest) returns (ListFilersResponse);
+    rpc RegisterFiler(RegisterFilerRequest) returns (RegisterFilerResponse);
+    rpc GetShardMapping(GetShardMappingRequest) returns (GetShardMappingResponse);
 }
 
 message Heartbeat {
@@ -557,6 +563,66 @@ message TransferLeaderRequest {
 message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
+}
+
+// Filer routing messages
+message GetFilerForInodeRequest {
+    uint64 inode = 1;
+}
+
+message GetFilerForInodeResponse {
+    string filer_address = 1;
+    uint64 shard_id = 2;
+    bool success = 3;
+    string error = 4;
+}
+
+message ListFilersRequest {
+}
+
+message FilerInfo {
+    string node_id = 1;
+    string address = 2;
+    uint32 grpc_port = 3;
+    uint32 http_port = 4;
+    bool is_healthy = 5;
+    uint64 leader_count = 6;
+    uint64 total_shards = 7;
+}
+
+message ListFilersResponse {
+    repeated FilerInfo filers = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message RegisterFilerRequest {
+    string node_id = 1;
+    string address = 2;
+    uint32 grpc_port = 3;
+    uint32 http_port = 4;
+    uint64 shard_count = 5;
+    repeated uint64 shard_ids = 6;
+}
+
+message RegisterFilerResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetShardMappingRequest {
+}
+
+message ShardMapping {
+    uint64 shard_id = 1;
+    string filer_address = 2;
+    string leader_address = 3;
+}
+
+message GetShardMappingResponse {
+    repeated ShardMapping mappings = 1;
+    bool success = 2;
+    string error = 3;
 }
 
 // Filer metadata types

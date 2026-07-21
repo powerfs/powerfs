@@ -58,6 +58,8 @@ pub struct MasterNode {
     pub metadata_manager: Arc<crate::metadata_manager::MetadataManager>,
     pub volume_client_pool: Arc<VolumeClientPool>,
     event_provider: Arc<dyn EventProvider>,
+    filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
+    shard_mapping: RwLock<HashMap<u64, String>>,
 }
 
 #[derive(Clone)]
@@ -72,6 +74,18 @@ pub struct VolumeLayout {
     disk_type: DiskType,
     #[allow(dead_code)]
     volumes: Vec<VolumeId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilerNodeInfo {
+    pub node_id: String,
+    pub address: String,
+    pub grpc_port: u32,
+    pub http_port: u32,
+    pub is_healthy: bool,
+    pub leader_count: u64,
+    pub total_shards: u64,
+    pub shard_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +357,8 @@ impl MasterNode {
             metadata_manager,
             volume_client_pool,
             event_provider,
+            filer_nodes: RwLock::new(HashMap::new()),
+            shard_mapping: RwLock::new(HashMap::new()),
         };
 
         let master_clone = master.clone();
@@ -420,6 +436,42 @@ impl MasterNode {
 
     pub fn set_leader(&self, leader_addr: String) {
         *self.leader_address.write().unwrap() = leader_addr;
+    }
+
+    pub fn register_filer(&self, info: FilerNodeInfo) {
+        let mut filer_nodes = self.filer_nodes.write().unwrap();
+        filer_nodes.insert(info.node_id.clone(), info.clone());
+
+        let mut shard_mapping = self.shard_mapping.write().unwrap();
+        for &shard_id in &info.shard_ids {
+            shard_mapping.insert(shard_id, info.address.clone());
+        }
+        info!("Registered filer: id={}, address={}, shards={:?}", info.node_id, info.address, info.shard_ids);
+    }
+
+    pub fn get_filer_for_inode(&self, inode: u64) -> Option<String> {
+        let shard_id = Self::calculate_shard(inode);
+        self.shard_mapping.read().unwrap().get(&shard_id).cloned()
+    }
+
+    pub fn get_shard_for_inode(&self, inode: u64) -> u64 {
+        Self::calculate_shard(inode)
+    }
+
+    pub fn list_filers(&self) -> Vec<FilerNodeInfo> {
+        self.filer_nodes.read().unwrap().values().cloned().collect()
+    }
+
+    pub fn get_shard_mapping(&self) -> Vec<(u64, String)> {
+        self.shard_mapping.read().unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    fn calculate_shard(inode: u64) -> u64 {
+        let inode_per_shard = 1_000_000;
+        inode / inode_per_shard
     }
 
     pub fn raft_term(&self) -> u64 {
@@ -1969,6 +2021,8 @@ impl Clone for MasterNode {
             metadata_manager: self.metadata_manager.clone(),
             volume_client_pool: self.volume_client_pool.clone(),
             event_provider: self.event_provider.clone(),
+            filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),
+            shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
         }
     }
 }

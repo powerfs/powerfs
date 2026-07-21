@@ -1357,6 +1357,103 @@ impl MasterService for MasterGrpcServer {
         }
     }
 
+    async fn get_filer_for_inode(
+        &self,
+        request: Request<GetFilerForInodeRequest>,
+    ) -> Result<Response<GetFilerForInodeResponse>, Status> {
+        let req = request.into_inner();
+        let inode = req.inode;
+
+        match self.master.get_filer_for_inode(inode) {
+            Some(filer_address) => {
+                let shard_id = self.master.get_shard_for_inode(inode);
+                Ok(Response::new(GetFilerForInodeResponse {
+                    filer_address,
+                    shard_id,
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            None => Ok(Response::new(GetFilerForInodeResponse {
+                filer_address: String::new(),
+                shard_id: 0,
+                success: false,
+                error: format!("No filer found for inode {}", inode),
+            })),
+        }
+    }
+
+    async fn list_filers(
+        &self,
+        _request: Request<ListFilersRequest>,
+    ) -> Result<Response<ListFilersResponse>, Status> {
+        let filers = self.master.list_filers();
+        let filer_infos: Vec<FilerInfo> = filers
+            .into_iter()
+            .map(|f| FilerInfo {
+                node_id: f.node_id,
+                address: f.address,
+                grpc_port: f.grpc_port,
+                http_port: f.http_port,
+                is_healthy: f.is_healthy,
+                leader_count: f.leader_count,
+                total_shards: f.total_shards,
+            })
+            .collect();
+
+        Ok(Response::new(ListFilersResponse {
+            filers: filer_infos,
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn register_filer(
+        &self,
+        request: Request<RegisterFilerRequest>,
+    ) -> Result<Response<RegisterFilerResponse>, Status> {
+        let req = request.into_inner();
+
+        let filer_info = crate::master::FilerNodeInfo {
+            node_id: req.node_id,
+            address: req.address,
+            grpc_port: req.grpc_port,
+            http_port: req.http_port,
+            is_healthy: true,
+            leader_count: 0,
+            total_shards: req.shard_count,
+            shard_ids: req.shard_ids,
+        };
+
+        self.master.register_filer(filer_info);
+
+        Ok(Response::new(RegisterFilerResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_shard_mapping(
+        &self,
+        _request: Request<GetShardMappingRequest>,
+    ) -> Result<Response<GetShardMappingResponse>, Status> {
+        let mappings = self.master.get_shard_mapping();
+        let shard_mappings: Vec<ShardMapping> = mappings
+            .into_iter()
+            .map(|(shard_id, filer_address)| ShardMapping {
+                shard_id,
+                filer_address,
+                leader_address: String::new(),
+            })
+            .collect();
+
+        Ok(Response::new(GetShardMappingResponse {
+            mappings: shard_mappings,
+            success: true,
+            error: String::new(),
+        }))
+    }
+
     type StreamMutateEntryStream =
         Pin<Box<dyn Stream<Item = Result<MutateEntryResponse, Status>> + Send + 'static>>;
 

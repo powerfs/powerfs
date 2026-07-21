@@ -1,57 +1,15 @@
-FROM ubuntu:24.04 AS builder
+FROM powerfs:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    build-essential \
-    pkg-config \
-    libfuse3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-WORKDIR /app
-
-COPY Cargo.toml Cargo.lock ./
-COPY powerfs-common ./powerfs-common
-COPY powerfs-core ./powerfs-core
-COPY powerfs-master ./powerfs-master
-COPY powerfs-volume ./powerfs-volume
-COPY powerfs-fuse ./powerfs-fuse
-COPY powerfs-monitor ./powerfs-monitor
-COPY powerfs-cli ./powerfs-cli
-COPY rfs_tester ./rfs_tester
-
-RUN cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse
-
-RUN cargo build --release --manifest-path rfs_tester/Cargo.toml
-
-FROM ubuntu:24.04 AS runtime
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    libfuse3-3 \
-    fuse3 \
-    netcat-openbsd \
+    fio \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 RUN mkdir -p /mnt/powerfs && chown root:root /mnt/powerfs && chmod 755 /mnt/powerfs
-RUN mkdir -p /mnt/test-mounts
+RUN mkdir -p /var/log && chown root:root /var/log && chmod 755 /var/log
 
-COPY --from=builder /app/target/release/powerfs /app/
-COPY --from=builder /app/target/release/powerfs-volume /app/
-COPY --from=builder /app/target/release/powerfs-monitor /app/
-COPY --from=builder /app/target/release/powerfs-fuse /app/
-COPY --from=builder /app/target/release/rfs_tester /app/
-
-RUN mkdir -p /app/tests
-
-COPY powerfs-fuse/tests/ /app/tests/
-COPY powerfs-master/tests/ /app/tests-master/
+COPY benchmark/ /benchmark/
 
 EXPOSE 9333 8080 8081
 

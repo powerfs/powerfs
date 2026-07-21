@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
@@ -8,7 +8,11 @@ use powerfs_filer::grpc_service::FilerMetaServiceImpl;
 use powerfs_filer::meta_shard_manager::MetaShardManager;
 use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
 use powerfs_filer::raft_group_manager::{Peer, RaftGroupManager, ShardId};
+use powerfs_filer::shard_scheduler::ShardScheduler;
 use powerfs_filer::shard_strategy::ShardStrategy;
+use powerfs_master::proto::powerfs::{
+    master_service_client::MasterServiceClient, RegisterFilerRequest,
+};
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -104,6 +108,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Shard {} initialized", i);
     }
 
+    let shard_scheduler = Arc::new(ShardScheduler::new(
+        raft_group_manager.clone(),
+        shard_strategy.clone(),
+    ));
+
+    for peer in &peers {
+        shard_scheduler.register_node(&peer.id.to_string(), &peer.address);
+    }
+
+    tokio::spawn({
+        let shard_scheduler = shard_scheduler.clone();
+        async move {
+            shard_scheduler.run().await;
+        }
+    });
+
+    info!("ShardScheduler started with {} nodes", peers.len());
+
+    register_with_master(&args).await;
+
     let grpc_service =
         FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
 
@@ -129,4 +153,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Shutting down Filer server...");
 
     Ok(())
+}
+
+async fn register_with_master(args: &Args) {
+    let address = args.raft_address.clone();
+    let grpc_port: u32 = args.grpc_address.split(':').last().unwrap_or("8889").parse().unwrap_or(8889);
+    let http_port: u32 = args.s3_address.split(':').last().unwrap_or("8888").parse().unwrap_or(8888);
+
+    let shard_ids: Vec<u64> = (0..args.shard_count).map(|i| i as u64).collect();
+
+    let request = RegisterFilerRequest {
+        node_id: args.node_id.to_string(),
+        address,
+        grpc_port,
+        http_port,
+        shard_count: args.shard_count as u64,
+        shard_ids,
+    };
+
+    let endpoint = match tonic::transport::Channel::from_shared(format!("http://{}", args.master_address)) {
+        Ok(ep) => ep,
+        Err(e) => {
+            warn!("Failed to connect to master for registration: {}", e);
+            return;
+        }
+    };
+
+    let channel = match endpoint.connect().await {
+        Ok(ch) => ch,
+        Err(e) => {
+            warn!("Failed to connect to master for registration: {}", e);
+            return;
+        }
+    };
+
+    let mut client = MasterServiceClient::new(channel);
+
+    match client.register_filer(tonic::Request::new(request)).await {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if resp.success {
+                info!("Successfully registered filer with master");
+            } else {
+                warn!("Filer registration failed: {}", resp.error);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to register filer with master: {}", e);
+        }
+    }
 }

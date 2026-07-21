@@ -3,8 +3,9 @@ use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
     DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
-    JobCompletionRequest, JobDeregistrationRequest, JobRegistrationRequest, KeepConnectedRequest,
-    LeaseReleaseRequest, LeaseRenewRequest, LeaseRequest, ListEntriesRequest,
+    GetFilerForInodeRequest, GetShardMappingRequest, JobCompletionRequest,
+    JobDeregistrationRequest, JobRegistrationRequest, KeepConnectedRequest, LeaseReleaseRequest,
+    LeaseRenewRequest, LeaseRequest, ListEntriesRequest, ListFilersRequest,
     LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification, PullDeltaRequest,
     PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, StatisticsRequest,
     StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest, VectorClock,
@@ -1172,6 +1173,146 @@ impl PowerFuseClient {
         Err("list_entries failed after max retries".to_string())
     }
 
+    pub async fn get_filer_for_inode(&self, inode: u64) -> Result<Option<(String, u64)>, String> {
+        debug!("get_filer_for_inode: inode={}", inode);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = GetFilerForInodeRequest { inode };
+
+            match client
+                .get_filer_for_inode(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success && !resp.filer_address.is_empty() {
+                        debug!(
+                            "get_filer_for_inode succeeded: inode={}, filer={}, shard={}",
+                            inode, resp.filer_address, resp.shard_id
+                        );
+                        return Ok(Some((resp.filer_address, resp.shard_id)));
+                    }
+                    debug!("get_filer_for_inode: no filer found for inode {}", inode);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let msg = format!("get_filer_for_inode failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("get_filer_for_inode failed after max retries".to_string())
+    }
+
+    pub async fn list_filers(&self) -> Result<Vec<(String, String, u32)>, String> {
+        debug!("list_filers");
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = ListFilersRequest {};
+
+            match client.list_filers(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    let filers: Vec<(String, String, u32)> = resp
+                        .filers
+                        .into_iter()
+                        .map(|f| (f.node_id, f.address, f.grpc_port))
+                        .collect();
+                    debug!("list_filers succeeded: {} filers", filers.len());
+                    return Ok(filers);
+                }
+                Err(e) => {
+                    let msg = format!("list_filers failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("list_filers failed after max retries".to_string())
+    }
+
+    pub async fn get_shard_mapping(&self) -> Result<Vec<(u64, String)>, String> {
+        debug!("get_shard_mapping");
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = GetShardMappingRequest {};
+
+            match client.get_shard_mapping(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    let mappings: Vec<(u64, String)> = resp
+                        .mappings
+                        .into_iter()
+                        .map(|m| (m.shard_id, m.filer_address))
+                        .collect();
+                    debug!("get_shard_mapping succeeded: {} mappings", mappings.len());
+                    return Ok(mappings);
+                }
+                Err(e) => {
+                    let msg = format!("get_shard_mapping failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("get_shard_mapping failed after max retries".to_string())
+    }
+
     pub async fn lookup_directory_entry(
         &self,
         parent_ino: u64,
@@ -2029,6 +2170,18 @@ impl SyncFuseClient {
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
         self.block_with_timeout(self.client.list_entries(parent_ino, limit, start_after))
+    }
+
+    pub fn get_filer_for_inode(&self, inode: u64) -> Result<Option<(String, u64)>, String> {
+        self.block_with_timeout(self.client.get_filer_for_inode(inode))
+    }
+
+    pub fn list_filers(&self) -> Result<Vec<(String, String, u32)>, String> {
+        self.block_with_timeout(self.client.list_filers())
+    }
+
+    pub fn get_shard_mapping(&self) -> Result<Vec<(u64, String)>, String> {
+        self.block_with_timeout(self.client.get_shard_mapping())
     }
 
     pub fn lookup_directory_entry(

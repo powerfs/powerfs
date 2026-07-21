@@ -1,0 +1,44 @@
+[global]
+ioengine=sync
+direct=1
+group_reporting=1
+time_based=1
+runtime=30
+size=4k
+
+[metadata-create]
+description=Metadata creation test
+directory=/tmp/powerfs-mount
+numjobs=8
+iodepth=64
+rw=write
+create_on_open=1
+create_serialize=0
+name_format=fio-test-file-%04d
+
+[metadata-delete]
+description=Metadata deletion test
+directory=/tmp/powerfs-mount
+numjobs=4
+iodepth=32
+rw=read
+unlink=1
+name_format=fio-test-file-%04d
+
+[metadata-stat]
+description=Metadata stat test
+directory=/tmp/powerfs-mount
+numjobs=16
+iodepth=256
+rw=read
+openflags=O_RDONLY
+filename=fio-test-file-0000
+
+[metadata-lookup]
+description=Metadata lookup test
+directory=/tmp/powerfs-mount
+numjobs=8
+iodepth=128
+rw=read
+openflags=O_RDONLY
+filename=fio-test-file-0001

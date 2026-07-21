@@ -528,6 +528,27 @@ impl RaftGroup {
         self.node.raft.raft_log.committed
     }
 
+    pub fn transfer_leader(&mut self, target_id: u64) -> Result<(), String> {
+        info!("Shard {} transferring leadership to node: {}", self.shard_id.0, target_id);
+
+        if !self.is_leader() {
+            return Err("not the leader".to_string());
+        }
+
+        if target_id == self.id {
+            return Err("cannot transfer leadership to self".to_string());
+        }
+
+        if !self.peers.contains_key(&target_id) {
+            return Err(format!("target node {} is not a peer", target_id));
+        }
+
+        self.node.transfer_leader(target_id);
+
+        info!("Shard {} leadership transfer initiated to node: {}", self.shard_id.0, target_id);
+        Ok(())
+    }
+
     pub fn last_index(&self) -> u64 {
         self.node.raft.raft_log.last_index()
     }
@@ -813,6 +834,19 @@ impl RaftGroupManager {
 
     pub fn get_apply_tx(&self) -> mpsc::Sender<ApplyEntry> {
         self.apply_tx.clone()
+    }
+
+    pub async fn transfer_shard_leader(&self, shard_id: ShardId, target_id: u64) -> Result<(), String> {
+        let group_arc = {
+            let groups = self.groups.read().await;
+            groups
+                .get(&shard_id)
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+                .clone()
+        };
+
+        let mut group = group_arc.write().await;
+        group.transfer_leader(target_id)
     }
 
     pub async fn broadcast_message(&self, msg: OutgoingMessage) {

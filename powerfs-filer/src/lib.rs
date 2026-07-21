@@ -8,6 +8,7 @@ pub mod provider_impl;
 pub mod raft_group_manager;
 pub mod s3_handler;
 pub mod server;
+pub mod shard_scheduler;
 pub mod shard_store;
 pub mod shard_strategy;
 pub mod volume_router;
@@ -22,6 +23,7 @@ pub use raft_group_manager::{
 };
 pub use s3_handler::S3Handler;
 pub use server::FilerServer;
+pub use shard_scheduler::{NodeMetrics, SchedulerConfig, SchedulerStatus, ShardScheduler};
 pub use shard_store::ShardStore;
 pub use shard_strategy::ShardStrategy;
 pub use volume_router::VolumeRouter;
