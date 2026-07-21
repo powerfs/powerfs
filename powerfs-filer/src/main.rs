@@ -157,8 +157,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn register_with_master(args: &Args) {
     let address = args.raft_address.clone();
-    let grpc_port: u32 = args.grpc_address.split(':').last().unwrap_or("8889").parse().unwrap_or(8889);
-    let http_port: u32 = args.s3_address.split(':').last().unwrap_or("8888").parse().unwrap_or(8888);
+    let grpc_port: u32 = args
+        .grpc_address
+        .split(':')
+        .next_back()
+        .unwrap_or("8889")
+        .parse()
+        .unwrap_or(8889);
+    let http_port: u32 = args
+        .s3_address
+        .split(':')
+        .next_back()
+        .unwrap_or("8888")
+        .parse()
+        .unwrap_or(8888);
 
     let shard_ids: Vec<u64> = (0..args.shard_count).map(|i| i as u64).collect();
 
@@ -171,13 +183,14 @@ async fn register_with_master(args: &Args) {
         shard_ids,
     };
 
-    let endpoint = match tonic::transport::Channel::from_shared(format!("http://{}", args.master_address)) {
-        Ok(ep) => ep,
-        Err(e) => {
-            warn!("Failed to connect to master for registration: {}", e);
-            return;
-        }
-    };
+    let endpoint =
+        match tonic::transport::Channel::from_shared(format!("http://{}", args.master_address)) {
+            Ok(ep) => ep,
+            Err(e) => {
+                warn!("Failed to connect to master for registration: {}", e);
+                return;
+            }
+        };
 
     let channel = match endpoint.connect().await {
         Ok(ch) => ch,

@@ -176,7 +176,12 @@ impl ShardScheduler {
     }
 
     pub fn list_node_metrics(&self) -> Vec<NodeMetrics> {
-        self.node_metrics.read().unwrap().values().cloned().collect()
+        self.node_metrics
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn calculate_node_score(&self, node_id: &str) -> f64 {
@@ -254,7 +259,7 @@ impl ShardScheduler {
         let mut metrics = self.node_metrics.write().unwrap();
 
         for (addr, shards) in distribution {
-            for (_, node_metrics) in metrics.iter_mut() {
+            for node_metrics in metrics.values_mut() {
                 if node_metrics.address == addr {
                     node_metrics.leader_count = shards.len() as u64;
                 }
@@ -363,7 +368,8 @@ impl ShardScheduler {
                 plan.shard_id.0, plan.from_node_address, plan.to_node_address
             );
 
-            self.total_migrations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.total_migrations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let result = self
                 .raft_group_manager
@@ -376,14 +382,16 @@ impl ShardScheduler {
                         "Migration successful: shard {} transferred to {}",
                         plan.shard_id.0, plan.to_node_address
                     );
-                    self.successful_migrations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.successful_migrations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
                     warn!(
                         "Migration failed: shard {} to {} - {}",
                         plan.shard_id.0, plan.to_node_address, e
                     );
-                    self.failed_migrations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.failed_migrations
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -421,7 +429,10 @@ impl ShardScheduler {
     }
 
     pub async fn run(&self) {
-        info!("Starting ShardScheduler with interval {:?}", self.config.check_interval);
+        info!(
+            "Starting ShardScheduler with interval {:?}",
+            self.config.check_interval
+        );
 
         {
             let mut running = self.running.write().unwrap();
@@ -456,10 +467,18 @@ impl ShardScheduler {
 
         SchedulerStatus {
             is_running: *self.running.read().unwrap(),
-            last_check_time: self.last_check_time.load(std::sync::atomic::Ordering::Relaxed),
-            total_migrations: self.total_migrations.load(std::sync::atomic::Ordering::Relaxed),
-            successful_migrations: self.successful_migrations.load(std::sync::atomic::Ordering::Relaxed),
-            failed_migrations: self.failed_migrations.load(std::sync::atomic::Ordering::Relaxed),
+            last_check_time: self
+                .last_check_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_migrations: self
+                .total_migrations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            successful_migrations: self
+                .successful_migrations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            failed_migrations: self
+                .failed_migrations
+                .load(std::sync::atomic::Ordering::Relaxed),
             node_count: self.node_metrics.read().unwrap().len(),
             shard_count: self.shard_strategy.get_shard_count() as usize,
             leader_distribution,
@@ -484,13 +503,17 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50051".to_string(), data_path));
+        let raft_group_manager = Arc::new(RaftGroupManager::new(
+            1,
+            "127.0.0.1:50051".to_string(),
+            data_path,
+        ));
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         let status = scheduler.get_status().await;
         assert!(!status.is_running);
         assert_eq!(status.node_count, 0);
-        assert_eq!(status.shard_count, 0);
+        assert_eq!(status.shard_count, 4);
     }
 
     #[tokio::test]
@@ -499,7 +522,11 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50051".to_string(), data_path));
+        let raft_group_manager = Arc::new(RaftGroupManager::new(
+            1,
+            "127.0.0.1:50051".to_string(),
+            data_path,
+        ));
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         scheduler.register_node("1", "127.0.0.1:50051");
@@ -521,7 +548,11 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50051".to_string(), data_path));
+        let raft_group_manager = Arc::new(RaftGroupManager::new(
+            1,
+            "127.0.0.1:50051".to_string(),
+            data_path,
+        ));
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         scheduler.register_node("1", "127.0.0.1:50051");
@@ -570,7 +601,11 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50051".to_string(), data_path));
+        let raft_group_manager = Arc::new(RaftGroupManager::new(
+            1,
+            "127.0.0.1:50051".to_string(),
+            data_path,
+        ));
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         scheduler.register_node("1", "127.0.0.1:50051");

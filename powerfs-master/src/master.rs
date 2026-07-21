@@ -446,7 +446,10 @@ impl MasterNode {
         for &shard_id in &info.shard_ids {
             shard_mapping.insert(shard_id, info.address.clone());
         }
-        info!("Registered filer: id={}, address={}, shards={:?}", info.node_id, info.address, info.shard_ids);
+        info!(
+            "Registered filer: id={}, address={}, shards={:?}",
+            info.node_id, info.address, info.shard_ids
+        );
     }
 
     pub fn get_filer_for_inode(&self, inode: u64) -> Option<String> {
@@ -463,7 +466,9 @@ impl MasterNode {
     }
 
     pub fn get_shard_mapping(&self) -> Vec<(u64, String)> {
-        self.shard_mapping.read().unwrap()
+        self.shard_mapping
+            .read()
+            .unwrap()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()

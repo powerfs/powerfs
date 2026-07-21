@@ -529,7 +529,10 @@ impl RaftGroup {
     }
 
     pub fn transfer_leader(&mut self, target_id: u64) -> Result<(), String> {
-        info!("Shard {} transferring leadership to node: {}", self.shard_id.0, target_id);
+        info!(
+            "Shard {} transferring leadership to node: {}",
+            self.shard_id.0, target_id
+        );
 
         if !self.is_leader() {
             return Err("not the leader".to_string());
@@ -545,7 +548,10 @@ impl RaftGroup {
 
         self.node.transfer_leader(target_id);
 
-        info!("Shard {} leadership transfer initiated to node: {}", self.shard_id.0, target_id);
+        info!(
+            "Shard {} leadership transfer initiated to node: {}",
+            self.shard_id.0, target_id
+        );
         Ok(())
     }
 
@@ -836,7 +842,11 @@ impl RaftGroupManager {
         self.apply_tx.clone()
     }
 
-    pub async fn transfer_shard_leader(&self, shard_id: ShardId, target_id: u64) -> Result<(), String> {
+    pub async fn transfer_shard_leader(
+        &self,
+        shard_id: ShardId,
+        target_id: u64,
+    ) -> Result<(), String> {
         let group_arc = {
             let groups = self.groups.read().await;
             groups
