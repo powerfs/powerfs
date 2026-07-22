@@ -122,7 +122,7 @@ services:
     ports:
       - "8080:8080"
       - "8091:8091"
-    command: /app/powerfs-volume --config /etc/powerfs/volume-1.toml
+    command: /app/powerfs-volume --config /etc/powerfs/volume-1.toml --grpc-address 172.20.0.21:8080
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.21 8080 || exit 1"]
       interval: 5s
@@ -147,7 +147,7 @@ services:
     ports:
       - "8081:8080"
       - "8092:8092"
-    command: /app/powerfs-volume --config /etc/powerfs/volume-2.toml
+    command: /app/powerfs-volume --config /etc/powerfs/volume-2.toml --grpc-address 172.20.0.22:8080
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.22 8080 || exit 1"]
       interval: 5s
@@ -172,7 +172,7 @@ services:
     ports:
       - "8082:8080"
       - "8093:8093"
-    command: /app/powerfs-volume --config /etc/powerfs/volume-3.toml
+    command: /app/powerfs-volume --config /etc/powerfs/volume-3.toml --grpc-address 172.20.0.23:8080
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.20.0.23 8080 || exit 1"]
       interval: 5s
@@ -301,7 +301,7 @@ services:
     volumes:
       - /tmp/powerfs/fuse1:/mnt/powerfs
       - ../config/fuse-1.toml:/etc/powerfs/fuse-1.toml
-    command: /app/powerfs-fuse --config /etc/powerfs/fuse-1.toml
+    command: /app/powerfs-fuse --mount-point /mnt/powerfs --config /etc/powerfs/fuse-1.toml
     depends_on:
       volume-1:
         condition: service_healthy
@@ -334,7 +334,7 @@ services:
     volumes:
       - /tmp/powerfs/fuse2:/mnt/powerfs
       - ../config/fuse-2.toml:/etc/powerfs/fuse-2.toml
-    command: /app/powerfs-fuse --config /etc/powerfs/fuse-2.toml
+    command: /app/powerfs-fuse --mount-point /mnt/powerfs --config /etc/powerfs/fuse-2.toml
     depends_on:
       volume-1:
         condition: service_healthy

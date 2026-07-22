@@ -244,7 +244,7 @@ mod tests {
                 dir.path().to_str().unwrap(),
                 "test-node",
                 "dev0",
-                100 * 1024 * 1024,
+                Some(100 * 1024 * 1024),
             )
             .unwrap(),
         );

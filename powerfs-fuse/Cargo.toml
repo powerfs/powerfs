@@ -15,9 +15,10 @@ harness = false
 [features]
 default = ["community"]
 community = []
-enterprise = []
+enterprise = ["powerfs-fuse-enterprise"]
 
 [dependencies]
+powerfs-fuse-enterprise = { path = "../powerfs-fuse-enterprise", optional = true }
 powerfs-fuse-core = { path = "../powerfs-fuse-core" }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }

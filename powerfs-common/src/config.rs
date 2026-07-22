@@ -44,6 +44,13 @@ pub struct VolumeConfig {
     pub master_addresses: Vec<String>,
     pub node_id: String,
     pub max_volume_size: u64,
+    /// Number of volumes to pre-create on startup
+    #[serde(default = "default_initial_volume_count")]
+    pub initial_volume_count: u32,
+    /// Optional device capacity override (bytes). When unset, capacity is
+    /// auto-detected from the underlying filesystem via statvfs.
+    #[serde(default)]
+    pub device_capacity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +133,8 @@ impl Default for VolumeConfig {
             master_addresses: vec!["http://localhost:9333".to_string()],
             node_id: "volume-server".to_string(),
             max_volume_size: 1073741824,
+            initial_volume_count: 2,
+            device_capacity: None,
         }
     }
 }
@@ -285,3 +294,7 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+fn default_initial_volume_count() -> u32 {
+    2
+}

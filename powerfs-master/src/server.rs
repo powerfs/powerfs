@@ -362,6 +362,61 @@ impl MasterService for MasterGrpcServer {
             1
         };
 
+        if stripe_count > 1 {
+            // Stripe mode: batch assign volumes via assign_stripe_volumes
+            match self
+                .master
+                .assign_stripe_volumes(stripe_count, &req.replication, &req.collection)
+                .await
+            {
+                Ok((volume_ids, _start_idx)) => {
+                    let mut stripe_fids = Vec::new();
+                    let mut stripe_locations = Vec::new();
+
+                    for &vid in &volume_ids {
+                        let vid_vol = VolumeId(vid as u32);
+                        let cookie = rand::random::<u32>() as u64;
+                        let file_key = self.master.allocate_file_key(&vid_vol).unwrap_or(1);
+                        let fid = powerfs_common::types::Fid {
+                            volume_id: vid_vol,
+                            cookie,
+                            file_key,
+                        };
+                        stripe_fids.push(fid.to_string());
+
+                        // lookup volume location
+                        if let Some(vol_info) = self.master.get_volume_info(&vid_vol) {
+                            if let Some(node) = self.master.get_node(&vol_info.node_id) {
+                                stripe_locations.push(Location {
+                                    url: node.url(),
+                                    public_url: node.public_url.clone(),
+                                    grpc_port: node.grpc_port,
+                                    data_center: node.data_center_id.to_string(),
+                                });
+                            }
+                        }
+                    }
+
+                    let primary_fid = stripe_fids.first().cloned().unwrap_or_default();
+                    let primary_location = stripe_locations.first().cloned();
+                    let replicas = stripe_locations.clone();
+
+                    return Ok(Response::new(AssignResponse {
+                        fid: primary_fid,
+                        count: req.count,
+                        error: String::new(),
+                        auth: String::new(),
+                        replicas,
+                        location: primary_location,
+                        stripe_fids,
+                        stripe_locations,
+                    }));
+                }
+                Err(e) => return Err(Status::internal(format!("{}", e))),
+            }
+        }
+
+        // Original single-volume path (stripe_count == 1)
         let mut stripe_fids = Vec::new();
         let mut stripe_locations = Vec::new();
 
@@ -1553,6 +1608,14 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<CreateEntryRequest>,
     ) -> Result<Response<CreateEntryResponse>, Status> {
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
+        }
+
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
         let metadata_manager = self.master.metadata_manager.clone();
@@ -1594,10 +1657,15 @@ impl MasterService for MasterGrpcServer {
         }
 
         match inode {
-            Ok(inode) => Ok(Response::new(CreateEntryResponse {
+            Ok(inode) if inode > 0 => Ok(Response::new(CreateEntryResponse {
                 success: true,
                 error: String::new(),
                 inode,
+            })),
+            Ok(_) => Ok(Response::new(CreateEntryResponse {
+                success: false,
+                error: "parent directory not found".to_string(),
+                inode: 0,
             })),
             Err(e) => Ok(Response::new(CreateEntryResponse {
                 success: false,
@@ -1611,6 +1679,14 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<UpdateEntryRequest>,
     ) -> Result<Response<UpdateEntryResponse>, Status> {
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
+        }
+
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
         let metadata_manager = self.master.metadata_manager.clone();
@@ -1671,6 +1747,14 @@ impl MasterService for MasterGrpcServer {
         &self,
         request: Request<DeleteEntryRequest>,
     ) -> Result<Response<DeleteEntryResponse>, Status> {
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
+        }
+
         let req = request.into_inner();
         let dir_tree = self.master.directory_tree.clone();
         let metadata_manager = self.master.metadata_manager.clone();

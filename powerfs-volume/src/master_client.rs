@@ -130,7 +130,13 @@ impl MasterClient {
 
     async fn run_heartbeat_daemon(&self) {
         loop {
-            match self.run_heartbeat_session().await {
+            let session_result = self.run_heartbeat_session().await;
+            let was_leader_changed = match &session_result {
+                Err(e) => e.to_string().contains("Leader changed"),
+                _ => false,
+            };
+
+            match session_result {
                 Ok(_) => {
                     info!("VOLUME_HEARTBEAT: heartbeat session completed");
                 }
@@ -139,8 +145,12 @@ impl MasterClient {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            self.next_master();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // LEADER_CHANGED 已经在 session 中更新了正确的 leader 索引，
+            // 不需要再切换到下一个 master
+            if !was_leader_changed {
+                self.next_master();
+            }
         }
     }
 
@@ -206,7 +216,6 @@ impl MasterClient {
                             if idx != current {
                                 info!("Switching to leader master: {}", resp.leader);
                                 current_master_index.store(idx, Ordering::Relaxed);
-                                return Err("Leader changed, reconnecting".into());
                             }
                         }
                     }

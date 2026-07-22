@@ -177,6 +177,8 @@ impl PowerFsFuserFs {
     /// 6. 更新 Master 上的 entry（chunks + size）
     /// 7. 清除脏标记
     fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
+        let start_time = std::time::Instant::now();
+
         // 获取 flush 锁
         let flush_lock = {
             let mut locks = self.flush_locks.write().unwrap();
@@ -205,6 +207,7 @@ impl PowerFsFuserFs {
         );
 
         // 从 Master 获取 entry（获取现有 FID）
+        let get_entry_start = std::time::Instant::now();
         let (entry, _path) = match self.client.get_entry_by_inode(inode) {
             Ok(Some(e)) => e,
             Ok(None) => {
@@ -225,19 +228,46 @@ impl PowerFsFuserFs {
                 let proto_entry =
                     crate::metadata_manager::dir_entry_to_proto(&meta_entry, &parent_path);
                 let client_id_str = self.meta.client_id().to_string();
+
+                let create_entry_start = std::time::Instant::now();
                 match self.client.create_entry(proto_entry, &client_id_str) {
                     Ok(_) => {
                         debug!(
                             "flush_dirty_chunks: created entry on master for inode {}",
                             inode
                         );
+                        let create_entry_elapsed = create_entry_start.elapsed();
+                        info!(
+                            "PERF: create_entry took {}ms for inode {}",
+                            create_entry_elapsed.as_millis(),
+                            inode
+                        );
+
                         match self.client.get_entry_by_inode(inode) {
                             Ok(Some(e)) => e,
                             _ => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    "entry not found after create",
-                                ));
+                                debug!(
+                                    "flush_dirty_chunks: entry not immediately available after create, using local info for inode {}",
+                                    inode
+                                );
+                                (
+                                    powerfs_master::proto::powerfs::Entry {
+                                        name: meta_entry.id.name.clone(),
+                                        directory: parent_path.clone(),
+                                        attributes: None,
+                                        chunks: vec![],
+                                        hard_link_id: "".to_string(),
+                                        hard_link_counter: 0,
+                                        extended: std::collections::HashMap::new(),
+                                        content_size: file_size,
+                                        disk_size: 0,
+                                        ttl: "".to_string(),
+                                        symlink_target: "".to_string(),
+                                        owner: "".to_string(),
+                                        generation: 0,
+                                    },
+                                    format!("{}/{}", parent_path, meta_entry.id.name),
+                                )
                             }
                         }
                     }
@@ -255,6 +285,12 @@ impl PowerFsFuserFs {
                 return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
             }
         };
+        let get_entry_elapsed = get_entry_start.elapsed();
+        info!(
+            "PERF: get_entry_by_inode took {}ms for inode {}",
+            get_entry_elapsed.as_millis(),
+            inode
+        );
 
         // 获取现有 FID
         let existing_fid = entry
@@ -264,26 +300,48 @@ impl PowerFsFuserFs {
             .and_then(|c| Fid::from_string(&c.fid).ok());
 
         // 分配新 FID（如果不存在）
+        let assign_fid_start = std::time::Instant::now();
         let fid = if let Some(fid) = existing_fid {
             fid
         } else {
             match self.client.assign_fid(&self.collection, &self.replication) {
-                Ok((new_fid, _, _, _)) => new_fid,
+                Ok((new_fid, _, _, _)) => {
+                    info!("PERF: assign_fid succeeded, new_fid={}", new_fid);
+                    new_fid
+                }
                 Err(e) => {
+                    error!("flush_dirty_chunks: assign_fid FAILED: {}", e);
                     let fs_error = parse_master_error(&e);
                     return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
                 }
             }
         };
+        let assign_fid_elapsed = assign_fid_start.elapsed();
+        info!(
+            "PERF: assign_fid took {}ms for inode {}",
+            assign_fid_elapsed.as_millis(),
+            inode
+        );
 
         // 查找 Volume 位置
+        let lookup_volume_start = std::time::Instant::now();
         let locations = match self.client.lookup_volume(fid.volume_id) {
-            Ok(l) => l,
+            Ok(l) => {
+                info!("PERF: lookup_volume succeeded, locations={:?}", l);
+                l
+            }
             Err(e) => {
+                error!("flush_dirty_chunks: lookup_volume FAILED: {}", e);
                 let fs_error = parse_master_error(&e);
                 return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
             }
         };
+        let lookup_volume_elapsed = lookup_volume_start.elapsed();
+        info!(
+            "PERF: lookup_volume took {}ms for inode {}",
+            lookup_volume_elapsed.as_millis(),
+            inode
+        );
 
         let loc = locations
             .first()
@@ -358,6 +416,7 @@ impl PowerFsFuserFs {
         }
 
         if !blob_entries.is_empty() {
+            let write_blob_start = std::time::Instant::now();
             if let Err(e) =
                 self.client
                     .batch_write_blob(&addr, fid.volume_id.0, fid.file_key, blob_entries)
@@ -366,6 +425,13 @@ impl PowerFsFuserFs {
                 error!("flush_dirty_chunks: batch_write_blob failed: {}", fs_error);
                 return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
             }
+            let write_blob_elapsed = write_blob_start.elapsed();
+            info!(
+                "PERF: batch_write_blob took {}ms for {} chunks, inode {}",
+                write_blob_elapsed.as_millis(),
+                new_chunks.len(),
+                inode
+            );
             debug!(
                 "flush_dirty_chunks: wrote {} chunks to volume {}",
                 new_chunks.len(),
@@ -403,11 +469,18 @@ impl PowerFsFuserFs {
             updated_entry.disk_size = file_size;
         }
 
+        let update_entry_start = std::time::Instant::now();
         match self
             .client
             .update_entry(&updated_entry, &client_id_str, old_size, is_truncate)
         {
             Ok(actual_size) => {
+                let update_entry_elapsed = update_entry_start.elapsed();
+                info!(
+                    "PERF: update_entry took {}ms for inode {}",
+                    update_entry_elapsed.as_millis(),
+                    inode
+                );
                 debug!(
                     "flush_dirty_chunks: update_entry succeeded, actual_size={}",
                     actual_size
@@ -432,6 +505,14 @@ impl PowerFsFuserFs {
 
         // 清除脏标记
         self.data.clear_dirty(inode);
+
+        let total_elapsed = start_time.elapsed();
+        info!(
+            "PERF: total flush_dirty_chunks took {}ms for inode {}, {} dirty chunks",
+            total_elapsed.as_millis(),
+            inode,
+            dirty_chunks.len()
+        );
 
         debug!(
             "flush_dirty_chunks: completed for inode={}, chunks={}",

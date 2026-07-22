@@ -11,6 +11,26 @@ type Result<T> = StorageResult<T>;
 
 const VOLUME_ALIGNMENT: u64 = 4096;
 
+/// 1MB needle block alignment, used by the volume server for write alignment.
+pub const NEEDLE_BLOCK_SIZE: usize = 1024 * 1024;
+
+/// Query the underlying filesystem capacity via statvfs.
+///
+/// Returns `(total_bytes, available_bytes)`. On failure, falls back to a
+/// conservative 100GB/90GB default so the volume server can still boot.
+fn get_fs_capacity(path: &str) -> (u64, u64) {
+    use nix::sys::statvfs;
+    match statvfs::statvfs(std::path::Path::new(path)) {
+        Ok(stat) => {
+            let block_size = stat.fragment_size();
+            let total = stat.blocks() * block_size;
+            let free = stat.blocks_available() * block_size;
+            (total, free)
+        }
+        Err(_) => (100 * 1024 * 1024 * 1024, 90 * 1024 * 1024 * 1024),
+    }
+}
+
 struct VolumeMeta {
     volume_id: u64,
     device_id: String,
@@ -41,34 +61,26 @@ impl LocalFsBackend {
         base_path: &str,
         node_id: &str,
         device_name: &str,
-        total_capacity: u64,
+        device_capacity: Option<u64>,
     ) -> Result<Self> {
         let base_path = PathBuf::from(base_path);
         std::fs::create_dir_all(&base_path)?;
 
         let device_id = format!("local_fs_{}", device_name);
-        let data_file = base_path.join(format!("device_{}.dat", device_name));
 
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&data_file)?;
-
-        let file_size = file.metadata()?.len();
-        if file_size < total_capacity {
-            file.set_len(total_capacity)?;
-        }
-
-        let actual_size = file.metadata()?.len();
-        let used_space = 0u64;
-        let free_space = actual_size - used_space;
+        // Capacity is configurable; fall back to the real filesystem capacity
+        // reported by statvfs. No device backing file is preallocated anymore:
+        // volumes are sparse files and actual used space is read from statvfs.
+        let path_str = base_path.to_str().unwrap_or(".");
+        let (fs_total, fs_free) = get_fs_capacity(path_str);
+        let total_capacity = device_capacity.unwrap_or(fs_total);
+        let used_space = fs_total.saturating_sub(fs_free);
+        let free_space = fs_free;
 
         let device = StorageDevice {
             device_id: device_id.clone(),
             device_type: DeviceType::LocalFile,
-            total_capacity: actual_size,
+            total_capacity,
             used_space,
             free_space,
             location: DeviceLocation {
@@ -87,7 +99,7 @@ impl LocalFsBackend {
             DeviceState {
                 info: device,
                 free_offset: 0,
-                _data_file: data_file,
+                _data_file: base_path.clone(),
             },
         );
 
@@ -101,30 +113,19 @@ impl LocalFsBackend {
         })
     }
 
-    pub fn add_device(&self, device_name: &str, total_capacity: u64) -> Result<String> {
+    pub fn add_device(&self, device_name: &str, device_capacity: Option<u64>) -> Result<String> {
         let device_id = format!("local_fs_{}", device_name);
-        let data_file = self.base_path.join(format!("device_{}.dat", device_name));
 
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&data_file)?;
-
-        let file_size = file.metadata()?.len();
-        if file_size < total_capacity {
-            file.set_len(total_capacity)?;
-        }
-
-        let actual_size = file.metadata()?.len();
-        let used_space = 0u64;
-        let free_space = actual_size - used_space;
+        let path_str = self.base_path.to_str().unwrap_or(".");
+        let (fs_total, fs_free) = get_fs_capacity(path_str);
+        let total_capacity = device_capacity.unwrap_or(fs_total);
+        let used_space = fs_total.saturating_sub(fs_free);
+        let free_space = fs_free;
 
         let device = StorageDevice {
             device_id: device_id.clone(),
             device_type: DeviceType::LocalFile,
-            total_capacity: actual_size,
+            total_capacity,
             used_space,
             free_space,
             location: DeviceLocation {
@@ -143,7 +144,7 @@ impl LocalFsBackend {
             DeviceState {
                 info: device,
                 free_offset: 0,
-                _data_file: data_file,
+                _data_file: self.base_path.clone(),
             },
         );
 
@@ -245,26 +246,23 @@ impl StorageBackend for LocalFsBackend {
         let mut selected_device: Option<String> = None;
         let mut alloc_offset: u64 = 0;
 
+        // Volume 是稀疏文件，size 只是逻辑上限，不预占物理空间。
+        // 选择第一个可用设备即可，不做 size 检查。
         for device_id in &candidate_device_ids {
             if let Some(device) = devices.get_mut(device_id) {
-                if device.info.free_space >= aligned_size {
-                    let offset = Self::align_up(device.free_offset, VOLUME_ALIGNMENT);
-                    if offset + aligned_size <= device.info.total_capacity {
-                        alloc_offset = offset;
-                        selected_device = Some(device_id.clone());
-                        break;
-                    }
-                }
+                let offset = Self::align_up(device.free_offset, VOLUME_ALIGNMENT);
+                alloc_offset = offset;
+                selected_device = Some(device_id.clone());
+                break;
             }
         }
 
-        let device_id =
-            selected_device.ok_or(StorageBackendError::NoAvailableDevice(aligned_size))?;
+        let device_id = selected_device.ok_or(StorageBackendError::NoAvailableDevice(size))?;
 
+        // Volumes are sparse files: do NOT debit the device's used/free space.
+        // Actual disk usage is observed via statvfs rather than tracked here.
         if let Some(device) = devices.get_mut(&device_id) {
             device.free_offset = alloc_offset + aligned_size;
-            device.info.used_space += aligned_size;
-            device.info.free_space -= aligned_size;
         }
 
         let data_file = self.base_path.join(format!("volume_{}.dat", volume_id));
@@ -274,6 +272,7 @@ impl StorageBackend for LocalFsBackend {
             .read(true)
             .write(true)
             .open(&data_file)?;
+        // Sparse file: set the logical length without allocating blocks.
         file.set_len(size)?;
 
         let volume_meta = VolumeMeta {
@@ -303,18 +302,8 @@ impl StorageBackend for LocalFsBackend {
             .remove(&volume_id)
             .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
 
-        let mut devices = self.devices.write().unwrap();
-        if let Some(device) = devices.get_mut(&volume_meta.device_id) {
-            device.info.used_space = device
-                .info
-                .used_space
-                .saturating_sub(volume_meta.total_size);
-            device.info.free_space = device
-                .info
-                .free_space
-                .saturating_add(volume_meta.total_size);
-        }
-
+        // statvfs remains the source of truth for device used/free space, so
+        // there is nothing to restore here — just drop the volume file.
         if volume_meta.data_file.exists() {
             std::fs::remove_file(&volume_meta.data_file)?;
         }
@@ -559,20 +548,15 @@ mod tests {
     fn create_test_backend() -> (LocalFsBackend, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        let backend = LocalFsBackend::new(path, "test-node", "dev0", 100 * 1024 * 1024).unwrap();
+        let backend = LocalFsBackend::new(path, "test-node", "dev0", None).unwrap();
         (backend, dir)
     }
 
     #[test]
     fn test_list_devices_empty() {
         let dir = tempdir().unwrap();
-        let backend = LocalFsBackend::new(
-            dir.path().to_str().unwrap(),
-            "test-node",
-            "dev0",
-            100 * 1024 * 1024,
-        )
-        .unwrap();
+        let backend =
+            LocalFsBackend::new(dir.path().to_str().unwrap(), "test-node", "dev0", None).unwrap();
         let devices = backend.list_devices().unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_type, DeviceType::LocalFile);
@@ -723,8 +707,10 @@ mod tests {
         let device_id = &devices[0].device_id;
 
         let health = backend.get_device_health(device_id).unwrap();
-        assert_eq!(health.health_status, HealthStatus::Healthy);
-        assert_eq!(health.utilization_percent, 0.0);
+        // used_space now reflects real filesystem usage reported by statvfs,
+        // so utilization is host-dependent. Validate the invariants only.
+        assert!(health.utilization_percent >= 0.0 && health.utilization_percent <= 100.0);
+        assert!(health.available_bytes <= health.capacity_bytes);
     }
 
     #[test]
@@ -746,7 +732,7 @@ mod tests {
     #[test]
     fn test_add_device() {
         let (backend, _dir) = create_test_backend();
-        let _new_id = backend.add_device("dev1", 50 * 1024 * 1024).unwrap();
+        let _new_id = backend.add_device("dev1", Some(50 * 1024 * 1024)).unwrap();
         let devices = backend.list_devices().unwrap();
         assert_eq!(devices.len(), 2);
     }

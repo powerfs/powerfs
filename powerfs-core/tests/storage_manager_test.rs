@@ -4,7 +4,7 @@ use powerfs_core::storage::StorageManager;
 fn create_storage_manager() -> (tempfile::TempDir, StorageManager) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let mgr = StorageManager::new(NodeId("test-node".to_string()), path).unwrap();
+    let mgr = StorageManager::new(NodeId("test-node".to_string()), path, None).unwrap();
     (dir, mgr)
 }
 
@@ -193,7 +193,7 @@ fn test_find_available_volume_skips_read_only() {
 fn test_load_volumes_empty_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
-    let mgr = StorageManager::new(NodeId("node".to_string()), path).unwrap();
+    let mgr = StorageManager::new(NodeId("node".to_string()), path, None).unwrap();
     assert!(mgr.load_volumes().is_ok());
     assert_eq!(mgr.volume_count(), 0);
 }
@@ -205,7 +205,7 @@ fn test_load_volumes_with_existing() {
 
     let backend;
     {
-        let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone()).unwrap();
+        let mgr1 = StorageManager::new(NodeId("node".to_string()), path.clone(), None).unwrap();
         backend = mgr1.backend();
         mgr1.create_volume(VolumeId(5), 1024 * 1024).unwrap();
     }

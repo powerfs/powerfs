@@ -34,8 +34,11 @@ struct Args {
     #[arg(long, default_value = "./data")]
     data_dir: String,
 
-    #[arg(long, default_value = "1073741824")]
-    volume_size: u64,
+    #[arg(long)]
+    volume_size: Option<u64>,
+
+    #[arg(long)]
+    initial_volume_count: Option<u32>,
 
     #[arg(long, default_value = "true")]
     register_with_master: bool,
@@ -96,11 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         volume_cfg.data_dir.clone()
     };
 
-    let volume_size = if args.volume_size != 1073741824 {
-        args.volume_size
-    } else {
-        volume_cfg.max_volume_size
-    };
+    let volume_size = args.volume_size.unwrap_or(volume_cfg.max_volume_size);
+
+    let initial_volume_count = args
+        .initial_volume_count
+        .unwrap_or(volume_cfg.initial_volume_count);
 
     info!("Starting PowerFS Volume Server");
     info!("  GRPC Address: {}", grpc_address);
@@ -110,11 +113,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Rack: {}", args.rack);
     info!("  Masters: {}", master_address.join(", "));
     info!("  Data Dir: {}", data_dir);
+    info!("  Initial Volume Count: {}", initial_volume_count);
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
-        StorageManager::new(node_id.clone(), data_dir.clone())
-            .expect("Failed to create storage manager"),
+        StorageManager::new(
+            node_id.clone(),
+            data_dir.clone(),
+            volume_cfg.device_capacity,
+        )
+        .expect("Failed to create storage manager"),
     );
 
     let grpc_port = grpc_address
@@ -184,7 +192,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(20)).await;
 
             info!("Requesting initial volumes from master...");
-            match master_client.grow("001", "default", 2).await {
+            match master_client
+                .grow("001", "default", initial_volume_count)
+                .await
+            {
                 Ok(response) => {
                     info!(
                         "grow response: new_volume_ids={:?}, locations={}, error={}",

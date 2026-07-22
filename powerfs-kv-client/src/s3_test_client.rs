@@ -27,7 +27,7 @@ impl S3TestClient {
             "/tmp/powerfs-test",
             node_id,
             "default",
-            1024 * 1024 * 1024,
+            Some(1024 * 1024 * 1024),
         )?);
         Ok(Self {
             backend,

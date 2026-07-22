@@ -604,6 +604,40 @@ impl DirORSet {
         });
     }
 
+    pub fn rename_entry(
+        &mut self,
+        old_id: &EntryId,
+        new_name: &str,
+        client_id: u64,
+    ) -> Option<EntryId> {
+        if let Some(old_entry) = self.entries.remove(old_id) {
+            self.vclock.increment(client_id);
+            let vclock = self.vclock.clone();
+
+            let seq = self.vclock.get(client_id);
+            let new_id = EntryId {
+                name: new_name.to_string(),
+                client_id,
+                seq,
+            };
+
+            let mut new_entry = old_entry.clone();
+            new_entry.id = new_id.clone();
+            new_entry.mtime = now_unix();
+
+            self.tombstones.insert(old_id.clone());
+            self.entries.insert(new_id.clone(), new_entry.clone());
+            self.delta_log.push(DeltaOp::Rename {
+                old_id: old_id.clone(),
+                new_entry,
+                vclock,
+            });
+            Some(new_id)
+        } else {
+            None
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_attr(
         &mut self,

@@ -8,4 +8,5 @@ http_port = 8091
 data_dir = "/data"
 node_id = "volume-server-1"
 master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
-max_volume_size = 1073741824
+max_volume_size = 1099511627776
+initial_volume_count = 2

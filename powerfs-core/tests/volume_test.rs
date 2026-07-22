@@ -8,7 +8,7 @@ fn create_test_volume(vol_id: u32, size: u64) -> (tempfile::TempDir, Volume) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
     let backend = Arc::new(
-        LocalFsBackend::new(path, "test-node", "default", 100 * 1024 * 1024 * 1024).unwrap(),
+        LocalFsBackend::new(path, "test-node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
     );
     let volume = Volume::new(VolumeId(vol_id), "test-node", path, size, backend).unwrap();
     (dir, volume)
@@ -49,8 +49,9 @@ fn test_volume_info() {
 fn test_volume_multiple_volumes_different_ids() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let backend =
-        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
 
     let v1 = Volume::new(VolumeId(1), "node", path, 1024 * 1024, backend.clone()).unwrap();
     let v2 = Volume::new(VolumeId(2), "node", path, 1024 * 1024, backend).unwrap();
@@ -292,8 +293,9 @@ fn test_volume_empty_data_round_trip() {
 fn test_volume_reopen_persists_data() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let backend =
-        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
 
     {
         let volume =
@@ -390,7 +392,8 @@ fn test_storage_manager_scrub_volume() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+    let manager =
+        StorageManager::new(NodeId("node-1".to_string()), path.to_string(), None).unwrap();
 
     manager
         .create_volume(VolumeId(1), 10 * 1024 * 1024)
@@ -411,7 +414,8 @@ fn test_storage_manager_verify_needle() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+    let manager =
+        StorageManager::new(NodeId("node-1".to_string()), path.to_string(), None).unwrap();
 
     manager
         .create_volume(VolumeId(1), 10 * 1024 * 1024)
@@ -430,7 +434,8 @@ fn test_storage_manager_scrub_all_volumes() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+    let manager =
+        StorageManager::new(NodeId("node-1".to_string()), path.to_string(), None).unwrap();
 
     manager
         .create_volume(VolumeId(1), 10 * 1024 * 1024)
@@ -468,8 +473,9 @@ fn test_storage_manager_scrub_all_volumes() {
 fn test_volume_reopen_restores_used() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let backend =
-        Arc::new(LocalFsBackend::new(path, "node", "default", 100 * 1024 * 1024 * 1024).unwrap());
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
 
     let used_before;
     {
@@ -731,7 +737,8 @@ fn test_storage_manager_compact_volume() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
-    let manager = StorageManager::new(NodeId("node-1".to_string()), path.to_string()).unwrap();
+    let manager =
+        StorageManager::new(NodeId("node-1".to_string()), path.to_string(), None).unwrap();
 
     manager
         .create_volume(VolumeId(1), 10 * 1024 * 1024)

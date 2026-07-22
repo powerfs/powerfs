@@ -26,11 +26,17 @@ impl BackendFactory {
                 }
 
                 let device = &details.devices[0];
+                // A configured capacity of 0 means "auto-detect from statvfs".
+                let device_capacity = if device.total_capacity > 0 {
+                    Some(device.total_capacity)
+                } else {
+                    None
+                };
                 let backend = LocalFsBackend::new(
                     &details.data_dir,
                     &config.node_id,
                     &device.name,
-                    device.total_capacity,
+                    device_capacity,
                 )?;
                 Ok(Arc::new(backend))
             }

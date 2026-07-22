@@ -761,7 +761,7 @@ async fn run_volume(
         }
     } else {
         Arc::new(
-            StorageManager::new(node_id.clone(), data_dir.clone())
+            StorageManager::new(node_id.clone(), data_dir.clone(), None)
                 .expect("Failed to create storage manager"),
         )
     };

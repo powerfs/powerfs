@@ -19,7 +19,7 @@ use powerfs_core::kv_cache_persist::KVPersistStore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -60,6 +60,7 @@ pub struct MasterNode {
     event_provider: Arc<dyn EventProvider>,
     filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
     shard_mapping: RwLock<HashMap<u64, String>>,
+    stripe_round_robin: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -359,6 +360,7 @@ impl MasterNode {
             event_provider,
             filer_nodes: RwLock::new(HashMap::new()),
             shard_mapping: RwLock::new(HashMap::new()),
+            stripe_round_robin: Arc::new(AtomicU32::new(0)),
         };
 
         let master_clone = master.clone();
@@ -692,6 +694,54 @@ impl MasterNode {
         );
 
         info!("Applied AssignVolume: vid={}, node={}", vid, nid_clone);
+
+        // 通知 Volume Server 创建 volume，否则后续 write_needle 会报 `volume not found`。
+        // 通过 VolumeClientPool 复用 gRPC 通道，避免在请求路径上反复建连。
+        let topology = self.topology.read().unwrap();
+        let node_info = topology.get_node(&nid).cloned();
+        drop(topology);
+
+        if let Some(node) = node_info {
+            let grpc_addr = format!("{}:{}", node.address, node.grpc_port);
+            let vid_clone = vid.0;
+            let pool = self.volume_client_pool.clone();
+            // master 的 size 是逻辑上限（volume_size_limit，默认 1TB），
+            // 但 volume server 的存储设备容量通常较小（如 100GB 虚拟设备）。
+            // 裁剪到设备可承受的范围，默认 256GB，满足 IO500 stonewall=300s
+            // 的高带宽写入需求（~500MB/s * 300s ≈ 150GB）。
+            let max_create_size = 1024 * 1024 * 1024 * 1024; // 1TB
+            let create_size = if size > 0 && size < max_create_size {
+                size
+            } else {
+                max_create_size
+            };
+            tokio::spawn(async move {
+                info!(
+                    "Notifying volume server {} to create volume {} (size={})",
+                    grpc_addr, vid_clone, create_size
+                );
+                if let Err(e) = pool
+                    .create_volume_with_retry(
+                        &grpc_addr,
+                        vid_clone,
+                        create_size,
+                        5,
+                        Duration::from_millis(500),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to create volume {} on {}: {}",
+                        vid_clone, grpc_addr, e
+                    );
+                }
+            });
+        } else {
+            warn!(
+                "Applied AssignVolume: node {} not found in topology, cannot notify volume server",
+                nid_clone
+            );
+        }
 
         let provider = self.event_provider.clone();
         let vid_clone = vid.0;
@@ -1080,9 +1130,16 @@ impl MasterNode {
 
         if short_volumes_no_used == current_short {
             info!(
-                "HEARTBEAT_DEBUG: volumes unchanged for node={}, skipping propose",
+                "HEARTBEAT_DEBUG: volumes unchanged for node={}, skipping propose, updating used locally",
                 params.node_id
             );
+            let mut volumes_map = self.volumes.write().unwrap();
+            for vol in &short_volumes {
+                let vid = VolumeId(vol.volume_id);
+                if let Some(existing) = volumes_map.get_mut(&vid) {
+                    existing.used = vol.used;
+                }
+            }
             return Ok(());
         }
 
@@ -1202,6 +1259,63 @@ impl MasterNode {
         self.create_new_volume(replication, collection).await
     }
 
+    /// 批量分配 stripe volumes
+    /// 每次都创建新 volume，确保 stripe 的各条带分布在不同 volume 上
+    /// 返回 (volume_ids, start_volume_idx) 用于 FileLayout
+    pub async fn assign_stripe_volumes(
+        &self,
+        count: u32,
+        replication: &str,
+        collection: &str,
+    ) -> Result<(Vec<u64>, u32)> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let mut volume_ids = Vec::with_capacity(count as usize);
+
+        for i in 0..count {
+            // stripe 模式下每个条带都创建新 volume，确保分布在不同 volume server 上
+            match self.create_new_volume(replication, collection).await {
+                Ok((fid, _nodes)) => {
+                    volume_ids.push(fid.volume_id.0 as u64);
+                    info!(
+                        "assign_stripe_volumes: created volume {} for stripe slot {}/{}",
+                        fid.volume_id.0,
+                        i + 1,
+                        count
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "assign_stripe_volumes: create_new_volume failed for slot {}/{}: {}",
+                        i + 1,
+                        count,
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        // round-robin: 不同文件从不同 volume 开始
+        let start_idx = self.stripe_round_robin.fetch_add(1, Ordering::Relaxed) % count;
+
+        Ok((volume_ids, start_idx))
+    }
+
+    /// 在指定 volume 上分配一个新的 file_key（自增）
+    pub fn allocate_file_key(&self, volume_id: &VolumeId) -> Option<u64> {
+        let mut volumes = self.volumes.write().unwrap();
+        if let Some(vol_info) = volumes.get_mut(volume_id) {
+            let key = vol_info.next_file_key;
+            vol_info.next_file_key += 1;
+            Some(key)
+        } else {
+            None
+        }
+    }
+
     pub async fn create_new_volume(
         &self,
         replication: &str,
@@ -1285,7 +1399,8 @@ impl MasterNode {
             self.propose_command(cmd).await?;
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 等待 Volume Server 实际创建 volume（gRPC 通知是异步的）
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let file_key = {
             let mut volumes = self.volumes.write().unwrap();
@@ -1409,7 +1524,8 @@ impl MasterNode {
             self.propose_command(cmd).await?;
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 等待 Volume Server 实际创建 volume（gRPC 通知是异步的）
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let file_key = {
             let mut volumes = self.volumes.write().unwrap();
@@ -2028,6 +2144,7 @@ impl Clone for MasterNode {
             event_provider: self.event_provider.clone(),
             filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),
             shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
+            stripe_round_robin: self.stripe_round_robin.clone(),
         }
     }
 }

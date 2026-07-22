@@ -21,10 +21,9 @@ fn backend_err(e: StorageBackendError) -> PowerFsError {
 
 #[allow(clippy::result_large_err)]
 impl StorageManager {
-    pub fn new(node_id: NodeId, data_path: String) -> Result<Self> {
-        let default_capacity = 100 * 1024 * 1024 * 1024; // 100GB
+    pub fn new(node_id: NodeId, data_path: String, device_capacity: Option<u64>) -> Result<Self> {
         let backend = Arc::new(
-            LocalFsBackend::new(&data_path, &node_id.0, "default", default_capacity)
+            LocalFsBackend::new(&data_path, &node_id.0, "default", device_capacity)
                 .map_err(backend_err)?,
         );
         Ok(StorageManager {
@@ -54,10 +53,10 @@ impl StorageManager {
         node_id: NodeId,
         data_path: String,
         algorithm: ChecksumAlgorithm,
+        device_capacity: Option<u64>,
     ) -> Result<Self> {
-        let default_capacity = 100 * 1024 * 1024 * 1024; // 100GB
         let backend = Arc::new(
-            LocalFsBackend::new(&data_path, &node_id.0, "default", default_capacity)
+            LocalFsBackend::new(&data_path, &node_id.0, "default", device_capacity)
                 .map_err(backend_err)?,
         );
         Ok(StorageManager {

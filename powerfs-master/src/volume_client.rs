@@ -1,7 +1,7 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
 use crate::volume_proto::powerfs::{
-    DeleteNeedleRequest, ReadNeedleRequest, RestoreNeedleRequest, WormLockRequest,
-    WriteNeedleRequest,
+    CreateVolumeRequest, DeleteNeedleRequest, ReadNeedleRequest, RestoreNeedleRequest,
+    WormLockRequest, WriteNeedleRequest,
 };
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -40,6 +40,72 @@ impl VolumeClientPool {
     async fn invalidate_channel(&self, address: &str) {
         let mut channels = self.channels.write().await;
         channels.remove(address);
+    }
+
+    /// 通知 Volume Server 创建 volume，带重试。
+    /// Master 在 apply_assign_volume 中调用此方法，确保 Volume Server 上
+    /// 实际存在对应 volume，避免后续 write_needle 报 `volume not found`。
+    pub async fn create_volume_with_retry(
+        &self,
+        address: &str,
+        volume_id: u32,
+        size: u64,
+        max_retries: u32,
+        retry_delay: std::time::Duration,
+    ) -> Result<(), String> {
+        for retry in 0..max_retries {
+            let channel = match self.get_or_create_channel(address).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    log::warn!(
+                        "create_volume: connect to {} failed (retry {}): {}",
+                        address,
+                        retry,
+                        e
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut service = VolumeServiceClient::new(channel);
+            let request = CreateVolumeRequest { volume_id, size };
+
+            match service.create_volume(tonic::Request::new(request)).await {
+                Ok(resp) => {
+                    let inner = resp.into_inner();
+                    if inner.success {
+                        log::info!("create_volume: volume {} created on {}", volume_id, address);
+                        return Ok(());
+                    } else {
+                        log::warn!(
+                            "create_volume: volume {} on {} returned success=false (retry {})",
+                            volume_id,
+                            address,
+                            retry
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.invalidate_channel(address).await;
+                    log::warn!(
+                        "create_volume: volume {} on {} failed (retry {}): {}",
+                        volume_id,
+                        address,
+                        retry,
+                        e
+                    );
+                }
+            }
+
+            if retry + 1 < max_retries {
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+        Err(format!(
+            "create_volume: failed after {} retries on {} for volume {}",
+            max_retries, address, volume_id
+        ))
     }
 
     pub async fn write_needle(

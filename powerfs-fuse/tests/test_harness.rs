@@ -97,14 +97,14 @@ fn force_cleanup() {
     let fuse_mount = get_fuse_mount();
     let test_data_dir = get_test_data_dir();
 
-    let _ = Command::new("fusermount3")
+    let _ = Command::new("fusermount")
         .arg("-u")
         .arg(&fuse_mount)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 
-    let _ = Command::new("fusermount3")
+    let _ = Command::new("fusermount")
         .arg("-zu")
         .arg(&fuse_mount)
         .stdout(Stdio::null())
@@ -159,12 +159,18 @@ fn is_port_open(addr: &str) -> bool {
 
 fn is_fuse_available() -> bool {
     Path::new("/dev/fuse").exists()
-        && Command::new("fusermount3")
+        && (Command::new("fusermount")
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok()
+            || Command::new("fusermount3")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok())
 }
 
 fn wait_for_port(addr: &str, timeout_secs: u64) -> bool {

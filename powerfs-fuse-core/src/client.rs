@@ -321,20 +321,140 @@ impl PowerFuseClient {
         }
     }
 
+    /// 批量分配 stripe FIDs
+    /// 当 stripe_count > 1 时，Master 会分配多个 volume，返回多个 FID
+    pub async fn assign_stripe_fids(
+        &self,
+        collection: &str,
+        replication: &str,
+        stripe_count: u32,
+        stripe_size: u64,
+    ) -> Result<(Vec<Fid>, Vec<Location>), String> {
+        debug!(
+            "assign_stripe_fids: collection={}, replication={}, stripe_count={}, stripe_size={}",
+            collection, replication, stripe_count, stripe_size
+        );
+
+        let max_retries = 3;
+        let mut attempt = 0;
+
+        loop {
+            let channel = match self.get_or_create_master_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        return Err(e);
+                    }
+                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
+                    continue;
+                }
+            };
+
+            let mut client = MasterServiceClient::new(channel);
+            let request = AssignRequest {
+                count: 1,
+                replication: replication.to_string(),
+                collection: collection.to_string(),
+                ttl: String::new(),
+                data_center: String::new(),
+                rack: String::new(),
+                data_node: String::new(),
+                disk_type: String::new(),
+                stripe_count,
+                stripe_size,
+            };
+
+            match client.assign(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+
+                    // 解析所有 stripe FIDs
+                    let mut fids = Vec::new();
+                    for fid_str in &resp.stripe_fids {
+                        match Fid::from_string(fid_str) {
+                            Ok(fid) => fids.push(fid),
+                            Err(e) => {
+                                warn!("assign_stripe_fids: invalid fid '{}': {}", fid_str, e);
+                            }
+                        }
+                    }
+
+                    if fids.is_empty() {
+                        // fallback: 用 primary fid
+                        if let Ok(fid) = Fid::from_string(&resp.fid) {
+                            fids.push(fid);
+                        }
+                    }
+
+                    let locations: Vec<Location> = resp.stripe_locations;
+                    debug!(
+                        "assign_stripe_fids succeeded: {} fids, {} locations",
+                        fids.len(),
+                        locations.len()
+                    );
+                    return Ok((fids, locations));
+                }
+                Err(e) => {
+                    attempt += 1;
+                    let msg = format!("assign_stripe_fids failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_master_channel().await;
+                    if msg.contains("not leader") {
+                        self.try_switch_leader(&msg).await;
+                    }
+                    if attempt >= max_retries {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1)))).await;
+                }
+            }
+        }
+    }
+
     async fn try_switch_leader(&self, error_msg: &str) {
         if let Some(start) = error_msg.find("current leader is ") {
-            let leader_addr = error_msg[start + 18..].trim();
+            let remaining = &error_msg[start + 18..];
+
+            let leader_addr = remaining
+                .split([',', '"', '}'])
+                .next()
+                .unwrap_or(remaining)
+                .trim();
+
             if !leader_addr.is_empty() {
-                info!("Trying to switch to leader: {}", leader_addr);
-                if let Some((index, _)) = self
+                info!(
+                    "Leader switch triggered: current leader reported as {}",
+                    leader_addr
+                );
+
+                if let Some((index, addr)) = self
                     .master_addresses
                     .iter()
                     .enumerate()
-                    .find(|(_, addr)| **addr == leader_addr)
+                    .find(|(_, addr)| *addr == leader_addr)
                 {
                     self.current_master_index
                         .store(index, std::sync::atomic::Ordering::Relaxed);
-                    info!("Switched to leader at index {}", index);
+                    info!("Switched to leader at index {} ({})", index, addr);
+                    self.set_leader_hint(Some(leader_addr.to_string())).await;
+                } else {
+                    let current = self
+                        .current_master_index
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let next = (current + 1) % self.master_addresses.len();
+                    self.current_master_index
+                        .store(next, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        "Round-robin: switching from master {} ({}) to {} ({})",
+                        current, self.master_addresses[current], next, self.master_addresses[next]
+                    );
+                    self.set_leader_hint(Some(self.master_addresses[next].clone()))
+                        .await;
                 }
             }
         }
@@ -583,12 +703,21 @@ impl PowerFuseClient {
     }
 
     pub fn location_to_grpc_addr(location: &Location) -> String {
-        if location.grpc_port > 0 {
-            let host = location.url.split(':').next().unwrap_or(&location.url);
-            format!("{}:{}", host, location.grpc_port)
+        let host = if !location.public_url.is_empty() {
+            let url = location
+                .public_url
+                .strip_prefix("http://")
+                .unwrap_or(&location.public_url);
+            url.split(':').next().unwrap_or(url).to_string()
         } else {
-            format!("{}:{}", location.url, location.grpc_port)
-        }
+            location
+                .url
+                .split(':')
+                .next()
+                .unwrap_or(&location.url)
+                .to_string()
+        };
+        format!("{}:{}", host, location.grpc_port)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -846,6 +975,9 @@ impl PowerFuseClient {
                     let msg = format!("create_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
+                    if msg.contains("not leader") {
+                        self.try_switch_leader(&msg).await;
+                    }
                     if attempt == self.config.max_retry_count {
                         return Err(msg);
                     }
@@ -905,6 +1037,9 @@ impl PowerFuseClient {
                     let msg = format!("update_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
+                    if msg.contains("not leader") {
+                        self.try_switch_leader(&msg).await;
+                    }
                     if attempt == self.config.max_retry_count {
                         return Err(msg);
                     }
@@ -1977,7 +2112,7 @@ pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
 
-const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl SyncFuseClient {
     pub fn new(client: Arc<PowerFuseClient>) -> Self {
@@ -2019,6 +2154,23 @@ impl SyncFuseClient {
         replication: &str,
     ) -> Result<AssignFidResult, String> {
         self.block_with_timeout(self.client.assign_fid(collection, replication))
+    }
+
+    /// 批量分配 stripe FIDs
+    /// 返回 (fids, locations) 列表，用于 FileLayout stripe 模式
+    pub fn assign_stripe_fids(
+        &self,
+        collection: &str,
+        replication: &str,
+        stripe_count: u32,
+        stripe_size: u64,
+    ) -> Result<(Vec<Fid>, Vec<Location>), String> {
+        self.block_with_timeout(self.client.assign_stripe_fids(
+            collection,
+            replication,
+            stripe_count,
+            stripe_size,
+        ))
     }
 
     pub fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
