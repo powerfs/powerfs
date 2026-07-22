@@ -345,11 +345,18 @@ impl MetadataManager {
     // ==================== 写路径 ====================
 
     /// 创建普通文件
-    pub fn create(&self, dir_ino: u64, name: &str, mode: u32) -> Result<DirEntry, FsError> {
+    pub fn create(
+        &self,
+        dir_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<DirEntry, FsError> {
         let inode = self.inode_allocator.allocate();
         let seq = self.next_seq();
         let entry_id = EntryId::new(name, self.client_id, seq);
-        let entry = DirEntry::new_file(entry_id, inode, dir_ino, mode);
+        let entry = DirEntry::new_file(entry_id, inode, dir_ino, mode, uid, gid);
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
@@ -360,11 +367,18 @@ impl MetadataManager {
     }
 
     /// 创建目录
-    pub fn mkdir(&self, dir_ino: u64, name: &str, mode: u32) -> Result<DirEntry, FsError> {
+    pub fn mkdir(
+        &self,
+        dir_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<DirEntry, FsError> {
         let inode = self.inode_allocator.allocate();
         let seq = self.next_seq();
         let entry_id = EntryId::new(name, self.client_id, seq);
-        let entry = DirEntry::new_dir(entry_id, inode, dir_ino, mode);
+        let entry = DirEntry::new_dir(entry_id, inode, dir_ino, mode, uid, gid);
 
         // 【关键修复】先调用 apply_to_local_orset（更新 inode_index/inode_paths），再创建 OR-Set
         // 避免死锁：apply_to_local_orset 需要 inode_index.write()，如果先持有 dir_cache.write()
@@ -409,17 +423,23 @@ impl MetadataManager {
         name: &str,
         mode: u32,
         rdev: u64,
+        uid: u32,
+        gid: u32,
     ) -> Result<DirEntry, FsError> {
         let inode = self.inode_allocator.allocate();
         let seq = self.next_seq();
         let entry_id = EntryId::new(name, self.client_id, seq);
         let file_type = FileType::from_mode(mode);
         let entry = match file_type {
-            FileType::Fifo => DirEntry::new_fifo(entry_id, inode, dir_ino, mode),
-            FileType::CharDevice => DirEntry::new_chrdev(entry_id, inode, dir_ino, mode, rdev),
-            FileType::BlockDevice => DirEntry::new_blkdev(entry_id, inode, dir_ino, mode, rdev),
-            FileType::Socket => DirEntry::new_socket(entry_id, inode, dir_ino, mode),
-            _ => DirEntry::new_file(entry_id, inode, dir_ino, mode),
+            FileType::Fifo => DirEntry::new_fifo(entry_id, inode, dir_ino, mode, uid, gid),
+            FileType::CharDevice => {
+                DirEntry::new_chrdev(entry_id, inode, dir_ino, mode, rdev, uid, gid)
+            }
+            FileType::BlockDevice => {
+                DirEntry::new_blkdev(entry_id, inode, dir_ino, mode, rdev, uid, gid)
+            }
+            FileType::Socket => DirEntry::new_socket(entry_id, inode, dir_ino, mode, uid, gid),
+            _ => DirEntry::new_file(entry_id, inode, dir_ino, mode, uid, gid),
         };
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
@@ -998,8 +1018,8 @@ impl MetadataManager {
             generation: 0,
             file_type: FileType::Directory,
             mode: 0o755 | libc::S_IFDIR,
-            uid: 0,
-            gid: 0,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
             size: 4096,
             mtime: now,
             atime: now,

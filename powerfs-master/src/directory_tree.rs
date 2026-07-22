@@ -506,8 +506,13 @@ impl DirectoryTree {
         let mut orset = self.orset.write().unwrap();
         let entry_id = powerfs_orset::EntryId::new(entry.name.clone(), client_id_num, 0);
         let file_type_bits = mode_val & 0o170000;
+        let (uid, gid) = entry
+            .attributes
+            .as_ref()
+            .map(|a| (a.uid, a.gid))
+            .unwrap_or((0, 0));
         let mut dir_entry = if file_type_bits == 0o40000 {
-            powerfs_orset::DirEntry::new_dir(entry_id, inode, parent_ino, mode_val)
+            powerfs_orset::DirEntry::new_dir(entry_id, inode, parent_ino, mode_val, uid, gid)
         } else if file_type_bits == 0o120000 {
             powerfs_orset::DirEntry::new_symlink(
                 entry_id,
@@ -517,17 +522,21 @@ impl DirectoryTree {
                 entry.symlink_target.clone(),
             )
         } else if file_type_bits == 0o10000 {
-            powerfs_orset::DirEntry::new_fifo(entry_id, inode, parent_ino, mode_val)
+            powerfs_orset::DirEntry::new_fifo(entry_id, inode, parent_ino, mode_val, uid, gid)
         } else if file_type_bits == 0o20000 {
             let rdev = entry.attributes.as_ref().map(|a| a.rdev).unwrap_or(0);
-            powerfs_orset::DirEntry::new_chrdev(entry_id, inode, parent_ino, mode_val, rdev)
+            powerfs_orset::DirEntry::new_chrdev(
+                entry_id, inode, parent_ino, mode_val, rdev, uid, gid,
+            )
         } else if file_type_bits == 0o60000 {
             let rdev = entry.attributes.as_ref().map(|a| a.rdev).unwrap_or(0);
-            powerfs_orset::DirEntry::new_blkdev(entry_id, inode, parent_ino, mode_val, rdev)
+            powerfs_orset::DirEntry::new_blkdev(
+                entry_id, inode, parent_ino, mode_val, rdev, uid, gid,
+            )
         } else if file_type_bits == 0o140000 {
-            powerfs_orset::DirEntry::new_socket(entry_id, inode, parent_ino, mode_val)
+            powerfs_orset::DirEntry::new_socket(entry_id, inode, parent_ino, mode_val, uid, gid)
         } else {
-            powerfs_orset::DirEntry::new_file(entry_id, inode, parent_ino, mode_val)
+            powerfs_orset::DirEntry::new_file(entry_id, inode, parent_ino, mode_val, uid, gid)
         };
 
         // 保留客户端传来的 uid/gid/nlink/rdev

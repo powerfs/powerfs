@@ -129,7 +129,14 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    pub fn new_file(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+    pub fn new_file(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -137,8 +144,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::RegularFile,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -151,7 +158,14 @@ impl DirEntry {
         }
     }
 
-    pub fn new_dir(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+    pub fn new_dir(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -159,8 +173,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::Directory,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -201,7 +215,14 @@ impl DirEntry {
         }
     }
 
-    pub fn new_fifo(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+    pub fn new_fifo(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -209,8 +230,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::Fifo,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -223,7 +244,15 @@ impl DirEntry {
         }
     }
 
-    pub fn new_chrdev(id: EntryId, inode: u64, parent_ino: u64, mode: u32, rdev: u64) -> Self {
+    pub fn new_chrdev(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -231,8 +260,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::CharDevice,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -245,7 +274,15 @@ impl DirEntry {
         }
     }
 
-    pub fn new_blkdev(id: EntryId, inode: u64, parent_ino: u64, mode: u32, rdev: u64) -> Self {
+    pub fn new_blkdev(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -253,8 +290,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::BlockDevice,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -267,7 +304,14 @@ impl DirEntry {
         }
     }
 
-    pub fn new_socket(id: EntryId, inode: u64, parent_ino: u64, mode: u32) -> Self {
+    pub fn new_socket(
+        id: EntryId,
+        inode: u64,
+        parent_ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         let now = now_unix();
         Self {
             id,
@@ -275,8 +319,8 @@ impl DirEntry {
             generation: 0,
             file_type: FileType::Socket,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size: 0,
             mtime: now,
             atime: now,
@@ -1358,7 +1402,7 @@ mod tests {
     #[test]
     fn test_dir_entry_new_file() {
         let id = EntryId::new("test.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644 | libc::S_IFREG);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644 | libc::S_IFREG, 0, 0);
         assert_eq!(entry.id, id);
         assert_eq!(entry.inode, 100);
         assert_eq!(entry.parent_ino, 1);
@@ -1370,7 +1414,7 @@ mod tests {
     #[test]
     fn test_dir_entry_new_dir() {
         let id = EntryId::new("subdir", 1, 2);
-        let entry = DirEntry::new_dir(id, 200, 1, 0o755 | libc::S_IFDIR);
+        let entry = DirEntry::new_dir(id, 200, 1, 0o755 | libc::S_IFDIR, 0, 0, 0, 0);
         assert!(entry.is_dir());
         assert_eq!(entry.parent_ino, 1);
     }
@@ -1379,7 +1423,7 @@ mod tests {
     fn test_dir_orset_add_remove() {
         let mut orset = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
 
         orset.add(entry);
         assert_eq!(orset.len(), 1);
@@ -1397,8 +1441,8 @@ mod tests {
 
         let id1 = EntryId::new("file.txt", 1, 1);
         let id2 = EntryId::new("file.txt", 2, 1);
-        let entry1 = DirEntry::new_file(id1.clone(), 100, 1, 0o644);
-        let entry2 = DirEntry::new_file(id2.clone(), 200, 1, 0o644);
+        let entry1 = DirEntry::new_file(id1.clone(), 100, 1, 0o644, 0, 0);
+        let entry2 = DirEntry::new_file(id2.clone(), 200, 1, 0o644, 0, 0);
 
         orset.add(entry1);
         orset.add(entry2);
@@ -1412,12 +1456,12 @@ mod tests {
     fn test_dir_orset_tombstone_prevents_revival() {
         let mut orset = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
 
         orset.add(entry);
         orset.remove(&id);
 
-        let entry2 = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry2 = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
         orset.add(entry2);
         assert_eq!(orset.len(), 0);
     }
@@ -1426,7 +1470,7 @@ mod tests {
     fn test_dir_orset_get_by_inode() {
         let mut orset = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id, 100, 1, 0o644);
+        let entry = DirEntry::new_file(id, 100, 1, 0o644, 0, 0);
         orset.add(entry);
 
         assert!(orset.get_by_inode(100).is_some());
@@ -1465,7 +1509,7 @@ mod tests {
         let mut vc = VectorClock::new();
         vc.increment(1);
 
-        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         let delta = DeltaOp::Add { entry, vclock: vc };
 
         orset.apply_delta(&delta);
@@ -1477,7 +1521,7 @@ mod tests {
     fn test_dir_orset_apply_delta_remove() {
         let mut orset = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        orset.add(DirEntry::new_file(id.clone(), 100, 1, 0o644));
+        orset.add(DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0));
 
         let mut vc = VectorClock::new();
         vc.increment(1);
@@ -1495,11 +1539,11 @@ mod tests {
     fn test_dir_orset_apply_delta_rename() {
         let mut orset = DirORSet::new(1);
         let old_id = EntryId::new("old.txt", 1, 1);
-        orset.add(DirEntry::new_file(old_id.clone(), 100, 1, 0o644));
+        orset.add(DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0));
 
         let mut vc = VectorClock::new();
         vc.increment(1);
-        let new_entry = DirEntry::new_file(EntryId::new("new.txt", 1, 2), 100, 1, 0o644);
+        let new_entry = DirEntry::new_file(EntryId::new("new.txt", 1, 2), 100, 1, 0o644, 0, 0);
         let delta = DeltaOp::Rename {
             old_id,
             new_entry,
@@ -1516,7 +1560,7 @@ mod tests {
     fn test_dir_orset_apply_delta_setattr() {
         let mut orset = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        orset.add(DirEntry::new_file(id, 100, 1, 0o644));
+        orset.add(DirEntry::new_file(id, 100, 1, 0o644, 0, 0));
 
         let mut vc = VectorClock::new();
         vc.increment(1);
@@ -1566,7 +1610,7 @@ mod tests {
     fn test_dir_orset_merge_with_tombstone() {
         let mut orset1 = DirORSet::new(1);
         let id = EntryId::new("file.txt", 1, 1);
-        orset1.add(DirEntry::new_file(id.clone(), 100, 1, 0o644));
+        orset1.add(DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0));
 
         let mut orset2 = DirORSet::new(1);
         orset2.remove(&id);
@@ -1581,7 +1625,7 @@ mod tests {
         let mut vc = VectorClock::new();
         vc.increment(1);
 
-        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         let delta = DeltaOp::Add {
             entry: entry.clone(),
             vclock: vc.clone(),
@@ -1602,8 +1646,8 @@ mod tests {
     fn test_conflict_detection_create_create() {
         let mut orset = DirORSet::new(1);
 
-        let entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
-        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
+        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
 
         let mut vc1 = VectorClock::new();
         vc1.increment(1);
@@ -1630,7 +1674,7 @@ mod tests {
     fn test_conflict_detection_write_write() {
         let mut orset = DirORSet::new(1);
 
-        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let entry = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         orset.add(entry);
 
         let mut vc1 = VectorClock::new();
@@ -1669,7 +1713,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
 
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
         orset.add(entry);
 
         let mut vc1 = VectorClock::new();
@@ -1699,7 +1743,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
 
         let id1 = EntryId::new("file.txt", 1, 1);
-        let entry1 = DirEntry::new_file(id1.clone(), 100, 1, 0o644);
+        let entry1 = DirEntry::new_file(id1.clone(), 100, 1, 0o644, 0, 0);
 
         let mut vc1 = VectorClock::new();
         vc1.increment(1);
@@ -1714,7 +1758,7 @@ mod tests {
             vclock: vc1,
         });
 
-        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         let mut vc2 = VectorClock::new();
         vc2.increment(2);
 
@@ -1732,13 +1776,13 @@ mod tests {
     fn test_conflict_detection_rename_conflict() {
         let mut orset = DirORSet::new(1);
 
-        let entry1 = DirEntry::new_file(EntryId::new("a.txt", 1, 1), 100, 1, 0o644);
+        let entry1 = DirEntry::new_file(EntryId::new("a.txt", 1, 1), 100, 1, 0o644, 0, 0);
         orset.apply_delta(&DeltaOp::Add {
             entry: entry1,
             vclock: VectorClock::new(),
         });
 
-        let entry2 = DirEntry::new_file(EntryId::new("target.txt", 2, 1), 200, 1, 0o644);
+        let entry2 = DirEntry::new_file(EntryId::new("target.txt", 2, 1), 200, 1, 0o644, 0, 0);
         let mut vc2 = VectorClock::new();
         vc2.increment(2);
         orset.apply_delta(&DeltaOp::Add {
@@ -1749,7 +1793,7 @@ mod tests {
         let mut vc1 = VectorClock::new();
         vc1.increment(1);
 
-        let new_entry = DirEntry::new_file(EntryId::new("target.txt", 1, 2), 100, 1, 0o644);
+        let new_entry = DirEntry::new_file(EntryId::new("target.txt", 1, 2), 100, 1, 0o644, 0, 0);
         orset.apply_delta(&DeltaOp::Rename {
             old_id: EntryId::new("a.txt", 1, 1),
             new_entry,
@@ -1765,8 +1809,8 @@ mod tests {
     fn test_conflict_resolution() {
         let mut orset = DirORSet::new(1);
 
-        let entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
-        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
+        let entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
 
         let mut vc1 = VectorClock::new();
         vc1.increment(1);
@@ -1803,7 +1847,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::Aggressive;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1813,7 +1857,7 @@ mod tests {
             crc32: 12345,
         }];
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1847,7 +1891,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::Aggressive;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1857,7 +1901,7 @@ mod tests {
             crc32: 12345,
         }];
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1890,7 +1934,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::Conservative;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1900,7 +1944,7 @@ mod tests {
             crc32: 12345,
         }];
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1933,7 +1977,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::Aggressive;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1943,7 +1987,7 @@ mod tests {
             crc32: 12345,
         }];
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1976,7 +2020,7 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::Manual;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -1986,7 +2030,7 @@ mod tests {
             crc32: 12345,
         }];
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.chunks = vec![CachedFileChunk {
             offset: 0,
             size: 10,
@@ -2020,10 +2064,10 @@ mod tests {
         let mut orset = DirORSet::new(1);
         orset.policy = MergePolicy::LwwTime;
 
-        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644);
+        let mut entry1 = DirEntry::new_file(EntryId::new("file.txt", 1, 1), 100, 1, 0o644, 0, 0);
         entry1.mtime = 1000;
 
-        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644);
+        let mut entry2 = DirEntry::new_file(EntryId::new("file.txt", 2, 1), 200, 1, 0o644, 0, 0);
         entry2.mtime = 2000;
 
         let mut vc1 = VectorClock::new();
@@ -2050,7 +2094,7 @@ mod tests {
         orset.policy = MergePolicy::WritePriority;
 
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
         orset.add(entry);
 
         let mut vc1 = VectorClock::new();
@@ -2081,7 +2125,7 @@ mod tests {
         orset.policy = MergePolicy::DeletePriority;
 
         let id = EntryId::new("file.txt", 1, 1);
-        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644);
+        let entry = DirEntry::new_file(id.clone(), 100, 1, 0o644, 0, 0);
         orset.add(entry);
 
         let mut vc1 = VectorClock::new();

@@ -963,7 +963,7 @@ impl Filesystem for PowerFsFuserFs {
 
     fn create(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -973,11 +973,18 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         let name_str = name.to_str().unwrap_or("");
         debug!(
-            "create: parent={}, name={}, mode={:o}",
-            parent, name_str, mode
+            "create: parent={}, name={}, mode={:o}, uid={}, gid={}",
+            parent,
+            name_str,
+            mode,
+            req.uid(),
+            req.gid()
         );
 
-        match self.meta.create(parent, name_str, mode | libc::S_IFREG) {
+        match self
+            .meta
+            .create(parent, name_str, mode | libc::S_IFREG, req.uid(), req.gid())
+        {
             Ok(entry) => {
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.created(&TTL, &attr, 0, 0, 0);
@@ -994,7 +1001,7 @@ impl Filesystem for PowerFsFuserFs {
 
     fn mkdir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1003,11 +1010,18 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         let name_str = name.to_str().unwrap_or("");
         debug!(
-            "mkdir: parent={}, name={}, mode={:o}",
-            parent, name_str, mode
+            "mkdir: parent={}, name={}, mode={:o}, uid={}, gid={}",
+            parent,
+            name_str,
+            mode,
+            req.uid(),
+            req.gid()
         );
 
-        match self.meta.mkdir(parent, name_str, mode | libc::S_IFDIR) {
+        match self
+            .meta
+            .mkdir(parent, name_str, mode | libc::S_IFDIR, req.uid(), req.gid())
+        {
             Ok(entry) => {
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
@@ -1132,7 +1146,7 @@ impl Filesystem for PowerFsFuserFs {
 
     fn mknod(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1142,11 +1156,19 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         let name_str = name.to_str().unwrap_or("");
         debug!(
-            "mknod: parent={}, name={}, mode={:o}, rdev={}",
-            parent, name_str, mode, rdev
+            "mknod: parent={}, name={}, mode={:o}, rdev={}, uid={}, gid={}",
+            parent,
+            name_str,
+            mode,
+            rdev,
+            req.uid(),
+            req.gid()
         );
 
-        match self.meta.mknod(parent, name_str, mode, rdev as u64) {
+        match self
+            .meta
+            .mknod(parent, name_str, mode, rdev as u64, req.uid(), req.gid())
+        {
             Ok(entry) => {
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
@@ -1207,6 +1229,10 @@ impl Filesystem for PowerFsFuserFs {
                 reply.error(e.to_errno());
             }
         }
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _inode: u64, _mask: i32, reply: ReplyEmpty) {
+        reply.ok();
     }
 
     fn open(&mut self, _req: &Request<'_>, _inode: u64, _flags: i32, reply: ReplyOpen) {
@@ -1712,7 +1738,6 @@ impl FuserApp {
             MountOption::FSName("powerfs".to_string()),
             MountOption::AutoUnmount,
             MountOption::AllowOther,
-            MountOption::DefaultPermissions,
         ];
 
         let fs_for_mount = fs.clone();

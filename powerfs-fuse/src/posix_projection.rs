@@ -288,6 +288,8 @@ mod tests {
             inode,
             1,
             0o644 | libc::S_IFREG,
+            0,
+            0,
         );
         entry.mtime = mtime;
         entry
@@ -435,8 +437,14 @@ mod tests {
     fn test_project_listing_with_directory() {
         let mut orset = DirORSet::new(1);
         orset.add(make_entry("file.txt", 1, 1, 100, 1000));
-        let mut dir_entry =
-            DirEntry::new_dir(EntryId::new("subdir", 1, 2), 101, 1, 0o755 | libc::S_IFDIR);
+        let mut dir_entry = DirEntry::new_dir(
+            EntryId::new("subdir", 1, 2),
+            101,
+            1,
+            0o755 | libc::S_IFDIR,
+            0,
+            0,
+        );
         dir_entry.mtime = 2000;
         orset.add(dir_entry);
 
