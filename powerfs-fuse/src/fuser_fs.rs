@@ -22,11 +22,12 @@ use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
 use powerfs_master::proto::powerfs::StatisticsResponse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 
@@ -37,30 +38,23 @@ const TTL: Duration = Duration::from_secs(0);
 const ROOT_INO: u64 = 1;
 
 struct PowerFsFuserFs {
-    /// 元数据管理器（OR-Set 缓存 + POSIX 投影）
     meta: Arc<MetadataManager>,
-    /// 数据管理器（ChunkCache + WriteBuffer + 文件大小）
     data: Arc<DataManager>,
-    /// gRPC 客户端（Volume Server + Master 同步）
     client: Arc<SyncFuseClient>,
-    /// Collection 名（Volume 分配用）
     collection: String,
-    /// 副本策略（Volume 分配用）
     replication: String,
-    /// 内核 dentry 失效通知器（mount2 模式下为 None）
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
-    /// 按 inode 的 flush 锁（避免并发 flush 冲突）
     flush_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
-    /// 全局脏标记（后台 flush 线程用）
     has_dirty: Arc<AtomicBool>,
-    /// 数据完整性验证开关（缺省关闭，调试时打开）
     verify_data: bool,
-    /// statfs 缓存（避免每次调用都访问 Master）
     statfs_cache: Arc<Mutex<Option<StatisticsResponse>>>,
-    /// 文件级租约管理（inode -> lease_id）
     leases: Arc<RwLock<HashMap<u64, String>>>,
-    /// 客户端 ID（用于租约获取）
     client_id: String,
+    lease_renewer_running: Arc<AtomicBool>,
+    write_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
+    lease_epochs: Arc<RwLock<HashMap<u64, u64>>>,
+    lease_notifier_running: Arc<AtomicBool>,
+    invalidated_inodes: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl PowerFsFuserFs {
@@ -75,6 +69,44 @@ impl PowerFsFuserFs {
         statfs_cache_value: Option<StatisticsResponse>,
         client_id: String,
     ) -> Self {
+        let leases: Arc<RwLock<HashMap<u64, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let write_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let lease_epochs: Arc<RwLock<HashMap<u64, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let invalidated_inodes: Arc<RwLock<HashSet<u64>>> = Arc::new(RwLock::new(HashSet::new()));
+        let lease_renewer_running = Arc::new(AtomicBool::new(true));
+        let lease_notifier_running = Arc::new(AtomicBool::new(true));
+        let client_clone = client.clone();
+        let leases_clone = leases.clone();
+        let lease_renewer_running_clone = lease_renewer_running.clone();
+        let lease_epochs_clone = lease_epochs.clone();
+        let invalidated_inodes_clone = invalidated_inodes.clone();
+
+        thread::spawn(move || {
+            while lease_renewer_running_clone.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(10));
+                let leases_map = leases_clone.read().unwrap();
+                for (&inode, lease_id) in leases_map.iter() {
+                    match client_clone.renew_lease(lease_id, 30000) {
+                        Ok((success, epoch)) => {
+                            if success {
+                                debug!("lease renewed for inode={}, epoch={}", inode, epoch);
+                                let mut epochs = lease_epochs_clone.write().unwrap();
+                                epochs.insert(inode, epoch);
+                            } else {
+                                warn!("lease renew failed for inode={}, lease expired", inode);
+                                let mut invalidated = invalidated_inodes_clone.write().unwrap();
+                                invalidated.insert(inode);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("lease renew error for inode={}: {}", inode, e);
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             meta,
             data,
@@ -86,8 +118,13 @@ impl PowerFsFuserFs {
             has_dirty: Arc::new(AtomicBool::new(false)),
             verify_data,
             statfs_cache: Arc::new(Mutex::new(statfs_cache_value)),
-            leases: Arc::new(RwLock::new(HashMap::new())),
+            leases,
             client_id,
+            lease_renewer_running,
+            write_locks,
+            lease_epochs,
+            lease_notifier_running,
+            invalidated_inodes,
         }
     }
 
@@ -171,6 +208,32 @@ impl PowerFsFuserFs {
             self.data.set_file_size(ino, meta_size);
         }
         effective
+    }
+
+    fn is_lease_invalidated(&self, inode: u64) -> bool {
+        let invalidated = self.invalidated_inodes.read().unwrap();
+        invalidated.contains(&inode)
+    }
+
+    #[allow(dead_code)]
+    fn handle_lease_invalidation(&self, inode: u64) {
+        warn!("handle_lease_invalidation: inode={}", inode);
+
+        let mut invalidated = self.invalidated_inodes.write().unwrap();
+        invalidated.remove(&inode);
+
+        let mut leases = self.leases.write().unwrap();
+        leases.remove(&inode);
+
+        let mut epochs = self.lease_epochs.write().unwrap();
+        epochs.remove(&inode);
+
+        let mut locks = self.write_locks.write().unwrap();
+        locks.remove(&inode);
+
+        self.data.write_buffer().take(inode);
+
+        self.invalidate_kernel_inode(inode);
     }
 
     /// 将脏 chunk 写入 Volume Server 并更新 Master 元数据
@@ -1244,19 +1307,8 @@ impl Filesystem for PowerFsFuserFs {
 
     fn open(&mut self, _req: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("open: inode={}, flags={:x}", inode, flags);
-        eprintln!(
-            "fuser_fs::open: inode={}, flags={:x}, uid={}, gid={}",
-            inode,
-            flags,
-            _req.uid(),
-            _req.gid()
-        );
 
         if let Ok(Some(entry)) = self.meta.get_entry_by_inode(inode) {
-            eprintln!(
-                "fuser_fs::open: found entry, mode={:o}, uid={}, gid={}",
-                entry.mode, entry.uid, entry.gid
-            );
             let uid = _req.uid();
             let gid = _req.gid();
             let is_read = flags == libc::O_RDONLY;
@@ -1441,20 +1493,61 @@ impl Filesystem for PowerFsFuserFs {
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let offset_u64 = offset as u64;
-        debug!(
-            "write: inode={}, offset={}, size={}",
-            inode,
-            offset_u64,
-            data.len()
-        );
+        if self.is_lease_invalidated(inode) {
+            warn!(
+                "write: lease invalidated for inode={}, returning error",
+                inode
+            );
+            reply.error(libc::EIO);
+            return;
+        }
 
-        let written = self.data.write(inode, offset_u64, data);
-        self.has_dirty.store(true, Ordering::Relaxed);
+        let is_append = flags & libc::O_APPEND != 0;
+
+        let offset_u64: u64;
+        let written: u64;
+
+        if is_append {
+            let write_lock = {
+                let mut locks = self.write_locks.write().unwrap();
+                locks
+                    .entry(inode)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+
+            let _guard = write_lock.lock().unwrap();
+
+            offset_u64 = self.data.current_file_size(inode);
+
+            debug!(
+                "write: inode={}, offset={}, size={}, append={}",
+                inode,
+                offset_u64,
+                data.len(),
+                is_append
+            );
+
+            written = self.data.write(inode, offset_u64, data);
+            self.has_dirty.store(true, Ordering::Relaxed);
+        } else {
+            offset_u64 = offset as u64;
+
+            debug!(
+                "write: inode={}, offset={}, size={}, append={}",
+                inode,
+                offset_u64,
+                data.len(),
+                is_append
+            );
+
+            written = self.data.write(inode, offset_u64, data);
+            self.has_dirty.store(true, Ordering::Relaxed);
+        }
 
         reply.written(written as u32);
     }
@@ -1494,15 +1587,16 @@ impl Filesystem for PowerFsFuserFs {
             error!("release: flush failed for inode={}", inode);
         }
 
-        // 清理 write_buffer（数据已在 chunk_cache 中）
         self.data.write_buffer().take(inode);
 
-        // 只在 flush 成功时才清除脏标记和释放资源
         if flush_ok {
             self.data.clear_dirty(inode);
         }
 
-        // 释放文件租约
+        if self.is_lease_invalidated(inode) {
+            self.handle_lease_invalidation(inode);
+        }
+
         if let Some(lease_id) = self.leases.write().unwrap().remove(&inode) {
             debug!(
                 "release: releasing lease for inode={}, lease_id={}",
@@ -1592,6 +1686,11 @@ impl Clone for PowerFsFuserFs {
             statfs_cache: self.statfs_cache.clone(),
             leases: self.leases.clone(),
             client_id: self.client_id.clone(),
+            lease_renewer_running: self.lease_renewer_running.clone(),
+            write_locks: self.write_locks.clone(),
+            lease_epochs: self.lease_epochs.clone(),
+            lease_notifier_running: self.lease_notifier_running.clone(),
+            invalidated_inodes: self.invalidated_inodes.clone(),
         }
     }
 }
