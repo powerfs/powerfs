@@ -40,9 +40,12 @@ impl MasterGrpcServer {
             master: self.master.clone(),
         };
 
+        let max_concurrent_streams = 64;
+
         Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(5)))
             .http2_keepalive_timeout(Some(Duration::from_secs(15)))
+            .max_concurrent_streams(max_concurrent_streams)
             .add_service(MasterServiceServer::new(self))
             .add_service(KvCacheServiceServer::new(kv_svc))
             .serve(addr)

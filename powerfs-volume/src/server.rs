@@ -18,6 +18,8 @@ use sysinfo::System;
 use tokio::time;
 use tonic::{transport::Server, Request, Response, Status};
 
+const MAX_MERGE_ENTRIES: usize = 100;
+
 pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
     node_id: NodeId,
@@ -667,7 +669,92 @@ impl VolumeService for VolumeServer {
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let mut success_count = 0;
-                if entries.len() <= 1 {
+
+                if entries.len() <= MAX_MERGE_ENTRIES {
+                    if entries.len() <= 1 {
+                        for entry in entries {
+                            let result = volume.write_needle_blob(
+                                file_key,
+                                entry.offset,
+                                entry.size,
+                                Bytes::from(entry.needle_blob),
+                                entry.cookie,
+                            );
+                            if result.is_ok() {
+                                success_count += 1;
+                            } else {
+                                warn!(
+                                    "batch_write_needle_blob entry failed: file_key={}, offset={}, size={}, err={:?}",
+                                    file_key, entry.offset, entry.size, result
+                                );
+                            }
+                        }
+                    } else {
+                        info!(
+                            "batch_write_needle_blob: merging {} entries for file_key={}",
+                            entries.len(),
+                            file_key
+                        );
+                        let mut max_end: i64 = 0;
+                        for entry in &entries {
+                            let end = entry.offset + entry.size as i64;
+                            if end > max_end {
+                                max_end = end;
+                            }
+                        }
+
+                        let existing_data_opt = volume
+                            .read_needle_meta(file_key)
+                            .and_then(|meta| {
+                                let data_size = meta.data_size as i32;
+                                if data_size > 0 {
+                                    volume.read_needle_blob(file_key, 0, data_size).ok()
+                                } else {
+                                    None
+                                }
+                            });
+
+                        let merged_data: Vec<u8>;
+                        if let Some(existing_data) = existing_data_opt {
+                            let existing_len = existing_data.len();
+                            let total_len = existing_len.max(max_end as usize);
+                            let mut data = vec![0u8; total_len];
+                            data[..existing_len].copy_from_slice(&existing_data);
+                            for entry in &entries {
+                                let offset = entry.offset as usize;
+                                let len = entry.size as usize;
+                                if offset + len <= data.len() {
+                                    data[offset..offset + len]
+                                        .copy_from_slice(&entry.needle_blob[..len]);
+                                }
+                            }
+                            merged_data = data;
+                        } else {
+                            let mut data = vec![0u8; max_end as usize];
+                            for entry in &entries {
+                                let offset = entry.offset as usize;
+                                let len = entry.size as usize;
+                                if offset + len <= data.len() {
+                                    data[offset..offset + len]
+                                        .copy_from_slice(&entry.needle_blob[..len]);
+                                }
+                            }
+                            merged_data = data;
+                        }
+
+                        match volume.write_needle(file_key, Bytes::from(merged_data)) {
+                            Ok(_) => success_count = entries.len() as i32,
+                            Err(e) => {
+                                warn!("batch_write_needle_blob merged write failed: {:?}", e);
+                            }
+                        }
+                    }
+                } else {
+                    info!(
+                        "batch_write_needle_blob: splitting {} entries into batches for file_key={}",
+                        entries.len(),
+                        file_key
+                    );
                     for entry in entries {
                         let result = volume.write_needle_blob(
                             file_key,
@@ -683,65 +770,6 @@ impl VolumeService for VolumeServer {
                                 "batch_write_needle_blob entry failed: file_key={}, offset={}, size={}, err={:?}",
                                 file_key, entry.offset, entry.size, result
                             );
-                        }
-                    }
-                } else {
-                    info!(
-                        "batch_write_needle_blob: merging {} entries for file_key={}",
-                        entries.len(),
-                        file_key
-                    );
-                    let mut max_end: i64 = 0;
-                    for entry in &entries {
-                        let end = entry.offset + entry.size as i64;
-                        if end > max_end {
-                            max_end = end;
-                        }
-                    }
-
-                    let existing_data_opt = volume
-                        .read_needle_meta(file_key)
-                        .and_then(|meta| {
-                            let data_size = meta.data_size as i32;
-                            if data_size > 0 {
-                                volume.read_needle_blob(file_key, 0, data_size).ok()
-                            } else {
-                                None
-                            }
-                        });
-
-                    let merged_data: Vec<u8>;
-                    if let Some(existing_data) = existing_data_opt {
-                        let existing_len = existing_data.len();
-                        let total_len = existing_len.max(max_end as usize);
-                        let mut data = vec![0u8; total_len];
-                        data[..existing_len].copy_from_slice(&existing_data);
-                        for entry in &entries {
-                            let offset = entry.offset as usize;
-                            let len = entry.size as usize;
-                            if offset + len <= data.len() {
-                                data[offset..offset + len]
-                                    .copy_from_slice(&entry.needle_blob[..len]);
-                            }
-                        }
-                        merged_data = data;
-                    } else {
-                        let mut data = vec![0u8; max_end as usize];
-                        for entry in &entries {
-                            let offset = entry.offset as usize;
-                            let len = entry.size as usize;
-                            if offset + len <= data.len() {
-                                data[offset..offset + len]
-                                    .copy_from_slice(&entry.needle_blob[..len]);
-                            }
-                        }
-                        merged_data = data;
-                    }
-
-                    match volume.write_needle(file_key, Bytes::from(merged_data)) {
-                        Ok(_) => success_count = entries.len() as i32,
-                        Err(e) => {
-                            warn!("batch_write_needle_blob merged write failed: {:?}", e);
                         }
                     }
                 }

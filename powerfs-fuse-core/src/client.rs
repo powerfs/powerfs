@@ -42,9 +42,12 @@ pub struct GrpcConfig {
     pub keepalive_interval: Duration,
     pub keepalive_timeout: Duration,
     pub connect_timeout: Duration,
-    pub request_timeout: Duration,
+    pub lookup_timeout: Duration,
+    pub metadata_timeout: Duration,
+    pub batch_timeout: Duration,
     pub max_retry_count: usize,
     pub retry_delay: Duration,
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for GrpcConfig {
@@ -53,9 +56,12 @@ impl Default for GrpcConfig {
             keepalive_interval: Duration::from_secs(5),
             keepalive_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(30),
+            lookup_timeout: Duration::from_secs(5),
+            metadata_timeout: Duration::from_secs(15),
+            batch_timeout: Duration::from_secs(30),
             max_retry_count: 3,
             retry_delay: Duration::from_millis(500),
+            max_concurrent_requests: 8,
         }
     }
 }
@@ -73,6 +79,8 @@ pub struct PowerFuseClient {
     config: GrpcConfig,
     /// Per-node health tracking, circuit breaker, leader cache.
     connection_manager: Arc<MasterConnectionManager>,
+    /// Semaphore to limit concurrent gRPC requests to Master
+    master_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl PowerFuseClient {
@@ -90,6 +98,8 @@ impl PowerFuseClient {
             addrs.clone(),
             ConnectionConfig::default(),
         ));
+        let master_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
         Arc::new(PowerFuseClient {
             master_addresses: Arc::new(addrs),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
@@ -99,6 +109,7 @@ impl PowerFuseClient {
             runtime_handle,
             config,
             connection_manager,
+            master_semaphore,
         })
     }
 
@@ -125,6 +136,10 @@ impl PowerFuseClient {
         *current_addr = Some(addr);
 
         Ok(channel)
+    }
+
+    async fn acquire_master_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.master_semaphore.clone().acquire_owned().await.ok()
     }
 
     async fn try_connect_to_master(&self) -> Result<(Channel, String), String> {
@@ -944,9 +959,22 @@ impl PowerFuseClient {
         );
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("create_entry: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("create_entry: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -964,6 +992,7 @@ impl PowerFuseClient {
 
             match client.create_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
@@ -972,6 +1001,7 @@ impl PowerFuseClient {
                     return Ok(resp.inode);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("create_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -1002,9 +1032,22 @@ impl PowerFuseClient {
         );
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("update_entry: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("update_entry: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -1024,6 +1067,7 @@ impl PowerFuseClient {
 
             match client.update_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.success {
                         return Err(
@@ -1034,6 +1078,7 @@ impl PowerFuseClient {
                     return Ok(resp.actual_size);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("update_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -1055,9 +1100,22 @@ impl PowerFuseClient {
         debug!("get_entry: path={}", path);
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("get_entry: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("get_entry: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -1074,6 +1132,7 @@ impl PowerFuseClient {
 
             match client.get_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
@@ -1082,6 +1141,7 @@ impl PowerFuseClient {
                     return Ok(resp.entry);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("get_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -1100,9 +1160,22 @@ impl PowerFuseClient {
         debug!("get_entry_by_inode: inode={}", inode);
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("get_entry_by_inode: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("get_entry_by_inode: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -1120,6 +1193,7 @@ impl PowerFuseClient {
                 .await
             {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
@@ -1131,6 +1205,7 @@ impl PowerFuseClient {
                     return Ok(None);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("get_entry_by_inode failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -1154,9 +1229,22 @@ impl PowerFuseClient {
         debug!("delete_entry: ino={}, is_directory={}", ino, is_directory);
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("delete_entry: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("delete_entry: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -1175,6 +1263,7 @@ impl PowerFuseClient {
 
             match client.delete_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
@@ -1183,6 +1272,7 @@ impl PowerFuseClient {
                     return Ok(resp.success);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("delete_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -1211,9 +1301,22 @@ impl PowerFuseClient {
         );
 
         for attempt in 1..=self.config.max_retry_count {
+            let permit = match self.acquire_master_permit().await {
+                Some(p) => p,
+                None => {
+                    warn!("rename_entry: failed to acquire semaphore permit");
+                    if attempt == self.config.max_retry_count {
+                        return Err("rename_entry: semaphore unavailable".to_string());
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
             let channel = match self.get_or_create_master_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    drop(permit);
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
@@ -1234,6 +1337,7 @@ impl PowerFuseClient {
 
             match client.rename_entry(tonic::Request::new(request)).await {
                 Ok(response) => {
+                    drop(permit);
                     let resp = response.into_inner();
                     if !resp.error.is_empty() {
                         return Err(resp.error);
@@ -1242,6 +1346,7 @@ impl PowerFuseClient {
                     return Ok(resp.success);
                 }
                 Err(e) => {
+                    drop(permit);
                     let msg = format!("rename_entry failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
                     self.invalidate_master_channel().await;
@@ -2112,8 +2217,6 @@ pub struct SyncFuseClient {
     client: Arc<PowerFuseClient>,
 }
 
-const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-
 impl SyncFuseClient {
     pub fn new(client: Arc<PowerFuseClient>) -> Self {
         SyncFuseClient { client }
@@ -2123,7 +2226,7 @@ impl SyncFuseClient {
         &self.client
     }
 
-    fn block_with_timeout<F, T>(&self, future: F) -> Result<T, String>
+    fn block_with_timeout<F, T>(&self, future: F, timeout: Duration) -> Result<T, String>
     where
         F: std::future::Future<Output = Result<T, String>>,
     {
@@ -2137,15 +2240,33 @@ impl SyncFuseClient {
                 *rt = Some(tokio::runtime::Runtime::new().unwrap());
             }
             rt.as_ref().unwrap().block_on(async {
-                match tokio::time::timeout(GRPC_CALL_TIMEOUT, future).await {
+                match tokio::time::timeout(timeout, future).await {
                     Ok(result) => result,
-                    Err(_) => Err(format!(
-                        "gRPC call timed out after {}s",
-                        GRPC_CALL_TIMEOUT.as_secs()
-                    )),
+                    Err(_) => Err(format!("gRPC call timed out after {}s", timeout.as_secs())),
                 }
             })
         })
+    }
+
+    fn block_with_lookup_timeout<F, T>(&self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.block_with_timeout(future, self.client.config.lookup_timeout)
+    }
+
+    fn block_with_metadata_timeout<F, T>(&self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.block_with_timeout(future, self.client.config.metadata_timeout)
+    }
+
+    fn block_with_batch_timeout<F, T>(&self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.block_with_timeout(future, self.client.config.batch_timeout)
     }
 
     pub fn assign_fid(
@@ -2153,7 +2274,7 @@ impl SyncFuseClient {
         collection: &str,
         replication: &str,
     ) -> Result<AssignFidResult, String> {
-        self.block_with_timeout(self.client.assign_fid(collection, replication))
+        self.block_with_batch_timeout(self.client.assign_fid(collection, replication))
     }
 
     /// 批量分配 stripe FIDs
@@ -2165,7 +2286,7 @@ impl SyncFuseClient {
         stripe_count: u32,
         stripe_size: u64,
     ) -> Result<(Vec<Fid>, Vec<Location>), String> {
-        self.block_with_timeout(self.client.assign_stripe_fids(
+        self.block_with_batch_timeout(self.client.assign_stripe_fids(
             collection,
             replication,
             stripe_count,
@@ -2174,7 +2295,7 @@ impl SyncFuseClient {
     }
 
     pub fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> {
-        self.block_with_timeout(self.client.lookup_volume(volume_id))
+        self.block_with_lookup_timeout(self.client.lookup_volume(volume_id))
     }
 
     pub fn write_data(
@@ -2184,10 +2305,12 @@ impl SyncFuseClient {
         file_key: u64,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        self.block_with_timeout(
-            self.client
-                .write_data(volume_addr, volume_id, file_key, data),
-        )
+        self.block_with_metadata_timeout(self.client.write_data(
+            volume_addr,
+            volume_id,
+            file_key,
+            data,
+        ))
     }
 
     pub fn read_data(
@@ -2196,7 +2319,7 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<Vec<u8>, String> {
-        self.block_with_timeout(self.client.read_data(volume_addr, volume_id, file_key))
+        self.block_with_metadata_timeout(self.client.read_data(volume_addr, volume_id, file_key))
     }
 
     pub fn delete_data(
@@ -2205,7 +2328,7 @@ impl SyncFuseClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<(), String> {
-        self.block_with_timeout(self.client.delete_data(volume_addr, volume_id, file_key))
+        self.block_with_metadata_timeout(self.client.delete_data(volume_addr, volume_id, file_key))
     }
 
     pub fn batch_write_blob(
@@ -2215,7 +2338,7 @@ impl SyncFuseClient {
         file_key: u64,
         entries: Vec<(i64, i32, Vec<u8>, u32)>,
     ) -> Result<(), String> {
-        self.block_with_timeout(self.client.batch_write_blob(
+        self.block_with_batch_timeout(self.client.batch_write_blob(
             volume_addr,
             volume_id,
             file_key,
@@ -2234,7 +2357,7 @@ impl SyncFuseClient {
         data: Vec<u8>,
         cookie: u32,
     ) -> Result<(), String> {
-        self.block_with_timeout(self.client.write_blob(
+        self.block_with_metadata_timeout(self.client.write_blob(
             volume_addr,
             volume_id,
             file_key,
@@ -2253,7 +2376,7 @@ impl SyncFuseClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        self.block_with_timeout(self.client.read_blob(
+        self.block_with_metadata_timeout(self.client.read_blob(
             volume_addr,
             volume_id,
             file_key,
@@ -2263,7 +2386,7 @@ impl SyncFuseClient {
     }
 
     pub fn create_entry(&self, entry: Entry, client_id: &str) -> Result<u64, String> {
-        self.block_with_timeout(self.client.create_entry(entry, client_id))
+        self.block_with_metadata_timeout(self.client.create_entry(entry, client_id))
     }
 
     pub fn update_entry(
@@ -2273,7 +2396,7 @@ impl SyncFuseClient {
         expected_size: u64,
         is_truncate: bool,
     ) -> Result<u64, String> {
-        self.block_with_timeout(self.client.update_entry(
+        self.block_with_metadata_timeout(self.client.update_entry(
             entry,
             client_id,
             expected_size,
@@ -2282,11 +2405,11 @@ impl SyncFuseClient {
     }
 
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
-        self.block_with_timeout(self.client.get_entry(path))
+        self.block_with_lookup_timeout(self.client.get_entry(path))
     }
 
     pub fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>, String> {
-        self.block_with_timeout(self.client.get_entry_by_inode(inode))
+        self.block_with_lookup_timeout(self.client.get_entry_by_inode(inode))
     }
 
     pub fn delete_entry(
@@ -2295,7 +2418,7 @@ impl SyncFuseClient {
         is_directory: bool,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.block_with_timeout(self.client.delete_entry(ino, is_directory, client_id))
+        self.block_with_metadata_timeout(self.client.delete_entry(ino, is_directory, client_id))
     }
 
     pub fn rename_entry(
@@ -2306,7 +2429,7 @@ impl SyncFuseClient {
         new_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.block_with_timeout(self.client.rename_entry(
+        self.block_with_metadata_timeout(self.client.rename_entry(
             old_parent_ino,
             old_name,
             new_parent_ino,
@@ -2321,19 +2444,19 @@ impl SyncFuseClient {
         limit: u64,
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
-        self.block_with_timeout(self.client.list_entries(parent_ino, limit, start_after))
+        self.block_with_metadata_timeout(self.client.list_entries(parent_ino, limit, start_after))
     }
 
     pub fn get_filer_for_inode(&self, inode: u64) -> Result<Option<(String, u64)>, String> {
-        self.block_with_timeout(self.client.get_filer_for_inode(inode))
+        self.block_with_lookup_timeout(self.client.get_filer_for_inode(inode))
     }
 
     pub fn list_filers(&self) -> Result<Vec<(String, String, u32)>, String> {
-        self.block_with_timeout(self.client.list_filers())
+        self.block_with_metadata_timeout(self.client.list_filers())
     }
 
     pub fn get_shard_mapping(&self) -> Result<Vec<(u64, String)>, String> {
-        self.block_with_timeout(self.client.get_shard_mapping())
+        self.block_with_metadata_timeout(self.client.get_shard_mapping())
     }
 
     pub fn lookup_directory_entry(
@@ -2341,7 +2464,7 @@ impl SyncFuseClient {
         parent_ino: u64,
         name: &str,
     ) -> Result<Option<Entry>, String> {
-        self.block_with_timeout(self.client.lookup_directory_entry(parent_ino, name))
+        self.block_with_lookup_timeout(self.client.lookup_directory_entry(parent_ino, name))
     }
 
     pub fn pull_delta(
@@ -2349,7 +2472,16 @@ impl SyncFuseClient {
         client_id: &str,
         client_vclock: &VectorClock,
     ) -> Result<PullDeltaResponse, String> {
-        self.block_with_timeout(self.client.pull_delta(client_id, client_vclock))
+        self.block_with_batch_timeout(self.client.pull_delta(client_id, client_vclock))
+    }
+
+    pub fn push_delta(
+        &self,
+        client_id: &str,
+        deltas: &[DeltaOp],
+        client_vclock: &VectorClock,
+    ) -> Result<PushDeltaResponse, String> {
+        self.block_with_batch_timeout(self.client.push_delta(client_id, deltas, client_vclock))
     }
 
     pub async fn pull_delta_async(
@@ -2372,15 +2504,15 @@ impl SyncFuseClient {
         client_id: &str,
         duration_ms: u64,
     ) -> Result<(String, u64), String> {
-        self.block_with_timeout(self.client.acquire_lease(path, client_id, duration_ms))
+        self.block_with_metadata_timeout(self.client.acquire_lease(path, client_id, duration_ms))
     }
 
     pub fn release_lease(&self, lease_id: &str) -> Result<bool, String> {
-        self.block_with_timeout(self.client.release_lease(lease_id))
+        self.block_with_metadata_timeout(self.client.release_lease(lease_id))
     }
 
     pub fn renew_lease(&self, lease_id: &str, duration_ms: u64) -> Result<(bool, u64), String> {
-        self.block_with_timeout(self.client.renew_lease(lease_id, duration_ms))
+        self.block_with_metadata_timeout(self.client.renew_lease(lease_id, duration_ms))
     }
 
     pub fn register_job_client(
@@ -2389,14 +2521,16 @@ impl SyncFuseClient {
         job_name: &str,
         client_id: &str,
     ) -> Result<bool, String> {
-        self.block_with_timeout(self.client.register_job_client(job_id, job_name, client_id))
+        self.block_with_metadata_timeout(
+            self.client.register_job_client(job_id, job_name, client_id),
+        )
     }
 
     pub fn deregister_job_client(&self, job_id: &str, client_id: &str) -> Result<bool, String> {
-        self.block_with_timeout(self.client.deregister_job_client(job_id, client_id))
+        self.block_with_metadata_timeout(self.client.deregister_job_client(job_id, client_id))
     }
 
     pub fn get_statistics(&self, collection: &str) -> Result<StatisticsResponse, String> {
-        self.block_with_timeout(self.client.get_statistics(collection))
+        self.block_with_lookup_timeout(self.client.get_statistics(collection))
     }
 }
