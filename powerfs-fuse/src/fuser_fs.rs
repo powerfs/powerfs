@@ -1244,6 +1244,61 @@ impl Filesystem for PowerFsFuserFs {
 
     fn open(&mut self, _req: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("open: inode={}, flags={:x}", inode, flags);
+        eprintln!(
+            "fuser_fs::open: inode={}, flags={:x}, uid={}, gid={}",
+            inode,
+            flags,
+            _req.uid(),
+            _req.gid()
+        );
+
+        if let Ok(Some(entry)) = self.meta.get_entry_by_inode(inode) {
+            eprintln!(
+                "fuser_fs::open: found entry, mode={:o}, uid={}, gid={}",
+                entry.mode, entry.uid, entry.gid
+            );
+            let uid = _req.uid();
+            let gid = _req.gid();
+            let is_read = flags == libc::O_RDONLY;
+            let is_write = flags & (libc::O_WRONLY | libc::O_RDWR) != 0;
+
+            let has_permission = if uid == 0 {
+                true
+            } else if entry.uid == uid {
+                if is_read {
+                    (entry.mode & 0o400) != 0
+                } else if is_write {
+                    (entry.mode & 0o200) != 0
+                } else {
+                    true
+                }
+            } else if entry.gid == gid {
+                if is_read {
+                    (entry.mode & 0o040) != 0
+                } else if is_write {
+                    (entry.mode & 0o020) != 0
+                } else {
+                    true
+                }
+            } else {
+                if is_read {
+                    (entry.mode & 0o004) != 0
+                } else if is_write {
+                    (entry.mode & 0o002) != 0
+                } else {
+                    true
+                }
+            };
+
+            if !has_permission {
+                warn!(
+                    "open: permission denied for inode={}, uid={}, gid={}, mode={:o}",
+                    inode, uid, gid, entry.mode
+                );
+                reply.error(libc::EACCES);
+                return;
+            }
+        }
 
         let is_write = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
 

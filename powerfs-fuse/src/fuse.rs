@@ -852,9 +852,9 @@ impl FileSystem for PowerFsFs {
 
     fn open(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Self::Inode,
-        _flags: u32,
+        flags: u32,
         _fuse_flags: u32,
     ) -> std::io::Result<(
         Option<Self::Handle>,
@@ -881,6 +881,47 @@ impl FileSystem for PowerFsFs {
                 eprintln!("fuse::open: entry is directory, returning EISDIR");
                 return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
             }
+
+            let uid = ctx.uid;
+            let gid = ctx.gid;
+            let flags_i32 = flags as i32;
+            let is_read = flags_i32 == libc::O_RDONLY;
+            let is_write = flags_i32 & (libc::O_WRONLY | libc::O_RDWR) != 0;
+
+            let has_permission = if entry.uid == uid {
+                if is_read {
+                    (entry.mode & 0o400) != 0
+                } else if is_write {
+                    (entry.mode & 0o200) != 0
+                } else {
+                    true
+                }
+            } else if entry.gid == gid {
+                if is_read {
+                    (entry.mode & 0o040) != 0
+                } else if is_write {
+                    (entry.mode & 0o020) != 0
+                } else {
+                    true
+                }
+            } else {
+                if is_read {
+                    (entry.mode & 0o004) != 0
+                } else if is_write {
+                    (entry.mode & 0o002) != 0
+                } else {
+                    true
+                }
+            };
+
+            if !has_permission {
+                eprintln!(
+                    "fuse::open: permission denied for uid={}, gid={}, mode={:o}",
+                    uid, gid, entry.mode
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+            }
+
             Ok((
                 Some(inode),
                 fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),

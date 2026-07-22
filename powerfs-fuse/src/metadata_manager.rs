@@ -2120,7 +2120,7 @@ mod tests {
         let mgr = create_mgr();
 
         let entry = mgr
-            .create(ROOT_INO, "test.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "test.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert_eq!(entry.id.name, "test.txt");
         assert_eq!(entry.file_type, FileType::RegularFile);
@@ -2148,7 +2148,7 @@ mod tests {
         let mgr = create_mgr();
 
         let entry = mgr
-            .mkdir(ROOT_INO, "subdir", 0o755 | libc::S_IFDIR)
+            .mkdir(ROOT_INO, "subdir", 0o755 | libc::S_IFDIR, 0, 0)
             .unwrap();
         assert_eq!(entry.id.name, "subdir");
         assert_eq!(entry.file_type, FileType::Directory);
@@ -2158,7 +2158,7 @@ mod tests {
 
         // 在新目录中创建文件
         let file_entry = mgr
-            .create(entry.inode, "inner.txt", 0o644 | libc::S_IFREG)
+            .create(entry.inode, "inner.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert_eq!(file_entry.parent_ino, entry.inode);
 
@@ -2182,7 +2182,7 @@ mod tests {
     fn test_unlink() {
         let mgr = create_mgr();
 
-        mgr.create(ROOT_INO, "to_delete.txt", 0o644 | libc::S_IFREG)
+        mgr.create(ROOT_INO, "to_delete.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert_eq!(mgr.dir_orset_len(ROOT_INO), 1);
 
@@ -2203,7 +2203,8 @@ mod tests {
     #[test]
     fn test_unlink_on_directory_fails() {
         let mgr = create_mgr();
-        mgr.mkdir(ROOT_INO, "adir", 0o755 | libc::S_IFDIR).unwrap();
+        mgr.mkdir(ROOT_INO, "adir", 0o755 | libc::S_IFDIR, 0, 0)
+            .unwrap();
 
         let result = mgr.unlink(ROOT_INO, "adir");
         assert!(matches!(result, Err(FsError::IsDirectory(_))));
@@ -2212,7 +2213,7 @@ mod tests {
     #[test]
     fn test_rmdir() {
         let mgr = create_mgr();
-        mgr.mkdir(ROOT_INO, "to_rmdir", 0o755 | libc::S_IFDIR)
+        mgr.mkdir(ROOT_INO, "to_rmdir", 0o755 | libc::S_IFDIR, 0, 0)
             .unwrap();
         assert_eq!(mgr.dir_orset_len(ROOT_INO), 1);
 
@@ -2224,9 +2225,9 @@ mod tests {
     fn test_rmdir_not_empty_fails() {
         let mgr = create_mgr();
         let dir_entry = mgr
-            .mkdir(ROOT_INO, "nonempty", 0o755 | libc::S_IFDIR)
+            .mkdir(ROOT_INO, "nonempty", 0o755 | libc::S_IFDIR, 0, 0)
             .unwrap();
-        mgr.create(dir_entry.inode, "child.txt", 0o644 | libc::S_IFREG)
+        mgr.create(dir_entry.inode, "child.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         let result = mgr.rmdir(ROOT_INO, "nonempty");
@@ -2236,7 +2237,7 @@ mod tests {
     #[test]
     fn test_rmdir_on_file_fails() {
         let mgr = create_mgr();
-        mgr.create(ROOT_INO, "afile.txt", 0o644 | libc::S_IFREG)
+        mgr.create(ROOT_INO, "afile.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         let result = mgr.rmdir(ROOT_INO, "afile.txt");
@@ -2247,7 +2248,7 @@ mod tests {
     fn test_rename_file() {
         let mgr = create_mgr();
 
-        mgr.create(ROOT_INO, "old_name.txt", 0o644 | libc::S_IFREG)
+        mgr.create(ROOT_INO, "old_name.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert_eq!(mgr.dir_orset_len(ROOT_INO), 1);
 
@@ -2266,10 +2267,14 @@ mod tests {
     fn test_rename_across_dirs() {
         let mgr = create_mgr();
 
-        let dir1 = mgr.mkdir(ROOT_INO, "dir1", 0o755 | libc::S_IFDIR).unwrap();
-        let dir2 = mgr.mkdir(ROOT_INO, "dir2", 0o755 | libc::S_IFDIR).unwrap();
+        let dir1 = mgr
+            .mkdir(ROOT_INO, "dir1", 0o755 | libc::S_IFDIR, 0, 0)
+            .unwrap();
+        let dir2 = mgr
+            .mkdir(ROOT_INO, "dir2", 0o755 | libc::S_IFDIR, 0, 0)
+            .unwrap();
 
-        mgr.create(dir1.inode, "mover.txt", 0o644 | libc::S_IFREG)
+        mgr.create(dir1.inode, "mover.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         // 从 dir1 移到 dir2
@@ -2295,9 +2300,9 @@ mod tests {
         let mgr = create_mgr();
 
         let dir = mgr
-            .mkdir(ROOT_INO, "old_dir", 0o755 | libc::S_IFDIR)
+            .mkdir(ROOT_INO, "old_dir", 0o755 | libc::S_IFDIR, 0, 0)
             .unwrap();
-        mgr.create(dir.inode, "child.txt", 0o644 | libc::S_IFREG)
+        mgr.create(dir.inode, "child.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         // 重命名目录
@@ -2319,7 +2324,7 @@ mod tests {
     fn test_setattr_mode() {
         let mgr = create_mgr();
         let entry = mgr
-            .create(ROOT_INO, "chmod.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "chmod.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         let updated = mgr
@@ -2339,7 +2344,7 @@ mod tests {
     fn test_setattr_size() {
         let mgr = create_mgr();
         let entry = mgr
-            .create(ROOT_INO, "resize.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "resize.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert_eq!(entry.size, 0);
 
@@ -2353,7 +2358,7 @@ mod tests {
     fn test_setattr_mtime() {
         let mgr = create_mgr();
         let entry = mgr
-            .create(ROOT_INO, "mtime.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "mtime.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         let updated = mgr
@@ -2373,7 +2378,7 @@ mod tests {
     fn test_get_entry_by_inode() {
         let mgr = create_mgr();
         let entry = mgr
-            .create(ROOT_INO, "getattr.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "getattr.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         let found = mgr.get_entry_by_inode(entry.inode).unwrap().unwrap();
@@ -2393,10 +2398,10 @@ mod tests {
     fn test_get_parent_dir() {
         let mgr = create_mgr();
         let dir = mgr
-            .mkdir(ROOT_INO, "parent_test", 0o755 | libc::S_IFDIR)
+            .mkdir(ROOT_INO, "parent_test", 0o755 | libc::S_IFDIR, 0, 0)
             .unwrap();
         let file = mgr
-            .create(dir.inode, "child.txt", 0o644 | libc::S_IFREG)
+            .create(dir.inode, "child.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         // 获取文件的父目录
@@ -2412,11 +2417,12 @@ mod tests {
     fn test_list_dir_multiple_entries() {
         let mgr = create_mgr();
 
-        mgr.create(ROOT_INO, "a.txt", 0o644 | libc::S_IFREG)
+        mgr.create(ROOT_INO, "a.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
-        mgr.create(ROOT_INO, "b.txt", 0o644 | libc::S_IFREG)
+        mgr.create(ROOT_INO, "b.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
-        mgr.mkdir(ROOT_INO, "c_dir", 0o755 | libc::S_IFDIR).unwrap();
+        mgr.mkdir(ROOT_INO, "c_dir", 0o755 | libc::S_IFDIR, 0, 0)
+            .unwrap();
 
         let listing = mgr.list_dir(ROOT_INO).unwrap();
         assert_eq!(listing.len(), 3);
@@ -2432,13 +2438,13 @@ mod tests {
         let mgr = create_mgr();
 
         let e1 = mgr
-            .create(ROOT_INO, "f1.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "f1.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         let e2 = mgr
-            .create(ROOT_INO, "f2.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "f2.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         let e3 = mgr
-            .create(ROOT_INO, "f3.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "f3.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         assert_eq!(e2.inode, e1.inode + 1);
@@ -2450,10 +2456,10 @@ mod tests {
         let mgr = create_mgr();
 
         let e1 = mgr
-            .create(ROOT_INO, "s1.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "s1.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         let e2 = mgr
-            .create(ROOT_INO, "s2.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "s2.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
 
         // 同一客户端的 seq 应递增
@@ -2468,7 +2474,7 @@ mod tests {
 
         // 创建 → 查找 → 修改属性 → 删除
         let entry = mgr
-            .create(ROOT_INO, "lifecycle.txt", 0o644 | libc::S_IFREG)
+            .create(ROOT_INO, "lifecycle.txt", 0o644 | libc::S_IFREG, 0, 0)
             .unwrap();
         assert!(mgr.lookup(ROOT_INO, "lifecycle.txt").unwrap().is_some());
 

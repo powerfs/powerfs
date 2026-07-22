@@ -222,7 +222,7 @@ services:
       - ../config/s3.toml:/etc/powerfs/s3.toml
     ports:
       - "9000:9000"
-    command: /app/powerfs s3 --config /etc/powerfs/s3.toml
+    command: /app/powerfs s3 --master 172.20.0.11:9333 --config /etc/powerfs/s3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"]
       interval: 5s

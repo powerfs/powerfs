@@ -363,6 +363,8 @@ pub enum ConflictType {
     WriteUnlink,
     DeleteCreate,
     RenameConflict,
+    RenameDelete,
+    CreateDelete,
 }
 
 /// 冲突记录
@@ -374,6 +376,8 @@ pub struct ConflictStats {
     pub write_unlink_count: u64,
     pub delete_create_count: u64,
     pub rename_conflict_count: u64,
+    pub rename_delete_count: u64,
+    pub create_delete_count: u64,
 }
 
 pub struct ConflictStatsFull {
@@ -390,6 +394,10 @@ pub struct ConflictStatsFull {
     pub delete_create_resolved: u64,
     pub rename_conflict_count: u64,
     pub rename_conflict_resolved: u64,
+    pub rename_delete_count: u64,
+    pub rename_delete_resolved: u64,
+    pub create_delete_count: u64,
+    pub create_delete_resolved: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -869,11 +877,17 @@ impl DirORSet {
                 self.record_conflict(ConflictType::WriteUnlink, None, branches);
             }
         }
+
+        if let Some(entry) = self.entries.get(id) {
+            if self.tombstones.iter().any(|t| t.name == id.name) {
+                self.record_conflict(ConflictType::CreateDelete, None, vec![entry.clone()]);
+            }
+        }
     }
 
     fn detect_rename_conflict(
         &mut self,
-        _old_id: &EntryId,
+        old_id: &EntryId,
         new_entry: &DirEntry,
         vclock: &VectorClock,
     ) {
@@ -887,6 +901,20 @@ impl DirORSet {
             }
             for branches in conflicts_to_record {
                 self.record_conflict(ConflictType::RenameConflict, None, branches);
+            }
+
+            if let Some(existing_entry) = self.entries.get(old_id) {
+                if existing_entry.id.client_id != new_entry.id.client_id {
+                    self.record_conflict(
+                        ConflictType::RenameConflict,
+                        None,
+                        vec![existing_entry.clone(), new_entry.clone()],
+                    );
+                }
+            }
+
+            if self.tombstones.contains(old_id) {
+                self.record_conflict(ConflictType::RenameDelete, None, vec![new_entry.clone()]);
             }
         }
     }
@@ -1040,6 +1068,8 @@ impl DirORSet {
             write_unlink_count: 0,
             delete_create_count: 0,
             rename_conflict_count: 0,
+            rename_delete_count: 0,
+            create_delete_count: 0,
         };
 
         for conflict in &self.conflicts {
@@ -1055,6 +1085,8 @@ impl DirORSet {
                 ConflictType::WriteUnlink => stats.write_unlink_count += 1,
                 ConflictType::DeleteCreate => stats.delete_create_count += 1,
                 ConflictType::RenameConflict => stats.rename_conflict_count += 1,
+                ConflictType::RenameDelete => stats.rename_delete_count += 1,
+                ConflictType::CreateDelete => stats.create_delete_count += 1,
             }
         }
 
@@ -1080,6 +1112,10 @@ impl DirORSet {
             delete_create_resolved: 0,
             rename_conflict_count: 0,
             rename_conflict_resolved: 0,
+            rename_delete_count: 0,
+            rename_delete_resolved: 0,
+            create_delete_count: 0,
+            create_delete_resolved: 0,
         };
 
         for conflict in &self.conflicts {
@@ -1124,6 +1160,18 @@ impl DirORSet {
                     stats.rename_conflict_count += 1;
                     if conflict.resolved {
                         stats.rename_conflict_resolved += 1;
+                    }
+                }
+                ConflictType::RenameDelete => {
+                    stats.rename_delete_count += 1;
+                    if conflict.resolved {
+                        stats.rename_delete_resolved += 1;
+                    }
+                }
+                ConflictType::CreateDelete => {
+                    stats.create_delete_count += 1;
+                    if conflict.resolved {
+                        stats.create_delete_resolved += 1;
                     }
                 }
             }

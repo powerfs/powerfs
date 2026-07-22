@@ -1071,8 +1071,20 @@ impl DirectoryTree {
     }
 
     pub fn acquire_lease(&self, path: &str, client_id: &str, duration_ms: u64) -> String {
-        // Opportunistic cleanup of expired leases to bound memory usage.
         self.cleanup_expired_leases();
+
+        let mut leases = self.leases.write().unwrap();
+        let mut path_lease_map = self.path_lease_map.write().unwrap();
+
+        if let Some(lease_ids) = path_lease_map.get(path) {
+            for lease_id in lease_ids {
+                if let Some(lease) = leases.get(lease_id) {
+                    if lease.expires_at > std::time::Instant::now() {
+                        return String::new();
+                    }
+                }
+            }
+        }
 
         let lease_id = uuid::Uuid::new_v4().to_string();
         let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
@@ -1086,18 +1098,12 @@ impl DirectoryTree {
             epoch,
         };
 
-        {
-            let mut leases = self.leases.write().unwrap();
-            leases.insert(lease_id.clone(), lease);
-        }
+        leases.insert(lease_id.clone(), lease);
 
-        {
-            let mut path_lease_map = self.path_lease_map.write().unwrap();
-            path_lease_map
-                .entry(path.to_string())
-                .or_default()
-                .insert(lease_id.clone());
-        }
+        path_lease_map
+            .entry(path.to_string())
+            .or_default()
+            .insert(lease_id.clone());
 
         lease_id
     }

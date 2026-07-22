@@ -967,6 +967,8 @@ impl MasterService for MasterGrpcServer {
                     powerfs_orset::ConflictType::WriteUnlink => 2,
                     powerfs_orset::ConflictType::DeleteCreate => 3,
                     powerfs_orset::ConflictType::RenameConflict => 4,
+                    powerfs_orset::ConflictType::RenameDelete => 5,
+                    powerfs_orset::ConflictType::CreateDelete => 6,
                 },
                 dir_ino,
                 dir_path: req.dir_path.clone(),

@@ -1242,6 +1242,8 @@ enum ConflictType {
     WRITE_UNLINK = 2;
     DELETE_CREATE = 3;
     RENAME_CONFLICT = 4;
+    RENAME_DELETE = 5;
+    CREATE_DELETE = 6;
 }
 
 enum ConflictResolution {
