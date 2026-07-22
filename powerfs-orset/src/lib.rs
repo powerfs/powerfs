@@ -1414,7 +1414,7 @@ mod tests {
     #[test]
     fn test_dir_entry_new_dir() {
         let id = EntryId::new("subdir", 1, 2);
-        let entry = DirEntry::new_dir(id, 200, 1, 0o755 | libc::S_IFDIR, 0, 0, 0, 0);
+        let entry = DirEntry::new_dir(id, 200, 1, 0o755 | libc::S_IFDIR, 0, 0);
         assert!(entry.is_dir());
         assert_eq!(entry.parent_ino, 1);
     }
@@ -1485,18 +1485,24 @@ mod tests {
             100,
             1,
             0o644,
+            0,
+            0,
         ));
         orset.add(DirEntry::new_file(
             EntryId::new("a.txt", 2, 1),
             200,
             1,
             0o644,
+            0,
+            0,
         ));
         orset.add(DirEntry::new_file(
             EntryId::new("b.txt", 1, 2),
             300,
             1,
             0o644,
+            0,
+            0,
         ));
 
         let names = orset.list_names();
@@ -1590,6 +1596,8 @@ mod tests {
             100,
             1,
             0o644,
+            0,
+            0,
         ));
 
         let mut orset2 = DirORSet::new(1);
@@ -1598,6 +1606,8 @@ mod tests {
             200,
             1,
             0o644,
+            0,
+            0,
         ));
 
         orset1.merge(&orset2);
@@ -2148,5 +2158,100 @@ mod tests {
         assert_eq!(orset.conflict_count(), 1);
         let conflicts = orset.unresolved_conflicts();
         assert_eq!(conflicts[0].conflict_type, ConflictType::WriteUnlink);
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_basic() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        let entry = DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0);
+        orset.add(entry);
+
+        let new_id = orset.rename_entry(&old_id, "new.txt", 1).unwrap();
+        assert_eq!(new_id.name, "new.txt");
+        assert_eq!(new_id.client_id, 1);
+        assert_eq!(new_id.seq, 2);
+
+        assert!(orset.get_by_name("old.txt").is_empty());
+        assert_eq!(orset.get_by_name("new.txt").len(), 1);
+        assert_eq!(orset.len(), 1);
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_nonexistent() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("nonexistent.txt", 1, 1);
+
+        let new_id = orset.rename_entry(&old_id, "new.txt", 1);
+        assert!(new_id.is_none());
+
+        assert_eq!(orset.len(), 0);
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_inode_preserved() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        let entry = DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0);
+        orset.add(entry);
+
+        let new_id = orset.rename_entry(&old_id, "new.txt", 1).unwrap();
+
+        let entries = orset.get_by_name("new.txt");
+        assert_eq!(entries.len(), 1);
+        let new_entry = entries[0];
+        assert_eq!(new_entry.inode, 100);
+        assert_eq!(new_entry.id, new_id);
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_mtime_updated() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        let mut entry = DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0);
+        entry.mtime = 1000;
+        orset.add(entry);
+
+        orset.rename_entry(&old_id, "new.txt", 1);
+
+        let entries = orset.get_by_name("new.txt");
+        assert_eq!(entries.len(), 1);
+        let new_entry = entries[0];
+        assert!(new_entry.mtime > 1000);
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_tombstone_added() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        let entry = DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0);
+        orset.add(entry);
+
+        orset.rename_entry(&old_id, "new.txt", 1);
+
+        assert!(orset.tombstones.contains(&old_id));
+    }
+
+    #[test]
+    fn test_dir_orset_rename_entry_delta_log() {
+        let mut orset = DirORSet::new(1);
+        let old_id = EntryId::new("old.txt", 1, 1);
+        let entry = DirEntry::new_file(old_id.clone(), 100, 1, 0o644, 0, 0);
+        orset.add(entry);
+
+        orset.rename_entry(&old_id, "new.txt", 1);
+
+        assert_eq!(orset.delta_log.len(), 2);
+        match &orset.delta_log[1] {
+            DeltaOp::Rename {
+                old_id: renamed_old_id,
+                new_entry,
+                ..
+            } => {
+                assert_eq!(renamed_old_id, &old_id);
+                assert_eq!(new_entry.id.name, "new.txt");
+            }
+            _ => panic!("Expected Rename delta"),
+        }
     }
 }

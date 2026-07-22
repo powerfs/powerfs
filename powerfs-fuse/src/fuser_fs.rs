@@ -57,6 +57,10 @@ struct PowerFsFuserFs {
     verify_data: bool,
     /// statfs 缓存（避免每次调用都访问 Master）
     statfs_cache: Arc<Mutex<Option<StatisticsResponse>>>,
+    /// 文件级租约管理（inode -> lease_id）
+    leases: Arc<RwLock<HashMap<u64, String>>>,
+    /// 客户端 ID（用于租约获取）
+    client_id: String,
 }
 
 impl PowerFsFuserFs {
@@ -69,6 +73,7 @@ impl PowerFsFuserFs {
         replication: String,
         verify_data: bool,
         statfs_cache_value: Option<StatisticsResponse>,
+        client_id: String,
     ) -> Self {
         Self {
             meta,
@@ -81,6 +86,8 @@ impl PowerFsFuserFs {
             has_dirty: Arc::new(AtomicBool::new(false)),
             verify_data,
             statfs_cache: Arc::new(Mutex::new(statfs_cache_value)),
+            leases: Arc::new(RwLock::new(HashMap::new())),
+            client_id,
         }
     }
 
@@ -1235,7 +1242,31 @@ impl Filesystem for PowerFsFuserFs {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, _inode: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
+        debug!("open: inode={}, flags={:x}", inode, flags);
+
+        let is_write = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
+
+        if is_write {
+            if let Some(path) = self.meta.get_path(inode) {
+                debug!("open: acquiring lease for path={}", path);
+                match self.client.acquire_lease(&path, &self.client_id, 30000) {
+                    Ok((lease_id, _epoch)) => {
+                        debug!(
+                            "open: lease acquired for inode={}, lease_id={}",
+                            inode, lease_id
+                        );
+                        self.leases.write().unwrap().insert(inode, lease_id);
+                    }
+                    Err(e) => {
+                        warn!("open: failed to acquire lease for inode={}: {}", inode, e);
+                    }
+                }
+            } else {
+                warn!("open: cannot get path for inode={}", inode);
+            }
+        }
+
         reply.opened(0, 0);
     }
 
@@ -1416,6 +1447,25 @@ impl Filesystem for PowerFsFuserFs {
             self.data.clear_dirty(inode);
         }
 
+        // 释放文件租约
+        if let Some(lease_id) = self.leases.write().unwrap().remove(&inode) {
+            debug!(
+                "release: releasing lease for inode={}, lease_id={}",
+                inode, lease_id
+            );
+            match self.client.release_lease(&lease_id) {
+                Ok(_) => {
+                    debug!("release: lease released successfully for inode={}", inode);
+                }
+                Err(e) => {
+                    warn!(
+                        "release: failed to release lease for inode={}: {}",
+                        inode, e
+                    );
+                }
+            }
+        }
+
         reply.ok();
     }
 
@@ -1485,6 +1535,8 @@ impl Clone for PowerFsFuserFs {
             has_dirty: self.has_dirty.clone(),
             verify_data: self.verify_data,
             statfs_cache: self.statfs_cache.clone(),
+            leases: self.leases.clone(),
+            client_id: self.client_id.clone(),
         }
     }
 }
@@ -1625,6 +1677,7 @@ impl FuserApp {
             self.replication.clone(),
             self.verify_data,
             statfs_cache_value,
+            client_id.clone(),
         );
 
         // 后台 statfs 缓存更新线程（每 5 秒更新一次，及时反映空间使用变化）
