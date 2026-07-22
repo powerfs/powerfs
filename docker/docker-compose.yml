@@ -15,7 +15,8 @@ volumes:
   volume-3-data:
   redis-data:
   s3-data:
-  filer-data:
+  filer-1-data:
+  filer-2-data:
 
 services:
   redis:
@@ -182,23 +183,22 @@ services:
       master-1:
         condition: service_healthy
 
-  filer:
+  filer-1:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: powerfs:latest
-    container_name: filer
+    container_name: filer-1
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.35
     ports:
       - "8888:8888"
       - "8889:8889"
-      - "8890:8890"
     volumes:
-      - filer-data:/data/filer
-      - ../config/filer.toml:/etc/powerfs/filer.toml
-    command: /app/powerfs filer --config /etc/powerfs/filer.toml
+      - filer-1-data:/data/filer
+      - ../config/filer-1.toml:/etc/powerfs/filer.toml
+    command: /app/powerfs filer --config /etc/powerfs/filer-1.toml --node-id 1 --s3-address 172.20.0.35:8888 --grpc-address 172.20.0.35:8889 --raft-address 172.20.0.35:8890 --master-address 172.20.0.11:9333 --shard-count 2
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
       interval: 10s
@@ -206,6 +206,31 @@ services:
       retries: 5
     depends_on:
       master-1:
+        condition: service_healthy
+
+  filer-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: filer-2
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.36
+    ports:
+      - "8898:8888"
+      - "8899:8889"
+    volumes:
+      - filer-2-data:/data/filer
+      - ../config/filer-2.toml:/etc/powerfs/filer-2.toml
+    command: /app/powerfs filer --config /etc/powerfs/filer-2.toml --node-id 2 --s3-address 172.20.0.36:8888 --grpc-address 172.20.0.36:8889 --raft-address 172.20.0.36:8890 --master-address 172.20.0.11:9333 --shard-count 2 --peers 172.20.0.35:8890 172.20.0.36:8890
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      filer-1:
         condition: service_healthy
 
   s3:

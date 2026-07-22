@@ -2,10 +2,19 @@ use log::info;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
 use crate::shard_store::{InodeInfo, ShardStats, ShardStore};
 use crate::shard_strategy::ShardStrategy;
+
+#[derive(Debug, Clone)]
+struct LeaseInfo {
+    inode: u64,
+    client_id: String,
+    expires_at: Instant,
+    epoch: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardDetail {
@@ -40,6 +49,8 @@ pub struct MetaShardManager {
     inode_generator: Arc<RwLock<u64>>,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
+    leases: RwLock<HashMap<String, LeaseInfo>>,
+    lease_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl MetaShardManager {
@@ -55,6 +66,8 @@ impl MetaShardManager {
             inode_generator: Arc::new(RwLock::new(1)),
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
+            leases: RwLock::new(HashMap::new()),
+            lease_epoch: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -749,5 +762,79 @@ impl MetaShardManager {
             total_dirs,
             buckets,
         }
+    }
+
+    pub async fn push_delta(
+        &self,
+        _shard_id: ShardId,
+        _client_id: &str,
+        _deltas: &[crate::powerfs::DeltaOp],
+        _client_vclock: &Option<crate::powerfs::VectorClock>,
+    ) -> Result<crate::powerfs::VectorClock, String> {
+        Ok(crate::powerfs::VectorClock { entries: vec![] })
+    }
+
+    pub async fn pull_delta(
+        &self,
+        _shard_id: ShardId,
+        _client_id: &str,
+        _client_vclock: &Option<crate::powerfs::VectorClock>,
+    ) -> Result<(Vec<crate::powerfs::DeltaOp>, crate::powerfs::VectorClock), String> {
+        Ok((vec![], crate::powerfs::VectorClock { entries: vec![] }))
+    }
+
+    pub async fn acquire_lease(
+        &self,
+        inode: u64,
+        _shard_id: ShardId,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        let mut leases = self.leases.write().unwrap();
+
+        for (lease_id, info) in leases.iter() {
+            if info.inode == inode && info.expires_at > Instant::now() {
+                if info.client_id == client_id {
+                    return Ok((lease_id.clone(), info.epoch));
+                }
+                return Err("lease already held by another client".to_string());
+            }
+        }
+
+        let lease_id = format!("lease_{}_{}", inode, std::process::id());
+        let epoch = self
+            .lease_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let expires_at = Instant::now() + Duration::from_millis(duration_ms);
+
+        leases.insert(
+            lease_id.clone(),
+            LeaseInfo {
+                inode,
+                client_id: client_id.to_string(),
+                expires_at,
+                epoch,
+            },
+        );
+
+        Ok((lease_id, epoch))
+    }
+
+    pub async fn release_lease(&self, lease_id: &str) -> Result<(), String> {
+        let mut leases = self.leases.write().unwrap();
+        if leases.remove(lease_id).is_none() {
+            return Err("lease not found".to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn renew_lease(&self, lease_id: &str, duration_ms: u64) -> Result<u64, String> {
+        let mut leases = self.leases.write().unwrap();
+        let info = leases
+            .get_mut(lease_id)
+            .ok_or_else(|| "lease not found".to_string())?;
+
+        info.expires_at = Instant::now() + Duration::from_millis(duration_ms);
+        Ok(info.epoch)
     }
 }

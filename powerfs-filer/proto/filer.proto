@@ -12,6 +12,15 @@ service FilerMetaService {
     rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
     rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
     
+    // Delta sync API
+    rpc PushDelta(PushDeltaRequest) returns (PushDeltaResponse);
+    rpc PullDelta(PullDeltaRequest) returns (PullDeltaResponse);
+    
+    // Lease management
+    rpc AcquireLease(LeaseRequest) returns (LeaseResponse);
+    rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
+    rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
+    
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
 }
@@ -168,4 +177,111 @@ message Entry {
     string symlink_target = 11;
     string owner = 12;
     uint64 generation = 13;
+}
+
+// Lease management types
+message LeaseRequest {
+    uint64 inode = 1;
+    uint64 duration_ms = 2;
+    string client_id = 3;
+}
+
+message LeaseResponse {
+    bool success = 1;
+    string error = 2;
+    string lease_id = 3;
+    uint64 duration_ms = 4;
+    uint64 epoch = 5;
+}
+
+message LeaseReleaseRequest {
+    string lease_id = 1;
+}
+
+message LeaseReleaseResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message LeaseRenewRequest {
+    string lease_id = 1;
+    uint64 duration_ms = 2;
+}
+
+message LeaseRenewResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 epoch = 3;
+}
+
+// Delta sync types
+message VectorClockEntry {
+    uint64 client_id = 1;
+    uint64 seq = 2;
+}
+
+message VectorClock {
+    repeated VectorClockEntry entries = 1;
+}
+
+message DeltaOp {
+    oneof op {
+        DirEntryOrset add = 1;
+        EntryId remove = 2;
+        RenameOp rename = 3;
+        SetAttrOp set_attr = 4;
+    }
+}
+
+message DirEntryOrset {
+    uint64 parent_ino = 1;
+    string name = 2;
+    uint64 inode = 3;
+    uint32 mode = 4;
+    uint64 seq = 5;
+    uint64 client_id = 6;
+}
+
+message EntryId {
+    uint64 parent_ino = 1;
+    string name = 2;
+}
+
+message RenameOp {
+    uint64 old_parent_ino = 1;
+    string old_name = 2;
+    uint64 new_parent_ino = 3;
+    string new_name = 4;
+}
+
+message SetAttrOp {
+    uint64 inode = 1;
+    uint64 size = 2;
+    uint64 mtime = 3;
+}
+
+message PushDeltaRequest {
+    uint64 shard_id = 1;
+    string client_id = 2;
+    repeated DeltaOp deltas = 3;
+    VectorClock client_vclock = 4;
+}
+
+message PushDeltaResponse {
+    bool success = 1;
+    string error = 2;
+    VectorClock server_vclock = 3;
+}
+
+message PullDeltaRequest {
+    uint64 shard_id = 1;
+    string client_id = 2;
+    VectorClock client_vclock = 3;
+}
+
+message PullDeltaResponse {
+    bool success = 1;
+    string error = 2;
+    repeated DeltaOp deltas = 3;
+    VectorClock server_vclock = 4;
 }

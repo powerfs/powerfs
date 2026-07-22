@@ -11,9 +11,11 @@ use super::powerfs::{
     CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest, DeleteEntryResponse,
     Entry as ProtoEntry, FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse,
     GetEntryRequest, GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse,
-    ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
-    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, RenameEntryRequest,
-    RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
+    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
+    LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
+    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
+    PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, RenameEntryResponse,
+    UpdateEntryRequest, UpdateEntryResponse,
 };
 
 pub struct FilerMetaServiceImpl {
@@ -443,6 +445,163 @@ impl FilerMetaService for FilerMetaServiceImpl {
             shard_ids: ids,
             error: "".to_string(),
         }))
+    }
+
+    async fn push_delta(
+        &self,
+        request: Request<PushDeltaRequest>,
+    ) -> Result<Response<PushDeltaResponse>, Status> {
+        let req = request.into_inner();
+        let shard_id = ShardId(req.shard_id);
+
+        let result = self
+            .meta_shard_manager
+            .push_delta(shard_id, &req.client_id, &req.deltas, &req.client_vclock)
+            .await;
+
+        match result {
+            Ok(vclock) => Ok(Response::new(PushDeltaResponse {
+                success: true,
+                error: "".to_string(),
+                server_vclock: Some(vclock),
+            })),
+            Err(e) => Ok(Response::new(PushDeltaResponse {
+                success: false,
+                error: e,
+                server_vclock: None,
+            })),
+        }
+    }
+
+    async fn pull_delta(
+        &self,
+        request: Request<PullDeltaRequest>,
+    ) -> Result<Response<PullDeltaResponse>, Status> {
+        let req = request.into_inner();
+        let shard_id = ShardId(req.shard_id);
+
+        let result = self
+            .meta_shard_manager
+            .pull_delta(shard_id, &req.client_id, &req.client_vclock)
+            .await;
+
+        match result {
+            Ok((deltas, vclock)) => Ok(Response::new(PullDeltaResponse {
+                success: true,
+                error: "".to_string(),
+                deltas,
+                server_vclock: Some(vclock),
+            })),
+            Err(e) => Ok(Response::new(PullDeltaResponse {
+                success: false,
+                error: e,
+                deltas: vec![],
+                server_vclock: None,
+            })),
+        }
+    }
+
+    async fn acquire_lease(
+        &self,
+        request: Request<LeaseRequest>,
+    ) -> Result<Response<LeaseResponse>, Status> {
+        let req = request.into_inner();
+        let inode = req.inode;
+
+        if inode == 0 {
+            return Ok(Response::new(LeaseResponse {
+                success: false,
+                error: "inode is required".to_string(),
+                lease_id: "".to_string(),
+                duration_ms: 0,
+                epoch: 0,
+            }));
+        }
+
+        let shard_id = self.inode_to_shard_id(inode);
+        let result = self
+            .meta_shard_manager
+            .acquire_lease(inode, shard_id, &req.client_id, req.duration_ms)
+            .await;
+
+        match result {
+            Ok((lease_id, epoch)) => Ok(Response::new(LeaseResponse {
+                success: true,
+                error: "".to_string(),
+                lease_id,
+                duration_ms: req.duration_ms,
+                epoch,
+            })),
+            Err(e) => Ok(Response::new(LeaseResponse {
+                success: false,
+                error: e,
+                lease_id: "".to_string(),
+                duration_ms: 0,
+                epoch: 0,
+            })),
+        }
+    }
+
+    async fn release_lease(
+        &self,
+        request: Request<LeaseReleaseRequest>,
+    ) -> Result<Response<LeaseReleaseResponse>, Status> {
+        let req = request.into_inner();
+        let lease_id = req.lease_id;
+
+        if lease_id.is_empty() {
+            return Ok(Response::new(LeaseReleaseResponse {
+                success: false,
+                error: "lease_id is required".to_string(),
+            }));
+        }
+
+        let result = self.meta_shard_manager.release_lease(&lease_id).await;
+
+        match result {
+            Ok(_) => Ok(Response::new(LeaseReleaseResponse {
+                success: true,
+                error: "".to_string(),
+            })),
+            Err(e) => Ok(Response::new(LeaseReleaseResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn renew_lease(
+        &self,
+        request: Request<LeaseRenewRequest>,
+    ) -> Result<Response<LeaseRenewResponse>, Status> {
+        let req = request.into_inner();
+        let lease_id = req.lease_id;
+
+        if lease_id.is_empty() {
+            return Ok(Response::new(LeaseRenewResponse {
+                success: false,
+                error: "lease_id is required".to_string(),
+                epoch: 0,
+            }));
+        }
+
+        let result = self
+            .meta_shard_manager
+            .renew_lease(&lease_id, req.duration_ms)
+            .await;
+
+        match result {
+            Ok(epoch) => Ok(Response::new(LeaseRenewResponse {
+                success: true,
+                error: "".to_string(),
+                epoch,
+            })),
+            Err(e) => Ok(Response::new(LeaseRenewResponse {
+                success: false,
+                error: e,
+                epoch: 0,
+            })),
+        }
     }
 }
 

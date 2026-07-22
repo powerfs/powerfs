@@ -1,0 +1,11 @@
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
+[filer]
+port = 8888
+grpc_port = 8889
+data_dir = "/data/filer"
+shard_count = 2
+raft_id = 1
+master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
