@@ -5,7 +5,6 @@ set -e
 BUILD_IMAGES=false
 REBUILD_CODE=false
 VERBOSE_LOG=false
-ENTERPRISE_FUSE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -20,10 +19,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --verbose|-v)
             VERBOSE_LOG=true
-            shift
-            ;;
-        --enterprise)
-            ENTERPRISE_FUSE=true
             shift
             ;;
         *)
@@ -64,7 +59,6 @@ log_info "  Host IP:         $HOST_IP"
 log_info "  Build images:    $BUILD_IMAGES"
 log_info "  Rebuild code:    $REBUILD_CODE"
 log_info "  Verbose mode:    $VERBOSE_LOG"
-log_info "  Enterprise FUSE: $ENTERPRISE_FUSE"
 log_info "  Docker dir:      $DOCKER_DIR"
 log_info "  Project dir:     $PROJECT_DIR"
 log_info ""
@@ -140,15 +134,9 @@ if [ "$BUILD_IMAGES" = true ]; then
         BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
         log_info "  Step 3b: Starting build at $BUILD_TIME..."
         
-        BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor"
+        BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse --bin powerfs-filer"
         
-        if [ "$ENTERPRISE_FUSE" = true ]; then
-            log_debug "  Running: $BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
-            BUILD_CMD="$BUILD_CMD --bin powerfs-fuse --features powerfs-fuse/enterprise"
-        else
-            log_debug "  Running: $BUILD_CMD --bin powerfs-fuse"
-            BUILD_CMD="$BUILD_CMD --bin powerfs-fuse"
-        fi
+        log_debug "  Running: $BUILD_CMD"
         
         if $BUILD_CMD 2>&1 | tail -10; then
             log_info "  [OK] Rust binaries built successfully"
@@ -629,6 +617,5 @@ log_info ""
 log_info "=== Build Options ==="
 log_info "  Build images (cleanup + build):  docker/scripts/start-fuse.sh -b"
 log_info "  Rebuild code + images:           docker/scripts/start-fuse.sh -bb"
-log_info "  Build with enterprise FUSE:      docker/scripts/start-fuse.sh -bb --enterprise"
 log_info ""
 log_info "========================================"

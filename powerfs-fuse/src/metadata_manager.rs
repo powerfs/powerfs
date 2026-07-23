@@ -24,16 +24,10 @@ use crossbeam::channel::{self, Receiver, Sender};
 use log::{debug, error, info, warn};
 
 use crate::client::SyncFuseClient;
-#[cfg(not(feature = "enterprise"))]
-use crate::dir_cache_provider::CommunityDirCache;
 use crate::error::FsError;
 use crate::inode_allocator::InodeAllocator;
 use crate::orset::{now_unix, DirEntry, DirORSet, EntryId, FileType, VectorClock};
 use crate::posix_projection::{PosixProjection, VisibleEntry};
-use powerfs_orset::DirCacheProvider;
-
-#[cfg(feature = "enterprise")]
-use powerfs_fuse_enterprise;
 
 /// 根目录 inode
 const ROOT_INO: u64 = 1;
@@ -41,25 +35,203 @@ const ROOT_INO: u64 = 1;
 /// Master 来源条目的 client_id（区分本地创建与 Master 同步）
 const MASTER_CLIENT_ID: u64 = 0;
 
+/// 目录 OR-Set 缓存类型（简化复杂类型）
+type DirCache = HashMap<u64, Arc<RwLock<DirORSet>>>;
+
+/// 分片目录缓存
+///
+/// Phase 3：Per-Queue单线程消费模式
+/// 按 parent inode 号 hash 分片，每个分片有独立的工作线程和无锁队列：
+/// - 分片数量 = CPU核心数 * 2
+/// - 同目录操作由同一工作线程处理，无需锁
+/// - 跨分片操作（如rename）通过消息传递，避免大锁
+struct ShardedDirCache {
+    shards: Arc<Vec<Arc<RwLock<DirCache>>>>,
+    num_shards: usize,
+    senders: Arc<Vec<Sender<ShardOp>>>,
+    _threads: Vec<thread::JoinHandle<()>>,
+}
+
+/// 分片操作类型
+enum ShardOp {
+    Insert {
+        dir_ino: u64,
+        orset: Arc<RwLock<DirORSet>>,
+    },
+    Remove {
+        dir_ino: u64,
+    },
+    Get {
+        dir_ino: u64,
+        reply: Sender<Option<Arc<RwLock<DirORSet>>>>,
+    },
+}
+
+impl Clone for ShardedDirCache {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            num_shards: self.num_shards,
+            senders: self.senders.clone(),
+            _threads: Vec::new(),
+        }
+    }
+}
+
+impl ShardedDirCache {
+    fn new() -> Self {
+        let num_shards = std::thread::available_parallelism()
+            .map(|n| n.get() * 2)
+            .unwrap_or(8);
+
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(Arc::new(RwLock::new(HashMap::new())));
+        }
+
+        let shards_arc = Arc::new(shards);
+        let mut senders = Vec::with_capacity(num_shards);
+        let mut threads = Vec::with_capacity(num_shards);
+
+        for i in 0..num_shards {
+            let (sender, receiver) = channel::unbounded();
+            let shard = shards_arc[i].clone();
+            let thread = thread::spawn(move || {
+                Self::shard_worker(receiver, shard);
+            });
+            senders.push(sender);
+            threads.push(thread);
+        }
+
+        Self {
+            shards: shards_arc,
+            num_shards,
+            senders: Arc::new(senders),
+            _threads: threads,
+        }
+    }
+
+    fn shard_worker(receiver: Receiver<ShardOp>, shard: Arc<RwLock<DirCache>>) {
+        while let Ok(op) = receiver.recv() {
+            match op {
+                ShardOp::Insert { dir_ino, orset } => {
+                    shard.write().unwrap().insert(dir_ino, orset);
+                }
+                ShardOp::Remove { dir_ino } => {
+                    shard.write().unwrap().remove(&dir_ino);
+                }
+                ShardOp::Get { dir_ino, reply } => {
+                    let result = shard.read().unwrap().get(&dir_ino).cloned();
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    fn shard_index(&self, dir_ino: u64) -> usize {
+        (dir_ino as usize) % self.num_shards
+    }
+
+    fn get_shard(&self, dir_ino: u64) -> Arc<RwLock<DirCache>> {
+        let idx = self.shard_index(dir_ino);
+        self.shards[idx].clone()
+    }
+
+    fn insert(&self, dir_ino: u64, orset: Arc<RwLock<DirORSet>>) {
+        let idx = self.shard_index(dir_ino);
+        let _ = self.senders[idx].send(ShardOp::Insert { dir_ino, orset });
+        let (read_sender, read_receiver) = channel::bounded::<Option<Arc<RwLock<DirORSet>>>>(1);
+        let _ = self.senders[idx].send(ShardOp::Get {
+            dir_ino,
+            reply: read_sender,
+        });
+        let _ = read_receiver.recv();
+    }
+
+    fn remove(&self, dir_ino: u64) -> Option<Arc<RwLock<DirORSet>>> {
+        let idx = self.shard_index(dir_ino);
+        let _ = self.senders[idx].send(ShardOp::Remove { dir_ino });
+        let (read_sender, read_receiver) = channel::bounded::<Option<Arc<RwLock<DirORSet>>>>(1);
+        let _ = self.senders[idx].send(ShardOp::Get {
+            dir_ino,
+            reply: read_sender,
+        });
+        read_receiver.recv().unwrap_or(None)
+    }
+
+    fn get(&self, dir_ino: u64) -> Option<Arc<RwLock<DirORSet>>> {
+        let idx = self.shard_index(dir_ino);
+        let (reply_sender, reply_receiver) = channel::bounded::<Option<Arc<RwLock<DirORSet>>>>(1);
+        let _ = self.senders[idx].send(ShardOp::Get {
+            dir_ino,
+            reply: reply_sender,
+        });
+        reply_receiver.recv().unwrap_or(None)
+    }
+
+    fn try_read(&self, dir_ino: u64) -> Result<Option<Arc<RwLock<DirORSet>>>, ()> {
+        let shard = self.get_shard(dir_ino);
+        let guard = shard.try_read().map_err(|_| ())?;
+        Ok(guard.get(&dir_ino).cloned())
+    }
+
+    fn ensure_dir_cache(&self, dir_ino: u64) -> Arc<RwLock<DirORSet>> {
+        let shard = self.get_shard(dir_ino);
+        {
+            let cache = shard.read().unwrap();
+            if let Some(orset_arc) = cache.get(&dir_ino) {
+                return orset_arc.clone();
+            }
+        }
+        let mut cache = shard.write().unwrap();
+        cache
+            .entry(dir_ino)
+            .or_insert_with(|| Arc::new(RwLock::new(DirORSet::new(dir_ino))))
+            .clone()
+    }
+}
+
 /// 变更操作类型
 #[derive(Debug, Clone)]
 enum ChangeOp {
     Create(DirEntry),
-    Delete(u64, bool),
+    Delete(u64, ()),
     Rename(u64, String, u64, String),
     SetAttr(DirEntry),
+}
+
+enum InvalidationRequest {
+    InvalidateEntry(u64, String),
+    InvalidatePath(String),
 }
 
 /// 变更缓存配置
 const CHANGE_CACHE_BATCH_SIZE: usize = 64;
 
+/// Inode 状态信息（用于引用计数和 generation 管理）
+struct InodeState {
+    generation: u64,
+    ref_count: std::sync::atomic::AtomicU32,
+}
+
+impl InodeState {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            ref_count: std::sync::atomic::AtomicU32::new(1),
+        }
+    }
+}
+
 pub struct MetadataManager {
-    /// 本地 OR-Set 缓存：dir_inode -> DirORSet（通过 trait 抽象）
-    dir_cache: Arc<dyn DirCacheProvider>,
+    /// 本地 OR-Set 缓存：按 parent inode hash 分片的 dir_inode -> DirORSet
+    dir_cache: ShardedDirCache,
     /// inode 反向索引：ino -> (dir_ino, EntryId)
     inode_index: Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
     /// inode → 全路径映射（用于 Master 同步时的 path KV 兼容）
     inode_paths: Arc<RwLock<HashMap<u64, String>>>,
+    /// inode 状态：ino -> InodeState（引用计数 + generation）
+    inode_state: Arc<RwLock<HashMap<u64, InodeState>>>,
     /// POSIX 投影层
     projection: PosixProjection,
     /// Inode 分配器
@@ -76,15 +248,20 @@ pub struct MetadataManager {
     client_vclock: Arc<RwLock<VectorClock>>,
     /// 变更缓存发送端（无锁化设计）
     change_sender: Sender<ChangeOp>,
+    /// 写操作计数器（用于动态 Delta Sync 间隔）
+    write_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// 缓存失效请求发送端（异步处理）
+    invalidation_sender: Sender<InvalidationRequest>,
 }
 
 impl MetadataManager {
     /// 创建本地版 MetadataManager（无 Master 连接，仅本地缓存）
     pub fn new_local(client_id: u64) -> Self {
         let mgr = Self {
-            dir_cache: Self::create_dir_cache(),
+            dir_cache: ShardedDirCache::new(),
             inode_index: Arc::new(RwLock::new(HashMap::new())),
             inode_paths: Arc::new(RwLock::new(HashMap::new())),
+            inode_state: Arc::new(RwLock::new(HashMap::new())),
             projection: PosixProjection::new(),
             inode_allocator: InodeAllocator::new(client_id),
             client_id,
@@ -93,6 +270,8 @@ impl MetadataManager {
             client: None,
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
             change_sender: channel::unbounded().0,
+            write_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            invalidation_sender: channel::unbounded().0,
         };
         mgr.init_root();
         mgr
@@ -101,11 +280,13 @@ impl MetadataManager {
     /// 创建带 Master 连接的 MetadataManager
     pub fn new_with_master(client: Arc<SyncFuseClient>, client_id: u64) -> Self {
         let (change_sender, change_receiver) = channel::unbounded();
+        let (invalidation_sender, invalidation_receiver) = channel::unbounded();
 
         let mgr = Self {
-            dir_cache: Self::create_dir_cache(),
+            dir_cache: ShardedDirCache::new(),
             inode_index: Arc::new(RwLock::new(HashMap::new())),
             inode_paths: Arc::new(RwLock::new(HashMap::new())),
+            inode_state: Arc::new(RwLock::new(HashMap::new())),
             projection: PosixProjection::new(),
             inode_allocator: InodeAllocator::new(client_id),
             client_id,
@@ -114,21 +295,13 @@ impl MetadataManager {
             client: Some(client),
             client_vclock: Arc::new(RwLock::new(VectorClock::new())),
             change_sender,
+            write_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            invalidation_sender,
         };
         mgr.init_root();
         mgr.start_change_cache_flusher(change_receiver);
+        mgr.start_invalidation_processor(invalidation_receiver);
         mgr
-    }
-
-    /// 根据编译 feature 创建目录缓存实现
-    #[cfg(not(feature = "enterprise"))]
-    fn create_dir_cache() -> Arc<dyn DirCacheProvider> {
-        Arc::new(CommunityDirCache::new())
-    }
-
-    #[cfg(feature = "enterprise")]
-    fn create_dir_cache() -> Arc<dyn DirCacheProvider> {
-        Arc::new(powerfs_fuse_enterprise::EnterpriseDirCache::new())
     }
 
     /// 初始化根目录
@@ -142,11 +315,86 @@ impl MetadataManager {
             .write()
             .unwrap()
             .insert(ROOT_INO, "/".to_string());
+
+        // 根目录 inode 状态
+        self.inode_state
+            .write()
+            .unwrap()
+            .insert(ROOT_INO, InodeState::new(0));
     }
 
     /// 获取 client_id
     pub fn client_id(&self) -> u64 {
         self.client_id
+    }
+
+    /// 获取 inode 的 generation
+    pub fn get_inode_generation(&self, ino: u64) -> u64 {
+        let state_map = self.inode_state.read().unwrap();
+        state_map.get(&ino).map(|s| s.generation).unwrap_or(0)
+    }
+
+    /// 获取 inode 的引用计数
+    pub fn get_inode_ref_count(&self, ino: u64) -> u32 {
+        let state_map = self.inode_state.read().unwrap();
+        state_map
+            .get(&ino)
+            .map(|s| s.ref_count.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// 增加 inode 引用计数（文件打开时调用）
+    pub fn acquire_inode(&self, ino: u64) {
+        let state_map = self.inode_state.read().unwrap();
+        if let Some(state) = state_map.get(&ino) {
+            state
+                .ref_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 减少 inode 引用计数（文件关闭时调用）
+    /// 返回当前引用计数（减1之后的值）
+    /// 当引用计数减为0时，清理 inode_state
+    pub fn release_inode(&self, ino: u64) -> u32 {
+        let state_map = self.inode_state.read().unwrap();
+        if let Some(state) = state_map.get(&ino) {
+            let new_count = state
+                .ref_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if new_count == 1 {
+                drop(state_map);
+                let mut state_map_write = self.inode_state.write().unwrap();
+                state_map_write.remove(&ino);
+            }
+            new_count - 1
+        } else {
+            0
+        }
+    }
+
+    /// 乐观更新 inode size
+    /// insize: 操作开始时的 size
+    /// outsize: 操作结束后的 size
+    /// 如果当前 size != insize，说明有其他操作（如 truncate），放弃更新
+    pub fn update_size_optimistic(&self, ino: u64, insize: u64, outsize: u64) -> bool {
+        let entry_info = {
+            let index = self.inode_index.read().unwrap();
+            index.get(&ino).map(|(d, e)| (*d, e.clone()))
+        };
+
+        if let Some((dir_ino, entry_id)) = entry_info {
+            if let Some(orset_arc) = self.dir_cache.get(dir_ino) {
+                let mut orset = orset_arc.write().unwrap();
+                if let Some(entry) = orset.entries.get_mut(&entry_id) {
+                    if entry.size == insize {
+                        entry.size = outsize;
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     // ==================== 读路径 ====================
@@ -161,6 +409,9 @@ impl MetadataManager {
         }
 
         // 本地未命中：仅当目录 OR-Set 不存在时才从 Master 拉取
+        // （如果 OR-Set 已存在但条目不存在，说明已被删除或从未创建，不应从 Master 重新拉取，
+        //   否则会用 Master 的旧数据覆盖本地删除——Master 不保存 client_id/seq，
+        //   tombstone 无法匹配，会导致已删除的条目复活）
         let need_fetch = self.dir_cache.get(dir_ino).is_none();
 
         if need_fetch && self.client.is_some() {
@@ -204,8 +455,8 @@ impl MetadataManager {
 
         // 最后的 fallback：使用非阻塞方式获取缓存
         // 避免在锁竞争时无限阻塞
-        let orset_arc = self.dir_cache.try_read(dir_ino);
-        if let Ok(Some(orset_arc)) = orset_arc {
+        let orset_arc_result = self.dir_cache.try_read(dir_ino);
+        if let Ok(Some(orset_arc)) = orset_arc_result {
             let orset = orset_arc.try_read();
             if let Ok(orset) = orset {
                 return Ok(self.projection.project_listing(&orset));
@@ -220,7 +471,7 @@ impl MetadataManager {
     /// 返回 None 表示需要从 Master 拉取
     fn try_list_dir_local(&self, dir_ino: u64) -> Option<Vec<VisibleEntry>> {
         // 先尝试读锁
-        let orset_arc = self.dir_cache.try_read(dir_ino).ok()??;
+        let orset_arc = self.dir_cache.get(dir_ino)?;
 
         let orset = orset_arc.read().ok()?;
         // 【关键修复】当 OR-Set 为空时，返回空向量而不是 None
@@ -241,8 +492,8 @@ impl MetadataManager {
             // 避免死锁场景：
             // - 线程A（get_entry_by_inode）: 持有 inode_index 读锁 → 等待 dir_cache 读锁
             // - 线程B（rmdir/unlink）: 持有 dir_cache 写锁 → 等待 inode_index 写锁
-            let orset_arc = self.dir_cache.get(dir_ino);
-            if let Some(orset_arc) = orset_arc {
+            let orset_arc_result = self.dir_cache.try_read(dir_ino);
+            if let Ok(Some(orset_arc)) = orset_arc_result {
                 let orset_result = orset_arc.try_read();
                 if let Ok(orset) = orset_result {
                     if let Some(entry) = orset.entries.get(&entry_id) {
@@ -385,9 +636,24 @@ impl MetadataManager {
         // 而 get_entry_by_inode 持有 inode_index.read() 并等待 dir_cache.read()，会形成循环等待
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // 【关键修复】创建新目录的 OR-Set
+        // 【关键修复】单独获取分片锁创建新目录的 OR-Set
         let new_dir_orset = Arc::new(RwLock::new(DirORSet::new(inode)));
         self.dir_cache.insert(inode, new_dir_orset);
+
+        // 【关键修复】目录创建必须立即同步到 Master/Filer，否则后续文件创建会失败
+        // 因为文件创建需要父目录已经存在于 Master/Filer 上
+        if let Some(client) = &self.client {
+            let parent_path = self.get_path(dir_ino).unwrap_or_else(|| "/".to_string());
+            let client_id_str = self.client_id.to_string();
+            // 优先使用 Filer 服务，没有配置 Filer 时回退到 Master
+            if client.has_filer() {
+                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
+                let _ = client.filer_create_entry(filer_entry, &client_id_str);
+            } else {
+                let proto_entry = dir_entry_to_proto(&entry, &parent_path);
+                let _ = client.create_entry(proto_entry, &client_id_str);
+            }
+        }
 
         // best-effort 同步到 Master（使用变更缓存）
         self.add_change(ChangeOp::Create(entry.clone()));
@@ -422,78 +688,69 @@ impl MetadataManager {
         dir_ino: u64,
         name: &str,
         mode: u32,
-        rdev: u64,
-        uid: u32,
-        gid: u32,
+        rdev: u32,
     ) -> Result<DirEntry, FsError> {
         let inode = self.inode_allocator.allocate();
         let seq = self.next_seq();
         let entry_id = EntryId::new(name, self.client_id, seq);
+
         let file_type = FileType::from_mode(mode);
         let entry = match file_type {
-            FileType::Fifo => DirEntry::new_fifo(entry_id, inode, dir_ino, mode, uid, gid),
+            FileType::Fifo => DirEntry::new_fifo(entry_id, inode, dir_ino, mode, 0, 0),
             FileType::CharDevice => {
-                DirEntry::new_chrdev(entry_id, inode, dir_ino, mode, rdev, uid, gid)
+                DirEntry::new_chrdev(entry_id, inode, dir_ino, mode, rdev as u64, 0, 0)
             }
             FileType::BlockDevice => {
-                DirEntry::new_blkdev(entry_id, inode, dir_ino, mode, rdev, uid, gid)
+                DirEntry::new_blkdev(entry_id, inode, dir_ino, mode, rdev as u64, 0, 0)
             }
-            FileType::Socket => DirEntry::new_socket(entry_id, inode, dir_ino, mode, uid, gid),
-            _ => DirEntry::new_file(entry_id, inode, dir_ino, mode, uid, gid),
+            FileType::Socket => DirEntry::new_socket(entry_id, inode, dir_ino, mode, 0, 0),
+            _ => DirEntry::new_file(entry_id, inode, dir_ino, mode, 0, 0),
         };
 
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // best-effort 同步到 Master（使用变更缓存）
         self.add_change(ChangeOp::Create(entry.clone()));
 
         Ok(entry)
     }
 
-    /// 创建硬链接（link）
-    pub fn link(&self, inode: u64, new_dir: u64, new_name: &str) -> Result<DirEntry, FsError> {
-        let (old_dir_ino, old_entry_id) = {
+    /// 创建硬链接
+    pub fn link(&self, ino: u64, new_dir_ino: u64, new_name: &str) -> Result<DirEntry, FsError> {
+        let (old_dir_ino, _old_entry_id) = {
             let index = self.inode_index.read().unwrap();
             index
-                .get(&inode)
+                .get(&ino)
                 .cloned()
-                .ok_or_else(|| FsError::NotFound(format!("link: inode {} not found", inode)))?
+                .ok_or_else(|| FsError::NotFound(format!("link: inode {} not found", ino)))?
         };
 
-        let old_entry = {
-            let orset_arc = self.ensure_dir_cache(old_dir_ino);
-            let orset = orset_arc.read().unwrap();
-            orset.entries.get(&old_entry_id).cloned().ok_or_else(|| {
-                FsError::NotFound(format!("link: entry {:?} not found", old_entry_id))
-            })?
-        };
-
-        if old_entry.file_type == FileType::Directory {
-            return Err(FsError::IsDirectory(format!(
-                "link: cannot link directory {}",
-                new_name
-            )));
-        }
+        let old_orset_arc = self.ensure_dir_cache(old_dir_ino);
+        let old_orset = old_orset_arc.read().unwrap();
+        let old_entry = old_orset
+            .entries
+            .values()
+            .find(|e| e.inode == ino)
+            .cloned()
+            .ok_or_else(|| FsError::NotFound(format!("link: inode {} entry not found", ino)))?;
+        drop(old_orset);
 
         let seq = self.next_seq();
         let new_entry_id = EntryId::new(new_name, self.client_id, seq);
         let mut new_entry = old_entry.clone();
         new_entry.id = new_entry_id;
-        new_entry.parent_ino = new_dir;
-        new_entry.nlink += 1;
-        new_entry.mtime = now_unix();
+        new_entry.parent_ino = new_dir_ino;
+        new_entry.nlink = old_entry.nlink + 1;
+        new_entry.ctime = now_unix();
 
-        let old_entry_for_update = new_entry.clone();
+        self.apply_to_local_orset(new_dir_ino, new_entry.clone())?;
 
-        {
-            let orset_arc = self.ensure_dir_cache(old_dir_ino);
-            let mut orset = orset_arc.write().unwrap();
-            if let Some(entry) = orset.entries.get_mut(&old_entry_id) {
-                entry.nlink = old_entry_for_update.nlink;
-            }
+        let orset_arc = self.ensure_dir_cache(old_dir_ino);
+        let mut orset = orset_arc.write().unwrap();
+        if let Some(e) = orset.entries.get_mut(&old_entry.id) {
+            e.nlink += 1;
+            e.ctime = now_unix();
         }
-
-        self.apply_to_local_orset(new_dir, new_entry.clone())?;
+        drop(orset);
 
         self.add_change(ChangeOp::Create(new_entry.clone()));
 
@@ -508,19 +765,20 @@ impl MetadataManager {
     ///
     /// 返回被删除文件的 inode（供调用方清理数据缓存）
     pub fn unlink(&self, dir_ino: u64, name: &str) -> Result<u64, FsError> {
-        // 先获取读锁查找信息
-        let (inode, entry_id) = {
-            let orset_arc = self.dir_cache.get(dir_ino).ok_or_else(|| {
-                FsError::NotFound(format!("unlink: {} not found in dir {}", name, dir_ino))
-            })?;
+        // 使用分片写锁，确保查找和删除原子操作
+        let (inode, _entry_id) = {
+            let orset_arc = self
+                .dir_cache
+                .get(dir_ino)
+                .ok_or_else(|| FsError::NotFound(format!("unlink: dir {} not found", dir_ino)))?;
 
-            let entry = {
-                let orset = orset_arc.read().unwrap();
-                self.projection.project_lookup(&orset, name)
-            }
-            .ok_or_else(|| {
-                FsError::NotFound(format!("unlink: {} not found in dir {}", name, dir_ino))
-            })?;
+            let mut orset = orset_arc.write().unwrap();
+            let entry = self
+                .projection
+                .project_lookup(&orset, name)
+                .ok_or_else(|| {
+                    FsError::NotFound(format!("unlink: {} not found in dir {}", name, dir_ino))
+                })?;
 
             if entry.file_type == FileType::Directory {
                 return Err(FsError::IsDirectory(format!(
@@ -529,20 +787,9 @@ impl MetadataManager {
                 )));
             }
 
+            orset.remove(&entry.id);
             (entry.inode, entry.id.clone())
         };
-
-        // 【关键修复】先修改 dir_cache/orset，再清理 inode_index/inode_paths
-        // 避免竞态条件和死锁：必须使用 dir_cache.write()，因为 orset.remove() 会修改 OR-Set
-        // 如果使用 dir_cache.read()，当 rmdir 等待 dir_cache.write() 时会形成死锁
-        {
-            let orset_arc = self
-                .dir_cache
-                .get(dir_ino)
-                .ok_or_else(|| FsError::NotFound(format!("unlink: dir {} not found", dir_ino)))?;
-            let mut orset = orset_arc.write().unwrap();
-            orset.remove(&entry_id);
-        }
 
         {
             let mut index = self.inode_index.write().unwrap();
@@ -553,65 +800,90 @@ impl MetadataManager {
             paths.remove(&inode);
         }
 
-        self.add_change(ChangeOp::Delete(inode, false));
+        self.release_inode(inode);
+
+        self.add_change(ChangeOp::Delete(inode, ()));
         Ok(inode)
     }
 
     /// 删除目录（rmdir）
     pub fn rmdir(&self, dir_ino: u64, name: &str) -> Result<(), FsError> {
-        // 先获取读锁查找信息
-        let (child_inode, entry_id) = {
-            let orset_arc = self.dir_cache.get(dir_ino).ok_or_else(|| {
-                FsError::NotFound(format!("rmdir: {} not found in dir {}", name, dir_ino))
-            })?;
+        // 使用分片锁：需要获取父目录分片和子目录分片（按序号顺序获取避免死锁）
+        let parent_shard_idx = self.dir_cache.shard_index(dir_ino);
 
-            let entry = {
-                let orset = orset_arc.read().unwrap();
-                self.projection.project_lookup(&orset, name)
-            }
-            .ok_or_else(|| {
-                FsError::NotFound(format!("rmdir: {} not found in dir {}", name, dir_ino))
-            })?;
+        let (child_inode, _entry_id) = {
+            // 获取父分片写锁
+            let parent_shard = self.dir_cache.shards[parent_shard_idx].clone();
+            let mut parent_cache = parent_shard.write().unwrap();
 
-            if entry.file_type != FileType::Directory {
-                return Err(FsError::NotDirectory(format!(
-                    "rmdir: {} is not a directory",
-                    name
-                )));
-            }
+            // 在写锁保护下查找、检查和删除（原子操作）
+            let (child_inode, entry_id) = if let Some(parent_orset) = parent_cache.get(&dir_ino) {
+                let mut orset = parent_orset.write().unwrap();
+                let entry = self
+                    .projection
+                    .project_lookup(&orset, name)
+                    .ok_or_else(|| {
+                        FsError::NotFound(format!("rmdir: {} not found in dir {}", name, dir_ino))
+                    })?;
 
-            (entry.inode, entry.id.clone())
-        };
+                if entry.file_type != FileType::Directory {
+                    return Err(FsError::NotDirectory(format!(
+                        "rmdir: {} is not a directory",
+                        name
+                    )));
+                }
 
-        // 检查目录是否为空
-        let is_empty = {
-            if let Some(child_orset) = self.dir_cache.get(child_inode) {
-                let orset = child_orset.read().unwrap();
-                orset.is_empty()
+                let child_inode = entry.inode;
+
+                let is_empty = {
+                    let child_shard_idx = self.dir_cache.shard_index(child_inode);
+                    if child_shard_idx == parent_shard_idx {
+                        if let Some(child_orset) = parent_cache.get(&child_inode) {
+                            child_orset.read().unwrap().is_empty()
+                        } else {
+                            true
+                        }
+                    } else {
+                        let child_shard = self.dir_cache.shards[child_shard_idx].clone();
+                        let child_cache = child_shard.read().unwrap();
+                        if let Some(child_orset) = child_cache.get(&child_inode) {
+                            child_orset.read().unwrap().is_empty()
+                        } else {
+                            true
+                        }
+                    }
+                };
+
+                if !is_empty {
+                    return Err(FsError::NotEmpty(format!(
+                        "rmdir: directory {} is not empty",
+                        name
+                    )));
+                }
+
+                orset.remove(&entry.id);
+                (child_inode, entry.id.clone())
             } else {
-                true
+                return Err(FsError::NotFound(format!(
+                    "rmdir: {} not found in dir {}",
+                    name, dir_ino
+                )));
+            };
+
+            // 如果子目录和父目录不在同一个分片，需要单独删除
+            let child_shard_idx = self.dir_cache.shard_index(child_inode);
+            if child_shard_idx != parent_shard_idx {
+                let child_shard = self.dir_cache.shards[child_shard_idx].clone();
+                let mut child_cache = child_shard.write().unwrap();
+                child_cache.remove(&child_inode);
+            } else {
+                parent_cache.remove(&child_inode);
             }
+
+            (child_inode, entry_id)
         };
 
-        if !is_empty {
-            return Err(FsError::NotEmpty(format!(
-                "rmdir: directory {} is not empty",
-                name
-            )));
-        }
-
-        // 执行删除
-        {
-            let orset_arc = self
-                .dir_cache
-                .get(dir_ino)
-                .ok_or_else(|| FsError::NotFound(format!("rmdir: dir {} not found", dir_ino)))?;
-            let mut orset = orset_arc.write().unwrap();
-            orset.remove(&entry_id);
-        }
-        self.dir_cache.remove(child_inode);
-
-        // 清理索引
+        // 清理索引（在 dir_cache 写锁释放后）
         {
             let mut index = self.inode_index.write().unwrap();
             index.remove(&child_inode);
@@ -621,8 +893,62 @@ impl MetadataManager {
             paths.remove(&child_inode);
         }
 
-        self.add_change(ChangeOp::Delete(child_inode, true));
+        self.release_inode(child_inode);
+
+        self.add_change(ChangeOp::Delete(child_inode, ()));
         Ok(())
+    }
+
+    /// 递归删除目录及其所有内容
+    pub fn rmdir_recursive(&self, dir_ino: u64) -> Result<(), FsError> {
+        // 获取目录下的所有子项
+        let children = match self.list_dir(dir_ino) {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(
+                    "rmdir_recursive: list_dir failed for inode {}: {}",
+                    dir_ino, e
+                );
+                return Ok(());
+            }
+        };
+
+        // 先删除所有子目录（递归）
+        for entry in children.iter() {
+            if entry.file_type == FileType::Directory {
+                if let Err(e) = self.rmdir_recursive(entry.inode) {
+                    warn!(
+                        "rmdir_recursive: failed to delete subdir {}: {}",
+                        entry.name, e
+                    );
+                }
+            }
+        }
+
+        // 再删除所有文件
+        for entry in children.iter() {
+            if entry.file_type != FileType::Directory {
+                if let Err(e) = self.unlink(dir_ino, &entry.name) {
+                    warn!(
+                        "rmdir_recursive: failed to unlink file {}: {}",
+                        entry.name, e
+                    );
+                }
+            }
+        }
+
+        // 获取父目录和名称来调用 rmdir
+        let (parent_ino, name) = {
+            let index = self.inode_index.read().unwrap();
+            if let Some(&(p, ref entry_id)) = index.get(&dir_ino) {
+                (p, entry_id.name.clone())
+            } else {
+                return Ok(());
+            }
+        };
+
+        // 最后删除当前目录
+        self.rmdir(parent_ino, &name)
     }
 
     /// 重命名（rename）
@@ -643,7 +969,6 @@ impl MetadataManager {
         new_name: &str,
     ) -> Result<Option<u64>, FsError> {
         if old_dir == new_dir && old_name == new_name {
-            // 同位置重命名，无操作
             return Ok(None);
         }
 
@@ -655,26 +980,193 @@ impl MetadataManager {
             format!("{}/{}", parent_path, new_name)
         };
 
-        // 查找旧条目
-        let old_entry = {
-            let orset_arc = self.dir_cache.get(old_dir).ok_or_else(|| {
+        // 检查是否跨分片
+        let old_shard_idx = self.dir_cache.shard_index(old_dir);
+        let new_shard_idx = self.dir_cache.shard_index(new_dir);
+        let is_cross_shard = old_shard_idx != new_shard_idx;
+
+        if is_cross_shard {
+            return self.rename_cross_shard(old_dir, old_name, new_dir, new_name, &new_path);
+        }
+
+        // 同分片 rename：使用分片写锁
+        let shard = self.dir_cache.get_shard(old_dir);
+
+        let (overwritten_inode, inode_to_update, new_entry_id_for_index, dest_inode_to_remove) = {
+            let mut cache = shard.write().unwrap();
+
+            let old_entry = if let Some(old_orset) = cache.get(&old_dir) {
+                let orset = old_orset.read().unwrap();
+                self.projection.project_lookup(&orset, old_name)
+            } else {
+                None
+            }
+            .ok_or_else(|| {
                 FsError::NotFound(format!("rename: {} not found in dir {}", old_name, old_dir))
             })?;
-            let orset = orset_arc.read().unwrap();
-            self.projection.project_lookup(&orset, old_name)
-        }
-        .ok_or_else(|| {
-            FsError::NotFound(format!("rename: {} not found in dir {}", old_name, old_dir))
-        })?;
 
-        // 检查目标是否已存在（POSIX 覆盖语义）
-        let (overwritten_inode, dest_to_remove) = {
-            if let Some(new_orset) = self.dir_cache.get(new_dir) {
+            let (overwritten_inode, dest_to_remove) = if let Some(new_orset) = cache.get(&new_dir) {
                 let orset = new_orset.read().unwrap();
                 if let Some(dest) = self.projection.project_lookup(&orset, new_name) {
                     if dest.inode != old_entry.inode {
                         if dest.file_type == FileType::Directory {
-                            // POSIX: 不能用普通文件覆盖目录
+                            return Err(FsError::IsDirectory(format!(
+                                "rename: cannot overwrite directory {}",
+                                new_name
+                            )));
+                        }
+                        (
+                            Some(dest.inode),
+                            Some((new_dir, dest.id.clone(), dest.inode)),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            if let Some((dest_dir, ref dest_id, _)) = dest_to_remove {
+                if let Some(orset) = cache.get(&dest_dir) {
+                    let mut orset = orset.write().unwrap();
+                    orset.remove(dest_id);
+                }
+            }
+
+            if old_dir == new_dir {
+                // 同目录 rename：使用 rename_entry 原子操作，生成单个 DeltaOp::Rename
+                let old_entry_id = old_entry.id.clone();
+                let new_id = if let Some(orset) = cache.get(&old_dir) {
+                    let mut orset = orset.write().unwrap();
+                    orset.rename_entry(&old_entry_id, new_name, self.client_id)
+                } else {
+                    None
+                };
+
+                let new_id = new_id.ok_or_else(|| {
+                    FsError::NotFound(format!("rename: {} not found in dir {}", old_name, old_dir))
+                })?;
+                let dest_inode_to_remove = dest_to_remove.map(|(_, _, ino)| ino);
+                (
+                    overwritten_inode,
+                    old_entry.inode,
+                    new_id,
+                    dest_inode_to_remove,
+                )
+            } else {
+                // 同分片不同目录 rename：remove + add
+                let old_entry_id = old_entry.id.clone();
+                if let Some(orset) = cache.get(&old_dir) {
+                    let mut orset = orset.write().unwrap();
+                    orset.remove(&old_entry_id);
+                }
+
+                let seq = self.next_seq();
+                let new_id = EntryId::new(new_name, self.client_id, seq);
+                let mut new_entry = old_entry.clone();
+                new_entry.id = new_id;
+                new_entry.parent_ino = new_dir;
+                new_entry.mtime = now_unix();
+
+                let new_orset_arc = if let Some(orset) = cache.get(&new_dir) {
+                    orset.clone()
+                } else {
+                    let orset = Arc::new(RwLock::new(DirORSet::new(new_dir)));
+                    cache.insert(new_dir, orset.clone());
+                    orset
+                };
+                {
+                    let mut orset = new_orset_arc.write().unwrap();
+                    orset.add(new_entry.clone());
+                }
+
+                if new_entry.file_type == FileType::Directory {
+                    if let Some(child_orset) = cache.get(&new_entry.inode) {
+                        let mut orset = child_orset.write().unwrap();
+                        orset.dir_ino = new_entry.inode;
+                    }
+                }
+
+                let dest_inode_to_remove = dest_to_remove.map(|(_, _, ino)| ino);
+                (
+                    overwritten_inode,
+                    new_entry.inode,
+                    new_entry.id.clone(),
+                    dest_inode_to_remove,
+                )
+            }
+        };
+
+        // 现在可以安全地更新 inode_index 和 inode_paths（不持有 dir_cache 锁）
+        if let Some(ino) = dest_inode_to_remove {
+            {
+                let mut index = self.inode_index.write().unwrap();
+                index.remove(&ino);
+            }
+            {
+                let mut paths = self.inode_paths.write().unwrap();
+                paths.remove(&ino);
+            }
+            self.release_inode(ino);
+        }
+
+        {
+            let mut index = self.inode_index.write().unwrap();
+            index.insert(inode_to_update, (new_dir, new_entry_id_for_index));
+        }
+        {
+            let mut paths = self.inode_paths.write().unwrap();
+            paths.insert(inode_to_update, new_path.clone());
+        }
+
+        self.add_change(ChangeOp::Rename(
+            old_dir,
+            old_name.to_string(),
+            new_dir,
+            new_name.to_string(),
+        ));
+
+        Ok(overwritten_inode)
+    }
+
+    /// 跨分片 rename：使用创建再删除的方式
+    /// 先在新目录创建条目，然后从旧目录删除原条目
+    /// 如果创建成功但删除失败，旧条目会保留（正确性优先）
+    fn rename_cross_shard(
+        &self,
+        old_dir: u64,
+        old_name: &str,
+        new_dir: u64,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<Option<u64>, FsError> {
+        // 先获取旧条目信息（不持有任何锁）
+        let old_entry = {
+            let orset_arc = self.dir_cache.get(old_dir).ok_or_else(|| {
+                FsError::NotFound(format!("rename: old dir {} not found", old_dir))
+            })?;
+            let orset = orset_arc.read().unwrap();
+            self.projection
+                .project_lookup(&orset, old_name)
+                .ok_or_else(|| {
+                    FsError::NotFound(format!("rename: {} not found in dir {}", old_name, old_dir))
+                })?
+        };
+
+        let old_inode = old_entry.inode;
+        let old_entry_id = old_entry.id.clone();
+
+        // 检查目标是否已存在（先获取新目录锁）
+        let (overwritten_inode, dest_to_remove) = {
+            let orset_arc = self.dir_cache.get(new_dir);
+            if let Some(orset_arc) = orset_arc {
+                let orset = orset_arc.read().unwrap();
+                if let Some(dest) = self.projection.project_lookup(&orset, new_name) {
+                    if dest.inode != old_inode {
+                        if dest.file_type == FileType::Directory {
                             return Err(FsError::IsDirectory(format!(
                                 "rename: cannot overwrite directory {}",
                                 new_name
@@ -695,22 +1187,7 @@ impl MetadataManager {
             }
         };
 
-        // 如果目标存在，先从新目录移除
-        if let Some((dest_dir, ref dest_id, _)) = dest_to_remove {
-            if let Some(orset_arc) = self.dir_cache.get(dest_dir) {
-                let mut orset = orset_arc.write().unwrap();
-                orset.remove(dest_id);
-            }
-        }
-
-        // 从旧目录移除
-        let old_entry_id = old_entry.id.clone();
-        if let Some(orset_arc) = self.dir_cache.get(old_dir) {
-            let mut orset = orset_arc.write().unwrap();
-            orset.remove(&old_entry_id);
-        }
-
-        // 创建新条目（保留 inode 和大部分属性，更新 name 和 parent_ino）
+        // 第一步：在新目录创建新条目
         let seq = self.next_seq();
         let new_id = EntryId::new(new_name, self.client_id, seq);
         let mut new_entry = old_entry.clone();
@@ -718,48 +1195,65 @@ impl MetadataManager {
         new_entry.parent_ino = new_dir;
         new_entry.mtime = now_unix();
 
-        // 加入新目录
-        let new_orset_arc = self.dir_cache.ensure_dir_cache(new_dir);
         {
-            let mut orset = new_orset_arc.write().unwrap();
+            let orset_arc = self.dir_cache.ensure_dir_cache(new_dir);
+            let mut orset = orset_arc.write().unwrap();
             orset.add(new_entry.clone());
         }
 
-        // 如果是目录，也需要更新其 OR-Set 的 dir_ino
-        if new_entry.file_type == FileType::Directory {
-            if let Some(child_orset) = self.dir_cache.get(new_entry.inode) {
-                let mut orset = child_orset.write().unwrap();
-                orset.dir_ino = new_entry.inode;
+        // 如果目标存在，从新目录移除旧目标
+        if let Some((dest_dir, ref dest_id, _)) = dest_to_remove {
+            let orset_arc = self.dir_cache.get(dest_dir);
+            if let Some(orset_arc) = orset_arc {
+                let mut orset = orset_arc.write().unwrap();
+                orset.remove(dest_id);
             }
         }
 
-        // 【关键修复】记录需要更新的 inode 信息
-        let dest_inode_to_remove = dest_to_remove.map(|(_, _, ino)| ino);
-        let inode_to_update = new_entry.inode;
-        let new_entry_id_for_index = new_entry.id.clone();
+        // 如果是目录，在新分片创建 OR-Set
+        if new_entry.file_type == FileType::Directory {
+            let new_dir_orset = Arc::new(RwLock::new(DirORSet::new(new_entry.inode)));
+            self.dir_cache.insert(new_entry.inode, new_dir_orset);
+        }
 
-        // 更新 inode_index 和 inode_paths
-        if let Some(ino) = dest_inode_to_remove {
-            {
-                let mut index = self.inode_index.write().unwrap();
-                index.remove(&ino);
+        // 第二步：从旧目录删除原条目（best-effort）
+        let delete_result = {
+            let orset_arc = self.dir_cache.get(old_dir);
+            if let Some(orset_arc) = orset_arc {
+                let mut orset = orset_arc.write().unwrap();
+                orset.remove(&old_entry_id);
+                Ok(())
+            } else {
+                Err(FsError::NotFound(format!(
+                    "rename: old dir {} not found during delete",
+                    old_dir
+                )))
             }
-            {
-                let mut paths = self.inode_paths.write().unwrap();
-                paths.remove(&ino);
-            }
+        };
+
+        // 如果删除失败，记录警告但不影响 rename 成功（旧条目会保留，正确性没问题）
+        if let Err(e) = delete_result {
+            warn!("rename_cross_shard: failed to remove old entry: {}", e);
+        }
+
+        // 更新索引（在所有锁释放后）
+        if let Some(ino) = dest_to_remove.map(|(_, _, ino)| ino) {
+            let mut index = self.inode_index.write().unwrap();
+            index.remove(&ino);
+            let mut paths = self.inode_paths.write().unwrap();
+            paths.remove(&ino);
+            self.release_inode(ino);
         }
 
         {
             let mut index = self.inode_index.write().unwrap();
-            index.insert(inode_to_update, (new_dir, new_entry_id_for_index));
+            index.insert(old_inode, (new_dir, new_entry.id.clone()));
         }
         {
             let mut paths = self.inode_paths.write().unwrap();
-            paths.insert(inode_to_update, new_path.clone());
+            paths.insert(old_inode, new_path.to_string());
         }
 
-        // 【关键修复】先释放所有锁再调用 add_change
         self.add_change(ChangeOp::Rename(
             old_dir,
             old_name.to_string(),
@@ -780,7 +1274,6 @@ impl MetadataManager {
         size: Option<u64>,
         mtime: Option<u64>,
     ) -> Result<DirEntry, FsError> {
-        // 【关键修复】先从 inode_index 获取信息（短暂持有），然后释放
         let (dir_ino, entry_id) = {
             let index = self.inode_index.read().unwrap();
             index
@@ -788,9 +1281,7 @@ impl MetadataManager {
                 .cloned()
                 .ok_or_else(|| FsError::NotFound(format!("setattr: inode {} not found", ino)))?
         };
-        // inode_index 锁已释放
 
-        // 更新本地 OR-Set 中的条目
         let orset_arc = self.ensure_dir_cache(dir_ino);
         let mut orset = orset_arc.write().unwrap();
         let entry = orset
@@ -813,10 +1304,10 @@ impl MetadataManager {
         if let Some(t) = mtime {
             entry.mtime = t;
         }
+        entry.ctime = now_unix();
         let updated = entry.clone();
         drop(orset);
 
-        // best-effort 同步到 Master（使用变更缓存）
         self.add_change(ChangeOp::SetAttr(updated.clone()));
 
         Ok(updated)
@@ -831,7 +1322,7 @@ impl MetadataManager {
         self.projection.project_lookup(&orset, name)
     }
 
-    /// 确保目录缓存存在，返回 OR-Set 的 Arc（委托给 trait）
+    /// 确保目录缓存存在，返回 OR-Set 的 Arc
     fn ensure_dir_cache(&self, dir_ino: u64) -> Arc<RwLock<DirORSet>> {
         self.dir_cache.ensure_dir_cache(dir_ino)
     }
@@ -857,44 +1348,26 @@ impl MetadataManager {
         // 更新路径映射（使用预获取的 entry_name，避免再次获取 inode_index 锁）
         self.update_path_for_inode(inode, dir_ino, &entry_name);
 
+        // 初始化 inode 状态（引用计数初始为1）
+        self.inode_state
+            .write()
+            .unwrap()
+            .insert(inode, InodeState::new(0));
+
         Ok(())
     }
 
     /// 失效本地缓存条目（用于接收远程删除通知时）
     pub fn invalidate_local_cache_entry(&self, parent_ino: u64, name: &str) {
-        let entry = match self.try_lookup_local(parent_ino, name) {
-            Some(e) => e,
-            None => {
-                debug!(
-                    "Entry not found in local cache: parent_ino={}, name={}",
-                    parent_ino, name
-                );
-                return;
-            }
-        };
-
-        let entry_id = entry.id.clone();
-        let inode_to_remove = entry.inode;
-
-        // 从父目录 OR-Set 移除
-        if let Some(orset_arc) = self.dir_cache.get(parent_ino) {
-            let mut orset = orset_arc.write().unwrap();
-            orset.remove(&entry_id);
+        if let Err(e) = self
+            .invalidation_sender
+            .try_send(InvalidationRequest::InvalidateEntry(
+                parent_ino,
+                name.to_string(),
+            ))
+        {
+            warn!("Failed to send invalidation request: {}", e);
         }
-
-        // 移除子目录缓存
-        self.dir_cache.remove(inode_to_remove);
-
-        let mut inode_index = self.inode_index.write().unwrap();
-        inode_index.remove(&inode_to_remove);
-
-        let mut inode_paths = self.inode_paths.write().unwrap();
-        inode_paths.remove(&inode_to_remove);
-
-        info!(
-            "Invalidated local cache entry: parent_ino={}, name={}, inode={}",
-            parent_ino, name, inode_to_remove
-        );
     }
 
     /// 非阻塞方式清理失效的 inode 条目
@@ -917,80 +1390,15 @@ impl MetadataManager {
 
     /// 非阻塞方式失效缓存（用于订阅线程，避免死锁）
     pub fn try_invalidate_local_cache_entry(&self, path: &str) -> bool {
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.is_empty() {
-            return false;
-        }
-
-        let mut current_ino = 1;
-        let mut found = true;
-
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                break;
-            }
-            let entry = self.try_lookup_local(current_ino, part);
-            if let Some(e) = entry {
-                current_ino = e.inode;
-            } else {
-                found = false;
-                break;
-            }
-        }
-
-        if !found {
-            return false;
-        }
-
-        let entry_name = parts.last().unwrap();
-        let entry = self.try_lookup_local(current_ino, entry_name);
-        if entry.is_none() {
-            return false;
-        }
-
-        let entry = entry.unwrap();
-        let entry_id = entry.id;
-        let inode_to_remove = entry.inode;
-
-        // 非阻塞方式获取父目录 OR-Set
-        let orset_result = self.dir_cache.try_read(current_ino);
-        if orset_result.is_err() {
-            return false;
-        }
-        let orset_arc = match orset_result.unwrap() {
-            Some(a) => a,
-            None => return false,
-        };
-
-        if let Ok(mut orset) = orset_arc.try_write() {
-            orset.remove(&entry_id);
+        if let Err(e) = self
+            .invalidation_sender
+            .try_send(InvalidationRequest::InvalidatePath(path.to_string()))
+        {
+            warn!("Failed to send invalidation request: {}", e);
+            false
         } else {
-            return false;
+            true
         }
-
-        // 移除子目录缓存
-        self.dir_cache.remove(inode_to_remove);
-
-        if let Ok(mut inode_index) = self.inode_index.try_write() {
-            inode_index.remove(&inode_to_remove);
-        }
-
-        if let Ok(mut inode_paths) = self.inode_paths.try_write() {
-            inode_paths.remove(&inode_to_remove);
-        }
-
-        true
-    }
-
-    fn try_lookup_local(&self, dir_ino: u64, name: &str) -> Option<DirEntry> {
-        let orset_arc = self.dir_cache.try_read(dir_ino).ok()??;
-        let orset_result = orset_arc.try_read();
-        if orset_result.is_err() {
-            return None;
-        }
-        let orset = orset_result.unwrap();
-
-        self.projection.project_lookup(&orset, name)
     }
 
     /// 更新 inode 的路径映射
@@ -1018,8 +1426,8 @@ impl MetadataManager {
             generation: 0,
             file_type: FileType::Directory,
             mode: 0o755 | libc::S_IFDIR,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: 0,
+            gid: 0,
             size: 4096,
             mtime: now,
             atime: now,
@@ -1037,13 +1445,12 @@ impl MetadataManager {
     /// 添加变更到变更缓存（无锁化设计）
     /// 使用 crossbeam channel 替代 Mutex，完全消除锁竞争
     fn add_change(&self, op: ChangeOp) {
+        self.increment_write_counter();
         if let Err(e) = self.change_sender.try_send(op) {
             warn!("Failed to send change to channel: {}", e);
         }
     }
 
-    /// 启动变更缓存 flush 线程（无锁化设计）
-    /// 使用 crossbeam channel 的 try_recv 批量收集变更，完全消除锁竞争
     fn start_change_cache_flusher(&self, change_receiver: Receiver<ChangeOp>) {
         let client = match &self.client {
             Some(c) => c.clone(),
@@ -1051,9 +1458,10 @@ impl MetadataManager {
         };
         let client_id_str = self.client_id_str.clone();
         let inode_paths = self.inode_paths.clone();
+        let use_filer = client.has_filer();
 
         thread::spawn(move || {
-            info!("Change cache flusher thread started");
+            info!("Change cache flusher thread started, filer={}", use_filer);
 
             loop {
                 thread::sleep(Duration::from_millis(10));
@@ -1070,50 +1478,307 @@ impl MetadataManager {
                     continue;
                 }
 
-                info!("Flushing {} pending changes to Master", changes.len());
+                info!("Flushing {} pending changes", changes.len());
 
-                for change in changes {
-                    match change {
-                        ChangeOp::Create(entry) => {
-                            if let Err(e) = sync_create_to_master_helper(
-                                &client,
-                                &client_id_str,
-                                &entry,
-                                &inode_paths,
-                            ) {
-                                warn!("Failed to sync create to master: {}", e);
+                if use_filer {
+                    // Filer 模式：逐个同步到 Filer
+                    for change in changes {
+                        match change {
+                            ChangeOp::Create(entry) => {
+                                let parent_path = {
+                                    let paths = inode_paths.read().unwrap();
+                                    paths
+                                        .get(&entry.parent_ino)
+                                        .cloned()
+                                        .unwrap_or_else(|| "/".to_string())
+                                };
+                                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
+                                match client.filer_create_entry(filer_entry, &client_id_str) {
+                                    Ok(_) => debug!(
+                                        "filer_create_entry succeeded: inode={}",
+                                        entry.inode
+                                    ),
+                                    Err(e) => warn!("filer_create_entry failed: {}", e),
+                                }
+                            }
+                            ChangeOp::Delete(ino, _) => {
+                                let path = {
+                                    let paths = inode_paths.read().unwrap();
+                                    paths.get(&ino).cloned()
+                                };
+                                if let Some(_path) = path {
+                                    let is_directory = false;
+                                    match client.filer_delete_entry(
+                                        ino,
+                                        is_directory,
+                                        &client_id_str,
+                                    ) {
+                                        Ok(_) => {
+                                            debug!("filer_delete_entry succeeded: inode={}", ino)
+                                        }
+                                        Err(e) => warn!("filer_delete_entry failed: {}", e),
+                                    }
+                                }
+                            }
+                            ChangeOp::Rename(_old_dir, _old_name, _new_dir, _new_name) => {
+                                // TODO: Filer rename support
+                                warn!("Rename sync to Filer not yet implemented");
+                            }
+                            ChangeOp::SetAttr(entry) => {
+                                let parent_path = {
+                                    let paths = inode_paths.read().unwrap();
+                                    paths
+                                        .get(&entry.parent_ino)
+                                        .cloned()
+                                        .unwrap_or_else(|| "/".to_string())
+                                };
+                                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
+                                match client.filer_update_entry(
+                                    &filer_entry,
+                                    &client_id_str,
+                                    entry.size,
+                                    false,
+                                ) {
+                                    Ok(_) => debug!(
+                                        "filer_update_entry succeeded: inode={}",
+                                        entry.inode
+                                    ),
+                                    Err(e) => warn!("filer_update_entry failed: {}", e),
+                                }
                             }
                         }
-                        ChangeOp::Delete(ino, is_dir) => {
-                            if let Err(e) = client.delete_entry(ino, is_dir, &client_id_str) {
-                                warn!("Failed to sync delete to master: {}", e);
+                    }
+                } else {
+                    // Master 模式：批量 push_delta
+                    let mut deltas = Vec::with_capacity(changes.len());
+                    for change in changes {
+                        let delta = match change {
+                            ChangeOp::Create(entry) => {
+                                let orset_entry = dir_entry_to_dir_entry_orset(&entry);
+                                powerfs_master::proto::powerfs::DeltaOp {
+                                    op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
+                                        orset_entry,
+                                    )),
+                                    vclock: None,
+                                }
                             }
-                        }
-                        ChangeOp::Rename(old_dir, old_name, new_dir, new_name) => {
-                            if let Err(e) = client.rename_entry(
-                                old_dir,
-                                &old_name,
-                                new_dir,
-                                &new_name,
-                                &client_id_str,
-                            ) {
-                                warn!("Failed to sync rename to master: {}", e);
+                            ChangeOp::Delete(ino, _) => {
+                                let entry_info = {
+                                    let paths = inode_paths.read().unwrap();
+                                    paths.get(&ino).cloned()
+                                };
+                                if let Some(path) = entry_info {
+                                    let parts: Vec<&str> = path.rsplit('/').collect();
+                                    let name = parts.first().unwrap_or(&"").to_string();
+                                    let entry_id = powerfs_master::proto::powerfs::EntryId {
+                                        name,
+                                        client_id: 0,
+                                        seq: 0,
+                                    };
+                                    powerfs_master::proto::powerfs::DeltaOp {
+                                        op: Some(
+                                            powerfs_master::proto::powerfs::delta_op::Op::Remove(
+                                                entry_id,
+                                            ),
+                                        ),
+                                        vclock: None,
+                                    }
+                                } else {
+                                    continue;
+                                }
                             }
-                        }
-                        ChangeOp::SetAttr(entry) => {
-                            if let Err(e) = sync_setattr_to_master_helper(
-                                &client,
-                                &client_id_str,
-                                &entry,
-                                &inode_paths,
-                            ) {
-                                warn!("Failed to sync setattr to master: {}", e);
+                            ChangeOp::Rename(_old_dir, old_name, new_dir, new_name) => {
+                                let entry_id = powerfs_master::proto::powerfs::EntryId {
+                                    name: old_name,
+                                    client_id: 0,
+                                    seq: 0,
+                                };
+                                let new_entry = powerfs_master::proto::powerfs::DirEntryOrset {
+                                    id: Some(powerfs_master::proto::powerfs::EntryId {
+                                        name: new_name,
+                                        client_id: 0,
+                                        seq: 0,
+                                    }),
+                                    inode: 0,
+                                    parent_ino: new_dir,
+                                    mode: 0,
+                                    size: 0,
+                                    mtime: 0,
+                                    atime: 0,
+                                    ctime: 0,
+                                    nlink: 0,
+                                    symlink_target: "".to_string(),
+                                    file_type: 0,
+                                    uid: 0,
+                                    gid: 0,
+                                    rdev: 0,
+                                };
+                                powerfs_master::proto::powerfs::DeltaOp {
+                                    op: Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(
+                                        powerfs_master::proto::powerfs::RenameOp {
+                                            old_id: Some(entry_id),
+                                            new_entry: Some(new_entry),
+                                        },
+                                    )),
+                                    vclock: None,
+                                }
+                            }
+                            ChangeOp::SetAttr(entry) => powerfs_master::proto::powerfs::DeltaOp {
+                                op: Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(
+                                    powerfs_master::proto::powerfs::SetAttrOp {
+                                        inode: entry.inode,
+                                        size: entry.size,
+                                        mtime: entry.mtime,
+                                        mode: entry.mode,
+                                        uid: entry.uid,
+                                        gid: entry.gid,
+                                        nlink: entry.nlink,
+                                    },
+                                )),
+                                vclock: None,
+                            },
+                        };
+                        deltas.push(delta);
+                    }
+
+                    if !deltas.is_empty() {
+                        let vclock =
+                            powerfs_master::proto::powerfs::VectorClock { entries: vec![] };
+                        match client.push_delta(&client_id_str, &deltas, &vclock) {
+                            Ok(resp) => {
+                                if resp.success {
+                                    debug!("Batch push_delta succeeded, {} deltas", deltas.len());
+                                } else {
+                                    warn!("Batch push_delta failed: {}", resp.error);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Batch push_delta error: {}", e);
                             }
                         }
                     }
                 }
             }
         });
+    }
+
+    fn start_invalidation_processor(&self, receiver: Receiver<InvalidationRequest>) {
+        let dir_cache = self.dir_cache.clone();
+        let inode_index = self.inode_index.clone();
+        let inode_paths = self.inode_paths.clone();
+
+        thread::spawn(move || {
+            info!("Invalidation processor thread started");
+
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(500)) {
+                    Ok(InvalidationRequest::InvalidateEntry(parent_ino, name)) => {
+                        Self::process_invalidate_entry(
+                            parent_ino,
+                            &name,
+                            &dir_cache,
+                            &inode_index,
+                            &inode_paths,
+                        );
+                    }
+                    Ok(InvalidationRequest::InvalidatePath(path)) => {
+                        Self::process_invalidate_path(
+                            &path,
+                            &dir_cache,
+                            &inode_index,
+                            &inode_paths,
+                        );
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                        continue;
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                        info!("Invalidation processor channel disconnected, exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn process_invalidate_entry(
+        parent_ino: u64,
+        name: &str,
+        dir_cache: &ShardedDirCache,
+        inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
+        inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    ) {
+        if let Some(orset_arc) = dir_cache.get(parent_ino) {
+            let orset = orset_arc.read().unwrap();
+            let entries = orset.get_by_name(name);
+            if entries.is_empty() {
+                return;
+            }
+        }
+
+        if let Some(orset_arc) = dir_cache.get(parent_ino) {
+            let mut orset = orset_arc.write().unwrap();
+            let entries: Vec<EntryId> = orset
+                .get_by_name(name)
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            for entry_id in entries {
+                orset.remove(&entry_id);
+            }
+        }
+
+        let mut inode_index_guard = inode_index.write().unwrap();
+        let mut inode_paths_guard = inode_paths.write().unwrap();
+
+        let mut to_remove = Vec::new();
+        for (&inode, (_, entry_id)) in inode_index_guard.iter() {
+            if entry_id.name == name {
+                to_remove.push(inode);
+            }
+        }
+
+        for inode in to_remove {
+            inode_index_guard.remove(&inode);
+            inode_paths_guard.remove(&inode);
+        }
+    }
+
+    fn process_invalidate_path(
+        path: &str,
+        dir_cache: &ShardedDirCache,
+        inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
+        inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    ) {
+        let mut inode_paths_guard = inode_paths.write().unwrap();
+        let inode = inode_paths_guard
+            .iter()
+            .find(|(_, p)| **p == path)
+            .map(|(&ino, _)| ino);
+
+        if let Some(inode) = inode {
+            inode_paths_guard.remove(&inode);
+            drop(inode_paths_guard);
+
+            let parent_ino;
+            let entry_id;
+            {
+                let mut inode_index_guard = inode_index.write().unwrap();
+                if let Some(&(p, ref eid)) = inode_index_guard.get(&inode) {
+                    parent_ino = p;
+                    entry_id = eid.clone();
+                } else {
+                    return;
+                }
+                inode_index_guard.remove(&inode);
+            }
+
+            if let Some(orset_arc) = dir_cache.get(parent_ino) {
+                let mut orset = orset_arc.write().unwrap();
+                orset.remove(&entry_id);
+            }
+            dir_cache.remove(inode);
+        }
     }
 
     // ==================== Master 同步（best-effort） ====================
@@ -1131,16 +1796,6 @@ impl MetadataManager {
             None => return Ok(()),
         };
 
-        // 先获取目录内容（不持有任何锁）
-        let entries = client
-            .list_entries(dir_ino, 10000, "")
-            .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
-
-        let num_entries = entries.len();
-        if num_entries == 0 {
-            return Ok(());
-        }
-
         // 获取父路径（需要短暂持有锁）
         let parent_path = {
             let inode_paths = self.inode_paths.read().unwrap();
@@ -1150,26 +1805,75 @@ impl MetadataManager {
                 .unwrap_or_else(|| "/".to_string())
         };
 
-        // 预计算所有条目数据（不持有锁）
-        let mut dir_entries = Vec::with_capacity(num_entries);
-        let mut index_updates = Vec::with_capacity(num_entries);
-        let mut path_updates = Vec::with_capacity(num_entries);
+        // 优先使用 Filer，回退到 Master
+        let use_filer = client.has_filer();
 
-        for proto_entry in entries {
-            let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
-            let ino = dir_entry.inode;
-            let entry_id = dir_entry.id.clone();
+        // 先获取目录内容（不持有任何锁）
+        let (dir_entries, path_updates, index_updates) = if use_filer {
+            let filer_entries = client
+                .filer_list_entries(dir_ino, 10000, "")
+                .map_err(|e| FsError::MasterError(format!("filer_list_entries: {}", e)))?;
 
-            dir_entries.push(dir_entry);
-            index_updates.push((ino, (dir_ino, entry_id)));
+            let num_entries = filer_entries.len();
+            if num_entries == 0 {
+                return Ok(());
+            }
 
-            let child_path = if parent_path == "/" {
-                format!("/{}", proto_entry.name)
-            } else {
-                format!("{}/{}", parent_path, proto_entry.name)
-            };
-            path_updates.push((ino, child_path));
-        }
+            let mut dir_entries = Vec::with_capacity(num_entries);
+            let mut index_updates = Vec::with_capacity(num_entries);
+            let mut path_updates = Vec::with_capacity(num_entries);
+
+            for filer_entry in filer_entries {
+                let dir_entry = filer_proto_to_dir_entry(&filer_entry, dir_ino);
+                let ino = dir_entry.inode;
+                let entry_id = dir_entry.id.clone();
+
+                dir_entries.push(dir_entry);
+                index_updates.push((ino, (dir_ino, entry_id)));
+
+                let child_path = if parent_path == "/" {
+                    format!("/{}", filer_entry.name)
+                } else {
+                    format!("{}/{}", parent_path, filer_entry.name)
+                };
+                path_updates.push((ino, child_path));
+            }
+
+            (dir_entries, path_updates, index_updates)
+        } else {
+            let entries = client
+                .list_entries(dir_ino, 10000, "")
+                .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
+
+            let num_entries = entries.len();
+            if num_entries == 0 {
+                return Ok(());
+            }
+
+            let mut dir_entries = Vec::with_capacity(num_entries);
+            let mut index_updates = Vec::with_capacity(num_entries);
+            let mut path_updates = Vec::with_capacity(num_entries);
+
+            for proto_entry in entries {
+                let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
+                let ino = dir_entry.inode;
+                let entry_id = dir_entry.id.clone();
+
+                dir_entries.push(dir_entry);
+                index_updates.push((ino, (dir_ino, entry_id)));
+
+                let child_path = if parent_path == "/" {
+                    format!("/{}", proto_entry.name)
+                } else {
+                    format!("{}/{}", parent_path, proto_entry.name)
+                };
+                path_updates.push((ino, child_path));
+            }
+
+            (dir_entries, path_updates, index_updates)
+        };
+
+        let num_entries = dir_entries.len();
 
         // 【关键修复】分开更新，避免同时持有 orset_arc 和 inode_index/inode_paths 锁
         // 死锁场景：
@@ -1202,23 +1906,19 @@ impl MetadataManager {
         }
 
         debug!(
-            "fetch_dir_from_master_without_deadlock: dir_ino={}, entries={}",
-            dir_ino, num_entries
+            "fetch_dir_from_master_without_deadlock: dir_ino={}, entries={}, filer={}",
+            dir_ino, num_entries, use_filer
         );
 
         Ok(())
     }
 
-    /// 从 Master 拉取目录内容，填充本地 OR-Set
+    /// 从 Master/Filer 拉取目录内容，填充本地 OR-Set
     fn fetch_dir_from_master(&self, dir_ino: u64) -> Result<(), FsError> {
         let client = match &self.client {
             Some(c) => c.clone(),
             None => return Ok(()),
         };
-
-        let entries = client
-            .list_entries(dir_ino, 10000, "")
-            .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
 
         // 【关键修复】先获取父路径（不持有其他锁），避免违反锁顺序
         let parent_path = {
@@ -1229,27 +1929,65 @@ impl MetadataManager {
                 .unwrap_or_else(|| "/".to_string())
         };
 
-        let num_entries = entries.len();
+        let use_filer = client.has_filer();
 
-        let mut dir_entries = Vec::with_capacity(num_entries);
-        let mut index_updates = Vec::with_capacity(num_entries);
-        let mut path_updates = Vec::with_capacity(num_entries);
+        let (dir_entries, index_updates, path_updates) = if use_filer {
+            let filer_entries = client
+                .filer_list_entries(dir_ino, 10000, "")
+                .map_err(|e| FsError::MasterError(format!("filer_list_entries: {}", e)))?;
 
-        for proto_entry in entries {
-            let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
-            let ino = dir_entry.inode;
-            let entry_id = dir_entry.id.clone();
+            let num_entries = filer_entries.len();
+            let mut dir_entries = Vec::with_capacity(num_entries);
+            let mut index_updates = Vec::with_capacity(num_entries);
+            let mut path_updates = Vec::with_capacity(num_entries);
 
-            dir_entries.push(dir_entry);
-            index_updates.push((ino, (dir_ino, entry_id)));
+            for filer_entry in filer_entries {
+                let dir_entry = filer_proto_to_dir_entry(&filer_entry, dir_ino);
+                let ino = dir_entry.inode;
+                let entry_id = dir_entry.id.clone();
 
-            let child_path = if parent_path == "/" {
-                format!("/{}", proto_entry.name)
-            } else {
-                format!("{}/{}", parent_path, proto_entry.name)
-            };
-            path_updates.push((ino, child_path));
-        }
+                dir_entries.push(dir_entry);
+                index_updates.push((ino, (dir_ino, entry_id)));
+
+                let child_path = if parent_path == "/" {
+                    format!("/{}", filer_entry.name)
+                } else {
+                    format!("{}/{}", parent_path, filer_entry.name)
+                };
+                path_updates.push((ino, child_path));
+            }
+
+            (dir_entries, index_updates, path_updates)
+        } else {
+            let entries = client
+                .list_entries(dir_ino, 10000, "")
+                .map_err(|e| FsError::MasterError(format!("list_entries: {}", e)))?;
+
+            let num_entries = entries.len();
+            let mut dir_entries = Vec::with_capacity(num_entries);
+            let mut index_updates = Vec::with_capacity(num_entries);
+            let mut path_updates = Vec::with_capacity(num_entries);
+
+            for proto_entry in entries {
+                let dir_entry = proto_to_dir_entry(&proto_entry, dir_ino);
+                let ino = dir_entry.inode;
+                let entry_id = dir_entry.id.clone();
+
+                dir_entries.push(dir_entry);
+                index_updates.push((ino, (dir_ino, entry_id)));
+
+                let child_path = if parent_path == "/" {
+                    format!("/{}", proto_entry.name)
+                } else {
+                    format!("{}/{}", parent_path, proto_entry.name)
+                };
+                path_updates.push((ino, child_path));
+            }
+
+            (dir_entries, index_updates, path_updates)
+        };
+
+        let num_entries = dir_entries.len();
 
         // 按正确锁顺序更新：dir_cache → orset_arc → inode_index → inode_paths
         let orset_arc = self.ensure_dir_cache(dir_ino);
@@ -1276,52 +2014,81 @@ impl MetadataManager {
         }
 
         debug!(
-            "fetch_dir_from_master: dir_ino={}, entries={}",
-            dir_ino, num_entries
+            "fetch_dir_from_master: dir_ino={}, entries={}, filer={}",
+            dir_ino, num_entries, use_filer
         );
         Ok(())
     }
 
-    /// 从 Master 按 inode 拉取单个条目
+    /// 从 Master/Filer 按 inode 拉取单个条目
     fn fetch_entry_by_inode_from_master(&self, ino: u64) -> Result<Option<DirEntry>, FsError> {
         let client = match &self.client {
             Some(c) => c.clone(),
             None => return Ok(None),
         };
 
-        let result = client
-            .get_entry_by_inode(ino)
-            .map_err(|e| FsError::MasterError(format!("get_entry_by_inode: {}", e)))?;
+        if client.has_filer() {
+            let result = client
+                .filer_get_entry_by_inode(ino)
+                .map_err(|e| FsError::MasterError(format!("filer_get_entry_by_inode: {}", e)))?;
 
-        match result {
-            Some((proto_entry, path)) => {
-                let parent_ino = self.infer_parent_ino_from_path(&path);
-                let dir_entry = proto_to_dir_entry(&proto_entry, parent_ino);
-                let entry_id = dir_entry.id.clone();
+            match result {
+                Some((filer_entry, path)) => {
+                    let parent_ino = self.infer_parent_ino_from_path(&path);
+                    let dir_entry = filer_proto_to_dir_entry(&filer_entry, parent_ino);
+                    let entry_id = dir_entry.id.clone();
 
-                // 【关键修复】按正确锁顺序更新：dir_cache → orset_arc → inode_index → inode_paths
-                // 先更新 OR-Set（需要 dir_cache）
-                let orset_arc = self.ensure_dir_cache(parent_ino);
-                {
-                    let mut orset = orset_arc.write().unwrap();
-                    orset.add(dir_entry.clone());
+                    let orset_arc = self.ensure_dir_cache(parent_ino);
+                    {
+                        let mut orset = orset_arc.write().unwrap();
+                        orset.add(dir_entry.clone());
+                    }
+
+                    {
+                        let mut inode_index = self.inode_index.write().unwrap();
+                        inode_index.insert(ino, (parent_ino, entry_id));
+                    }
+
+                    {
+                        let mut inode_paths = self.inode_paths.write().unwrap();
+                        inode_paths.insert(ino, path);
+                    }
+
+                    Ok(Some(dir_entry))
                 }
-
-                // 再更新 inode_index
-                {
-                    let mut inode_index = self.inode_index.write().unwrap();
-                    inode_index.insert(ino, (parent_ino, entry_id));
-                }
-
-                // 最后更新 inode_paths
-                {
-                    let mut inode_paths = self.inode_paths.write().unwrap();
-                    inode_paths.insert(ino, path);
-                }
-
-                Ok(Some(dir_entry))
+                None => Ok(None),
             }
-            None => Ok(None),
+        } else {
+            let result = client
+                .get_entry_by_inode(ino)
+                .map_err(|e| FsError::MasterError(format!("get_entry_by_inode: {}", e)))?;
+
+            match result {
+                Some((proto_entry, path)) => {
+                    let parent_ino = self.infer_parent_ino_from_path(&path);
+                    let dir_entry = proto_to_dir_entry(&proto_entry, parent_ino);
+                    let entry_id = dir_entry.id.clone();
+
+                    let orset_arc = self.ensure_dir_cache(parent_ino);
+                    {
+                        let mut orset = orset_arc.write().unwrap();
+                        orset.add(dir_entry.clone());
+                    }
+
+                    {
+                        let mut inode_index = self.inode_index.write().unwrap();
+                        inode_index.insert(ino, (parent_ino, entry_id));
+                    }
+
+                    {
+                        let mut inode_paths = self.inode_paths.write().unwrap();
+                        inode_paths.insert(ino, path);
+                    }
+
+                    Ok(Some(dir_entry))
+                }
+                None => Ok(None),
+            }
         }
     }
 
@@ -1360,10 +2127,12 @@ impl MetadataManager {
             }
         };
         let client_id_str = self.client_id_str.clone();
-        let dir_cache = self.dir_cache.clone() as Arc<dyn DirCacheProvider>;
+        let dir_cache = self.dir_cache.clone();
         let inode_index = self.inode_index.clone();
         let inode_paths = self.inode_paths.clone();
+        let inode_state = self.inode_state.clone();
         let client_vclock = self.client_vclock.clone();
+        let write_counter = self.write_counter.clone();
 
         tokio::spawn(async move {
             info!("Performing initial full sync...");
@@ -1380,7 +2149,13 @@ impl MetadataManager {
                 Ok(response) => {
                     info!("Initial sync received {} deltas", response.deltas.len());
                     for delta in response.deltas {
-                        apply_delta_helper(&delta, &dir_cache, &inode_index, &inode_paths);
+                        apply_delta_helper(
+                            &delta,
+                            &dir_cache,
+                            &inode_index,
+                            &inode_paths,
+                            &inode_state,
+                        );
                     }
                     if let Some(new_vclock) = response.server_vclock {
                         let mut vclock_guard =
@@ -1393,15 +2168,20 @@ impl MetadataManager {
                 }
             }
 
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
             let mut backoff = Duration::from_secs(1);
             let max_backoff = Duration::from_secs(60);
             let mut iteration = 0;
 
             loop {
-                interval.tick().await;
+                let writes_in_period = write_counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let interval = calculate_delta_sync_interval(writes_in_period);
+
+                tokio::time::sleep(interval).await;
                 iteration += 1;
-                info!("Delta Sync iteration {} starting", iteration);
+                info!(
+                    "Delta Sync iteration {} starting, interval={:?}, writes_in_period={}",
+                    iteration, interval, writes_in_period
+                );
 
                 match do_pull_and_apply_deltas(
                     &client,
@@ -1409,6 +2189,7 @@ impl MetadataManager {
                     &dir_cache,
                     &inode_index,
                     &inode_paths,
+                    &inode_state,
                     &client_vclock,
                 )
                 .await
@@ -1424,6 +2205,11 @@ impl MetadataManager {
                 }
             }
         });
+    }
+
+    fn increment_write_counter(&self) {
+        self.write_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn pull_and_apply_deltas(&self) -> Result<(), FsError> {
@@ -1470,7 +2256,7 @@ impl MetadataManager {
                     let dir_entry = proto_dir_entry_to_local(entry);
                     let dir_ino = entry.parent_ino;
 
-                    let orset_arc = self.dir_cache.ensure_dir_cache(dir_ino);
+                    let orset_arc = self.ensure_dir_cache(dir_ino);
                     let mut orset = orset_arc.write().expect("orset lock poisoned");
                     orset.add(dir_entry.clone());
 
@@ -1492,6 +2278,12 @@ impl MetadataManager {
                         .write()
                         .expect("inode_paths lock poisoned")
                         .insert(entry.inode, child_path);
+
+                    // 初始化 inode 状态
+                    self.inode_state
+                        .write()
+                        .expect("inode_state lock poisoned")
+                        .insert(entry.inode, InodeState::new(0));
                 }
             }
             Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(id)) => {
@@ -1505,14 +2297,18 @@ impl MetadataManager {
 
                 if let Some(ino) = inode_to_remove {
                     if let Some((dir_ino, eid)) = index.remove(&ino) {
-                        if let Some(orset_arc) = self.dir_cache.get(dir_ino) {
-                            let mut orset = orset_arc.write().expect("orset lock poisoned");
-                            orset.remove(&eid);
-                        }
+                        let orset_arc = self.ensure_dir_cache(dir_ino);
+                        let mut orset = orset_arc.write().expect("orset lock poisoned");
+                        orset.remove(&eid);
 
                         self.inode_paths
                             .write()
                             .expect("inode_paths lock poisoned")
+                            .remove(&ino);
+
+                        self.inode_state
+                            .write()
+                            .expect("inode_state lock poisoned")
                             .remove(&ino);
                     }
                 }
@@ -1532,17 +2328,16 @@ impl MetadataManager {
 
                         if let Some(ino) = inode_to_rename {
                             if let Some((old_dir_ino, _)) = index.get(&ino) {
-                                if let Some(orset_arc_old) = self.dir_cache.get(*old_dir_ino) {
-                                    let mut orset_old =
-                                        orset_arc_old.write().expect("orset lock poisoned");
-                                    orset_old.remove(&old_entry_id);
-                                }
+                                let orset_arc_old = self.ensure_dir_cache(*old_dir_ino);
+                                let mut orset_old =
+                                    orset_arc_old.write().expect("orset lock poisoned");
+                                orset_old.remove(&old_entry_id);
                             }
 
                             let dir_entry = proto_dir_entry_to_local(new_entry);
                             let new_dir_ino = new_entry.parent_ino;
 
-                            let orset_arc_new = self.dir_cache.ensure_dir_cache(new_dir_ino);
+                            let orset_arc_new = self.ensure_dir_cache(new_dir_ino);
                             let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
                             orset_new.add(dir_entry.clone());
 
@@ -1573,18 +2368,26 @@ impl MetadataManager {
             Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(op)) => {
                 let index = self.inode_index.read().expect("inode_index lock poisoned");
                 if let Some((dir_ino, entry_id)) = index.get(&op.inode) {
-                    if let Some(orset_arc) = self.dir_cache.get(*dir_ino) {
-                        let mut orset = orset_arc.write().expect("orset lock poisoned");
-                        if let Some(entry) = orset.entries.get_mut(entry_id) {
-                            if op.mode != 0 {
-                                entry.mode = op.mode;
-                            }
-                            if op.size != 0 {
-                                entry.size = op.size;
-                            }
-                            if op.mtime != 0 {
-                                entry.mtime = op.mtime;
-                            }
+                    let orset_arc = self.ensure_dir_cache(*dir_ino);
+                    let mut orset = orset_arc.write().expect("orset lock poisoned");
+                    if let Some(entry) = orset.entries.get_mut(entry_id) {
+                        if op.mode != 0 {
+                            entry.mode = op.mode;
+                        }
+                        if op.uid != 0 {
+                            entry.uid = op.uid;
+                        }
+                        if op.gid != 0 {
+                            entry.gid = op.gid;
+                        }
+                        if op.size != 0 {
+                            entry.size = op.size;
+                        }
+                        if op.mtime != 0 {
+                            entry.mtime = op.mtime;
+                        }
+                        if op.nlink != 0 {
+                            entry.nlink = op.nlink;
                         }
                     }
                 }
@@ -1603,14 +2406,14 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
     let attrs = proto.attributes.as_ref();
     let mode_val = attrs.map(|a| a.mode).unwrap_or(0);
     let ino = attrs.map(|a| a.ino).unwrap_or(0);
-    let size = attrs.map(|a| a.size).unwrap_or(0);
-    let mtime = attrs.map(|a| a.mtime).unwrap_or(0);
-    let atime = attrs.map(|a| a.atime).unwrap_or(0);
-    let ctime = attrs.map(|a| a.ctime).unwrap_or(0);
     let uid = attrs.map(|a| a.uid).unwrap_or(0);
     let gid = attrs.map(|a| a.gid).unwrap_or(0);
     let nlink = attrs.map(|a| a.nlink).unwrap_or(1);
     let rdev = attrs.map(|a| a.rdev).unwrap_or(0);
+    let size = attrs.map(|a| a.size).unwrap_or(0);
+    let mtime = attrs.map(|a| a.mtime).unwrap_or(0);
+    let atime = attrs.map(|a| a.atime).unwrap_or(0);
+    let ctime = attrs.map(|a| a.ctime).unwrap_or(0);
 
     let file_type = FileType::from_mode(mode_val);
     let chunks: Vec<crate::orset::CachedFileChunk> = proto
@@ -1700,6 +2503,112 @@ pub fn dir_entry_to_proto(
     }
 }
 
+/// DirEntry → Filer proto Entry（用于 Filer 同步）
+pub fn dir_entry_to_filer_proto(
+    entry: &DirEntry,
+    parent_path: &str,
+) -> powerfs_filer::powerfs::Entry {
+    use powerfs_filer::powerfs::{
+        Entry as FilerEntry, FileChunk as FilerFileChunk, FuseAttributes as FilerFuseAttributes,
+    };
+
+    let chunks: Vec<FilerFileChunk> = entry
+        .chunks
+        .iter()
+        .map(|c| FilerFileChunk {
+            offset: c.offset,
+            size: c.size,
+            mtime: c.mtime,
+            fid: c.fid.clone(),
+            cookie: c.cookie,
+            crc32: c.crc32,
+        })
+        .collect();
+
+    FilerEntry {
+        name: entry.id.name.clone(),
+        directory: parent_path.to_string(),
+        attributes: Some(FilerFuseAttributes {
+            ino: entry.inode,
+            mode: entry.mode,
+            nlink: entry.nlink,
+            uid: entry.uid,
+            gid: entry.gid,
+            rdev: entry.rdev,
+            size: entry.size,
+            blksize: 4096,
+            blocks: entry.size.div_ceil(512),
+            atime: entry.atime,
+            mtime: entry.mtime,
+            ctime: entry.ctime,
+            crtime: entry.ctime,
+            perm: 0,
+        }),
+        chunks,
+        hard_link_id: String::new(),
+        hard_link_counter: 0,
+        extended: std::collections::HashMap::new(),
+        content_size: entry.size,
+        disk_size: entry.size,
+        ttl: String::new(),
+        symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+        owner: String::new(),
+        generation: 0,
+    }
+}
+
+/// Filer proto Entry → DirEntry（用于从 Filer 拉取数据）
+fn filer_proto_to_dir_entry(proto: &powerfs_filer::powerfs::Entry, parent_ino: u64) -> DirEntry {
+    let attrs = proto.attributes.as_ref();
+    let mode_val = attrs.map(|a| a.mode).unwrap_or(0);
+    let ino = attrs.map(|a| a.ino).unwrap_or(0);
+    let uid = attrs.map(|a| a.uid).unwrap_or(0);
+    let gid = attrs.map(|a| a.gid).unwrap_or(0);
+    let nlink = attrs.map(|a| a.nlink).unwrap_or(1);
+    let rdev = attrs.map(|a| a.rdev).unwrap_or(0);
+    let size = attrs.map(|a| a.size).unwrap_or(0);
+    let mtime = attrs.map(|a| a.mtime).unwrap_or(0);
+    let atime = attrs.map(|a| a.atime).unwrap_or(0);
+    let ctime = attrs.map(|a| a.ctime).unwrap_or(0);
+
+    let file_type = FileType::from_mode(mode_val);
+    let chunks: Vec<crate::orset::CachedFileChunk> = proto
+        .chunks
+        .iter()
+        .map(|c| crate::orset::CachedFileChunk {
+            offset: c.offset,
+            size: c.size,
+            mtime: c.mtime,
+            fid: c.fid.clone(),
+            cookie: c.cookie,
+            crc32: c.crc32,
+        })
+        .collect();
+
+    DirEntry {
+        id: EntryId::new(&proto.name, MASTER_CLIENT_ID, 0),
+        inode: ino,
+        generation: proto.generation,
+        file_type,
+        mode: mode_val,
+        uid,
+        gid,
+        size,
+        mtime,
+        atime,
+        ctime,
+        nlink,
+        rdev,
+        parent_ino,
+        chunks,
+        symlink_target: if proto.symlink_target.is_empty() {
+            None
+        } else {
+            Some(proto.symlink_target.clone())
+        },
+    }
+}
+
 fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrset) -> DirEntry {
     let id = if let Some(id) = &entry.id {
         EntryId::new(id.name.clone(), id.client_id, id.seq)
@@ -1731,7 +2640,7 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         atime: entry.atime,
         ctime: entry.ctime,
         nlink: entry.nlink,
-        rdev: 0,
+        rdev: entry.rdev,
         parent_ino: entry.parent_ino,
         chunks: vec![],
         symlink_target: if entry.symlink_target.is_empty() {
@@ -1739,6 +2648,58 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         } else {
             Some(entry.symlink_target.clone())
         },
+    }
+}
+
+fn dir_entry_to_dir_entry_orset(entry: &DirEntry) -> powerfs_master::proto::powerfs::DirEntryOrset {
+    let file_type = match entry.file_type {
+        FileType::RegularFile => 0,
+        FileType::Directory => 1,
+        FileType::Symlink => 2,
+        FileType::Fifo => 3,
+        FileType::CharDevice => 4,
+        FileType::BlockDevice => 5,
+        FileType::Socket => 6,
+    };
+
+    powerfs_master::proto::powerfs::DirEntryOrset {
+        id: Some(powerfs_master::proto::powerfs::EntryId {
+            name: entry.id.name.clone(),
+            client_id: entry.id.client_id,
+            seq: entry.id.seq,
+        }),
+        inode: entry.inode,
+        parent_ino: entry.parent_ino,
+        mode: entry.mode,
+        size: entry.size,
+        mtime: entry.mtime,
+        atime: entry.atime,
+        ctime: entry.ctime,
+        nlink: entry.nlink,
+        symlink_target: entry.symlink_target.clone().unwrap_or_default(),
+        file_type,
+        uid: entry.uid,
+        gid: entry.gid,
+        rdev: entry.rdev,
+    }
+}
+
+fn calculate_delta_sync_interval(writes_in_period: u64) -> Duration {
+    const MIN_INTERVAL: Duration = Duration::from_secs(1);
+    const MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+    if writes_in_period == 0 {
+        MAX_INTERVAL
+    } else if writes_in_period < 10 {
+        Duration::from_secs(10)
+    } else if writes_in_period < 50 {
+        Duration::from_secs(5)
+    } else if writes_in_period < 100 {
+        Duration::from_secs(3)
+    } else if writes_in_period < 500 {
+        Duration::from_secs(2)
+    } else {
+        MIN_INTERVAL
     }
 }
 
@@ -1767,9 +2728,10 @@ fn proto_to_vec_vclock(proto: &powerfs_master::proto::powerfs::VectorClock) -> V
 async fn do_pull_and_apply_deltas(
     client: &SyncFuseClient,
     client_id_str: &str,
-    dir_cache: &Arc<dyn DirCacheProvider>,
+    dir_cache: &ShardedDirCache,
     inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
     inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    inode_state: &Arc<RwLock<HashMap<u64, InodeState>>>,
     client_vclock: &Arc<RwLock<VectorClock>>,
 ) -> Result<(), String> {
     let vclock = client_vclock
@@ -1786,7 +2748,7 @@ async fn do_pull_and_apply_deltas(
         info!("pull_delta received {} deltas", response.deltas.len());
 
         for delta in response.deltas {
-            apply_delta_helper(&delta, dir_cache, inode_index, inode_paths);
+            apply_delta_helper(&delta, dir_cache, inode_index, inode_paths, inode_state);
         }
 
         if let Some(server_vclock) = response.server_vclock {
@@ -1801,9 +2763,10 @@ async fn do_pull_and_apply_deltas(
 
 fn apply_delta_helper(
     delta: &powerfs_master::proto::powerfs::DeltaOp,
-    dir_cache: &Arc<dyn DirCacheProvider>,
+    dir_cache: &ShardedDirCache,
     inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
     inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    inode_state: &Arc<RwLock<HashMap<u64, InodeState>>>,
 ) {
     match &delta.op {
         Some(powerfs_master::proto::powerfs::delta_op::Op::Add(entry)) => {
@@ -1842,12 +2805,16 @@ fn apply_delta_helper(
                     .write()
                     .expect("inode_paths lock poisoned")
                     .insert(entry.inode, child_path);
+
+                inode_state
+                    .write()
+                    .expect("inode_state lock poisoned")
+                    .insert(entry.inode, InodeState::new(0));
             }
         }
         Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(id)) => {
             let entry_id = EntryId::new(id.name.clone(), id.client_id, id.seq);
 
-            // 【关键修复】先获取 inode_index 信息，立即释放
             let ino_info = {
                 let index = inode_index.read().expect("inode_index lock poisoned");
                 index
@@ -1857,7 +2824,6 @@ fn apply_delta_helper(
             };
 
             if let Some((ino, dir_ino, eid)) = ino_info {
-                // 【关键修复】按正确锁顺序：先 dir_cache/orset，再 inode_index，最后 inode_paths
                 if let Some(orset_arc) = dir_cache.get(dir_ino) {
                     let mut orset = orset_arc.write().expect("orset lock poisoned");
                     orset.remove(&eid);
@@ -1872,6 +2838,11 @@ fn apply_delta_helper(
                     let mut paths = inode_paths.write().expect("inode_paths lock poisoned");
                     paths.remove(&ino);
                 }
+
+                {
+                    let mut state = inode_state.write().expect("inode_state lock poisoned");
+                    state.remove(&ino);
+                }
             }
         }
         Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(op)) => {
@@ -1880,7 +2851,6 @@ fn apply_delta_helper(
                     let old_entry_id =
                         EntryId::new(old_id.name.clone(), old_id.client_id, old_id.seq);
 
-                    // 【关键修复】先获取 inode_index 信息，立即释放
                     let ino_info = {
                         let index = inode_index.read().expect("inode_index lock poisoned");
                         index
@@ -1890,15 +2860,11 @@ fn apply_delta_helper(
                     };
 
                     if let Some((ino, old_dir_ino)) = ino_info {
-                        // 【关键修复】按正确锁顺序：先 dir_cache/orset，再 inode_index，最后 inode_paths
-
-                        // 从旧目录 OR-Set 移除
-                        if let Some(orset_arc_old) = dir_cache.get(old_dir_ino) {
-                            let mut orset_old = orset_arc_old.write().expect("orset lock poisoned");
-                            orset_old.remove(&old_entry_id);
+                        if let Some(orset_arc) = dir_cache.get(old_dir_ino) {
+                            let mut orset = orset_arc.write().expect("orset lock poisoned");
+                            orset.remove(&old_entry_id);
                         }
 
-                        // 添加到新目录 OR-Set
                         let dir_entry = proto_dir_entry_to_local(new_entry);
                         let new_dir_ino = new_entry.parent_ino;
 
@@ -1906,7 +2872,6 @@ fn apply_delta_helper(
                         let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
                         orset_new.add(dir_entry.clone());
 
-                        // 更新 inode_index
                         {
                             let mut index = inode_index.write().expect("inode_index lock poisoned");
                             index.insert(
@@ -1918,7 +2883,6 @@ fn apply_delta_helper(
                             );
                         }
 
-                        // 更新 inode_paths
                         let parent_path = {
                             let paths = inode_paths.read().expect("inode_paths lock poisoned");
                             paths
@@ -1948,11 +2912,20 @@ fn apply_delta_helper(
                         if op.mode != 0 {
                             entry.mode = op.mode;
                         }
+                        if op.uid != 0 {
+                            entry.uid = op.uid;
+                        }
+                        if op.gid != 0 {
+                            entry.gid = op.gid;
+                        }
                         if op.size != 0 {
                             entry.size = op.size;
                         }
                         if op.mtime != 0 {
                             entry.mtime = op.mtime;
+                        }
+                        if op.nlink != 0 {
+                            entry.nlink = op.nlink;
                         }
                     }
                 }
@@ -1986,88 +2959,6 @@ impl MetadataManager {
         let inode_index = self.inode_index.read().unwrap();
         inode_index.len()
     }
-}
-
-/// 同步创建到 Master 的辅助函数
-fn sync_create_to_master_helper(
-    client: &SyncFuseClient,
-    client_id_str: &str,
-    entry: &DirEntry,
-    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
-) -> Result<(), String> {
-    let path = {
-        let paths = inode_paths.read().expect("inode_paths lock poisoned");
-        paths.get(&entry.inode).cloned()
-    };
-
-    let path = match path {
-        Some(p) => p,
-        None => {
-            return Err(format!(
-                "sync_create_to_master: no path for inode {}",
-                entry.inode
-            ));
-        }
-    };
-
-    let parent_path = if let Some(last_slash) = path.rfind('/') {
-        if last_slash == 0 {
-            "/".to_string()
-        } else {
-            path[..last_slash].to_string()
-        }
-    } else {
-        "/".to_string()
-    };
-
-    let proto_entry = dir_entry_to_proto(entry, &parent_path);
-
-    client
-        .create_entry(proto_entry, client_id_str)
-        .map_err(|e| format!("sync_create_to_master failed: {}", e))?;
-
-    Ok(())
-}
-
-/// 同步属性变更到 Master 的辅助函数
-fn sync_setattr_to_master_helper(
-    client: &SyncFuseClient,
-    client_id_str: &str,
-    entry: &DirEntry,
-    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
-) -> Result<(), String> {
-    let path = {
-        let paths = inode_paths.read().expect("inode_paths lock poisoned");
-        paths.get(&entry.inode).cloned()
-    };
-
-    let path = match path {
-        Some(p) => p,
-        None => {
-            return Err(format!(
-                "sync_setattr_to_master: no path for inode {}",
-                entry.inode
-            ));
-        }
-    };
-
-    let parent_path = if let Some(last_slash) = path.rfind('/') {
-        if last_slash == 0 {
-            "/".to_string()
-        } else {
-            path[..last_slash].to_string()
-        }
-    } else {
-        "/".to_string()
-    };
-
-    let proto_entry = dir_entry_to_proto(entry, &parent_path);
-
-    client
-        .update_entry(&proto_entry, client_id_str, 0, false)
-        .map_err(|e| format!("sync_setattr_to_master failed: {}", e))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2633,9 +3524,9 @@ mod tests {
                     mode: 0o755,
                     size: 200,
                     mtime: 2000,
-                    uid: 0,
-                    gid: 0,
-                    nlink: 0,
+                    uid: 1000,
+                    gid: 2000,
+                    nlink: 3,
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),
@@ -2646,6 +3537,9 @@ mod tests {
         assert_eq!(entry.mode, 0o755);
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, 2000);
+        assert_eq!(entry.uid, 1000);
+        assert_eq!(entry.gid, 2000);
+        assert_eq!(entry.nlink, 3);
     }
 
     #[test]

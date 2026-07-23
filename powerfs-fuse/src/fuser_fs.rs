@@ -13,6 +13,10 @@
 use crate::client::{PowerFuseClient, SyncFuseClient};
 use crate::data_manager::DataManager;
 use crate::error::parse_master_error;
+use crate::file_layout::{
+    FileLayout, DEFAULT_STRIPE_COUNT, DEFAULT_STRIPE_SIZE, PROMOTE_THRESHOLD,
+};
+use crate::flush_manager::{FlushConfig, FlushManager};
 use crate::metadata_manager::MetadataManager;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
@@ -38,22 +42,41 @@ const TTL: Duration = Duration::from_secs(0);
 const ROOT_INO: u64 = 1;
 
 struct PowerFsFuserFs {
+    /// 元数据管理器（OR-Set 缓存 + POSIX 投影）
     meta: Arc<MetadataManager>,
+    /// 数据管理器（ChunkCache + WriteBuffer + 文件大小）
     data: Arc<DataManager>,
+    /// gRPC 客户端（Volume Server + Master 同步）
     client: Arc<SyncFuseClient>,
+    /// Collection 名（Volume 分配用）
     collection: String,
+    /// 副本策略（Volume 分配用）
     replication: String,
+    /// 内核 dentry 失效通知器（mount2 模式下为 None）
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
-    flush_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
+    /// 全局脏标记（后台 flush 线程用）
     has_dirty: Arc<AtomicBool>,
+    /// 后台 flush 管理器
+    flush_manager: Option<Arc<FlushManager>>,
+    /// 数据完整性验证开关（缺省关闭，调试时打开）
     verify_data: bool,
+    /// statfs 缓存（避免每次调用都访问 Master）
     statfs_cache: Arc<Mutex<Option<StatisticsResponse>>>,
+    /// statfs 专用 gRPC 客户端（独立通道，高负载时保证 df 正常工作）
+    statfs_client: Option<Arc<SyncFuseClient>>,
+    /// 文件级租约管理（inode -> lease_id）
     leases: Arc<RwLock<HashMap<u64, String>>>,
+    /// 客户端 ID（用于租约获取）
     client_id: String,
+    /// 租约续期线程停止信号
     lease_renewer_running: Arc<AtomicBool>,
+    /// inode 级写锁（保证 O_APPEND 原子性）
     write_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
+    /// 租约 epoch 追踪（inode -> epoch）
     lease_epochs: Arc<RwLock<HashMap<u64, u64>>>,
+    /// 租约失效通知线程停止信号
     lease_notifier_running: Arc<AtomicBool>,
+    /// 已失效的 inode 集合（等待清理）
     invalidated_inodes: Arc<RwLock<HashSet<u64>>>,
 }
 
@@ -67,8 +90,10 @@ impl PowerFsFuserFs {
         replication: String,
         verify_data: bool,
         statfs_cache_value: Option<StatisticsResponse>,
+        statfs_client: Option<Arc<SyncFuseClient>>,
         client_id: String,
     ) -> Self {
+        let cache_max = data.chunk_cache().max_bytes();
         let leases: Arc<RwLock<HashMap<u64, String>>> = Arc::new(RwLock::new(HashMap::new()));
         let write_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -87,7 +112,13 @@ impl PowerFsFuserFs {
                 thread::sleep(Duration::from_secs(10));
                 let leases_map = leases_clone.read().unwrap();
                 for (&inode, lease_id) in leases_map.iter() {
-                    match client_clone.renew_lease(lease_id, 30000) {
+                    let renew_result = if client_clone.has_filer() {
+                        client_clone.filer_renew_lease(lease_id, 30000)
+                    } else {
+                        client_clone.renew_lease(lease_id, 30000)
+                    };
+
+                    match renew_result {
                         Ok((success, epoch)) => {
                             if success {
                                 debug!("lease renewed for inode={}, epoch={}", inode, epoch);
@@ -107,17 +138,18 @@ impl PowerFsFuserFs {
             }
         });
 
-        Self {
+        let fs = Self {
             meta,
             data,
             client,
             collection,
             replication,
             notifier: Arc::new(Mutex::new(None)),
-            flush_locks: Arc::new(RwLock::new(HashMap::new())),
             has_dirty: Arc::new(AtomicBool::new(false)),
+            flush_manager: None,
             verify_data,
             statfs_cache: Arc::new(Mutex::new(statfs_cache_value)),
+            statfs_client,
             leases,
             client_id,
             lease_renewer_running,
@@ -125,6 +157,36 @@ impl PowerFsFuserFs {
             lease_epochs,
             lease_notifier_running,
             invalidated_inodes,
+        };
+
+        let flush_manager = {
+            let client_arc = fs.client.clone();
+            let meta_arc = fs.meta.clone();
+            let data_arc = fs.data.clone();
+            let collection = fs.collection.clone();
+            let replication = fs.replication.clone();
+            let verify_data = fs.verify_data;
+
+            FlushManager::new(
+                FlushConfig::default(),
+                cache_max,
+                move |inode: u64| -> std::result::Result<(), String> {
+                    Self::flush_dirty_chunks_static(
+                        inode,
+                        &client_arc,
+                        &meta_arc,
+                        &data_arc,
+                        &collection,
+                        &replication,
+                        verify_data,
+                    )
+                },
+            )
+        };
+
+        Self {
+            flush_manager: Some(flush_manager),
+            ..fs
         }
     }
 
@@ -189,7 +251,7 @@ impl PowerFsFuserFs {
         }
     }
 
-    /// 获取文件实际大小（取 meta server 与本地脏数据的较大值）
+    /// 获取文件实际大小（取 max(meta_size, data_size)）
     ///
     /// 以 meta server 的 size 为准（CAS 策略，可能有其他 client 写入），
     /// 但如果本地有未 flush 的脏数据，本地写入端代表了已知的文件最远端，
@@ -197,16 +259,19 @@ impl PowerFsFuserFs {
     /// 如果 meta_size 更大（其他 client 写入），同步到本地 data_manager，
     /// 确保读路径的边界检查正确。
     fn get_file_size(&self, ino: u64) -> u64 {
-        let meta_size = self
-            .meta
-            .get_entry_by_inode(ino)
+        let data_size = self.data.current_file_size(ino);
+        let meta_result = self.meta.get_entry_by_inode(ino);
+        let meta_size = meta_result
             .map(|e| e.map(|e| e.size).unwrap_or(0))
             .unwrap_or(0);
-        let local_size = self.data.current_file_size(ino);
-        let effective = meta_size.max(local_size);
-        if meta_size > local_size {
+        let effective = data_size.max(meta_size);
+        if meta_size > data_size {
             self.data.set_file_size(ino, meta_size);
         }
+        debug!(
+            "get_file_size: ino={}, data_size={}, meta_size={}, result={}",
+            ino, data_size, meta_size, effective
+        );
         effective
     }
 
@@ -247,27 +312,70 @@ impl PowerFsFuserFs {
     /// 6. 更新 Master 上的 entry（chunks + size）
     /// 7. 清除脏标记
     fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
-        let start_time = std::time::Instant::now();
+        match Self::flush_dirty_chunks_static(
+            inode,
+            &self.client,
+            &self.meta,
+            &self.data,
+            &self.collection,
+            &self.replication,
+            self.verify_data,
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(std::io::Error::other(e)),
+        }
+    }
 
-        // 获取 flush 锁
-        let flush_lock = {
-            let mut locks = self.flush_locks.write().unwrap();
-            locks
-                .entry(inode)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _guard = flush_lock.lock().unwrap();
+    #[allow(clippy::too_many_arguments)]
+    fn flush_dirty_chunks_static(
+        inode: u64,
+        client: &Arc<SyncFuseClient>,
+        meta: &Arc<MetadataManager>,
+        data: &Arc<DataManager>,
+        collection: &str,
+        replication: &str,
+        verify_data: bool,
+    ) -> std::result::Result<(), String> {
+        let result = Self::flush_dirty_chunks_inner(
+            inode,
+            client,
+            meta,
+            data,
+            collection,
+            replication,
+            verify_data,
+        );
+        result.map_err(|e| format!("{}", e))
+    }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn flush_dirty_chunks_inner(
+        inode: u64,
+        client: &Arc<SyncFuseClient>,
+        meta: &Arc<MetadataManager>,
+        data: &Arc<DataManager>,
+        collection: &str,
+        replication: &str,
+        _verify_data: bool,
+    ) -> std::io::Result<()> {
         // 获取脏 chunk 列表（排序确保按顺序处理）
-        let mut dirty_chunks: Vec<u64> = self.data.get_dirty_chunks(inode);
+        let mut dirty_chunks: Vec<u64> = data.get_dirty_chunks(inode);
         dirty_chunks.sort_unstable();
         if dirty_chunks.is_empty() {
             return Ok(());
         }
 
-        let file_size = self.get_file_size(inode);
-        let chunk_size = self.data.chunk_cache().chunk_size();
+        let file_size = {
+            let data_size = data.current_file_size(inode);
+            let meta_size = meta
+                .get_entry_by_inode(inode)
+                .ok()
+                .flatten()
+                .map(|e| e.size)
+                .unwrap_or(0);
+            data_size.max(meta_size)
+        };
+        let chunk_size = data.chunk_cache().chunk_size();
 
         debug!(
             "flush_dirty_chunks: inode={}, dirty_chunks={}, file_size={}",
@@ -277,12 +385,11 @@ impl PowerFsFuserFs {
         );
 
         // 从 Master 获取 entry（获取现有 FID）
-        let get_entry_start = std::time::Instant::now();
-        let (entry, _path) = match self.client.get_entry_by_inode(inode) {
+        let (entry, _path) = match client.get_entry_by_inode(inode) {
             Ok(Some(e)) => e,
             Ok(None) => {
                 // entry 不在 Master 上（可能是本地新建的），创建一个
-                let meta_entry = match self.meta.get_entry_by_inode(inode) {
+                let meta_entry = match meta.get_entry_by_inode(inode) {
                     Ok(Some(e)) => e,
                     _ => {
                         return Err(std::io::Error::new(
@@ -291,55 +398,43 @@ impl PowerFsFuserFs {
                         ));
                     }
                 };
-                let parent_path = self
-                    .meta
+                let parent_path = meta
                     .get_path(meta_entry.parent_ino)
                     .unwrap_or_else(|| "/".to_string());
                 let proto_entry =
                     crate::metadata_manager::dir_entry_to_proto(&meta_entry, &parent_path);
-                let client_id_str = self.meta.client_id().to_string();
-
-                let create_entry_start = std::time::Instant::now();
-                match self.client.create_entry(proto_entry, &client_id_str) {
+                let client_id_str = meta.client_id().to_string();
+                match client.create_entry(proto_entry, &client_id_str) {
                     Ok(_) => {
                         debug!(
                             "flush_dirty_chunks: created entry on master for inode {}",
                             inode
                         );
-                        let create_entry_elapsed = create_entry_start.elapsed();
-                        info!(
-                            "PERF: create_entry took {}ms for inode {}",
-                            create_entry_elapsed.as_millis(),
-                            inode
-                        );
-
-                        match self.client.get_entry_by_inode(inode) {
-                            Ok(Some(e)) => e,
-                            _ => {
-                                debug!(
-                                    "flush_dirty_chunks: entry not immediately available after create, using local info for inode {}",
-                                    inode
-                                );
-                                (
-                                    powerfs_master::proto::powerfs::Entry {
-                                        name: meta_entry.id.name.clone(),
-                                        directory: parent_path.clone(),
-                                        attributes: None,
-                                        chunks: vec![],
-                                        hard_link_id: "".to_string(),
-                                        hard_link_counter: 0,
-                                        extended: std::collections::HashMap::new(),
-                                        content_size: file_size,
-                                        disk_size: 0,
-                                        ttl: "".to_string(),
-                                        symlink_target: "".to_string(),
-                                        owner: "".to_string(),
-                                        generation: 0,
-                                    },
-                                    format!("{}/{}", parent_path, meta_entry.id.name),
-                                )
+                        let mut result = None;
+                        for retry in 0..10 {
+                            match client.get_entry_by_inode(inode) {
+                                Ok(Some(e)) => {
+                                    debug!("flush_dirty_chunks: got entry after {} retries", retry);
+                                    result = Some(e);
+                                    break;
+                                }
+                                _ => {
+                                    if retry < 9 {
+                                        debug!(
+                                            "flush_dirty_chunks: waiting for entry, retry {}/9",
+                                            retry + 1
+                                        );
+                                        std::thread::sleep(Duration::from_millis(100));
+                                    }
+                                }
                             }
                         }
+                        result.ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "entry not found after create",
+                            )
+                        })?
                     }
                     Err(e) => {
                         warn!("flush_dirty_chunks: create_entry failed: {}", e);
@@ -355,68 +450,58 @@ impl PowerFsFuserFs {
                 return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
             }
         };
-        let get_entry_elapsed = get_entry_start.elapsed();
-        info!(
-            "PERF: get_entry_by_inode took {}ms for inode {}",
-            get_entry_elapsed.as_millis(),
-            inode
-        );
 
-        // 获取现有 FID
-        let existing_fid = entry
-            .chunks
-            .iter()
-            .find(|c| !c.fid.is_empty())
-            .and_then(|c| Fid::from_string(&c.fid).ok());
+        // 解析现有 FileLayout（从 Entry.extended）
+        let mut layout = FileLayout::from_extended(&entry.extended);
 
-        // 分配新 FID（如果不存在）
-        let assign_fid_start = std::time::Instant::now();
-        let fid = if let Some(fid) = existing_fid {
-            fid
-        } else {
-            match self.client.assign_fid(&self.collection, &self.replication) {
-                Ok((new_fid, _, _, _)) => {
-                    info!("PERF: assign_fid succeeded, new_fid={}", new_fid);
-                    new_fid
+        // 判断是否需要从 Flat 提升为 Stripe
+        let should_promote =
+            layout.as_ref().is_none_or(|l| !l.is_stripe()) && file_size > PROMOTE_THRESHOLD;
+
+        if should_promote {
+            info!(
+                "flush_dirty_chunks: promoting inode={} to Stripe mode (file_size={} > {})",
+                inode, file_size, PROMOTE_THRESHOLD
+            );
+            // 批量分配 stripe volumes
+            match client.assign_stripe_fids(
+                collection,
+                replication,
+                DEFAULT_STRIPE_COUNT,
+                DEFAULT_STRIPE_SIZE,
+            ) {
+                Ok((fids, _locations)) => {
+                    if fids.len() >= DEFAULT_STRIPE_COUNT as usize {
+                        let volume_ids: Vec<u64> =
+                            fids.iter().map(|f| f.volume_id.0 as u64).collect();
+                        // round-robin 起始索引由 Master 决定，这里用 0（Master 已通过 fetch_add 错开）
+                        let new_layout = FileLayout::stripe(
+                            DEFAULT_STRIPE_SIZE,
+                            DEFAULT_STRIPE_COUNT,
+                            volume_ids.clone(),
+                            0,
+                        );
+                        info!(
+                            "flush_dirty_chunks: inode={} assigned stripe volumes={:?}",
+                            inode, volume_ids
+                        );
+                        layout = Some(new_layout);
+                    } else {
+                        warn!(
+                            "flush_dirty_chunks: assign_stripe_fids returned only {} fids, expected {}",
+                            fids.len(),
+                            DEFAULT_STRIPE_COUNT
+                        );
+                    }
                 }
                 Err(e) => {
-                    error!("flush_dirty_chunks: assign_fid FAILED: {}", e);
-                    let fs_error = parse_master_error(&e);
-                    return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+                    warn!(
+                        "flush_dirty_chunks: assign_stripe_fids failed: {}, falling back to Flat",
+                        e
+                    );
                 }
             }
-        };
-        let assign_fid_elapsed = assign_fid_start.elapsed();
-        info!(
-            "PERF: assign_fid took {}ms for inode {}",
-            assign_fid_elapsed.as_millis(),
-            inode
-        );
-
-        // 查找 Volume 位置
-        let lookup_volume_start = std::time::Instant::now();
-        let locations = match self.client.lookup_volume(fid.volume_id) {
-            Ok(l) => {
-                info!("PERF: lookup_volume succeeded, locations={:?}", l);
-                l
-            }
-            Err(e) => {
-                error!("flush_dirty_chunks: lookup_volume FAILED: {}", e);
-                let fs_error = parse_master_error(&e);
-                return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
-            }
-        };
-        let lookup_volume_elapsed = lookup_volume_start.elapsed();
-        info!(
-            "PERF: lookup_volume took {}ms for inode {}",
-            lookup_volume_elapsed.as_millis(),
-            inode
-        );
-
-        let loc = locations
-            .first()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = PowerFuseClient::location_to_grpc_addr(loc);
+        }
 
         // 先收集所有脏 chunk 数据到内存（防止 LRU 淘汰导致数据丢失）
         let mut dirty_chunk_data: Vec<(u64, u64, Vec<u8>, u64, u32)> = Vec::new(); // (chunk_idx, chunk_offset, data, mtime, crc32)
@@ -427,13 +512,13 @@ impl PowerFsFuserFs {
             dirty_chunks,
             file_size,
             chunk_size,
-            self.data.chunk_cache().len(),
-            self.data.chunk_cache().current_bytes(),
+            data.chunk_cache().len(),
+            data.chunk_cache().current_bytes(),
         );
 
         for chunk_idx in &dirty_chunks {
             let chunk_offset = chunk_idx * chunk_size;
-            let chunk_data_opt = self.data.chunk_cache().get(inode, chunk_offset);
+            let chunk_data_opt = data.chunk_cache().get(inode, chunk_offset);
             debug!(
                 "flush_dirty_chunks: looking up chunk idx={}, offset={} → {}",
                 chunk_idx,
@@ -460,57 +545,218 @@ impl PowerFsFuserFs {
             }
         }
 
-        // 批量写入脏 chunk 到 Volume Server
-        let mut blob_entries = Vec::new();
+        // 根据 layout 决定写入策略
+        let is_stripe = layout.as_ref().is_some_and(|l| l.is_stripe());
+
         let mut new_chunks = Vec::new();
 
-        for (_chunk_idx, chunk_offset, data, mtime, crc32) in &dirty_chunk_data {
-            let data_len = data.len();
-            // 调试：检测全 0 chunk（正常 flush 不应全 0）
-            if !data.is_empty() && data.iter().all(|&b| b == 0) {
-                warn!(
-                    "flush_dirty_chunks: ALL ZEROS chunk! ino={}, chunk_offset={}, size={}",
-                    inode, chunk_offset, data_len
+        if is_stripe {
+            // ============ Stripe 模式：按 volume 分组写入 ============
+            let stripe_layout = layout.as_ref().unwrap();
+
+            // 为每个 volume 缓存 FID 和 addr
+            // 首次写入某个 volume 时分配 file_key
+            let mut vol_fids: HashMap<u64, Fid> = HashMap::new();
+            let mut vol_addrs: HashMap<u64, String> = HashMap::new();
+
+            // 按 volume 分组脏 chunk
+            let mut vol_blob_entries: HashMap<u64, Vec<(i64, i32, Vec<u8>, u32)>> = HashMap::new();
+            let mut vol_chunk_info: HashMap<u64, Vec<(u64, u64, u64, u32)>> = HashMap::new(); // (chunk_offset, data_len, mtime, crc32)
+
+            for (_chunk_idx, chunk_offset, data_bytes, mtime, crc32) in &dirty_chunk_data {
+                let data_len = data_bytes.len();
+                let target_vol_id = stripe_layout.volume_id_for_offset(*chunk_offset);
+
+                match target_vol_id {
+                    Some(vid) => {
+                        // 查找或分配该 volume 的 FID
+                        if let std::collections::hash_map::Entry::Vacant(e) = vol_fids.entry(vid) {
+                            let existing = entry
+                                .chunks
+                                .iter()
+                                .find(|c| {
+                                    !c.fid.is_empty()
+                                        && Fid::from_string(&c.fid)
+                                            .map(|f| f.volume_id.0 as u64 == vid)
+                                            .unwrap_or(false)
+                                })
+                                .and_then(|c| Fid::from_string(&c.fid).ok());
+
+                            let fid = match existing {
+                                Some(f) => f,
+                                None => match client.assign_fid(collection, replication) {
+                                    Ok((new_fid, _, _, _)) => new_fid,
+                                    Err(e) => {
+                                        let fs_error = parse_master_error(&e);
+                                        return Err(std::io::Error::from_raw_os_error(
+                                            fs_error.to_errno(),
+                                        ));
+                                    }
+                                },
+                            };
+
+                            let locations = match client.lookup_volume(fid.volume_id) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let fs_error = parse_master_error(&e);
+                                    return Err(std::io::Error::from_raw_os_error(
+                                        fs_error.to_errno(),
+                                    ));
+                                }
+                            };
+                            let loc = locations
+                                .first()
+                                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+                            let addr = PowerFuseClient::location_to_grpc_addr(loc);
+
+                            e.insert(fid);
+                            vol_addrs.insert(vid, addr);
+                        }
+
+                        vol_blob_entries.entry(vid).or_default().push((
+                            *chunk_offset as i64,
+                            data_len as i32,
+                            data_bytes.clone(),
+                            0u32,
+                        ));
+                        vol_chunk_info.entry(vid).or_default().push((
+                            *chunk_offset,
+                            data_len as u64,
+                            *mtime,
+                            *crc32,
+                        ));
+                    }
+                    None => {
+                        warn!(
+                            "flush_dirty_chunks: no volume for offset={}, skipping",
+                            chunk_offset
+                        );
+                    }
+                }
+            }
+
+            // 按 volume 批量写入
+            for (vid, entries) in vol_blob_entries {
+                if let Some(fid) = vol_fids.get(&vid) {
+                    if let Some(addr) = vol_addrs.get(&vid) {
+                        if !entries.is_empty() {
+                            if let Err(e) = client.batch_write_blob(
+                                addr,
+                                fid.volume_id.0,
+                                fid.file_key,
+                                entries,
+                            ) {
+                                let fs_error = crate::error::parse_volume_error(&e);
+                                error!(
+                                    "flush_dirty_chunks: stripe batch_write_blob failed for volume {}: {}",
+                                    vid, fs_error
+                                );
+                                return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+                            }
+                            debug!(
+                                "flush_dirty_chunks: wrote {} chunks to stripe volume {} at {}",
+                                vol_chunk_info.get(&vid).map(|v| v.len()).unwrap_or(0),
+                                vid,
+                                addr
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 构建 FileChunk 列表
+            for (vid, chunk_infos) in vol_chunk_info {
+                if let Some(fid) = vol_fids.get(&vid) {
+                    for (chunk_offset, data_len, mtime, crc32) in chunk_infos {
+                        new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
+                            offset: chunk_offset,
+                            size: data_len,
+                            mtime,
+                            fid: fid.to_string(),
+                            cookie: 0,
+                            crc32,
+                        });
+                    }
+                }
+            }
+        } else {
+            // ============ Flat 模式：原有逻辑，单 volume 写入 ============
+            let existing_fid = entry
+                .chunks
+                .iter()
+                .find(|c| !c.fid.is_empty())
+                .and_then(|c| Fid::from_string(&c.fid).ok());
+
+            let fid = if let Some(fid) = existing_fid {
+                fid
+            } else {
+                match client.assign_fid(collection, replication) {
+                    Ok((new_fid, _, _, _)) => new_fid,
+                    Err(e) => {
+                        let fs_error = parse_master_error(&e);
+                        return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+                    }
+                }
+            };
+
+            let locations = match client.lookup_volume(fid.volume_id) {
+                Ok(l) => l,
+                Err(e) => {
+                    let fs_error = parse_master_error(&e);
+                    return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+                }
+            };
+
+            let loc = locations
+                .first()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+            let addr = PowerFuseClient::location_to_grpc_addr(loc);
+
+            let mut blob_entries = Vec::new();
+
+            for (_chunk_idx, chunk_offset, data_bytes, mtime, crc32) in &dirty_chunk_data {
+                let data_len = data_bytes.len();
+                if !data_bytes.is_empty() && data_bytes.iter().all(|&b| b == 0) {
+                    warn!(
+                        "flush_dirty_chunks: ALL ZEROS chunk! ino={}, chunk_offset={}, size={}",
+                        inode, chunk_offset, data_len
+                    );
+                }
+                blob_entries.push((
+                    *chunk_offset as i64,
+                    data_len as i32,
+                    data_bytes.clone(),
+                    0u32,
+                ));
+
+                new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
+                    offset: *chunk_offset,
+                    size: data_len as u64,
+                    mtime: *mtime,
+                    fid: fid.to_string(),
+                    cookie: 0,
+                    crc32: *crc32,
+                });
+            }
+
+            if !blob_entries.is_empty() {
+                if let Err(e) =
+                    client.batch_write_blob(&addr, fid.volume_id.0, fid.file_key, blob_entries)
+                {
+                    let fs_error = crate::error::parse_volume_error(&e);
+                    error!("flush_dirty_chunks: batch_write_blob failed: {}", fs_error);
+                    return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
+                }
+                debug!(
+                    "flush_dirty_chunks: wrote {} chunks to volume {}",
+                    new_chunks.len(),
+                    addr
                 );
             }
-            blob_entries.push((*chunk_offset as i64, data_len as i32, data.clone(), 0u32));
-
-            new_chunks.push(powerfs_master::proto::powerfs::FileChunk {
-                offset: *chunk_offset,
-                size: data_len as u64,
-                mtime: *mtime,
-                fid: fid.to_string(),
-                cookie: 0,
-                crc32: *crc32,
-            });
         }
 
-        if !blob_entries.is_empty() {
-            let write_blob_start = std::time::Instant::now();
-            if let Err(e) =
-                self.client
-                    .batch_write_blob(&addr, fid.volume_id.0, fid.file_key, blob_entries)
-            {
-                let fs_error = crate::error::parse_volume_error(&e);
-                error!("flush_dirty_chunks: batch_write_blob failed: {}", fs_error);
-                return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
-            }
-            let write_blob_elapsed = write_blob_start.elapsed();
-            info!(
-                "PERF: batch_write_blob took {}ms for {} chunks, inode {}",
-                write_blob_elapsed.as_millis(),
-                new_chunks.len(),
-                inode
-            );
-            debug!(
-                "flush_dirty_chunks: wrote {} chunks to volume {}",
-                new_chunks.len(),
-                addr
-            );
-        }
-
-        // 更新 Master 上的 entry（合并 chunks + 更新 size）
-        let client_id_str = self.meta.client_id().to_string();
+        // 更新 Master 上的 entry（合并 chunks + 更新 size + 存储 layout）
+        let client_id_str = meta.client_id().to_string();
         let mut updated_entry = entry.clone();
         // 合并 chunks：保留旧的非脏 chunk，添加新的脏 chunk
         for new_chunk in &new_chunks {
@@ -522,11 +768,18 @@ impl PowerFsFuserFs {
         // 按 offset 排序
         updated_entry.chunks.sort_by_key(|c| c.offset);
 
+        // 存储 FileLayout 到 extended
+        if let Some(ref l) = layout {
+            if l.is_stripe() {
+                l.to_extended(&mut updated_entry.extended);
+            }
+        }
+
         let old_size = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
         let is_truncate = file_size > 0 && file_size < old_size;
         debug!(
-            "flush_dirty_chunks: inode={}, old_size={}, new_size={}, is_truncate={}",
-            inode, old_size, file_size, is_truncate
+            "flush_dirty_chunks: inode={}, old_size={}, new_size={}, is_truncate={}, is_stripe={}",
+            inode, old_size, file_size, is_truncate, is_stripe
         );
 
         // 更新 size
@@ -539,18 +792,8 @@ impl PowerFsFuserFs {
             updated_entry.disk_size = file_size;
         }
 
-        let update_entry_start = std::time::Instant::now();
-        match self
-            .client
-            .update_entry(&updated_entry, &client_id_str, old_size, is_truncate)
-        {
+        match client.update_entry(&updated_entry, &client_id_str, old_size, is_truncate) {
             Ok(actual_size) => {
-                let update_entry_elapsed = update_entry_start.elapsed();
-                info!(
-                    "PERF: update_entry took {}ms for inode {}",
-                    update_entry_elapsed.as_millis(),
-                    inode
-                );
                 debug!(
                     "flush_dirty_chunks: update_entry succeeded, actual_size={}",
                     actual_size
@@ -560,7 +803,7 @@ impl PowerFsFuserFs {
                         "flush_dirty_chunks: inode={}, size changed during flush (expected={}, actual={}), updating local cache",
                         inode, file_size, actual_size
                     );
-                    self.data.set_file_size(inode, actual_size);
+                    data.set_file_size(inode, actual_size);
                 }
             }
             Err(e) => {
@@ -568,31 +811,20 @@ impl PowerFsFuserFs {
             }
         }
 
-        // 数据完整性验证（可选，默认关闭）：读取刚刚写入的 chunk 并与本地数据比较
-        if self.verify_data {
-            self.verify_flushed_data(inode, &dirty_chunk_data, &addr, fid)?;
-        }
-
         // 清除脏标记
-        self.data.clear_dirty(inode);
-
-        let total_elapsed = start_time.elapsed();
-        info!(
-            "PERF: total flush_dirty_chunks took {}ms for inode {}, {} dirty chunks",
-            total_elapsed.as_millis(),
-            inode,
-            dirty_chunks.len()
-        );
+        data.clear_dirty(inode);
 
         debug!(
-            "flush_dirty_chunks: completed for inode={}, chunks={}",
+            "flush_dirty_chunks: completed for inode={}, chunks={}, is_stripe={}",
             inode,
-            new_chunks.len()
+            new_chunks.len(),
+            is_stripe
         );
 
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// 验证写入的数据完整性
     fn verify_flushed_data(
         &self,
@@ -601,10 +833,21 @@ impl PowerFsFuserFs {
         addr: &str,
         fid: powerfs_common::types::Fid,
     ) -> std::io::Result<()> {
+        Self::verify_flushed_data_static(inode, dirty_chunk_data, addr, fid, &self.client)
+    }
+
+    #[allow(dead_code)]
+    fn verify_flushed_data_static(
+        inode: u64,
+        dirty_chunk_data: &[(u64, u64, Vec<u8>, u64, u32)],
+        addr: &str,
+        fid: powerfs_common::types::Fid,
+        client: &Arc<SyncFuseClient>,
+    ) -> std::io::Result<()> {
         use md5::compute;
 
         for (_chunk_idx, chunk_offset, local_data, _mtime, _crc32) in dirty_chunk_data {
-            match self.client.read_blob(
+            match client.read_blob(
                 addr,
                 fid.volume_id.0,
                 fid.file_key,
@@ -871,6 +1114,7 @@ impl Filesystem for PowerFsFuserFs {
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => {
+                // 调试：符号链接 inode 丢失
                 warn!("getattr: inode {} not found (ENOENT)", inode);
                 reply.error(libc::ENOENT);
             }
@@ -1059,6 +1303,8 @@ impl Filesystem for PowerFsFuserFs {
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.created(&TTL, &attr, 0, 0, 0);
 
+                self.data.set_file_size(entry.inode, 0);
+
                 // 失效父目录 dentry 缓存
                 self.invalidate_kernel_dentry(parent, name_str);
             }
@@ -1216,7 +1462,7 @@ impl Filesystem for PowerFsFuserFs {
 
     fn mknod(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1226,26 +1472,25 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         let name_str = name.to_str().unwrap_or("");
         debug!(
-            "mknod: parent={}, name={}, mode={:o}, rdev={}, uid={}, gid={}",
-            parent,
-            name_str,
-            mode,
-            rdev,
-            req.uid(),
-            req.gid()
+            "mknod: parent={}, name={}, mode={:o}, rdev={}",
+            parent, name_str, mode, rdev
         );
 
-        match self
-            .meta
-            .mknod(parent, name_str, mode, rdev as u64, req.uid(), req.gid())
-        {
+        match self.meta.mknod(parent, name_str, mode, rdev) {
             Ok(entry) => {
+                debug!(
+                    "mknod: created name={}, inode={}, parent={}",
+                    name_str, entry.inode, parent
+                );
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
                 self.invalidate_kernel_dentry(parent, name_str);
             }
             Err(e) => {
-                error!("mknod: parent={}, name={}, error={}", parent, name_str, e);
+                error!(
+                    "mknod: FAILED parent={}, name={}, error={:?}",
+                    parent, name_str, e
+                );
                 reply.error(e.to_errno());
             }
         }
@@ -1255,27 +1500,31 @@ impl Filesystem for PowerFsFuserFs {
         &mut self,
         _req: &Request<'_>,
         inode: u64,
-        new_parent: u64,
-        new_name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let new_name_str = new_name.to_str().unwrap_or("");
+        let newname_str = newname.to_str().unwrap_or("");
         debug!(
-            "link: inode={}, new_parent={}, new_name={}",
-            inode, new_parent, new_name_str
+            "link: inode={}, newparent={}, newname={}",
+            inode, newparent, newname_str
         );
 
-        match self.meta.link(inode, new_parent, new_name_str) {
+        match self.meta.link(inode, newparent, newname_str) {
             Ok(entry) => {
+                debug!(
+                    "link: created inode={}, newparent={}, newname={}",
+                    inode, newparent, newname_str
+                );
                 let attr = Self::dir_entry_to_file_attr(&entry);
                 reply.entry(&TTL, &attr, 0);
-                self.invalidate_kernel_dentry(new_parent, new_name_str);
+                self.invalidate_kernel_dentry(newparent, newname_str);
                 self.invalidate_kernel_inode(inode);
             }
             Err(e) => {
                 error!(
-                    "link: inode={}, new_parent={}, new_name={}, error={}",
-                    inode, new_parent, new_name_str, e
+                    "link: FAILED inode={}, newparent={}, newname={}, error={:?}",
+                    inode, newparent, newname_str, e
                 );
                 reply.error(e.to_errno());
             }
@@ -1301,12 +1550,11 @@ impl Filesystem for PowerFsFuserFs {
         }
     }
 
-    fn access(&mut self, _req: &Request<'_>, _inode: u64, _mask: i32, reply: ReplyEmpty) {
-        reply.ok();
-    }
-
     fn open(&mut self, _req: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
-        debug!("open: inode={}, flags={:x}", inode, flags);
+        self.meta.acquire_inode(inode);
+
+        let file_size = self.get_file_size(inode);
+        self.data.set_file_size(inode, file_size);
 
         if let Ok(Some(entry)) = self.meta.get_entry_by_inode(inode) {
             let uid = _req.uid();
@@ -1353,31 +1601,40 @@ impl Filesystem for PowerFsFuserFs {
         }
 
         let is_write = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
-
         if is_write {
-            if let Some(path) = self.meta.get_path(inode) {
-                debug!("open: acquiring lease for path={}", path);
-                match self.client.acquire_lease(&path, &self.client_id, 30000) {
-                    Ok((lease_id, _epoch)) => {
-                        debug!(
-                            "open: lease acquired for inode={}, lease_id={}",
-                            inode, lease_id
-                        );
-                        self.leases.write().unwrap().insert(inode, lease_id);
-                    }
-                    Err(e) => {
-                        warn!("open: failed to acquire lease for inode={}: {}", inode, e);
+            debug!("open: acquiring lease for inode={}", inode);
+            let lease_result = if self.client.has_filer() {
+                self.client
+                    .filer_acquire_lease(inode, &self.client_id, 30000)
+            } else {
+                match self.meta.get_path(inode) {
+                    Some(path) => self.client.acquire_lease(&path, &self.client_id, 30000),
+                    None => {
+                        warn!("open: cannot get path for inode={}", inode);
+                        Err("cannot get path".to_string())
                     }
                 }
-            } else {
-                warn!("open: cannot get path for inode={}", inode);
+            };
+
+            match lease_result {
+                Ok((lease_id, _epoch)) => {
+                    debug!(
+                        "open: lease acquired for inode={}, lease_id={}",
+                        inode, lease_id
+                    );
+                    self.leases.write().unwrap().insert(inode, lease_id);
+                }
+                Err(e) => {
+                    warn!("open: failed to acquire lease for inode={}: {}", inode, e);
+                }
             }
         }
 
         reply.opened(0, 0);
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _inode: u64, _flags: i32, reply: ReplyOpen) {
+    fn opendir(&mut self, _req: &Request<'_>, inode: u64, _flags: i32, reply: ReplyOpen) {
+        self.meta.acquire_inode(inode);
         reply.opened(0, 0);
     }
 
@@ -1405,6 +1662,7 @@ impl Filesystem for PowerFsFuserFs {
             return;
         }
 
+        // 先尝试从 DataManager 本地缓存读
         match self.data.read(inode, offset_u64, size_usize) {
             Some(data) => {
                 // 调试：检测全 0 读取
@@ -1532,8 +1790,22 @@ impl Filesystem for PowerFsFuserFs {
                 is_append
             );
 
+            if let Some(fm) = &self.flush_manager {
+                if fm.is_backpressured() {
+                    debug!(
+                        "write: backpressure active (dirty={}), waiting for flush",
+                        fm.global_dirty_bytes()
+                    );
+                    fm.wait_for_backpressure_relief(Duration::from_secs(30));
+                }
+            }
+
             written = self.data.write(inode, offset_u64, data);
             self.has_dirty.store(true, Ordering::Relaxed);
+
+            if let Some(fm) = &self.flush_manager {
+                fm.track_dirty(inode, written as usize);
+            }
         } else {
             offset_u64 = offset as u64;
 
@@ -1545,8 +1817,28 @@ impl Filesystem for PowerFsFuserFs {
                 is_append
             );
 
+            if let Some(fm) = &self.flush_manager {
+                if fm.is_backpressured() {
+                    debug!(
+                        "write: backpressure active (dirty={}), waiting for flush",
+                        fm.global_dirty_bytes()
+                    );
+                    fm.wait_for_backpressure_relief(Duration::from_secs(30));
+                }
+            }
+
             written = self.data.write(inode, offset_u64, data);
             self.has_dirty.store(true, Ordering::Relaxed);
+
+            if let Some(fm) = &self.flush_manager {
+                fm.track_dirty(inode, written as usize);
+            }
+        }
+
+        let insize = self.get_file_size(inode);
+        let outsize = (offset_u64 + data.len() as u64).max(insize);
+        if outsize > insize {
+            self.meta.update_size_optimistic(inode, insize, outsize);
         }
 
         reply.written(written as u32);
@@ -1581,28 +1873,34 @@ impl Filesystem for PowerFsFuserFs {
     ) {
         debug!("release: inode={}, flush={}", inode, _flush);
 
-        // flush 脏数据（失败不影响文件关闭，数据已在本地缓存，稍后可重试）
-        let flush_ok = self.flush_dirty_chunks(inode).is_ok();
-        if !flush_ok {
-            error!("release: flush failed for inode={}", inode);
-        }
-
+        // 清理 write_buffer（数据已在 chunk_cache 中）
         self.data.write_buffer().take(inode);
 
-        if flush_ok {
-            self.data.clear_dirty(inode);
+        // 通知后台 flush 线程处理该 inode 的脏数据
+        if let Some(fm) = &self.flush_manager {
+            fm.notify_release(inode);
         }
 
+        self.meta.release_inode(inode);
+
+        // 清理租约失效状态
         if self.is_lease_invalidated(inode) {
             self.handle_lease_invalidation(inode);
         }
 
+        // 释放租约
         if let Some(lease_id) = self.leases.write().unwrap().remove(&inode) {
             debug!(
                 "release: releasing lease for inode={}, lease_id={}",
                 inode, lease_id
             );
-            match self.client.release_lease(&lease_id) {
+            let release_result = if self.client.has_filer() {
+                self.client.filer_release_lease(&lease_id)
+            } else {
+                self.client.release_lease(&lease_id)
+            };
+
+            match release_result {
                 Ok(_) => {
                     debug!("release: lease released successfully for inode={}", inode);
                 }
@@ -1615,6 +1913,19 @@ impl Filesystem for PowerFsFuserFs {
             }
         }
 
+        reply.ok();
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        inode: u64,
+        _fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        debug!("releasedir: inode={}", inode);
+        self.meta.release_inode(inode);
         reply.ok();
     }
 
@@ -1680,10 +1991,11 @@ impl Clone for PowerFsFuserFs {
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             notifier: self.notifier.clone(),
-            flush_locks: self.flush_locks.clone(),
             has_dirty: self.has_dirty.clone(),
+            flush_manager: self.flush_manager.clone(),
             verify_data: self.verify_data,
             statfs_cache: self.statfs_cache.clone(),
+            statfs_client: self.statfs_client.clone(),
             leases: self.leases.clone(),
             client_id: self.client_id.clone(),
             lease_renewer_running: self.lease_renewer_running.clone(),
@@ -1831,6 +2143,17 @@ impl FuserApp {
         // 在创建 fs 之前先 clone meta，以便后续元数据订阅线程使用
         let meta_clone_for_subscribe = meta.clone();
 
+        // 创建 statfs 专用 gRPC 客户端（独立通道，高负载时保证 df 正常工作）
+        let master_addrs_ref: Vec<&str> =
+            self.master_addresses.iter().map(|s| s.as_str()).collect();
+        let filer_addrs_ref: Vec<&str> = self.filer_addresses.iter().map(|s| s.as_str()).collect();
+        let statfs_client = Some(Arc::new(SyncFuseClient::new(PowerFuseClient::new(
+            &master_addrs_ref,
+            &filer_addrs_ref,
+            self.runtime_handle.clone(),
+            &self.collection,
+        ))));
+
         // 创建 FUSE 文件系统
         let fs = PowerFsFuserFs::new(
             sync_client.clone(),
@@ -1840,6 +2163,7 @@ impl FuserApp {
             self.replication.clone(),
             self.verify_data,
             statfs_cache_value,
+            statfs_client,
             client_id.clone(),
         );
 
@@ -1848,7 +2172,9 @@ impl FuserApp {
         let collection_clone_for_statfs = self.collection.clone();
         std::thread::spawn(move || loop {
             let result = fs_clone_for_statfs
-                .client
+                .statfs_client
+                .as_ref()
+                .unwrap_or(&fs_clone_for_statfs.client)
                 .get_statistics(&collection_clone_for_statfs);
             if let Ok(stats) = result {
                 let mut cache_guard = fs_clone_for_statfs.statfs_cache.lock().unwrap();
@@ -1954,6 +2280,7 @@ impl FuserApp {
             MountOption::FSName("powerfs".to_string()),
             MountOption::AutoUnmount,
             MountOption::AllowOther,
+            MountOption::DefaultPermissions,
         ];
 
         let fs_for_mount = fs.clone();

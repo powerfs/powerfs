@@ -961,8 +961,8 @@ impl ChunkCache {
     }
 
     pub fn with_defaults() -> Self {
-        // 默认 128MB 缓存上限
-        ChunkCache::with_max_bytes(DEFAULT_CHUNK_SIZE, 128 * 1024 * 1024)
+        // 默认 4GB 缓存上限
+        ChunkCache::with_max_bytes(DEFAULT_CHUNK_SIZE, 4 * 1024 * 1024 * 1024)
     }
 
     pub fn chunk_size(&self) -> u64 {

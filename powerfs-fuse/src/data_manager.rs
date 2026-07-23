@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use crate::cache::ChunkCache;
 
@@ -144,7 +144,6 @@ impl DataManager {
     /// 读取范围受文件大小限制，超出部分返回短读。
     /// 支持跨 chunk 读取。
     pub fn read(&self, ino: u64, offset: u64, size: usize) -> Option<Vec<u8>> {
-        // 受文件大小限制
         let file_size = self.current_file_size(ino);
         if offset >= file_size {
             return Some(vec![]);
@@ -157,21 +156,69 @@ impl DataManager {
         let mut remaining = read_size;
 
         while remaining > 0 {
-            let chunk = self.chunk_cache.get(ino, current_offset)?;
-            let chunk_offset = self.chunk_cache.get_chunk_offset(current_offset);
-            let available = chunk.data.len().saturating_sub(chunk_offset as usize);
-            if available == 0 {
-                break;
+            let chunk = self.chunk_cache.get(ino, current_offset);
+
+            if let Some(chunk_data) = chunk {
+                let chunk_offset = self.chunk_cache.get_chunk_offset(current_offset);
+                let available = chunk_data.data.len().saturating_sub(chunk_offset as usize);
+                if available == 0 {
+                    break;
+                }
+                let take = remaining.min(available);
+                result.extend_from_slice(
+                    &chunk_data.data[chunk_offset as usize..chunk_offset as usize + take],
+                );
+                remaining -= take;
+                current_offset += take as u64;
+            } else {
+                let buffer_data = self.read_from_write_buffer(ino, current_offset, remaining);
+                if buffer_data.is_empty() {
+                    break;
+                }
+                let take = buffer_data.len();
+                result.extend_from_slice(&buffer_data);
+                remaining -= take;
+                current_offset += take as u64;
             }
-            let take = remaining.min(available);
-            result.extend_from_slice(
-                &chunk.data[chunk_offset as usize..chunk_offset as usize + take],
-            );
-            remaining -= take;
-            current_offset += take as u64;
         }
 
         Some(result)
+    }
+
+    fn read_from_write_buffer(&self, ino: u64, offset: u64, size: usize) -> Vec<u8> {
+        let buffers = self.write_buffer.buffers.read().unwrap();
+        if let Some(entries) = buffers.get(&ino) {
+            let mut result = vec![0u8; size];
+            let mut has_data = false;
+
+            for entry in entries {
+                if entry.offset >= offset + size as u64 {
+                    continue;
+                }
+                if entry.offset + entry.data.len() as u64 <= offset {
+                    continue;
+                }
+
+                let entry_start = entry.offset.max(offset);
+                let entry_end = (entry.offset + entry.data.len() as u64).min(offset + size as u64);
+
+                let dest_start = (entry_start - offset) as usize;
+                let dest_end = (entry_end - offset) as usize;
+                let src_start = (entry_start - entry.offset) as usize;
+                let src_end = (entry_end - entry.offset) as usize;
+
+                result[dest_start..dest_end].copy_from_slice(&entry.data[src_start..src_end]);
+                has_data = true;
+            }
+
+            if has_data {
+                result
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
     }
 
     /// 写入文件数据
@@ -195,10 +242,17 @@ impl DataManager {
                 data.len()
             );
         }
+
         let end = offset + data.len() as u64;
 
         // 修复：本地维护文件大小，无需 RPC
         self.update_file_size_if_larger(ino, end);
+
+        let current_size = self.current_file_size(ino);
+        info!(
+            "DataManager::write: ino={}, end={}, current_size_after_update={}",
+            ino, end, current_size
+        );
 
         let chunk_size = self.chunk_cache.chunk_size();
         let mtime = crate::orset::now_unix();
@@ -261,7 +315,9 @@ impl DataManager {
     /// 获取文件当前大小（本地维护）
     pub fn current_file_size(&self, ino: u64) -> u64 {
         let sizes = self.file_sizes.read().unwrap();
-        *sizes.get(&ino).unwrap_or(&0)
+        let cached_size = *sizes.get(&ino).unwrap_or(&0);
+        let buffer_max_offset = self.write_buffer.get_max_write_offset(ino);
+        cached_size.max(buffer_max_offset)
     }
 
     /// 设置文件大小（用于 setattr/truncate）
@@ -278,7 +334,7 @@ impl DataManager {
         }
     }
 
-    /// 截断文件（清理 chunks 和写缓冲）
+    /// 截断文件（修复历史问题：清理 chunks 和写缓冲）
     ///
     /// 1. 更新本地文件大小
     /// 2. 清理超过 new_size 的 chunk 缓存

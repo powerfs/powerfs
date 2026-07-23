@@ -5,10 +5,6 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-#[cfg(feature = "enterprise")]
-use powerfs_fuse_enterprise::FuserApp;
-
-#[cfg(not(feature = "enterprise"))]
 use powerfs_fuse::FuserApp;
 
 use powerfs_common::config::PowerFsConfig;
