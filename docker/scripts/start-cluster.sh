@@ -141,13 +141,24 @@ sleep 5
 
 echo ""
 echo "[5/8] Starting Filer..."
-docker compose up -d --no-deps filer
+docker compose up -d --no-deps filer-1 filer-2
 
-echo "  Waiting for Filer to be ready..."
+echo "  Waiting for Filer-1 to be ready..."
 timeout=30
 while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9001 >/dev/null 2>&1; then
-        echo "  [OK] Filer ready"
+    if nc -z localhost 8888 >/dev/null 2>&1; then
+        echo "  [OK] Filer-1 ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo "  Waiting for Filer-2 to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if nc -z localhost 8898 >/dev/null 2>&1; then
+        echo "  [OK] Filer-2 ready"
         break
     fi
     sleep 1

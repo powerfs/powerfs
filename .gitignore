@@ -1,4 +1,6 @@
 ./powerfs-fuse/Cargo.toml
+.trae/
+ubuntu-linux-git/
 autoconf-2.71
 autoconf-2.71.tar.gz
 target/

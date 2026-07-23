@@ -317,16 +317,16 @@ done
 
 log_info ""
 log_info "[5/9] Starting Filer..."
-log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps filer"
+log_debug "  Running: docker compose -f $DOCKER_DIR/docker-compose.yml up -d --no-deps filer-1 filer-2"
 
-if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps filer; then
-    log_info "  [OK] Filer container started"
+if docker compose -f "$DOCKER_DIR/docker-compose.yml" up -d --no-deps filer-1 filer-2; then
+    log_info "  [OK] Filer containers started"
 else
-    log_error "  [FAIL] Failed to start Filer container"
+    log_error "  [FAIL] Failed to start Filer containers"
     exit 2
 fi
 
-log_info "  Waiting for Filer to be ready..."
+log_info "  Waiting for Filer-1 to be ready..."
 timeout=30
 attempt=0
 while [ $timeout -gt 0 ]; do
@@ -334,12 +334,12 @@ while [ $timeout -gt 0 ]; do
     log_debug "  Attempt $attempt/$timeout: Checking port 8888..."
     
     if nc -z localhost 8888 >/dev/null 2>&1; then
-        log_info "  [OK] Filer ready on port 8888 after $attempt attempts"
+        log_info "  [OK] Filer-1 ready on port 8888 after $attempt attempts"
         break
     fi
     
     if [ $((attempt % 10)) -eq 0 ]; then
-        log_warn "  [WARN] Filer not ready yet (attempt $attempt/$timeout)"
+        log_warn "  [WARN] Filer-1 not ready yet (attempt $attempt/$timeout)"
     fi
     
     sleep 1
@@ -347,8 +347,33 @@ while [ $timeout -gt 0 ]; do
 done
 
 if [ $timeout -eq 0 ]; then
-    log_warn "  [WARN] Filer may not be ready"
-    log_warn "  Check: docker logs filer"
+    log_warn "  [WARN] Filer-1 may not be ready"
+    log_warn "  Check: docker logs filer-1"
+fi
+
+log_info "  Waiting for Filer-2 to be ready..."
+timeout=30
+attempt=0
+while [ $timeout -gt 0 ]; do
+    attempt=$((attempt + 1))
+    log_debug "  Attempt $attempt/$timeout: Checking port 8898..."
+    
+    if nc -z localhost 8898 >/dev/null 2>&1; then
+        log_info "  [OK] Filer-2 ready on port 8898 after $attempt attempts"
+        break
+    fi
+    
+    if [ $((attempt % 10)) -eq 0 ]; then
+        log_warn "  [WARN] Filer-2 not ready yet (attempt $attempt/$timeout)"
+    fi
+    
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+if [ $timeout -eq 0 ]; then
+    log_warn "  [WARN] Filer-2 may not be ready"
+    log_warn "  Check: docker logs filer-2"
 fi
 
 log_info ""
