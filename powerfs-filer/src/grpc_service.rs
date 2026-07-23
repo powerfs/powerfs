@@ -71,11 +71,11 @@ impl FilerMetaService for FilerMetaServiceImpl {
             .await
         {
             Ok(ino) => ino,
-            Err(_) => {
+            Err(e) => {
                 return Ok(Response::new(GetEntryResponse {
                     found: false,
                     entry: None,
-                    error: "path not found".to_string(),
+                    error: e,
                 }));
             }
         };
@@ -83,11 +83,11 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let shard_id = self.inode_to_shard_id(inode);
         let entry = match self.meta_shard_manager.get_entry(inode, shard_id).await {
             Ok(e) => e,
-            Err(_) => {
+            Err(e) => {
                 return Ok(Response::new(GetEntryResponse {
                     found: false,
                     entry: None,
-                    error: "entry not found".to_string(),
+                    error: e,
                 }));
             }
         };
@@ -455,22 +455,35 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let req = request.into_inner();
         let shard_id = ShardId(req.shard_id);
 
+        log::info!(
+            "push_delta received: shard={}, client={}, deltas_count={}",
+            shard_id.0,
+            req.client_id,
+            req.deltas.len()
+        );
+
         let result = self
             .meta_shard_manager
             .push_delta(shard_id, &req.client_id, &req.deltas, &req.client_vclock)
             .await;
 
         match result {
-            Ok(vclock) => Ok(Response::new(PushDeltaResponse {
-                success: true,
-                error: "".to_string(),
-                server_vclock: Some(vclock),
-            })),
-            Err(e) => Ok(Response::new(PushDeltaResponse {
-                success: false,
-                error: e,
-                server_vclock: None,
-            })),
+            Ok(vclock) => {
+                log::info!("push_delta succeeded for client {}", req.client_id);
+                Ok(Response::new(PushDeltaResponse {
+                    success: true,
+                    error: "".to_string(),
+                    server_vclock: Some(vclock),
+                }))
+            }
+            Err(e) => {
+                log::error!("push_delta failed for client {}: {}", req.client_id, e);
+                Ok(Response::new(PushDeltaResponse {
+                    success: false,
+                    error: e,
+                    server_vclock: None,
+                }))
+            }
         }
     }
 

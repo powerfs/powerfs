@@ -178,6 +178,7 @@ impl MetaShardManager {
     // ========================================================================
 
     /// 获取或创建 per-shard per-directory 的 OR-Set 状态
+    #[allow(dead_code)]
     fn get_or_create_orset(&self, shard_id: ShardId, dir_ino: u64) -> ServerDirORSet {
         let key = (shard_id, dir_ino);
         let mut states = self.orset_states.write().unwrap();
@@ -187,6 +188,42 @@ impl MetaShardManager {
         let state = ServerDirORSet::new(dir_ino);
         states.insert(key, state.clone());
         state
+    }
+
+    /// Atomically get-or-create, modify, and update OR-Set state
+    /// This prevents race conditions between read and write operations
+    fn modify_orset<F>(
+        &self,
+        shard_id: ShardId,
+        dir_ino: u64,
+        f: F,
+    ) -> (ServerDirORSet, MergeResult)
+    where
+        F: FnOnce(&mut ServerDirORSet) -> MergeResult,
+    {
+        let key = (shard_id, dir_ino);
+        let mut states = self.orset_states.write().unwrap();
+        let mut orset = if let Some(state) = states.get(&key) {
+            state.clone()
+        } else {
+            ServerDirORSet::new(dir_ino)
+        };
+
+        let merge_result = f(&mut orset);
+
+        // Update the state in the map
+        states.insert(key, orset.clone());
+        drop(states); // Release lock before doing IO
+
+        // Persist to RocksDB (after releasing lock to avoid blocking)
+        if let Some(store) = self.shard_stores.read().unwrap().get(&shard_id).cloned() {
+            store.save_orset_state(dir_ino, &orset);
+            for (entry_key, tombstones) in &orset.tombstones {
+                store.save_tombstones(entry_key, tombstones);
+            }
+        }
+
+        (orset, merge_result)
     }
 
     /// 获取或创建 per-shard 的 VectorClock
@@ -207,6 +244,7 @@ impl MetaShardManager {
     }
 
     /// 更新 per-shard per-directory 的 OR-Set 状态，并持久化到 RocksDB
+    #[allow(dead_code)]
     fn update_orset(&self, shard_id: ShardId, dir_ino: u64, state: ServerDirORSet) {
         let key = (shard_id, dir_ino);
         let mut states = self.orset_states.write().unwrap();
@@ -1170,66 +1208,69 @@ impl MetaShardManager {
             // Record to delta log for backward compatibility
             delta_log.append(client_id, seq, delta.clone());
 
-            // CRDT Merge: Apply to OR-Set first
+            // CRDT Merge: Apply to OR-Set first (atomic operation)
             if let Some(dir_ino) = self.get_dir_ino_from_delta(delta) {
-                let mut orset = self.get_or_create_orset(shard_id, dir_ino);
                 let tag = EntryTag::new(client_id, seq);
 
-                let merge_result = match &delta.op {
-                    Some(crate::powerfs::delta_op::Op::Add(entry)) => {
-                        let orset_entry = DirEntryOrset {
-                            tag: tag.clone(),
-                            inode: entry.inode,
-                            name: entry.name.clone(),
-                            parent_ino: entry.parent_ino,
-                            mode: entry.mode,
-                            file_type: crate::shard_store::FileType::File, // 默认
-                            size: 0,
-                            mtime: 0,
-                            etag: None,
-                        };
-                        orset.merge_add(orset_entry)
-                    }
-                    Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
-                        orset.merge_remove(entry_id.parent_ino, &entry_id.name, &tag)
-                    }
-                    Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => orset.merge_rename(
-                        rename_op.old_parent_ino,
-                        &rename_op.old_name,
-                        rename_op.new_parent_ino,
-                        &rename_op.new_name,
-                        &tag,
-                    ),
-                    Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
-                        // SetAttr 只有 inode，需要先查找条目信息
-                        let ino = setattr_op.inode;
-                        let (parent_ino, name) = {
-                            let stores = self.shard_stores.read().unwrap();
-                            let mut found = None;
-                            for store in stores.values() {
-                                if let Some(info) = store.get_inode(ino) {
-                                    found = Some((info.parent_inode, info.name.clone()));
-                                    break;
+                // Use atomic modify_orset to prevent race conditions
+                let (_orset, merge_result) = self.modify_orset(shard_id, dir_ino, |orset| {
+                    match &delta.op {
+                        Some(crate::powerfs::delta_op::Op::Add(entry)) => {
+                            let orset_entry = DirEntryOrset {
+                                tag: tag.clone(),
+                                inode: entry.inode,
+                                name: entry.name.clone(),
+                                parent_ino: entry.parent_ino,
+                                mode: entry.mode,
+                                file_type: crate::shard_store::FileType::File,
+                                size: 0,
+                                mtime: 0,
+                                etag: None,
+                            };
+                            orset.merge_add(orset_entry)
+                        }
+                        Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
+                            orset.merge_remove(entry_id.parent_ino, &entry_id.name, &tag)
+                        }
+                        Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => orset
+                            .merge_rename(
+                                rename_op.old_parent_ino,
+                                &rename_op.old_name,
+                                rename_op.new_parent_ino,
+                                &rename_op.new_name,
+                                &tag,
+                            ),
+                        Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
+                            // SetAttr needs to look up entry info first
+                            let ino = setattr_op.inode;
+                            let (parent_ino, name) = {
+                                let stores = self.shard_stores.read().unwrap();
+                                let mut found = None;
+                                for store in stores.values() {
+                                    if let Some(info) = store.get_inode(ino) {
+                                        found = Some((info.parent_inode, info.name.clone()));
+                                        break;
+                                    }
                                 }
-                            }
-                            found.ok_or_else(|| format!("inode {} not found for SetAttr", ino))?
-                        };
+                                match found {
+                                    Some(v) => v,
+                                    None => {
+                                        return MergeResult::Applied; // Skip if inode not found
+                                    }
+                                }
+                            };
 
-                        // 从 OR-Set 中找到对应的条目
-                        let mut orset = self.get_or_create_orset(shard_id, parent_ino);
-                        orset.merge_setattr(
-                            parent_ino,
-                            &name,
-                            &tag,
-                            setattr_op.size,
-                            setattr_op.mtime,
-                        )
+                            orset.merge_setattr(
+                                parent_ino,
+                                &name,
+                                &tag,
+                                setattr_op.size,
+                                setattr_op.mtime,
+                            )
+                        }
+                        None => MergeResult::Applied,
                     }
-                    None => MergeResult::Applied,
-                };
-
-                // Update OR-Set state
-                self.update_orset(shard_id, dir_ino, orset);
+                });
 
                 // Apply to shard store (物理存储)
                 if let Some(store) = &shard_store {
@@ -1238,7 +1279,6 @@ impl MetaShardManager {
                             self.apply_delta_to_store(store, delta).await?;
                         }
                         MergeResult::ConcurrentlyAdded => {
-                            // 并发 Add: 两个都保留，需要特殊处理
                             debug!(
                                 "Concurrent Add detected for dir {}: {:?}",
                                 dir_ino, merge_result

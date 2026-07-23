@@ -154,8 +154,8 @@ impl RaftGroup {
 
         let mut cfg = Config {
             id,
-            election_tick: 10,
-            heartbeat_tick: 3,
+            election_tick: 20,
+            heartbeat_tick: 5,
             max_size_per_msg: 1 << 20,
             max_inflight_msgs: 256,
             check_quorum: !peers.is_empty(),
@@ -224,12 +224,13 @@ impl RaftGroup {
     pub async fn run(&mut self) -> Result<(), String> {
         info!("Starting Raft event loop for shard {}", self.shard_id.0);
 
-        let mut tick_interval = interval(Duration::from_millis(100));
+        let mut tick_interval = interval(Duration::from_millis(200));
 
         while *self.running.read().await {
             tokio::select! {
                 _ = tick_interval.tick() => {
                     self.node.tick();
+                    self.update_leader_address();
                     while self.node.has_ready() {
                         self.process_ready();
                     }
@@ -390,6 +391,22 @@ impl RaftGroup {
 
         self.node.advance_apply();
 
+        // Update leader_address from raft.leader_id (covers heartbeat-only updates
+        // where ss is None but leader_id has changed)
+        if !self.is_leader() {
+            let leader_id = self.node.raft.leader_id;
+            let new_addr = if leader_id == 0 {
+                String::new()
+            } else if leader_id == self.id {
+                self.address.clone()
+            } else {
+                self.peers
+                    .get(&leader_id)
+                    .map_or(String::new(), |p| p.address.clone())
+            };
+            *self.leader_address.write().unwrap() = new_addr;
+        }
+
         if !messages_to_send.is_empty() {
             for msg in messages_to_send {
                 self.send_message(&msg);
@@ -478,7 +495,29 @@ impl RaftGroup {
         if let Err(e) = self.node.step(msg) {
             error!("Shard {} step failed: {}", self.shard_id.0, e);
         }
+        // Update leader_address from raft.leader_id (heartbeats update leader_id
+        // without producing a Ready event)
+        self.update_leader_address();
         self.process_ready();
+    }
+
+    /// Update leader_address from raft.leader_id
+    fn update_leader_address(&self) {
+        if self.is_leader() {
+            *self.leader_address.write().unwrap() = self.address.clone();
+            return;
+        }
+        let leader_id = self.node.raft.leader_id;
+        let new_addr = if leader_id == 0 {
+            String::new()
+        } else if leader_id == self.id {
+            self.address.clone()
+        } else {
+            self.peers
+                .get(&leader_id)
+                .map_or(String::new(), |p| p.address.clone())
+        };
+        *self.leader_address.write().unwrap() = new_addr;
     }
 
     pub fn is_leader(&self) -> bool {
@@ -656,6 +695,7 @@ impl RaftGroup {
 pub struct ShardStatusArcs {
     pub leader_state: Arc<AtomicBool>,
     pub applied_index: Arc<StdRwLock<u64>>,
+    pub leader_address: Arc<StdRwLock<String>>,
 }
 
 pub struct RaftGroupManager {
@@ -840,15 +880,16 @@ impl RaftGroupManager {
             peers,
             &self.storage_path,
             leader_state.clone(),
-            leader_address,
+            leader_address.clone(),
             self.message_tx.clone(),
         )?;
 
         // Save Arc clones of the status handles so get_shard_status can read
-        // leader_state/applied_index without acquiring the group RwLock.
+        // leader_state/applied_index/leader_address without acquiring the group RwLock.
         let status_arcs = ShardStatusArcs {
             leader_state,
             applied_index: group.applied_index_handle(),
+            leader_address,
         };
 
         // Cache propose_tx and step_tx so we can use them without acquiring
@@ -943,16 +984,21 @@ impl RaftGroupManager {
     }
 
     pub async fn get_shard_leader(&self, shard_id: ShardId) -> Option<String> {
-        let groups = self.groups.read().await;
-        let group = groups.get(&shard_id)?;
-        let group = group.read().await;
-        Some(group.leader_address())
+        let arcs = self.shard_status_arcs.read().await;
+        let handle = arcs.get(&shard_id)?;
+        let addr = handle.leader_address.read().unwrap().clone();
+        if addr.is_empty() {
+            None
+        } else {
+            Some(addr)
+        }
     }
 
     pub async fn is_shard_leader(&self, shard_id: ShardId) -> bool {
-        let groups = self.groups.read().await;
-        if let Some(group) = groups.get(&shard_id) {
-            group.read().await.is_leader()
+        // Read from the parallel shard_status_arcs map so we never block on
+        // the Raft event loop (which permanently holds the group write lock).
+        if let Some(arcs) = self.shard_status_arcs.read().await.get(&shard_id) {
+            arcs.leader_state.load(std::sync::atomic::Ordering::SeqCst)
         } else {
             false
         }

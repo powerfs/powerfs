@@ -447,7 +447,9 @@ impl Storage for RocksDbRaftStorage {
     fn term(&self, idx: u64) -> Result<u64, raft::Error> {
         let hs = self.hard_state.read().unwrap();
 
-        if idx == hs.commit {
+        // When the log is empty, the only valid term is the committed term
+        // for the committed index
+        if idx <= hs.commit {
             return Ok(hs.term);
         }
 
@@ -457,19 +459,70 @@ impl Storage for RocksDbRaftStorage {
                 return Ok(entry.term);
             }
         }
+        drop(entries);
+
+        // Check snapshot for term (when log is compacted)
+        let snapshot_cf = self.db.cf_handle(CF_SNAPSHOT);
+        if let Some(cf) = snapshot_cf {
+            if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
+                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                    let meta = snap.get_metadata();
+                    if idx <= meta.index {
+                        return Ok(meta.term);
+                    }
+                }
+            }
+        }
 
         Err(raft::Error::Store(raft::StorageError::Unavailable))
     }
 
     fn first_index(&self) -> Result<u64, raft::Error> {
         let entries = self.entries.read().unwrap();
-        Ok(entries.front().map_or(1, |e| e.index))
+        if let Some(entry) = entries.front() {
+            return Ok(entry.index);
+        }
+        drop(entries);
+
+        // If no entries, check snapshot
+        let snapshot_cf = self.db.cf_handle(CF_SNAPSHOT);
+        if let Some(cf) = snapshot_cf {
+            if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
+                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                    return Ok(snap.get_metadata().index + 1);
+                }
+            }
+        }
+
+        // No entries, no snapshot - return hs.commit + 1 or 1
+        let hs = self.hard_state.read().unwrap();
+        if hs.commit > 0 {
+            Ok(hs.commit + 1)
+        } else {
+            Ok(1)
+        }
     }
 
     fn last_index(&self) -> Result<u64, raft::Error> {
         let entries = self.entries.read().unwrap();
+        if let Some(entry) = entries.back() {
+            return Ok(entry.index);
+        }
+        drop(entries);
+
+        // If no entries, check snapshot for last index
+        let snapshot_cf = self.db.cf_handle(CF_SNAPSHOT);
+        if let Some(cf) = snapshot_cf {
+            if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
+                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                    return Ok(snap.get_metadata().index);
+                }
+            }
+        }
+
+        // No entries, no snapshot - return hard state commit
         let hs = self.hard_state.read().unwrap();
-        Ok(entries.back().map_or(hs.commit, |e| e.index))
+        Ok(hs.commit)
     }
 
     fn snapshot(

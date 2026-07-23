@@ -434,19 +434,22 @@ impl ShardStore {
             .db
             .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut dir_entries = self.directory_entries.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
 
-        inodes.insert(inode, inode_info);
+            inodes.insert(inode, inode_info);
 
-        dir_entries.entry(parent_inode).or_default();
-        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-            dir.insert(name, inode);
+            dir_entries.entry(parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.insert(name, inode);
+            }
         }
-
-        stats.inode_count += 1;
-        stats.file_count += 1;
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            stats.file_count += 1;
+        }
         self.save_stats();
 
         info!(
@@ -501,19 +504,22 @@ impl ShardStore {
             .db
             .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut dir_entries = self.directory_entries.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
 
-        inodes.insert(inode, inode_info);
+            inodes.insert(inode, inode_info);
 
-        dir_entries.entry(parent_inode).or_default();
-        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-            dir.insert(name, inode);
+            dir_entries.entry(parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.insert(name, inode);
+            }
         }
-
-        stats.inode_count += 1;
-        stats.file_count += 1;
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            stats.file_count += 1;
+        }
         self.save_stats();
 
         info!(
@@ -548,28 +554,37 @@ impl ShardStore {
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
         let cf_dir_entries = self.db.cf_handle(CF_DIR_ENTRIES).unwrap();
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut dir_entries = self.directory_entries.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
+        let removed = {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
 
-        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-            if let Some(&inode) = dir.get(&name) {
-                let dir_entry_key = format!("{}:{}", parent_inode, name);
-                let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
+            let mut removed = None;
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                if let Some(&inode) = dir.get(&name) {
+                    let dir_entry_key = format!("{}:{}", parent_inode, name);
+                    let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
 
-                let inode_key = inode.to_be_bytes();
-                let _ = self.db.delete_cf(cf_inodes, inode_key);
+                    let inode_key = inode.to_be_bytes();
+                    let _ = self.db.delete_cf(cf_inodes, inode_key);
 
-                dir.remove(&name);
-                if let Some(info) = inodes.remove(&inode) {
-                    stats.inode_count -= 1;
-                    if matches!(info.file_type, FileType::File) {
-                        stats.file_count -= 1;
+                    dir.remove(&name);
+                    if let Some(info) = inodes.remove(&inode) {
+                        let is_file = matches!(info.file_type, FileType::File);
+                        removed = Some(is_file);
                     }
                 }
             }
+            removed
+        };
+        {
+            let mut stats = self.stats.write().unwrap();
+            if let Some(is_file) = removed {
+                stats.inode_count -= 1;
+                if is_file {
+                    stats.file_count -= 1;
+                }
+            }
         }
-
         self.save_stats();
         info!(
             "Shard {} deleted file: parent_inode={}, name={}",
@@ -612,21 +627,24 @@ impl ShardStore {
             .db
             .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut dir_entries = self.directory_entries.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
 
-        inodes.insert(inode, inode_info);
+            inodes.insert(inode, inode_info);
 
-        dir_entries.entry(parent_inode).or_default();
-        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-            dir.insert(name, inode);
+            dir_entries.entry(parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.insert(name, inode);
+            }
+
+            dir_entries.entry(inode).or_default();
         }
-
-        dir_entries.entry(inode).or_default();
-
-        stats.inode_count += 1;
-        stats.dir_count += 1;
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            stats.dir_count += 1;
+        }
         self.save_stats();
 
         info!(
@@ -639,44 +657,53 @@ impl ShardStore {
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
         let cf_dir_entries = self.db.cf_handle(CF_DIR_ENTRIES).unwrap();
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut dir_entries = self.directory_entries.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
+        let removed = {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
 
-        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-            if let Some(&inode) = dir.get(&name) {
-                let dir_entry_key = format!("{}:{}", parent_inode, name);
-                let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
+            let mut removed = None;
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                if let Some(&inode) = dir.get(&name) {
+                    let dir_entry_key = format!("{}:{}", parent_inode, name);
+                    let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
 
-                let inode_key = inode.to_be_bytes();
-                let _ = self.db.delete_cf(cf_inodes, inode_key);
+                    let inode_key = inode.to_be_bytes();
+                    let _ = self.db.delete_cf(cf_inodes, inode_key);
 
-                let prefix = format!("{}:", inode);
-                let mut it = self.db.raw_iterator_cf(cf_dir_entries);
-                it.seek(prefix.as_bytes());
-                while it.valid() {
-                    if let Some(key) = it.key() {
-                        let key_str = String::from_utf8_lossy(key);
-                        if key_str.starts_with(&prefix) {
-                            let _ = self.db.delete_cf(cf_dir_entries, key);
-                        } else {
-                            break;
+                    let prefix = format!("{}:", inode);
+                    let mut it = self.db.raw_iterator_cf(cf_dir_entries);
+                    it.seek(prefix.as_bytes());
+                    while it.valid() {
+                        if let Some(key) = it.key() {
+                            let key_str = String::from_utf8_lossy(key);
+                            if key_str.starts_with(&prefix) {
+                                let _ = self.db.delete_cf(cf_dir_entries, key);
+                            } else {
+                                break;
+                            }
                         }
+                        it.next();
                     }
-                    it.next();
-                }
 
-                dir.remove(&name);
-                if let Some(info) = inodes.remove(&inode) {
-                    dir_entries.remove(&inode);
-                    stats.inode_count -= 1;
-                    if matches!(info.file_type, FileType::Directory) {
-                        stats.dir_count -= 1;
+                    dir.remove(&name);
+                    if let Some(info) = inodes.remove(&inode) {
+                        dir_entries.remove(&inode);
+                        let is_dir = matches!(info.file_type, FileType::Directory);
+                        removed = Some(is_dir);
                     }
                 }
             }
+            removed
+        };
+        {
+            let mut stats = self.stats.write().unwrap();
+            if let Some(is_dir) = removed {
+                stats.inode_count -= 1;
+                if is_dir {
+                    stats.dir_count -= 1;
+                }
+            }
         }
-
         self.save_stats();
         info!(
             "Shard {} deleted directory: parent_inode={}, name={}",
@@ -808,18 +835,22 @@ impl ShardStore {
             .put_cf(cf_inodes, inode_key, &data)
             .map_err(|e| format!("put inode to rocksdb: {}", e))?;
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
         let is_file = matches!(info.file_type, FileType::File);
         let is_dir = matches!(info.file_type, FileType::Directory);
 
-        inodes.insert(info.inode, info);
-        stats.inode_count += 1;
-        if is_file {
-            stats.file_count += 1;
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.insert(info.inode, info);
         }
-        if is_dir {
-            stats.dir_count += 1;
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            if is_file {
+                stats.file_count += 1;
+            }
+            if is_dir {
+                stats.dir_count += 1;
+            }
         }
         self.save_stats();
 
@@ -876,18 +907,24 @@ impl ShardStore {
             .delete_cf(cf_inodes, inode.to_be_bytes())
             .map_err(|e| format!("delete inode from rocksdb: {}", e))?;
 
-        let mut inodes = self.inodes.write().unwrap();
-        let mut stats = self.stats.write().unwrap();
-
-        if let Some(info) = inodes.remove(&inode) {
-            let is_file = matches!(info.file_type, FileType::File);
-            let is_dir = matches!(info.file_type, FileType::Directory);
-            stats.inode_count = stats.inode_count.saturating_sub(1);
-            if is_file {
-                stats.file_count = stats.file_count.saturating_sub(1);
-            }
-            if is_dir {
-                stats.dir_count = stats.dir_count.saturating_sub(1);
+        let removed = {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.remove(&inode).map(|info| {
+                let is_file = matches!(info.file_type, FileType::File);
+                let is_dir = matches!(info.file_type, FileType::Directory);
+                (is_file, is_dir)
+            })
+        };
+        if let Some((is_file, is_dir)) = removed {
+            {
+                let mut stats = self.stats.write().unwrap();
+                stats.inode_count = stats.inode_count.saturating_sub(1);
+                if is_file {
+                    stats.file_count = stats.file_count.saturating_sub(1);
+                }
+                if is_dir {
+                    stats.dir_count = stats.dir_count.saturating_sub(1);
+                }
             }
             self.save_stats();
         }

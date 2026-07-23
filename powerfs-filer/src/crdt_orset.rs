@@ -458,10 +458,7 @@ impl ServerDirORSet {
 
             // 6. 记录旧位置的 tombstone
             let tombstone = Tombstone::new(tag.clone(), &old_key);
-            self.tombstones
-                .entry(old_key)
-                .or_default()
-                .push(tombstone);
+            self.tombstones.entry(old_key).or_default().push(tombstone);
 
             self.update_vclock(tag);
             MergeResult::Applied

@@ -4,6 +4,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
+use axum::{response::IntoResponse, routing::get, Router};
+use serde_json::json;
+
 use powerfs_filer::grpc_service::FilerMetaServiceImpl;
 use powerfs_filer::meta_shard_manager::MetaShardManager;
 use powerfs_filer::posix_service::PosixMetaServiceImpl;
@@ -163,11 +166,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let _listener = TcpListener::bind(&args.s3_address).await?;
+    // Bind HTTP listener
+    let http_listener = TcpListener::bind(&args.s3_address).await?;
+    let std_listener = http_listener.into_std()?;
     info!(
         "S3 endpoint ready on {} (before Raft initialization)",
         args.s3_address
     );
+
+    // Start HTTP admin server for CRDT management
+    let meta_shard_mgr = meta_shard_manager.clone();
+    let admin_router = Router::new()
+        .route(
+            "/admin/status",
+            get({
+                let mgr = meta_shard_mgr.clone();
+                move || {
+                    let m = mgr.clone();
+                    async move {
+                        let status = m.get_filer_status().await;
+                        axum::Json(serde_json::to_value(status).unwrap_or_default())
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/shards",
+            get({
+                let mgr = meta_shard_mgr.clone();
+                move || {
+                    let m = mgr.clone();
+                    async move {
+                        let shards = m.list_shards_detail().await;
+                        axum::Json(serde_json::to_value(shards).unwrap_or_default())
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/crdt/overview",
+            get({
+                let mgr = meta_shard_mgr.clone();
+                move || {
+                    let m = mgr.clone();
+                    async move {
+                        let overview = m.get_crdt_overview();
+                        axum::Json(serde_json::json!(overview))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/crdt/shards/:id",
+            get({
+                let mgr = meta_shard_mgr.clone();
+                move |path: axum::extract::Path<u64>| {
+                    let m = mgr.clone();
+                    let id = path.0;
+                    async move {
+                        let states = m.get_shard_orset_states(ShardId(id));
+                        axum::Json(serde_json::to_value(states).unwrap_or_default())
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/crdt/shards/:id/dirs/:dir_ino",
+            get({
+                let mgr = meta_shard_mgr.clone();
+                move |path: axum::extract::Path<(u64, u64)>| {
+                    let m = mgr.clone();
+                    let (id, dir_ino) = path.0;
+                    async move {
+                        match m.get_dir_orset_state(ShardId(id), dir_ino) {
+                            Some(state) => axum::Json(json!(state)).into_response(),
+                            None => {
+                                (axum::http::StatusCode::NOT_FOUND, "Not found").into_response()
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/crdt/cleanup",
+            axum::routing::post({
+                let mgr = meta_shard_mgr.clone();
+                move |body: String| {
+                    let m = mgr.clone();
+                    async move {
+                        let ttl_hours: u64 = body
+                            .split('=')
+                            .find(|s| s.starts_with("ttl"))
+                            .and_then(|s| s.split('=').nth(1))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(24);
+                        let cleaned = m.cleanup_tombstones(ttl_hours);
+                        axum::Json(json!({
+                            "cleaned_count": cleaned,
+                            "ttl_hours": ttl_hours
+                        }))
+                    }
+                }
+            }),
+        );
+
+    info!("Starting HTTP admin server on {}...", args.s3_address);
+    tokio::spawn(async move {
+        if let Err(e) = axum::Server::from_tcp(std_listener)
+            .unwrap()
+            .serve(admin_router.into_make_service())
+            .await
+        {
+            error!("HTTP admin server error: {}", e);
+        }
+    });
+    info!("HTTP admin server started on {}", args.s3_address);
 
     // Handle subcommand
     match &args.command {
