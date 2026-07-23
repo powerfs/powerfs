@@ -117,6 +117,8 @@ fn main() {
             fuse_cfg.master_addresses.clone()
         };
 
+    let filer_addrs = fuse_cfg.filer_addresses.clone();
+
     let mount_point = if !args.mount_point.is_empty() {
         args.mount_point.clone()
     } else {
@@ -247,6 +249,7 @@ fn main() {
     let result = runtime.block_on(async {
         let fuse_client = FuserApp::new(
             &master_addrs,
+            &filer_addrs,
             &mount_point,
             &collection,
             &replication,

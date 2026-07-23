@@ -21,6 +21,9 @@ service FilerMetaService {
     rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
     rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
     
+    // Raft message exchange for multi-Filer communication
+    rpc SendRaftMessage(RaftMessageRequest) returns (RaftMessageResponse);
+    
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
 }
@@ -284,4 +287,15 @@ message PullDeltaResponse {
     string error = 2;
     repeated DeltaOp deltas = 3;
     VectorClock server_vclock = 4;
+}
+
+// Raft message exchange types
+message RaftMessageRequest {
+    uint64 shard_id = 1;
+    bytes message = 2;
+}
+
+message RaftMessageResponse {
+    bool success = 1;
+    string error = 2;
 }

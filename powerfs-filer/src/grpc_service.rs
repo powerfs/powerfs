@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use protobuf::Message;
 use tonic::{Request, Response, Status};
 
 use crate::meta_shard_manager::MetaShardManager;
@@ -14,8 +15,8 @@ use super::powerfs::{
     LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
     LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
     LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
-    PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, RenameEntryResponse,
-    UpdateEntryRequest, UpdateEntryResponse,
+    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
+    RenameEntryRequest, RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
 };
 
 pub struct FilerMetaServiceImpl {
@@ -600,6 +601,44 @@ impl FilerMetaService for FilerMetaServiceImpl {
                 success: false,
                 error: e,
                 epoch: 0,
+            })),
+        }
+    }
+
+    async fn send_raft_message(
+        &self,
+        request: Request<RaftMessageRequest>,
+    ) -> Result<Response<RaftMessageResponse>, Status> {
+        let req = request.into_inner();
+        let shard_id = ShardId(req.shard_id);
+        let message_data = req.message;
+
+        log::debug!("Received Raft message for shard {}", shard_id.0);
+
+        // Deserialize the Raft message
+        let mut msg = raft::eraftpb::Message::new();
+        if let Err(e) = msg.merge_from_bytes(&message_data) {
+            log::error!("Failed to deserialize Raft message: {}", e);
+            return Ok(Response::new(RaftMessageResponse {
+                success: false,
+                error: format!("failed to deserialize message: {}", e),
+            }));
+        }
+
+        // Pass the message to the Raft group manager
+        let result = self
+            .meta_shard_manager
+            .step_raft_message(shard_id, msg)
+            .await;
+
+        match result {
+            Ok(_) => Ok(Response::new(RaftMessageResponse {
+                success: true,
+                error: "".to_string(),
+            })),
+            Err(e) => Ok(Response::new(RaftMessageResponse {
+                success: false,
+                error: e,
             })),
         }
     }

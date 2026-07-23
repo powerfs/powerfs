@@ -1,5 +1,5 @@
 use bytes;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use powerfs_common::raft::RocksDbRaftStorage;
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeType, Message as RaftMessage};
@@ -12,6 +12,10 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
+use tonic::transport::Channel;
+
+use crate::powerfs::filer_meta_service_client::FilerMetaServiceClient;
+use crate::powerfs::RaftMessageRequest;
 
 const SNAPSHOT_THRESHOLD: u64 = 10000;
 
@@ -118,6 +122,7 @@ pub struct RaftGroup {
 }
 
 impl RaftGroup {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_id: ShardId,
         id: u64,
@@ -126,6 +131,7 @@ impl RaftGroup {
         storage_path: &str,
         leader_state: Arc<AtomicBool>,
         leader_address: Arc<StdRwLock<String>>,
+        message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
     ) -> Result<Self, String> {
         let storage_path = format!("{}/shard_{}", storage_path, shard_id.0);
 
@@ -176,7 +182,6 @@ impl RaftGroup {
             .map_err(|e| format!("failed to create raft node: {}", e))?;
 
         let (propose_tx, propose_rx) = mpsc::channel(1000);
-        let (message_tx, _message_rx) = tokio::sync::broadcast::channel(1000);
         let (step_tx, step_rx) = mpsc::channel(1000);
         let (apply_tx, apply_rx) = mpsc::channel(1000);
 
@@ -659,11 +664,18 @@ pub struct RaftGroupManager {
     // that get_shard_status can read leader_state/applied_index without
     // acquiring the group RwLock (which is permanently held by run()).
     shard_status_arcs: RwLock<HashMap<ShardId, ShardStatusArcs>>,
+    // Per-shard propose senders, cached at group creation to avoid needing
+    // the group RwLock (which is permanently held by run()).
+    shard_propose_txs: RwLock<HashMap<ShardId, mpsc::Sender<ProposeRequest>>>,
+    // Per-shard step senders, cached at group creation for the same reason.
+    shard_step_txs: RwLock<HashMap<ShardId, mpsc::Sender<RaftMessage>>>,
     node_id: u64,
     node_address: String,
     storage_path: String,
     message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
     apply_tx: mpsc::Sender<ApplyEntry>,
+    peers: RwLock<HashMap<u64, Peer>>,
+    filer_channels: RwLock<HashMap<String, Channel>>,
 }
 
 impl RaftGroupManager {
@@ -674,12 +686,138 @@ impl RaftGroupManager {
         Self {
             groups: RwLock::new(HashMap::new()),
             shard_status_arcs: RwLock::new(HashMap::new()),
+            shard_propose_txs: RwLock::new(HashMap::new()),
+            shard_step_txs: RwLock::new(HashMap::new()),
             node_id,
             node_address,
             storage_path,
             message_tx,
             apply_tx,
+            peers: RwLock::new(HashMap::new()),
+            filer_channels: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Register a peer node for Raft communication
+    pub async fn register_peer(&self, peer: Peer) {
+        let peer_id = peer.id;
+        let mut peers = self.peers.write().await;
+        peers.insert(peer_id, peer);
+        info!("Registered peer: id={}", peer_id);
+    }
+
+    /// Get peer address by ID
+    pub async fn get_peer_address(&self, peer_id: u64) -> Option<String> {
+        let peers = self.peers.read().await;
+        peers.get(&peer_id).map(|p| p.address.clone())
+    }
+
+    /// Send a Raft message to a peer via gRPC
+    async fn send_raft_message_to_peer(
+        &self,
+        peer_address: &str,
+        shard_id: ShardId,
+        message: &RaftMessage,
+    ) {
+        let channel = match self.get_or_create_filer_channel(peer_address).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                error!("Failed to get channel for peer {}: {}", peer_address, e);
+                return;
+            }
+        };
+
+        let mut buf = Vec::new();
+        if let Err(e) = message.write_to_vec(&mut buf) {
+            error!("Failed to serialize Raft message: {}", e);
+            return;
+        }
+
+        let mut client = FilerMetaServiceClient::new(channel);
+        let request = RaftMessageRequest {
+            shard_id: shard_id.0,
+            message: buf,
+        };
+
+        match client.send_raft_message(tonic::Request::new(request)).await {
+            Ok(_) => {
+                debug!(
+                    "Raft message sent to peer {} for shard {}",
+                    peer_address, shard_id.0
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to send Raft message to peer {}: {}",
+                    peer_address, e
+                );
+                // Invalidate the channel so we try to reconnect next time
+                let mut channels = self.filer_channels.write().await;
+                channels.remove(peer_address);
+            }
+        }
+    }
+
+    /// Get or create a gRPC channel to a Filer peer
+    async fn get_or_create_filer_channel(&self, peer_address: &str) -> Result<Channel, String> {
+        {
+            let channels = self.filer_channels.read().await;
+            if let Some(ch) = channels.get(peer_address) {
+                return Ok(ch.clone());
+            }
+        }
+
+        info!("Creating new channel to filer peer: {}", peer_address);
+        let grpc_addr = format!("http://{}", peer_address);
+        let endpoint = Channel::from_shared(grpc_addr)
+            .map_err(|e| format!("invalid address: {}", e))?
+            .connect_timeout(Duration::from_secs(3));
+
+        // Wrap with explicit timeout as a safety net
+        let channel = tokio::time::timeout(Duration::from_secs(5), endpoint.connect())
+            .await
+            .map_err(|_| "connection timed out".to_string())?
+            .map_err(|e| format!("failed to connect: {}", e))?;
+
+        let mut channels = self.filer_channels.write().await;
+        channels.insert(peer_address.to_string(), channel.clone());
+
+        info!("Successfully connected to filer peer: {}", peer_address);
+        Ok(channel)
+    }
+
+    /// Start the Raft message transmission loop
+    pub async fn start_message_transmitter(self: Arc<Self>) {
+        let mut message_rx = self.message_tx.subscribe();
+
+        tokio::spawn(async move {
+            info!("Raft message transmitter started");
+
+            while let Ok(outgoing) = message_rx.recv().await {
+                let peer_address = match self.get_peer_address(outgoing.to_id).await {
+                    Some(addr) => addr,
+                    None => {
+                        warn!("Peer {} not found for Raft message", outgoing.to_id);
+                        continue;
+                    }
+                };
+
+                // Deserialize the message
+                let mut msg = RaftMessage::new();
+                if let Err(e) = msg.merge_from_bytes(&outgoing.message) {
+                    error!("Failed to deserialize outgoing Raft message: {}", e);
+                    continue;
+                }
+
+                // Send via gRPC
+                let self_clone = self.clone();
+                self_clone
+                    .send_raft_message_to_peer(&peer_address, outgoing.shard_id, &msg)
+                    .await;
+            }
+
+            info!("Raft message transmitter stopped");
+        });
     }
 
     pub async fn create_group(
@@ -703,6 +841,7 @@ impl RaftGroupManager {
             &self.storage_path,
             leader_state.clone(),
             leader_address,
+            self.message_tx.clone(),
         )?;
 
         // Save Arc clones of the status handles so get_shard_status can read
@@ -711,6 +850,11 @@ impl RaftGroupManager {
             leader_state,
             applied_index: group.applied_index_handle(),
         };
+
+        // Cache propose_tx and step_tx so we can use them without acquiring
+        // the group RwLock (which is permanently held by run()).
+        let propose_tx = group.get_propose_tx();
+        let step_tx = group.get_step_tx();
 
         let group_ref = Arc::new(RwLock::new(group));
         let group_clone = group_ref.clone();
@@ -729,6 +873,14 @@ impl RaftGroupManager {
             .write()
             .await
             .insert(shard_id, status_arcs);
+
+        // Cache the senders
+        self.shard_propose_txs
+            .write()
+            .await
+            .insert(shard_id, propose_tx);
+        self.shard_step_txs.write().await.insert(shard_id, step_tx);
+
         Ok(group_ref)
     }
 
@@ -752,19 +904,11 @@ impl RaftGroupManager {
     }
 
     pub async fn propose(&self, shard_id: ShardId, data: Vec<u8>) -> Result<u64, String> {
-        // Clone the Arc<RwLock<RaftGroup>> and drop the groups read guard
-        // before awaiting on the group's own read lock, so the Future stays Send.
-        let group_arc = {
-            let groups = self.groups.read().await;
-            groups
-                .get(&shard_id)
+        let propose_tx = {
+            let txs = self.shard_propose_txs.read().await;
+            txs.get(&shard_id)
                 .ok_or_else(|| format!("shard {} not found", shard_id.0))?
                 .clone()
-        };
-
-        let propose_tx = {
-            let group_guard = group_arc.read().await;
-            group_guard.get_propose_tx()
         };
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -783,17 +927,11 @@ impl RaftGroupManager {
     }
 
     pub async fn step(&self, shard_id: ShardId, msg: RaftMessage) -> Result<(), String> {
-        let group_arc = {
-            let groups = self.groups.read().await;
-            groups
-                .get(&shard_id)
+        let step_tx = {
+            let txs = self.shard_step_txs.read().await;
+            txs.get(&shard_id)
                 .ok_or_else(|| format!("shard {} not found", shard_id.0))?
                 .clone()
-        };
-
-        let step_tx = {
-            let group_guard = group_arc.read().await;
-            group_guard.get_step_tx()
         };
 
         step_tx

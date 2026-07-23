@@ -82,6 +82,7 @@ pub struct S3Config {
 pub struct FuseConfig {
     pub mount_point: String,
     pub master_addresses: Vec<String>,
+    pub filer_addresses: Vec<String>,
     pub collection: String,
     pub replication: String,
     pub threads: usize,
@@ -172,6 +173,7 @@ impl Default for FuseConfig {
         Self {
             mount_point: "/mnt/powerfs".to_string(),
             master_addresses: vec!["http://localhost:9333".to_string()],
+            filer_addresses: Vec::new(),
             collection: "default".to_string(),
             replication: "000".to_string(),
             threads: 8,

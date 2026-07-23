@@ -1,5 +1,15 @@
 use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
+use powerfs_filer::powerfs::filer_meta_service_client::FilerMetaServiceClient;
+use powerfs_filer::powerfs::{
+    CreateEntryRequest as FilerCreateEntryRequest, DeleteEntryRequest as FilerDeleteEntryRequest,
+    Entry as FilerEntry, GetEntryByInodeRequest as FilerGetEntryByInodeRequest,
+    GetEntryRequest as FilerGetEntryRequest, LeaseReleaseRequest as FilerLeaseReleaseRequest,
+    LeaseRenewRequest as FilerLeaseRenewRequest, LeaseRequest as FilerLeaseRequest,
+    ListEntriesRequest as FilerListEntriesRequest,
+    LookupDirectoryEntryRequest as FilerLookupDirectoryEntryRequest,
+    UpdateEntryRequest as FilerUpdateEntryRequest,
+};
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
     DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
@@ -81,27 +91,63 @@ pub struct PowerFuseClient {
     connection_manager: Arc<MasterConnectionManager>,
     /// Semaphore to limit concurrent gRPC requests to Master
     master_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Filer addresses for metadata operations
+    filer_addresses: Arc<Vec<String>>,
+    /// Cached Filer channel
+    filer_channel: RwLock<Option<Channel>>,
+    /// Collection name (used as bucket name in Filer path model)
+    collection: String,
 }
 
 impl PowerFuseClient {
-    pub fn new(master_addrs: &[&str], runtime_handle: Handle) -> Arc<Self> {
-        Self::with_config(master_addrs, runtime_handle, GrpcConfig::default())
+    pub fn new(
+        master_addrs: &[&str],
+        filer_addrs: &[&str],
+        runtime_handle: Handle,
+        collection: &str,
+    ) -> Arc<Self> {
+        let master_addrs: Vec<String> = master_addrs.iter().map(|s| s.to_string()).collect();
+        let filer_addrs: Vec<String> = filer_addrs.iter().map(|s| s.to_string()).collect();
+        let connection_manager = Arc::new(MasterConnectionManager::new(
+            master_addrs.clone(),
+            ConnectionConfig::default(),
+        ));
+        let master_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            GrpcConfig::default().max_concurrent_requests,
+        ));
+        Arc::new(PowerFuseClient {
+            master_addresses: Arc::new(master_addrs),
+            current_master_index: std::sync::atomic::AtomicUsize::new(0),
+            master_channel: RwLock::new(None),
+            current_master_addr: RwLock::new(None),
+            volume_channels: RwLock::new(HashMap::new()),
+            runtime_handle,
+            config: GrpcConfig::default(),
+            connection_manager,
+            master_semaphore,
+            filer_addresses: Arc::new(filer_addrs),
+            filer_channel: RwLock::new(None),
+            collection: collection.to_string(),
+        })
     }
 
     pub fn with_config(
         master_addrs: &[&str],
+        filer_addrs: &[&str],
         runtime_handle: Handle,
         config: GrpcConfig,
+        collection: &str,
     ) -> Arc<Self> {
-        let addrs: Vec<String> = master_addrs.iter().map(|s| s.to_string()).collect();
+        let master_addrs: Vec<String> = master_addrs.iter().map(|s| s.to_string()).collect();
+        let filer_addrs: Vec<String> = filer_addrs.iter().map(|s| s.to_string()).collect();
         let connection_manager = Arc::new(MasterConnectionManager::new(
-            addrs.clone(),
+            master_addrs.clone(),
             ConnectionConfig::default(),
         ));
         let master_semaphore =
             Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
         Arc::new(PowerFuseClient {
-            master_addresses: Arc::new(addrs),
+            master_addresses: Arc::new(master_addrs),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
             master_channel: RwLock::new(None),
             current_master_addr: RwLock::new(None),
@@ -110,7 +156,29 @@ impl PowerFuseClient {
             config,
             connection_manager,
             master_semaphore,
+            filer_addresses: Arc::new(filer_addrs),
+            filer_channel: RwLock::new(None),
+            collection: collection.to_string(),
         })
+    }
+
+    /// Create a new client without Filer addresses (legacy compatibility)
+    pub fn without_filer(master_addrs: &[&str], runtime_handle: Handle) -> Arc<Self> {
+        Self::new(master_addrs, &[], runtime_handle, "default")
+    }
+
+    /// Get collection name (used as bucket name in Filer)
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// Convert a FUSE path to Filer path (prepend collection as bucket)
+    fn to_filer_path(&self, fuse_path: &str) -> String {
+        if fuse_path.starts_with('/') {
+            format!("{}{}", self.collection, fuse_path)
+        } else {
+            format!("{}/{}", self.collection, fuse_path)
+        }
     }
 
     /// Expose the underlying connection manager for callers (e.g. the
@@ -191,6 +259,600 @@ impl PowerFuseClient {
         volume_channels.insert(addr.to_string(), channel.clone());
 
         Ok(channel)
+    }
+
+    /// Get or create a Filer channel for metadata operations
+    async fn get_or_create_filer_channel(&self) -> Result<Channel, String> {
+        if self.filer_addresses.is_empty() {
+            return Err("No filer addresses configured".to_string());
+        }
+
+        {
+            let channel = self.filer_channel.read().await;
+            if let Some(ch) = &*channel {
+                return Ok(ch.clone());
+            }
+        }
+
+        for addr in &*self.filer_addresses {
+            info!("Trying to connect to filer: {}", addr);
+            match self.create_channel(addr).await {
+                Ok(ch) => {
+                    info!("Connected to filer: {}", addr);
+                    let mut filer_channel = self.filer_channel.write().await;
+                    *filer_channel = Some(ch.clone());
+                    return Ok(ch);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to filer {}: {}", addr, e);
+                }
+            }
+        }
+
+        Err("No filer available".to_string())
+    }
+
+    /// Check if Filer is configured
+    pub fn has_filer(&self) -> bool {
+        !self.filer_addresses.is_empty()
+    }
+
+    /// Invalidate cached Filer channel
+    pub async fn invalidate_filer_channel(&self) {
+        let mut filer_channel = self.filer_channel.write().await;
+        *filer_channel = None;
+        warn!("Invalidated filer channel");
+    }
+
+    /// Create entry via Filer service
+    pub async fn filer_create_entry(
+        &self,
+        entry: FilerEntry,
+        client_id: &str,
+    ) -> Result<u64, String> {
+        let filer_directory = self.to_filer_path(&entry.directory);
+        debug!(
+            "filer_create_entry: name={}, directory={} (fuse_dir={})",
+            entry.name, filer_directory, entry.directory
+        );
+
+        let mut filer_entry = entry.clone();
+        filer_entry.directory = filer_directory;
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerCreateEntryRequest {
+                entry: Some(filer_entry.clone()),
+                client_id: client_id.to_string(),
+            };
+
+            match client.create_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("filer_create_entry succeeded: inode={}", resp.inode);
+                    return Ok(resp.inode);
+                }
+                Err(e) => {
+                    let msg = format!("filer_create_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_create_entry failed after max retries".to_string())
+    }
+
+    /// Get entry via Filer service
+    pub async fn filer_get_entry(&self, path: &str) -> Result<Option<FilerEntry>, String> {
+        let filer_path = self.to_filer_path(path);
+        debug!("filer_get_entry: path={} (fuse_path={})", filer_path, path);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerGetEntryRequest {
+                path: filer_path.clone(),
+            };
+
+            match client.get_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("filer_get_entry succeeded: found={}", resp.entry.is_some());
+                    return Ok(resp.entry);
+                }
+                Err(e) => {
+                    let msg = format!("filer_get_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_get_entry failed after max retries".to_string())
+    }
+
+    /// Get entry by inode via Filer service
+    pub async fn filer_get_entry_by_inode(
+        &self,
+        inode: u64,
+    ) -> Result<Option<(FilerEntry, String)>, String> {
+        debug!("filer_get_entry_by_inode: inode={}", inode);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerGetEntryByInodeRequest { inode };
+
+            match client
+                .get_entry_by_inode(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!("filer_get_entry_by_inode succeeded: found={}", resp.found);
+                    if resp.found {
+                        return Ok(Some((resp.entry.unwrap(), resp.path)));
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "filer_get_entry_by_inode failed (attempt {}): {}",
+                        attempt, e
+                    );
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_get_entry_by_inode failed after max retries".to_string())
+    }
+
+    /// Update entry via Filer service
+    pub async fn filer_update_entry(
+        &self,
+        entry: &FilerEntry,
+        client_id: &str,
+        expected_size: u64,
+        is_truncate: bool,
+    ) -> Result<bool, String> {
+        let filer_directory = self.to_filer_path(&entry.directory);
+        debug!(
+            "filer_update_entry: name={}, directory={} (fuse_dir={})",
+            entry.name, filer_directory, entry.directory
+        );
+
+        let mut filer_entry = entry.clone();
+        filer_entry.directory = filer_directory;
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerUpdateEntryRequest {
+                entry: Some(filer_entry.clone()),
+                client_id: client_id.to_string(),
+                expected_size,
+                is_truncate,
+            };
+
+            match client.update_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("filer_update_entry succeeded: success={}", resp.success);
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("filer_update_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_update_entry failed after max retries".to_string())
+    }
+
+    /// Delete entry via Filer service
+    pub async fn filer_delete_entry(
+        &self,
+        ino: u64,
+        is_directory: bool,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        debug!(
+            "filer_delete_entry: ino={}, is_directory={}",
+            ino, is_directory
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerDeleteEntryRequest {
+                ino,
+                is_directory,
+                client_id: client_id.to_string(),
+            };
+
+            match client.delete_entry(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("filer_delete_entry succeeded: success={}", resp.success);
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("filer_delete_entry failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_delete_entry failed after max retries".to_string())
+    }
+
+    /// List entries via Filer service
+    pub async fn filer_list_entries(
+        &self,
+        parent_ino: u64,
+        limit: u64,
+        start_after: &str,
+    ) -> Result<Vec<FilerEntry>, String> {
+        debug!(
+            "filer_list_entries: parent_ino={}, limit={}, start_after={}",
+            parent_ino, limit, start_after
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerListEntriesRequest {
+                parent_ino,
+                limit,
+                last_name: start_after.to_string(),
+            };
+
+            match client.list_entries(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!(
+                        "filer_list_entries succeeded: {} entries",
+                        resp.entries.len()
+                    );
+                    return Ok(resp.entries);
+                }
+                Err(e) => {
+                    let msg = format!("filer_list_entries failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_list_entries failed after max retries".to_string())
+    }
+
+    /// Lookup directory entry via Filer service
+    pub async fn filer_lookup_directory_entry(
+        &self,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<Option<FilerEntry>, String> {
+        debug!(
+            "filer_lookup_directory_entry: parent_ino={}, name={}",
+            parent_ino, name
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerLookupDirectoryEntryRequest {
+                parent_ino,
+                name: name.to_string(),
+            };
+
+            match client
+                .lookup_directory_entry(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if !resp.error.is_empty() {
+                        return Err(resp.error);
+                    }
+                    debug!(
+                        "filer_lookup_directory_entry succeeded: found={}",
+                        resp.entry.is_some()
+                    );
+                    return Ok(resp.entry);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "filer_lookup_directory_entry failed (attempt {}): {}",
+                        attempt, e
+                    );
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_lookup_directory_entry failed after max retries".to_string())
+    }
+
+    /// Acquire lease via Filer service
+    pub async fn filer_acquire_lease(
+        &self,
+        inode: u64,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        debug!(
+            "filer_acquire_lease: inode={}, client_id={}, duration_ms={}",
+            inode, client_id, duration_ms
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerLeaseRequest {
+                inode,
+                client_id: client_id.to_string(),
+                duration_ms,
+            };
+
+            match client.acquire_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!(
+                            "filer_acquire_lease succeeded: lease_id={}, epoch={}",
+                            resp.lease_id, resp.epoch
+                        );
+                        return Ok((resp.lease_id, resp.epoch));
+                    } else {
+                        let msg = format!("filer_acquire_lease failed: {}", resp.error);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("filer_acquire_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_acquire_lease failed after max retries".to_string())
+    }
+
+    /// Release lease via Filer service
+    pub async fn filer_release_lease(&self, lease_id: &str) -> Result<bool, String> {
+        debug!("filer_release_lease: lease_id={}", lease_id);
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerLeaseReleaseRequest {
+                lease_id: lease_id.to_string(),
+            };
+
+            match client.release_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!("filer_release_lease succeeded: success={}", resp.success);
+                    return Ok(resp.success);
+                }
+                Err(e) => {
+                    let msg = format!("filer_release_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_release_lease failed after max retries".to_string())
+    }
+
+    /// Renew lease via Filer service
+    pub async fn filer_renew_lease(
+        &self,
+        lease_id: &str,
+        duration_ms: u64,
+    ) -> Result<(bool, u64), String> {
+        debug!(
+            "filer_renew_lease: lease_id={}, duration_ms={}",
+            lease_id, duration_ms
+        );
+
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_filer_channel().await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!("Failed to get filer channel (attempt {}): {}", attempt, e);
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = FilerMetaServiceClient::new(channel);
+            let request = FilerLeaseRenewRequest {
+                lease_id: lease_id.to_string(),
+                duration_ms,
+            };
+
+            match client.renew_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    debug!(
+                        "filer_renew_lease succeeded: success={}, epoch={}",
+                        resp.success, resp.epoch
+                    );
+                    return Ok((resp.success, resp.epoch));
+                }
+                Err(e) => {
+                    let msg = format!("filer_renew_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_filer_channel().await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+
+        Err("filer_renew_lease failed after max retries".to_string())
     }
 
     async fn create_channel(&self, addr: &str) -> Result<Channel, String> {
@@ -2532,5 +3194,109 @@ impl SyncFuseClient {
 
     pub fn get_statistics(&self, collection: &str) -> Result<StatisticsResponse, String> {
         self.block_with_lookup_timeout(self.client.get_statistics(collection))
+    }
+
+    /// Check if Filer is configured
+    pub fn has_filer(&self) -> bool {
+        self.client.has_filer()
+    }
+
+    /// Create entry via Filer service
+    pub fn filer_create_entry(&self, entry: FilerEntry, client_id: &str) -> Result<u64, String> {
+        self.block_with_metadata_timeout(self.client.filer_create_entry(entry, client_id))
+    }
+
+    /// Get entry via Filer service
+    pub fn filer_get_entry(&self, path: &str) -> Result<Option<FilerEntry>, String> {
+        self.block_with_lookup_timeout(self.client.filer_get_entry(path))
+    }
+
+    /// Get entry by inode via Filer service
+    pub fn filer_get_entry_by_inode(
+        &self,
+        inode: u64,
+    ) -> Result<Option<(FilerEntry, String)>, String> {
+        self.block_with_lookup_timeout(self.client.filer_get_entry_by_inode(inode))
+    }
+
+    /// Update entry via Filer service
+    pub fn filer_update_entry(
+        &self,
+        entry: &FilerEntry,
+        client_id: &str,
+        expected_size: u64,
+        is_truncate: bool,
+    ) -> Result<bool, String> {
+        self.block_with_metadata_timeout(self.client.filer_update_entry(
+            entry,
+            client_id,
+            expected_size,
+            is_truncate,
+        ))
+    }
+
+    /// Delete entry via Filer service
+    pub fn filer_delete_entry(
+        &self,
+        ino: u64,
+        is_directory: bool,
+        client_id: &str,
+    ) -> Result<bool, String> {
+        self.block_with_metadata_timeout(self.client.filer_delete_entry(
+            ino,
+            is_directory,
+            client_id,
+        ))
+    }
+
+    /// List entries via Filer service
+    pub fn filer_list_entries(
+        &self,
+        parent_ino: u64,
+        limit: u64,
+        start_after: &str,
+    ) -> Result<Vec<FilerEntry>, String> {
+        self.block_with_metadata_timeout(self.client.filer_list_entries(
+            parent_ino,
+            limit,
+            start_after,
+        ))
+    }
+
+    /// Lookup directory entry via Filer service
+    pub fn filer_lookup_directory_entry(
+        &self,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<Option<FilerEntry>, String> {
+        self.block_with_lookup_timeout(self.client.filer_lookup_directory_entry(parent_ino, name))
+    }
+
+    /// Acquire lease via Filer service
+    pub fn filer_acquire_lease(
+        &self,
+        inode: u64,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        self.block_with_metadata_timeout(self.client.filer_acquire_lease(
+            inode,
+            client_id,
+            duration_ms,
+        ))
+    }
+
+    /// Release lease via Filer service
+    pub fn filer_release_lease(&self, lease_id: &str) -> Result<bool, String> {
+        self.block_with_metadata_timeout(self.client.filer_release_lease(lease_id))
+    }
+
+    /// Renew lease via Filer service
+    pub fn filer_renew_lease(
+        &self,
+        lease_id: &str,
+        duration_ms: u64,
+    ) -> Result<(bool, u64), String> {
+        self.block_with_metadata_timeout(self.client.filer_renew_lease(lease_id, duration_ms))
     }
 }

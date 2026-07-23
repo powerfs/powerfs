@@ -75,6 +75,35 @@ impl WriteBuffer {
         let buffers = self.buffers.read().unwrap();
         buffers.get(&inode).map(|e| !e.is_empty()).unwrap_or(false)
     }
+
+    /// 清除指定 inode 的所有写缓冲
+    pub fn clear_inode(&self, inode: u64) {
+        let mut buffers = self.buffers.write().unwrap();
+        buffers.remove(&inode);
+    }
+
+    /// 移除指定 inode 中，offset >= new_size 的条目
+    /// 对于部分重叠的条目（offset < new_size 但 end > new_size），会截断其数据
+    pub fn remove_after(&self, inode: u64, new_size: u64) {
+        let mut buffers = self.buffers.write().unwrap();
+        if let Some(entries) = buffers.get_mut(&inode) {
+            entries.retain_mut(|e| {
+                let end = e.offset + e.data.len() as u64;
+                if e.offset >= new_size {
+                    // 完全在 new_size 之后，移除
+                    false
+                } else if end > new_size {
+                    // 部分重叠，截断数据
+                    let truncate_len = (new_size - e.offset) as usize;
+                    e.data.truncate(truncate_len);
+                    true
+                } else {
+                    // 完全在 new_size 之前，保留
+                    true
+                }
+            });
+        }
+    }
 }
 
 /// 数据管理器
@@ -249,11 +278,12 @@ impl DataManager {
         }
     }
 
-    /// 截断文件（修复历史问题：清理 chunks）
+    /// 截断文件（清理 chunks 和写缓冲）
     ///
     /// 1. 更新本地文件大小
     /// 2. 清理超过 new_size 的 chunk 缓存
-    /// 3. 清理 dirty_chunks 中超过 new_size 的标记
+    /// 3. 清理超过 new_size 的写缓冲
+    /// 4. 清理 dirty_chunks 中超过 new_size 的标记
     pub fn truncate(&self, ino: u64, new_size: u64) {
         // 1. 更新本地大小
         self.set_file_size(ino, new_size);
@@ -261,7 +291,14 @@ impl DataManager {
         // 2. 清理超过 new_size 的 chunk 缓存
         self.chunk_cache.remove_after(ino, new_size);
 
-        // 3. 清理 dirty_chunks
+        // 3. 清理超过 new_size 的写缓冲
+        if new_size == 0 {
+            self.write_buffer.clear_inode(ino);
+        } else {
+            self.write_buffer.remove_after(ino, new_size);
+        }
+
+        // 4. 清理 dirty_chunks
         let max_chunk_index = if new_size == 0 {
             0
         } else {

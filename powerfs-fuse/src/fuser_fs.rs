@@ -1698,6 +1698,7 @@ impl Clone for PowerFsFuserFs {
 pub struct FuserApp {
     mount_point: String,
     master_addresses: Vec<String>,
+    filer_addresses: Vec<String>,
     collection: String,
     replication: String,
     num_threads: usize,
@@ -1708,6 +1709,7 @@ pub struct FuserApp {
 impl FuserApp {
     pub async fn new(
         master_addrs: &[String],
+        filer_addrs: &[String],
         mount_point: &str,
         collection: &str,
         replication: &str,
@@ -1720,6 +1722,7 @@ impl FuserApp {
         Ok(Self {
             mount_point: mount_point.to_string(),
             master_addresses: master_addrs.to_vec(),
+            filer_addresses: filer_addrs.to_vec(),
             collection: collection.to_string(),
             replication: replication.to_string(),
             num_threads,
@@ -1779,7 +1782,13 @@ impl FuserApp {
 
         let master_addrs_ref: Vec<&str> =
             self.master_addresses.iter().map(|s| s.as_str()).collect();
-        let grpc_client = PowerFuseClient::new(&master_addrs_ref, self.runtime_handle.clone());
+        let filer_addrs_ref: Vec<&str> = self.filer_addresses.iter().map(|s| s.as_str()).collect();
+        let grpc_client = PowerFuseClient::new(
+            &master_addrs_ref,
+            &filer_addrs_ref,
+            self.runtime_handle.clone(),
+            &self.collection,
+        );
         let sync_client = Arc::new(SyncFuseClient::new(grpc_client.clone()));
 
         // 生成 client_id

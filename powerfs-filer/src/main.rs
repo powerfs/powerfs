@@ -1,6 +1,7 @@
 use clap::Parser;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
@@ -45,6 +46,9 @@ struct Args {
 
     #[arg(long, default_values = ["127.0.0.1:8889"])]
     peers: Vec<String>,
+
+    #[arg(long, default_value = "default")]
+    default_bucket: String,
 }
 
 #[tokio::main]
@@ -100,6 +104,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    // Register peers first so Raft message transmitter can send to them
+    for peer in &peers {
+        raft_group_manager.register_peer(peer.clone()).await;
+    }
+
+    // Start Raft message transmitter BEFORE creating shards
+    // so that broadcast channel has an active receiver when Raft starts sending messages
+    raft_group_manager.clone().start_message_transmitter().await;
+
     for i in 0..args.shard_count {
         let shard_id = ShardId(i as u64);
         meta_shard_manager
@@ -139,6 +152,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(grpc_addr);
 
     info!("Filer server started successfully");
+
+    // Initialize default bucket asynchronously with retries (won't block startup)
+    let meta_shard_manager_clone = meta_shard_manager.clone();
+    let default_bucket = args.default_bucket.clone();
+    tokio::spawn(async move {
+        info!("Initializing default bucket: {}", default_bucket);
+        let mut retries = 0;
+        let max_retries = 30;
+        loop {
+            match meta_shard_manager_clone
+                .ensure_bucket_root(&default_bucket)
+                .await
+            {
+                Ok(root_inode) => {
+                    info!(
+                        "Default bucket '{}' initialized with root inode {}",
+                        default_bucket, root_inode
+                    );
+                    break;
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries >= max_retries {
+                        warn!(
+                            "Failed to initialize default bucket '{}' after {} retries: {}",
+                            default_bucket, max_retries, e
+                        );
+                        break;
+                    }
+                    debug!(
+                        "Retry {}/{}: failed to initialize default bucket '{}': {}",
+                        retries, max_retries, default_bucket, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    });
 
     tokio::spawn(async move {
         if let Err(e) = grpc_server.await {

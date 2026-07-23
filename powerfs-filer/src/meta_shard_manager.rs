@@ -837,4 +837,13 @@ impl MetaShardManager {
         info.expires_at = Instant::now() + Duration::from_millis(duration_ms);
         Ok(info.epoch)
     }
+
+    /// Step a Raft message to the appropriate shard's Raft group
+    pub async fn step_raft_message(
+        &self,
+        shard_id: ShardId,
+        msg: raft::eraftpb::Message,
+    ) -> Result<(), String> {
+        self.raft_group_manager.step(shard_id, msg).await
+    }
 }

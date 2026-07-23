@@ -448,6 +448,23 @@ pub struct PullDeltaResponse {
     #[prost(message, optional, tag = "4")]
     pub server_vclock: ::core::option::Option<VectorClock>,
 }
+/// Raft message exchange types
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaftMessageRequest {
+    #[prost(uint64, tag = "1")]
+    pub shard_id: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub message: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaftMessageResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod filer_meta_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -859,6 +876,32 @@ pub mod filer_meta_service_client {
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "RenewLease"));
             self.inner.unary(req, path, codec).await
         }
+        /// Raft message exchange for multi-Filer communication
+        pub async fn send_raft_message(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RaftMessageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/SendRaftMessage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.FilerMetaService", "SendRaftMessage"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_shard_stats(
             &mut self,
             request: impl tonic::IntoRequest<super::GetShardStatsRequest>,
@@ -1006,6 +1049,14 @@ pub mod filer_meta_service_server {
             request: tonic::Request<super::LeaseRenewRequest>,
         ) -> std::result::Result<
             tonic::Response<super::LeaseRenewResponse>,
+            tonic::Status,
+        >;
+        /// Raft message exchange for multi-Filer communication
+        async fn send_raft_message(
+            &self,
+            request: tonic::Request<super::RaftMessageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
             tonic::Status,
         >;
         async fn get_shard_stats(
@@ -1692,6 +1743,53 @@ pub mod filer_meta_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = RenewLeaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.FilerMetaService/SendRaftMessage" => {
+                    #[allow(non_camel_case_types)]
+                    struct SendRaftMessageSvc<T: FilerMetaService>(pub Arc<T>);
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::RaftMessageRequest>
+                    for SendRaftMessageSvc<T> {
+                        type Response = super::RaftMessageResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RaftMessageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as FilerMetaService>::send_raft_message(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = SendRaftMessageSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
