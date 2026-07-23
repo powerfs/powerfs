@@ -7,11 +7,14 @@ use axum::{
 };
 use log::info;
 use powerfs_common::error::PowerFsError;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bucket_manager::BucketManager;
 use crate::entry_manager::EntryManager;
-use crate::meta_shard_manager::{FilerStatus, MetaShardManager, ShardDetail};
+use crate::meta_shard_manager::{
+    CrdtOverview, FilerStatus, MetaShardManager, OrsetStateDetail, ShardDetail,
+};
 use crate::metadata_store::MetadataStore;
 use crate::raft_group_manager::ShardId;
 use crate::s3_handler::S3Handler;
@@ -69,6 +72,15 @@ impl FilerServer {
             .route("/admin/status", get(admin_status))
             .route("/admin/shards", get(admin_list_shards))
             .route("/admin/shards/:id", get(admin_get_shard))
+            // CRDT management routes
+            .route("/admin/crdt/overview", get(admin_crdt_overview))
+            .route("/admin/crdt/shards/:id", get(admin_crdt_shard_states))
+            .route(
+                "/admin/crdt/shards/:id/dirs/:dir_ino",
+                get(admin_crdt_dir_state),
+            )
+            .route("/admin/crdt/cleanup", post(admin_crdt_cleanup))
+            // Balancer routes
             .route("/admin/balancer/status", get(admin_balancer_status))
             .route("/admin/balancer/start", post(admin_balancer_start))
             .route("/admin/balancer/stop", post(admin_balancer_stop))
@@ -213,4 +225,55 @@ async fn admin_balancer_set_config(
 ) -> axum::response::Response {
     state.shard_scheduler.set_config(config);
     (axum::http::StatusCode::OK, "Config updated").into_response()
+}
+
+// ========================================================================
+// CRDT 管理接口
+// ========================================================================
+
+async fn admin_crdt_overview(State(state): State<Arc<FilerState>>) -> Json<CrdtOverview> {
+    let overview = state.meta_shard_manager.get_crdt_overview();
+    Json(overview)
+}
+
+async fn admin_crdt_shard_states(
+    State(state): State<Arc<FilerState>>,
+    Path(id): Path<u64>,
+) -> Json<Vec<OrsetStateDetail>> {
+    let states = state.meta_shard_manager.get_shard_orset_states(ShardId(id));
+    Json(states)
+}
+
+async fn admin_crdt_dir_state(
+    State(state): State<Arc<FilerState>>,
+    Path((id, dir_ino)): Path<(u64, u64)>,
+) -> axum::response::Response {
+    match state
+        .meta_shard_manager
+        .get_dir_orset_state(ShardId(id), dir_ino)
+    {
+        Some(state) => Json(state).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            "Directory OR-Set state not found",
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_crdt_cleanup(
+    State(state): State<Arc<FilerState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let ttl_hours = params
+        .get("ttl")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(24);
+
+    let cleaned = state.meta_shard_manager.cleanup_tombstones(ttl_hours);
+    Json(serde_json::json!({
+        "cleaned_count": cleaned,
+        "ttl_hours": ttl_hours
+    }))
+    .into_response()
 }

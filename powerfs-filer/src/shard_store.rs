@@ -4,11 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::crdt_orset::{ServerDirORSet, Tombstone};
 use crate::raft_group_manager::{ShardCommand, ShardId};
 
 const CF_INODES: &str = "inodes";
 const CF_DIR_ENTRIES: &str = "dir_entries";
 const CF_STATS: &str = "stats";
+const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persistent metadata
+const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
+const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -33,7 +37,7 @@ pub struct InodeInfo {
     pub etag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FileType {
     File,
     Directory,
@@ -56,6 +60,7 @@ pub struct ShardStore {
     inodes: RwLock<HashMap<u64, InodeInfo>>,
     directory_entries: RwLock<HashMap<u64, HashMap<String, u64>>>,
     stats: RwLock<ShardStats>,
+    root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
 }
 
 impl ShardStore {
@@ -68,6 +73,9 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_INODES, rocksdb::Options::default()),
             ColumnFamilyDescriptor::new(CF_DIR_ENTRIES, rocksdb::Options::default()),
             ColumnFamilyDescriptor::new(CF_STATS, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_METADATA, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_ORSET_STATE, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_TOMBSTONES, rocksdb::Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -86,6 +94,7 @@ impl ShardStore {
                 write_qps: 0,
                 read_qps: 0,
             }),
+            root_inodes: RwLock::new(HashMap::new()),
         };
 
         store.load_data()?;
@@ -96,8 +105,169 @@ impl ShardStore {
         self.load_inodes()?;
         self.load_dir_entries()?;
         self.load_stats()?;
+        self.load_root_inodes()?;
         info!("Shard {} loaded data from rocksdb", self.shard_id.0);
         Ok(())
+    }
+
+    fn load_root_inodes(&mut self) -> Result<(), String> {
+        let cf = match self.db.cf_handle(CF_METADATA) {
+            Some(cf) => cf,
+            None => return Ok(()),
+        };
+
+        if let Ok(Some(data)) = self.db.get_cf(cf, b"root_inodes") {
+            if let Ok(map) = serde_json::from_slice::<HashMap<String, u64>>(&data) {
+                *self.root_inodes.write().unwrap() = map;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn save_root_inodes(&self) {
+        if let Some(cf) = self.db.cf_handle(CF_METADATA) {
+            let root_inodes = self.root_inodes.read().unwrap().clone();
+            if let Ok(data) = serde_json::to_vec(&root_inodes) {
+                let _ = self.db.put_cf(cf, b"root_inodes", &data);
+            }
+        }
+    }
+
+    pub fn get_root_inode(&self, bucket: &str) -> Option<u64> {
+        let root_inodes = self.root_inodes.read().unwrap();
+        root_inodes.get(bucket).cloned()
+    }
+
+    pub fn set_root_inode(&self, bucket: &str, inode: u64) {
+        self.root_inodes
+            .write()
+            .unwrap()
+            .insert(bucket.to_string(), inode);
+        self.save_root_inodes();
+    }
+
+    pub fn list_root_inodes(&self) -> Vec<(String, u64)> {
+        let root_inodes = self.root_inodes.read().unwrap();
+        root_inodes.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    // ========================================================================
+    // CRDT OR-Set State Persistence
+    // ========================================================================
+
+    /// 保存 OR-Set 状态到 RocksDB
+    pub fn save_orset_state(&self, dir_ino: u64, state: &ServerDirORSet) {
+        if let Some(cf) = self.db.cf_handle(CF_ORSET_STATE) {
+            if let Ok(data) = serde_json::to_vec(state) {
+                let key = format!("dir_orset:{}", dir_ino);
+                let _ = self.db.put_cf(cf, key.as_bytes(), &data);
+            }
+        }
+    }
+
+    /// 加载 OR-Set 状态从 RocksDB
+    pub fn load_orset_state(&self, dir_ino: u64) -> Option<ServerDirORSet> {
+        let cf = self.db.cf_handle(CF_ORSET_STATE)?;
+        let key = format!("dir_orset:{}", dir_ino);
+        if let Ok(Some(data)) = self.db.get_cf(cf, key.as_bytes()) {
+            if let Ok(state) = serde_json::from_slice::<ServerDirORSet>(&data) {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    /// 加载所有 OR-Set 状态
+    pub fn load_all_orset_states(&self) -> Vec<(u64, ServerDirORSet)> {
+        let mut states = Vec::new();
+        if let Some(cf) = self.db.cf_handle(CF_ORSET_STATE) {
+            let mut it = self.db.raw_iterator_cf(cf);
+            it.seek_to_first();
+            while it.valid() {
+                if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                    if let Ok(key_str) = std::str::from_utf8(key) {
+                        if let Some(dir_ino_str) = key_str.strip_prefix("dir_orset:") {
+                            if let Ok(dir_ino) = dir_ino_str.parse::<u64>() {
+                                if let Ok(state) = serde_json::from_slice::<ServerDirORSet>(value) {
+                                    states.push((dir_ino, state));
+                                }
+                            }
+                        }
+                    }
+                }
+                it.next();
+            }
+        }
+        states
+    }
+
+    // ========================================================================
+    // CRDT Tombstone Persistence
+    // ========================================================================
+
+    /// 保存 Tombstone 列表到 RocksDB
+    pub fn save_tombstones(&self, entry_key: &str, tombstones: &[Tombstone]) {
+        if let Some(cf) = self.db.cf_handle(CF_TOMBSTONES) {
+            if let Ok(data) = serde_json::to_vec(tombstones) {
+                let key = format!("tombstone:{}", entry_key);
+                let _ = self.db.put_cf(cf, key.as_bytes(), &data);
+            }
+        }
+    }
+
+    /// 加载 Tombstone 列表从 RocksDB
+    pub fn load_tombstones(&self, entry_key: &str) -> Vec<Tombstone> {
+        if let Some(cf) = self.db.cf_handle(CF_TOMBSTONES) {
+            let key = format!("tombstone:{}", entry_key);
+            if let Ok(Some(data)) = self.db.get_cf(cf, key.as_bytes()) {
+                if let Ok(list) = serde_json::from_slice::<Vec<Tombstone>>(&data) {
+                    return list;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// 清理过期的 Tombstone
+    pub fn cleanup_expired_tombstones(&self, ttl_hours: u64) -> usize {
+        let ttl = std::time::Duration::from_secs(ttl_hours * 3600);
+        let mut cleaned_count = 0;
+
+        if let Some(cf) = self.db.cf_handle(CF_TOMBSTONES) {
+            let mut keys_to_delete = Vec::new();
+            let mut it = self.db.raw_iterator_cf(cf);
+            it.seek_to_first();
+
+            while it.valid() {
+                if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                    if let Ok(list) = serde_json::from_slice::<Vec<Tombstone>>(value) {
+                        let remaining: Vec<Tombstone> = list
+                            .iter()
+                            .filter(|t| !t.is_expired(ttl))
+                            .cloned()
+                            .collect();
+
+                        if remaining.len() < list.len() {
+                            if remaining.is_empty() {
+                                keys_to_delete.push(key.to_vec());
+                            } else if let Ok(new_data) = serde_json::to_vec(&remaining) {
+                                let _ = self.db.put_cf(cf, key, &new_data);
+                            }
+                            cleaned_count += list.len() - remaining.len();
+                        }
+                    }
+                }
+                it.next();
+            }
+
+            // 删除空 tombstone 列表
+            for key in keys_to_delete {
+                let _ = self.db.delete_cf(cf, &key);
+            }
+        }
+
+        cleaned_count
     }
 
     fn load_inodes(&mut self) -> Result<(), String> {
@@ -618,5 +788,127 @@ impl ShardStore {
     pub fn contains_inode(&self, inode: u64) -> bool {
         let (start, end) = self.inode_range;
         inode >= start && inode < end
+    }
+
+    // CRDT Delta Operations: Public API for applying deltas
+
+    pub fn current_time() -> u64 {
+        chrono::Utc::now().timestamp() as u64
+    }
+
+    pub fn create_inode(&self, info: InodeInfo) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let inode_key = info.inode.to_be_bytes();
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        self.db
+            .put_cf(cf_inodes, inode_key, &data)
+            .map_err(|e| format!("put inode to rocksdb: {}", e))?;
+
+        let mut inodes = self.inodes.write().unwrap();
+        let mut stats = self.stats.write().unwrap();
+        let is_file = matches!(info.file_type, FileType::File);
+        let is_dir = matches!(info.file_type, FileType::Directory);
+
+        inodes.insert(info.inode, info);
+        stats.inode_count += 1;
+        if is_file {
+            stats.file_count += 1;
+        }
+        if is_dir {
+            stats.dir_count += 1;
+        }
+        self.save_stats();
+
+        Ok(())
+    }
+
+    pub fn add_dir_entry(&self, parent_inode: u64, name: &str, inode: u64) -> Result<(), String> {
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let key = format!("{}:{}", parent_inode, name);
+        let value = inode.to_be_bytes();
+        self.db
+            .put_cf(cf_dir_entries, key.as_bytes(), value)
+            .map_err(|e| format!("put dir entry to rocksdb: {}", e))?;
+
+        let mut dir_entries = self.directory_entries.write().unwrap();
+        dir_entries.entry(parent_inode).or_default();
+        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+            dir.insert(name.to_string(), inode);
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_dir_entry(&self, parent_inode: u64, name: &str) -> Result<(), String> {
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let key = format!("{}:{}", parent_inode, name);
+        self.db
+            .delete_cf(cf_dir_entries, key.as_bytes())
+            .map_err(|e| format!("delete dir entry from rocksdb: {}", e))?;
+
+        let mut dir_entries = self.directory_entries.write().unwrap();
+        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+            dir.remove(name);
+        }
+
+        Ok(())
+    }
+
+    pub fn delete_inode(&self, inode: u64) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        self.db
+            .delete_cf(cf_inodes, inode.to_be_bytes())
+            .map_err(|e| format!("delete inode from rocksdb: {}", e))?;
+
+        let mut inodes = self.inodes.write().unwrap();
+        let mut stats = self.stats.write().unwrap();
+
+        if let Some(info) = inodes.remove(&inode) {
+            let is_file = matches!(info.file_type, FileType::File);
+            let is_dir = matches!(info.file_type, FileType::Directory);
+            stats.inode_count = stats.inode_count.saturating_sub(1);
+            if is_file {
+                stats.file_count = stats.file_count.saturating_sub(1);
+            }
+            if is_dir {
+                stats.dir_count = stats.dir_count.saturating_sub(1);
+            }
+            self.save_stats();
+        }
+
+        Ok(())
+    }
+
+    pub fn update_inode(&self, info: InodeInfo) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        self.db
+            .put_cf(cf_inodes, info.inode.to_be_bytes(), &data)
+            .map_err(|e| format!("put updated inode to rocksdb: {}", e))?;
+
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(info.inode, info);
+
+        Ok(())
     }
 }

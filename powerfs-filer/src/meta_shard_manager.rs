@@ -1,12 +1,18 @@
-use log::info;
+use log::{debug, info, warn};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::crdt_orset::{
+    DirEntryOrset, EntryTag, MergeResult, ServerDirORSet, ServerVectorClock, Tombstone,
+};
 use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
 use crate::shard_store::{InodeInfo, ShardStats, ShardStore};
 use crate::shard_strategy::ShardStrategy;
+
+// POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
+pub const POSIX_ROOT_INODE: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct LeaseInfo {
@@ -14,6 +20,54 @@ struct LeaseInfo {
     client_id: String,
     expires_at: Instant,
     epoch: u64,
+}
+
+// Delta Log: stores applied delta operations for incremental sync
+#[derive(Debug, Clone)]
+struct DeltaLogEntry {
+    client_id: String,
+    seq: u64,
+    delta: crate::powerfs::DeltaOp,
+}
+
+struct DeltaLog {
+    entries: RwLock<Vec<DeltaLogEntry>>,
+    max_size: usize,
+}
+
+impl DeltaLog {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: RwLock::new(Vec::new()),
+            max_size,
+        }
+    }
+
+    fn append(&self, client_id: &str, seq: u64, delta: crate::powerfs::DeltaOp) {
+        let mut entries = self.entries.write().unwrap();
+        entries.push(DeltaLogEntry {
+            client_id: client_id.to_string(),
+            seq,
+            delta,
+        });
+        // Trim old entries if exceeding max_size
+        if entries.len() > self.max_size {
+            let excess = entries.len() - self.max_size;
+            entries.drain(0..excess);
+        }
+    }
+
+    fn get_since(&self, client_vclock: &HashMap<String, u64>) -> Vec<crate::powerfs::DeltaOp> {
+        let entries = self.entries.read().unwrap();
+        entries
+            .iter()
+            .filter(|e| {
+                let client_seq = client_vclock.get(&e.client_id).copied().unwrap_or(0);
+                e.seq > client_seq
+            })
+            .map(|e| e.delta.clone())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +96,34 @@ pub struct FilerStatus {
     pub buckets: Vec<String>,
 }
 
+// ========================================================================
+// CRDT 管理接口类型
+// ========================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrdtOverview {
+    pub total_orset_states: usize,
+    pub shard_states: HashMap<u64, Vec<OrsetStateInfo>>,
+    pub shard_vclocks: HashMap<u64, HashMap<String, u64>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrsetStateInfo {
+    pub dir_ino: u64,
+    pub entry_count: usize,
+    pub tombstone_count: usize,
+    pub vclock_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrsetStateDetail {
+    pub dir_ino: u64,
+    pub entries: HashMap<String, DirEntryOrset>,
+    pub entry_tags: HashMap<String, HashSet<EntryTag>>,
+    pub tombstones: HashMap<String, Vec<Tombstone>>,
+    pub vclock: ServerVectorClock,
+}
+
 pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManager>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
@@ -51,6 +133,12 @@ pub struct MetaShardManager {
     root_inodes: RwLock<HashMap<String, u64>>,
     leases: RwLock<HashMap<String, LeaseInfo>>,
     lease_epoch: std::sync::atomic::AtomicU64,
+    // CRDT: Per-shard vector clocks for tracking all client operations
+    shard_vclocks: RwLock<HashMap<ShardId, ServerVectorClock>>,
+    // CRDT: Delta log for incremental sync (backward compatibility)
+    delta_logs: RwLock<HashMap<ShardId, Arc<DeltaLog>>>,
+    // CRDT: Per-shard per-directory OR-Set state
+    orset_states: RwLock<HashMap<(ShardId, u64), ServerDirORSet>>,
 }
 
 impl MetaShardManager {
@@ -68,6 +156,95 @@ impl MetaShardManager {
             root_inodes: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             lease_epoch: std::sync::atomic::AtomicU64::new(1),
+            shard_vclocks: RwLock::new(HashMap::new()),
+            delta_logs: RwLock::new(HashMap::new()),
+            orset_states: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_create_delta_log(&self, shard_id: ShardId) -> Arc<DeltaLog> {
+        let mut logs = self.delta_logs.write().unwrap();
+        if let Some(log) = logs.get(&shard_id) {
+            return log.clone();
+        }
+        // Create new delta log with max 10000 entries
+        let log = Arc::new(DeltaLog::new(10000));
+        logs.insert(shard_id, log.clone());
+        log
+    }
+
+    // ========================================================================
+    // CRDT OR-Set 辅助方法
+    // ========================================================================
+
+    /// 获取或创建 per-shard per-directory 的 OR-Set 状态
+    fn get_or_create_orset(&self, shard_id: ShardId, dir_ino: u64) -> ServerDirORSet {
+        let key = (shard_id, dir_ino);
+        let mut states = self.orset_states.write().unwrap();
+        if let Some(state) = states.get(&key) {
+            return state.clone();
+        }
+        let state = ServerDirORSet::new(dir_ino);
+        states.insert(key, state.clone());
+        state
+    }
+
+    /// 获取或创建 per-shard 的 VectorClock
+    fn get_or_create_shard_vclock(&self, shard_id: ShardId) -> ServerVectorClock {
+        let mut vclocks = self.shard_vclocks.write().unwrap();
+        if let Some(vclock) = vclocks.get(&shard_id) {
+            return vclock.clone();
+        }
+        let vclock = ServerVectorClock::new();
+        vclocks.insert(shard_id, vclock.clone());
+        vclock
+    }
+
+    /// 更新 per-shard 的 VectorClock
+    fn update_shard_vclock(&self, shard_id: ShardId, vclock: ServerVectorClock) {
+        let mut vclocks = self.shard_vclocks.write().unwrap();
+        vclocks.insert(shard_id, vclock);
+    }
+
+    /// 更新 per-shard per-directory 的 OR-Set 状态，并持久化到 RocksDB
+    fn update_orset(&self, shard_id: ShardId, dir_ino: u64, state: ServerDirORSet) {
+        let key = (shard_id, dir_ino);
+        let mut states = self.orset_states.write().unwrap();
+        states.insert(key, state.clone());
+        drop(states);
+
+        // 持久化到 RocksDB
+        if let Some(store) = self.shard_stores.read().unwrap().get(&shard_id).cloned() {
+            store.save_orset_state(dir_ino, &state);
+
+            // 同时持久化 tombstones
+            for (entry_key, tombstones) in &state.tombstones {
+                store.save_tombstones(entry_key, tombstones);
+            }
+        }
+    }
+
+    /// 从 DeltaOp 中提取父目录 inode
+    fn get_dir_ino_from_delta(&self, delta: &crate::powerfs::DeltaOp) -> Option<u64> {
+        match &delta.op {
+            Some(crate::powerfs::delta_op::Op::Add(entry)) => Some(entry.parent_ino),
+            Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => Some(entry_id.parent_ino),
+            Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => {
+                // 返回旧位置的父目录 inode
+                Some(rename_op.old_parent_ino)
+            }
+            Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
+                // SetAttr 只有 inode，需要查找父目录
+                let ino = setattr_op.inode;
+                let stores = self.shard_stores.read().unwrap();
+                for store in stores.values() {
+                    if let Some(info) = store.get_inode(ino) {
+                        return Some(info.parent_inode);
+                    }
+                }
+                None
+            }
+            None => None,
         }
     }
 
@@ -92,6 +269,36 @@ impl MetaShardManager {
             let mut stores = self.shard_stores.write().unwrap();
             stores.insert(shard_id, shard_store.clone());
         }
+
+        // 从 RocksDB 加载 OR-Set 状态
+        let orset_states = shard_store.load_all_orset_states();
+        {
+            let mut states = self.orset_states.write().unwrap();
+            for (dir_ino, state) in orset_states {
+                states.insert((shard_id, dir_ino), state);
+            }
+        }
+        info!(
+            "Loaded {} OR-Set states for shard {}",
+            shard_store.load_all_orset_states().len(),
+            shard_id.0
+        );
+
+        // 启动 tombstone 清理任务 (每小时执行一次)
+        let shard_store_clone = shard_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let cleaned = shard_store_clone.cleanup_expired_tombstones(24); // 24 hours TTL
+                if cleaned > 0 {
+                    info!(
+                        "Cleaned {} expired tombstones for shard {}",
+                        cleaned, shard_id.0
+                    );
+                }
+            }
+        });
 
         tokio::spawn(async move {
             while let Some(entry) = apply_rx.recv().await {
@@ -212,6 +419,53 @@ impl MetaShardManager {
         }
 
         Err("failed to create directory: timeout waiting for apply".to_string())
+    }
+
+    /// Create directory for a given path, auto-creating parent directories (mkdir -p behavior)
+    pub async fn create_directory_for_path(&self, path: &str) -> Result<u64, String> {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(POSIX_ROOT_INODE);
+        }
+
+        let mut current_inode = POSIX_ROOT_INODE;
+        for part in &parts {
+            // Check if this component already exists
+            let lookup_shard = self.shard_strategy.calculate_shard(current_inode);
+            let exists = {
+                let stores = self.shard_stores.read().unwrap();
+                if let Some(store) = stores.get(&lookup_shard) {
+                    store.lookup(current_inode, part).is_some()
+                } else {
+                    false
+                }
+            };
+
+            if !exists {
+                // Create this directory component
+                let info = self.create_directory(current_inode, part).await?;
+                current_inode = info.inode;
+            } else {
+                // Look up the inode for existing directory
+                let lookup_shard = self.shard_strategy.calculate_shard(current_inode);
+                let ino = {
+                    let stores = self.shard_stores.read().unwrap();
+                    if let Some(store) = stores.get(&lookup_shard) {
+                        store
+                            .lookup(current_inode, part)
+                            .map(|e| e.inode)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                };
+                if ino == 0 {
+                    return Err(format!("failed to find existing directory: {}", part));
+                }
+                current_inode = ino;
+            }
+        }
+        Ok(current_inode)
     }
 
     pub async fn delete_directory(&self, parent_inode: u64, name: &str) -> Result<(), String> {
@@ -530,21 +784,142 @@ impl MetaShardManager {
         Ok(current_inode)
     }
 
+    /// Resolve a POSIX flat path (e.g., "/dir1/file1") starting from POSIX_ROOT_INODE.
+    /// This is used by FUSE clients.
+    pub async fn resolve_flat_path(&self, path: &str) -> Result<u64, String> {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+
+        // Root path "/" returns the POSIX root inode
+        if parts.is_empty() {
+            return Ok(POSIX_ROOT_INODE);
+        }
+
+        let mut current_inode = POSIX_ROOT_INODE;
+
+        for part in parts.iter() {
+            let shard_id = self.shard_strategy.calculate_shard(current_inode);
+            let stores = self.shard_stores.read().unwrap();
+            let shard_store = stores
+                .get(&shard_id)
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+
+            let inode_info = shard_store.lookup(current_inode, part).ok_or_else(|| {
+                format!(
+                    "path component '{}' not found in directory {}",
+                    part, current_inode
+                )
+            })?;
+
+            current_inode = inode_info.inode;
+        }
+
+        Ok(current_inode)
+    }
+
+    /// Check if POSIX root inode exists in the store
+    pub fn has_posix_root(&self) -> bool {
+        let shard_id = self.shard_strategy.calculate_shard(POSIX_ROOT_INODE);
+        let stores = self.shard_stores.read().unwrap();
+        stores
+            .get(&shard_id)
+            .map(|s| s.get_inode(POSIX_ROOT_INODE).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Format POSIX root inode (inode 1, directory "/")
+    pub async fn format_posix_root(&self) -> Result<u64, String> {
+        // Check if already exists
+        if self.has_posix_root() {
+            info!("POSIX root inode {} already exists", POSIX_ROOT_INODE);
+            return Ok(POSIX_ROOT_INODE);
+        }
+
+        let shard_id = self.shard_strategy.calculate_shard(POSIX_ROOT_INODE);
+        let cmd = ShardCommand::CreateDirectory {
+            parent_inode: 0,
+            name: "/".to_string(),
+            inode: POSIX_ROOT_INODE,
+        };
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for apply
+        let mut retries = 0;
+        while retries < 20 {
+            let applied = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .map(|s| s.get_inode(POSIX_ROOT_INODE).is_some())
+                    .unwrap_or(false)
+            };
+            if applied {
+                info!(
+                    "POSIX root inode {} initialized successfully",
+                    POSIX_ROOT_INODE
+                );
+                return Ok(POSIX_ROOT_INODE);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            retries += 1;
+        }
+        Err("failed to create POSIX root: timeout waiting for apply".to_string())
+    }
+
     pub fn register_root_inode(&self, bucket: &str, inode: u64) {
         let mut root_inodes = self.root_inodes.write().unwrap();
         root_inodes.insert(bucket.to_string(), inode);
+
+        // Persist to the shard store that owns inode 0
+        let shard_id = self.shard_strategy.calculate_shard(0);
+        let stores = self.shard_stores.read().unwrap();
+        if let Some(store) = stores.get(&shard_id) {
+            store.set_root_inode(bucket, inode);
+        }
+    }
+
+    /// Load root_inodes from all shard stores (called during startup)
+    pub fn load_root_inodes_from_shards(&self) {
+        let mut root_inodes_map = std::collections::HashMap::new();
+        let stores = self.shard_stores.read().unwrap();
+        for store in stores.values() {
+            for (bucket, inode) in store.list_root_inodes() {
+                root_inodes_map.insert(bucket, inode);
+            }
+        }
+        drop(stores);
+
+        let mut root_inodes = self.root_inodes.write().unwrap();
+        *root_inodes = root_inodes_map;
+        info!("Loaded {} root inodes from shard stores", root_inodes.len());
+    }
+
+    /// Get all bucket names
+    pub fn list_buckets(&self) -> Vec<String> {
+        let root_inodes = self.root_inodes.read().unwrap();
+        root_inodes.keys().cloned().collect()
     }
 
     // ===== S3 object metadata operations (backed by sharded Raft + RocksDB) =====
 
-    /// Get the root inode for a bucket, creating it if it does not exist.
-    pub async fn ensure_bucket_root(&self, bucket: &str) -> Result<u64, String> {
+    /// Get the root inode for a bucket from in-memory cache only (no creation).
+    pub fn get_bucket_root(&self, bucket: &str) -> Option<u64> {
+        let roots = self.root_inodes.read().unwrap();
+        roots.get(bucket).cloned()
+    }
+
+    /// Format: Create a root directory inode for the bucket at parent inode 0 and persist it.
+    /// This is the "mkfs" operation - should be called once during initial setup.
+    pub async fn format_bucket_root(&self, bucket: &str) -> Result<u64, String> {
+        // Check if already exists
         {
             let roots = self.root_inodes.read().unwrap();
             if let Some(&inode) = roots.get(bucket) {
                 return Ok(inode);
             }
         }
+
         // Create a root directory inode for the bucket at parent inode 0.
         let inode = self.generate_inode();
         let shard_id = self.shard_strategy.calculate_shard(0);
@@ -559,7 +934,7 @@ impl MetaShardManager {
 
         // Wait for apply
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 20 {
             let applied = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -571,10 +946,16 @@ impl MetaShardManager {
                 self.register_root_inode(bucket, inode);
                 return Ok(inode);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             retries += 1;
         }
         Err("failed to create bucket root: timeout waiting for apply".to_string())
+    }
+
+    /// Ensure the root inode for a bucket, creating it if it does not exist.
+    /// This is the legacy method - prefer format_bucket_root for initial setup.
+    pub async fn ensure_bucket_root(&self, bucket: &str) -> Result<u64, String> {
+        self.format_bucket_root(bucket).await
     }
 
     /// Create an S3 object entry (file inode with fid/volume_id/etag) under a bucket root.
@@ -766,21 +1147,291 @@ impl MetaShardManager {
 
     pub async fn push_delta(
         &self,
-        _shard_id: ShardId,
-        _client_id: &str,
-        _deltas: &[crate::powerfs::DeltaOp],
-        _client_vclock: &Option<crate::powerfs::VectorClock>,
+        shard_id: ShardId,
+        client_id: &str,
+        deltas: &[crate::powerfs::DeltaOp],
+        client_vclock: &Option<crate::powerfs::VectorClock>,
     ) -> Result<crate::powerfs::VectorClock, String> {
-        Ok(crate::powerfs::VectorClock { entries: vec![] })
+        // CRDT Merge: Apply client deltas to server OR-Set state
+        let delta_log = self.get_or_create_delta_log(shard_id);
+        let shard_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+
+        let mut max_seq = 0u64;
+
+        for delta in deltas {
+            let seq = extract_seq_from_delta(delta).unwrap_or(0);
+            if seq > max_seq {
+                max_seq = seq;
+            }
+
+            // Record to delta log for backward compatibility
+            delta_log.append(client_id, seq, delta.clone());
+
+            // CRDT Merge: Apply to OR-Set first
+            if let Some(dir_ino) = self.get_dir_ino_from_delta(delta) {
+                let mut orset = self.get_or_create_orset(shard_id, dir_ino);
+                let tag = EntryTag::new(client_id, seq);
+
+                let merge_result = match &delta.op {
+                    Some(crate::powerfs::delta_op::Op::Add(entry)) => {
+                        let orset_entry = DirEntryOrset {
+                            tag: tag.clone(),
+                            inode: entry.inode,
+                            name: entry.name.clone(),
+                            parent_ino: entry.parent_ino,
+                            mode: entry.mode,
+                            file_type: crate::shard_store::FileType::File, // 默认
+                            size: 0,
+                            mtime: 0,
+                            etag: None,
+                        };
+                        orset.merge_add(orset_entry)
+                    }
+                    Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
+                        orset.merge_remove(entry_id.parent_ino, &entry_id.name, &tag)
+                    }
+                    Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => orset.merge_rename(
+                        rename_op.old_parent_ino,
+                        &rename_op.old_name,
+                        rename_op.new_parent_ino,
+                        &rename_op.new_name,
+                        &tag,
+                    ),
+                    Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
+                        // SetAttr 只有 inode，需要先查找条目信息
+                        let ino = setattr_op.inode;
+                        let (parent_ino, name) = {
+                            let stores = self.shard_stores.read().unwrap();
+                            let mut found = None;
+                            for store in stores.values() {
+                                if let Some(info) = store.get_inode(ino) {
+                                    found = Some((info.parent_inode, info.name.clone()));
+                                    break;
+                                }
+                            }
+                            found.ok_or_else(|| format!("inode {} not found for SetAttr", ino))?
+                        };
+
+                        // 从 OR-Set 中找到对应的条目
+                        let mut orset = self.get_or_create_orset(shard_id, parent_ino);
+                        orset.merge_setattr(
+                            parent_ino,
+                            &name,
+                            &tag,
+                            setattr_op.size,
+                            setattr_op.mtime,
+                        )
+                    }
+                    None => MergeResult::Applied,
+                };
+
+                // Update OR-Set state
+                self.update_orset(shard_id, dir_ino, orset);
+
+                // Apply to shard store (物理存储)
+                if let Some(store) = &shard_store {
+                    match merge_result {
+                        MergeResult::Applied | MergeResult::Idempotent => {
+                            self.apply_delta_to_store(store, delta).await?;
+                        }
+                        MergeResult::ConcurrentlyAdded => {
+                            // 并发 Add: 两个都保留，需要特殊处理
+                            debug!(
+                                "Concurrent Add detected for dir {}: {:?}",
+                                dir_ino, merge_result
+                            );
+                            self.apply_delta_to_store(store, delta).await?;
+                        }
+                        MergeResult::ConcurrentlyRemoved => {
+                            // 并发 Remove: 不物理删除，仅记录 tombstone
+                            debug!(
+                                "Concurrent Remove detected for dir {}: {:?}",
+                                dir_ino, merge_result
+                            );
+                        }
+                        MergeResult::Conflict => {
+                            warn!("Conflict detected for dir {}: {:?}", dir_ino, merge_result);
+                        }
+                    }
+                }
+            } else if let Some(store) = &shard_store {
+                // 无法确定目录的操作，直接应用
+                self.apply_delta_to_store(store, delta).await?;
+            }
+        }
+
+        // Merge client's VectorClock into per-shard VectorClock
+        let mut shard_vclock = self.get_or_create_shard_vclock(shard_id);
+        if let Some(vclock) = client_vclock {
+            for entry in &vclock.entries {
+                shard_vclock.observe(&entry.client_id.to_string(), entry.seq);
+            }
+        } else if max_seq > 0 {
+            shard_vclock.observe(client_id, max_seq);
+        }
+        self.update_shard_vclock(shard_id, shard_vclock.clone());
+
+        Ok(shard_vclock.to_proto())
     }
 
     pub async fn pull_delta(
         &self,
-        _shard_id: ShardId,
+        shard_id: ShardId,
         _client_id: &str,
-        _client_vclock: &Option<crate::powerfs::VectorClock>,
+        client_vclock: &Option<crate::powerfs::VectorClock>,
     ) -> Result<(Vec<crate::powerfs::DeltaOp>, crate::powerfs::VectorClock), String> {
-        Ok((vec![], crate::powerfs::VectorClock { entries: vec![] }))
+        // Get delta log for this shard (backward compatibility)
+        let delta_log = self.get_or_create_delta_log(shard_id);
+
+        // Convert client's VectorClock to HashMap for comparison
+        let client_vclock_map: HashMap<String, u64> = match client_vclock {
+            Some(vclock) => {
+                let mut map = HashMap::new();
+                for entry in &vclock.entries {
+                    map.insert(entry.client_id.to_string(), entry.seq);
+                }
+                map
+            }
+            None => HashMap::new(),
+        };
+
+        // Get deltas that the client hasn't seen yet from delta log
+        let mut deltas = delta_log.get_since(&client_vclock_map);
+
+        // Also compute deltas from OR-Set state for more accurate sync
+        let orset_deltas = self.compute_orset_deltas(shard_id, &client_vclock_map);
+        deltas.extend(orset_deltas);
+
+        // Return per-shard VectorClock
+        let shard_vclock = self.get_or_create_shard_vclock(shard_id);
+        Ok((deltas, shard_vclock.to_proto()))
+    }
+
+    /// 从 OR-Set 状态计算增量变更
+    fn compute_orset_deltas(
+        &self,
+        shard_id: ShardId,
+        client_vclock_map: &HashMap<String, u64>,
+    ) -> Vec<crate::powerfs::DeltaOp> {
+        let mut deltas = Vec::new();
+        let states = self.orset_states.read().unwrap();
+
+        for ((sid, _dir_ino), orset) in states.iter() {
+            if *sid != shard_id {
+                continue;
+            }
+
+            // 检查 OR-Set 的 vclock 是否有新的变更
+            let orset_vclock = orset.vclock();
+            let diff = orset_vclock.diff_against(&ServerVectorClock::from_map(client_vclock_map));
+
+            for (client_id, seq) in diff {
+                // 获取该客户端在这个目录下的所有变更
+                for entry in orset.entries.values() {
+                    if entry.tag.client_id == client_id && entry.tag.seq <= seq {
+                        // 添加 Add 操作
+                        deltas.push(crate::powerfs::DeltaOp {
+                            op: Some(crate::powerfs::delta_op::Op::Add(
+                                crate::powerfs::DirEntryOrset {
+                                    parent_ino: entry.parent_ino,
+                                    name: entry.name.clone(),
+                                    inode: entry.inode,
+                                    mode: entry.mode,
+                                    seq: entry.tag.seq,
+                                    client_id: entry.tag.client_id.parse().unwrap_or(0),
+                                },
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+
+        deltas
+    }
+
+    async fn apply_delta_to_store(
+        &self,
+        store: &Arc<ShardStore>,
+        delta: &crate::powerfs::DeltaOp,
+    ) -> Result<(), String> {
+        match &delta.op {
+            Some(crate::powerfs::delta_op::Op::Add(entry_orset)) => {
+                // Create inode and directory entry
+                let inode_info = InodeInfo {
+                    inode: entry_orset.inode,
+                    name: entry_orset.name.clone(),
+                    parent_inode: entry_orset.parent_ino,
+                    file_type: crate::shard_store::FileType::File, // Simplified, should check mode
+                    size: 0,
+                    mtime: crate::shard_store::ShardStore::current_time(),
+                    atime: crate::shard_store::ShardStore::current_time(),
+                    ctime: crate::shard_store::ShardStore::current_time(),
+                    mode: entry_orset.mode,
+                    uid: 0,
+                    gid: 0,
+                    blocks: 0,
+                    fid: None,
+                    volume_id: None,
+                    etag: None,
+                };
+                store.create_inode(inode_info)?;
+                store.add_dir_entry(
+                    entry_orset.parent_ino,
+                    &entry_orset.name,
+                    entry_orset.inode,
+                )?;
+                debug!(
+                    "Applied Add delta: {}/{} inode={}",
+                    entry_orset.parent_ino, entry_orset.name, entry_orset.inode
+                );
+            }
+            Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
+                if let Some(inode_info) = store.lookup(entry_id.parent_ino, &entry_id.name) {
+                    let inode = inode_info.inode;
+                    store.remove_dir_entry(entry_id.parent_ino, &entry_id.name)?;
+                    store.delete_inode(inode)?;
+                    debug!(
+                        "Applied Remove delta: {}/{} inode={}",
+                        entry_id.parent_ino, entry_id.name, inode
+                    );
+                }
+            }
+            Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => {
+                if let Some(inode_info) =
+                    store.lookup(rename_op.old_parent_ino, &rename_op.old_name)
+                {
+                    let inode = inode_info.inode;
+                    store.remove_dir_entry(rename_op.old_parent_ino, &rename_op.old_name)?;
+                    store.add_dir_entry(rename_op.new_parent_ino, &rename_op.new_name, inode)?;
+                    debug!(
+                        "Applied Rename delta: {}/{} -> {}/{}",
+                        rename_op.old_parent_ino,
+                        rename_op.old_name,
+                        rename_op.new_parent_ino,
+                        rename_op.new_name
+                    );
+                }
+            }
+            Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
+                if let Some(mut inode_info) = store.get_inode(setattr_op.inode) {
+                    if setattr_op.size > 0 {
+                        inode_info.size = setattr_op.size;
+                    }
+                    inode_info.mtime = setattr_op.mtime;
+                    store.update_inode(inode_info)?;
+                    debug!(
+                        "Applied SetAttr delta: inode={} size={} mtime={}",
+                        setattr_op.inode, setattr_op.size, setattr_op.mtime
+                    );
+                }
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     pub async fn acquire_lease(
@@ -845,5 +1496,77 @@ impl MetaShardManager {
         msg: raft::eraftpb::Message,
     ) -> Result<(), String> {
         self.raft_group_manager.step(shard_id, msg).await
+    }
+
+    // ========================================================================
+    // CRDT 管理接口
+    // ========================================================================
+
+    /// 获取所有 OR-Set 状态概览
+    pub fn get_crdt_overview(&self) -> CrdtOverview {
+        let states = self.orset_states.read().unwrap();
+        let vclocks = self.shard_vclocks.read().unwrap();
+
+        let mut shard_states = HashMap::new();
+        for ((shard_id, dir_ino), state) in states.iter() {
+            let entry = shard_states.entry(shard_id.0).or_insert_with(Vec::new);
+            entry.push(OrsetStateInfo {
+                dir_ino: *dir_ino,
+                entry_count: state.entries.len(),
+                tombstone_count: state.tombstones.values().map(|t| t.len()).sum(),
+                vclock_entries: state.vclock.entries().len(),
+            });
+        }
+
+        let mut shard_vclocks_info = HashMap::new();
+        for (shard_id, vclock) in vclocks.iter() {
+            shard_vclocks_info.insert(shard_id.0, vclock.entries().clone());
+        }
+
+        CrdtOverview {
+            total_orset_states: states.len(),
+            shard_states,
+            shard_vclocks: shard_vclocks_info,
+        }
+    }
+
+    /// 获取指定分片的 OR-Set 状态
+    pub fn get_shard_orset_states(&self, shard_id: ShardId) -> Vec<OrsetStateDetail> {
+        let states = self.orset_states.read().unwrap();
+        states
+            .iter()
+            .filter(|((sid, _), _)| *sid == shard_id)
+            .map(|((_, dir_ino), state)| OrsetStateDetail {
+                dir_ino: *dir_ino,
+                entries: state.entries.clone(),
+                entry_tags: state.entry_tags.clone(),
+                tombstones: state.tombstones.clone(),
+                vclock: state.vclock.clone(),
+            })
+            .collect()
+    }
+
+    /// 获取指定目录的 OR-Set 状态
+    pub fn get_dir_orset_state(&self, shard_id: ShardId, dir_ino: u64) -> Option<ServerDirORSet> {
+        let states = self.orset_states.read().unwrap();
+        states.get(&(shard_id, dir_ino)).cloned()
+    }
+
+    /// 清理过期 Tombstone
+    pub fn cleanup_tombstones(&self, ttl_hours: u64) -> usize {
+        let mut total_cleaned = 0;
+        let stores = self.shard_stores.read().unwrap();
+        for store in stores.values() {
+            total_cleaned += store.cleanup_expired_tombstones(ttl_hours);
+        }
+        total_cleaned
+    }
+}
+
+// Helper function to extract sequence number from DeltaOp
+fn extract_seq_from_delta(delta: &crate::powerfs::DeltaOp) -> Option<u64> {
+    match &delta.op {
+        Some(crate::powerfs::delta_op::Op::Add(entry_orset)) => Some(entry_orset.seq),
+        _ => None,
     }
 }

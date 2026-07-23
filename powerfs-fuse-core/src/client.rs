@@ -1,24 +1,28 @@
 use log::{debug, error, info, warn};
 use powerfs_common::types::{Fid, VolumeId};
-use powerfs_filer::powerfs::filer_meta_service_client::FilerMetaServiceClient;
+use powerfs_filer::powerfs::posix_meta_service_client::PosixMetaServiceClient;
 use powerfs_filer::powerfs::{
-    CreateEntryRequest as FilerCreateEntryRequest, DeleteEntryRequest as FilerDeleteEntryRequest,
-    Entry as FilerEntry, GetEntryByInodeRequest as FilerGetEntryByInodeRequest,
-    GetEntryRequest as FilerGetEntryRequest, LeaseReleaseRequest as FilerLeaseReleaseRequest,
-    LeaseRenewRequest as FilerLeaseRenewRequest, LeaseRequest as FilerLeaseRequest,
-    ListEntriesRequest as FilerListEntriesRequest,
+    delta_op as filer_delta_op, CreateEntryRequest as FilerCreateEntryRequest,
+    DeleteEntryRequest as FilerDeleteEntryRequest, DeltaOp as FilerDeltaOp, Entry as FilerEntry,
+    GetEntryByInodeRequest as FilerGetEntryByInodeRequest, GetEntryRequest as FilerGetEntryRequest,
+    LeaseReleaseRequest as FilerLeaseReleaseRequest, LeaseRenewRequest as FilerLeaseRenewRequest,
+    LeaseRequest as FilerLeaseRequest, ListEntriesRequest as FilerListEntriesRequest,
     LookupDirectoryEntryRequest as FilerLookupDirectoryEntryRequest,
-    UpdateEntryRequest as FilerUpdateEntryRequest,
+    PullDeltaRequest as FilerPullDeltaRequest, PullDeltaResponse as FilerPullDeltaResponse,
+    PushDeltaRequest as FilerPushDeltaRequest, PushDeltaResponse as FilerPushDeltaResponse,
+    UpdateEntryRequest as FilerUpdateEntryRequest, VectorClock as FilerVectorClock,
+    VectorClockEntry as FilerVectorClockEntry,
 };
+use powerfs_master::proto::powerfs::delta_op as master_delta_op;
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, AssignRequest, CreateEntryRequest,
     DeleteEntryRequest, DeltaOp, Entry, GetEntryByInodeRequest, GetEntryRequest,
     GetFilerForInodeRequest, GetShardMappingRequest, JobCompletionRequest,
     JobDeregistrationRequest, JobRegistrationRequest, KeepConnectedRequest, LeaseReleaseRequest,
     LeaseRenewRequest, LeaseRequest, ListEntriesRequest, ListFilersRequest,
-    LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification, PullDeltaRequest,
-    PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, RenameEntryRequest, StatisticsRequest,
-    StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest, VectorClock,
+    LookupDirectoryEntryRequest, LookupVolumeRequest, MetadataNotification, RenameEntryRequest,
+    StatisticsRequest, StatisticsResponse, SubscribeMetadataRequest, UpdateEntryRequest,
+    VectorClock,
 };
 use powerfs_volume::proto::powerfs::{
     volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
@@ -36,6 +40,78 @@ use powerfs_master::proto::powerfs::Location;
 use crate::connection_manager::{ConnectionConfig, MasterConnectionManager};
 
 pub type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
+
+// Convert Master's VectorClock to Filer's VectorClock
+fn master_vclock_to_filer(vclock: &VectorClock) -> FilerVectorClock {
+    FilerVectorClock {
+        entries: vclock
+            .entries
+            .iter()
+            .map(|e| FilerVectorClockEntry {
+                client_id: e.client_id,
+                seq: e.seq,
+            })
+            .collect(),
+    }
+}
+
+// Convert Master's DeltaOp to Filer's DeltaOp
+fn master_delta_to_filer(delta: &DeltaOp) -> FilerDeltaOp {
+    match &delta.op {
+        Some(master_delta_op::Op::Add(orset)) => {
+            let id = orset.id.as_ref();
+            FilerDeltaOp {
+                op: Some(filer_delta_op::Op::Add(
+                    powerfs_filer::powerfs::DirEntryOrset {
+                        parent_ino: orset.parent_ino,
+                        name: id.map(|i| i.name.clone()).unwrap_or_default(),
+                        inode: orset.inode,
+                        mode: orset.mode,
+                        seq: id.map(|i| i.seq).unwrap_or(0),
+                        client_id: id.map(|i| i.client_id).unwrap_or(0),
+                    },
+                )),
+            }
+        }
+        Some(master_delta_op::Op::Remove(entry_id)) => {
+            FilerDeltaOp {
+                op: Some(filer_delta_op::Op::Remove(
+                    powerfs_filer::powerfs::EntryId {
+                        parent_ino: 0, // Need to get from context
+                        name: entry_id.name.clone(),
+                    },
+                )),
+            }
+        }
+        Some(master_delta_op::Op::Rename(rename_op)) => {
+            let old_id = rename_op.old_id.as_ref();
+            let new_entry = rename_op.new_entry.as_ref();
+            FilerDeltaOp {
+                op: Some(filer_delta_op::Op::Rename(
+                    powerfs_filer::powerfs::RenameOp {
+                        old_parent_ino: new_entry.map(|e| e.parent_ino).unwrap_or(0),
+                        old_name: old_id.map(|i| i.name.clone()).unwrap_or_default(),
+                        new_parent_ino: new_entry.map(|e| e.parent_ino).unwrap_or(0),
+                        new_name: new_entry
+                            .and_then(|e| e.id.as_ref())
+                            .map(|i| i.name.clone())
+                            .unwrap_or_default(),
+                    },
+                )),
+            }
+        }
+        Some(master_delta_op::Op::SetAttr(set_attr_op)) => FilerDeltaOp {
+            op: Some(filer_delta_op::Op::SetAttr(
+                powerfs_filer::powerfs::SetAttrOp {
+                    inode: set_attr_op.inode,
+                    size: set_attr_op.size,
+                    mtime: set_attr_op.mtime,
+                },
+            )),
+        },
+        None => FilerDeltaOp { op: None },
+    }
+}
 
 #[derive(Debug)]
 pub struct WriteBlobParams {
@@ -172,13 +248,10 @@ impl PowerFuseClient {
         &self.collection
     }
 
-    /// Convert a FUSE path to Filer path (prepend collection as bucket)
+    /// Convert a FUSE path to Filer path (POSIX flat path, no bucket prefix)
     fn to_filer_path(&self, fuse_path: &str) -> String {
-        if fuse_path.starts_with('/') {
-            format!("{}{}", self.collection, fuse_path)
-        } else {
-            format!("{}/{}", self.collection, fuse_path)
-        }
+        // POSIX flat path: keep the path as-is
+        fuse_path.to_string()
     }
 
     /// Expose the underlying connection manager for callers (e.g. the
@@ -332,7 +405,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerCreateEntryRequest {
                 entry: Some(filer_entry.clone()),
                 client_id: client_id.to_string(),
@@ -380,7 +453,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerGetEntryRequest {
                 path: filer_path.clone(),
             };
@@ -429,7 +502,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerGetEntryByInodeRequest { inode };
 
             match client
@@ -495,7 +568,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerUpdateEntryRequest {
                 entry: Some(filer_entry.clone()),
                 client_id: client_id.to_string(),
@@ -549,7 +622,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerDeleteEntryRequest {
                 ino,
                 is_directory,
@@ -602,7 +675,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerListEntriesRequest {
                 parent_ino,
                 limit,
@@ -657,7 +730,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerLookupDirectoryEntryRequest {
                 parent_ino,
                 name: name.to_string(),
@@ -721,7 +794,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerLeaseRequest {
                 inode,
                 client_id: client_id.to_string(),
@@ -775,7 +848,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerLeaseReleaseRequest {
                 lease_id: lease_id.to_string(),
             };
@@ -825,7 +898,7 @@ impl PowerFuseClient {
                 }
             };
 
-            let mut client = FilerMetaServiceClient::new(channel);
+            let mut client = PosixMetaServiceClient::new(channel);
             let request = FilerLeaseRenewRequest {
                 lease_id: lease_id.to_string(),
                 duration_ms,
@@ -2724,31 +2797,41 @@ impl PowerFuseClient {
         client_id: &str,
         deltas: &[DeltaOp],
         client_vclock: &VectorClock,
-    ) -> Result<PushDeltaResponse, String> {
+    ) -> Result<FilerPushDeltaResponse, String> {
         debug!(
             "push_delta: client_id={}, delta_count={}",
             client_id,
             deltas.len()
         );
 
+        // Convert Master DeltaOp to Filer DeltaOp
+        let filer_deltas: Vec<FilerDeltaOp> =
+            deltas.iter().map(master_delta_to_filer).collect();
+
         for attempt in 1..=self.config.max_retry_count {
-            let channel = match self.get_or_create_master_channel().await {
+            // Use Filer channel instead of Master for metadata operations
+            let channel = match self.get_or_create_filer_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
-                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    warn!(
+                        "Failed to get filer channel for push_delta (attempt {}): {}",
+                        attempt, e
+                    );
                     tokio::time::sleep(self.config.retry_delay).await;
                     continue;
                 }
             };
 
-            let mut client = MasterServiceClient::new(channel);
-            let request = PushDeltaRequest {
+            let mut client = PosixMetaServiceClient::new(channel);
+            // Use default shard_id (0) for now; CRDT Delta Sync works across all shards
+            let request = FilerPushDeltaRequest {
+                shard_id: 0,
                 client_id: client_id.to_string(),
-                deltas: deltas.to_vec(),
-                client_vclock: Some(client_vclock.clone()),
+                deltas: filer_deltas.clone(),
+                client_vclock: Some(master_vclock_to_filer(client_vclock)),
             };
 
             match client.push_delta(tonic::Request::new(request)).await {
@@ -2760,7 +2843,7 @@ impl PowerFuseClient {
                 Err(e) => {
                     let msg = format!("push_delta failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
-                    self.invalidate_master_channel().await;
+                    self.invalidate_filer_channel().await;
                     if attempt == self.config.max_retry_count {
                         return Err(msg);
                     }
@@ -2776,26 +2859,32 @@ impl PowerFuseClient {
         &self,
         client_id: &str,
         client_vclock: &VectorClock,
-    ) -> Result<PullDeltaResponse, String> {
+    ) -> Result<FilerPullDeltaResponse, String> {
         debug!("pull_delta: client_id={}", client_id);
 
         for attempt in 1..=self.config.max_retry_count {
-            let channel = match self.get_or_create_master_channel().await {
+            // Use Filer channel instead of Master for metadata operations
+            let channel = match self.get_or_create_filer_channel().await {
                 Ok(ch) => ch,
                 Err(e) => {
                     if attempt == self.config.max_retry_count {
                         return Err(e);
                     }
-                    warn!("Failed to get master channel (attempt {}): {}", attempt, e);
+                    warn!(
+                        "Failed to get filer channel for pull_delta (attempt {}): {}",
+                        attempt, e
+                    );
                     tokio::time::sleep(self.config.retry_delay).await;
                     continue;
                 }
             };
 
-            let mut client = MasterServiceClient::new(channel);
-            let request = PullDeltaRequest {
+            let mut client = PosixMetaServiceClient::new(channel);
+            // Use default shard_id (0) for now; CRDT Delta Sync works across all shards
+            let request = FilerPullDeltaRequest {
+                shard_id: 0,
                 client_id: client_id.to_string(),
-                client_vclock: Some(client_vclock.clone()),
+                client_vclock: Some(master_vclock_to_filer(client_vclock)),
             };
 
             match client.pull_delta(tonic::Request::new(request)).await {
@@ -2807,7 +2896,7 @@ impl PowerFuseClient {
                 Err(e) => {
                     let msg = format!("pull_delta failed (attempt {}): {}", attempt, e);
                     warn!("{}", msg);
-                    self.invalidate_master_channel().await;
+                    self.invalidate_filer_channel().await;
                     if attempt == self.config.max_retry_count {
                         return Err(msg);
                     }
@@ -3133,7 +3222,7 @@ impl SyncFuseClient {
         &self,
         client_id: &str,
         client_vclock: &VectorClock,
-    ) -> Result<PullDeltaResponse, String> {
+    ) -> Result<FilerPullDeltaResponse, String> {
         self.block_with_batch_timeout(self.client.pull_delta(client_id, client_vclock))
     }
 
@@ -3142,7 +3231,7 @@ impl SyncFuseClient {
         client_id: &str,
         deltas: &[DeltaOp],
         client_vclock: &VectorClock,
-    ) -> Result<PushDeltaResponse, String> {
+    ) -> Result<FilerPushDeltaResponse, String> {
         self.block_with_batch_timeout(self.client.push_delta(client_id, deltas, client_vclock))
     }
 
@@ -3150,7 +3239,7 @@ impl SyncFuseClient {
         &self,
         client_id: &str,
         client_vclock: &VectorClock,
-    ) -> Result<PullDeltaResponse, String> {
+    ) -> Result<FilerPullDeltaResponse, String> {
         self.client.pull_delta(client_id, client_vclock).await
     }
 

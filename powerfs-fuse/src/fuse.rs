@@ -1278,6 +1278,9 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
+        // Use local cache for directory listing
+        // In PowerFS CRDT model, client writes update local cache, and delta sync
+        // propagates changes to other clients' caches.
         let mut children = self.cache.list_children(inode);
         if children.is_empty() {
             if let Ok(entries) = self.client.list_entries(inode, 1000, "") {

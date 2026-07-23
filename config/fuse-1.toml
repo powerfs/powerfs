@@ -1,7 +1,7 @@
 [fuse]
 mount_point = "/mnt/powerfs"
 master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
-# filer_addresses = ["172.20.0.35:8889", "172.20.0.36:8889"]
+filer_addresses = ["172.20.0.35:8889", "172.20.0.36:8889"]
 collection = "default"
 replication = "000"
 threads = 8

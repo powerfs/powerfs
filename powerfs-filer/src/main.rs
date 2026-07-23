@@ -1,13 +1,14 @@
-use clap::Parser;
-use log::{debug, info, warn};
+use clap::{Parser, Subcommand};
+use log::{error, info, warn};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
 use powerfs_filer::grpc_service::FilerMetaServiceImpl;
 use powerfs_filer::meta_shard_manager::MetaShardManager;
+use powerfs_filer::posix_service::PosixMetaServiceImpl;
 use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
+use powerfs_filer::powerfs::posix_meta_service_server::PosixMetaServiceServer;
 use powerfs_filer::raft_group_manager::{Peer, RaftGroupManager, ShardId};
 use powerfs_filer::shard_scheduler::ShardScheduler;
 use powerfs_filer::shard_strategy::ShardStrategy;
@@ -20,6 +21,9 @@ use powerfs_master::proto::powerfs::{
 #[command(version = "0.1.0")]
 #[command(about = "PowerFS Filer Server - Metadata Sharding & Routing")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(long, default_value = "0.0.0.0:8888")]
     s3_address: String,
 
@@ -49,6 +53,18 @@ struct Args {
 
     #[arg(long, default_value = "default")]
     default_bucket: String,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Format/initialize metadata storage (like mkfs)
+    Format {
+        /// Bucket to create (default: default)
+        #[arg(long, default_value = "default")]
+        bucket: String,
+    },
+    /// Start the filer server (default)
+    Start,
 }
 
 #[tokio::main]
@@ -121,6 +137,168 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Shard {} initialized", i);
     }
 
+    // Create both service implementations
+    let grpc_service =
+        FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
+    let posix_service =
+        PosixMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
+
+    // Start gRPC server FIRST so healthcheck can pass even if Raft is not ready
+    info!(
+        "Starting gRPC server on {} (before Raft initialization)",
+        args.grpc_address
+    );
+    info!("  - FilerMetaService (S3 bucket compatibility)");
+    info!("  - PosixMetaService (POSIX flat path)");
+
+    let grpc_addr = args.grpc_address.parse()?;
+    let grpc_server = Server::builder()
+        .add_service(FilerMetaServiceServer::new(grpc_service))
+        .add_service(PosixMetaServiceServer::new(posix_service))
+        .serve(grpc_addr);
+
+    tokio::spawn(async move {
+        if let Err(e) = grpc_server.await {
+            log::error!("gRPC server error: {}", e);
+        }
+    });
+
+    let _listener = TcpListener::bind(&args.s3_address).await?;
+    info!(
+        "S3 endpoint ready on {} (before Raft initialization)",
+        args.s3_address
+    );
+
+    // Handle subcommand
+    match &args.command {
+        Some(Command::Format { bucket }) => {
+            // Format mode: initialize metadata (like mkfs)
+            // 1. Initialize POSIX root inode (inode 1)
+            info!("Format mode: initializing POSIX root inode...");
+            match meta_shard_manager.format_posix_root().await {
+                Ok(root_inode) => {
+                    info!("Successfully formatted POSIX root inode {}", root_inode);
+                }
+                Err(e) => {
+                    error!("Failed to format POSIX root: {}", e);
+                    return Err(e.into());
+                }
+            }
+
+            // 2. Initialize S3 bucket root (if specified)
+            info!("Format mode: initializing bucket '{}'", bucket);
+            match meta_shard_manager.format_bucket_root(bucket).await {
+                Ok(root_inode) => {
+                    info!(
+                        "Successfully formatted bucket '{}' with root inode {}",
+                        bucket, root_inode
+                    );
+                    info!("Metadata initialization complete. You can now start the filer server.");
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("Failed to format bucket '{}': {}", bucket, e);
+                    return Err(e.into());
+                }
+            }
+        }
+        Some(Command::Start) | None => {
+            // Start mode: load existing metadata and serve
+            info!("Start mode: loading existing metadata...");
+
+            // Wait for Raft leader election to complete (with timeout)
+            let shard_strategy_local = meta_shard_manager.get_shard_strategy();
+            let posix_shard_id = shard_strategy_local.calculate_shard(1);
+            info!(
+                "Waiting for Raft leader election for shard {}...",
+                posix_shard_id.0
+            );
+            let mut is_leader = false;
+            let mut leader_found = false;
+            for _ in 0..30 {
+                if raft_group_manager.is_shard_leader(posix_shard_id).await {
+                    is_leader = true;
+                    leader_found = true;
+                    info!("This node is the leader for shard {}", posix_shard_id.0);
+                    break;
+                }
+                if let Some(leader_addr) = raft_group_manager.get_shard_leader(posix_shard_id).await
+                {
+                    leader_found = true;
+                    info!(
+                        "Leader elected for shard {}: {} (this node is follower)",
+                        posix_shard_id.0, leader_addr
+                    );
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            if !leader_found {
+                warn!(
+                    "Leader election timeout, continuing anyway (gRPC server is already running)"
+                );
+            }
+
+            // Check and initialize POSIX root (only leader can do this)
+            if !meta_shard_manager.has_posix_root() {
+                if is_leader {
+                    warn!("POSIX root inode not found. Initializing...");
+                    match meta_shard_manager.format_posix_root().await {
+                        Ok(root_inode) => {
+                            info!("Initialized POSIX root inode {}", root_inode);
+                        }
+                        Err(e) => {
+                            error!("Failed to initialize POSIX root: {}", e);
+                            // Don't return error - gRPC server is already running
+                            // The POSIX root will be initialized by the leader when it becomes available
+                        }
+                    }
+                } else {
+                    warn!("POSIX root inode not found, but this node is not leader. Waiting for leader to initialize...");
+                    // Wait a bit for leader to initialize
+                    for _ in 0..20 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        if meta_shard_manager.has_posix_root() {
+                            info!("POSIX root inode initialized by leader");
+                            break;
+                        }
+                    }
+                    if !meta_shard_manager.has_posix_root() {
+                        warn!("POSIX root inode not initialized yet (will retry later)");
+                    }
+                }
+            } else {
+                info!("POSIX root inode already exists");
+            }
+
+            meta_shard_manager.load_root_inodes_from_shards();
+
+            let buckets = meta_shard_manager.list_buckets();
+            if buckets.is_empty() {
+                warn!(
+                    "No S3 buckets found. Run 'powerfs-filer format' first to initialize metadata."
+                );
+                warn!("Attempting to auto-initialize default bucket...");
+                match meta_shard_manager
+                    .format_bucket_root(&args.default_bucket)
+                    .await
+                {
+                    Ok(root_inode) => {
+                        info!(
+                            "Auto-initialized default bucket '{}' with root inode {}",
+                            args.default_bucket, root_inode
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to auto-initialize default bucket: {}", e);
+                    }
+                }
+            } else {
+                info!("Loaded {} S3 buckets: {:?}", buckets.len(), buckets);
+            }
+        }
+    }
+
     let shard_scheduler = Arc::new(ShardScheduler::new(
         raft_group_manager.clone(),
         shard_strategy.clone(),
@@ -141,64 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     register_with_master(&args).await;
 
-    let grpc_service =
-        FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
-
-    info!("Starting gRPC server on {}", args.grpc_address);
-
-    let grpc_addr = args.grpc_address.parse()?;
-    let grpc_server = Server::builder()
-        .add_service(FilerMetaServiceServer::new(grpc_service))
-        .serve(grpc_addr);
-
     info!("Filer server started successfully");
-
-    // Initialize default bucket asynchronously with retries (won't block startup)
-    let meta_shard_manager_clone = meta_shard_manager.clone();
-    let default_bucket = args.default_bucket.clone();
-    tokio::spawn(async move {
-        info!("Initializing default bucket: {}", default_bucket);
-        let mut retries = 0;
-        let max_retries = 30;
-        loop {
-            match meta_shard_manager_clone
-                .ensure_bucket_root(&default_bucket)
-                .await
-            {
-                Ok(root_inode) => {
-                    info!(
-                        "Default bucket '{}' initialized with root inode {}",
-                        default_bucket, root_inode
-                    );
-                    break;
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        warn!(
-                            "Failed to initialize default bucket '{}' after {} retries: {}",
-                            default_bucket, max_retries, e
-                        );
-                        break;
-                    }
-                    debug!(
-                        "Retry {}/{}: failed to initialize default bucket '{}': {}",
-                        retries, max_retries, default_bucket, e
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        if let Err(e) = grpc_server.await {
-            log::error!("gRPC server error: {}", e);
-        }
-    });
-
-    let _listener = TcpListener::bind(&args.s3_address).await?;
-    info!("S3 endpoint ready on {}", args.s3_address);
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down Filer server...");

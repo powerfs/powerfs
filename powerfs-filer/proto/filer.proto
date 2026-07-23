@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package powerfs;
 
+// S3 桶兼容服务 (用于 S3 API)
 service FilerMetaService {
     rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
     rpc GetEntryByInode(GetEntryByInodeRequest) returns (GetEntryByInodeResponse);
@@ -22,6 +23,34 @@ service FilerMetaService {
     rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
     
     // Raft message exchange for multi-Filer communication
+    rpc SendRaftMessage(RaftMessageRequest) returns (RaftMessageResponse);
+    
+    rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
+    rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+}
+
+// POSIX 元数据服务 (扁平路径，FUSE 使用)
+service PosixMetaService {
+    rpc GetEntry(GetEntryRequest) returns (GetEntryResponse);
+    rpc GetEntryByInode(GetEntryByInodeRequest) returns (GetEntryByInodeResponse);
+    rpc CreateEntry(CreateEntryRequest) returns (CreateEntryResponse);
+    rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+    rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse);
+    rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse);
+    rpc RenameEntry(RenameEntryRequest) returns (RenameEntryResponse);
+    rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+    rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
+    
+    // Delta sync API
+    rpc PushDelta(PushDeltaRequest) returns (PushDeltaResponse);
+    rpc PullDelta(PullDeltaRequest) returns (PullDeltaResponse);
+    
+    // Lease management
+    rpc AcquireLease(LeaseRequest) returns (LeaseResponse);
+    rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
+    rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
+    
+    // Raft message exchange
     rpc SendRaftMessage(RaftMessageRequest) returns (RaftMessageResponse);
     
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
@@ -55,6 +84,18 @@ message CreateEntryRequest {
 }
 
 message CreateEntryResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 inode = 3;
+}
+
+message CreateDirectoryRequest {
+    string path = 1;
+    uint32 mode = 2;
+    string client_id = 3;
+}
+
+message CreateDirectoryResponse {
     bool success = 1;
     string error = 2;
     uint64 inode = 3;

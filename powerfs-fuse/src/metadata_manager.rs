@@ -29,6 +29,13 @@ use crate::inode_allocator::InodeAllocator;
 use crate::orset::{now_unix, DirEntry, DirORSet, EntryId, FileType, VectorClock};
 use crate::posix_projection::{PosixProjection, VisibleEntry};
 
+// Import Filer types for Delta Sync
+use powerfs_filer::powerfs::VectorClock as FilerVectorClock;
+use powerfs_master::proto::powerfs::{
+    DeltaOp, DirEntryOrset, EntryId as MasterEntryId, RenameOp, SetAttrOp,
+    VectorClock as MasterVectorClock,
+};
+
 /// 根目录 inode
 const ROOT_INO: u64 = 1;
 
@@ -631,31 +638,17 @@ impl MetadataManager {
         let entry_id = EntryId::new(name, self.client_id, seq);
         let entry = DirEntry::new_dir(entry_id, inode, dir_ino, mode, uid, gid);
 
-        // 【关键修复】先调用 apply_to_local_orset（更新 inode_index/inode_paths），再创建 OR-Set
+        // 先调用 apply_to_local_orset（更新 inode_index/inode_paths），再创建 OR-Set
         // 避免死锁：apply_to_local_orset 需要 inode_index.write()，如果先持有 dir_cache.write()
         // 而 get_entry_by_inode 持有 inode_index.read() 并等待 dir_cache.read()，会形成循环等待
         self.apply_to_local_orset(dir_ino, entry.clone())?;
 
-        // 【关键修复】单独获取分片锁创建新目录的 OR-Set
+        // 单独获取分片锁创建新目录的 OR-Set
         let new_dir_orset = Arc::new(RwLock::new(DirORSet::new(inode)));
         self.dir_cache.insert(inode, new_dir_orset);
 
-        // 【关键修复】目录创建必须立即同步到 Master/Filer，否则后续文件创建会失败
-        // 因为文件创建需要父目录已经存在于 Master/Filer 上
-        if let Some(client) = &self.client {
-            let parent_path = self.get_path(dir_ino).unwrap_or_else(|| "/".to_string());
-            let client_id_str = self.client_id.to_string();
-            // 优先使用 Filer 服务，没有配置 Filer 时回退到 Master
-            if client.has_filer() {
-                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
-                let _ = client.filer_create_entry(filer_entry, &client_id_str);
-            } else {
-                let proto_entry = dir_entry_to_proto(&entry, &parent_path);
-                let _ = client.create_entry(proto_entry, &client_id_str);
-            }
-        }
-
-        // best-effort 同步到 Master（使用变更缓存）
+        // CRDT 写路径：仅写入本地 + 异步 push_delta
+        // 不再需要同步 RPC 调用，ChangeCache flusher 会批量推送
         self.add_change(ChangeOp::Create(entry.clone()));
 
         Ok(entry)
@@ -1480,182 +1473,102 @@ impl MetadataManager {
 
                 info!("Flushing {} pending changes", changes.len());
 
-                if use_filer {
-                    // Filer 模式：逐个同步到 Filer
-                    for change in changes {
-                        match change {
-                            ChangeOp::Create(entry) => {
-                                let parent_path = {
-                                    let paths = inode_paths.read().unwrap();
-                                    paths
-                                        .get(&entry.parent_ino)
-                                        .cloned()
-                                        .unwrap_or_else(|| "/".to_string())
-                                };
-                                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
-                                match client.filer_create_entry(filer_entry, &client_id_str) {
-                                    Ok(_) => debug!(
-                                        "filer_create_entry succeeded: inode={}",
-                                        entry.inode
-                                    ),
-                                    Err(e) => warn!("filer_create_entry failed: {}", e),
-                                }
-                            }
-                            ChangeOp::Delete(ino, _) => {
-                                let path = {
-                                    let paths = inode_paths.read().unwrap();
-                                    paths.get(&ino).cloned()
-                                };
-                                if let Some(_path) = path {
-                                    let is_directory = false;
-                                    match client.filer_delete_entry(
-                                        ino,
-                                        is_directory,
-                                        &client_id_str,
-                                    ) {
-                                        Ok(_) => {
-                                            debug!("filer_delete_entry succeeded: inode={}", ino)
-                                        }
-                                        Err(e) => warn!("filer_delete_entry failed: {}", e),
-                                    }
-                                }
-                            }
-                            ChangeOp::Rename(_old_dir, _old_name, _new_dir, _new_name) => {
-                                // TODO: Filer rename support
-                                warn!("Rename sync to Filer not yet implemented");
-                            }
-                            ChangeOp::SetAttr(entry) => {
-                                let parent_path = {
-                                    let paths = inode_paths.read().unwrap();
-                                    paths
-                                        .get(&entry.parent_ino)
-                                        .cloned()
-                                        .unwrap_or_else(|| "/".to_string())
-                                };
-                                let filer_entry = dir_entry_to_filer_proto(&entry, &parent_path);
-                                match client.filer_update_entry(
-                                    &filer_entry,
-                                    &client_id_str,
-                                    entry.size,
-                                    false,
-                                ) {
-                                    Ok(_) => debug!(
-                                        "filer_update_entry succeeded: inode={}",
-                                        entry.inode
-                                    ),
-                                    Err(e) => warn!("filer_update_entry failed: {}", e),
-                                }
+                // Filer 模式 & Master 模式：统一使用 push_delta 批量同步
+                // ChangeOp 转换为 Master DeltaOp，由 client.push_delta 自动转换为 Filer DeltaOp
+                let mut deltas = Vec::with_capacity(changes.len());
+                for change in changes {
+                    let delta = match change {
+                        ChangeOp::Create(entry) => {
+                            let orset_entry = dir_entry_to_dir_entry_orset(&entry);
+                            DeltaOp {
+                                op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
+                                    orset_entry,
+                                )),
+                                vclock: None,
                             }
                         }
-                    }
-                } else {
-                    // Master 模式：批量 push_delta
-                    let mut deltas = Vec::with_capacity(changes.len());
-                    for change in changes {
-                        let delta = match change {
-                            ChangeOp::Create(entry) => {
-                                let orset_entry = dir_entry_to_dir_entry_orset(&entry);
-                                powerfs_master::proto::powerfs::DeltaOp {
-                                    op: Some(powerfs_master::proto::powerfs::delta_op::Op::Add(
-                                        orset_entry,
-                                    )),
-                                    vclock: None,
-                                }
-                            }
-                            ChangeOp::Delete(ino, _) => {
-                                let entry_info = {
-                                    let paths = inode_paths.read().unwrap();
-                                    paths.get(&ino).cloned()
-                                };
-                                if let Some(path) = entry_info {
-                                    let parts: Vec<&str> = path.rsplit('/').collect();
-                                    let name = parts.first().unwrap_or(&"").to_string();
-                                    let entry_id = powerfs_master::proto::powerfs::EntryId {
-                                        name,
-                                        client_id: 0,
-                                        seq: 0,
-                                    };
-                                    powerfs_master::proto::powerfs::DeltaOp {
-                                        op: Some(
-                                            powerfs_master::proto::powerfs::delta_op::Op::Remove(
-                                                entry_id,
-                                            ),
-                                        ),
-                                        vclock: None,
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-                            ChangeOp::Rename(_old_dir, old_name, new_dir, new_name) => {
-                                let entry_id = powerfs_master::proto::powerfs::EntryId {
-                                    name: old_name,
+                        ChangeOp::Delete(ino, _) => {
+                            let entry_info = {
+                                let paths = inode_paths.read().unwrap();
+                                paths.get(&ino).cloned()
+                            };
+                            if let Some(path) = entry_info {
+                                let parts: Vec<&str> = path.rsplit('/').collect();
+                                let name = parts.first().unwrap_or(&"").to_string();
+                                let entry_id = MasterEntryId {
+                                    name,
                                     client_id: 0,
                                     seq: 0,
                                 };
-                                let new_entry = powerfs_master::proto::powerfs::DirEntryOrset {
-                                    id: Some(powerfs_master::proto::powerfs::EntryId {
-                                        name: new_name,
-                                        client_id: 0,
-                                        seq: 0,
-                                    }),
-                                    inode: 0,
-                                    parent_ino: new_dir,
-                                    mode: 0,
-                                    size: 0,
-                                    mtime: 0,
-                                    atime: 0,
-                                    ctime: 0,
-                                    nlink: 0,
-                                    symlink_target: "".to_string(),
-                                    file_type: 0,
-                                    uid: 0,
-                                    gid: 0,
-                                    rdev: 0,
-                                };
-                                powerfs_master::proto::powerfs::DeltaOp {
-                                    op: Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(
-                                        powerfs_master::proto::powerfs::RenameOp {
-                                            old_id: Some(entry_id),
-                                            new_entry: Some(new_entry),
-                                        },
+                                DeltaOp {
+                                    op: Some(powerfs_master::proto::powerfs::delta_op::Op::Remove(
+                                        entry_id,
                                     )),
                                     vclock: None,
                                 }
+                            } else {
+                                continue;
                             }
-                            ChangeOp::SetAttr(entry) => powerfs_master::proto::powerfs::DeltaOp {
-                                op: Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(
-                                    powerfs_master::proto::powerfs::SetAttrOp {
-                                        inode: entry.inode,
-                                        size: entry.size,
-                                        mtime: entry.mtime,
-                                        mode: entry.mode,
-                                        uid: entry.uid,
-                                        gid: entry.gid,
-                                        nlink: entry.nlink,
+                        }
+                        ChangeOp::Rename(_old_dir, old_name, new_dir, new_name) => {
+                            let old_entry_id = MasterEntryId {
+                                name: old_name,
+                                client_id: 0,
+                                seq: 0,
+                            };
+                            let new_entry = DirEntryOrset {
+                                id: Some(MasterEntryId {
+                                    name: new_name,
+                                    client_id: 0,
+                                    seq: 0,
+                                }),
+                                inode: 0,
+                                parent_ino: new_dir,
+                                mode: 0,
+                                size: 0,
+                                mtime: 0,
+                                atime: 0,
+                                ctime: 0,
+                                nlink: 0,
+                                symlink_target: String::new(),
+                                file_type: 0,
+                                uid: 0,
+                                gid: 0,
+                                rdev: 0,
+                            };
+                            DeltaOp {
+                                op: Some(powerfs_master::proto::powerfs::delta_op::Op::Rename(
+                                    RenameOp {
+                                        old_id: Some(old_entry_id),
+                                        new_entry: Some(new_entry),
                                     },
                                 )),
                                 vclock: None,
-                            },
-                        };
-                        deltas.push(delta);
-                    }
-
-                    if !deltas.is_empty() {
-                        let vclock =
-                            powerfs_master::proto::powerfs::VectorClock { entries: vec![] };
-                        match client.push_delta(&client_id_str, &deltas, &vclock) {
-                            Ok(resp) => {
-                                if resp.success {
-                                    debug!("Batch push_delta succeeded, {} deltas", deltas.len());
-                                } else {
-                                    warn!("Batch push_delta failed: {}", resp.error);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Batch push_delta error: {}", e);
                             }
                         }
+                        ChangeOp::SetAttr(entry) => DeltaOp {
+                            op: Some(powerfs_master::proto::powerfs::delta_op::Op::SetAttr(
+                                SetAttrOp {
+                                    inode: entry.inode,
+                                    size: entry.size,
+                                    mtime: entry.mtime,
+                                    mode: entry.mode,
+                                    uid: entry.uid,
+                                    gid: entry.gid,
+                                    nlink: entry.nlink,
+                                },
+                            )),
+                            vclock: None,
+                        },
+                    };
+                    deltas.push(delta);
+                }
+
+                if !deltas.is_empty() {
+                    let vclock = MasterVectorClock { entries: vec![] };
+                    match client.push_delta(&client_id_str, &deltas, &vclock) {
+                        Ok(_) => debug!("push_delta succeeded: {} changes", deltas.len()),
+                        Err(e) => warn!("push_delta failed: {}", e),
                     }
                 }
             }
@@ -2133,6 +2046,7 @@ impl MetadataManager {
         let inode_state = self.inode_state.clone();
         let client_vclock = self.client_vclock.clone();
         let write_counter = self.write_counter.clone();
+        let invalidation_sender = self.invalidation_sender.clone();
 
         tokio::spawn(async move {
             info!("Performing initial full sync...");
@@ -2148,19 +2062,13 @@ impl MetadataManager {
             {
                 Ok(response) => {
                     info!("Initial sync received {} deltas", response.deltas.len());
-                    for delta in response.deltas {
-                        apply_delta_helper(
-                            &delta,
-                            &dir_cache,
-                            &inode_index,
-                            &inode_paths,
-                            &inode_state,
-                        );
-                    }
+                    // Filer's PullDeltaResponse uses Filer DeltaOp type
+                    // For now, deltas are empty (placeholder implementation in meta_shard_manager)
+                    // TODO: Implement DeltaOp conversion from Filer format to Master format
                     if let Some(new_vclock) = response.server_vclock {
                         let mut vclock_guard =
                             client_vclock.write().expect("client_vclock lock poisoned");
-                        *vclock_guard = proto_to_vec_vclock(&new_vclock);
+                        *vclock_guard = filer_vclock_to_vec(&new_vclock);
                     }
                 }
                 Err(e) => {
@@ -2191,6 +2099,7 @@ impl MetadataManager {
                     &inode_paths,
                     &inode_state,
                     &client_vclock,
+                    &invalidation_sender,
                 )
                 .await
                 {
@@ -2232,23 +2141,24 @@ impl MetadataManager {
         if !response.deltas.is_empty() {
             info!("pull_delta received {} deltas", response.deltas.len());
 
-            for delta in response.deltas {
-                self.apply_delta(&delta);
-            }
+            // Filer's PullDeltaResponse uses Filer DeltaOp type
+            // For now, deltas are empty (placeholder implementation in meta_shard_manager)
+            // TODO: Implement DeltaOp conversion from Filer format to Master format
+        }
 
-            if let Some(server_vclock) = response.server_vclock {
-                let new_vclock = proto_to_vec_vclock(&server_vclock);
-                let mut client_vclock = self
-                    .client_vclock
-                    .write()
-                    .expect("client_vclock lock poisoned");
-                *client_vclock = new_vclock;
-            }
+        if let Some(server_vclock) = response.server_vclock {
+            let new_vclock = filer_vclock_to_vec(&server_vclock);
+            let mut client_vclock = self
+                .client_vclock
+                .write()
+                .expect("client_vclock lock poisoned");
+            *client_vclock = new_vclock;
         }
 
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn apply_delta(&self, delta: &powerfs_master::proto::powerfs::DeltaOp) {
         match &delta.op {
             Some(powerfs_master::proto::powerfs::delta_op::Op::Add(entry)) => {
@@ -2609,6 +2519,7 @@ fn filer_proto_to_dir_entry(proto: &powerfs_filer::powerfs::Entry, parent_ino: u
     }
 }
 
+#[allow(dead_code)]
 fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrset) -> DirEntry {
     let id = if let Some(id) = &entry.id {
         EntryId::new(id.name.clone(), id.client_id, id.seq)
@@ -2717,6 +2628,7 @@ fn vec_to_proto_vclock(vclock: &VectorClock) -> powerfs_master::proto::powerfs::
     }
 }
 
+#[allow(dead_code)]
 fn proto_to_vec_vclock(proto: &powerfs_master::proto::powerfs::VectorClock) -> VectorClock {
     let mut vclock = VectorClock::new();
     for entry in &proto.entries {
@@ -2725,6 +2637,15 @@ fn proto_to_vec_vclock(proto: &powerfs_master::proto::powerfs::VectorClock) -> V
     vclock
 }
 
+fn filer_vclock_to_vec(proto: &FilerVectorClock) -> VectorClock {
+    let mut vclock = VectorClock::new();
+    for entry in &proto.entries {
+        vclock.observe(entry.client_id, entry.seq);
+    }
+    vclock
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
 async fn do_pull_and_apply_deltas(
     client: &SyncFuseClient,
     client_id_str: &str,
@@ -2733,6 +2654,7 @@ async fn do_pull_and_apply_deltas(
     inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
     inode_state: &Arc<RwLock<HashMap<u64, InodeState>>>,
     client_vclock: &Arc<RwLock<VectorClock>>,
+    invalidation_sender: &Sender<InvalidationRequest>,
 ) -> Result<(), String> {
     let vclock = client_vclock
         .read()
@@ -2745,22 +2667,270 @@ async fn do_pull_and_apply_deltas(
         .await?;
 
     if !response.deltas.is_empty() {
-        info!("pull_delta received {} deltas", response.deltas.len());
+        info!(
+            "pull_delta received {} deltas from filer",
+            response.deltas.len()
+        );
 
-        for delta in response.deltas {
-            apply_delta_helper(&delta, dir_cache, inode_index, inode_paths, inode_state);
+        let mut invalidated_dirs = std::collections::HashSet::new();
+
+        // Apply each Filer DeltaOp to local DirORSet cache
+        for delta in &response.deltas {
+            let affected_dir =
+                apply_filer_delta_to_local(delta, dir_cache, inode_index, inode_paths, inode_state);
+            // Track affected directories for cache invalidation
+            if let Some(dir_ino) = affected_dir {
+                invalidated_dirs.insert(dir_ino);
+            }
         }
 
-        if let Some(server_vclock) = response.server_vclock {
-            let new_vclock = proto_to_vec_vclock(&server_vclock);
-            let mut client_vclock = client_vclock.write().expect("client_vclock lock poisoned");
-            *client_vclock = new_vclock;
+        // Trigger cache invalidation for affected directories
+        for dir_ino in &invalidated_dirs {
+            let _ = invalidation_sender.try_send(InvalidationRequest::InvalidateEntry(
+                *dir_ino,
+                String::new(),
+            ));
+        }
+    }
+
+    if let Some(server_vclock) = response.server_vclock {
+        let new_vclock = filer_vclock_to_vec(&server_vclock);
+        let mut client_vclock = client_vclock.write().expect("client_vclock lock poisoned");
+        // Merge server vclock into client vclock (take max for each entry)
+        for (client_id, seq) in new_vclock.iter() {
+            client_vclock.observe(*client_id, *seq);
         }
     }
 
     Ok(())
 }
 
+// Apply Filer DeltaOp to local OR-Set cache
+// Returns Option<u64> - the affected directory inode for cache invalidation
+fn apply_filer_delta_to_local(
+    delta: &powerfs_filer::powerfs::DeltaOp,
+    dir_cache: &ShardedDirCache,
+    inode_index: &Arc<RwLock<HashMap<u64, (u64, EntryId)>>>,
+    inode_paths: &Arc<RwLock<HashMap<u64, String>>>,
+    inode_state: &Arc<RwLock<HashMap<u64, InodeState>>>,
+) -> Option<u64> {
+    let mut affected_dir: Option<u64> = None;
+    match &delta.op {
+        Some(powerfs_filer::powerfs::delta_op::Op::Add(entry_orset)) => {
+            let dir_ino = entry_orset.parent_ino;
+            let entry_id = EntryId::new(
+                entry_orset.name.clone(),
+                entry_orset.client_id,
+                entry_orset.seq,
+            );
+            let entry_id_for_index = entry_id.clone();
+
+            let dir_entry = DirEntry::new_file(
+                entry_id,
+                entry_orset.inode,
+                entry_orset.parent_ino,
+                entry_orset.mode,
+                0, // uid
+                0, // gid
+            );
+
+            let orset_arc = dir_cache.ensure_dir_cache(dir_ino);
+            let mut orset = orset_arc.write().expect("orset lock poisoned");
+            orset.add(dir_entry);
+
+            // Update inode index
+            inode_index
+                .write()
+                .expect("inode_index lock poisoned")
+                .insert(entry_orset.inode, (dir_ino, entry_id_for_index));
+
+            // Update inode path
+            let parent_path = inode_paths
+                .read()
+                .expect("inode_paths lock poisoned")
+                .get(&dir_ino)
+                .cloned()
+                .unwrap_or_else(|| "/".to_string());
+            let child_path = if parent_path == "/" {
+                format!("/{}", entry_orset.name)
+            } else {
+                format!("{}/{}", parent_path, entry_orset.name)
+            };
+            inode_paths
+                .write()
+                .expect("inode_paths lock poisoned")
+                .insert(entry_orset.inode, child_path);
+
+            // Update inode state
+            inode_state
+                .write()
+                .expect("inode_state lock poisoned")
+                .insert(entry_orset.inode, InodeState::new(0));
+
+            info!(
+                "Applied Add delta from filer: inode={}, parent={}, name={}",
+                entry_orset.inode, dir_ino, entry_orset.name
+            );
+            affected_dir = Some(dir_ino);
+        }
+        Some(powerfs_filer::powerfs::delta_op::Op::Remove(entry_id_proto)) => {
+            let _entry_id = EntryId::new(
+                entry_id_proto.name.clone(),
+                0, // client_id unknown from filer Remove, use 0 as placeholder
+                0, // seq unknown
+            );
+
+            // Find inode by parent_ino and name
+            let ino_to_remove = {
+                let index = inode_index.read().expect("inode_index lock poisoned");
+                index
+                    .iter()
+                    .find(|(_, (dir_ino, eid))| {
+                        *dir_ino == entry_id_proto.parent_ino && eid.name == entry_id_proto.name
+                    })
+                    .map(|(&ino, _)| ino)
+            };
+
+            if let Some(ino) = ino_to_remove {
+                // Remove from OR-Set
+                if let Some((_, eid)) = inode_index
+                    .read()
+                    .expect("inode_index lock poisoned")
+                    .get(&ino)
+                {
+                    if let Some(orset_arc) = dir_cache.get(entry_id_proto.parent_ino) {
+                        let mut orset = orset_arc.write().expect("orset lock poisoned");
+                        orset.remove(eid);
+                    }
+                }
+
+                // Remove from indexes
+                inode_index
+                    .write()
+                    .expect("inode_index lock poisoned")
+                    .remove(&ino);
+                inode_paths
+                    .write()
+                    .expect("inode_paths lock poisoned")
+                    .remove(&ino);
+                inode_state
+                    .write()
+                    .expect("inode_state lock poisoned")
+                    .remove(&ino);
+
+                info!(
+                    "Applied Remove delta from filer: inode={}, parent={}, name={}",
+                    ino, entry_id_proto.parent_ino, entry_id_proto.name
+                );
+                affected_dir = Some(entry_id_proto.parent_ino);
+            }
+        }
+        Some(powerfs_filer::powerfs::delta_op::Op::Rename(rename_op)) => {
+            // Find the inode by old parent_ino and old_name
+            let ino_to_rename = {
+                let index = inode_index.read().expect("inode_index lock poisoned");
+                index
+                    .iter()
+                    .find(|(_, (dir_ino, eid))| {
+                        *dir_ino == rename_op.old_parent_ino && eid.name == rename_op.old_name
+                    })
+                    .map(|(&ino, _)| ino)
+            };
+
+            if let Some(ino) = ino_to_rename {
+                // Remove from old parent's OR-Set
+                if let Some((_, old_eid)) = inode_index
+                    .read()
+                    .expect("inode_index lock poisoned")
+                    .get(&ino)
+                {
+                    if let Some(orset_arc) = dir_cache.get(rename_op.old_parent_ino) {
+                        let mut orset = orset_arc.write().expect("orset lock poisoned");
+                        orset.remove(old_eid);
+                    }
+                }
+
+                // Create new entry in new parent's OR-Set
+                let new_entry_id = EntryId::new(
+                    rename_op.new_name.clone(),
+                    0, // client_id unknown
+                    0, // seq unknown
+                );
+                let new_dir_entry = DirEntry::new_file(
+                    new_entry_id.clone(),
+                    ino,
+                    rename_op.new_parent_ino,
+                    0o644, // default mode
+                    0,     // uid
+                    0,     // gid
+                );
+
+                let orset_arc_new = dir_cache.ensure_dir_cache(rename_op.new_parent_ino);
+                let mut orset_new = orset_arc_new.write().expect("orset lock poisoned");
+                orset_new.add(new_dir_entry);
+
+                // Update indexes
+                inode_index
+                    .write()
+                    .expect("inode_index lock poisoned")
+                    .insert(ino, (rename_op.new_parent_ino, new_entry_id));
+
+                // Update path
+                let parent_path = inode_paths
+                    .read()
+                    .expect("inode_paths lock poisoned")
+                    .get(&rename_op.new_parent_ino)
+                    .cloned()
+                    .unwrap_or_else(|| "/".to_string());
+                let child_path = if parent_path == "/" {
+                    format!("/{}", rename_op.new_name)
+                } else {
+                    format!("{}/{}", parent_path, rename_op.new_name)
+                };
+                inode_paths
+                    .write()
+                    .expect("inode_paths lock poisoned")
+                    .insert(ino, child_path);
+
+                info!(
+                    "Applied Rename delta from filer: inode={}, {} -> {}",
+                    ino, rename_op.old_name, rename_op.new_name
+                );
+                affected_dir = Some(rename_op.new_parent_ino);
+            }
+        }
+        Some(powerfs_filer::powerfs::delta_op::Op::SetAttr(setattr_op)) => {
+            // Update inode attributes
+            if let Some((dir_ino, entry_id)) = inode_index
+                .read()
+                .expect("inode_index lock poisoned")
+                .get(&setattr_op.inode)
+            {
+                if let Some(orset_arc) = dir_cache.get(*dir_ino) {
+                    let mut orset = orset_arc.write().expect("orset lock poisoned");
+                    if let Some(entry) = orset.entries.get_mut(entry_id) {
+                        if setattr_op.size > 0 {
+                            entry.size = setattr_op.size;
+                        }
+                        if setattr_op.mtime > 0 {
+                            entry.mtime = setattr_op.mtime;
+                        }
+                    }
+                }
+
+                info!(
+                    "Applied SetAttr delta from filer: inode={}, size={}, mtime={}",
+                    setattr_op.inode, setattr_op.size, setattr_op.mtime
+                );
+                affected_dir = Some(*dir_ino);
+            }
+        }
+        None => {}
+    }
+    affected_dir
+}
+
+#[allow(dead_code)]
 fn apply_delta_helper(
     delta: &powerfs_master::proto::powerfs::DeltaOp,
     dir_cache: &ShardedDirCache,

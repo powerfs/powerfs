@@ -1,0 +1,191 @@
+# CRDT 测试专用部署配置
+# 3 Filer 容器 + 3 分片，每个容器持有一个分片的 leader
+
+networks:
+  crdt-test-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+volumes:
+  crdt-filer-1-data:
+  crdt-filer-2-data:
+  crdt-filer-3-data:
+
+services:
+  crdt-filer-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-filer-1
+    networks:
+      crdt-test-network:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - crdt-filer-1-data:/data/filer
+    ports:
+      - "18888:8888"   # S3 API
+      - "18889:8889"   # gRPC API
+    command: >
+      /app/powerfs-filer
+      --node-id 1
+      --s3-address 0.0.0.0:8888
+      --grpc-address 0.0.0.0:8889
+      --raft-address 172.30.0.11:8890
+      --data-dir /data/filer
+      --shard-count 3
+      --peers 172.30.0.11:8890
+      --peers 172.30.0.12:8890
+      --peers 172.30.0.13:8890
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  crdt-filer-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-filer-2
+    networks:
+      crdt-test-network:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - crdt-filer-2-data:/data/filer
+    ports:
+      - "28888:8888"   # S3 API
+      - "28889:8889"   # gRPC API
+    command: >
+      /app/powerfs-filer
+      --node-id 2
+      --s3-address 0.0.0.0:8888
+      --grpc-address 0.0.0.0:8889
+      --raft-address 172.30.0.12:8890
+      --data-dir /data/filer
+      --shard-count 3
+      --peers 172.30.0.11:8890
+      --peers 172.30.0.12:8890
+      --peers 172.30.0.13:8890
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      crdt-filer-1:
+        condition: service_healthy
+
+  crdt-filer-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-filer-3
+    networks:
+      crdt-test-network:
+        ipv4_address: 172.30.0.13
+    volumes:
+      - crdt-filer-3-data:/data/filer
+    ports:
+      - "38888:8888"   # S3 API
+      - "38889:8889"   # gRPC API
+    command: >
+      /app/powerfs-filer
+      --node-id 3
+      --s3-address 0.0.0.0:8888
+      --grpc-address 0.0.0.0:8889
+      --raft-address 172.30.0.13:8890
+      --data-dir /data/filer
+      --shard-count 3
+      --peers 172.30.0.11:8890
+      --peers 172.30.0.12:8890
+      --peers 172.30.0.13:8890
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      crdt-filer-2:
+        condition: service_healthy
+
+  # FUSE 客户端 1
+  crdt-fuse-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-fuse-1
+    cpus: '1.0'
+    mem_limit: 512m
+    init: true
+    networks:
+      crdt-test-network:
+        ipv4_address: 172.30.0.21
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    volumes:
+      - /tmp/powerfs/crdt-fuse1:/mnt/powerfs
+    command: >
+      /app/powerfs-fuse
+      --mount-point /mnt/powerfs
+      --filer-address 172.30.0.11:8889
+      --client-id fuse-1
+      --sync-interval 1
+    depends_on:
+      crdt-filer-1:
+        condition: service_healthy
+      crdt-filer-2:
+        condition: service_healthy
+      crdt-filer-3:
+        condition: service_healthy
+
+  # FUSE 客户端 2
+  crdt-fuse-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-fuse-2
+    cpus: '1.0'
+    mem_limit: 512m
+    init: true
+    networks:
+      crdt-test-network:
+        ipv4_address: 172.30.0.22
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    volumes:
+      - /tmp/powerfs/crdt-fuse2:/mnt/powerfs
+    command: >
+      /app/powerfs-fuse
+      --mount-point /mnt/powerfs
+      --filer-address 172.30.0.12:8889
+      --client-id fuse-2
+      --sync-interval 1
+    depends_on:
+      crdt-filer-1:
+        condition: service_healthy
+      crdt-filer-2:
+        condition: service_healthy
+      crdt-filer-3:
+        condition: service_healthy
