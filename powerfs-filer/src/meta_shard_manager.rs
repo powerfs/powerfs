@@ -1198,6 +1198,8 @@ impl MetaShardManager {
         };
 
         let mut max_seq = 0u64;
+        // Collect SetAttr operations for batch processing at the end
+        let mut pending_setattr_batch: Vec<InodeInfo> = Vec::new();
 
         for delta in deltas {
             let seq = extract_seq_from_delta(delta).unwrap_or(0);
@@ -1276,7 +1278,39 @@ impl MetaShardManager {
                 if let Some(store) = &shard_store {
                     match merge_result {
                         MergeResult::Applied | MergeResult::Idempotent => {
-                            self.apply_delta_to_store(store, delta).await?;
+                            // For SetAttr, defer to batch processing
+                            if let Some(crate::powerfs::delta_op::Op::SetAttr(setattr_op)) =
+                                &delta.op
+                            {
+                                if let Some(mut inode_info) = store.get_inode(setattr_op.inode) {
+                                    if setattr_op.size > 0 {
+                                        inode_info.size = setattr_op.size;
+                                        inode_info.blocks = setattr_op.size.div_ceil(512);
+                                    }
+                                    inode_info.mtime = setattr_op.mtime;
+                                    if !setattr_op.chunks.is_empty() {
+                                        inode_info.chunks = setattr_op
+                                            .chunks
+                                            .iter()
+                                            .map(|c| crate::shard_store::StoredFileChunk {
+                                                offset: c.offset,
+                                                size: c.size,
+                                                mtime: c.mtime,
+                                                fid: c.fid.clone(),
+                                                cookie: c.cookie,
+                                                crc32: c.crc32,
+                                            })
+                                            .collect();
+                                    }
+                                    if !setattr_op.extended.is_empty() {
+                                        inode_info.extended = setattr_op.extended.clone();
+                                    }
+                                    pending_setattr_batch.push(inode_info);
+                                }
+                            } else {
+                                // Non-SetAttr operations: apply immediately
+                                self.apply_delta_to_store(store, delta).await?;
+                            }
                         }
                         MergeResult::ConcurrentlyAdded => {
                             debug!(
@@ -1300,6 +1334,15 @@ impl MetaShardManager {
             } else if let Some(store) = &shard_store {
                 // 无法确定目录的操作，直接应用
                 self.apply_delta_to_store(store, delta).await?;
+            }
+        }
+
+        // Batch commit all pending SetAttr operations in a single RocksDB WriteBatch
+        if !pending_setattr_batch.is_empty() {
+            if let Some(store) = &shard_store {
+                let count = pending_setattr_batch.len();
+                store.batch_update_inodes(pending_setattr_batch)?;
+                debug!("Batch committed {} SetAttr operations", count);
             }
         }
 

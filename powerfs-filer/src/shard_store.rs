@@ -85,14 +85,36 @@ impl ShardStore {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // RocksDB performance tuning for metadata workload
+        opts.set_max_open_files(10000);
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB write buffer
+        opts.set_max_write_buffer_number(4);
+        opts.set_min_write_buffer_number_to_merge(2);
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_level_zero_slowdown_writes_trigger(16);
+        opts.set_level_zero_stop_writes_trigger(32);
+        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB
+        opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB
+        opts.enable_statistics();
+        opts.set_stats_dump_period_sec(60);
+
+        // Optimized CF options for different workloads
+        let make_cf_opts = || {
+            let mut cf_opts = rocksdb::Options::default();
+            cf_opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB per CF
+            cf_opts.set_max_write_buffer_number(3);
+            cf_opts.set_level_zero_file_num_compaction_trigger(4);
+            cf_opts.set_target_file_size_base(32 * 1024 * 1024);
+            cf_opts
+        };
 
         let cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(CF_INODES, rocksdb::Options::default()),
-            ColumnFamilyDescriptor::new(CF_DIR_ENTRIES, rocksdb::Options::default()),
-            ColumnFamilyDescriptor::new(CF_STATS, rocksdb::Options::default()),
-            ColumnFamilyDescriptor::new(CF_METADATA, rocksdb::Options::default()),
-            ColumnFamilyDescriptor::new(CF_ORSET_STATE, rocksdb::Options::default()),
-            ColumnFamilyDescriptor::new(CF_TOMBSTONES, rocksdb::Options::default()),
+            ColumnFamilyDescriptor::new(CF_INODES, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_DIR_ENTRIES, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_STATS, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -968,6 +990,40 @@ impl ShardStore {
 
         let mut inodes = self.inodes.write().unwrap();
         inodes.insert(info.inode, info);
+
+        Ok(())
+    }
+
+    /// Batch update multiple inodes in a single RocksDB WriteBatch for better throughput
+    pub fn batch_update_inodes(&self, inodes: Vec<InodeInfo>) -> Result<(), String> {
+        if inodes.is_empty() {
+            return Ok(());
+        }
+
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut mem_updates = Vec::with_capacity(inodes.len());
+
+        for info in inodes {
+            let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+            batch.put_cf(cf_inodes, info.inode.to_be_bytes(), &data);
+            mem_updates.push(info);
+        }
+
+        let write_opts = rocksdb::WriteOptions::default();
+        self.db
+            .write_opt(batch, &write_opts)
+            .map_err(|e| format!("batch write inodes to rocksdb: {}", e))?;
+
+        // Update in-memory cache
+        let mut cache = self.inodes.write().unwrap();
+        for info in mem_updates {
+            cache.insert(info.inode, info);
+        }
 
         Ok(())
     }

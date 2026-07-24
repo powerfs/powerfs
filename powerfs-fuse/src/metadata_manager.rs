@@ -213,7 +213,7 @@ enum InvalidationRequest {
 }
 
 /// 变更缓存配置
-const CHANGE_CACHE_BATCH_SIZE: usize = 64;
+const CHANGE_CACHE_BATCH_SIZE: usize = 256;
 
 /// Inode 状态信息（用于引用计数和 generation 管理）
 struct InodeState {
@@ -1511,7 +1511,7 @@ impl MetadataManager {
             info!("Change cache flusher thread started, filer={}", use_filer);
 
             loop {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(5));
 
                 let mut changes = Vec::with_capacity(CHANGE_CACHE_BATCH_SIZE);
                 while let Ok(change) = change_receiver.try_recv() {
@@ -1524,6 +1524,9 @@ impl MetadataManager {
                 if changes.is_empty() {
                     continue;
                 }
+
+                // Deduplicate: merge SetAttr for the same inode (keep latest)
+                let changes = deduplicate_changes(changes);
 
                 info!("Flushing {} pending changes", changes.len());
 
@@ -2630,6 +2633,42 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         },
         extended: std::collections::HashMap::new(),
     }
+}
+
+/// Deduplicate changes: for multiple SetAttr on the same inode, keep only the last one.
+/// Create and Delete operations are preserved as-is.
+fn deduplicate_changes(changes: Vec<ChangeOp>) -> Vec<ChangeOp> {
+    use std::collections::HashMap;
+
+    let mut latest_setattr: HashMap<u64, DirEntry> = HashMap::new();
+    let mut result: Vec<ChangeOp> = Vec::with_capacity(changes.len());
+
+    // First pass: collect latest SetAttr per inode
+    for change in &changes {
+        if let ChangeOp::SetAttr(entry) = change {
+            latest_setattr.insert(entry.inode, entry.clone());
+        }
+    }
+
+    // Second pass: keep non-SetAttr and first occurrence of SetAttr (replaced with latest)
+    let mut emitted_setattr: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for change in changes {
+        match change {
+            ChangeOp::SetAttr(entry) => {
+                let ino = entry.inode;
+                if !emitted_setattr.contains(&ino) {
+                    emitted_setattr.insert(ino);
+                    if let Some(latest) = latest_setattr.remove(&ino) {
+                        result.push(ChangeOp::SetAttr(latest));
+                    }
+                }
+                // Skip duplicate SetAttr for the same inode
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
 }
 
 fn dir_entry_to_dir_entry_orset(entry: &DirEntry) -> powerfs_master::proto::powerfs::DirEntryOrset {

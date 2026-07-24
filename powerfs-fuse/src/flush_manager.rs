@@ -22,15 +22,15 @@ pub struct FlushConfig {
 impl Default for FlushConfig {
     fn default() -> Self {
         FlushConfig {
-            per_file_threshold: 16 * 1024 * 1024,
-            global_threshold: 256 * 1024 * 1024,
-            max_dirty_age: Duration::from_secs(10),
-            backpressure_ratio: 0.8,
+            per_file_threshold: 32 * 1024 * 1024,
+            global_threshold: 512 * 1024 * 1024,
+            max_dirty_age: Duration::from_secs(5),
+            backpressure_ratio: 0.85,
             worker_count: num_cpus::get(),
-            scan_interval: Duration::from_secs(2),
+            scan_interval: Duration::from_millis(500),
             max_retries: 5,
-            initial_backoff_ms: 2000,
-            max_backoff_ms: 60000,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30000,
         }
     }
 }
