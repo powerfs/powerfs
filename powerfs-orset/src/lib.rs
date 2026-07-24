@@ -126,6 +126,9 @@ pub struct DirEntry {
     pub parent_ino: u64,
     pub chunks: Vec<CachedFileChunk>,
     pub symlink_target: Option<String>,
+    /// Extended attributes (e.g. file layout: stripe/flat)
+    #[serde(default)]
+    pub extended: HashMap<String, Vec<u8>>,
 }
 
 impl DirEntry {
@@ -155,6 +158,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 
@@ -184,6 +188,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 
@@ -212,6 +217,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: Some(target),
+            extended: HashMap::new(),
         }
     }
 
@@ -241,6 +247,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 
@@ -271,6 +278,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 
@@ -301,6 +309,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 
@@ -330,6 +339,7 @@ impl DirEntry {
             parent_ino,
             chunks: vec![],
             symlink_target: None,
+            extended: HashMap::new(),
         }
     }
 

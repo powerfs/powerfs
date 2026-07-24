@@ -10,13 +10,14 @@ use crate::shard_strategy::ShardStrategy;
 use super::powerfs::filer_meta_service_server::FilerMetaService;
 use super::powerfs::{
     CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest, DeleteEntryResponse,
-    Entry as ProtoEntry, FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse,
-    GetEntryRequest, GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse,
-    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
-    LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
-    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
-    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
-    RenameEntryRequest, RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
+    Entry as ProtoEntry, FileChunk as ProtoFileChunk, FuseAttributes, GetEntryByInodeRequest,
+    GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse, GetShardStatsRequest,
+    GetShardStatsResponse, LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest,
+    LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse,
+    ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
+    LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
+    PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RenameEntryRequest,
+    RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
 };
 
 pub struct FilerMetaServiceImpl {
@@ -114,7 +115,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
                     found: false,
                     entry: None,
                     path: "".to_string(),
-                    error: "entry not found".to_string(),
+                    error: "".to_string(),
                 }));
             }
         };
@@ -677,10 +678,21 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
             crtime: inode.ctime,
             perm: 0,
         }),
-        chunks: vec![],
+        chunks: inode
+            .chunks
+            .iter()
+            .map(|c| ProtoFileChunk {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                fid: c.fid.clone(),
+                cookie: c.cookie,
+                crc32: c.crc32,
+            })
+            .collect(),
         hard_link_id: "".to_string(),
         hard_link_counter: 0,
-        extended: std::collections::HashMap::new(),
+        extended: inode.extended.clone(),
         content_size: inode.size,
         disk_size: inode.size,
         ttl: "".to_string(),

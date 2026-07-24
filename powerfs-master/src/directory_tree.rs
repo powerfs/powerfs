@@ -1343,6 +1343,7 @@ impl DirectoryTree {
                         } else {
                             Some(entry.symlink_target.clone())
                         },
+                        extended: std::collections::HashMap::new(),
                     };
                     Some(powerfs_orset::DeltaOp::Add {
                         entry: dir_entry,
@@ -1386,6 +1387,7 @@ impl DirectoryTree {
                             parent_ino: entry.parent_ino,
                             chunks: Vec::new(),
                             symlink_target: None,
+                            extended: std::collections::HashMap::new(),
                         }
                     } else {
                         continue;
@@ -1780,6 +1782,8 @@ fn delta_to_proto(delta: &powerfs_orset::DeltaOp) -> crate::proto::powerfs::Delt
                 uid: uid.unwrap_or(0),
                 gid: gid.unwrap_or(0),
                 nlink: nlink.unwrap_or(0),
+                chunks: vec![],
+                extended: std::collections::HashMap::new(),
             },
         )),
     };

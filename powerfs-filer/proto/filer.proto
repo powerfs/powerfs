@@ -302,6 +302,8 @@ message SetAttrOp {
     uint64 inode = 1;
     uint64 size = 2;
     uint64 mtime = 3;
+    repeated FileChunk chunks = 4;
+    map<string, bytes> extended = 5;
 }
 
 message PushDeltaRequest {

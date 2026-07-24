@@ -134,6 +134,7 @@ impl MetadataManager {
                         } else {
                             Some(entry.symlink_target.clone())
                         },
+                        extended: std::collections::HashMap::new(),
                     };
 
                     let policy = policies
@@ -260,6 +261,7 @@ impl MetadataManager {
                                 parent_ino: *dir_ino,
                                 chunks: Vec::new(),
                                 symlink_target: None,
+                                extended: std::collections::HashMap::new(),
                             };
                             let delta = powerfs_orset::DeltaOp::Rename {
                                 old_id: EntryId::new(old_name, client_id_num, 0),

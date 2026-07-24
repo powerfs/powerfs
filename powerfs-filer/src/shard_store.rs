@@ -35,6 +35,23 @@ pub struct InodeInfo {
     pub volume_id: Option<u32>,
     #[serde(default)]
     pub etag: Option<String>,
+    // File chunks for data layout (stored in Filer, not Master)
+    #[serde(default)]
+    pub chunks: Vec<StoredFileChunk>,
+    // Extended attributes (e.g. file layout: stripe/flat)
+    #[serde(default)]
+    pub extended: HashMap<String, Vec<u8>>,
+}
+
+/// Stored file chunk (persisted in Filer InodeInfo)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoredFileChunk {
+    pub offset: u64,
+    pub size: u64,
+    pub mtime: u64,
+    pub fid: String,
+    pub cookie: u32,
+    pub crc32: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -418,6 +435,8 @@ impl ShardStore {
             fid: None,
             volume_id: None,
             etag: None,
+            chunks: vec![],
+            extended: HashMap::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -488,6 +507,8 @@ impl ShardStore {
             fid: Some(fid),
             volume_id: Some(volume_id),
             etag: Some(etag),
+            chunks: vec![],
+            extended: HashMap::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -611,6 +632,8 @@ impl ShardStore {
             fid: None,
             volume_id: None,
             etag: None,
+            chunks: vec![],
+            extended: HashMap::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();

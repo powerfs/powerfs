@@ -1417,6 +1417,8 @@ impl MetaShardManager {
                     fid: None,
                     volume_id: None,
                     etag: None,
+                    chunks: vec![],
+                    extended: std::collections::HashMap::new(),
                 };
                 store.create_inode(inode_info)?;
                 store.add_dir_entry(
@@ -1460,12 +1462,36 @@ impl MetaShardManager {
                 if let Some(mut inode_info) = store.get_inode(setattr_op.inode) {
                     if setattr_op.size > 0 {
                         inode_info.size = setattr_op.size;
+                        inode_info.blocks = setattr_op.size.div_ceil(512);
                     }
                     inode_info.mtime = setattr_op.mtime;
+                    // Update chunks if provided
+                    if !setattr_op.chunks.is_empty() {
+                        inode_info.chunks = setattr_op
+                            .chunks
+                            .iter()
+                            .map(|c| crate::shard_store::StoredFileChunk {
+                                offset: c.offset,
+                                size: c.size,
+                                mtime: c.mtime,
+                                fid: c.fid.clone(),
+                                cookie: c.cookie,
+                                crc32: c.crc32,
+                            })
+                            .collect();
+                    }
+                    // Update extended if provided
+                    if !setattr_op.extended.is_empty() {
+                        inode_info.extended = setattr_op.extended.clone();
+                    }
                     store.update_inode(inode_info)?;
                     debug!(
-                        "Applied SetAttr delta: inode={} size={} mtime={}",
-                        setattr_op.inode, setattr_op.size, setattr_op.mtime
+                        "Applied SetAttr delta: inode={} size={} mtime={} chunks={} extended_keys={}",
+                        setattr_op.inode,
+                        setattr_op.size,
+                        setattr_op.mtime,
+                        setattr_op.chunks.len(),
+                        setattr_op.extended.len(),
                     );
                 }
             }

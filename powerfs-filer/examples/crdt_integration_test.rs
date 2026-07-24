@@ -288,6 +288,8 @@ async fn test_setattr(
         inode: 4001,
         size: 1024,
         mtime: 1000000,
+        chunks: vec![],
+        extended: std::collections::HashMap::new(),
     };
 
     let setattr_delta = DeltaOp {

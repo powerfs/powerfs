@@ -1,191 +1,195 @@
-# CRDT 测试专用部署配置
-# 3 Filer 容器 + 3 分片，每个容器持有一个分片的 leader
+# CRDT Test Environment
+# Simplified deployment for testing CRDT conflict resolution engine
+# Components: Redis + Master + 3 Filer nodes
 
 networks:
-  crdt-test-network:
+  crdt-test-net:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/16
-          gateway: 172.30.0.1
+        - subnet: 172.31.0.0/16
+          gateway: 172.31.0.1
 
 volumes:
+  crdt-redis-data:
+  crdt-master-data:
   crdt-filer-1-data:
   crdt-filer-2-data:
   crdt-filer-3-data:
+  crdt-volume-1-data:
 
 services:
-  crdt-filer-1:
+  redis:
+    image: redis:7-alpine
+    container_name: crdt-redis
+    networks:
+      crdt-test-net:
+        ipv4_address: 172.31.0.10
+    volumes:
+      - crdt-redis-data:/data
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+
+  master:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: crdt-master
+    networks:
+      crdt-test-net:
+        ipv4_address: 172.31.0.11
+    volumes:
+      - crdt-master-data:/data/master
+    environment:
+      - REDIS_URL=redis://172.31.0.10:6379
+    command: >
+      /app/powerfs master
+      --port 9333
+      --dir /data/master
+      --raft-id 1
+      --peer 172.31.0.11:9333
+    expose:
+      - "9333"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  filer-1:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: crdt-filer-1
     networks:
-      crdt-test-network:
-        ipv4_address: 172.30.0.11
+      crdt-test-net:
+        ipv4_address: 172.31.0.21
     volumes:
       - crdt-filer-1-data:/data/filer
     ports:
-      - "18888:8888"   # S3 API
-      - "18889:8889"   # gRPC API
+      - "18888:8888"    # S3 Admin API
+      - "18889:8889"    # gRPC API
     command: >
       /app/powerfs-filer
       --node-id 1
       --s3-address 0.0.0.0:8888
       --grpc-address 0.0.0.0:8889
-      --raft-address 172.30.0.11:8890
+      --raft-address 172.31.0.21:8889
       --data-dir /data/filer
       --shard-count 3
-      --peers 172.30.0.11:8890
-      --peers 172.30.0.12:8890
-      --peers 172.30.0.13:8890
+      --master-address 172.31.0.11:9333
+      --redis-address redis://172.31.0.10:6379/
+      --peers 172.31.0.21:8889
+      --peers 172.31.0.22:8889
+      --peers 172.31.0.23:8889
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
+    depends_on:
+      master:
+        condition: service_healthy
 
-  crdt-filer-2:
+  filer-2:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: crdt-filer-2
     networks:
-      crdt-test-network:
-        ipv4_address: 172.30.0.12
+      crdt-test-net:
+        ipv4_address: 172.31.0.22
     volumes:
       - crdt-filer-2-data:/data/filer
     ports:
-      - "28888:8888"   # S3 API
-      - "28889:8889"   # gRPC API
+      - "28888:8888"
+      - "28889:8889"
     command: >
       /app/powerfs-filer
       --node-id 2
       --s3-address 0.0.0.0:8888
       --grpc-address 0.0.0.0:8889
-      --raft-address 172.30.0.12:8890
+      --raft-address 172.31.0.22:8889
       --data-dir /data/filer
       --shard-count 3
-      --peers 172.30.0.11:8890
-      --peers 172.30.0.12:8890
-      --peers 172.30.0.13:8890
+      --master-address 172.31.0.11:9333
+      --redis-address redis://172.31.0.10:6379/
+      --peers 172.31.0.21:8889
+      --peers 172.31.0.22:8889
+      --peers 172.31.0.23:8889
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
     depends_on:
-      crdt-filer-1:
+      master:
         condition: service_healthy
 
-  crdt-filer-3:
+  filer-3:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: crdt-filer-3
     networks:
-      crdt-test-network:
-        ipv4_address: 172.30.0.13
+      crdt-test-net:
+        ipv4_address: 172.31.0.23
     volumes:
       - crdt-filer-3-data:/data/filer
     ports:
-      - "38888:8888"   # S3 API
-      - "38889:8889"   # gRPC API
+      - "38888:8888"
+      - "38889:8889"
     command: >
       /app/powerfs-filer
       --node-id 3
       --s3-address 0.0.0.0:8888
       --grpc-address 0.0.0.0:8889
-      --raft-address 172.30.0.13:8890
+      --raft-address 172.31.0.23:8889
       --data-dir /data/filer
       --shard-count 3
-      --peers 172.30.0.11:8890
-      --peers 172.30.0.12:8890
-      --peers 172.30.0.13:8890
+      --master-address 172.31.0.11:9333
+      --redis-address redis://172.31.0.10:6379/
+      --peers 172.31.0.21:8889
+      --peers 172.31.0.22:8889
+      --peers 172.31.0.23:8889
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
     depends_on:
-      crdt-filer-2:
+      master:
         condition: service_healthy
 
-  # FUSE 客户端 1
-  crdt-fuse-1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+  volume-1:
     image: powerfs:latest
-    container_name: crdt-fuse-1
-    cpus: '1.0'
-    mem_limit: 512m
-    init: true
+    container_name: crdt-volume-1
     networks:
-      crdt-test-network:
-        ipv4_address: 172.30.0.21
-    devices:
-      - /dev/fuse:/dev/fuse
-    cap_add:
-      - SYS_ADMIN
-      - DAC_READ_SEARCH
-    security_opt:
-      - apparmor:unconfined
-    privileged: true
-    restart: unless-stopped
+      crdt-test-net:
+        ipv4_address: 172.31.0.31
     volumes:
-      - /tmp/powerfs/crdt-fuse1:/mnt/powerfs
-    command: >
-      /app/powerfs-fuse
-      --mount-point /mnt/powerfs
-      --filer-address 172.30.0.11:8889
-      --client-id fuse-1
-      --sync-interval 1
+      - crdt-volume-1-data:/data
+      - ../config/volume-crdt-1.toml:/etc/powerfs/volume-1.toml
+    expose:
+      - "8080"
+      - "8091"
+    command: /app/powerfs-volume --config /etc/powerfs/volume-1.toml --grpc-address 172.31.0.31:8080
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.31.0.31 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     depends_on:
-      crdt-filer-1:
-        condition: service_healthy
-      crdt-filer-2:
-        condition: service_healthy
-      crdt-filer-3:
-        condition: service_healthy
-
-  # FUSE 客户端 2
-  crdt-fuse-2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: powerfs:latest
-    container_name: crdt-fuse-2
-    cpus: '1.0'
-    mem_limit: 512m
-    init: true
-    networks:
-      crdt-test-network:
-        ipv4_address: 172.30.0.22
-    devices:
-      - /dev/fuse:/dev/fuse
-    cap_add:
-      - SYS_ADMIN
-      - DAC_READ_SEARCH
-    security_opt:
-      - apparmor:unconfined
-    privileged: true
-    restart: unless-stopped
-    volumes:
-      - /tmp/powerfs/crdt-fuse2:/mnt/powerfs
-    command: >
-      /app/powerfs-fuse
-      --mount-point /mnt/powerfs
-      --filer-address 172.30.0.12:8889
-      --client-id fuse-2
-      --sync-interval 1
-    depends_on:
-      crdt-filer-1:
-        condition: service_healthy
-      crdt-filer-2:
-        condition: service_healthy
-      crdt-filer-3:
+      master:
         condition: service_healthy

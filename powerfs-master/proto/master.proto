@@ -1206,6 +1206,8 @@ message SetAttrOp {
     uint32 uid = 5;
     uint32 gid = 6;
     uint32 nlink = 7;
+    repeated FileChunk chunks = 8;
+    map<string, bytes> extended = 9;
 }
 
 message PushDeltaRequest {

@@ -20,6 +20,10 @@ struct Args {
     #[arg(long, default_value = "localhost:9334")]
     master: Vec<String>,
 
+    /// Filer server gRPC addresses (e.g. localhost:8889 localhost:8890)
+    #[arg(long)]
+    filer: Vec<String>,
+
     /// Mount point path
     #[arg(long)]
     mount_point: String,
@@ -113,7 +117,11 @@ fn main() {
             fuse_cfg.master_addresses.clone()
         };
 
-    let filer_addrs = fuse_cfg.filer_addresses.clone();
+    let filer_addrs = if !args.filer.is_empty() {
+        args.filer.clone()
+    } else {
+        fuse_cfg.filer_addresses.clone()
+    };
 
     let mount_point = if !args.mount_point.is_empty() {
         args.mount_point.clone()
@@ -194,6 +202,9 @@ fn main() {
 
     info!("PowerFS FUSE Client starting...");
     info!("  Masters: {}", master_addrs.join(", "));
+    if !filer_addrs.is_empty() {
+        info!("  Filers: {}", filer_addrs.join(", "));
+    }
     info!("  Mount point: {}", mount_point);
     info!("  Collection: {}", collection);
     info!("  Replication: {}", replication);

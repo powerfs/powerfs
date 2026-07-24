@@ -1306,6 +1306,59 @@ impl MetadataManager {
         Ok(updated)
     }
 
+    /// 更新 entry 的 chunks、size 和 extended 字段（flush_dirty_chunks 用）
+    ///
+    /// CRDT：本地 OR-Set 即更新成功，通过 ChangeOp::SetAttr 触发异步 push_delta。
+    /// 不再调用 Master/Filer 的同步元数据接口。
+    pub fn update_entry_chunks(
+        &self,
+        ino: u64,
+        chunks: Vec<crate::orset::CachedFileChunk>,
+        size: u64,
+        extended: HashMap<String, Vec<u8>>,
+    ) {
+        let (dir_ino, entry_id) = {
+            let index = self.inode_index.read().unwrap();
+            match index.get(&ino).cloned() {
+                Some(info) => info,
+                None => {
+                    warn!(
+                        "update_entry_chunks: inode {} not found in inode_index",
+                        ino
+                    );
+                    return;
+                }
+            }
+        };
+
+        let orset_arc = self.ensure_dir_cache(dir_ino);
+        let mut orset = orset_arc.write().unwrap();
+        let entry = match orset.entries.get_mut(&entry_id) {
+            Some(e) => e,
+            None => {
+                warn!(
+                    "update_entry_chunks: entry {:?} not found in OR-Set",
+                    entry_id
+                );
+                return;
+            }
+        };
+
+        entry.chunks = chunks;
+        entry.size = size;
+        entry.extended = extended;
+        entry.ctime = now_unix();
+        let updated = entry.clone();
+        drop(orset);
+
+        self.add_change(ChangeOp::SetAttr(updated));
+
+        debug!(
+            "update_entry_chunks: inode={} updated locally, push_delta queued",
+            ino
+        );
+    }
+
     // ==================== 内部辅助 ====================
 
     /// 本地 lookup（不触发 Master 回退）
@@ -1430,6 +1483,7 @@ impl MetadataManager {
             parent_ino: ROOT_INO,
             chunks: vec![],
             symlink_target: None,
+            extended: std::collections::HashMap::new(),
         }
     }
 
@@ -1556,6 +1610,19 @@ impl MetadataManager {
                                     uid: entry.uid,
                                     gid: entry.gid,
                                     nlink: entry.nlink,
+                                    chunks: entry
+                                        .chunks
+                                        .iter()
+                                        .map(|c| powerfs_master::proto::powerfs::FileChunk {
+                                            offset: c.offset,
+                                            size: c.size,
+                                            mtime: c.mtime,
+                                            fid: c.fid.clone(),
+                                            cookie: c.cookie,
+                                            crc32: c.crc32,
+                                        })
+                                        .collect(),
+                                    extended: entry.extended.clone(),
                                 },
                             )),
                             vclock: None,
@@ -2360,6 +2427,7 @@ fn proto_to_dir_entry(proto: &powerfs_master::proto::powerfs::Entry, parent_ino:
         } else {
             Some(proto.symlink_target.clone())
         },
+        extended: proto.extended.clone(),
     }
 }
 
@@ -2516,6 +2584,7 @@ fn filer_proto_to_dir_entry(proto: &powerfs_filer::powerfs::Entry, parent_ino: u
         } else {
             Some(proto.symlink_target.clone())
         },
+        extended: proto.extended.clone(),
     }
 }
 
@@ -2559,6 +2628,7 @@ fn proto_dir_entry_to_local(entry: &powerfs_master::proto::powerfs::DirEntryOrse
         } else {
             Some(entry.symlink_target.clone())
         },
+        extended: std::collections::HashMap::new(),
     }
 }
 
@@ -3697,6 +3767,8 @@ mod tests {
                     uid: 1000,
                     gid: 2000,
                     nlink: 3,
+                    chunks: vec![],
+                    extended: std::collections::HashMap::new(),
                 },
             )),
             vclock: Some(powerfs_master::proto::powerfs::VectorClock { entries: vec![] }),

@@ -384,193 +384,34 @@ impl PowerFsFuserFs {
             file_size
         );
 
-        let use_filer = client.has_filer();
-
-        // Enum to wrap both Filer and Master entry types
-        enum EntryWrapper {
-            Filer(powerfs_filer::powerfs::Entry),
-            Master(powerfs_master::proto::powerfs::Entry),
-        }
-
-        // 获取 entry（从 Filer 或 Master）
-        let entry_wrapper = if use_filer {
-            // Filer 模式：从 Filer 获取 entry
-            match client.filer_get_entry_by_inode(inode) {
-                Ok(Some(e)) => EntryWrapper::Filer(e.0),
-                Ok(None) => {
-                    // entry 不在 Filer 上（可能是本地新建的），创建一个
-                    let meta_entry = match meta.get_entry_by_inode(inode) {
-                        Ok(Some(e)) => e,
-                        _ => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("entry not found for inode {}", inode),
-                            ));
-                        }
-                    };
-                    let parent_path = meta
-                        .get_path(meta_entry.parent_ino)
-                        .unwrap_or_else(|| "/".to_string());
-                    let filer_entry = crate::metadata_manager::dir_entry_to_filer_proto(
-                        &meta_entry,
-                        &parent_path,
-                    );
-                    let client_id_str = meta.client_id().to_string();
-                    match client.filer_create_entry(filer_entry, &client_id_str) {
-                        Ok(_) => {
-                            debug!(
-                                "flush_dirty_chunks: created entry on filer for inode {}",
-                                inode
-                            );
-                            let mut result = None;
-                            for retry in 0..10 {
-                                match client.filer_get_entry_by_inode(inode) {
-                                    Ok(Some(e)) => {
-                                        debug!(
-                                            "flush_dirty_chunks: got entry after {} retries",
-                                            retry
-                                        );
-                                        result = Some(e);
-                                        break;
-                                    }
-                                    _ => {
-                                        if retry < 9 {
-                                            debug!(
-                                                "flush_dirty_chunks: waiting for entry, retry {}/9",
-                                                retry + 1
-                                            );
-                                            std::thread::sleep(Duration::from_millis(100));
-                                        }
-                                    }
-                                }
-                            }
-                            match result {
-                                Some(e) => EntryWrapper::Filer(e.0),
-                                None => {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        "entry not found after create",
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("flush_dirty_chunks: filer_create_entry failed: {}", e);
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                format!("filer_create_entry failed: {}", e),
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("flush_dirty_chunks: filer_get_entry_by_inode failed: {}", e);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!("filer_get_entry_by_inode failed: {}", e),
-                    ));
-                }
-            }
-        } else {
-            // Master 模式：从 Master 获取 entry
-            match client.get_entry_by_inode(inode) {
-                Ok(Some(e)) => EntryWrapper::Master(e.0),
-                Ok(None) => {
-                    // entry 不在 Master 上（可能是本地新建的），创建一个
-                    let meta_entry = match meta.get_entry_by_inode(inode) {
-                        Ok(Some(e)) => e,
-                        _ => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("entry not found for inode {}", inode),
-                            ));
-                        }
-                    };
-                    let parent_path = meta
-                        .get_path(meta_entry.parent_ino)
-                        .unwrap_or_else(|| "/".to_string());
-                    let proto_entry =
-                        crate::metadata_manager::dir_entry_to_proto(&meta_entry, &parent_path);
-                    let client_id_str = meta.client_id().to_string();
-                    match client.create_entry(proto_entry, &client_id_str) {
-                        Ok(_) => {
-                            debug!(
-                                "flush_dirty_chunks: created entry on master for inode {}",
-                                inode
-                            );
-                            let mut result = None;
-                            for retry in 0..10 {
-                                match client.get_entry_by_inode(inode) {
-                                    Ok(Some(e)) => {
-                                        debug!(
-                                            "flush_dirty_chunks: got entry after {} retries",
-                                            retry
-                                        );
-                                        result = Some(e);
-                                        break;
-                                    }
-                                    _ => {
-                                        if retry < 9 {
-                                            debug!(
-                                                "flush_dirty_chunks: waiting for entry, retry {}/9",
-                                                retry + 1
-                                            );
-                                            std::thread::sleep(Duration::from_millis(100));
-                                        }
-                                    }
-                                }
-                            }
-                            match result {
-                                Some(e) => EntryWrapper::Master(e.0),
-                                None => {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        "entry not found after create",
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("flush_dirty_chunks: create_entry failed: {}", e);
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                format!("create_entry failed: {}", e),
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let fs_error = parse_master_error(&e);
-                    return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
-                }
+        // CRDT: Get entry from local OR-Set (no Master/Filer sync needed)
+        let meta_entry = match meta.get_entry_by_inode(inode) {
+            Ok(Some(e)) => e,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("entry not found for inode {}", inode),
+                ));
             }
         };
 
-        // Get extended map from the entry wrapper
-        let extended = match &entry_wrapper {
-            EntryWrapper::Filer(e) => &e.extended,
-            EntryWrapper::Master(e) => &e.extended,
-        };
-
-        // Get chunks from the entry (as Master FileChunk type for unified processing)
-        let entry_chunks: Vec<powerfs_master::proto::powerfs::FileChunk> = match &entry_wrapper {
-            EntryWrapper::Master(e) => e.chunks.clone(),
-            EntryWrapper::Filer(e) => e
-                .chunks
-                .iter()
-                .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                    offset: c.offset,
-                    size: c.size,
-                    mtime: c.mtime,
-                    fid: c.fid.clone(),
-                    cookie: c.cookie,
-                    crc32: c.crc32,
-                })
-                .collect(),
-        };
+        // Get extended and chunks from local OR-Set entry
+        let extended: std::collections::HashMap<String, Vec<u8>> = meta_entry.extended.clone();
+        let entry_chunks: Vec<powerfs_master::proto::powerfs::FileChunk> = meta_entry
+            .chunks
+            .iter()
+            .map(|c| powerfs_master::proto::powerfs::FileChunk {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                fid: c.fid.clone(),
+                cookie: c.cookie,
+                crc32: c.crc32,
+            })
+            .collect();
 
         // 解析现有 FileLayout（从 Entry.extended）
-        let mut layout = FileLayout::from_extended(extended);
+        let mut layout = FileLayout::from_extended(&extended);
 
         // 判断是否需要从 Flat 提升为 Stripe
         let should_promote =
@@ -871,112 +712,40 @@ impl PowerFsFuserFs {
             }
         }
 
-        // 获取 Master Entry 类型的 entry
-        let entry: powerfs_master::proto::powerfs::Entry = match &entry_wrapper {
-            EntryWrapper::Master(e) => e.clone(),
-            EntryWrapper::Filer(e) => {
-                // Convert Filer Entry to Master Entry
-                powerfs_master::proto::powerfs::Entry {
-                    name: e.name.clone(),
-                    directory: e.directory.clone(),
-                    attributes: e.attributes.as_ref().map(|a| {
-                        powerfs_master::proto::powerfs::FuseAttributes {
-                            ino: a.ino,
-                            size: a.size,
-                            mode: a.mode,
-                            uid: a.uid,
-                            gid: a.gid,
-                            mtime: a.mtime,
-                            atime: a.atime,
-                            nlink: a.nlink,
-                            blocks: a.blocks,
-                            blksize: 0,
-                            ctime: 0,
-                            crtime: 0,
-                            perm: 0,
-                            rdev: a.rdev,
-                        }
-                    }),
-                    chunks: e
-                        .chunks
-                        .iter()
-                        .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                            offset: c.offset,
-                            size: c.size,
-                            mtime: c.mtime,
-                            fid: c.fid.clone(),
-                            cookie: c.cookie,
-                            crc32: c.crc32,
-                        })
-                        .collect(),
-                    hard_link_id: e.hard_link_id.clone(),
-                    hard_link_counter: e.hard_link_counter,
-                    extended: e.extended.clone(),
-                    content_size: e.content_size,
-                    disk_size: e.disk_size,
-                    ttl: e.ttl.clone(),
-                    generation: 0,
-                    owner: String::new(),
-                    symlink_target: String::new(),
-                }
-            }
-        };
-
-        // 更新 Master 上的 entry（合并 chunks + 更新 size + 存储 layout）
-        let client_id_str = meta.client_id().to_string();
-        let mut updated_entry = entry.clone();
-        // 合并 chunks：保留旧的非脏 chunk，添加新的脏 chunk
+        // CRDT: Update local OR-Set entry (chunks, size, extended) + async push_delta
+        // Merge chunks: keep old non-dirty chunks, add new dirty chunks
+        let mut updated_chunks: Vec<crate::orset::CachedFileChunk> = meta_entry.chunks.clone();
         for new_chunk in &new_chunks {
-            updated_entry
-                .chunks
-                .retain(|c| c.offset != new_chunk.offset);
-            updated_entry.chunks.push(new_chunk.clone());
+            updated_chunks.retain(|c| c.offset != new_chunk.offset);
+            updated_chunks.push(crate::orset::CachedFileChunk {
+                offset: new_chunk.offset,
+                size: new_chunk.size,
+                mtime: new_chunk.mtime,
+                fid: new_chunk.fid.clone(),
+                cookie: new_chunk.cookie,
+                crc32: new_chunk.crc32,
+            });
         }
-        // 按 offset 排序
-        updated_entry.chunks.sort_by_key(|c| c.offset);
+        updated_chunks.sort_by_key(|c| c.offset);
 
-        // 存储 FileLayout 到 extended
+        // Update extended with file layout
+        let mut updated_extended = extended.clone();
         if let Some(ref l) = layout {
             if l.is_stripe() {
-                l.to_extended(&mut updated_entry.extended);
+                l.to_extended(&mut updated_extended);
             }
         }
 
-        let old_size = entry.attributes.as_ref().map(|a| a.size).unwrap_or(0);
+        let old_size = meta_entry.size;
         let is_truncate = file_size > 0 && file_size < old_size;
         debug!(
             "flush_dirty_chunks: inode={}, old_size={}, new_size={}, is_truncate={}, is_stripe={}",
             inode, old_size, file_size, is_truncate, is_stripe
         );
 
-        // 更新 size
-        if file_size > 0 {
-            if let Some(attrs) = updated_entry.attributes.as_mut() {
-                attrs.size = file_size;
-                attrs.blocks = file_size.div_ceil(512);
-            }
-            updated_entry.content_size = file_size;
-            updated_entry.disk_size = file_size;
-        }
-
-        match client.update_entry(&updated_entry, &client_id_str, old_size, is_truncate) {
-            Ok(actual_size) => {
-                debug!(
-                    "flush_dirty_chunks: update_entry succeeded, actual_size={}",
-                    actual_size
-                );
-                if actual_size > 0 && actual_size != file_size {
-                    info!(
-                        "flush_dirty_chunks: inode={}, size changed during flush (expected={}, actual={}), updating local cache",
-                        inode, file_size, actual_size
-                    );
-                    data.set_file_size(inode, actual_size);
-                }
-            }
-            Err(e) => {
-                warn!("flush_dirty_chunks: update_entry failed: {}", e);
-            }
-        }
+        // Update local OR-Set entry with new chunks, size, and extended
+        let new_size = if file_size > 0 { file_size } else { old_size };
+        meta.update_entry_chunks(inode, updated_chunks, new_size, updated_extended);
 
         // 清除脏标记
         data.clear_dirty(inode);
@@ -1051,20 +820,16 @@ impl PowerFsFuserFs {
     fn fetch_chunk_from_volume(&self, inode: u64, chunk_offset: u64) -> std::io::Result<Vec<u8>> {
         let chunk_size = self.data.chunk_cache().chunk_size();
 
-        // 从 Master 获取 entry（获取 chunk FID）
-        let (entry, _) = match self.client.get_entry_by_inode(inode) {
+        // CRDT: Get chunk FID from local OR-Set (no Master/Filer sync)
+        let meta_entry = match self.meta.get_entry_by_inode(inode) {
             Ok(Some(e)) => e,
-            Ok(None) => {
+            _ => {
                 return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-            }
-            Err(e) => {
-                let fs_error = parse_master_error(&e);
-                return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));
             }
         };
 
         // 查找该 offset 对应的 chunk FID
-        let chunk_fid = entry
+        let chunk_fid = meta_entry
             .chunks
             .iter()
             .find(|c| c.offset == chunk_offset)
@@ -1079,7 +844,7 @@ impl PowerFsFuserFs {
         let fid_str = match chunk_fid {
             Some(f) => f,
             None => {
-                // 该 chunk 在 Master 上不存在（可能是空洞或未写入的区域）
+                // 该 chunk 不存在（可能是空洞或未写入的区域）
                 return Ok(vec![0u8; chunk_size as usize]);
             }
         };

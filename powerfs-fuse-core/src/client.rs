@@ -106,6 +106,19 @@ fn master_delta_to_filer(delta: &DeltaOp) -> FilerDeltaOp {
                     inode: set_attr_op.inode,
                     size: set_attr_op.size,
                     mtime: set_attr_op.mtime,
+                    chunks: set_attr_op
+                        .chunks
+                        .iter()
+                        .map(|c| powerfs_filer::powerfs::FileChunk {
+                            offset: c.offset,
+                            size: c.size,
+                            mtime: c.mtime,
+                            fid: c.fid.clone(),
+                            cookie: c.cookie,
+                            crc32: c.crc32,
+                        })
+                        .collect(),
+                    extended: set_attr_op.extended.clone(),
                 },
             )),
         },
@@ -2805,8 +2818,7 @@ impl PowerFuseClient {
         );
 
         // Convert Master DeltaOp to Filer DeltaOp
-        let filer_deltas: Vec<FilerDeltaOp> =
-            deltas.iter().map(master_delta_to_filer).collect();
+        let filer_deltas: Vec<FilerDeltaOp> = deltas.iter().map(master_delta_to_filer).collect();
 
         for attempt in 1..=self.config.max_retry_count {
             // Use Filer channel instead of Master for metadata operations
