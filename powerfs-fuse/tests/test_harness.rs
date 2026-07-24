@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self};
+use std::io;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -158,19 +158,61 @@ fn is_port_open(addr: &str) -> bool {
 }
 
 fn is_fuse_available() -> bool {
-    Path::new("/dev/fuse").exists()
-        && (Command::new("fusermount")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-            || Command::new("fusermount3")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok())
+    let fuse_path = Path::new("/dev/fuse");
+    if !fuse_path.exists() {
+        return false;
+    }
+
+    // Check if we can actually read/write /dev/fuse.
+    // FUSE requires both read and write access to the device.
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fuse_path)
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Cannot open /dev/fuse for read+write: {}", e);
+            return false;
+        }
+    }
+
+    // Check fusermount availability (libfuse3 uses fusermount3)
+    let has_fusermount3 = Command::new("fusermount3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+
+    let has_fusermount = Command::new("fusermount")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+
+    if !has_fusermount3 && !has_fusermount {
+        eprintln!("Neither fusermount3 nor fusermount found; FUSE tests disabled");
+        return false;
+    }
+
+    // Check libfuse3 is loadable (powerfs-fuse uses libfuse3 via fuser crate)
+    // We try to dlopen it via checking common library paths
+    let libfuse3_paths = [
+        "/usr/lib/x86_64-linux-gnu/libfuse3.so",
+        "/usr/lib/x86_64-linux-gnu/libfuse.so.3",
+        "/usr/lib/libfuse3.so",
+        "/usr/lib/libfuse.so.3",
+    ];
+    let has_libfuse3 = libfuse3_paths.iter().any(|p| Path::new(p).exists());
+
+    if !has_libfuse3 {
+        eprintln!("libfuse3 not found; FUSE tests require libfuse3");
+        return false;
+    }
+
+    true
 }
 
 fn wait_for_port(addr: &str, timeout_secs: u64) -> bool {

@@ -356,11 +356,13 @@ impl DataManager {
     }
 
     /// 获取文件当前大小（本地维护）
+    ///
+    /// 只依赖 file_sizes map，不再包含 write_buffer 的最大偏移。
+    /// write_buffer 条目是临时的（flush 后应被清理），
+    /// 不应参与文件大小计算，否则会导致虚高。
     pub fn current_file_size(&self, ino: u64) -> u64 {
         let sizes = self.file_sizes.read().unwrap();
-        let cached_size = *sizes.get(&ino).unwrap_or(&0);
-        let buffer_max_offset = self.write_buffer.get_max_write_offset(ino);
-        cached_size.max(buffer_max_offset)
+        *sizes.get(&ino).unwrap_or(&0)
     }
 
     /// 设置文件大小（用于 setattr/truncate）

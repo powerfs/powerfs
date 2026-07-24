@@ -20,7 +20,8 @@ use crate::flush_manager::{FlushConfig, FlushManager};
 use crate::metadata_manager::MetadataManager;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
+    Request, TimeOrNow,
 };
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
@@ -29,7 +30,7 @@ use powerfs_master::proto::powerfs::StatisticsResponse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -78,6 +79,10 @@ struct PowerFsFuserFs {
     lease_notifier_running: Arc<AtomicBool>,
     /// 已失效的 inode 集合（等待清理）
     invalidated_inodes: Arc<RwLock<HashSet<u64>>>,
+    /// 文件句柄 -> 当前文件位置（用于 lseek 实现）
+    file_positions: Arc<RwLock<HashMap<u64, i64>>>,
+    /// 下一个文件句柄（唯一递增）
+    next_fh: Arc<AtomicU64>,
 }
 
 impl PowerFsFuserFs {
@@ -157,6 +162,8 @@ impl PowerFsFuserFs {
             lease_epochs,
             lease_notifier_running,
             invalidated_inodes,
+            file_positions: Arc::new(RwLock::new(HashMap::new())),
+            next_fh: Arc::new(AtomicU64::new(1)),
         };
 
         let flush_manager = {
@@ -324,6 +331,25 @@ impl PowerFsFuserFs {
             Ok(_) => Ok(()),
             Err(e) => Err(std::io::Error::other(e)),
         }
+    }
+
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn set_file_position(&self, fh: u64, pos: i64) {
+        let mut positions = self.file_positions.write().unwrap();
+        positions.insert(fh, pos);
+    }
+
+    fn get_file_position(&self, fh: u64) -> i64 {
+        let positions = self.file_positions.read().unwrap();
+        *positions.get(&fh).unwrap_or(&0)
+    }
+
+    fn remove_file_position(&self, fh: u64) {
+        let mut positions = self.file_positions.write().unwrap();
+        positions.remove(&fh);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -843,6 +869,10 @@ impl PowerFsFuserFs {
         // 清除脏标记
         data.clear_dirty(inode);
 
+        // 清除 write buffer 条目（数据已写入 Volume Server，write buffer 是冗余的）
+        // 防止 write buffer 条目累积导致 current_file_size 虚高
+        data.write_buffer().clear_inode(inode);
+
         debug!(
             "flush_dirty_chunks: completed for inode={}, chunks={}, is_stripe={}",
             inode,
@@ -1326,7 +1356,9 @@ impl Filesystem for PowerFsFuserFs {
         {
             Ok(entry) => {
                 let attr = Self::dir_entry_to_file_attr(&entry);
-                reply.created(&TTL, &attr, 0, 0, 0);
+                let fh = self.alloc_fh();
+                self.set_file_position(fh, 0);
+                reply.created(&TTL, &attr, fh, 0, 0);
 
                 self.data.set_file_size(entry.inode, 0);
 
@@ -1655,19 +1687,55 @@ impl Filesystem for PowerFsFuserFs {
             }
         }
 
-        reply.opened(0, 0);
+        let fh = self.alloc_fh();
+        self.set_file_position(fh, 0);
+        reply.opened(fh, 0);
     }
 
     fn opendir(&mut self, _req: &Request<'_>, inode: u64, _flags: i32, reply: ReplyOpen) {
         self.meta.acquire_inode(inode);
-        reply.opened(0, 0);
+        let fh = self.alloc_fh();
+        self.set_file_position(fh, 0);
+        reply.opened(fh, 0);
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        inode: u64,
+        fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let current = self.get_file_position(fh);
+        let new_pos = match whence {
+            0 => offset,           // SEEK_SET
+            1 => current + offset, // SEEK_CUR
+            2 => {
+                let file_size = self.get_file_size(inode);
+                (file_size as i64) + offset
+            } // SEEK_END
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        if new_pos < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        self.set_file_position(fh, new_pos);
+        reply.offset(new_pos);
     }
 
     fn read(
         &mut self,
         _req: &Request<'_>,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -1683,95 +1751,102 @@ impl Filesystem for PowerFsFuserFs {
 
         let file_size = self.get_file_size(inode);
         if offset_u64 >= file_size {
+            self.set_file_position(fh, offset);
             reply.data(&[]);
             return;
         }
 
-        // 先尝试从 DataManager 本地缓存读
-        match self.data.read(inode, offset_u64, size_usize) {
-            Some(data) => {
-                // 调试：检测全 0 读取
-                if !data.is_empty() && data.iter().all(|&b| b == 0) {
-                    warn!(
-                        "read: ALL ZEROS from cache! inode={}, offset={}, size={}",
-                        inode,
-                        offset_u64,
-                        data.len()
-                    );
+        let data_len = {
+            // 先尝试从 DataManager 本地缓存读
+            match self.data.read(inode, offset_u64, size_usize) {
+                Some(data) => {
+                    if !data.is_empty() && data.iter().all(|&b| b == 0) {
+                        warn!(
+                            "read: ALL ZEROS from cache! inode={}, offset={}, size={}",
+                            inode,
+                            offset_u64,
+                            data.len()
+                        );
+                    }
+                    let len = data.len();
+                    reply.data(&data);
+                    len
                 }
-                reply.data(&data);
-                return;
-            }
-            None => {
-                // chunk miss，需要从 Volume Server 拉取
-                debug!("read: chunk miss for inode={}, fetching from volume", inode);
-            }
-        }
+                None => {
+                    // chunk miss，需要从 Volume Server 拉取
+                    debug!("read: chunk miss for inode={}, fetching from volume", inode);
 
-        // 从 Volume Server 拉取缺失的 chunk
-        let chunk_size = self.data.chunk_cache().chunk_size();
-        let start_chunk_idx = offset_u64 / chunk_size;
-        let end_chunk_idx = (offset_u64 + size_usize as u64).div_ceil(chunk_size);
+                    let chunk_size = self.data.chunk_cache().chunk_size();
+                    let start_chunk_idx = offset_u64 / chunk_size;
+                    let end_chunk_idx = (offset_u64 + size_usize as u64).div_ceil(chunk_size);
 
-        for chunk_idx in start_chunk_idx..end_chunk_idx {
-            let chunk_offset = chunk_idx * chunk_size;
+                    for chunk_idx in start_chunk_idx..end_chunk_idx {
+                        let chunk_offset = chunk_idx * chunk_size;
 
-            // 检查 chunk 是否已在缓存中
-            if self.data.chunk_cache().get(inode, chunk_offset).is_some() {
-                continue;
-            }
+                        if self.data.chunk_cache().get(inode, chunk_offset).is_some() {
+                            continue;
+                        }
 
-            // 从 Volume Server 拉取
-            match self.fetch_chunk_from_volume(inode, chunk_offset) {
-                Ok(data) => {
-                    let mtime = crate::orset::now_unix();
-                    self.data
-                        .chunk_cache()
-                        .put(inode, chunk_offset, data, mtime, 0);
-                }
-                Err(e) => {
-                    let mtime = crate::orset::now_unix();
-                    if e.raw_os_error() == Some(libc::ENOENT) {
-                        let zero_data = vec![0u8; chunk_size as usize];
-                        self.data
-                            .chunk_cache()
-                            .put(inode, chunk_offset, zero_data, mtime, 0);
-                    } else {
-                        error!("read: fetch_chunk_from_volume failed: {}", e);
-                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-                        return;
+                        match self.fetch_chunk_from_volume(inode, chunk_offset) {
+                            Ok(data) => {
+                                let mtime = crate::orset::now_unix();
+                                self.data
+                                    .chunk_cache()
+                                    .put(inode, chunk_offset, data, mtime, 0);
+                            }
+                            Err(e) => {
+                                let mtime = crate::orset::now_unix();
+                                if e.raw_os_error() == Some(libc::ENOENT) {
+                                    let zero_data = vec![0u8; chunk_size as usize];
+                                    self.data.chunk_cache().put(
+                                        inode,
+                                        chunk_offset,
+                                        zero_data,
+                                        mtime,
+                                        0,
+                                    );
+                                } else {
+                                    error!("read: fetch_chunk_from_volume failed: {}", e);
+                                    self.set_file_position(fh, offset);
+                                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    match self.data.read(inode, offset_u64, size_usize) {
+                        Some(data) => {
+                            if !data.is_empty() && data.iter().all(|&b| b == 0) {
+                                warn!(
+                                    "read: ALL ZEROS from volume! inode={}, offset={}, size={}",
+                                    inode,
+                                    offset_u64,
+                                    data.len()
+                                );
+                            }
+                            let len = data.len();
+                            reply.data(&data);
+                            len
+                        }
+                        None => {
+                            warn!("read: still no data after fetch for inode={}", inode);
+                            reply.data(&[]);
+                            0
+                        }
                     }
                 }
             }
-        }
+        };
 
-        // 重试从本地缓存读
-        match self.data.read(inode, offset_u64, size_usize) {
-            Some(data) => {
-                // 调试：检测从 Volume Server 拉取后的全 0 读取
-                if !data.is_empty() && data.iter().all(|&b| b == 0) {
-                    warn!(
-                        "read: ALL ZEROS from volume! inode={}, offset={}, size={}",
-                        inode,
-                        offset_u64,
-                        data.len()
-                    );
-                }
-                reply.data(&data)
-            }
-            None => {
-                // 仍然失败，返回空数据
-                warn!("read: still no data after fetch for inode={}", inode);
-                reply.data(&[]);
-            }
-        }
+        self.set_file_position(fh, offset + data_len as i64);
     }
 
     fn write(
         &mut self,
         _req: &Request<'_>,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -1865,6 +1940,9 @@ impl Filesystem for PowerFsFuserFs {
             self.meta.update_size_optimistic(inode, insize, outsize);
         }
 
+        let new_pos = offset_u64 + written;
+        self.set_file_position(fh, new_pos as i64);
+
         reply.written(written as u32);
     }
 
@@ -1889,30 +1967,28 @@ impl Filesystem for PowerFsFuserFs {
         &mut self,
         _req: &Request<'_>,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        debug!("release: inode={}, flush={}", inode, _flush);
+        debug!("release: inode={}, fh={}, flush={}", inode, fh, _flush);
 
-        // 清理 write_buffer（数据已在 chunk_cache 中）
+        self.remove_file_position(fh);
+
         self.data.write_buffer().take(inode);
 
-        // 通知后台 flush 线程处理该 inode 的脏数据
         if let Some(fm) = &self.flush_manager {
             fm.notify_release(inode);
         }
 
         self.meta.release_inode(inode);
 
-        // 清理租约失效状态
         if self.is_lease_invalidated(inode) {
             self.handle_lease_invalidation(inode);
         }
 
-        // 释放租约
         if let Some(lease_id) = self.leases.write().unwrap().remove(&inode) {
             debug!(
                 "release: releasing lease for inode={}, lease_id={}",
@@ -1944,11 +2020,12 @@ impl Filesystem for PowerFsFuserFs {
         &mut self,
         _req: &Request<'_>,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        debug!("releasedir: inode={}", inode);
+        debug!("releasedir: inode={}, fh={}", inode, fh);
+        self.remove_file_position(fh);
         self.meta.release_inode(inode);
         reply.ok();
     }
@@ -2027,6 +2104,8 @@ impl Clone for PowerFsFuserFs {
             lease_epochs: self.lease_epochs.clone(),
             lease_notifier_running: self.lease_notifier_running.clone(),
             invalidated_inodes: self.invalidated_inodes.clone(),
+            file_positions: self.file_positions.clone(),
+            next_fh: self.next_fh.clone(),
         }
     }
 }

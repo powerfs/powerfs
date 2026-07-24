@@ -98,13 +98,27 @@ fn test_multiple_leases_on_same_path() {
     let entry = create_test_entry("multi.txt", "/", 0o100644);
     tree.create_entry(entry, "test_client").unwrap();
 
+    // Lease locks provide strong consistency - only one client
+    // can hold an exclusive lease on a path at a time.
     let lease1 = tree.acquire_lease("/multi.txt", "client-1", 60000);
+    assert!(!lease1.is_empty(), "First client should acquire lease");
+
+    // Second client should be denied while first lease is active
     let lease2 = tree.acquire_lease("/multi.txt", "client-2", 60000);
+    assert!(
+        lease2.is_empty(),
+        "Second client should NOT acquire lease while first is active"
+    );
 
-    assert_ne!(lease1, lease2);
-    assert!(tree.has_active_lease("/multi.txt"));
-
+    // After releasing the first lease, second client can acquire
     tree.release_lease(&lease1);
+    assert!(!tree.has_active_lease("/multi.txt"));
+
+    let lease2 = tree.acquire_lease("/multi.txt", "client-2", 60000);
+    assert!(
+        !lease2.is_empty(),
+        "Second client should acquire lease after first releases"
+    );
     assert!(tree.has_active_lease("/multi.txt"));
 
     tree.release_lease(&lease2);

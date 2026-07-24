@@ -1076,19 +1076,35 @@ impl DirectoryTree {
         let mut leases = self.leases.write().unwrap();
         let mut path_lease_map = self.path_lease_map.write().unwrap();
 
-        // Allow multiple leases on the same path.
-        // Conflict resolution is handled by epoch/version checks,
-        // not by blocking lease acquisition.
+        // Check for existing active lease on this path atomically with insertion.
+        // Lease locks provide strong consistency for file data read/write.
+        // Only one client can hold an active lease at a time.
+        let now = std::time::Instant::now();
+        let current_epoch = self.get_epoch();
+
+        if let Some(lease_ids) = path_lease_map.get(path) {
+            for lease_id in lease_ids {
+                if let Some(lease) = leases.get(lease_id) {
+                    if lease.epoch == current_epoch && lease.expires_at > now {
+                        debug!(
+                            "Lease denied for path {}: active lease already exists",
+                            path
+                        );
+                        return String::new();
+                    }
+                }
+            }
+        }
+
         let lease_id = uuid::Uuid::new_v4().to_string();
-        let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
-        let epoch = self.get_epoch();
+        let expires_at = now + std::time::Duration::from_millis(duration_ms);
 
         let lease = Lease {
             lease_id: lease_id.clone(),
             path: path.to_string(),
             client_id: client_id.to_string(),
             expires_at,
-            epoch,
+            epoch: current_epoch,
         };
 
         leases.insert(lease_id.clone(), lease);
