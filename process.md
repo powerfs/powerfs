@@ -40,7 +40,7 @@
   - 租约管理：`leases: Arc<RwLock<HashMap<u64, String>>>`
 
 ### 8. 租约续期机制
-- [powerfs-fuse-enterprise/src/fuser_fs.rs](powerfs-fuse-enterprise/src/fuser_fs.rs)
+- [powerfs-fuse/src/fuser_fs.rs](powerfs-fuse/src/fuser_fs.rs)
   - 后台续期线程：每 10 秒遍历所有活跃租约调用 `renew_lease()`
   - 续期周期：10秒（小于租约有效期 30 秒，确保租约不失效）
   - 续期成功/失败都记录日志，方便调试
@@ -52,7 +52,7 @@
 - ✅ concurrent_consistency 测试全部通过
 
 ### 10. FUSE O_APPEND 并发修复
-- [powerfs-fuse-enterprise/src/fuser_fs.rs](powerfs-fuse-enterprise/src/fuser_fs.rs)
+- [powerfs-fuse/src/fuser_fs.rs](powerfs-fuse/src/fuser_fs.rs)
   - 问题：内核在 getattr 和 write 之间有竞态窗口，多线程可能拿到相同文件大小并写到同一 offset 导致覆盖丢数据
   - 解决方案：
     1. 检测 `O_APPEND` 标志，动态计算写入偏移（`current_file_size(inode)`）
@@ -60,7 +60,7 @@
     3. 获取文件大小和写入操作在同一临界区内完成，保证原子性
 
 ### 11. 并发读写 size 追踪修复
-- [powerfs-fuse-enterprise/src/data_manager.rs](powerfs-fuse-enterprise/src/data_manager.rs)
+- [powerfs-fuse/src/data_manager.rs](powerfs-fuse/src/data_manager.rs)
   - 问题：多线程并发 read 时偶发返回 0 字节导致 UnexpectedEof
   - 根本原因：文件创建/打开后 file_sizes 缓存未初始化，导致 `current_file_size()` 返回 0
   - 解决方案：
@@ -70,7 +70,7 @@
     4. `read()` 方法增加从 write_buffer 读取的逻辑，支持读取尚未刷新到 chunk_cache 的数据
 
 ### 12. 租约失效通知机制
-- [powerfs-fuse-enterprise/src/fuser_fs.rs](powerfs-fuse-enterprise/src/fuser_fs.rs)
+- [powerfs-fuse/src/fuser_fs.rs](powerfs-fuse/src/fuser_fs.rs)
   - 问题：当租约被 Master 抢占或过期时，客户端需要及时感知并处理
   - 解决方案：
     1. 新增 `lease_epochs` 追踪每个 inode 的租约 epoch
@@ -176,4 +176,3 @@
 |------|------|------|
 | powerfs | `101df36a` | Implement file-level lease mechanism |
 | powerfs | `b9c2e911` | Fix FUSE uid/gid permissions |
-| powerfs-fuse-enterprise | `84370c3` | Fix FUSE uid/gid permissions |

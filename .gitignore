@@ -8,7 +8,6 @@ core
 raft-rs/
 io500/
 spdk/
-powerfs-fuse-enterprise/
 **/*.rs.bk
 *.state
 github.sh

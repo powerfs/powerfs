@@ -300,8 +300,8 @@ for (vol_idx, vol_off_start, vol_off_end, file_off_start) in ranges {
 
 | 组件 | 文件路径 | 核心功能 |
 |------|----------|----------|
-| FileLayout 定义 | `powerfs-fuse-enterprise/src/file_layout.rs` | LayoutType、FileLayout 结构、定位算法、序列化 |
-| FUSE 集成 | `powerfs-fuse-enterprise/src/fuser_fs.rs` | flush_dirty_chunks_inner 中的 Stripe 提升和写入 |
+| FileLayout 定义 | `powerfs-fuse/src/file_layout.rs` | LayoutType、FileLayout 结构、定位算法、序列化 |
+| FUSE 集成 | `powerfs-fuse/src/fuser_fs.rs` | flush_dirty_chunks_inner 中的 Stripe 提升和写入 |
 | Master 分配 | `powerfs-master/src/master.rs` | assign_stripe_volumes、round-robin 起始索引 |
 | gRPC 接口 | `powerfs-master/src/server.rs` | AssignFidRequest/Response 支持 stripe_count |
 

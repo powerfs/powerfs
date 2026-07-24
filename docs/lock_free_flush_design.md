@@ -423,8 +423,8 @@ fn do_flush_inode(&self, inode: u64) {
 
 | 组件 | 文件路径 | 核心改动 |
 |------|----------|----------|
-| FlushManager | `powerfs-fuse-enterprise/src/flush_manager.rs` | 移除锁，新增多通道分发和连接池 |
-| FUSE 集成 | `powerfs-fuse-enterprise/src/fuser_fs.rs` | 移除 flush_locks 引用 |
+| FlushManager | `powerfs-fuse/src/flush_manager.rs` | 移除锁，新增多通道分发和连接池 |
+| FUSE 集成 | `powerfs-fuse/src/fuser_fs.rs` | 移除 flush_locks 引用 |
 
 ---
 

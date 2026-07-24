@@ -12,14 +12,17 @@ name = "fs_bench"
 path = "benches/fs_bench.rs"
 harness = false
 
+[features]
+default = []
+
 [dependencies]
 powerfs-fuse-core = { path = "../powerfs-fuse-core" }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-volume = { path = "../powerfs-volume" }
-powerfs-filer = { path = "../powerfs-filer" }
 powerfs-orset = { path = "../powerfs-orset" }
+powerfs-filer = { path = "../powerfs-filer" }
 fuse-backend-rs = { workspace = true }
 fuser = { workspace = true }
 libc = { workspace = true }

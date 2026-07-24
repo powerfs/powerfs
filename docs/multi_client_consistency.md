@@ -162,7 +162,7 @@ Client A                    Client B
 
 **代码位置**：
 - [powerfs-orset/src/lib.rs](file:///home/portion/powerfs/powerfs-orset/src/lib.rs) - OR-Set 核心数据结构
-- [powerfs-fuse-enterprise/src/posix_projection.rs](file:///home/portion/powerfs/powerfs-fuse-enterprise/src/posix_projection.rs) - POSIX 投影层，支持冲突检测和展示
+- [powerfs-fuse/src/posix_projection.rs](file:///home/portion/powerfs/powerfs-fuse/src/posix_projection.rs) - POSIX 投影层，支持冲突检测和展示
 
 ### 2. Master Lease 机制
 
