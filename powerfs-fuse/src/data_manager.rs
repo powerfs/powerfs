@@ -143,6 +143,7 @@ impl DataManager {
     /// 优先从 chunk 缓存读取，未命中返回 None（由调用方从 Volume 拉取）。
     /// 读取范围受文件大小限制，超出部分返回短读。
     /// 支持跨 chunk 读取。
+    /// 如果读取范围内任何字节在缓存中缺失，返回 None（触发 Volume Server 拉取）。
     pub fn read(&self, ino: u64, offset: u64, size: usize) -> Option<Vec<u8>> {
         let file_size = self.current_file_size(ino);
         if offset >= file_size {
@@ -154,20 +155,31 @@ impl DataManager {
         let mut result = Vec::with_capacity(read_size);
         let mut current_offset = offset;
         let mut remaining = read_size;
+        let mut cache_hit = false;
 
         while remaining > 0 {
             let chunk = self.chunk_cache.get(ino, current_offset);
 
             if let Some(chunk_data) = chunk {
+                cache_hit = true;
                 let chunk_offset = self.chunk_cache.get_chunk_offset(current_offset);
                 let available = chunk_data.data.len().saturating_sub(chunk_offset as usize);
                 if available == 0 {
                     break;
                 }
                 let take = remaining.min(available);
-                result.extend_from_slice(
-                    &chunk_data.data[chunk_offset as usize..chunk_offset as usize + take],
-                );
+                let mut chunk_bytes =
+                    chunk_data.data[chunk_offset as usize..chunk_offset as usize + take].to_vec();
+
+                // 关键修复：用 WriteBuffer 数据覆盖 chunk cache 数据
+                // 防止 chunk 淘汰后重新创建导致旧数据丢失
+                let buffer_data = self.read_from_write_buffer(ino, current_offset, take);
+                if !buffer_data.is_empty() {
+                    let buf_len = buffer_data.len().min(take);
+                    chunk_bytes[..buf_len].copy_from_slice(&buffer_data[..buf_len]);
+                }
+
+                result.extend_from_slice(&chunk_bytes);
                 remaining -= take;
                 current_offset += take as u64;
             } else {
@@ -175,11 +187,26 @@ impl DataManager {
                 if buffer_data.is_empty() {
                     break;
                 }
+                cache_hit = true;
                 let take = buffer_data.len();
                 result.extend_from_slice(&buffer_data);
                 remaining -= take;
                 current_offset += take as u64;
             }
+        }
+
+        // 如果完全没有命中缓存，返回 None 触发 Volume Server 拉取
+        if !cache_hit {
+            return None;
+        }
+
+        // 如果只读取了部分数据，也返回 None 让调用方补充缺失的数据
+        if remaining > 0 {
+            debug!(
+                "DataManager::read: partial read ino={}, offset={}, requested={}, got={}, missing={}",
+                ino, offset, read_size, result.len(), remaining
+            );
+            return None;
         }
 
         Some(result)
@@ -281,16 +308,32 @@ impl DataManager {
 
             if !written {
                 // chunk 不存在，创建新 chunk
+                // 关键修复：从 WriteBuffer 合并已有数据，防止 chunk 淘汰后数据丢失
                 let mut new_data = vec![0u8; chunk_size as usize];
+
+                // 先从 WriteBuffer 合并该 chunk 范围的已有数据
+                let chunk_start_byte = chunk_index * chunk_size;
+                let existing_buffer_data =
+                    self.read_from_write_buffer(ino, chunk_start_byte, chunk_size as usize);
+                if !existing_buffer_data.is_empty() {
+                    let copy_len = existing_buffer_data.len().min(chunk_size as usize);
+                    new_data[..copy_len].copy_from_slice(&existing_buffer_data[..copy_len]);
+                    debug!(
+                        "Merged {} bytes from WriteBuffer into new chunk (ino={}, idx={})",
+                        copy_len, ino, chunk_index
+                    );
+                }
+
+                // 再应用新的写入数据（覆盖已有数据中相同的字节位置）
                 new_data[chunk_offset as usize..chunk_offset as usize + write_len]
                     .copy_from_slice(&remaining[..write_len]);
                 self.chunk_cache
-                    .put(ino, chunk_index * chunk_size, new_data, mtime, 0);
+                    .put(ino, chunk_start_byte, new_data, mtime, 0);
                 debug!(
                     "DataManager::write: created new chunk ino={}, chunk_idx={}, chunk_offset={}, cache_len={}, cache_bytes={}",
                     ino,
                     chunk_index,
-                    chunk_index * chunk_size,
+                    chunk_start_byte,
                     self.chunk_cache.len(),
                     self.chunk_cache.current_bytes(),
                 );

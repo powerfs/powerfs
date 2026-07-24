@@ -1,6 +1,6 @@
 use powerfs_filer::powerfs::delta_op::Op;
 use powerfs_filer::powerfs::{
-    delta_op, filer_meta_service_client::FilerMetaServiceClient, DeltaOp, DirEntryOrset, EntryId,
+    filer_meta_service_client::FilerMetaServiceClient, DeltaOp, DirEntryOrset, EntryId,
     PullDeltaRequest, PushDeltaRequest,
 };
 use std::time::Instant;

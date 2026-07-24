@@ -1637,10 +1637,9 @@ impl Filesystem for PowerFsFuserFs {
                         .put(inode, chunk_offset, data, mtime, 0);
                 }
                 Err(e) => {
-                    // 如果是 ENOENT（chunk 不存在），用零填充
+                    let mtime = crate::orset::now_unix();
                     if e.raw_os_error() == Some(libc::ENOENT) {
                         let zero_data = vec![0u8; chunk_size as usize];
-                        let mtime = crate::orset::now_unix();
                         self.data
                             .chunk_cache()
                             .put(inode, chunk_offset, zero_data, mtime, 0);
