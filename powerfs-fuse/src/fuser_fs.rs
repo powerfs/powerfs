@@ -598,12 +598,59 @@ impl PowerFsFuserFs {
                 if let Some(fid) = vol_fids.get(&vid) {
                     if let Some(addr) = vol_addrs.get(&vid) {
                         if !entries.is_empty() {
-                            if let Err(e) = client.batch_write_blob(
+                            // Calculate stripe range for lease acquisition
+                            let min_offset = entries.iter().map(|e| e.0).min().unwrap_or(0);
+                            let max_end =
+                                entries.iter().map(|e| e.0 + e.1 as i64).max().unwrap_or(0);
+                            let stripe_size = DEFAULT_STRIPE_SIZE as i64;
+                            let stripe_start = (min_offset / stripe_size) as u64;
+                            let stripe_end = ((max_end - 1) / stripe_size) as u64 + 1;
+                            let stripe_count = stripe_end - stripe_start;
+
+                            // Acquire range lease for the write
+                            let lease_token = match client.acquire_range_lease(
+                                addr,
+                                inode,
+                                stripe_start,
+                                stripe_count,
+                                true, // exclusive write lease
+                                DEFAULT_STRIPE_SIZE,
+                                30_000, // 30 second lease
+                            ) {
+                                Ok((token, _expire_ms)) => {
+                                    debug!(
+                                        "flush_dirty_chunks: acquired range lease for inode={}, stripes={}-{}, token={}",
+                                        inode, stripe_start, stripe_count, token
+                                    );
+                                    Some(token)
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "flush_dirty_chunks: range lease not available for inode={}: {}, proceeding without lease",
+                                        inode, e
+                                    );
+                                    None
+                                }
+                            };
+
+                            let write_result = client.batch_write_blob(
                                 addr,
                                 fid.volume_id.0,
                                 fid.file_key,
                                 entries,
-                            ) {
+                            );
+
+                            // Release lease after write
+                            if let Some(token) = &lease_token {
+                                if let Err(e) = client.release_range_lease(addr, token) {
+                                    warn!(
+                                        "flush_dirty_chunks: failed to release range lease: {}",
+                                        e
+                                    );
+                                }
+                            }
+
+                            if let Err(e) = write_result {
                                 let fs_error = crate::error::parse_volume_error(&e);
                                 error!(
                                     "flush_dirty_chunks: stripe batch_write_blob failed for volume {}: {}",
@@ -697,9 +744,55 @@ impl PowerFsFuserFs {
             }
 
             if !blob_entries.is_empty() {
-                if let Err(e) =
-                    client.batch_write_blob(&addr, fid.volume_id.0, fid.file_key, blob_entries)
-                {
+                // Calculate stripe range for lease acquisition
+                let min_offset = blob_entries.iter().map(|e| e.0).min().unwrap_or(0);
+                let max_end = blob_entries
+                    .iter()
+                    .map(|e| e.0 + e.1 as i64)
+                    .max()
+                    .unwrap_or(0);
+                let stripe_size = DEFAULT_STRIPE_SIZE as i64;
+                let stripe_start = (min_offset / stripe_size) as u64;
+                let stripe_end = ((max_end - 1) / stripe_size) as u64 + 1;
+                let stripe_count = stripe_end - stripe_start;
+
+                // Acquire range lease for the write
+                let lease_token = match client.acquire_range_lease(
+                    &addr,
+                    inode,
+                    stripe_start,
+                    stripe_count,
+                    true,
+                    DEFAULT_STRIPE_SIZE,
+                    30_000,
+                ) {
+                    Ok((token, _expire_ms)) => {
+                        debug!(
+                            "flush_dirty_chunks: acquired range lease for inode={}, stripes={}-{}, token={}",
+                            inode, stripe_start, stripe_count, token
+                        );
+                        Some(token)
+                    }
+                    Err(e) => {
+                        debug!(
+                            "flush_dirty_chunks: range lease not available for inode={}: {}, proceeding without lease",
+                            inode, e
+                        );
+                        None
+                    }
+                };
+
+                let write_result =
+                    client.batch_write_blob(&addr, fid.volume_id.0, fid.file_key, blob_entries);
+
+                // Release lease after write
+                if let Some(token) = &lease_token {
+                    if let Err(e) = client.release_range_lease(&addr, token) {
+                        warn!("flush_dirty_chunks: failed to release range lease: {}", e);
+                    }
+                }
+
+                if let Err(e) = write_result {
                     let fs_error = crate::error::parse_volume_error(&e);
                     error!("flush_dirty_chunks: batch_write_blob failed: {}", fs_error);
                     return Err(std::io::Error::from_raw_os_error(fs_error.to_errno()));

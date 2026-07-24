@@ -321,6 +321,119 @@ pub struct VolumeStatusResponse {
     #[prost(uint64, tag = "5")]
     pub file_deleted_count: u64,
 }
+/// Range lease request: acquire a lease for a stripe range
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseRequest {
+    /// File inode
+    #[prost(uint64, tag = "1")]
+    pub inode: u64,
+    /// Starting stripe index
+    #[prost(uint64, tag = "2")]
+    pub stripe_start: u64,
+    /// Number of stripes
+    #[prost(uint64, tag = "3")]
+    pub stripe_count: u64,
+    /// Client identifier
+    #[prost(string, tag = "4")]
+    pub client_id: ::prost::alloc::string::String,
+    /// Lease duration in milliseconds
+    #[prost(uint64, tag = "5")]
+    pub duration_ms: u64,
+    /// Exclusive (write) or shared (read)
+    #[prost(bool, tag = "6")]
+    pub exclusive: bool,
+    /// Stripe size in bytes (for alignment)
+    #[prost(uint64, tag = "7")]
+    pub stripe_size: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+    /// Token for subsequent operations
+    #[prost(string, tag = "3")]
+    pub lease_token: ::prost::alloc::string::String,
+    /// Lease epoch version
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    /// Granted stripe indices
+    #[prost(uint64, repeated, tag = "5")]
+    pub granted_stripes: ::prost::alloc::vec::Vec<u64>,
+    /// Expiration timestamp
+    #[prost(uint64, tag = "6")]
+    pub expire_at_ms: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseReleaseRequest {
+    #[prost(string, tag = "1")]
+    pub lease_token: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub client_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseReleaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseRenewRequest {
+    #[prost(string, tag = "1")]
+    pub lease_token: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub client_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub duration_ms: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeLeaseRenewResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+}
+/// WriteNeedleBlob with lease token for validated writes
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteNeedleBlobLeaseRequest {
+    #[prost(uint32, tag = "1")]
+    pub volume_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub file_key: u64,
+    #[prost(int64, tag = "3")]
+    pub offset: i64,
+    #[prost(int32, tag = "4")]
+    pub size: i32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub needle_blob: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "6")]
+    pub cookie: u32,
+    /// Range lease token
+    #[prost(string, tag = "7")]
+    pub lease_token: ::prost::alloc::string::String,
+    /// Stripe index for lease validation
+    #[prost(uint64, tag = "8")]
+    pub stripe_index: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteNeedleBlobLeaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod volume_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -680,6 +793,68 @@ pub mod volume_service_client {
                 .insert(GrpcMethod::new("powerfs.VolumeService", "VolumeStatus"));
             self.inner.unary(req, path, codec).await
         }
+        /// Range Lease Management for data consistency
+        pub async fn acquire_range_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RangeLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/AcquireRangeLease");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "powerfs.VolumeService",
+                "AcquireRangeLease",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn release_range_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RangeLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseReleaseResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/ReleaseRangeLease");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "powerfs.VolumeService",
+                "ReleaseRangeLease",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn renew_range_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RangeLeaseRenewRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseRenewResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/powerfs.VolumeService/RenewRangeLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.VolumeService", "RenewRangeLease"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -749,6 +924,19 @@ pub mod volume_service_server {
             &self,
             request: tonic::Request<super::VolumeStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::VolumeStatusResponse>, tonic::Status>;
+        /// Range Lease Management for data consistency
+        async fn acquire_range_lease(
+            &self,
+            request: tonic::Request<super::RangeLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseResponse>, tonic::Status>;
+        async fn release_range_lease(
+            &self,
+            request: tonic::Request<super::RangeLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseReleaseResponse>, tonic::Status>;
+        async fn renew_range_lease(
+            &self,
+            request: tonic::Request<super::RangeLeaseRenewRequest>,
+        ) -> std::result::Result<tonic::Response<super::RangeLeaseRenewResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct VolumeServiceServer<T: VolumeService> {
@@ -1439,6 +1627,134 @@ pub mod volume_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = VolumeStatusSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.VolumeService/AcquireRangeLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcquireRangeLeaseSvc<T: VolumeService>(pub Arc<T>);
+                    impl<T: VolumeService> tonic::server::UnaryService<super::RangeLeaseRequest>
+                        for AcquireRangeLeaseSvc<T>
+                    {
+                        type Response = super::RangeLeaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RangeLeaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as VolumeService>::acquire_range_lease(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = AcquireRangeLeaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.VolumeService/ReleaseRangeLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseRangeLeaseSvc<T: VolumeService>(pub Arc<T>);
+                    impl<T: VolumeService>
+                        tonic::server::UnaryService<super::RangeLeaseReleaseRequest>
+                        for ReleaseRangeLeaseSvc<T>
+                    {
+                        type Response = super::RangeLeaseReleaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RangeLeaseReleaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as VolumeService>::release_range_lease(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ReleaseRangeLeaseSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.VolumeService/RenewRangeLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenewRangeLeaseSvc<T: VolumeService>(pub Arc<T>);
+                    impl<T: VolumeService>
+                        tonic::server::UnaryService<super::RangeLeaseRenewRequest>
+                        for RenewRangeLeaseSvc<T>
+                    {
+                        type Response = super::RangeLeaseRenewResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RangeLeaseRenewRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as VolumeService>::renew_range_lease(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = RenewRangeLeaseSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

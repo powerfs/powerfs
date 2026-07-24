@@ -1076,16 +1076,9 @@ impl DirectoryTree {
         let mut leases = self.leases.write().unwrap();
         let mut path_lease_map = self.path_lease_map.write().unwrap();
 
-        if let Some(lease_ids) = path_lease_map.get(path) {
-            for lease_id in lease_ids {
-                if let Some(lease) = leases.get(lease_id) {
-                    if lease.expires_at > std::time::Instant::now() {
-                        return String::new();
-                    }
-                }
-            }
-        }
-
+        // Allow multiple leases on the same path.
+        // Conflict resolution is handled by epoch/version checks,
+        // not by blocking lease acquisition.
         let lease_id = uuid::Uuid::new_v4().to_string();
         let expires_at = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
         let epoch = self.get_epoch();

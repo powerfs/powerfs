@@ -1,4 +1,4 @@
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_filer::powerfs::posix_meta_service_client::PosixMetaServiceClient;
 use powerfs_filer::powerfs::{
@@ -25,8 +25,9 @@ use powerfs_master::proto::powerfs::{
     VectorClock,
 };
 use powerfs_volume::proto::powerfs::{
-    volume_service_client::VolumeServiceClient, DeleteNeedleRequest, ReadNeedleBlobRequest,
-    ReadNeedleRequest, WriteNeedleBlobRequest, WriteNeedleRequest,
+    volume_service_client::VolumeServiceClient, DeleteNeedleRequest, RangeLeaseReleaseRequest,
+    RangeLeaseRenewRequest, RangeLeaseRequest, ReadNeedleBlobRequest, ReadNeedleRequest,
+    WriteNeedleBlobRequest, WriteNeedleRequest,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -186,6 +187,8 @@ pub struct PowerFuseClient {
     filer_channel: RwLock<Option<Channel>>,
     /// Collection name (used as bucket name in Filer path model)
     collection: String,
+    /// Client identifier for range lease management
+    client_id: String,
 }
 
 impl PowerFuseClient {
@@ -204,6 +207,14 @@ impl PowerFuseClient {
         let master_semaphore = Arc::new(tokio::sync::Semaphore::new(
             GrpcConfig::default().max_concurrent_requests,
         ));
+        let client_id = format!(
+            "powerfs-fuse-{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
         Arc::new(PowerFuseClient {
             master_addresses: Arc::new(master_addrs),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
@@ -217,6 +228,7 @@ impl PowerFuseClient {
             filer_addresses: Arc::new(filer_addrs),
             filer_channel: RwLock::new(None),
             collection: collection.to_string(),
+            client_id,
         })
     }
 
@@ -235,6 +247,14 @@ impl PowerFuseClient {
         ));
         let master_semaphore =
             Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
+        let client_id = format!(
+            "powerfs-fuse-{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
         Arc::new(PowerFuseClient {
             master_addresses: Arc::new(master_addrs),
             current_master_index: std::sync::atomic::AtomicUsize::new(0),
@@ -248,6 +268,7 @@ impl PowerFuseClient {
             filer_addresses: Arc::new(filer_addrs),
             filer_channel: RwLock::new(None),
             collection: collection.to_string(),
+            client_id,
         })
     }
 
@@ -259,6 +280,11 @@ impl PowerFuseClient {
     /// Get collection name (used as bucket name in Filer)
     pub fn collection(&self) -> &str {
         &self.collection
+    }
+
+    /// Get client identifier for range lease management
+    pub fn client_id(&self) -> &str {
+        &self.client_id
     }
 
     /// Convert a FUSE path to Filer path (POSIX flat path, no bucket prefix)
@@ -2969,6 +2995,333 @@ impl PowerFuseClient {
 
         Err("get_statistics failed after max retries".to_string())
     }
+
+    /// Acquire a range lease on a Volume Server for a specific inode range
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_range_lease(
+        &self,
+        volume_addr: &str,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        client_id: &str,
+        duration_ms: u64,
+        exclusive: bool,
+        stripe_size: u64,
+    ) -> Result<(String, u64), String> {
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Failed to get volume channel for lease (attempt {}): {}",
+                        attempt, e
+                    );
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+
+            let request = RangeLeaseRequest {
+                inode,
+                stripe_start,
+                stripe_count,
+                client_id: client_id.to_string(),
+                duration_ms,
+                exclusive,
+                stripe_size,
+            };
+
+            match client
+                .acquire_range_lease(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!(
+                            "acquire_range_lease succeeded: inode={}, stripes={}-{}, token={}",
+                            inode, stripe_start, stripe_count, resp.lease_token
+                        );
+                        return Ok((resp.lease_token, resp.expire_at_ms));
+                    } else {
+                        warn!("acquire_range_lease failed: {}", resp.error);
+                        return Err(resp.error);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("acquire_range_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+        Err("acquire_range_lease failed after max retries".to_string())
+    }
+
+    /// Release a range lease on a Volume Server
+    pub async fn release_range_lease(
+        &self,
+        volume_addr: &str,
+        lease_token: &str,
+        client_id: &str,
+    ) -> Result<(), String> {
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Failed to get volume channel for lease release (attempt {}): {}",
+                        attempt, e
+                    );
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+
+            let request = RangeLeaseReleaseRequest {
+                lease_token: lease_token.to_string(),
+                client_id: client_id.to_string(),
+            };
+
+            match client
+                .release_range_lease(tonic::Request::new(request))
+                .await
+            {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        debug!("release_range_lease succeeded: token={}", lease_token);
+                        return Ok(());
+                    } else {
+                        warn!("release_range_lease failed: {}", resp.error);
+                        return Err(resp.error);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("release_range_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+        Err("release_range_lease failed after max retries".to_string())
+    }
+
+    /// Renew a range lease on a Volume Server
+    pub async fn renew_range_lease(
+        &self,
+        volume_addr: &str,
+        lease_token: &str,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(), String> {
+        for attempt in 1..=self.config.max_retry_count {
+            let channel = match self.get_or_create_volume_channel(volume_addr).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if attempt == self.config.max_retry_count {
+                        return Err(e);
+                    }
+                    warn!(
+                        "Failed to get volume channel for lease renew (attempt {}): {}",
+                        attempt, e
+                    );
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    continue;
+                }
+            };
+
+            let mut client = VolumeServiceClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+
+            let request = RangeLeaseRenewRequest {
+                lease_token: lease_token.to_string(),
+                client_id: client_id.to_string(),
+                duration_ms,
+            };
+
+            match client.renew_range_lease(tonic::Request::new(request)).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.success {
+                        trace!("renew_range_lease succeeded: token={}", lease_token);
+                        return Ok(());
+                    } else {
+                        warn!("renew_range_lease failed: {}", resp.error);
+                        return Err(resp.error);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("renew_range_lease failed (attempt {}): {}", attempt, e);
+                    warn!("{}", msg);
+                    self.invalidate_volume_channel(volume_addr).await;
+                    if attempt == self.config.max_retry_count {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        }
+        Err("renew_range_lease failed after max retries".to_string())
+    }
+}
+
+/// A single active range lease entry
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct RangeLeaseEntry {
+    volume_addr: String,
+    token: String,
+    inode: u64,
+    stripe_start: u64,
+    stripe_count: u64,
+    expire_duration_ms: u64,
+}
+
+/// Client-side range lease manager with automatic renewal
+pub struct RangeLeaseClient {
+    client: Arc<PowerFuseClient>,
+    client_id: String,
+    /// Acquired leases
+    active_leases: Arc<tokio::sync::RwLock<Vec<RangeLeaseEntry>>>,
+}
+
+impl RangeLeaseClient {
+    pub fn new(client: Arc<PowerFuseClient>, client_id: String) -> Self {
+        let leases: Arc<tokio::sync::RwLock<Vec<RangeLeaseEntry>>> =
+            Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+        // Start background renewal task
+        let renew_client = client.clone();
+        let renew_leases = leases.clone();
+        let renew_id = client_id.clone();
+        let renew_duration = Duration::from_millis(1000);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(renew_duration).await;
+                let to_renew = {
+                    let leases_guard = renew_leases.read().await;
+                    leases_guard
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.volume_addr.clone(),
+                                entry.token.clone(),
+                                entry.expire_duration_ms,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                for (addr, token, expire_ms) in to_renew {
+                    if expire_ms > 0 {
+                        let _ = renew_client
+                            .renew_range_lease(&addr, &token, &renew_id, expire_ms)
+                            .await;
+                    }
+                }
+            }
+        });
+
+        RangeLeaseClient {
+            client,
+            client_id,
+            active_leases: leases,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire(
+        &self,
+        volume_addr: &str,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        exclusive: bool,
+        stripe_size: u64,
+        duration_ms: u64,
+    ) -> Result<String, String> {
+        let (token, expire_ms) = self
+            .client
+            .acquire_range_lease(
+                volume_addr,
+                inode,
+                stripe_start,
+                stripe_count,
+                &self.client_id,
+                duration_ms,
+                exclusive,
+                stripe_size,
+            )
+            .await?;
+
+        let mut leases = self.active_leases.write().await;
+        leases.push(RangeLeaseEntry {
+            volume_addr: volume_addr.to_string(),
+            token: token.clone(),
+            inode,
+            stripe_start,
+            stripe_count,
+            expire_duration_ms: expire_ms,
+        });
+
+        Ok(token)
+    }
+
+    pub async fn release(&self, token: &str) -> Result<(), String> {
+        let volume_addr = {
+            let leases = self.active_leases.read().await;
+            let lease = leases
+                .iter()
+                .find(|e| e.token == token)
+                .ok_or_else(|| "Lease not found".to_string())?;
+            lease.volume_addr.clone()
+        };
+
+        self.client
+            .release_range_lease(&volume_addr, token, &self.client_id)
+            .await?;
+
+        let mut leases = self.active_leases.write().await;
+        leases.retain(|e| e.token != token);
+
+        Ok(())
+    }
+
+    pub async fn release_all(&self) {
+        let leases = self.active_leases.read().await.clone();
+        for entry in leases {
+            let _ = self
+                .client
+                .release_range_lease(&entry.volume_addr, &entry.token, &self.client_id)
+                .await;
+        }
+        self.active_leases.write().await.clear();
+    }
 }
 
 pub trait ChunkCacheLike: Send + Sync {
@@ -3399,5 +3752,46 @@ impl SyncFuseClient {
         duration_ms: u64,
     ) -> Result<(bool, u64), String> {
         self.block_with_metadata_timeout(self.client.filer_renew_lease(lease_id, duration_ms))
+    }
+
+    /// Get client identifier for range lease management
+    pub fn client_id(&self) -> &str {
+        self.client.client_id()
+    }
+
+    /// Acquire a range lease on a Volume Server
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_range_lease(
+        &self,
+        volume_addr: &str,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        exclusive: bool,
+        stripe_size: u64,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        self.block_with_timeout(
+            self.client.acquire_range_lease(
+                volume_addr,
+                inode,
+                stripe_start,
+                stripe_count,
+                self.client.client_id(),
+                duration_ms,
+                exclusive,
+                stripe_size,
+            ),
+            Duration::from_secs(10),
+        )
+    }
+
+    /// Release a range lease on a Volume Server
+    pub fn release_range_lease(&self, volume_addr: &str, lease_token: &str) -> Result<(), String> {
+        self.block_with_timeout(
+            self.client
+                .release_range_lease(volume_addr, lease_token, self.client.client_id()),
+            Duration::from_secs(10),
+        )
     }
 }

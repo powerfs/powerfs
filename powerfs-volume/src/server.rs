@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::proto::{VolumeService, VolumeServiceServer};
+use crate::range_lease::RangeLeaseManager;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use log::{debug, error, info, warn};
@@ -13,12 +14,13 @@ use powerfs_common::{
 };
 use powerfs_core::storage::StorageManager;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::time;
 use tonic::{transport::Server, Request, Response, Status};
 
 const MAX_MERGE_ENTRIES: usize = 100;
+const DEFAULT_STRIPE_SIZE: u64 = 64 * 1024 * 1024;
 
 pub struct VolumeServer {
     storage_manager: Arc<StorageManager>,
@@ -28,6 +30,7 @@ pub struct VolumeServer {
     grpc_port: u32,
     http_port: u32,
     data_dir: String,
+    range_lease_mgr: Arc<RangeLeaseManager>,
 }
 
 impl VolumeServer {
@@ -63,6 +66,7 @@ impl VolumeServer {
             grpc_port,
             http_port,
             data_dir: data_dir.to_string(),
+            range_lease_mgr: Arc::new(RangeLeaseManager::new(DEFAULT_STRIPE_SIZE)),
         }
     }
 
@@ -74,6 +78,18 @@ impl VolumeServer {
         info!("Max message size: 256MB");
 
         self.start_node_status_publisher().await;
+
+        // Range lease cleanup task: every 5 seconds remove expired leases
+        let lease_mgr = self.range_lease_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let removed = lease_mgr.cleanup_expired();
+                if removed > 0 {
+                    debug!("Cleaned up {} expired range leases", removed);
+                }
+            }
+        });
 
         // 内存泄漏诊断任务：每 30 秒打印一次关键指标
         tokio::spawn(async move {
@@ -944,6 +960,115 @@ impl VolumeService for VolumeServer {
                 "volume not found: {}",
                 volume_id.0
             )))
+        }
+    }
+
+    async fn acquire_range_lease(
+        &self,
+        request: Request<crate::proto::RangeLeaseRequest>,
+    ) -> std::result::Result<Response<crate::proto::RangeLeaseResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            "acquire_range_lease: inode={}, stripe_start={}, stripe_count={}, client={}, exclusive={}",
+            req.inode, req.stripe_start, req.stripe_count, req.client_id, req.exclusive
+        );
+
+        let result = self.range_lease_mgr.acquire(
+            req.inode,
+            req.stripe_start,
+            req.stripe_count,
+            &req.client_id,
+            req.duration_ms,
+            req.exclusive,
+            req.stripe_size,
+        );
+
+        match result {
+            Ok(lease) => {
+                let granted_stripes: Vec<u64> =
+                    (lease.stripe_start..lease.stripe_start + lease.stripe_count).collect();
+                let expire_at_ms = {
+                    let remaining = lease.expire_at.saturating_duration_since(Instant::now());
+                    remaining.as_millis() as u64
+                };
+                Ok(Response::new(crate::proto::RangeLeaseResponse {
+                    success: true,
+                    error: String::new(),
+                    lease_token: lease.token.clone(),
+                    epoch: lease.epoch,
+                    granted_stripes,
+                    expire_at_ms,
+                }))
+            }
+            Err(e) => {
+                warn!("acquire_range_lease failed: {}", e);
+                Ok(Response::new(crate::proto::RangeLeaseResponse {
+                    success: false,
+                    error: e,
+                    lease_token: String::new(),
+                    epoch: 0,
+                    granted_stripes: vec![],
+                    expire_at_ms: 0,
+                }))
+            }
+        }
+    }
+
+    async fn release_range_lease(
+        &self,
+        request: Request<crate::proto::RangeLeaseReleaseRequest>,
+    ) -> std::result::Result<Response<crate::proto::RangeLeaseReleaseResponse>, Status> {
+        let req = request.into_inner();
+        debug!(
+            "release_range_lease: token={}, client={}",
+            req.lease_token, req.client_id
+        );
+
+        match self
+            .range_lease_mgr
+            .release(&req.lease_token, &req.client_id)
+        {
+            Ok(()) => Ok(Response::new(crate::proto::RangeLeaseReleaseResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => {
+                warn!("release_range_lease failed: {}", e);
+                Ok(Response::new(crate::proto::RangeLeaseReleaseResponse {
+                    success: false,
+                    error: e,
+                }))
+            }
+        }
+    }
+
+    async fn renew_range_lease(
+        &self,
+        request: Request<crate::proto::RangeLeaseRenewRequest>,
+    ) -> std::result::Result<Response<crate::proto::RangeLeaseRenewResponse>, Status> {
+        let req = request.into_inner();
+        debug!(
+            "renew_range_lease: token={}, client={}",
+            req.lease_token, req.client_id
+        );
+
+        match self
+            .range_lease_mgr
+            .renew(&req.lease_token, &req.client_id, req.duration_ms)
+        {
+            Ok(()) => Ok(Response::new(crate::proto::RangeLeaseRenewResponse {
+                success: true,
+                error: String::new(),
+                epoch: 0,
+            })),
+            Err(e) => {
+                warn!("renew_range_lease failed: {}", e);
+                Ok(Response::new(crate::proto::RangeLeaseRenewResponse {
+                    success: false,
+                    error: e,
+                    epoch: 0,
+                }))
+            }
         }
     }
 }

@@ -19,6 +19,11 @@ service VolumeService {
     rpc ReadNeedleMeta(ReadNeedleMetaRequest) returns (ReadNeedleMetaResponse);
     rpc BatchDelete(BatchDeleteRequest) returns (BatchDeleteResponse);
     rpc VolumeStatus(VolumeStatusRequest) returns (VolumeStatusResponse);
+
+    // Range Lease Management for data consistency
+    rpc AcquireRangeLease(RangeLeaseRequest) returns (RangeLeaseResponse);
+    rpc ReleaseRangeLease(RangeLeaseReleaseRequest) returns (RangeLeaseReleaseResponse);
+    rpc RenewRangeLease(RangeLeaseRenewRequest) returns (RangeLeaseRenewResponse);
 }
 
 message CreateVolumeRequest {
@@ -212,4 +217,67 @@ message VolumeStatusResponse {
     uint64 volume_size = 3;
     uint64 file_count = 4;
     uint64 file_deleted_count = 5;
+}
+
+// ============================================================
+// Range Lease Management (Per-stripe data consistency)
+// ============================================================
+
+// Range lease request: acquire a lease for a stripe range
+message RangeLeaseRequest {
+    uint64 inode = 1;           // File inode
+    uint64 stripe_start = 2;    // Starting stripe index
+    uint64 stripe_count = 3;    // Number of stripes
+    string client_id = 4;       // Client identifier
+    uint64 duration_ms = 5;     // Lease duration in milliseconds
+    bool exclusive = 6;         // Exclusive (write) or shared (read)
+    uint64 stripe_size = 7;     // Stripe size in bytes (for alignment)
+}
+
+message RangeLeaseResponse {
+    bool success = 1;
+    string error = 2;
+    string lease_token = 3;     // Token for subsequent operations
+    uint64 epoch = 4;           // Lease epoch version
+    repeated uint64 granted_stripes = 5;  // Granted stripe indices
+    uint64 expire_at_ms = 6;    // Expiration timestamp
+}
+
+message RangeLeaseReleaseRequest {
+    string lease_token = 1;
+    string client_id = 2;
+}
+
+message RangeLeaseReleaseResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RangeLeaseRenewRequest {
+    string lease_token = 1;
+    string client_id = 2;
+    uint64 duration_ms = 3;
+}
+
+message RangeLeaseRenewResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 epoch = 3;
+}
+
+// WriteNeedleBlob with lease token for validated writes
+message WriteNeedleBlobLeaseRequest {
+    uint32 volume_id = 1;
+    uint64 file_key = 2;
+    int64 offset = 3;
+    int32 size = 4;
+    bytes needle_blob = 5;
+    uint32 cookie = 6;
+    string lease_token = 7;     // Range lease token
+    uint64 stripe_index = 8;   // Stripe index for lease validation
+}
+
+message WriteNeedleBlobLeaseResponse {
+    bool success = 1;
+    string error = 2;
 }
