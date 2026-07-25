@@ -1,1 +1,0 @@
-savedcmd_/home/portion/powerfs/kernel/powerfs_mod/powerfs.mod := printf '%s\n'   powerfs_mod.o powerfs_fs.o powerfs_transport.o | awk '!x[$$0]++ { print("/home/portion/powerfs/kernel/powerfs_mod/"$$0) }' > /home/portion/powerfs/kernel/powerfs_mod/powerfs.mod

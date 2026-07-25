@@ -1,0 +1,113 @@
+# 内核模块测试专用配置
+# 说明：复用现有 powerfs-network 网络，QEMU VM 通过桥接访问
+# 当前运行的容器 IP：
+#   master-1: 172.20.0.11:9333
+#   master-2: 172.20.0.12:9333
+#   master-3: 172.20.0.13:9333
+#   volume-1: 172.20.0.21:8080
+#   volume-2: 172.20.0.22:8080
+#   volume-3: 172.20.0.23:8080
+#   filer-1: 172.20.0.35:8889
+#   filer-2: 172.20.0.36:8889
+#   redis:    172.20.0.50:6379
+
+networks:
+  powerfs-network:
+    external: true
+    name: docker_powerfs-network
+
+volumes:
+  master-kernel-test-data:
+  filer-kernel-test-data:
+  volume-kernel-test-data:
+
+services:
+  redis-kernel:
+    image: redis:7-alpine
+    container_name: powerfs-kernel-redis
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.51
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 3
+
+  master-kernel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: powerfs-kernel-master
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.14
+    volumes:
+      - master-kernel-test-data:/data
+      - ../config/master-1.toml:/etc/powerfs/master.toml
+    command: /app/powerfs master --config /etc/powerfs/master.toml
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      redis-kernel:
+        condition: service_healthy
+
+  volume-kernel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: powerfs-kernel-volume
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.24
+    volumes:
+      - volume-kernel-test-data:/data
+      - ../config/volume-1.toml:/etc/powerfs/volume.toml
+    command: /app/powerfs-volume --config /etc/powerfs/volume.toml --grpc-address 0.0.0.0:8080
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8080 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      master-kernel:
+        condition: service_healthy
+
+  filer-kernel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: powerfs-kernel-filer
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.37
+    volumes:
+      - filer-kernel-test-data:/data/filer
+    command: >
+      /app/powerfs-filer
+      --node-id 1
+      --s3-address 0.0.0.0:8888
+      --grpc-address 0.0.0.0:8889
+      --raft-address 172.20.0.37:8890
+      --data-dir /data/filer
+      --shard-count 2
+      --master-address 172.20.0.14:9333
+      --redis-address redis://172.20.0.51:6379
+      --peers 172.20.0.37:8889
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      master-kernel:
+        condition: service_healthy
+      volume-kernel:
+        condition: service_healthy
