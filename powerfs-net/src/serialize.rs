@@ -1,0 +1,820 @@
+//! TLV (Type-Length-Value) serialization/deserialization
+//!
+//! This module provides a simple binary serialization format that is
+//! compatible with both Rust and C implementations.
+//!
+//! Format per field:
+//!   field_id (1B) | length (2B) | value (length bytes)
+//!
+//! This is simpler than protobuf but supports field addition and
+//! is compact enough for metadata operations.
+
+use crate::errors::NetError;
+use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
+
+/// TLV encoder for building request/response bodies
+pub struct TlvEncoder {
+    buf: Vec<u8>,
+}
+
+impl TlvEncoder {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(256),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Get the encoded bytes
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    // ========================================================================
+    // Encode methods for basic types
+    // ========================================================================
+
+    /// Add a uint8 field
+    pub fn add_u8(&mut self, field: FieldId, value: u8) -> &mut Self {
+        self.write_header(field, 1);
+        self.buf.push(value);
+        self
+    }
+
+    /// Add a uint16 field
+    pub fn add_u16(&mut self, field: FieldId, value: u16) -> &mut Self {
+        self.write_header(field, 2);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// Add a uint32 field
+    pub fn add_u32(&mut self, field: FieldId, value: u32) -> &mut Self {
+        self.write_header(field, 4);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// Add a uint64 field
+    pub fn add_u64(&mut self, field: FieldId, value: u64) -> &mut Self {
+        self.write_header(field, 8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// Add a string field
+    pub fn add_string(&mut self, field: FieldId, value: &str) -> Result<&mut Self, NetError> {
+        let bytes = value.as_bytes();
+        if bytes.len() > MAX_TLV_VALUE_LEN as usize {
+            return Err(NetError::Serialize(format!(
+                "string too long: {} > {}",
+                bytes.len(),
+                MAX_TLV_VALUE_LEN
+            )));
+        }
+        self.write_header(field, bytes.len() as u16);
+        self.buf.extend_from_slice(bytes);
+        Ok(self)
+    }
+
+    /// Add raw bytes field
+    pub fn add_bytes(&mut self, field: FieldId, value: &[u8]) -> Result<&mut Self, NetError> {
+        if value.len() > MAX_TLV_VALUE_LEN as usize {
+            return Err(NetError::Serialize(format!(
+                "bytes too long: {} > {}",
+                value.len(),
+                MAX_TLV_VALUE_LEN
+            )));
+        }
+        self.write_header(field, value.len() as u16);
+        self.buf.extend_from_slice(value);
+        Ok(self)
+    }
+
+    /// Add a nested TLV-encoded field (for repeated/complex types)
+    pub fn add_nested(&mut self, field: FieldId, value: &[u8]) -> Result<&mut Self, NetError> {
+        if value.len() > MAX_TLV_VALUE_LEN as usize {
+            return Err(NetError::Serialize(format!(
+                "nested too long: {} > {}",
+                value.len(),
+                MAX_TLV_VALUE_LEN
+            )));
+        }
+        self.write_header(field, value.len() as u16);
+        self.buf.extend_from_slice(value);
+        Ok(self)
+    }
+
+    // ========================================================================
+    // Helper: write TLV header
+    // ========================================================================
+
+    fn write_header(&mut self, field: FieldId, length: u16) {
+        self.buf.push(field.as_u8());
+        self.buf.extend_from_slice(&length.to_le_bytes());
+    }
+}
+
+impl Default for TlvEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// TLV decoder for parsing request/response bodies
+pub struct TlvDecoder<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> TlvDecoder<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
+
+    // ========================================================================
+    // Decode methods for basic types
+    // ========================================================================
+
+    /// Peek at the next field ID without consuming it
+    pub fn peek_field(&self) -> Option<FieldId> {
+        if self.pos >= self.buf.len() {
+            return None;
+        }
+        FieldId::from_u8(self.buf[self.pos])
+    }
+
+    /// Get the next field ID and length, skipping unknown fields
+    pub fn next_field(&mut self) -> Option<(FieldId, u16)> {
+        while self.pos + 3 <= self.buf.len() {
+            let field_id = self.buf[self.pos];
+            let length = u16::from_le_bytes([self.buf[self.pos + 1], self.buf[self.pos + 2]]);
+            self.pos += 3;
+
+            if let Some(field) = FieldId::from_u8(field_id) {
+                return Some((field, length));
+            }
+
+            // Unknown field - skip it
+            let end = self.pos + length as usize;
+            if end > self.buf.len() {
+                return None; // Malformed
+            }
+            self.pos = end;
+        }
+        None
+    }
+
+    /// Skip the current field
+    pub fn skip(&mut self, length: u16) -> Result<(), NetError> {
+        let end = self.pos + length as usize;
+        if end > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        self.pos = end;
+        Ok(())
+    }
+
+    /// Decode a uint8 value (current position should be at the value)
+    pub fn read_u8(&mut self, length: u16) -> Result<u8, NetError> {
+        if length != 1 {
+            return Err(NetError::Serialize(format!(
+                "expected 1 byte, got {}",
+                length
+            )));
+        }
+        if self.pos + 1 > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let val = self.buf[self.pos];
+        self.pos += 1;
+        Ok(val)
+    }
+
+    /// Decode a uint16 value
+    pub fn read_u16(&mut self, length: u16) -> Result<u16, NetError> {
+        if length != 2 {
+            return Err(NetError::Serialize(format!(
+                "expected 2 bytes, got {}",
+                length
+            )));
+        }
+        if self.pos + 2 > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let val = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+        self.pos += 2;
+        Ok(val)
+    }
+
+    /// Decode a uint32 value
+    pub fn read_u32(&mut self, length: u16) -> Result<u32, NetError> {
+        if length != 4 {
+            return Err(NetError::Serialize(format!(
+                "expected 4 bytes, got {}",
+                length
+            )));
+        }
+        if self.pos + 4 > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let bytes: [u8; 4] = self.buf[self.pos..self.pos + 4]
+            .try_into()
+            .map_err(|_| NetError::Serialize("buffer too short".into()))?;
+        let val = u32::from_le_bytes(bytes);
+        self.pos += 4;
+        Ok(val)
+    }
+
+    /// Decode a uint64 value
+    pub fn read_u64(&mut self, length: u16) -> Result<u64, NetError> {
+        if length != 8 {
+            return Err(NetError::Serialize(format!(
+                "expected 8 bytes, got {}",
+                length
+            )));
+        }
+        if self.pos + 8 > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let bytes: [u8; 8] = self.buf[self.pos..self.pos + 8]
+            .try_into()
+            .map_err(|_| NetError::Serialize("buffer too short".into()))?;
+        let val = u64::from_le_bytes(bytes);
+        self.pos += 8;
+        Ok(val)
+    }
+
+    /// Decode a string value
+    pub fn read_string(&mut self, length: u16) -> Result<&'a str, NetError> {
+        if self.pos + length as usize > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let val = std::str::from_utf8(&self.buf[self.pos..self.pos + length as usize])
+            .map_err(|_| NetError::Serialize("invalid UTF-8".into()))?;
+        self.pos += length as usize;
+        Ok(val)
+    }
+
+    /// Decode raw bytes
+    pub fn read_bytes(&mut self, length: u16) -> Result<&'a [u8], NetError> {
+        if self.pos + length as usize > self.buf.len() {
+            return Err(NetError::Serialize("unexpected end of data".into()));
+        }
+        let val = &self.buf[self.pos..self.pos + length as usize];
+        self.pos += length as usize;
+        Ok(val)
+    }
+
+    /// Decode a nested TLV structure as raw bytes
+    pub fn read_nested(&mut self, length: u16) -> Result<&'a [u8], NetError> {
+        self.read_bytes(length)
+    }
+
+    // ========================================================================
+    // Convenience methods: read a named field in one call
+    // ========================================================================
+
+    /// Check if the next field has the given FieldId without consuming it
+    pub fn has_field(&self, field: FieldId) -> bool {
+        self.peek_field() == Some(field)
+    }
+
+    /// Read a u64 value for the given field (consumes the field)
+    pub fn next_u64(&mut self, field: FieldId) -> Result<u64, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                self.read_u64(length)
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+
+    /// Read a u32 value for the given field (consumes the field)
+    pub fn next_u32(&mut self, field: FieldId) -> Result<u32, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                self.read_u32(length)
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+
+    /// Read a u16 value for the given field (consumes the field)
+    pub fn next_u16(&mut self, field: FieldId) -> Result<u16, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                self.read_u16(length)
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+
+    /// Read a u8 value for the given field (consumes the field)
+    pub fn next_u8(&mut self, field: FieldId) -> Result<u8, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                self.read_u8(length)
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+
+    /// Read a string value for the given field (consumes the field, returns owned String)
+    pub fn next_string(&mut self, field: FieldId) -> Result<String, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                let s = self.read_string(length)?;
+                Ok(s.to_string())
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+
+    /// Read raw bytes for the given field (consumes the field, returns owned Vec<u8>)
+    pub fn next_bytes(&mut self, field: FieldId) -> Result<Vec<u8>, NetError> {
+        match self.next_field() {
+            Some((f, length)) => {
+                if f != field {
+                    return Err(NetError::Serialize(format!(
+                        "expected field {:?}, got {:?}",
+                        field, f
+                    )));
+                }
+                let data = self.read_bytes(length)?;
+                Ok(data.to_vec())
+            }
+            None => Err(NetError::Serialize(format!(
+                "no more fields, expected {:?}",
+                field
+            ))),
+        }
+    }
+}
+
+// ============================================================================
+// High-level encoding/decoding helpers for common message patterns
+// ============================================================================
+
+/// Encode a lookup request: parent_ino + name
+pub fn encode_lookup_req(parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode a lookup request
+pub fn decode_lookup_req(body: &[u8]) -> Result<(u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut parent_ino = 0u64;
+    let mut name = String::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Name => name = dec.read_string(length)?.to_string(),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((parent_ino, name))
+}
+
+/// Encode a create request: parent_ino + name + mode + uid + gid
+pub fn encode_create_req(
+    parent_ino: u64,
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u32(FieldId::Mode, mode);
+    enc.add_u32(FieldId::Uid, uid);
+    enc.add_u32(FieldId::Gid, gid);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a create request
+pub fn decode_create_req(body: &[u8]) -> Result<(u64, String, u32, u32, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut parent_ino = 0u64;
+    let mut name = String::new();
+    let mut mode = 0u32;
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Name => name = dec.read_string(length)?.to_string(),
+            FieldId::Mode => mode = dec.read_u32(length)?,
+            FieldId::Uid => uid = dec.read_u32(length)?,
+            FieldId::Gid => gid = dec.read_u32(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((parent_ino, name, mode, uid, gid))
+}
+
+/// Encode an entry response (common pattern for many operations)
+#[allow(clippy::too_many_arguments)]
+pub fn encode_entry_resp(
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    nlink: u32,
+    mtime: u64,
+    atime: u64,
+    ctime: u64,
+    is_dir: bool,
+    symlink_target: Option<&str>,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u32(FieldId::Mode, mode);
+    enc.add_u32(FieldId::Uid, uid);
+    enc.add_u32(FieldId::Gid, gid);
+    enc.add_u64(FieldId::Size, size);
+    enc.add_u32(FieldId::Nlink, nlink);
+    enc.add_u64(FieldId::Mtime, mtime);
+    enc.add_u64(FieldId::Atime, atime);
+    enc.add_u64(FieldId::Ctime, ctime);
+    enc.add_u8(FieldId::IsDir, is_dir as u8);
+    if let Some(target) = symlink_target {
+        enc.add_string(FieldId::SymlinkTarget, target)?;
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode an entry response
+pub struct EntryInfo {
+    pub ino: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub nlink: u32,
+    pub mtime: u64,
+    pub atime: u64,
+    pub ctime: u64,
+    pub is_dir: bool,
+    pub symlink_target: Option<String>,
+    pub name: String,
+}
+
+impl EntryInfo {
+    pub fn default_entry() -> Self {
+        Self {
+            ino: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            nlink: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            is_dir: false,
+            symlink_target: None,
+            name: String::new(),
+        }
+    }
+}
+
+pub fn decode_entry_resp(body: &[u8]) -> Result<EntryInfo, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut entry = EntryInfo::default_entry();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => entry.ino = dec.read_u64(length)?,
+            FieldId::Mode => entry.mode = dec.read_u32(length)?,
+            FieldId::Uid => entry.uid = dec.read_u32(length)?,
+            FieldId::Gid => entry.gid = dec.read_u32(length)?,
+            FieldId::Size => entry.size = dec.read_u64(length)?,
+            FieldId::Nlink => entry.nlink = dec.read_u32(length)?,
+            FieldId::Mtime => entry.mtime = dec.read_u64(length)?,
+            FieldId::Atime => entry.atime = dec.read_u64(length)?,
+            FieldId::Ctime => entry.ctime = dec.read_u64(length)?,
+            FieldId::IsDir => entry.is_dir = dec.read_u8(length)? != 0,
+            FieldId::SymlinkTarget => {
+                entry.symlink_target = Some(dec.read_string(length)?.to_string());
+            }
+            FieldId::Name => {
+                entry.name = dec.read_string(length)?.to_string();
+            }
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok(entry)
+}
+
+/// Encode a rename request
+pub fn encode_rename_req(
+    old_parent_ino: u64,
+    old_name: &str,
+    new_parent_ino: u64,
+    new_name: &str,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, old_parent_ino);
+    enc.add_string(FieldId::Name, old_name)?;
+    enc.add_u64(FieldId::Ino, new_parent_ino); // reuse Ino for new parent
+    enc.add_string(FieldId::SymlinkTarget, new_name)?; // reuse SymlinkTarget for new name
+    Ok(enc.into_bytes())
+}
+
+/// Decode a rename request
+pub fn decode_rename_req(body: &[u8]) -> Result<(u64, String, u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut old_parent_ino = 0u64;
+    let mut old_name = String::new();
+    let mut new_parent_ino = 0u64;
+    let mut new_name = String::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::ParentIno => old_parent_ino = dec.read_u64(length)?,
+            FieldId::Name => old_name = dec.read_string(length)?.to_string(),
+            FieldId::Ino => new_parent_ino = dec.read_u64(length)?,
+            FieldId::SymlinkTarget => new_name = dec.read_string(length)?.to_string(),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((old_parent_ino, old_name, new_parent_ino, new_name))
+}
+
+/// Encode an unlink/rmdir request
+pub fn encode_delete_req(ino: u64, is_dir: bool) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u8(FieldId::IsDir, is_dir as u8);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a delete request
+pub fn decode_delete_req(body: &[u8]) -> Result<(u64, bool), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+    let mut is_dir = false;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            FieldId::IsDir => is_dir = dec.read_u8(length)? != 0,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((ino, is_dir))
+}
+
+/// Encode a readdir request
+pub fn encode_readdir_req(
+    parent_ino: u64,
+    limit: u32,
+    last_name: Option<&str>,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_u32(FieldId::Limit, limit);
+    if let Some(name) = last_name {
+        enc.add_string(FieldId::LastName, name)?;
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a readdir request
+pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u32, Option<String>), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut parent_ino = 0u64;
+    let mut limit = 0u32;
+    let mut last_name: Option<String> = None;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Limit => limit = dec.read_u32(length)?,
+            FieldId::LastName => last_name = Some(dec.read_string(length)?.to_string()),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((parent_ino, limit, last_name))
+}
+
+/// Encode a data request (read/write)
+pub fn encode_data_req(ino: u64, offset: u64, data_len: u32) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::Offset, offset);
+    enc.add_u32(FieldId::DataLen, data_len);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a data request
+pub fn decode_data_req(body: &[u8]) -> Result<(u64, u64, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+    let mut offset = 0u64;
+    let mut data_len = 0u32;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            FieldId::Offset => offset = dec.read_u64(length)?,
+            FieldId::DataLen => data_len = dec.read_u32(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((ino, offset, data_len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_decode_lookup() {
+        let body = encode_lookup_req(12345, "test.txt").unwrap();
+        let (parent_ino, name) = decode_lookup_req(&body).unwrap();
+        assert_eq!(parent_ino, 12345);
+        assert_eq!(name, "test.txt");
+    }
+
+    #[test]
+    fn test_encode_decode_create() {
+        let body = encode_create_req(1, "hello.txt", 0o644, 1000, 1000).unwrap();
+        let (parent_ino, name, mode, uid, gid) = decode_create_req(&body).unwrap();
+        assert_eq!(parent_ino, 1);
+        assert_eq!(name, "hello.txt");
+        assert_eq!(mode, 0o644);
+        assert_eq!(uid, 1000);
+        assert_eq!(gid, 1000);
+    }
+
+    #[test]
+    fn test_encode_decode_entry() {
+        let body = encode_entry_resp(
+            99, 0o644, 1000, 1000, 1024, 1, 1234567890, 1234567890, 1234567890, false, None,
+        )
+        .unwrap();
+        let entry = decode_entry_resp(&body).unwrap();
+        assert_eq!(entry.ino, 99);
+        assert_eq!(entry.mode, 0o644);
+        assert_eq!(entry.size, 1024);
+        assert!(!entry.is_dir);
+        assert!(entry.symlink_target.is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_symlink_entry() {
+        let body = encode_entry_resp(
+            100,
+            0o777,
+            1000,
+            1000,
+            0,
+            1,
+            0,
+            0,
+            0,
+            false,
+            Some("/tmp/target"),
+        )
+        .unwrap();
+        let entry = decode_entry_resp(&body).unwrap();
+        assert_eq!(entry.ino, 100);
+        assert_eq!(entry.symlink_target.as_deref(), Some("/tmp/target"));
+    }
+
+    #[test]
+    fn test_tlv_encoder_decoder() {
+        let mut enc = TlvEncoder::new();
+        enc.add_u8(FieldId::IsDir, 1);
+        enc.add_u16(FieldId::Mode, 0o755);
+        enc.add_u32(FieldId::Uid, 1000);
+        enc.add_u64(FieldId::Size, 123456789);
+        enc.add_string(FieldId::Name, "test").unwrap();
+        let bytes = enc.into_bytes();
+
+        let mut dec = TlvDecoder::new(&bytes);
+        assert_eq!(dec.remaining(), bytes.len());
+
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::IsDir);
+        assert_eq!(dec.read_u8(len).unwrap(), 1);
+
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::Mode);
+        assert_eq!(dec.read_u16(len).unwrap(), 0o755);
+
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::Uid);
+        assert_eq!(dec.read_u32(len).unwrap(), 1000);
+
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::Size);
+        assert_eq!(dec.read_u64(len).unwrap(), 123456789);
+
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::Name);
+        assert_eq!(dec.read_string(len).unwrap(), "test");
+
+        assert!(dec.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_field_skipped() {
+        let mut enc = TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 42);
+        // Use an unknown field ID (0xFE)
+        enc.buf.push(0xFE);
+        enc.buf.extend_from_slice(&3u16.to_le_bytes());
+        enc.buf.extend_from_slice(&[1u8, 2, 3]);
+        let bytes = enc.into_bytes();
+
+        let mut dec = TlvDecoder::new(&bytes);
+        let (field, len) = dec.next_field().unwrap();
+        assert_eq!(field, FieldId::Mode);
+        assert_eq!(dec.read_u32(len).unwrap(), 42);
+
+        // Unknown field 0xFE should be automatically skipped by next_field()
+        // Since it's the last field, next_field() should return None
+        assert!(dec.next_field().is_none());
+
+        assert!(dec.is_empty());
+    }
+}

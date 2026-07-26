@@ -1,7 +1,8 @@
 use clap::Parser;
-use log::{info, warn};
+use log::{error, info, warn};
 use powerfs_common::{config::PowerFsConfig, types::NodeId};
 use powerfs_core::storage::StorageManager;
+use powerfs_net::PowerFsNetServer;
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
@@ -18,6 +19,10 @@ struct Args {
 
     #[arg(long, default_value = "8080")]
     http_port: u32,
+
+    /// powerfs-net binary protocol port (0 = disabled)
+    #[arg(long, default_value = "8081")]
+    net_port: u16,
 
     #[arg(long, default_value = "volume-server-1")]
     node_id: String,
@@ -145,6 +150,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_port,
         &data_dir,
     );
+
+    // Start powerfs-net binary protocol server for Volume
+    let net_port = args.net_port;
+    if net_port > 0 {
+        let net_bind_addr = format!("{}:{}", ip, net_port);
+        let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
+            Arc::new(volume_server.clone()),
+        ));
+        info!("Starting powerfs-net Volume server on {}", net_bind_addr);
+        if let Ok(net_server) = PowerFsNetServer::bind(&ip, net_port, net_handler).await {
+            tokio::spawn(async move {
+                if let Err(e) = net_server.serve().await {
+                    error!("powerfs-net Volume server error: {:?}", e);
+                }
+            });
+        }
+    }
 
     let master_addrs: Vec<&str> = master_address.iter().map(|s| s.as_str()).collect();
     let master_client = MasterClient::new(NewMasterClientParams {

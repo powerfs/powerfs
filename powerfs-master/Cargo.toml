@@ -18,6 +18,7 @@ rfs_tester = { path = "../rfs_tester" }
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
+powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 tokio = { workspace = true }
 crossbeam = { workspace = true }

@@ -16,6 +16,7 @@ use powerfs_common::{
 };
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
+use powerfs_net::PowerFsNetServer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -32,6 +33,7 @@ pub use crate::volume_assigner::{
 pub struct MasterNode {
     id: NodeId,
     address: SocketAddr,
+    net_port: u16,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
     collections: RwLock<HashMap<String, CollectionConfig>>,
@@ -208,6 +210,7 @@ impl MasterNode {
         raft_path: &str,
         raft_id: u64,
         peers: Vec<String>,
+        net_port: u16,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
 
@@ -332,6 +335,7 @@ impl MasterNode {
         let master = MasterNode {
             id: node_id.clone(),
             address: addr,
+            net_port,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
             collections: RwLock::new(collections),
@@ -2068,6 +2072,23 @@ impl MasterNode {
                 .ok();
         });
 
+        // Start powerfs-net binary protocol server
+        let net_port = self.net_port;
+        if net_port > 0 {
+            let net_addr = format!("{}:{}", self.address.ip(), net_port);
+            let net_handler = Arc::new(crate::net_handler::MasterNetHandler::new(self.clone()));
+            info!("Starting powerfs-net server on {}", net_addr);
+            if let Ok(net_server) =
+                PowerFsNetServer::bind(&self.address.ip().to_string(), net_port, net_handler).await
+            {
+                tokio::spawn(async move {
+                    if let Err(e) = net_server.serve().await {
+                        error!("powerfs-net server error: {:?}", e);
+                    }
+                });
+            }
+        }
+
         // Start Raft message forwarder
         let message_rx = self.message_tx.subscribe();
         let raft_peers = self.peers.clone();
@@ -2116,6 +2137,7 @@ impl Clone for MasterNode {
         MasterNode {
             id: self.id.clone(),
             address: self.address,
+            net_port: self.net_port,
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
             collections: RwLock::new(self.collections.read().unwrap().clone()),

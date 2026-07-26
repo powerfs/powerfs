@@ -22,15 +22,16 @@ use tonic::{transport::Server, Request, Response, Status};
 const MAX_MERGE_ENTRIES: usize = 100;
 const DEFAULT_STRIPE_SIZE: u64 = 64 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct VolumeServer {
-    storage_manager: Arc<StorageManager>,
+    pub storage_manager: Arc<StorageManager>,
     node_id: NodeId,
     event_provider: Arc<dyn EventProvider>,
     ip: String,
     grpc_port: u32,
     http_port: u32,
     data_dir: String,
-    range_lease_mgr: Arc<RangeLeaseManager>,
+    pub range_lease_mgr: Arc<RangeLeaseManager>,
 }
 
 impl VolumeServer {

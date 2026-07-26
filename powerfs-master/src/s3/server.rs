@@ -1451,6 +1451,7 @@ mod tests {
                 dir.path().join("raft").to_str().unwrap(),
                 1,
                 vec![],
+                0,
             )
             .await
             .unwrap(),

@@ -25,6 +25,7 @@ redis-metrics = ["powerfs-common/redis-metrics"]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-net = { path = "../powerfs-net" }
 powerfs-volume = { path = "../powerfs-volume" }
 powerfs-fuse = { path = "../powerfs-fuse", optional = true }
 powerfs-filer = { path = "../powerfs-filer", optional = true }

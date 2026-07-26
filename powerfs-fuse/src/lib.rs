@@ -22,4 +22,4 @@ pub mod orset {
 }
 
 pub use dir_cache_provider::EnterpriseDirCache;
-pub use fuser_fs::FuserApp;
+pub use fuse::FuseApp;

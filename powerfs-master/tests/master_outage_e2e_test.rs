@@ -55,7 +55,7 @@ impl Drop for MasterInstance {
 
 async fn start_master(bind_addr: &str, raft_path: &str) -> MasterInstance {
     let master = Arc::new(
-        MasterNode::new(bind_addr, bind_addr, None, raft_path, 1, vec![])
+        MasterNode::new(bind_addr, bind_addr, None, raft_path, 1, vec![], 0)
             .await
             .expect("Failed to create MasterNode"),
     );

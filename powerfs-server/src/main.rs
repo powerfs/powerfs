@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use log::{info, warn};
+use log::{error, info, warn};
 use powerfs_common::{
     config::PowerFsConfig,
     error::{PowerFsError, Result},
@@ -11,7 +11,7 @@ use powerfs_core::storage::StorageManager;
 use powerfs_core::storage_backend::factory::BackendFactory;
 #[cfg(any(feature = "spdk", feature = "spdk-stub"))]
 use powerfs_core::storage_backend::SpdkBackend;
-use powerfs_fuse::FuserApp;
+use powerfs_fuse::FuseApp;
 use powerfs_master::{
     master::MasterNode,
     raft_storage::{RaftVerifyReport, RocksDbStorage},
@@ -21,6 +21,7 @@ use powerfs_master::{
     s3::S3Server,
     tracking_allocator::TrackingAllocator,
 };
+use powerfs_net::PowerFsNetServer;
 use powerfs_volume::{
     master_client::{MasterClient, NewMasterClientParams},
     server::VolumeServer,
@@ -68,6 +69,10 @@ enum Commands {
         #[arg(long, short = 'P', default_value = "9333")]
         port: u16,
 
+        /// powerfs-net binary protocol port (0 = disabled)
+        #[arg(long, default_value = "9334")]
+        net_port: u16,
+
         /// Data directory (meta, raft will be created inside)
         #[arg(long, short = 'D', default_value = "./data/master")]
         dir: String,
@@ -104,6 +109,10 @@ enum Commands {
     Volume {
         #[arg(long, short = 'P', default_value = "8080")]
         port: u16,
+
+        /// powerfs-net binary protocol port (0 = disabled)
+        #[arg(long, default_value = "8081")]
+        net_port: u16,
 
         /// Data directory (meta, data will be created inside)
         #[arg(long, short = 'D', default_value = "./data/volume")]
@@ -328,6 +337,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Master {
             port,
+            net_port,
             dir,
             raft_dir,
             meta_dir,
@@ -360,12 +370,18 @@ async fn main() -> Result<()> {
                 } else {
                     master_cfg.peers
                 },
+                net_port: if net_port != 9334 {
+                    net_port
+                } else {
+                    master_cfg.net_port
+                },
             })
             .await
         }
 
         Commands::Volume {
             port,
+            net_port,
             dir,
             meta_dir,
             data_dir,
@@ -393,6 +409,11 @@ async fn main() -> Result<()> {
                     volume_cfg.max_volume_size
                 },
                 config.as_deref(),
+                if net_port != 8081 {
+                    net_port
+                } else {
+                    volume_cfg.net_port
+                },
             )
             .await
         }
@@ -591,6 +612,7 @@ struct RunMasterParams<'a> {
     advertise_addr: Option<String>,
     raft_id: u64,
     peers: Vec<String>,
+    net_port: u16,
 }
 
 async fn run_master(params: RunMasterParams<'_>) -> Result<()> {
@@ -623,6 +645,7 @@ async fn run_master(params: RunMasterParams<'_>) -> Result<()> {
         &raft_dir,
         params.raft_id,
         params.peers,
+        params.net_port,
     )
     .await?;
 
@@ -647,6 +670,7 @@ async fn run_volume(
     ip: Option<String>,
     _max_volume_size: u64,
     config_path: Option<&str>,
+    net_port: u16,
 ) -> Result<()> {
     info!("Starting PowerFS Volume node");
 
@@ -783,6 +807,22 @@ async fn run_volume(
         http_port as u32,
         &data_dir,
     );
+
+    // Start powerfs-net binary protocol server for Volume
+    if net_port > 0 {
+        let net_bind_addr = format!("{}:{}", bind_ip, net_port);
+        let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
+            Arc::new(volume_server.clone()),
+        ));
+        info!("Starting powerfs-net Volume server on {}", net_bind_addr);
+        if let Ok(net_server) = PowerFsNetServer::bind(&bind_ip, net_port, net_handler).await {
+            tokio::spawn(async move {
+                if let Err(e) = net_server.serve().await {
+                    error!("powerfs-net Volume server error: {:?}", e);
+                }
+            });
+        }
+    }
 
     tokio::spawn(async move {
         if let Err(e) = volume_server.start(&address).await {
@@ -1064,17 +1104,10 @@ async fn run_filer(
 async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Result<()> {
     info!("Starting PowerFS FUSE client");
 
-    let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(
-        &[master_addr.to_string()],
-        &[],
-        dir,
-        "default",
-        "000",
-        8,
-        false,
-    )
-    .await?;
+    let master_addr = master.as_deref().unwrap_or("localhost:9333");
+    let (master_host, master_net_port) = parse_master_addr(master_addr);
+    let fuse_app =
+        FuseApp::new(&[master_host], dir, "default", "000", master_net_port, 8081).await?;
 
     info!("Mounting PowerFS at: {}", dir);
     info!("Connected to master: {}", master_addr);
@@ -1085,21 +1118,23 @@ async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Resul
 async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
     info!("Mounting PowerFS at: {}", dir);
 
-    let master_addr = master.as_deref().unwrap_or("localhost:9334");
-    let fuse_app = FuserApp::new(
-        &[master_addr.to_string()],
-        &[],
-        dir,
-        "default",
-        "000",
-        8,
-        false,
-    )
-    .await?;
+    let master_addr = master.as_deref().unwrap_or("localhost:9333");
+    let (master_host, master_net_port) = parse_master_addr(master_addr);
+    let fuse_app =
+        FuseApp::new(&[master_host], dir, "default", "000", master_net_port, 8081).await?;
 
     info!("Connected to master: {}", master_addr);
 
     fuse_app.run().await
+}
+
+fn parse_master_addr(addr: &str) -> (String, u16) {
+    if let Some((host, port_str)) = addr.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (host.to_string(), port);
+        }
+    }
+    (addr.to_string(), 9334)
 }
 
 async fn run_s3(

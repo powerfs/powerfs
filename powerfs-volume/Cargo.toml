@@ -19,6 +19,7 @@ chrono = { workspace = true }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-net = { path = "../powerfs-net" }
 tokio = { workspace = true, features = ["time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
@@ -32,3 +33,4 @@ clap = { workspace = true }
 env_logger = { workspace = true }
 redis = { version = "0.22", features = ["tokio-comp"] }
 sysinfo = "0.30"
+async-trait = { workspace = true }

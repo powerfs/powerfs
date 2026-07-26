@@ -33,6 +33,8 @@ pub struct MasterConfig {
     pub advertise_addr: Option<String>,
     pub raft_id: u64,
     pub peers: Vec<String>,
+    /// powerfs-net binary protocol port (0 = disabled)
+    pub net_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub struct VolumeConfig {
     /// auto-detected from the underlying filesystem via statvfs.
     #[serde(default)]
     pub device_capacity: Option<u64>,
+    /// powerfs-net binary protocol port (0 = disabled)
+    pub net_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +125,7 @@ impl Default for MasterConfig {
             advertise_addr: None,
             raft_id: 1,
             peers: Vec::new(),
+            net_port: 9334,
         }
     }
 }
@@ -136,6 +141,7 @@ impl Default for VolumeConfig {
             max_volume_size: 1073741824,
             initial_volume_count: 2,
             device_capacity: None,
+            net_port: 8081,
         }
     }
 }

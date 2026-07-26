@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use powerfs_fuse::FuserApp;
+use powerfs_fuse::FuseApp;
 
 use powerfs_common::config::PowerFsConfig;
 
@@ -14,15 +14,19 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(name = "powerfs-fuse")]
-#[command(about = "PowerFS FUSE client - mount PowerFS as a filesystem")]
+#[command(about = "PowerFS FUSE client - mount PowerFS as a filesystem via powerfs-net")]
 struct Args {
-    /// Master server gRPC addresses (e.g. localhost:9334 localhost:9335)
-    #[arg(long, default_value = "localhost:9334")]
+    /// Master server addresses (e.g. localhost)
+    #[arg(long, default_value = "localhost")]
     master: Vec<String>,
 
-    /// Filer server gRPC addresses (e.g. localhost:8889 localhost:8890)
-    #[arg(long)]
-    filer: Vec<String>,
+    /// Master powerfs-net port
+    #[arg(long, default_value = "9334")]
+    master_net_port: u16,
+
+    /// Volume powerfs-net port
+    #[arg(long, default_value = "8081")]
+    volume_net_port: u16,
 
     /// Mount point path
     #[arg(long)]
@@ -35,10 +39,6 @@ struct Args {
     /// Replication setting (e.g. "000" for no replicas)
     #[arg(long, default_value = "000")]
     replication: String,
-
-    /// Number of FUSE worker threads
-    #[arg(long, default_value = "8")]
-    threads: usize,
 
     /// Verbose logging
     #[arg(short, long)]
@@ -110,17 +110,10 @@ fn main() {
     let cfg = load_config(&args.config);
     let fuse_cfg = cfg.fuse;
 
-    let master_addrs =
-        if !args.master.is_empty() && args.master != vec!["localhost:9334".to_string()] {
-            args.master.clone()
-        } else {
-            fuse_cfg.master_addresses.clone()
-        };
-
-    let filer_addrs = if !args.filer.is_empty() {
-        args.filer.clone()
+    let master_addrs = if !args.master.is_empty() && args.master != vec!["localhost".to_string()] {
+        args.master.clone()
     } else {
-        fuse_cfg.filer_addresses.clone()
+        fuse_cfg.master_addresses.clone()
     };
 
     let mount_point = if !args.mount_point.is_empty() {
@@ -141,11 +134,9 @@ fn main() {
         fuse_cfg.replication.clone()
     };
 
-    let threads = if args.threads != 8 {
-        args.threads
-    } else {
-        fuse_cfg.threads
-    };
+    let master_net_port = args.master_net_port;
+    let volume_net_port = args.volume_net_port;
+
     let verbose = if args.verbose { true } else { fuse_cfg.verbose };
     let container = if args.container {
         true
@@ -200,15 +191,13 @@ fn main() {
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
 
-    info!("PowerFS FUSE Client starting...");
+    info!("PowerFS FUSE Client starting (powerfs-net)...");
     info!("  Masters: {}", master_addrs.join(", "));
-    if !filer_addrs.is_empty() {
-        info!("  Filers: {}", filer_addrs.join(", "));
-    }
+    info!("  Master net port: {}", master_net_port);
+    info!("  Volume net port: {}", volume_net_port);
     info!("  Mount point: {}", mount_point);
     info!("  Collection: {}", collection);
     info!("  Replication: {}", replication);
-    info!("  Worker threads: {}", threads);
     info!("  Container mode: {}", container);
     info!("  Data verification: {}", args.verify_data);
 
@@ -254,14 +243,13 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     let result = runtime.block_on(async {
-        let fuse_client = FuserApp::new(
+        let fuse_client = FuseApp::new(
             &master_addrs,
-            &filer_addrs,
             &mount_point,
             &collection,
             &replication,
-            threads,
-            args.verify_data,
+            master_net_port,
+            volume_net_port,
         )
         .await
         .expect("Failed to create FUSE client");

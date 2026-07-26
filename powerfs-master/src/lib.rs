@@ -4,6 +4,7 @@ pub mod lock_manager;
 pub mod master;
 pub mod metadata_manager;
 pub mod metrics;
+pub mod net_handler;
 pub mod proto;
 pub mod provider_impl;
 pub mod raft_client;

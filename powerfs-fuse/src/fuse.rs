@@ -1,5 +1,4 @@
 use crate::cache::{CachedEntry, ChunkCache, MetadataCache, ROOT_INODE};
-use crate::client::{PowerFuseClient, SyncFuseClient};
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -9,6 +8,7 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
+use powerfs_fuse_core::net_client::SyncFuseNetClient;
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
@@ -24,11 +24,14 @@ const PREFETCH_CHUNKS: u64 = 2;
 const FUSE_APPEND: u32 = 0x400;
 
 /// FUSE application that manages the mount lifecycle
+#[allow(dead_code)]
 pub struct FuseApp {
     mount_point: String,
     master_addresses: Vec<String>,
     collection: String,
     replication: String,
+    master_net_port: u16,
+    volume_net_port: u16,
     runtime_handle: Handle,
 }
 
@@ -38,6 +41,8 @@ impl FuseApp {
         mount_point: &str,
         collection: &str,
         replication: &str,
+        master_net_port: u16,
+        volume_net_port: u16,
     ) -> Result<Self> {
         let runtime_handle = Handle::try_current()
             .map_err(|e| PowerFsError::Internal(format!("no tokio runtime: {}", e)))?;
@@ -47,6 +52,8 @@ impl FuseApp {
             master_addresses: master_addrs.to_vec(),
             collection: collection.to_string(),
             replication: replication.to_string(),
+            master_net_port,
+            volume_net_port,
             runtime_handle,
         })
     }
@@ -58,15 +65,29 @@ impl FuseApp {
             self.master_addresses.join(", ")
         );
 
-        let master_addrs_ref: Vec<&str> =
-            self.master_addresses.iter().map(|s| s.as_str()).collect();
-        let grpc_client = PowerFuseClient::new(
-            &master_addrs_ref,
-            &[],
-            self.runtime_handle.clone(),
-            &self.collection,
+        let master_addr = self
+            .master_addresses
+            .first()
+            .unwrap_or(&"127.0.0.1".to_string())
+            .clone();
+
+        let net_config = powerfs_fuse_core::net_client::NetClientConfig {
+            master_addr: master_addr.clone(),
+            master_net_port: self.master_net_port,
+            volume_net_port: self.volume_net_port,
+            client_id: 0,
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+        };
+
+        let sync_client = Arc::new(SyncFuseNetClient::connect(net_config).await.map_err(|e| {
+            PowerFsError::Internal(format!("Failed to connect to powerfs-net: {}", e))
+        })?);
+
+        info!(
+            "Connected to powerfs-net at {}:{}",
+            master_addr, self.master_net_port
         );
-        let sync_client = Arc::new(SyncFuseClient::new(grpc_client));
 
         let cache = Arc::new(MetadataCache::new());
 
@@ -178,7 +199,7 @@ impl FuseServer {
 type FileLocks = HashMap<u64, Vec<FileLock>>;
 
 struct PowerFsFs {
-    client: Arc<SyncFuseClient>,
+    client: Arc<SyncFuseNetClient>,
     cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
     collection: String,
@@ -221,7 +242,7 @@ impl PowerFsFs {
         let loc = locations
             .first()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = PowerFuseClient::location_to_grpc_addr(loc);
+        let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
         let chunk_size = self.chunk_cache.chunk_size();
 
         let mut chunks = Vec::new();
@@ -706,7 +727,7 @@ impl FileSystem for PowerFsFs {
                 match self.client.lookup_volume(fid.volume_id) {
                     Ok(locations) => {
                         if let Some(loc) = locations.first() {
-                            let addr = PowerFuseClient::location_to_grpc_addr(loc);
+                            let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
                             if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key)
                             {
                                 warn!("Failed to delete remote data: {}", e);
@@ -954,7 +975,7 @@ impl FileSystem for PowerFsFs {
         let loc = locations
             .first()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = PowerFuseClient::location_to_grpc_addr(loc);
+        let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
 
         for chunk_idx in start_chunk..=prefetch_end_chunk {
             let chunk_offset = chunk_idx * chunk_size;

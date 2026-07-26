@@ -1,0 +1,17 @@
+[package]
+name = "powerfs-net"
+version = "0.1.0"
+edition = "2021"
+description = "PowerFS lightweight binary network protocol for metadata and data operations"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+log = "0.4"
+parking_lot = "0.12"
+crc32c = "0.6"
+thiserror = "1"
+async-trait = "0.1"
+env_logger = "0.10"
+
+[dev-dependencies]

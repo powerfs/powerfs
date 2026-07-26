@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "powerfs-net",
     "powerfs-core",
     "powerfs-master",
     "powerfs-volume",
@@ -9,7 +10,6 @@ members = [
     "powerfs-server",
     "powerfs-cli",
     "powerfs-kv-client",
-    "powerfs-kernel",
     "powerfs-monitor",
     "powerfs-orset",
     "powerfs-filer",
