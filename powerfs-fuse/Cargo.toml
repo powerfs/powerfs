@@ -20,11 +20,8 @@ powerfs-fuse-core = { path = "../powerfs-fuse-core" }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
-powerfs-volume = { path = "../powerfs-volume" }
 powerfs-orset = { path = "../powerfs-orset" }
-powerfs-filer = { path = "../powerfs-filer" }
 fuse-backend-rs = { workspace = true }
-fuser = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
@@ -33,8 +30,6 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
 env_logger = { workspace = true }
 clap = { workspace = true }
 lru = { workspace = true }
@@ -42,12 +37,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
-tokio-util = "0.7"
-tokio-stream = "0.1"
-md5 = "0.7"
-hostname = "0.3"
 futures = { workspace = true }
-crossbeam = { workspace = true }
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

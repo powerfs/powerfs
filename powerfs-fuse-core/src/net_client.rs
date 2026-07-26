@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::client::AssignFidResult;
+/// Result type for assign_fid: (fid, primary_location, stripe_fids, stripe_locations)
+pub type AssignFidResult = (Fid, Option<Location>, Vec<String>, Vec<Location>);
 
 /// Configuration for the net client
 #[derive(Debug, Clone)]
