@@ -41,6 +41,12 @@ pub struct InodeInfo {
     // Extended attributes (e.g. file layout: stripe/flat)
     #[serde(default)]
     pub extended: HashMap<String, Vec<u8>>,
+    // Symlink target (for symlink type)
+    #[serde(default)]
+    pub symlink_target: Option<String>,
+    // Hard link count (for hard links)
+    #[serde(default)]
+    pub nlink: u32,
 }
 
 /// Stored file chunk (persisted in Filer InodeInfo)
@@ -444,6 +450,21 @@ impl ShardStore {
             } => {
                 self.setattr(inode, size, mode, uid, gid);
             }
+            ShardCommand::CreateSymlink {
+                parent_inode,
+                name,
+                inode,
+                target,
+            } => {
+                self.create_symlink(parent_inode, name, inode, target);
+            }
+            ShardCommand::CreateHardLink {
+                inode,
+                new_parent_inode,
+                new_name,
+            } => {
+                self.create_hard_link(inode, new_parent_inode, new_name);
+            }
         }
     }
 
@@ -468,6 +489,8 @@ impl ShardStore {
             etag: None,
             chunks: vec![],
             extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -540,6 +563,8 @@ impl ShardStore {
             etag: Some(etag),
             chunks: vec![],
             extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -665,6 +690,8 @@ impl ShardStore {
             etag: None,
             chunks: vec![],
             extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 2,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1069,5 +1096,102 @@ impl ShardStore {
         };
 
         let _ = self.update_inode(info);
+    }
+
+    /// Create a symbolic link
+    fn create_symlink(&self, parent_inode: u64, name: String, inode: u64, target: String) {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let target_len = target.len() as u64;
+        let target_for_log = target.clone();
+
+        let inode_info = InodeInfo {
+            inode,
+            name: name.clone(),
+            parent_inode,
+            file_type: FileType::Symlink,
+            size: target_len,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            extended: HashMap::new(),
+            symlink_target: Some(target),
+            nlink: 1,
+        };
+
+        let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
+        let cf_dir_entries = self.db.cf_handle(CF_DIR_ENTRIES).unwrap();
+
+        let inode_key = inode.to_be_bytes();
+        if let Ok(data) = serde_json::to_vec(&inode_info) {
+            let _ = self.db.put_cf(cf_inodes, inode_key, &data);
+        }
+
+        let dir_entry_key = format!("{}:{}", parent_inode, name);
+        let inode_value = inode.to_be_bytes();
+        let _ = self
+            .db
+            .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
+
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            let mut dir_entries = self.directory_entries.write().unwrap();
+
+            inodes.insert(inode, inode_info);
+
+            dir_entries.entry(parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.insert(name, inode);
+            }
+        }
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+        }
+        self.save_stats();
+
+        info!(
+            "Shard {} created symlink: inode={}, target={}",
+            self.shard_id.0, inode, target_for_log
+        );
+    }
+
+    /// Create a hard link
+    fn create_hard_link(&self, inode: u64, new_parent_inode: u64, new_name: String) {
+        let cf_dir_entries = self.db.cf_handle(CF_DIR_ENTRIES).unwrap();
+        let new_name_for_log = new_name.clone();
+
+        let dir_entry_key = format!("{}:{}", new_parent_inode, new_name);
+        let inode_value = inode.to_be_bytes();
+        let _ = self
+            .db
+            .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
+
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            dir_entries.entry(new_parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&new_parent_inode) {
+                dir.insert(new_name, inode);
+            }
+
+            // Update nlink count
+            let mut inodes = self.inodes.write().unwrap();
+            if let Some(info) = inodes.get_mut(&inode) {
+                info.nlink += 1;
+                let _ = self.update_inode(info.clone());
+            }
+        }
+
+        info!(
+            "Shard {} created hard link: inode={}, new_parent={}, new_name={}",
+            self.shard_id.0, inode, new_parent_inode, new_name_for_log
+        );
     }
 }

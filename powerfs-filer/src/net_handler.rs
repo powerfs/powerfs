@@ -400,6 +400,92 @@ impl FilerNetHandler {
         enc.add_u64(FieldId::Blksize, 4096);
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
     }
+
+    /// Handle Symlink request
+    async fn handle_symlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
+        let name = dec.next_string(FieldId::Name).unwrap_or_default();
+        let target = dec.next_string(FieldId::SymlinkTarget).unwrap_or_default();
+
+        info!(
+            "FILER_NET_SYMLINK: parent_ino={}, name={}, target={}",
+            parent_ino, name, target
+        );
+
+        match self
+            .meta_shard_manager
+            .create_symlink(parent_ino, &name, &target)
+            .await
+        {
+            Ok(info) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::Ino, info.inode);
+                enc.add_string(FieldId::Name, &name)?;
+                enc.add_string(FieldId::SymlinkTarget, &target)?;
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SYMLINK failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle Readlink request
+    async fn handle_readlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+
+        info!("FILER_NET_READLINK: ino={}", ino);
+
+        match self.meta_shard_manager.get_inode(ino) {
+            Some(info) => {
+                let target = info.symlink_target.unwrap_or_default();
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::SymlinkTarget, &target)?;
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+        }
+    }
+
+    /// Handle Link request (hard link)
+    async fn handle_link(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let new_parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
+        let new_name = dec.next_string(FieldId::Name).unwrap_or_default();
+
+        info!(
+            "FILER_NET_LINK: ino={}, new_parent={}, new_name={}",
+            ino, new_parent_ino, new_name
+        );
+
+        match self
+            .meta_shard_manager
+            .create_hard_link(ino, new_parent_ino, &new_name)
+            .await
+        {
+            Ok(_) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::Ino, ino);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_LINK failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -425,6 +511,9 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Rename => self.handle_rename(msg).await,
             MsgType::ReadDir => self.handle_readdir(msg).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
+            MsgType::Symlink => self.handle_symlink(msg).await,
+            MsgType::Readlink => self.handle_readlink(msg).await,
+            MsgType::Link => self.handle_link(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

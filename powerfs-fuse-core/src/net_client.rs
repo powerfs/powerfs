@@ -441,6 +441,75 @@ impl PowerFuseNetClient {
         Ok(())
     }
 
+    /// Create a symbolic link
+    pub async fn symlink(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: &str,
+    ) -> NetResult<u64> {
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ParentIno, parent_ino);
+        enc.add_string(FieldId::Name, name)?;
+        enc.add_string(FieldId::SymlinkTarget, target)?;
+
+        let resp = self
+            .filer_client
+            .send_request(MsgType::Symlink, enc.into_bytes().as_slice(), &[])
+            .await?;
+
+        if !resp.is_ok() {
+            return Err(powerfs_net::NetError::ServerError("symlink failed".into()));
+        }
+
+        let mut dec = TlvDecoder::new(&resp.body);
+        let ino = dec.next_u64(FieldId::Ino)?;
+        Ok(ino)
+    }
+
+    /// Read a symbolic link target
+    pub async fn readlink(&self, ino: u64) -> NetResult<String> {
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, ino);
+
+        let resp = self
+            .filer_client
+            .send_request(MsgType::Readlink, enc.into_bytes().as_slice(), &[])
+            .await?;
+
+        if !resp.is_ok() {
+            return Err(powerfs_net::NetError::ServerError("readlink failed".into()));
+        }
+
+        let mut dec = TlvDecoder::new(&resp.body);
+        let target = dec.next_string(FieldId::SymlinkTarget).unwrap_or_default();
+        Ok(target)
+    }
+
+    /// Create a hard link
+    pub async fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &str,
+    ) -> NetResult<u64> {
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, ino);
+        enc.add_u64(FieldId::ParentIno, new_parent_ino);
+        enc.add_string(FieldId::Name, new_name)?;
+
+        let resp = self
+            .filer_client
+            .send_request(MsgType::Link, enc.into_bytes().as_slice(), &[])
+            .await?;
+
+        if !resp.is_ok() {
+            return Err(powerfs_net::NetError::ServerError("link failed".into()));
+        }
+
+        Ok(ino)
+    }
+
     // ========================================================================
     // Volume operations
     // ========================================================================
@@ -915,6 +984,31 @@ impl SyncFuseNetClient {
         self.block_with_default_timeout(self.client.setattr(ino, size, mode, uid, gid))
     }
 
+    /// Create a symbolic link (sync)
+    pub fn symlink(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: &str,
+    ) -> NetResult<u64> {
+        self.block_with_default_timeout(self.client.symlink(parent_ino, name, target))
+    }
+
+    /// Read a symbolic link target (sync)
+    pub fn readlink(&self, ino: u64) -> NetResult<String> {
+        self.block_with_default_timeout(self.client.readlink(ino))
+    }
+
+    /// Create a hard link (sync)
+    pub fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &str,
+    ) -> NetResult<u64> {
+        self.block_with_default_timeout(self.client.link(ino, new_parent_ino, new_name))
+    }
+
     // ========================================================================
     // Lease operations (sync)
     // ========================================================================
@@ -1199,7 +1293,7 @@ impl SyncFuseNetClient {
 
         let body = enc.into_bytes();
         let resp = self
-            .block_with_default_timeout(self.client.master_client.send_request(
+            .block_with_default_timeout(self.client.filer_client.send_request(
                 MsgType::Rename,
                 &body,
                 &[],

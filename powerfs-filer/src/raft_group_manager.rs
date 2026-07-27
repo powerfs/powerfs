@@ -98,6 +98,19 @@ pub enum ShardCommand {
         uid: Option<u64>,
         gid: Option<u64>,
     },
+    /// Create a symbolic link
+    CreateSymlink {
+        parent_inode: u64,
+        name: String,
+        inode: u64,
+        target: String,
+    },
+    /// Create a hard link
+    CreateHardLink {
+        inode: u64,
+        new_parent_inode: u64,
+        new_name: String,
+    },
 }
 
 impl ShardCommand {

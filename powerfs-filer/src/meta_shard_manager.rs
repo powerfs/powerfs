@@ -622,6 +622,8 @@ impl MetaShardManager {
                 etag: None,
                 chunks: Vec::new(),
                 extended: std::collections::HashMap::new(),
+                symlink_target: None,
+                nlink: 2,
             });
         }
 
@@ -799,6 +801,69 @@ impl MetaShardManager {
             mode,
             uid,
             gid,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+        Ok(())
+    }
+
+    /// Create a symbolic link via Raft consensus
+    pub async fn create_symlink(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        target: &str,
+    ) -> Result<InodeInfo, String> {
+        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
+
+        let shard_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_id)
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+                .clone()
+        };
+
+        let inode = self.generate_inode();
+
+        let cmd = ShardCommand::CreateSymlink {
+            parent_inode,
+            name: name.to_string(),
+            inode,
+            target: target.to_string(),
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        let mut retries = 0;
+        while retries < 10 {
+            if let Some(info) = shard_store.get_inode(inode) {
+                return Ok(info);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            retries += 1;
+        }
+
+        Err("failed to create symlink: timeout waiting for apply".to_string())
+    }
+
+    /// Create a hard link via Raft consensus
+    pub async fn create_hard_link(
+        &self,
+        inode: u64,
+        new_parent_inode: u64,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.shard_strategy.calculate_shard(new_parent_inode);
+
+        let cmd = ShardCommand::CreateHardLink {
+            inode,
+            new_parent_inode,
+            new_name: new_name.to_string(),
         };
 
         self.raft_group_manager
@@ -1528,6 +1593,8 @@ impl MetaShardManager {
                     etag: None,
                     chunks: vec![],
                     extended: std::collections::HashMap::new(),
+                    symlink_target: None,
+                    nlink: 1,
                 };
                 store.create_inode(inode_info)?;
                 store.add_dir_entry(

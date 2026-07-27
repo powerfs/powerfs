@@ -1472,51 +1472,16 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let parent_path = self
-            .cache
-            .inode_to_path(parent)
-            .unwrap_or_else(|| "/".to_string());
-
-        let now = chrono::Utc::now().timestamp() as u64;
-        let entry = FilerEntry {
-            name: name_str.to_string(),
-            directory: parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: 0,
-                mode: 0o120777,
-                nlink: 1,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                size: link_str.len() as u64,
-                blksize: 4096,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                perm: 0o777,
-            }),
-            chunks: Vec::new(),
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            extended: HashMap::new(),
-            content_size: link_str.len() as u64,
-            disk_size: 0,
-            ttl: String::new(),
-            symlink_target: link_str.to_string(),
-            owner: String::new(),
-            generation: 0,
-        };
-
-        let inode = match self.client.create_entry(entry, "") {
+        // Use powerfs-net protocol to create symlink on server
+        let inode = match self.client.symlink(parent, name_str, link_str) {
             Ok(ino) => ino,
             Err(e) => {
-                error!("create_entry failed for symlink: {}", e);
+                error!("symlink failed on server: {}", e);
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         };
 
+        let now = chrono::Utc::now().timestamp() as u64;
         let cached_entry = CachedEntry {
             inode,
             parent,
@@ -1548,12 +1513,23 @@ impl FileSystem for PowerFsFs {
     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> std::io::Result<Vec<u8>> {
         debug!("readlink: inode={}", inode);
 
-        let target = self
-            .cache
-            .get_symlink_target(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        // First try to get from cache
+        if let Some(target) = self.cache.get_symlink_target(inode) {
+            return Ok(target.into_bytes());
+        }
 
-        Ok(target.into_bytes())
+        // If not in cache, fetch from server via powerfs-net protocol
+        match self.client.readlink(inode) {
+            Ok(target) => {
+                // Update cache with the symlink target
+                self.cache.set_symlink_target(inode, target.clone());
+                Ok(target.into_bytes())
+            }
+            Err(e) => {
+                warn!("readlink failed for inode {}: {}", inode, e);
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+        }
     }
 
     fn link(
@@ -1582,36 +1558,44 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EPERM));
         }
 
-        self.cache.inc_nlink(inode);
+        // Use powerfs-net protocol to create hard link on server
+        match self.client.link(inode, newparent, name_str) {
+            Ok(_) => {
+                self.cache.inc_nlink(inode);
 
-        let new_entry = CachedEntry {
-            inode,
-            parent: newparent,
-            name: name_str.to_string(),
-            is_dir: false,
-            is_symlink: entry.is_symlink,
-            symlink_target: entry.symlink_target.clone(),
-            nlink: self.cache.get_nlink(inode),
-            fid: entry.fid.clone(),
-            size: entry.size,
-            mode: entry.mode,
-            uid: entry.uid,
-            gid: entry.gid,
-            atime: entry.atime,
-            mtime: entry.mtime,
-            ctime: chrono::Utc::now().timestamp(),
-            xattrs: entry.xattrs.clone(),
-            chunks: entry.chunks.clone(),
-            hard_link_id: entry.hard_link_id.clone(),
-            hard_link_counter: entry.hard_link_counter,
-            content_size: entry.content_size,
-            disk_size: entry.disk_size,
-            generation: 0,
-        };
+                let new_entry = CachedEntry {
+                    inode,
+                    parent: newparent,
+                    name: name_str.to_string(),
+                    is_dir: false,
+                    is_symlink: entry.is_symlink,
+                    symlink_target: entry.symlink_target.clone(),
+                    nlink: self.cache.get_nlink(inode),
+                    fid: entry.fid.clone(),
+                    size: entry.size,
+                    mode: entry.mode,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    atime: entry.atime,
+                    mtime: entry.mtime,
+                    ctime: chrono::Utc::now().timestamp(),
+                    xattrs: entry.xattrs.clone(),
+                    chunks: entry.chunks.clone(),
+                    hard_link_id: entry.hard_link_id.clone(),
+                    hard_link_counter: entry.hard_link_counter,
+                    content_size: entry.content_size,
+                    disk_size: entry.disk_size,
+                    generation: 0,
+                };
 
-        self.cache.insert(new_entry.clone());
-
-        Ok(self.create_fuse_entry(&new_entry))
+                self.cache.insert(new_entry.clone());
+                Ok(self.create_fuse_entry(&new_entry))
+            }
+            Err(e) => {
+                warn!("link failed on server: {}", e);
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
     }
 
     fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> std::io::Result<libc::statvfs64> {
