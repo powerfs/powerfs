@@ -27,5 +27,5 @@ pub use client::{ClientConfig, PowerFsNetClient};
 pub use connection::ConnectionManager;
 pub use errors::{NetError, NetResult};
 pub use protocol::*;
-pub use serialize::EntryInfo;
+pub use serialize::{DirEntry, EntryInfo, TlvDecoder, TlvEncoder};
 pub use server::{PowerFsNetHandler, PowerFsNetServer};

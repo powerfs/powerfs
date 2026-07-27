@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::*;
-use crate::serialize::EntryInfo;
+use crate::serialize::{DirEntry, EntryInfo};
 
 /// Configuration for the net client
 #[derive(Debug, Clone)]
@@ -431,6 +431,108 @@ impl PowerFsNetClient {
         }
 
         Ok(())
+    }
+
+    /// Create a symbolic link
+    pub async fn create_symlink(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: &str,
+    ) -> NetResult<EntryInfo> {
+        let body = crate::serialize::encode_symlink_req(parent_ino, name, target)?;
+        let resp = self.send_request(MsgType::Symlink, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "symlink failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        crate::serialize::decode_entry_resp(&resp.body)
+    }
+
+    /// Read a symbolic link target
+    pub async fn readlink(&self, ino: u64) -> NetResult<String> {
+        let body = crate::serialize::encode_readlink_req(ino)?;
+        let resp = self.send_request(MsgType::Readlink, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "readlink failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        crate::serialize::decode_readlink_resp(&resp.body)
+    }
+
+    /// Create a hard link
+    pub async fn create_hard_link(&self, ino: u64, parent_ino: u64, name: &str) -> NetResult<()> {
+        let body = crate::serialize::encode_link_req(ino, parent_ino, name)?;
+        let resp = self.send_request(MsgType::Link, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "link failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get file attributes
+    pub async fn getattr(&self, ino: u64) -> NetResult<EntryInfo> {
+        let body = crate::serialize::encode_getattr_req(ino)?;
+        let resp = self.send_request(MsgType::GetAttr, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "getattr failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        crate::serialize::decode_entry_resp(&resp.body)
+    }
+
+    /// Set file attributes
+    pub async fn setattr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+    ) -> NetResult<EntryInfo> {
+        let body = crate::serialize::encode_setattr_req(ino, mode, uid, gid, size)?;
+        let resp = self.send_request(MsgType::SetAttr, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "setattr failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        crate::serialize::decode_entry_resp(&resp.body)
+    }
+
+    /// Read directory entries
+    pub async fn readdir(&self, ino: u64, offset: u64, count: u32) -> NetResult<Vec<DirEntry>> {
+        let body = crate::serialize::encode_readdir_req(ino, offset, count)?;
+        let resp = self.send_request(MsgType::ReadDir, &body, &[]).await?;
+
+        if !resp.is_ok() {
+            return Err(NetError::ServerError(format!(
+                "readdir failed: status={}",
+                resp.header.status
+            )));
+        }
+
+        crate::serialize::decode_readdir_resp(&resp.body)
     }
 }
 

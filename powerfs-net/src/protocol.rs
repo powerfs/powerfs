@@ -263,7 +263,7 @@ impl FrameHeader {
     }
 
     fn calc_header_crc(&self) -> u32 {
-        let mut crc = 0u32;
+        let mut crc: u32 = 0xFFFFFFFF;
         crc = crc32c::crc32c_append(crc, &self.magic);
         crc = crc32c::crc32c_append(crc, &[self.version]);
         crc = crc32c::crc32c_append(crc, &[self.flags]);
@@ -271,7 +271,8 @@ impl FrameHeader {
         crc = crc32c::crc32c_append(crc, &self.msg_type.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.status.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.data_len.to_le_bytes());
-        crc32c::crc32c_append(crc, &self.reserved)
+        crc = crc32c::crc32c_append(crc, &self.reserved);
+        crc ^ 0xFFFFFFFF
     }
 
     pub fn verify_crc(&self) -> bool {
@@ -488,6 +489,8 @@ pub enum FieldId {
     LastName = 0x21,
     HasMore = 0x22,
     Entries = 0x23,
+    Count = 0x24,
+    Entry = 0x25,
 
     // Delta sync fields
     ClientId = 0x30,
@@ -536,6 +539,8 @@ impl FieldId {
             0x21 => Some(Self::LastName),
             0x22 => Some(Self::HasMore),
             0x23 => Some(Self::Entries),
+            0x24 => Some(Self::Count),
+            0x25 => Some(Self::Entry),
             0x30 => Some(Self::ClientId),
             0x31 => Some(Self::Seq),
             0x32 => Some(Self::VclockEntries),

@@ -12,6 +12,9 @@
 use crate::errors::NetError;
 use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
 
+/// Result of decode_setattr_req: (ino, mode, uid, gid, size)
+pub type SetattrResult = (u64, Option<u32>, Option<u32>, Option<u32>, Option<u64>);
+
 /// TLV encoder for building request/response bodies
 pub struct TlvEncoder {
     buf: Vec<u8>,
@@ -641,37 +644,31 @@ pub fn decode_delete_req(body: &[u8]) -> Result<(u64, bool), NetError> {
 }
 
 /// Encode a readdir request
-pub fn encode_readdir_req(
-    parent_ino: u64,
-    limit: u32,
-    last_name: Option<&str>,
-) -> Result<Vec<u8>, NetError> {
+pub fn encode_readdir_req(ino: u64, offset: u64, count: u32) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::ParentIno, parent_ino);
-    enc.add_u32(FieldId::Limit, limit);
-    if let Some(name) = last_name {
-        enc.add_string(FieldId::LastName, name)?;
-    }
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::Offset, offset);
+    enc.add_u32(FieldId::Count, count);
     Ok(enc.into_bytes())
 }
 
 /// Decode a readdir request
-pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u32, Option<String>), NetError> {
+pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u64, u32), NetError> {
     let mut dec = TlvDecoder::new(body);
-    let mut parent_ino = 0u64;
-    let mut limit = 0u32;
-    let mut last_name: Option<String> = None;
+    let mut ino = 0u64;
+    let mut offset = 0u64;
+    let mut count = 0u32;
 
     while let Some((field, length)) = dec.next_field() {
         match field {
-            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
-            FieldId::Limit => limit = dec.read_u32(length)?,
-            FieldId::LastName => last_name = Some(dec.read_string(length)?.to_string()),
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            FieldId::Offset => offset = dec.read_u64(length)?,
+            FieldId::Count => count = dec.read_u32(length)?,
             _ => dec.skip(length)?,
         }
     }
 
-    Ok((parent_ino, limit, last_name))
+    Ok((ino, offset, count))
 }
 
 /// Encode a data request (read/write)
@@ -700,6 +697,250 @@ pub fn decode_data_req(body: &[u8]) -> Result<(u64, u64, u32), NetError> {
     }
 
     Ok((ino, offset, data_len))
+}
+
+// ============================================================================
+// Symlink / Readlink / Link operations
+// ============================================================================
+
+/// Encode a symlink request
+pub fn encode_symlink_req(parent_ino: u64, name: &str, target: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_string(FieldId::SymlinkTarget, target)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode a symlink request
+pub fn decode_symlink_req(body: &[u8]) -> Result<(u64, String, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut parent_ino = 0u64;
+    let mut name = String::new();
+    let mut target = String::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Name => name = dec.read_string(length)?.to_string(),
+            FieldId::SymlinkTarget => target = dec.read_string(length)?.to_string(),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((parent_ino, name, target))
+}
+
+/// Encode a readlink request
+pub fn encode_readlink_req(ino: u64) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a readlink request
+pub fn decode_readlink_req(body: &[u8]) -> Result<u64, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok(ino)
+}
+
+/// Decode a readlink response (returns the symlink target string)
+pub fn decode_readlink_resp(body: &[u8]) -> Result<String, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut target = String::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::SymlinkTarget => target = dec.read_string(length)?.to_string(),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok(target)
+}
+
+/// Encode a hard link request
+pub fn encode_link_req(ino: u64, parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode a hard link request
+pub fn decode_link_req(body: &[u8]) -> Result<(u64, u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+    let mut parent_ino = 0u64;
+    let mut name = String::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Name => name = dec.read_string(length)?.to_string(),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((ino, parent_ino, name))
+}
+
+// ============================================================================
+// Getattr / Setattr operations
+// ============================================================================
+
+/// Encode a getattr request
+pub fn encode_getattr_req(ino: u64) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a getattr request
+pub fn decode_getattr_req(body: &[u8]) -> Result<u64, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok(ino)
+}
+
+/// Encode a setattr request
+pub fn encode_setattr_req(
+    ino: u64,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    if let Some(m) = mode {
+        enc.add_u32(FieldId::Mode, m);
+    }
+    if let Some(u) = uid {
+        enc.add_u32(FieldId::Uid, u);
+    }
+    if let Some(g) = gid {
+        enc.add_u32(FieldId::Gid, g);
+    }
+    if let Some(s) = size {
+        enc.add_u64(FieldId::Size, s);
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a setattr request
+pub fn decode_setattr_req(body: &[u8]) -> Result<SetattrResult, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut ino = 0u64;
+    let mut mode: Option<u32> = None;
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut size: Option<u64> = None;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => ino = dec.read_u64(length)?,
+            FieldId::Mode => mode = Some(dec.read_u32(length)?),
+            FieldId::Uid => uid = Some(dec.read_u32(length)?),
+            FieldId::Gid => gid = Some(dec.read_u32(length)?),
+            FieldId::Size => size = Some(dec.read_u64(length)?),
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((ino, mode, uid, gid, size))
+}
+
+// ============================================================================
+// Readdir response
+// ============================================================================
+
+/// A directory entry returned by readdir
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub ino: u64,
+    pub name: String,
+    pub mode: u32,
+    pub offset: u64,
+}
+
+/// Encode a readdir response
+pub fn encode_readdir_resp(entries: &[DirEntry]) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u32(FieldId::Count, entries.len() as u32);
+
+    for entry in entries {
+        let mut entry_enc = TlvEncoder::new();
+        entry_enc.add_u64(FieldId::Ino, entry.ino);
+        entry_enc.add_string(FieldId::Name, &entry.name)?;
+        entry_enc.add_u32(FieldId::Mode, entry.mode);
+        entry_enc.add_u64(FieldId::Offset, entry.offset);
+        enc.add_nested(FieldId::Entry, &entry_enc.into_bytes())?;
+    }
+
+    Ok(enc.into_bytes())
+}
+
+/// Decode a readdir response
+pub fn decode_readdir_resp(body: &[u8]) -> Result<Vec<DirEntry>, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut count = 0u32;
+    let mut entries = Vec::new();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Count => count = dec.read_u32(length)?,
+            FieldId::Entry => {
+                let entry_data = dec.read_bytes(length)?;
+                let mut entry_dec = TlvDecoder::new(entry_data);
+                let mut entry = DirEntry {
+                    ino: 0,
+                    name: String::new(),
+                    mode: 0,
+                    offset: 0,
+                };
+
+                while let Some((ef, el)) = entry_dec.next_field() {
+                    match ef {
+                        FieldId::Ino => entry.ino = entry_dec.read_u64(el)?,
+                        FieldId::Name => entry.name = entry_dec.read_string(el)?.to_string(),
+                        FieldId::Mode => entry.mode = entry_dec.read_u32(el)?,
+                        FieldId::Offset => entry.offset = entry_dec.read_u64(el)?,
+                        _ => entry_dec.skip(el)?,
+                    }
+                }
+
+                entries.push(entry);
+            }
+            _ => dec.skip(length)?,
+        }
+    }
+
+    // If no count field was present, just return what we decoded
+    if count > 0 && entries.len() != count as usize {
+        // Not an error, just a hint
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
