@@ -23,8 +23,7 @@ pub const MAX_TLV_VALUE_LEN: u16 = 65535; // 64KB - 1
 // ============================================================================
 
 /// Frame flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameFlags(u8);
 
 impl FrameFlags {
@@ -66,7 +65,6 @@ impl FrameFlags {
         Self(self.0 & !flag)
     }
 }
-
 
 // ============================================================================
 // Connection Types

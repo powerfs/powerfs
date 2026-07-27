@@ -195,9 +195,11 @@ services:
     ports:
       - "8888:8888"
       - "8889:8889"
+      - "8890:8890"
+      - "9344:9334"
     volumes:
       - filer-1-data:/data/filer
-    command: /app/powerfs-filer --node-id 1 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.35:8890 --data-dir /data/filer --shard-count 2 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --peers 172.20.0.35:8889 --peers 172.20.0.36:8889
+    command: /app/powerfs-filer --node-id 1 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.35:8890 --data-dir /data/filer --shard-count 2 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --peers 172.20.0.35:8889 --peers 172.20.0.36:8889 --net-address 0.0.0.0:9334
     healthcheck:
       test: ["CMD-SHELL", "nc -z filer-1 8888 && nc -z filer-1 8889 || exit 1"]
       interval: 10s
@@ -219,9 +221,11 @@ services:
     ports:
       - "8898:8888"
       - "8899:8889"
+      - "8891:8890"
+      - "9345:9334"
     volumes:
       - filer-2-data:/data/filer
-    command: /app/powerfs-filer --node-id 2 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.36:8890 --data-dir /data/filer --shard-count 2 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --peers 172.20.0.35:8889 --peers 172.20.0.36:8889
+    command: /app/powerfs-filer --node-id 2 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.36:8890 --data-dir /data/filer --shard-count 2 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --peers 172.20.0.35:8889 --peers 172.20.0.36:8889 --net-address 0.0.0.0:9334
     healthcheck:
       test: ["CMD-SHELL", "nc -z filer-2 8888 && nc -z filer-2 8889 || exit 1"]
       interval: 10s

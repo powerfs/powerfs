@@ -85,6 +85,7 @@ pub struct FilerNodeInfo {
     pub address: String,
     pub grpc_port: u32,
     pub http_port: u32,
+    pub net_port: u32,
     pub is_healthy: bool,
     pub leader_count: u64,
     pub total_shards: u64,

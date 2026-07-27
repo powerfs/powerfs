@@ -90,6 +90,14 @@ pub enum ShardCommand {
         volume_id: u32,
         etag: String,
     },
+    /// Set inode attributes (size, mode, uid, gid)
+    SetAttr {
+        inode: u64,
+        size: Option<u64>,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+    },
 }
 
 impl ShardCommand {
@@ -132,6 +140,7 @@ impl RaftGroup {
         leader_state: Arc<AtomicBool>,
         leader_address: Arc<StdRwLock<String>>,
         message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
+        apply_tx: mpsc::Sender<ApplyEntry>,
     ) -> Result<Self, String> {
         let storage_path = format!("{}/shard_{}", storage_path, shard_id.0);
 
@@ -183,15 +192,14 @@ impl RaftGroup {
 
         let (propose_tx, propose_rx) = mpsc::channel(1000);
         let (step_tx, step_rx) = mpsc::channel(1000);
-        let (apply_tx, apply_rx) = mpsc::channel(1000);
 
         let mut peer_map = HashMap::new();
         for peer in &peers {
             peer_map.insert(peer.id, peer.clone());
         }
 
-        let is_single_node = peers.is_empty();
-        leader_state.store(is_single_node, Ordering::Relaxed);
+        // Don't pre-set leader_state - let Raft election happen naturally
+        // This ensures that the actual Raft state is consistent with leader_state
 
         info!(
             "Created RaftGroup: shard_id={}, id={}, address={}, peers={:?}",
@@ -213,7 +221,7 @@ impl RaftGroup {
             step_tx,
             step_rx,
             apply_tx,
-            _apply_rx: apply_rx,
+            _apply_rx: mpsc::channel(1).1, // Dummy, not used
             running: Arc::new(RwLock::new(true)),
             applied_index: Arc::new(StdRwLock::new(0)),
             leader_state,
@@ -619,17 +627,6 @@ impl RaftGroup {
         self.message_tx.clone()
     }
 
-    pub fn take_apply_rx(&mut self) -> mpsc::Receiver<ApplyEntry> {
-        let (tx, rx) = mpsc::channel(1000);
-        let old_rx = std::mem::replace(&mut self._apply_rx, rx);
-        self.apply_tx = tx;
-        old_rx
-    }
-
-    pub fn get_apply_tx(&self) -> mpsc::Sender<ApplyEntry> {
-        self.apply_tx.clone()
-    }
-
     pub async fn stop(&mut self) {
         *self.running.write().await = false;
         info!("RaftGroup {} stopped", self.shard_id.0);
@@ -709,6 +706,9 @@ pub struct RaftGroupManager {
     shard_propose_txs: RwLock<HashMap<ShardId, mpsc::Sender<ProposeRequest>>>,
     // Per-shard step senders, cached at group creation for the same reason.
     shard_step_txs: RwLock<HashMap<ShardId, mpsc::Sender<RaftMessage>>>,
+    // Per-shard apply receivers, stored before event loop starts to avoid
+    // needing the group RwLock (which is permanently held by run()).
+    shard_apply_rxs: RwLock<HashMap<ShardId, mpsc::Receiver<ApplyEntry>>>,
     node_id: u64,
     node_address: String,
     storage_path: String,
@@ -728,6 +728,7 @@ impl RaftGroupManager {
             shard_status_arcs: RwLock::new(HashMap::new()),
             shard_propose_txs: RwLock::new(HashMap::new()),
             shard_step_txs: RwLock::new(HashMap::new()),
+            shard_apply_rxs: RwLock::new(HashMap::new()),
             node_id,
             node_address,
             storage_path,
@@ -873,6 +874,9 @@ impl RaftGroupManager {
         let leader_state = Arc::new(AtomicBool::new(false));
         let leader_address = Arc::new(StdRwLock::new(String::new()));
 
+        // Create apply channel pair before creating the group
+        let (apply_tx, apply_rx) = mpsc::channel(1000);
+
         let group = RaftGroup::new(
             shard_id,
             self.node_id,
@@ -882,6 +886,7 @@ impl RaftGroupManager {
             leader_state.clone(),
             leader_address.clone(),
             self.message_tx.clone(),
+            apply_tx,
         )?;
 
         // Save Arc clones of the status handles so get_shard_status can read
@@ -915,18 +920,27 @@ impl RaftGroupManager {
             .await
             .insert(shard_id, status_arcs);
 
-        // Cache the senders
+        // Cache the senders and apply receiver
         self.shard_propose_txs
             .write()
             .await
             .insert(shard_id, propose_tx);
         self.shard_step_txs.write().await.insert(shard_id, step_tx);
+        self.shard_apply_rxs
+            .write()
+            .await
+            .insert(shard_id, apply_rx);
 
         Ok(group_ref)
     }
 
     pub async fn get_group(&self, shard_id: ShardId) -> Option<Arc<RwLock<RaftGroup>>> {
         self.groups.read().await.get(&shard_id).cloned()
+    }
+
+    pub async fn get_apply_rx(&self, shard_id: ShardId) -> Option<mpsc::Receiver<ApplyEntry>> {
+        let mut rxs = self.shard_apply_rxs.write().await;
+        rxs.remove(&shard_id)
     }
 
     pub async fn remove_group(&self, shard_id: ShardId) -> Result<(), String> {
@@ -937,6 +951,9 @@ impl RaftGroupManager {
 
         // Drop the parallel status Arcs as well.
         self.shard_status_arcs.write().await.remove(&shard_id);
+        self.shard_propose_txs.write().await.remove(&shard_id);
+        self.shard_step_txs.write().await.remove(&shard_id);
+        self.shard_apply_rxs.write().await.remove(&shard_id);
 
         let mut group = group.write().await;
         group.stop().await;

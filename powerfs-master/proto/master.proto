@@ -603,6 +603,7 @@ message RegisterFilerRequest {
     uint32 http_port = 4;
     uint64 shard_count = 5;
     repeated uint64 shard_ids = 6;
+    uint32 net_port = 7;
 }
 
 message RegisterFilerResponse {

@@ -1,0 +1,150 @@
+networks:
+  powerfs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+volumes:
+  master-1-data:
+  volume-1-data:
+  filer-1-data:
+  redis-data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.50
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ===== Master (单节点模式) =====
+  master-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: master-1
+    hostname: master-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.11
+    command: /app/powerfs master --config /etc/powerfs/master.toml
+    volumes:
+      - master-1-data:/data
+      - ../config/master-single.toml:/etc/powerfs/master.toml:ro
+      - ../logs:/logs
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RUST_LOG: ${RUST_LOG:-info,powerfs_master=info}
+    ports:
+      - "9333:9333"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ===== Volume Server =====
+  volume-server-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: volume-server-1
+    hostname: volume-server-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.21
+    command: ["/app/powerfs-volume", "--config", "/etc/powerfs/volume.toml", "--grpc-address", "172.20.0.21:8080"]
+    volumes:
+      - volume-1-data:/data
+      - ../config/volume-1.toml:/etc/powerfs/volume.toml:ro
+      - ../logs:/logs
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RUST_LOG: ${RUST_LOG:-info,powerfs_volume=info}
+    depends_on:
+      master-1:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "8091:8091"
+    restart: unless-stopped
+
+  # ===== Filer (单节点模式) =====
+  filer-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: filer-1
+    hostname: filer-1
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.35
+    command: /app/powerfs-filer --node-id 1 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.35:8890 --data-dir /data/filer --shard-count 1 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --net-address 0.0.0.0:9334
+    volumes:
+      - filer-1-data:/data/filer
+      - ../logs:/logs
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RUST_LOG: ${RUST_LOG:-info,powerfs_filer=info,powerfs_net=debug}
+    depends_on:
+      master-1:
+        condition: service_healthy
+      volume-server-1:
+        condition: service_started
+    ports:
+      - "8888:8888"
+      - "8889:8889"
+      - "9334:9334"
+    restart: unless-stopped
+
+  # ===== FUSE Client =====
+  fuse-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: fuse-1
+    hostname: fuse-1
+    privileged: true
+    init: true
+    networks:
+      powerfs-network:
+        ipv4_address: 172.20.0.60
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    command: /app/powerfs-fuse --mount-point /mnt/powerfs --config /etc/powerfs/fuse.toml
+    volumes:
+      - /mnt/powerfs:/mnt/powerfs
+      - ../config/fuse-single.toml:/etc/powerfs/fuse.toml:ro
+      - ../logs:/logs
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RUST_LOG: ${RUST_LOG:-info,powerfs_fuse=debug,powerfs_net=debug}
+    depends_on:
+      filer-1:
+        condition: service_started
+    restart: unless-stopped

@@ -205,15 +205,10 @@ impl PowerFsNetServer {
                 .with_status(STATUS_OK);
 
                 let mut s = stream.lock().await;
-                let frame = build_frame(
-                    MsgType::Ping.as_u16(),
-                    FrameFlags::new(FrameFlags::RESPONSE),
-                    message.header.seq,
-                    &[],
-                    &[],
-                );
+                let mut frame = Vec::with_capacity(FrameHeader::SIZE);
                 let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
                 resp_header.encode(&mut hdr_buf);
+                frame.extend_from_slice(&hdr_buf);
                 s.write_all(&frame).await?;
                 continue;
             }
@@ -222,16 +217,17 @@ impl PowerFsNetServer {
             if message.is_request() {
                 let response = handler.handle_request(&message).await?;
 
-                // Send response
+                // Send response - use the response header directly to preserve status
                 {
                     let mut s = stream.lock().await;
-                    let frame = build_frame(
-                        response.header.msg_type,
-                        FrameFlags::new(FrameFlags::RESPONSE),
-                        response.header.seq,
-                        &response.body,
-                        &response.data,
+                    let mut frame = Vec::with_capacity(
+                        FrameHeader::SIZE + response.body.len() + response.data.len(),
                     );
+                    let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+                    response.header.encode(&mut hdr_buf);
+                    frame.extend_from_slice(&hdr_buf);
+                    frame.extend_from_slice(&response.body);
+                    frame.extend_from_slice(&response.data);
                     s.write_all(&frame).await?;
                 }
             }

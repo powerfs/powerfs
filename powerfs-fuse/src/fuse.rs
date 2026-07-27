@@ -32,10 +32,13 @@ pub struct FuseApp {
     replication: String,
     master_net_port: u16,
     volume_net_port: u16,
+    filer_addr: String,
+    filer_net_port: u16,
     runtime_handle: Handle,
 }
 
 impl FuseApp {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         master_addrs: &[String],
         mount_point: &str,
@@ -43,6 +46,8 @@ impl FuseApp {
         replication: &str,
         master_net_port: u16,
         volume_net_port: u16,
+        filer_addr: String,
+        filer_net_port: u16,
     ) -> Result<Self> {
         let runtime_handle = Handle::try_current()
             .map_err(|e| PowerFsError::Internal(format!("no tokio runtime: {}", e)))?;
@@ -54,6 +59,8 @@ impl FuseApp {
             replication: replication.to_string(),
             master_net_port,
             volume_net_port,
+            filer_addr,
+            filer_net_port,
             runtime_handle,
         })
     }
@@ -81,6 +88,8 @@ impl FuseApp {
             master_addr: master_addr.clone(),
             master_net_port: self.master_net_port,
             volume_net_port: self.volume_net_port,
+            filer_addr: self.filer_addr.clone(),
+            filer_net_port: self.filer_net_port,
             client_id: 0,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
@@ -91,8 +100,8 @@ impl FuseApp {
         })?);
 
         info!(
-            "Connected to powerfs-net at {}:{}",
-            master_addr, self.master_net_port
+            "Connected to powerfs-net: Master={}:{}, Filer={}:{}",
+            master_addr, self.master_net_port, self.filer_addr, self.filer_net_port
         );
 
         let cache = Arc::new(MetadataCache::new());
@@ -706,7 +715,7 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
-        match self.client.delete_entry(entry.inode, true, "") {
+        match self.client.delete_entry(parent, name_str, true, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete directory entry on master: {}", e);
@@ -746,7 +755,7 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            match self.client.delete_entry(entry.inode, false, "") {
+            match self.client.delete_entry(parent, name_str, false, "") {
                 Ok(_) => {}
                 Err(e) => {
                     warn!("Failed to delete file entry on master: {}", e);
@@ -1428,7 +1437,7 @@ impl FileSystem for PowerFsFs {
             generation: entry.generation,
         };
 
-        match self.client.delete_entry(entry.inode, entry.is_dir, "") {
+        match self.client.delete_entry(olddir, old_str, entry.is_dir, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to delete old entry on master during rename: {}", e);

@@ -435,6 +435,15 @@ impl ShardStore {
             } => {
                 self.put_object(parent_inode, name, inode, size, fid, volume_id, etag);
             }
+            ShardCommand::SetAttr {
+                inode,
+                size,
+                mode,
+                uid,
+                gid,
+            } => {
+                self.setattr(inode, size, mode, uid, gid);
+            }
         }
     }
 
@@ -1026,5 +1035,39 @@ impl ShardStore {
         }
 
         Ok(())
+    }
+
+    /// Set inode attributes
+    fn setattr(
+        &self,
+        inode: u64,
+        size: Option<u64>,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+    ) {
+        let info = match self.get_inode(inode) {
+            Some(mut info) => {
+                if let Some(s) = size {
+                    info.size = s;
+                }
+                if let Some(m) = mode {
+                    info.mode = m as u32;
+                }
+                if let Some(u) = uid {
+                    info.uid = u as u32;
+                }
+                if let Some(g) = gid {
+                    info.gid = g as u32;
+                }
+                let now = chrono::Utc::now().timestamp() as u64;
+                info.ctime = now;
+                info.mtime = now;
+                info
+            }
+            None => return,
+        };
+
+        let _ = self.update_inode(info);
     }
 }

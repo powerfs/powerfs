@@ -139,10 +139,16 @@ impl MasterNetHandler {
 
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
-            return Err(powerfs_net::NetError::ServerError(format!(
-                "not leader; current leader is {}",
+            error!(
+                "NET_ASSIGN: not leader; current leader is {}, returning error response",
                 leader
-            )));
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+                Vec::new(),
+            ));
         }
 
         let result = self.master.assign_volume(&replication, &collection).await;

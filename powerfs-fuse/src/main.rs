@@ -28,6 +28,14 @@ struct Args {
     #[arg(long, default_value = "8081")]
     volume_net_port: u16,
 
+    /// Filer powerfs-net port
+    #[arg(long, default_value = "9334")]
+    filer_net_port: u16,
+
+    /// Filer address (host:port or just host)
+    #[arg(long, default_value = "")]
+    filer_addr: String,
+
     /// Mount point path
     #[arg(long)]
     mount_point: String,
@@ -137,6 +145,35 @@ fn main() {
     let master_net_port = args.master_net_port;
     let volume_net_port = args.volume_net_port;
 
+    // Determine filer address: CLI arg > config > default to master address
+    let (filer_addr, filer_net_port) = if !args.filer_addr.is_empty() {
+        // Parse "host:port" or just "host" from CLI
+        let parts: Vec<&str> = args.filer_addr.split(':').collect();
+        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+        let port = parts
+            .get(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(args.filer_net_port);
+        (host, port)
+    } else if !fuse_cfg.filer_addresses.is_empty() {
+        // Use first filer from config
+        let filer_full = &fuse_cfg.filer_addresses[0];
+        let parts: Vec<&str> = filer_full.split(':').collect();
+        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+        let port = parts
+            .get(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(args.filer_net_port);
+        (host, port)
+    } else {
+        // Default to master address
+        let default_master = "127.0.0.1".to_string();
+        let master_full = master_addrs.first().unwrap_or(&default_master);
+        let parts: Vec<&str> = master_full.split(':').collect();
+        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+        (host, args.filer_net_port)
+    };
+
     let verbose = if args.verbose { true } else { fuse_cfg.verbose };
     let container = if args.container {
         true
@@ -194,6 +231,7 @@ fn main() {
     info!("PowerFS FUSE Client starting (powerfs-net)...");
     info!("  Masters: {}", master_addrs.join(", "));
     info!("  Master net port: {}", master_net_port);
+    info!("  Filer: {}:{}", filer_addr, filer_net_port);
     info!("  Volume net port: {}", volume_net_port);
     info!("  Mount point: {}", mount_point);
     info!("  Collection: {}", collection);
@@ -250,6 +288,8 @@ fn main() {
             &replication,
             master_net_port,
             volume_net_port,
+            filer_addr,
+            filer_net_port,
         )
         .await
         .expect("Failed to create FUSE client");

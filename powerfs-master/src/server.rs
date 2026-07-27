@@ -1479,6 +1479,7 @@ impl MasterService for MasterGrpcServer {
             address: req.address,
             grpc_port: req.grpc_port,
             http_port: req.http_port,
+            net_port: req.net_port,
             is_healthy: true,
             leader_count: 0,
             total_shards: req.shard_count,

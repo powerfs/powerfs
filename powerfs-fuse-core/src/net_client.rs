@@ -24,6 +24,8 @@ pub struct NetClientConfig {
     pub master_addr: String,
     pub master_net_port: u16,
     pub volume_net_port: u16,
+    pub filer_addr: String,
+    pub filer_net_port: u16,
     pub client_id: u64,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -35,6 +37,8 @@ impl Default for NetClientConfig {
             master_addr: "127.0.0.1".into(),
             master_net_port: 9334,
             volume_net_port: 8081,
+            filer_addr: "127.0.0.1".into(),
+            filer_net_port: 9334,
             client_id: 0,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
@@ -61,6 +65,7 @@ pub struct VolumeLocation {
 #[derive(Clone)]
 pub struct PowerFuseNetClient {
     master_client: Arc<PowerFsNetClient>,
+    filer_client: Arc<PowerFsNetClient>,
     volume_clients: Arc<RwLock<Vec<Arc<PowerFsNetClient>>>>,
     config: NetClientConfig,
 }
@@ -86,8 +91,28 @@ impl PowerFuseNetClient {
             config.master_addr, config.master_net_port
         );
 
+        let filer_client = Arc::new(PowerFsNetClient::new(ClientConfig {
+            addr: config.filer_addr.clone(),
+            port: config.filer_net_port,
+            client_id: config.client_id,
+            client_type: ClientType::Fuse,
+            connect_timeout: config.connect_timeout,
+            request_timeout: config.request_timeout,
+            max_retries: 3,
+            retry_delay: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(30),
+            max_inflight_requests: 256,
+        }));
+
+        filer_client.connect().await?;
+        info!(
+            "PowerFuseNetClient connected to Filer at {}:{}",
+            config.filer_addr, config.filer_net_port
+        );
+
         Ok(Self {
             master_client,
+            filer_client,
             volume_clients: Arc::new(RwLock::new(Vec::new())),
             config,
         })
@@ -180,7 +205,7 @@ impl PowerFuseNetClient {
         let body = powerfs_net::serialize::encode_lookup_req(parent_ino, name)?;
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::Lookup, &body, &[])
             .await?;
 
@@ -192,8 +217,36 @@ impl PowerFuseNetClient {
             return Err(powerfs_net::NetError::ServerError("lookup failed".into()));
         }
 
-        let info = powerfs_net::serialize::decode_entry_resp(&resp.body)?;
+        let mut info = powerfs_net::serialize::decode_entry_resp(&resp.body)?;
+        info.name = name.to_string();
         Ok(info)
+    }
+
+    /// Walk a full path from root, returning the EntryInfo of the final component.
+    /// Path format: "/a/b/c" or "a/b/c". Empty path returns root (ino=1).
+    pub async fn lookup_path(&self, path: &str) -> NetResult<EntryInfo> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed.is_empty() {
+            // Root directory
+            let mut info = EntryInfo::default_entry();
+            info.ino = 1;
+            info.is_dir = true;
+            info.mode = 0o40755;
+            info.nlink = 2;
+            return Ok(info);
+        }
+
+        let mut current_ino: u64 = 1;
+        let mut last_info: Option<EntryInfo> = None;
+        for component in trimmed.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            let info = self.lookup(current_ino, component).await?;
+            current_ino = info.ino;
+            last_info = Some(info);
+        }
+        last_info.ok_or_else(|| powerfs_net::NetError::ServerError("empty path".into()))
     }
 
     /// Create a file
@@ -213,7 +266,7 @@ impl PowerFuseNetClient {
         enc.add_u64(FieldId::Gid, gid);
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::Create, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -243,7 +296,7 @@ impl PowerFuseNetClient {
         enc.add_u64(FieldId::Gid, gid);
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::Mkdir, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -263,7 +316,7 @@ impl PowerFuseNetClient {
         enc.add_string(FieldId::Name, name)?;
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::Unlink, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -280,7 +333,7 @@ impl PowerFuseNetClient {
         enc.add_string(FieldId::Name, name)?;
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::Rmdir, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -303,7 +356,7 @@ impl PowerFuseNetClient {
         enc.add_string(FieldId::LastName, last_name)?;
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::ReadDir, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -312,9 +365,33 @@ impl PowerFuseNetClient {
         }
 
         let mut dec = TlvDecoder::new(&resp.body);
-        let count = dec.next_u64(FieldId::Limit).unwrap_or(0) as usize;
-        let mut entries = Vec::with_capacity(count);
+        // Master encodes: Limit, HasMore, then repeating (Name, Ino, Mode) per entry.
+        // Use next_field()+read to consume Limit and HasMore; this is robust because
+        // next_u64() on a mismatched field leaves the decoder in a broken state.
+        let mut count = 0usize;
+        let mut got_limit = false;
+        let mut got_has_more = false;
+        while let Some((field, length)) = dec.next_field() {
+            match field {
+                FieldId::Limit => {
+                    count = dec.read_u64(length).unwrap_or(0) as usize;
+                    got_limit = true;
+                }
+                FieldId::HasMore => {
+                    let _ = dec.read_u64(length);
+                    got_has_more = true;
+                }
+                _ => {
+                    // Unexpected field before entries - skip its value
+                    let _ = dec.skip(length);
+                }
+            }
+            if got_limit && got_has_more {
+                break;
+            }
+        }
 
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let name = dec.next_string(FieldId::Name).unwrap_or_default();
             let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -354,7 +431,7 @@ impl PowerFuseNetClient {
         }
 
         let resp = self
-            .master_client
+            .filer_client
             .send_request(MsgType::SetAttr, enc.into_bytes().as_slice(), &[])
             .await?;
 
@@ -777,6 +854,11 @@ impl SyncFuseNetClient {
         self.block_with_default_timeout(self.client.lookup(parent_ino, name))
     }
 
+    /// Walk a full path from root, returning EntryInfo of the final component (sync)
+    pub fn lookup_path(&self, path: &str) -> NetResult<EntryInfo> {
+        self.block_with_default_timeout(self.client.lookup_path(path))
+    }
+
     /// Create a file (sync)
     pub fn create_file(
         &self,
@@ -995,8 +1077,7 @@ impl SyncFuseNetClient {
     }
 
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, String> {
-        let (parent_ino, name) = parse_path_to_parent_name(path);
-        match self.block_with_default_timeout(self.client.lookup(parent_ino, name)) {
+        match self.block_with_default_timeout(self.client.lookup_path(path)) {
             Ok(info) => Ok(Some(entry_info_to_entry(&info, path))),
             Err(_) => Ok(None),
         }
@@ -1016,8 +1097,8 @@ impl SyncFuseNetClient {
         let parent_ino = if parent_path.is_empty() || parent_path == "/" {
             1
         } else {
-            self.block_with_default_timeout(self.client.lookup(1, &parent_path))
-                .map_err(|e| format!("net lookup parent failed: {}", e))?
+            self.block_with_default_timeout(self.client.lookup_path(&parent_path))
+                .map_err(|e| format!("net lookup parent path '{}' failed: {}", parent_path, e))?
                 .ino
         };
 
@@ -1064,24 +1145,20 @@ impl SyncFuseNetClient {
 
     pub fn delete_entry(
         &self,
-        ino: u64,
+        parent_ino: u64,
+        name: &str,
         is_directory: bool,
         _client_id: &str,
     ) -> Result<bool, String> {
-        let info = self
-            .block_with_default_timeout(self.client.lookup(ino, ""))
-            .map_err(|e| format!("net lookup for delete failed: {}", e))?;
-
-        if info.name.is_empty() {
+        if name.is_empty() {
             return Err("cannot delete: empty name".into());
         }
 
-        let parent_ino = 1; // Default to root
         if is_directory {
-            self.block_with_default_timeout(self.client.rmdir(parent_ino, &info.name))
+            self.block_with_default_timeout(self.client.rmdir(parent_ino, name))
                 .map_err(|e| format!("net rmdir failed: {}", e))?;
         } else {
-            self.block_with_default_timeout(self.client.unlink(parent_ino, &info.name))
+            self.block_with_default_timeout(self.client.unlink(parent_ino, name))
                 .map_err(|e| format!("net unlink failed: {}", e))?;
         }
 
@@ -1190,19 +1267,6 @@ fn volume_location_to_location(loc: VolumeLocation) -> Location {
     }
 }
 
-/// Parse a path into (parent_ino, name)
-/// Root inode is 1. Top-level paths like "/foo" have parent_ino=1, name="foo".
-fn parse_path_to_parent_name(path: &str) -> (u64, &str) {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return (1, "");
-    }
-    match trimmed.find('/') {
-        Some(idx) => (1, &trimmed[..idx]),
-        None => (1, trimmed),
-    }
-}
-
 /// Extract address from URL (e.g. "http://127.0.0.1:9334" -> "127.0.0.1")
 #[allow(clippy::double_ended_iterator_last)]
 fn extract_addr_from_url(url: &str) -> String {
@@ -1211,10 +1275,4 @@ fn extract_addr_from_url(url: &str) -> String {
         .and_then(|s| s.split(':').next())
         .unwrap_or(url)
         .to_string()
-}
-
-/// Extract port from URL (e.g. "http://127.0.0.1:9334" -> Some(9334))
-#[allow(clippy::double_ended_iterator_last)]
-fn extract_port_from_url(url: &str) -> Option<u16> {
-    url.split(':').last().and_then(|s| s.parse::<u16>().ok())
 }

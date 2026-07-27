@@ -1106,8 +1106,17 @@ async fn run_fuse(dir: &str, master: Option<String>, _volume_port: u16) -> Resul
 
     let master_addr = master.as_deref().unwrap_or("localhost:9333");
     let (master_host, master_net_port) = parse_master_addr(master_addr);
-    let fuse_app =
-        FuseApp::new(&[master_host], dir, "default", "000", master_net_port, 8081).await?;
+    let fuse_app = FuseApp::new(
+        std::slice::from_ref(&master_host),
+        dir,
+        "default",
+        "000",
+        master_net_port,
+        8081,
+        master_host.clone(),
+        9334,
+    )
+    .await?;
 
     info!("Mounting PowerFS at: {}", dir);
     info!("Connected to master: {}", master_addr);
@@ -1120,8 +1129,17 @@ async fn run_mount(dir: &str, master: Option<String>) -> Result<()> {
 
     let master_addr = master.as_deref().unwrap_or("localhost:9333");
     let (master_host, master_net_port) = parse_master_addr(master_addr);
-    let fuse_app =
-        FuseApp::new(&[master_host], dir, "default", "000", master_net_port, 8081).await?;
+    let fuse_app = FuseApp::new(
+        std::slice::from_ref(&master_host),
+        dir,
+        "default",
+        "000",
+        master_net_port,
+        8081,
+        master_host.clone(),
+        9334,
+    )
+    .await?;
 
     info!("Connected to master: {}", master_addr);
 

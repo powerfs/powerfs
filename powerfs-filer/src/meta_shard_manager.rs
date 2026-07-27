@@ -8,7 +8,7 @@ use crate::crdt_orset::{
     DirEntryOrset, EntryTag, MergeResult, ServerDirORSet, ServerVectorClock, Tombstone,
 };
 use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
-use crate::shard_store::{InodeInfo, ShardStats, ShardStore};
+use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore};
 use crate::shard_strategy::ShardStrategy;
 
 // POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
@@ -289,13 +289,15 @@ impl MetaShardManager {
     pub async fn create_shard(&self, shard_id: ShardId, peers: Vec<Peer>) -> Result<(), String> {
         let inode_range = self.shard_strategy.get_shard_range(shard_id);
 
-        let group = self
-            .raft_group_manager
+        self.raft_group_manager
             .create_group(shard_id, peers)
             .await?;
 
-        let mut group_lock = group.write().await;
-        let mut apply_rx = group_lock.take_apply_rx();
+        let mut apply_rx = self
+            .raft_group_manager
+            .get_apply_rx(shard_id)
+            .await
+            .ok_or_else(|| format!("shard {} apply_rx not found", shard_id.0))?;
 
         let db_path = format!("{}/shard_{}_data", self.data_path, shard_id.0);
         let shard_store = Arc::new(
@@ -598,7 +600,47 @@ impl MetaShardManager {
         self.shard_stores.read().unwrap().keys().cloned().collect()
     }
 
-    fn generate_inode(&self) -> u64 {
+    /// Resolve a full path to an inode (component by component lookup)
+    pub fn path_to_inode(&self, path: &str) -> Option<InodeInfo> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed.is_empty() {
+            return Some(InodeInfo {
+                inode: 1,
+                name: String::new(),
+                parent_inode: 0,
+                file_type: FileType::Directory,
+                size: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                blocks: 0,
+                fid: None,
+                volume_id: None,
+                etag: None,
+                chunks: Vec::new(),
+                extended: std::collections::HashMap::new(),
+            });
+        }
+
+        let mut current_ino: u64 = 1;
+        let mut last_info: Option<InodeInfo> = None;
+
+        for component in trimmed.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            let info = self.lookup(current_ino, component)?;
+            current_ino = info.inode;
+            last_info = Some(info);
+        }
+
+        last_info
+    }
+
+    pub fn generate_inode(&self) -> u64 {
         let mut gen = self.inode_generator.write().unwrap();
         let inode = *gen;
         *gen += 1;
@@ -739,6 +781,30 @@ impl MetaShardManager {
         } else {
             Err("cross-shard rename not supported yet".to_string())
         }
+    }
+
+    /// Set inode attributes via Raft consensus
+    pub async fn setattr(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        size: Option<u64>,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::SetAttr {
+            inode,
+            size,
+            mode,
+            uid,
+            gid,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+        Ok(())
     }
 
     pub async fn list_entries(

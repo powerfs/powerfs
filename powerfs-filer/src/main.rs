@@ -9,6 +9,7 @@ use serde_json::json;
 
 use powerfs_filer::grpc_service::FilerMetaServiceImpl;
 use powerfs_filer::meta_shard_manager::MetaShardManager;
+use powerfs_filer::net_handler::FilerNetHandler;
 use powerfs_filer::posix_service::PosixMetaServiceImpl;
 use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
 use powerfs_filer::powerfs::posix_meta_service_server::PosixMetaServiceServer;
@@ -18,6 +19,7 @@ use powerfs_filer::shard_strategy::ShardStrategy;
 use powerfs_master::proto::powerfs::{
     master_service_client::MasterServiceClient, RegisterFilerRequest,
 };
+use powerfs_net::server::PowerFsNetServer;
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -32,6 +34,9 @@ struct Args {
 
     #[arg(long, default_value = "0.0.0.0:8889")]
     grpc_address: String,
+
+    #[arg(long, default_value = "0.0.0.0:9334")]
+    net_address: String,
 
     #[arg(long, default_value = "1")]
     node_id: u64,
@@ -121,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             id: (i + 1) as u64,
             address: addr.clone(),
         })
+        .filter(|p| p.id != args.node_id)
         .collect();
 
     // Register peers first so Raft message transmitter can send to them
@@ -165,6 +171,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log::error!("gRPC server error: {}", e);
         }
     });
+
+    // Start powerfs-net binary protocol server for FUSE metadata operations
+    let net_handler = Arc::new(FilerNetHandler::new(
+        meta_shard_manager.clone(),
+        shard_strategy.clone(),
+    ));
+    let net_addr_parts: Vec<&str> = args.net_address.split(':').collect();
+    let net_bind_ip = net_addr_parts.first().unwrap_or(&"0.0.0.0");
+    let net_port: u16 = net_addr_parts
+        .get(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9334);
+    info!(
+        "Starting powerfs-net server on {}:{}",
+        net_bind_ip, net_port
+    );
+    if let Ok(net_server) = PowerFsNetServer::bind(net_bind_ip, net_port, net_handler).await {
+        tokio::spawn(async move {
+            if let Err(e) = net_server.serve().await {
+                error!("powerfs-net server error: {:?}", e);
+            }
+        });
+    } else {
+        warn!(
+            "Failed to start powerfs-net server on {}:{}",
+            net_bind_ip, net_port
+        );
+    }
 
     // Bind HTTP listener
     let http_listener = TcpListener::bind(&args.s3_address).await?;
@@ -457,6 +491,13 @@ async fn register_with_master(args: &Args) {
         .unwrap_or("8888")
         .parse()
         .unwrap_or(8888);
+    let net_port: u32 = args
+        .net_address
+        .split(':')
+        .next_back()
+        .unwrap_or("9334")
+        .parse()
+        .unwrap_or(9334);
 
     let shard_ids: Vec<u64> = (0..args.shard_count).map(|i| i as u64).collect();
 
@@ -467,6 +508,7 @@ async fn register_with_master(args: &Args) {
         http_port,
         shard_count: args.shard_count as u64,
         shard_ids,
+        net_port,
     };
 
     let endpoint =
