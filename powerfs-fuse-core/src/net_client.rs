@@ -941,7 +941,8 @@ impl SyncFuseNetClient {
         data: Vec<u8>,
         _cookie: u32,
     ) -> Result<(), String> {
-        let port = extract_port_from_url(volume_addr).unwrap_or(self.config.volume_net_port);
+        // Always use volume_net_port: volume URL contains gRPC port, not net port
+        let port = self.config.volume_net_port;
         let addr = extract_addr_from_url(volume_addr);
 
         self.block_with_default_timeout(self.client.write_blob(
@@ -964,7 +965,8 @@ impl SyncFuseNetClient {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>, String> {
-        let port = extract_port_from_url(volume_addr).unwrap_or(self.config.volume_net_port);
+        // Always use volume_net_port: volume URL contains gRPC port, not net port
+        let port = self.config.volume_net_port;
         let addr = extract_addr_from_url(volume_addr);
 
         self.block_with_default_timeout(self.client.read_blob(
@@ -984,7 +986,8 @@ impl SyncFuseNetClient {
         volume_id: u32,
         file_key: u64,
     ) -> Result<(), String> {
-        let port = extract_port_from_url(volume_addr).unwrap_or(self.config.volume_net_port);
+        // Always use volume_net_port: volume URL contains gRPC port, not net port
+        let port = self.config.volume_net_port;
         let addr = extract_addr_from_url(volume_addr);
 
         self.block_with_default_timeout(self.client.delete_data(&addr, port, volume_id, file_key))

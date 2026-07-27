@@ -65,11 +65,17 @@ impl FuseApp {
             self.master_addresses.join(", ")
         );
 
-        let master_addr = self
+        // Extract IP from master address (config may contain "IP:PORT" for gRPC)
+        let master_full = self
             .master_addresses
             .first()
             .unwrap_or(&"127.0.0.1".to_string())
             .clone();
+        let master_addr = master_full
+            .split(':')
+            .next()
+            .unwrap_or("127.0.0.1")
+            .to_string();
 
         let net_config = powerfs_fuse_core::net_client::NetClientConfig {
             master_addr: master_addr.clone(),
