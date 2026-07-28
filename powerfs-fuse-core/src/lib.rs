@@ -22,7 +22,8 @@ pub use meta_shard_client::{
     ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,
     RequestQueue, RequestResult, TransportChannel,
 };
-pub use net_client::{NetClientConfig, PowerFuseNetClient, SyncFuseNetClient};
+pub use net_client::{NetClientConfig, PowerFuseNetClient};
+pub use provider_adapter::{FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider};
 pub use request_id::RequestId;
 pub use request_state::{RequestContext, RequestKind, RequestState};
 pub use topology::{
@@ -31,9 +32,4 @@ pub use topology::{
 };
 pub use volume_client::{
     LeaseInfo, LeaseState, VolumeClient, VolumeClientConfig, VolumeClientState,
-};
-// Net-based providers (for FUSE path using powerfs-net binary protocol)
-pub use provider_adapter::{
-    FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider, NetFuseMetadataProvider,
-    NetFuseStorageProvider, NetFuseVolumeProvider,
 };

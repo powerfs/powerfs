@@ -826,6 +826,27 @@ impl MasterNetHandler {
         }
     }
 
+    /// Handle GetTopology request
+    async fn handle_get_topology(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        info!("NET_GET_TOPOLOGY: returning topology info");
+
+        let leader = self.master.get_leader().await;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_string(FieldId::Owner, &leader)?;
+        enc.add_u64(FieldId::Entries, 0);
+
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
+
     /// Helper: build a response message
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         let flags = FrameFlags::new(FrameFlags::RESPONSE);
@@ -867,6 +888,7 @@ impl PowerFsNetHandler for MasterNetHandler {
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::ReadDir => self.handle_readdir(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::GetTopology => self.handle_get_topology(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -923,6 +945,7 @@ impl ServerRequestHandler for MasterNetHandler {
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::ReadDir => self.handle_readdir(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::GetTopology => self.handle_get_topology(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

@@ -1073,30 +1073,37 @@ pub struct ChunkData {
     pub dirty: bool,
 }
 
+const NUM_SHARDS: usize = 16;
+type ShardMap = HashMap<(u64, u64), ChunkData>;
+
 pub struct ChunkCache {
-    cache: RwLock<HashMap<(u64, u64), ChunkData>>,
+    shards: Vec<RwLock<ShardMap>>,
     chunk_size: u64,
-    /// 最大缓存字节数（0 表示不限制）
     max_bytes: usize,
-    /// 当前缓存字节数
     current_bytes: AtomicU64,
+}
+
+fn shard_idx(key: &(u64, u64)) -> usize {
+    let hash = key.0.wrapping_add(key.1);
+    (hash as usize) % NUM_SHARDS
 }
 
 impl ChunkCache {
     pub fn new(chunk_size: u64, max_chunks: usize) -> Self {
         let max_bytes = chunk_size as usize * max_chunks;
-        ChunkCache {
-            cache: RwLock::new(HashMap::new()),
-            chunk_size,
-            max_bytes,
-            current_bytes: AtomicU64::new(0),
-        }
+        Self::with_shards(chunk_size, max_bytes)
     }
 
-    /// 创建按字节数限制的缓存
     pub fn with_max_bytes(chunk_size: u64, max_bytes: usize) -> Self {
+        Self::with_shards(chunk_size, max_bytes)
+    }
+
+    fn with_shards(chunk_size: u64, max_bytes: usize) -> Self {
+        let shards = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect();
         ChunkCache {
-            cache: RwLock::new(HashMap::new()),
+            shards,
             chunk_size,
             max_bytes,
             current_bytes: AtomicU64::new(0),
@@ -1122,8 +1129,10 @@ impl ChunkCache {
 
     pub fn get(&self, inode: u64, offset: u64) -> Option<ChunkData> {
         let chunk_index = self.get_chunk_index(offset);
-        let cache = self.cache.read().unwrap();
-        cache.get(&(inode, chunk_index)).cloned()
+        let key = (inode, chunk_index);
+        let shard = shard_idx(&key);
+        let cache = self.shards[shard].read().unwrap();
+        cache.get(&key).cloned()
     }
 
     pub fn modify<F>(&self, inode: u64, offset: u64, f: F) -> bool
@@ -1131,8 +1140,10 @@ impl ChunkCache {
         F: FnOnce(&mut ChunkData),
     {
         let chunk_index = self.get_chunk_index(offset);
-        let mut cache = self.cache.write().unwrap();
-        if let Some(chunk) = cache.get_mut(&(inode, chunk_index)) {
+        let key = (inode, chunk_index);
+        let shard = shard_idx(&key);
+        let mut cache = self.shards[shard].write().unwrap();
+        if let Some(chunk) = cache.get_mut(&key) {
             f(chunk);
             true
         } else {
@@ -1142,58 +1153,75 @@ impl ChunkCache {
 
     pub fn put(&self, inode: u64, offset: u64, data: Vec<u8>, mtime: u64, crc32: u32) {
         let chunk_index = self.get_chunk_index(offset);
+        let key = (inode, chunk_index);
+        let shard = shard_idx(&key);
         let data_len = data.len();
-        let mut cache = self.cache.write().unwrap();
+        let needs_eviction;
 
-        // 如果已有旧 chunk，先减去其字节数
-        if let Some(old) = cache.get(&(inode, chunk_index)) {
-            let old_len = old.data.len() as u64;
-            self.current_bytes.fetch_sub(old_len, Ordering::SeqCst);
+        {
+            let mut cache = self.shards[shard].write().unwrap();
+
+            if let Some(old) = cache.get(&key) {
+                let old_len = old.data.len() as u64;
+                self.current_bytes.fetch_sub(old_len, Ordering::SeqCst);
+            }
+
+            cache.insert(
+                key,
+                ChunkData {
+                    data,
+                    offset: chunk_index * self.chunk_size,
+                    size: self.chunk_size,
+                    mtime,
+                    crc32,
+                    dirty: true,
+                },
+            );
+            self.current_bytes
+                .fetch_add(data_len as u64, Ordering::SeqCst);
+
+            needs_eviction = self.max_bytes > 0
+                && self.current_bytes.load(Ordering::SeqCst) > self.max_bytes as u64;
         }
 
-        cache.insert(
-            (inode, chunk_index),
-            ChunkData {
-                data,
-                offset: chunk_index * self.chunk_size,
-                size: self.chunk_size,
-                mtime,
-                crc32,
-                dirty: true,
-            },
-        );
-        self.current_bytes
-            .fetch_add(data_len as u64, Ordering::SeqCst);
-
-        // LRU 淘汰：超过 max_bytes 时移除最旧的 chunk
-        if self.max_bytes > 0 {
-            self.evict_if_needed(&mut cache);
+        // Evict AFTER releasing the shard write lock to avoid cross-shard deadlock
+        if needs_eviction {
+            self.evict_if_needed();
         }
     }
 
-    /// 当缓存超过 max_bytes 时，按 mtime 从旧到新淘汰
-    /// 注意：跳过脏 chunk（dirty = true），避免数据丢失
-    fn evict_if_needed(&self, cache: &mut HashMap<(u64, u64), ChunkData>) {
+    fn evict_if_needed(&self) {
         if self.max_bytes == 0 {
             return;
         }
-        while self.current_bytes.load(Ordering::SeqCst) > self.max_bytes as u64 {
-            if cache.is_empty() {
+        loop {
+            if self.current_bytes.load(Ordering::SeqCst) <= self.max_bytes as u64 {
                 break;
             }
-            // 找到 mtime 最小且非脏的 chunk 移除
-            let oldest_key = cache
-                .iter()
-                .filter(|(_, v)| !v.dirty)
-                .min_by_key(|(_, v)| v.mtime)
-                .map(|(k, _)| *k);
-            if let Some(key) = oldest_key {
+
+            // Find the oldest non-dirty chunk across ALL shards.
+            // Collect under read locks, then release before acquiring write lock
+            // to avoid deadlock with concurrent shard write locks held by put/modify.
+            let mut oldest: Option<(usize, (u64, u64))> = None;
+            let mut oldest_mtime = u64::MAX;
+            for (shard_idx, shard) in self.shards.iter().enumerate() {
+                let cache = shard.read().unwrap();
+                for (key, chunk) in cache.iter() {
+                    if !chunk.dirty && chunk.mtime < oldest_mtime {
+                        oldest_mtime = chunk.mtime;
+                        oldest = Some((shard_idx, *key));
+                    }
+                }
+            }
+
+            if let Some((shard_idx, key)) = oldest {
+                let shard = &self.shards[shard_idx];
+                let mut cache = shard.write().unwrap();
                 if let Some(removed) = cache.remove(&key) {
                     self.current_bytes
                         .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
                 }
             } else {
-                // 没有可淘汰的非脏 chunk，缓存已满但不能淘汰脏数据
                 warn!(
                     "ChunkCache: cache full but all chunks are dirty, cannot evict. current_bytes={}, max_bytes={}",
                     self.current_bytes.load(Ordering::SeqCst),
@@ -1206,25 +1234,23 @@ impl ChunkCache {
 
     /// 移除指定 inode 中 chunk offset >= max_offset 的所有 chunk（用于 truncate）
     pub fn remove_after(&self, inode: u64, max_offset: u64) {
-        // 计算第一个需要移除的 chunk index
-        // chunk i 覆盖字节 [i*chunk_size, (i+1)*chunk_size)
-        // 我们要保留字节 [0, max_offset)，所以保留与 [0, max_offset) 有重叠的 chunk
-        // chunk i 有重叠当且仅当 i*chunk_size < max_offset
-        // 移除条件: i*chunk_size >= max_offset
         let first_to_remove = if max_offset == 0 {
             0
         } else {
             (max_offset - 1) / self.chunk_size + 1
         };
-        let mut cache = self.cache.write().unwrap();
-        let keys_to_remove: Vec<_> = cache
-            .iter()
-            .filter(|((ino, chunk_idx), _)| *ino == inode && *chunk_idx >= first_to_remove)
-            .map(|(k, v)| (*k, v.data.len() as u64))
-            .collect();
-        for (key, data_len) in keys_to_remove {
-            cache.remove(&key);
-            self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
+
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            let keys_to_remove: Vec<_> = cache
+                .iter()
+                .filter(|((ino, chunk_idx), _)| *ino == inode && *chunk_idx >= first_to_remove)
+                .map(|(k, v)| (*k, v.data.len() as u64))
+                .collect();
+            for (key, data_len) in keys_to_remove {
+                cache.remove(&key);
+                self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1239,22 +1265,26 @@ impl ChunkCache {
     }
 
     pub fn remove(&self, inode: u64) {
-        let mut cache = self.cache.write().unwrap();
-        let keys_to_remove: Vec<_> = cache
-            .iter()
-            .filter(|((ino, _), _)| *ino == inode)
-            .map(|(k, v)| (*k, v.data.len() as u64))
-            .collect();
-        for (key, data_len) in keys_to_remove {
-            cache.remove(&key);
-            self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            let keys_to_remove: Vec<_> = cache
+                .iter()
+                .filter(|((ino, _), _)| *ino == inode)
+                .map(|(k, v)| (*k, v.data.len() as u64))
+                .collect();
+            for (key, data_len) in keys_to_remove {
+                cache.remove(&key);
+                self.current_bytes.fetch_sub(data_len, Ordering::SeqCst);
+            }
         }
     }
 
     pub fn remove_chunk(&self, inode: u64, offset: u64) {
         let chunk_index = self.get_chunk_index(offset);
-        let mut cache = self.cache.write().unwrap();
-        if let Some(removed) = cache.remove(&(inode, chunk_index)) {
+        let key = (inode, chunk_index);
+        let shard = shard_idx(&key);
+        let mut cache = self.shards[shard].write().unwrap();
+        if let Some(removed) = cache.remove(&key) {
             self.current_bytes
                 .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
         }
@@ -1266,42 +1296,57 @@ impl ChunkCache {
 
     /// 清除指定 inode 的所有脏标记（flush 完成后调用）
     pub fn clear_dirty(&self, inode: u64) {
-        let mut cache = self.cache.write().unwrap();
-        for ((ino, _), chunk) in cache.iter_mut() {
-            if *ino == inode {
-                chunk.dirty = false;
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            for ((ino, _), chunk) in cache.iter_mut() {
+                if *ino == inode {
+                    chunk.dirty = false;
+                }
             }
         }
     }
 
     pub fn dirty_chunks(&self) -> u64 {
-        let cache = self.cache.read().unwrap();
-        cache.values().filter(|chunk| chunk.dirty).count() as u64
+        let mut count: u64 = 0;
+        for shard in &self.shards {
+            let cache = shard.read().unwrap();
+            count += cache.values().filter(|chunk| chunk.dirty).count() as u64;
+        }
+        count
     }
 
     pub fn dirty_bytes(&self) -> u64 {
-        let cache = self.cache.read().unwrap();
-        cache
-            .values()
-            .filter(|chunk| chunk.dirty)
-            .map(|chunk| chunk.data.len() as u64)
-            .sum()
+        let mut total: u64 = 0;
+        for shard in &self.shards {
+            let cache = shard.read().unwrap();
+            total += cache
+                .values()
+                .filter(|chunk| chunk.dirty)
+                .map(|chunk| chunk.data.len() as u64)
+                .sum::<u64>();
+        }
+        total
     }
 
     pub fn clear(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.clear();
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            cache.clear();
+        }
         self.current_bytes.store(0, Ordering::SeqCst);
     }
 
     pub fn len(&self) -> usize {
-        let cache = self.cache.read().unwrap();
-        cache.len()
+        let mut total: usize = 0;
+        for shard in &self.shards {
+            let cache = shard.read().unwrap();
+            total += cache.len();
+        }
+        total
     }
 
     pub fn is_empty(&self) -> bool {
-        let cache = self.cache.read().unwrap();
-        cache.is_empty()
+        self.shards.iter().all(|s| s.read().unwrap().is_empty())
     }
 
     pub fn prefetch(&self, inode: u64, start_offset: u64, end_offset: u64) -> Vec<(u64, u64)> {
@@ -1313,12 +1358,12 @@ impl ChunkCache {
         };
         let mut missing = Vec::new();
 
-        {
-            let cache = self.cache.read().unwrap();
-            for chunk_index in start_chunk..=end_chunk {
-                if !cache.contains_key(&(inode, chunk_index)) {
-                    missing.push((chunk_index * self.chunk_size, self.chunk_size));
-                }
+        for chunk_index in start_chunk..=end_chunk {
+            let key = (inode, chunk_index);
+            let shard = shard_idx(&key);
+            let cache = self.shards[shard].read().unwrap();
+            if !cache.contains_key(&key) {
+                missing.push((chunk_index * self.chunk_size, self.chunk_size));
             }
         }
 

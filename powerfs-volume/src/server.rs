@@ -662,6 +662,117 @@ impl VolumeService for VolumeServer {
         }
     }
 
+    async fn write_needle_blob_lease(
+        &self,
+        request: Request<crate::proto::powerfs::WriteNeedleBlobLeaseRequest>,
+    ) -> std::result::Result<Response<crate::proto::powerfs::WriteNeedleBlobLeaseResponse>, Status>
+    {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let file_key = req.file_key;
+        let offset = req.offset;
+        let size = req.size;
+        let cookie = req.cookie;
+        let lease_token = req.lease_token.clone();
+        let stripe_index = req.stripe_index;
+        let holder_client_id = if req.client_id.is_empty() {
+            "grpc-internal".to_string()
+        } else {
+            req.client_id.clone()
+        };
+
+        debug!(
+            "write_needle_blob_lease: volume_id={}, file_key={}, offset={}, size={}, lease_token={}, stripe={}, holder={}",
+            volume_id.0, file_key, offset, size, lease_token, stripe_index, holder_client_id
+        );
+
+        if lease_token.is_empty() {
+            return Ok(Response::new(
+                crate::proto::powerfs::WriteNeedleBlobLeaseResponse {
+                    success: false,
+                    error: "Missing lease token".to_string(),
+                },
+            ));
+        }
+
+        let lease_mgr = self.range_lease_mgr.clone();
+        let validation_result = lease_mgr.validate_token_with_grace_period(
+            &lease_token,
+            &holder_client_id,
+            stripe_index,
+            3000,
+        );
+
+        match validation_result {
+            Ok(()) => {
+                info!(
+                    "write_needle_blob_lease: lease validated for stripe {}",
+                    stripe_index
+                );
+            }
+            Err(e) => {
+                warn!("write_needle_blob_lease: lease validation failed: {}", e);
+                return Ok(Response::new(
+                    crate::proto::powerfs::WriteNeedleBlobLeaseResponse {
+                        success: false,
+                        error: format!("Lease validation failed: {}", e),
+                    },
+                ));
+            }
+        }
+
+        let start = time::Instant::now();
+        let storage_manager = self.storage_manager.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            if let Some(volume) = storage_manager.get_volume(&volume_id) {
+                let result = volume.write_needle_blob(
+                    file_key,
+                    offset,
+                    size,
+                    Bytes::from(req.needle_blob),
+                    cookie,
+                );
+                match result {
+                    Ok(_) => Ok(Response::new(
+                        crate::proto::powerfs::WriteNeedleBlobLeaseResponse {
+                            success: true,
+                            error: String::new(),
+                        },
+                    )),
+                    Err(e) => {
+                        warn!("write_needle_blob_lease write failed: {}", e);
+                        Ok(Response::new(
+                            crate::proto::powerfs::WriteNeedleBlobLeaseResponse {
+                                success: false,
+                                error: format!("Write failed: {}", e),
+                            },
+                        ))
+                    }
+                }
+            } else {
+                warn!("write_needle_blob_lease: volume not found: {}", volume_id.0);
+                Ok(Response::new(
+                    crate::proto::powerfs::WriteNeedleBlobLeaseResponse {
+                        success: false,
+                        error: format!("Volume not found: {}", volume_id.0),
+                    },
+                ))
+            }
+        })
+        .await
+        {
+            Ok(r) => {
+                debug!("write_needle_blob_lease completed in {:?}", start.elapsed());
+                r
+            }
+            Err(e) => {
+                error!("write_needle_blob_lease task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
+            }
+        }
+    }
+
     async fn batch_write_needle_blob(
         &self,
         request: Request<crate::proto::powerfs::BatchWriteNeedleBlobRequest>,

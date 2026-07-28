@@ -24,6 +24,9 @@ service VolumeService {
     rpc AcquireRangeLease(RangeLeaseRequest) returns (RangeLeaseResponse);
     rpc ReleaseRangeLease(RangeLeaseReleaseRequest) returns (RangeLeaseReleaseResponse);
     rpc RenewRangeLease(RangeLeaseRenewRequest) returns (RangeLeaseRenewResponse);
+
+    // Lease-validated write for data consistency
+    rpc WriteNeedleBlobLease(WriteNeedleBlobLeaseRequest) returns (WriteNeedleBlobLeaseResponse);
 }
 
 message CreateVolumeRequest {
@@ -275,6 +278,7 @@ message WriteNeedleBlobLeaseRequest {
     uint32 cookie = 6;
     string lease_token = 7;     // Range lease token
     uint64 stripe_index = 8;   // Stripe index for lease validation
+    string client_id = 9;      // Client identity for lease holder validation
 }
 
 message WriteNeedleBlobLeaseResponse {

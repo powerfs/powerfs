@@ -12,6 +12,8 @@ use crate::net_client::PowerFuseNetClient;
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
+use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+use powerfs_net::FieldId;
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
@@ -185,8 +187,8 @@ pub struct VolumeClient {
     mgmt_channel: Arc<TransportChannel>,
     /// Volume 路由表
     volume_router: Arc<RwLock<HashMap<u64, VolumeInfo>>>,
-    /// Lease 表 (volume_id -> LeaseInfo)
-    leases: Arc<RwLock<HashMap<u64, LeaseInfo>>>,
+    /// Lease 表 ((volume_id, inode) -> LeaseInfo)
+    leases: Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
     /// 熔断器
     breaker: Arc<CircuitBreaker>,
     /// 拓扑管理器
@@ -385,22 +387,30 @@ impl VolumeClient {
         router.get(&volume_id).cloned()
     }
 
-    /// 获取 Lease 状态
-    pub fn get_lease_state(&self, volume_id: u64) -> LeaseState {
+    /// 获取指定 inode 的 Lease 状态
+    pub fn get_lease_state(&self, volume_id: u64, inode: u64) -> LeaseState {
         let leases = self.leases.read().unwrap();
         leases
-            .get(&volume_id)
+            .get(&(volume_id, inode))
             .map(|l| l.state)
             .unwrap_or(LeaseState::None)
     }
 
-    /// 检查 Lease 是否有效
-    pub fn has_valid_lease(&self, volume_id: u64) -> bool {
+    /// 检查指定 inode 的 Lease 是否有效
+    pub fn has_valid_lease(&self, volume_id: u64, inode: u64) -> bool {
         let leases = self.leases.read().unwrap();
         leases
-            .get(&volume_id)
+            .get(&(volume_id, inode))
             .map(|l| l.is_valid())
             .unwrap_or(false)
+    }
+
+    /// 检查指定 volume 是否有任意有效 Lease（粗粒度预检查）
+    pub fn has_valid_lease_for_volume(&self, volume_id: u64) -> bool {
+        let leases = self.leases.read().unwrap();
+        leases
+            .iter()
+            .any(|(&(vid, _), lease)| vid == volume_id && lease.is_valid())
     }
 
     /// 提交数据请求 (读/写共享队列)
@@ -418,8 +428,9 @@ impl VolumeClient {
             return Err("Circuit breaker is open".to_string());
         }
 
-        // 检查写请求的 Lease
-        if matches!(context.kind, RequestKind::Write) && !self.has_valid_lease(volume_id) {
+        // 检查写请求的 Lease（粗粒度 volume 级预检查）
+        if matches!(context.kind, RequestKind::Write) && !self.has_valid_lease_for_volume(volume_id)
+        {
             return Err("No valid lease for write request".to_string());
         }
 
@@ -540,19 +551,27 @@ impl VolumeClient {
         }
     }
 
-    /// 更新 Lease
-    pub fn update_lease(&self, volume_id: u64, token: String, duration: std::time::Duration) {
+    /// 更新指定 inode 的 Lease
+    pub fn update_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        token: String,
+        duration: std::time::Duration,
+    ) {
         let mut leases = self.leases.write().unwrap();
+        let key = (volume_id, inode);
         let lease = leases
-            .entry(volume_id)
+            .entry(key)
             .or_insert_with(|| LeaseInfo::new(token.clone(), duration));
         lease.renew(duration);
     }
 
-    /// 释放 Lease
-    pub fn release_lease(&self, volume_id: u64) {
+    /// 释放指定 inode 的 Lease
+    pub fn release_lease(&self, volume_id: u64, inode: u64) {
         let mut leases = self.leases.write().unwrap();
-        if let Some(lease) = leases.get_mut(&volume_id) {
+        let key = (volume_id, inode);
+        if let Some(lease) = leases.get_mut(&key) {
             lease.release();
         }
     }
@@ -836,7 +855,7 @@ async fn process_volume_available_requests(
     breaker: &Arc<CircuitBreaker>,
     net_client: &Option<Arc<PowerFuseNetClient>>,
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
-    leases: &Arc<RwLock<HashMap<u64, LeaseInfo>>>,
+    leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> bool {
     // Lease 通道优先
@@ -910,7 +929,7 @@ async fn process_data_request_internal(
     breaker: &Arc<CircuitBreaker>,
     _data_channels: &[Arc<TransportChannel>],
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
-    leases: &Arc<RwLock<HashMap<u64, LeaseInfo>>>,
+    leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
@@ -961,7 +980,11 @@ async fn process_data_request_internal(
             match msg {
                 Ok(resp) if resp.is_ok() => {
                     breaker.record_success();
-                    Ok(RequestResult::success(request_id.clone(), resp.body))
+                    Ok(RequestResult::success_with_payload(
+                        request_id.clone(),
+                        resp.body,
+                        resp.data,
+                    ))
                 }
                 Ok(resp) => {
                     breaker.record_failure();
@@ -977,12 +1000,14 @@ async fn process_data_request_internal(
             }
         }
         RequestKind::Write => {
-            let has_lease = {
+            // Decode TLV body to extract file_key (inode) for per-inode lease check
+            let file_key = TlvDecoder::new(&body).next_u64(FieldId::Name).unwrap_or(0);
+            let (has_lease, lease_token) = {
                 let lease_map = leases.read().unwrap();
-                lease_map
-                    .get(&req.shard_id)
-                    .map(|l| l.is_valid())
-                    .unwrap_or(false)
+                match lease_map.get(&(req.shard_id, file_key)) {
+                    Some(lease) if lease.is_valid() => (true, Some(lease.token.clone())),
+                    _ => (false, None),
+                }
             };
             if !has_lease {
                 let err = ClientError::NoValidLease;
@@ -990,11 +1015,44 @@ async fn process_data_request_internal(
                 return Err(err);
             }
 
-            let msg = vol_client.send_request(resolved_msg_type, &body, &[]).await;
+            // Inject lease_token into TLV body for server-side validation
+            let final_body = if let Some(token) = lease_token {
+                // Parse existing TLV fields and rebuild with lease_token appended
+                let mut dec = TlvDecoder::new(&body);
+                let mut enc = TlvEncoder::new();
+
+                // Read volume_id (Ino)
+                if let Ok(ino) = dec.next_u64(FieldId::Ino) {
+                    let _ = enc.add_u64(FieldId::Ino, ino);
+                }
+                // Read file_key (Name)
+                let _ = dec.next_u64(FieldId::Name).map(|_| {
+                    let _ = enc.add_u64(FieldId::Name, file_key);
+                });
+                // Read data (DataLen)
+                if let Ok(data) = dec.next_bytes(FieldId::DataLen) {
+                    let _ = enc.add_bytes(FieldId::DataLen, &data);
+                }
+                // Add lease token for server-side validation
+                let _ = enc.add_string(FieldId::LeaseToken, &token);
+                // Add client_id for lease holder validation
+                let _ = enc.add_string(FieldId::ClientId, "fuse-client");
+                enc.into_bytes()
+            } else {
+                body.clone()
+            };
+
+            let msg = vol_client
+                .send_request(resolved_msg_type, &final_body, &[])
+                .await;
             match msg {
                 Ok(resp) if resp.is_ok() => {
                     breaker.record_success();
-                    Ok(RequestResult::success(request_id.clone(), resp.body))
+                    Ok(RequestResult::success_with_payload(
+                        request_id.clone(),
+                        resp.body,
+                        resp.data,
+                    ))
                 }
                 Ok(resp) => {
                     breaker.record_failure();
@@ -1065,7 +1123,11 @@ async fn process_lease_request_internal(
     let result = vol_client.send_request(msg_type, &body, &[]).await;
 
     let final_result = match result {
-        Ok(resp) if resp.is_ok() => Ok(RequestResult::success(request_id.clone(), resp.body)),
+        Ok(resp) if resp.is_ok() => Ok(RequestResult::success_with_payload(
+            request_id.clone(),
+            resp.body,
+            resp.data,
+        )),
         Ok(resp) => Err(ClientError::Server(format!(
             "Server error: {}",
             resp.header.status
@@ -1126,7 +1188,11 @@ async fn process_mgmt_request_internal(
     let result = vol_client.send_request(msg_type, &body, &[]).await;
 
     let final_result = match result {
-        Ok(resp) if resp.is_ok() => Ok(RequestResult::success(request_id.clone(), resp.body)),
+        Ok(resp) if resp.is_ok() => Ok(RequestResult::success_with_payload(
+            request_id.clone(),
+            resp.body,
+            resp.data,
+        )),
         Ok(resp) => Err(ClientError::Server(format!(
             "Server error: {}",
             resp.header.status
@@ -1201,8 +1267,13 @@ mod tests {
         let (client, _) = create_test_volume_client();
 
         // 先获取 Lease
-        client.update_lease(1, "token-1".to_string(), std::time::Duration::from_secs(30));
-        assert!(client.has_valid_lease(1));
+        client.update_lease(
+            1,
+            100,
+            "token-1".to_string(),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(client.has_valid_lease_for_volume(1));
 
         let ctx = create_test_context(RequestKind::Write);
         assert!(client.submit_data_request(ctx, 1).is_ok());
@@ -1213,18 +1284,23 @@ mod tests {
         let (client, _) = create_test_volume_client();
 
         // 初始无 Lease
-        assert_eq!(client.get_lease_state(1), LeaseState::None);
-        assert!(!client.has_valid_lease(1));
+        assert_eq!(client.get_lease_state(1, 100), LeaseState::None);
+        assert!(!client.has_valid_lease(1, 100));
 
         // 获取 Lease
-        client.update_lease(1, "token-1".to_string(), std::time::Duration::from_secs(30));
-        assert_eq!(client.get_lease_state(1), LeaseState::Acquired);
-        assert!(client.has_valid_lease(1));
+        client.update_lease(
+            1,
+            100,
+            "token-1".to_string(),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(client.get_lease_state(1, 100), LeaseState::Acquired);
+        assert!(client.has_valid_lease(1, 100));
 
         // 释放 Lease
-        client.release_lease(1);
-        assert_eq!(client.get_lease_state(1), LeaseState::Released);
-        assert!(!client.has_valid_lease(1));
+        client.release_lease(1, 100);
+        assert_eq!(client.get_lease_state(1, 100), LeaseState::Released);
+        assert!(!client.has_valid_lease(1, 100));
     }
 
     #[test]

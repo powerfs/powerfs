@@ -28,6 +28,7 @@ pub(crate) fn default_msg_type_for_kind(kind: RequestKind) -> powerfs_net::MsgTy
 pub struct RequestResult {
     pub request_id: RequestId,
     pub data: Option<Vec<u8>>,
+    pub payload: Option<Vec<u8>>,
 }
 
 /// 请求等待者类型别名
@@ -38,6 +39,15 @@ impl RequestResult {
         Self {
             request_id,
             data: Some(data),
+            payload: None,
+        }
+    }
+
+    pub fn success_with_payload(request_id: RequestId, data: Vec<u8>, payload: Vec<u8>) -> Self {
+        Self {
+            request_id,
+            data: Some(data),
+            payload: Some(payload),
         }
     }
 
@@ -45,6 +55,7 @@ impl RequestResult {
         Self {
             request_id,
             data: None,
+            payload: None,
         }
     }
 }
@@ -708,7 +719,11 @@ impl MetaShardClient {
                 match msg {
                     Ok(resp) if resp.is_ok() => {
                         self.breaker.record_success();
-                        Ok(RequestResult::success(request_id.clone(), resp.body))
+                        Ok(RequestResult::success_with_payload(
+                            request_id.clone(),
+                            resp.body,
+                            resp.data,
+                        ))
                     }
                     Ok(resp) => {
                         self.breaker.record_failure();
@@ -732,7 +747,11 @@ impl MetaShardClient {
                 match msg {
                     Ok(resp) if resp.is_ok() => {
                         self.breaker.record_success();
-                        Ok(RequestResult::success(request_id.clone(), resp.body))
+                        Ok(RequestResult::success_with_payload(
+                            request_id.clone(),
+                            resp.body,
+                            resp.data,
+                        ))
                     }
                     Ok(resp) => {
                         self.breaker.record_failure();
@@ -931,7 +950,9 @@ async fn process_request_internal(
             match msg {
                 Ok(resp) if resp.is_ok() => {
                     breaker.record_success();
-                    Ok(RequestResult::success(request_id, resp.body))
+                    Ok(RequestResult::success_with_payload(
+                        request_id, resp.body, resp.data,
+                    ))
                 }
                 Ok(resp) => {
                     breaker.record_failure();
@@ -955,7 +976,9 @@ async fn process_request_internal(
             match msg {
                 Ok(resp) if resp.is_ok() => {
                     breaker.record_success();
-                    Ok(RequestResult::success(request_id, resp.body))
+                    Ok(RequestResult::success_with_payload(
+                        request_id, resp.body, resp.data,
+                    ))
                 }
                 Ok(resp) => {
                     breaker.record_failure();

@@ -213,6 +213,61 @@ impl RangeLeaseManager {
         Ok(())
     }
 
+    pub fn validate_token_for_inode(
+        &self,
+        token: &str,
+        holder: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let leases = self.leases.read().unwrap();
+        let lease = leases
+            .get(token)
+            .ok_or_else(|| "Lease token not found".to_string())?;
+
+        if lease.is_expired() {
+            return Err("Lease expired".to_string());
+        }
+        if lease.holder != holder {
+            return Err("Lease holder mismatch".to_string());
+        }
+        if lease.inode != inode {
+            return Err(format!(
+                "Lease inode mismatch: expected {}, got {}",
+                lease.inode, inode
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_token_with_grace_period(
+        &self,
+        token: &str,
+        holder: &str,
+        inode: u64,
+        grace_ms: u64,
+    ) -> Result<(), String> {
+        let leases = self.leases.read().unwrap();
+        let lease = leases
+            .get(token)
+            .ok_or_else(|| "Lease token not found".to_string())?;
+
+        if lease.holder != holder {
+            return Err("Lease holder mismatch".to_string());
+        }
+        if lease.inode != inode {
+            return Err(format!(
+                "Lease inode mismatch: expected {}, got {}",
+                lease.inode, inode
+            ));
+        }
+
+        let grace = Duration::from_millis(grace_ms);
+        if Instant::now() > lease.expire_at + grace {
+            return Err("Lease expired beyond grace period".to_string());
+        }
+        Ok(())
+    }
+
     pub fn get_active_leases_count(&self) -> usize {
         let leases = self.leases.read().unwrap();
         leases.values().filter(|l| !l.is_expired()).count()

@@ -14,7 +14,7 @@ use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -144,9 +144,11 @@ impl FuseApp {
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
-            dirty_chunks: Arc::new(RwLock::new(HashSet::new())),
+            dirty_shards: (0..NUM_DIRTY_SHARDS)
+                .map(|_| Arc::new(RwLock::new(HashSet::new())))
+                .collect(),
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            append_mutex: Arc::new(Mutex::new(HashMap::new())),
+            write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let fs_arc = Arc::new(fs);
@@ -251,21 +253,72 @@ struct PowerFsFs {
     collection: String,
     replication: String,
     locks: Arc<RwLock<FileLocks>>,
-    dirty_chunks: Arc<RwLock<HashSet<(u64, u64)>>>,
+    dirty_shards: DirtyShards,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
-    append_mutex: Arc<Mutex<HashMap<u64, ()>>>,
+    write_locks: WriteLocks,
 }
 
+const NUM_DIRTY_SHARDS: usize = 16;
+
+type WriteLockMap = HashMap<(u64, u64), Arc<std::sync::Mutex<()>>>;
+type WriteLocks = Arc<std::sync::Mutex<WriteLockMap>>;
+type DirtyShardSet = HashSet<(u64, u64)>;
+type DirtyShards = Vec<Arc<RwLock<DirtyShardSet>>>;
+
 impl PowerFsFs {
-    fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
-        let dirty: Vec<(u64, u64)> = {
-            let dirty_set = self.dirty_chunks.read().unwrap();
-            dirty_set
+    fn get_write_lock(&self, inode: u64, chunk_idx: u64) -> Arc<std::sync::Mutex<()>> {
+        let key = (inode, chunk_idx);
+        let mut locks = self.write_locks.lock().unwrap();
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn dirty_shard_idx(key: &(u64, u64)) -> usize {
+        let hash = key.0.wrapping_add(key.1);
+        (hash as usize) % NUM_DIRTY_SHARDS
+    }
+
+    fn mark_dirty(&self, inode: u64, chunk_idx: u64) {
+        let key = (inode, chunk_idx);
+        let shard = &self.dirty_shards[Self::dirty_shard_idx(&key)];
+        let mut set = shard.write().unwrap();
+        set.insert(key);
+        self.has_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn drain_dirty_for_inode(&self, inode: u64) -> Vec<(u64, u64)> {
+        let mut result = Vec::new();
+        for shard in &self.dirty_shards {
+            let mut set = shard.write().unwrap();
+            let keys: Vec<_> = set
                 .iter()
                 .filter(|(ino, _)| *ino == inode)
                 .cloned()
-                .collect()
-        };
+                .collect();
+            for k in &keys {
+                set.remove(k);
+            }
+            result.extend(keys);
+        }
+        result
+    }
+
+    fn all_dirty_inodes(&self) -> HashSet<u64> {
+        let mut inodes = HashSet::new();
+        for shard in &self.dirty_shards {
+            let set = shard.read().unwrap();
+            for (ino, _) in set.iter() {
+                inodes.insert(*ino);
+            }
+        }
+        inodes
+    }
+
+    fn flush_dirty_chunks(&self, inode: u64) -> std::io::Result<()> {
+        let dirty = self.drain_dirty_for_inode(inode);
 
         if dirty.is_empty() {
             return Ok(());
@@ -325,8 +378,7 @@ impl PowerFsFs {
             }
         }
 
-        let mut dirty_set = self.dirty_chunks.write().unwrap();
-        dirty_set.retain(|(ino, _)| *ino != inode);
+        // Dirty entries already drained by drain_dirty_for_inode above
 
         let path = self.cache.inode_to_path(inode).unwrap_or_default();
         if !path.is_empty() && !chunks.is_empty() {
@@ -372,16 +424,11 @@ impl PowerFsFs {
     }
 
     fn flush_all_dirty_chunks(&self) -> std::io::Result<()> {
-        let dirty: Vec<(u64, u64)> = {
-            let dirty_set = self.dirty_chunks.read().unwrap();
-            dirty_set.iter().cloned().collect()
-        };
+        let inodes = self.all_dirty_inodes();
 
-        if dirty.is_empty() {
+        if inodes.is_empty() {
             return Ok(());
         }
-
-        let inodes: HashSet<u64> = dirty.iter().map(|(ino, _)| *ino).collect();
 
         for inode in inodes {
             let _ = self.flush_dirty_chunks(inode);
@@ -1072,8 +1119,10 @@ impl FileSystem for PowerFsFs {
                         if e.contains("needle not found") {
                             info!("read_blob: needle not found in volume, checking dirty chunks");
                             let is_dirty = {
-                                let dirty_set = self.dirty_chunks.read().unwrap();
-                                dirty_set.contains(&(inode, chunk_idx))
+                                let key = (inode, chunk_idx);
+                                let shard = &self.dirty_shards[Self::dirty_shard_idx(&key)];
+                                let dirty_set = shard.read().unwrap();
+                                dirty_set.contains(&key)
                             };
                             if is_dirty {
                                 info!("read_blob: chunk {} is dirty, flushing first", chunk_idx);
@@ -1155,25 +1204,24 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<usize> {
         debug!("write: inode={}, size={}, offset={}", inode, size, offset);
 
-        let is_append = (flags & FUSE_APPEND) != 0;
-
-        let _append_lock = if is_append {
-            Some(self.append_mutex.lock().unwrap())
-        } else {
-            None
-        };
-
-        let entry = self
-            .cache
-            .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-
+        // Read data into buffer BEFORE acquiring any lock — I/O must not hold locks
         let mut buf = vec![0u8; size as usize];
         let read_len = r.read(&mut buf).unwrap_or(0);
         if read_len == 0 {
             return Ok(0);
         }
         buf.truncate(read_len);
+
+        let is_append = (flags & FUSE_APPEND) != 0;
+
+        // Lock for metadata operations (append offset, FID assignment, size update)
+        let meta_lock = self.get_write_lock(inode, u64::MAX);
+        let _meta_guard = meta_lock.lock();
+
+        let entry = self
+            .cache
+            .get_inode(inode)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
         if is_append {
             let latest_entry = self
@@ -1194,11 +1242,33 @@ impl FileSystem for PowerFsFs {
                 self.chunk_cache.get_chunk_index(end_offset - 1)
             };
 
+            // Drop metadata lock before acquiring per-chunk locks so chunk writes
+            // to the same file don't serialize on the metadata lock
+            drop(_meta_guard);
+
+            let new_size = offset + read_len as u64;
+
+            // Acquire per-chunk locks in sorted order to prevent deadlock.
+            // We store both the Arc and the guard so the Arc stays alive for
+            // the duration of the guard.
+            let mut chunk_locks: Vec<(
+                u64,
+                Arc<std::sync::Mutex<()>>,
+                std::sync::MutexGuard<'static, ()>,
+            )> = Vec::new();
+            for chunk_idx in start_chunk..=end_chunk {
+                let lock: Arc<std::sync::Mutex<()>> = self.get_write_lock(inode, chunk_idx);
+                let static_lock: &'static std::sync::Mutex<()> =
+                    unsafe { &*(&*lock as *const std::sync::Mutex<()>) };
+                let guard = static_lock.lock().unwrap_or_else(|e| e.into_inner());
+                chunk_locks.push((chunk_idx, lock, guard));
+            }
+
             let mut data_offset = 0u64;
             let mut current_offset = offset;
 
-            for chunk_idx in start_chunk..=end_chunk {
-                let chunk_start_offset = chunk_idx * chunk_size;
+            for (chunk_idx, _arc, _guard) in &chunk_locks {
+                let chunk_start_offset = *chunk_idx * chunk_size;
                 let in_chunk_start = current_offset.saturating_sub(chunk_start_offset) as usize;
                 let bytes_to_write = std::cmp::min(
                     read_len as u64 - data_offset,
@@ -1226,20 +1296,20 @@ impl FileSystem for PowerFsFs {
                         .put(inode, chunk_start_offset, new_data, mtime, 0);
                 }
 
-                let mut dirty = self.dirty_chunks.write().unwrap();
-                dirty.insert((inode, chunk_idx));
-                self.has_dirty
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.mark_dirty(inode, *chunk_idx);
 
                 data_offset += bytes_to_write as u64;
                 current_offset += bytes_to_write as u64;
             }
 
-            let new_size = offset + read_len as u64;
+            // Re-acquire metadata lock for size update
+            drop(chunk_locks);
+            let _meta_guard = meta_lock.lock();
             if new_size > entry.size {
                 self.cache.update_size(inode, new_size);
             }
         } else {
+            // First write: assign FID under metadata lock
             let (fid, _location, _stripe_fids, _stripe_locations) = self
                 .client
                 .assign_fid(&self.collection, &self.replication)
@@ -1255,10 +1325,7 @@ impl FileSystem for PowerFsFs {
             let mtime = entry.mtime as u64;
             self.chunk_cache.put(inode, 0, buf, mtime, 0);
 
-            let mut dirty = self.dirty_chunks.write().unwrap();
-            dirty.insert((inode, 0));
-            self.has_dirty
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.mark_dirty(inode, 0);
 
             let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
             let filer_entry = powerfs_master::proto::powerfs::Entry {

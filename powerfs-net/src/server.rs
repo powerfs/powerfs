@@ -12,11 +12,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::*;
@@ -40,6 +42,13 @@ pub struct PowerFsNetServer {
     listener: TcpListener,
     handler: Arc<dyn PowerFsNetHandler>,
     manager: Option<Arc<ServerConnectionManager>>,
+    shutdown: Arc<RwLock<ShutdownState>>,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    shutting_down: bool,
+    active_connections: u64,
 }
 
 impl PowerFsNetServer {
@@ -87,6 +96,7 @@ impl PowerFsNetServer {
             listener,
             handler,
             manager,
+            shutdown: Arc::new(RwLock::new(ShutdownState::default())),
         })
     }
 
@@ -105,13 +115,26 @@ impl PowerFsNetServer {
         info!("Starting to accept connections...");
 
         loop {
+            if self.is_shutting_down().await {
+                info!("Server is shutting down, stopping accept loop");
+                break;
+            }
+
             match self.listener.accept().await {
                 Ok((stream, addr)) => {
+                    if self.is_shutting_down().await {
+                        info!("Rejecting new connection during shutdown from {}", addr);
+                        break;
+                    }
                     info!("New connection from {}", addr);
+                    self.increment_connections().await;
                     let handler = self.handler.clone();
                     let manager = self.manager.clone();
+                    let shutdown = self.shutdown.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, handler, manager).await {
+                        let result = Self::handle_connection(stream, handler, manager).await;
+                        Self::decrement_connections(&shutdown).await;
+                        if let Err(e) = result {
                             error!("Connection error from {}: {:?}", addr, e);
                         }
                     });
@@ -121,6 +144,147 @@ impl PowerFsNetServer {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Start serving with graceful shutdown support
+    /// Returns when shutdown is signaled and all connections are drained
+    pub async fn serve_with_shutdown(&self, timeout: Duration) -> NetResult<()> {
+        info!("Starting to accept connections (graceful shutdown enabled)...");
+
+        loop {
+            if self.is_shutting_down().await {
+                info!("Shutdown signaled, draining connections...");
+                break;
+            }
+
+            let accept_result = {
+                let shutdown = self.shutdown.clone();
+                tokio::select! {
+                    result = self.listener.accept() => Some(result),
+                    _ = async {
+                        let mut state = shutdown.write().await;
+                        state.shutting_down = true;
+                    } => None,
+                }
+            };
+
+            if let Some(Ok((stream, addr))) = accept_result {
+                if self.is_shutting_down().await {
+                    break;
+                }
+                info!("New connection from {}", addr);
+                self.increment_connections().await;
+                let handler = self.handler.clone();
+                let manager = self.manager.clone();
+                let shutdown = self.shutdown.clone();
+                tokio::spawn(async move {
+                    let result = Self::handle_connection(stream, handler, manager).await;
+                    Self::decrement_connections(&shutdown).await;
+                    if let Err(e) = result {
+                        error!("Connection error from {}: {:?}", addr, e);
+                    }
+                });
+            }
+        }
+
+        // Drain active connections with timeout
+        self.drain_connections(timeout).await;
+
+        // Force disconnect any remaining sessions
+        if let Some(ref mgr) = self.manager {
+            let sessions = mgr.list_client_ids().await;
+            for id in sessions {
+                mgr.force_disconnect(id).await;
+            }
+        }
+
+        info!("Server shut down gracefully");
+        Ok(())
+    }
+
+    /// Signal the server to shut down gracefully
+    pub async fn signal_shutdown(&self) {
+        let mut state = self.shutdown.write().await;
+        if !state.shutting_down {
+            state.shutting_down = true;
+            info!("Shutdown signal received");
+        }
+    }
+
+    /// Wait for active connections to drain
+    async fn drain_connections(&self, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            let remaining = self.active_connections().await;
+            if remaining == 0 {
+                info!("All connections drained");
+                break;
+            }
+            if start.elapsed() >= timeout {
+                warn!(
+                    "Shutdown timeout reached, {} connections remaining",
+                    remaining
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn is_shutting_down(&self) -> bool {
+        self.shutdown.read().await.shutting_down
+    }
+
+    async fn active_connections(&self) -> u64 {
+        self.shutdown.read().await.active_connections
+    }
+
+    async fn increment_connections(&self) {
+        let mut state = self.shutdown.write().await;
+        state.active_connections += 1;
+    }
+
+    async fn decrement_connections(shutdown: &Arc<RwLock<ShutdownState>>) {
+        let mut state = shutdown.write().await;
+        state.active_connections = state.active_connections.saturating_sub(1);
+    }
+
+    /// Serve until SIGTERM/SIGINT is received, then gracefully shut down
+    pub async fn serve_until_signal(&self, timeout: Duration) -> NetResult<()> {
+        let shutdown = self.shutdown.clone();
+        let signal_handle = tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    info!("Received shutdown signal (Ctrl+C or SIGTERM)");
+                    let mut state = shutdown.write().await;
+                    state.shutting_down = true;
+                }
+                Err(e) => {
+                    warn!("Failed to listen for signal: {:?}", e);
+                    let mut state = shutdown.write().await;
+                    state.shutting_down = true;
+                }
+            }
+        });
+
+        let result = self.serve().await;
+        signal_handle.abort();
+
+        // Drain connections
+        self.drain_connections(timeout).await;
+
+        // Force disconnect remaining
+        if let Some(ref mgr) = self.manager {
+            let sessions = mgr.list_client_ids().await;
+            for id in sessions {
+                mgr.force_disconnect(id).await;
+            }
+        }
+
+        info!("Server shut down gracefully");
+        result
     }
 
     /// Handle a single connection
