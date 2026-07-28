@@ -3,8 +3,8 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{NeedleId, VolumeId};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, STATUS_ERR_NOT_FOUND,
-    STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, RequestContext,
+    ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 
@@ -412,14 +412,18 @@ impl VolumeNetHandler {
 
 #[async_trait::async_trait]
 impl PowerFsNetHandler for VolumeNetHandler {
-    async fn handle_request(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+    async fn handle_request(
+        &self,
+        client_id: u64,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
         let msg_type = msg
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
         debug!(
-            "NET_VOLUME: handling request {:?}, seq={}",
-            msg_type, msg.header.seq
+            "NET_VOLUME: handling request {:?}, client_id={}, seq={}",
+            msg_type, client_id, msg.header.seq
         );
 
         match msg_type {
@@ -452,5 +456,46 @@ impl PowerFsNetHandler for VolumeNetHandler {
 
     async fn on_disconnect(&self, client_id: u64) {
         info!("NET_VOLUME: client disconnected, id={}", client_id);
+    }
+}
+
+#[async_trait::async_trait]
+impl ServerRequestHandler for VolumeNetHandler {
+    async fn handle(
+        &self,
+        ctx: &mut RequestContext,
+        msg: &NetMessage,
+    ) -> powerfs_net::NetResult<NetMessage> {
+        let msg_type = msg
+            .msg_type()
+            .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
+
+        debug!(
+            "NET_VOLUME: handling request {:?}, trace={}, client_id={}, seq={}",
+            msg_type,
+            ctx.trace_id(),
+            ctx.client.client_id,
+            msg.header.seq
+        );
+
+        match msg_type {
+            MsgType::WriteNeedle => self.handle_write_needle(msg).await,
+            MsgType::ReadNeedle => self.handle_read_needle(msg).await,
+            MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
+            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg).await,
+            MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
+            MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::Ping => {
+                let flags = FrameFlags::new(FrameFlags::RESPONSE);
+                let header =
+                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
+                        .with_status(STATUS_OK);
+                Ok(NetMessage::new(header))
+            }
+            _ => {
+                warn!("NET_VOLUME: unsupported message type {:?}", msg_type);
+                Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
+            }
+        }
     }
 }

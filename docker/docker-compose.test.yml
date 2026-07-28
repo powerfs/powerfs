@@ -1,3 +1,11 @@
+# PowerFS Test Environment — Optimized for Fast Startup
+#
+# Images must be pre-built with:
+#   sudo ./build_powerfs_image.sh
+#
+# Start with:
+#   sudo ./start_fuse_env.sh --wait
+
 networks:
   powerfs-network:
     driver: bridge
@@ -19,6 +27,7 @@ volumes:
   filer-3-data:
 
 services:
+  # ── Wave 1: Redis ──
   redis:
     image: redis:7-alpine
     container_name: redis-test
@@ -32,14 +41,13 @@ services:
     command: redis-server --bind 0.0.0.0 --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 3s
 
+  # ── Wave 2: Masters (Raft consensus, serial startup) ──
   master-1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: master-1-test
     networks:
@@ -52,20 +60,18 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.11:9333 --raft-id 1 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.11:9333 --raft-id 1 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       redis:
         condition: service_healthy
 
   master-2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: master-2-test
     networks:
@@ -78,20 +84,18 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.12:9333 --raft-id 2 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.12:9333 --raft-id 2 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       master-1:
         condition: service_healthy
 
   master-3:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: master-3-test
     networks:
@@ -104,20 +108,19 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs master --port 9333 --dir /data/master --advertise-addr 172.21.0.13:9333 --raft-id 3 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.13:9333 --raft-id 3 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       master-2:
         condition: service_healthy
 
+  # ── Wave 3a: Volumes (parallel, depend on master-1 only) ──
   volume-1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: volume-1-test
     networks:
@@ -134,17 +137,15 @@ services:
     command: /app/powerfs-volume --grpc-address 172.21.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-1
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.21 8080 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       master-1:
         condition: service_healthy
 
   volume-2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: volume-2-test
     networks:
@@ -161,17 +162,15 @@ services:
     command: /app/powerfs-volume --grpc-address 172.21.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-2
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.22 8080 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       master-1:
         condition: service_healthy
 
   volume-3:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: volume-3-test
     networks:
@@ -188,17 +187,16 @@ services:
     command: /app/powerfs-volume --grpc-address 172.21.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-3
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.23 8080 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      interval: 2s
+      timeout: 2s
       retries: 3
+      start_period: 5s
     depends_on:
       master-1:
         condition: service_healthy
 
+  # ── Wave 3b: Filers (Raft consensus, serial startup) ──
   filer-1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: filer-1-test
     networks:
@@ -207,79 +205,77 @@ services:
     ports:
       - "8988:8888"
       - "8989:8889"
+      - "8990:8890"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs filer --port 8888 --grpc-port 8889 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 1 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 1 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
     volumes:
       - filer-1-data:/data/filer
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     depends_on:
       master-1:
         condition: service_healthy
 
   filer-2:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: filer-2-test
     networks:
       powerfs-network:
         ipv4_address: 172.21.0.32
     ports:
-      - "8990:8888"
-      - "8991:8889"
+      - "8991:8888"
+      - "8992:8889"
+      - "8993:8890"
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs filer --port 8888 --grpc-port 8889 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 2 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 2 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
     volumes:
       - filer-2-data:/data/filer
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     depends_on:
       filer-1:
         condition: service_healthy
 
   filer-3:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: filer-3-test
     networks:
       powerfs-network:
         ipv4_address: 172.21.0.33
     ports:
-      - "8992:8888"
-      - "8993:8889"
+      - "8994:8888"
+      - "8995:8889"
+      - "8996:8890"
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs filer --port 8888 --grpc-port 8889 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 3 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 3 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
     volumes:
       - filer-3-data:/data/filer
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     depends_on:
       filer-2:
         condition: service_healthy
 
+  # ── Wave 4: FUSE Client + Benchmark ──
   fuse-test:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile-test
     image: powerfs-test:latest
     container_name: fuse-test
     cpus: '2.0'
@@ -299,51 +295,55 @@ services:
     restart: unless-stopped
     environment:
       - RUST_LOG=debug
+    entrypoint: /bin/sh
     command:
-      - /app/powerfs-fuse
-      - --master
-      - 172.21.0.11:9333
-      - --master
-      - 172.21.0.12:9333
-      - --master
-      - 172.21.0.13:9333
-      - --mount-point
-      - /mnt/powerfs
-      - --collection
-      - default
-      - --replication
-      - "000"
-      - --threads
-      - "16"
-      - --verbose
-      - --container
-      - --log-file
-      - /var/log/powerfs-fuse.log
+      - -c
+      - |
+        # Create FUSE mount directory
+        mkdir -p /mnt/fuse
+        # Start FUSE client in background
+        /app/powerfs-fuse \
+          --master 172.21.0.11:9333 \
+          --master 172.21.0.12:9333 \
+          --master 172.21.0.13:9333 \
+          --master-net-port 9334 \
+          --filer-addr 172.21.0.31 \
+          --filer-net-port 8890 \
+          --mount-point /mnt/fuse \
+          --collection default \
+          --replication 000 \
+          --verbose \
+          --container \
+          --log-file /var/log/powerfs-fuse.log &
+        FUSE_PID=$$!
+        # Wait for FUSE to mount
+        for i in $$(seq 1 30); do
+          if mount | grep -q "/mnt/fuse"; then
+            echo "FUSE mounted at /mnt/fuse"
+            break
+          fi
+          sleep 1
+        done
+        echo "FUSE ready, mount point: /mnt/fuse"
+        # Keep container running
+        wait $$FUSE_PID
     volumes:
-      - /tmp/powerfs/test:/mnt/powerfs
+      - /tmp/powerfs/test:/tmp/test-results
     healthcheck:
-      test: ["CMD-SHELL", "ls /mnt/powerfs > /dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
       retries: 10
+      start_period: 20s
     depends_on:
+      master-1:
+        condition: service_started
       volume-1:
-        condition: service_healthy
-      volume-2:
-        condition: service_healthy
-      volume-3:
-        condition: service_healthy
+        condition: service_started
       filer-1:
-        condition: service_healthy
-      filer-2:
-        condition: service_healthy
-      filer-3:
-        condition: service_healthy
+        condition: service_started
 
   benchmark:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile-test
     image: powerfs-test:latest
     container_name: benchmark
     cpus: '2.0'

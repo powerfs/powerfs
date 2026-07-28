@@ -16,7 +16,7 @@ use powerfs_common::{
 };
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
-use powerfs_net::PowerFsNetServer;
+use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -2078,9 +2078,22 @@ impl MasterNode {
         if net_port > 0 {
             let net_addr = format!("{}:{}", self.address.ip(), net_port);
             let net_handler = Arc::new(crate::net_handler::MasterNetHandler::new(self.clone()));
+
+            // Wrap with ManagedNetHandler for session management + middleware
+            let net_manager = Arc::new(ServerConnectionManager::new());
+            let managed_handler = Arc::new(ManagedNetHandler::from_arc(
+                net_manager.clone(),
+                net_handler,
+            ));
+
             info!("Starting powerfs-net server on {}", net_addr);
-            if let Ok(net_server) =
-                PowerFsNetServer::bind(&self.address.ip().to_string(), net_port, net_handler).await
+            if let Ok(net_server) = PowerFsNetServer::bind_with_manager(
+                &self.address.ip().to_string(),
+                net_port,
+                managed_handler,
+                net_manager,
+            )
+            .await
             {
                 tokio::spawn(async move {
                     if let Err(e) = net_server.serve().await {

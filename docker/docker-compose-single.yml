@@ -41,7 +41,7 @@ services:
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.11
-    command: /app/powerfs master --config /etc/powerfs/master.toml
+    command: /app/powerfs-master --config /etc/powerfs/master.toml
     volumes:
       - master-1-data:/data
       - ../config/master-single.toml:/etc/powerfs/master.toml:ro
@@ -98,13 +98,23 @@ services:
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.35
-    command: /app/powerfs-filer --node-id 1 --s3-address 0.0.0.0:8888 --grpc-address 0.0.0.0:8889 --raft-address 172.20.0.35:8890 --data-dir /data/filer --shard-count 1 --master-address 172.20.0.11:9333 --redis-address redis://redis:6379 --net-address 0.0.0.0:9334
+    command: >
+      /app/powerfs-filer
+      --port 8888
+      --grpc-port 8889
+      --net-port 9334
+      --raft-id 1
+      -D /data/filer
+      --shard-count 1
+      --master 172.20.0.11:9333
+      --raft-peer 172.20.0.35:8889
     volumes:
       - filer-1-data:/data/filer
       - ../logs:/logs
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       RUST_LOG: ${RUST_LOG:-info,powerfs_filer=info,powerfs_net=debug}
+      REDIS_URL: redis://redis:6379
     depends_on:
       master-1:
         condition: service_healthy

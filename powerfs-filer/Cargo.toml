@@ -3,13 +3,13 @@ name = "powerfs-filer"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "powerfs-filer"
-path = "src/main.rs"
-
 [features]
 default = ["redis-event"]
 redis-event = ["dep:redis", "powerfs-common/redis-event"]
+
+[[bin]]
+name = "powerfs-filer"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.6"

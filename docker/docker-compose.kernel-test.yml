@@ -47,7 +47,7 @@ services:
     volumes:
       - master-kernel-test-data:/data
       - ../config/master-1.toml:/etc/powerfs/master.toml
-    command: /app/powerfs master --config /etc/powerfs/master.toml
+    command: /app/powerfs-master --config /etc/powerfs/master.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9333 || exit 1"]
       interval: 2s
@@ -92,15 +92,16 @@ services:
       - filer-kernel-test-data:/data/filer
     command: >
       /app/powerfs-filer
-      --node-id 1
-      --s3-address 0.0.0.0:8888
-      --grpc-address 0.0.0.0:8889
-      --raft-address 172.20.0.37:8890
-      --data-dir /data/filer
+      --port 8888
+      --grpc-port 8889
+      --net-port 8890
+      --raft-id 1
+      -D /data/filer
       --shard-count 2
-      --master-address 172.20.0.14:9333
-      --redis-address redis://172.20.0.51:6379
-      --peers 172.20.0.37:8889
+      --master 172.20.0.14:9333
+      --raft-peer 172.20.0.37:8889
+    environment:
+      - REDIS_URL=redis://172.20.0.51:6379
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 2s

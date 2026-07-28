@@ -3,12 +3,13 @@
 //! This module provides a client that communicates with PowerFS Master/Volume
 //! servers using the lightweight powerfs-net binary protocol instead of gRPC.
 
-use log::info;
+use log::{info, warn};
 use powerfs_common::types::{Fid, VolumeId};
 use powerfs_master::proto::powerfs::{Entry, FuseAttributes, Location};
 use powerfs_net::serialize::{EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    ClientConfig, ClientType, FieldId, MsgType, NetMessage, NetResult, PowerFsNetClient,
+    ClientConfig, ClientType, FieldId, MsgType, NetError, NetMessage, NetResult, PowerFsNetClient,
+    STATUS_ERR_REDIRECT,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ impl Default for NetClientConfig {
             filer_net_port: 9334,
             client_id: 0,
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -155,6 +156,16 @@ impl PowerFuseNetClient {
         Ok(new_client)
     }
 
+    /// 获取 master 客户端引用
+    pub fn master_client(&self) -> &Arc<PowerFsNetClient> {
+        &self.master_client
+    }
+
+    /// 获取 filer 客户端引用
+    pub fn filer_client(&self) -> &Arc<PowerFsNetClient> {
+        &self.filer_client
+    }
+
     // ========================================================================
     // Master operations
     // ========================================================================
@@ -249,6 +260,62 @@ impl PowerFuseNetClient {
         last_info.ok_or_else(|| powerfs_net::NetError::ServerError("empty path".into()))
     }
 
+    /// Send a request with automatic redirect handling.
+    /// If the server responds with STATUS_ERR_REDIRECT, parse the leader address,
+    /// connect to it, and retry the request.
+    async fn send_request_with_redirect(
+        &self,
+        msg_type: MsgType,
+        body: Vec<u8>,
+        data: &[u8],
+    ) -> NetResult<NetMessage> {
+        let resp = self
+            .filer_client
+            .send_request(msg_type, body.as_slice(), data)
+            .await?;
+
+        // Check for redirect
+        if resp.header.status == STATUS_ERR_REDIRECT {
+            let mut dec = TlvDecoder::new(&resp.body);
+            let leader_addr = dec.next_string(FieldId::Owner).unwrap_or_default();
+            if !leader_addr.is_empty() {
+                warn!("Redirect to leader: {}, retrying...", leader_addr);
+                // Parse host:port
+                let parts: Vec<&str> = leader_addr.split(':').collect();
+                let (host, port) = if parts.len() == 2 {
+                    (
+                        parts[0].to_string(),
+                        parts[1]
+                            .parse::<u16>()
+                            .unwrap_or(self.config.filer_net_port),
+                    )
+                } else {
+                    (leader_addr.clone(), self.config.filer_net_port)
+                };
+
+                let new_client = PowerFsNetClient::new(ClientConfig {
+                    addr: host,
+                    port,
+                    client_id: self.config.client_id,
+                    client_type: ClientType::Fuse,
+                    connect_timeout: self.config.connect_timeout,
+                    request_timeout: self.config.request_timeout,
+                    max_retries: 3,
+                    retry_delay: Duration::from_millis(100),
+                    heartbeat_interval: Duration::from_secs(30),
+                    max_inflight_requests: 256,
+                });
+                new_client.connect().await?;
+                let redirect_resp = new_client
+                    .send_request(msg_type, body.as_slice(), data)
+                    .await?;
+                return Ok(redirect_resp);
+            }
+        }
+
+        Ok(resp)
+    }
+
     /// Create a file
     pub async fn create_file(
         &self,
@@ -266,12 +333,11 @@ impl PowerFuseNetClient {
         enc.add_u64(FieldId::Gid, gid);
 
         let resp = self
-            .filer_client
-            .send_request(MsgType::Create, enc.into_bytes().as_slice(), &[])
+            .send_request_with_redirect(MsgType::Create, enc.into_bytes(), &[])
             .await?;
 
         if !resp.is_ok() {
-            return Err(powerfs_net::NetError::ServerError("create failed".into()));
+            return Err(NetError::ServerError("create failed".into()));
         }
 
         let mut dec = TlvDecoder::new(&resp.body);
@@ -296,12 +362,11 @@ impl PowerFuseNetClient {
         enc.add_u64(FieldId::Gid, gid);
 
         let resp = self
-            .filer_client
-            .send_request(MsgType::Mkdir, enc.into_bytes().as_slice(), &[])
+            .send_request_with_redirect(MsgType::Mkdir, enc.into_bytes(), &[])
             .await?;
 
         if !resp.is_ok() {
-            return Err(powerfs_net::NetError::ServerError("mkdir failed".into()));
+            return Err(NetError::ServerError("mkdir failed".into()));
         }
 
         let mut dec = TlvDecoder::new(&resp.body);
@@ -316,12 +381,11 @@ impl PowerFuseNetClient {
         enc.add_string(FieldId::Name, name)?;
 
         let resp = self
-            .filer_client
-            .send_request(MsgType::Unlink, enc.into_bytes().as_slice(), &[])
+            .send_request_with_redirect(MsgType::Unlink, enc.into_bytes(), &[])
             .await?;
 
         if !resp.is_ok() {
-            return Err(powerfs_net::NetError::ServerError("unlink failed".into()));
+            return Err(NetError::ServerError("unlink failed".into()));
         }
         Ok(())
     }
@@ -333,12 +397,11 @@ impl PowerFuseNetClient {
         enc.add_string(FieldId::Name, name)?;
 
         let resp = self
-            .filer_client
-            .send_request(MsgType::Rmdir, enc.into_bytes().as_slice(), &[])
+            .send_request_with_redirect(MsgType::Rmdir, enc.into_bytes(), &[])
             .await?;
 
         if !resp.is_ok() {
-            return Err(powerfs_net::NetError::ServerError("rmdir failed".into()));
+            return Err(NetError::ServerError("rmdir failed".into()));
         }
         Ok(())
     }
@@ -442,12 +505,7 @@ impl PowerFuseNetClient {
     }
 
     /// Create a symbolic link
-    pub async fn symlink(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        target: &str,
-    ) -> NetResult<u64> {
+    pub async fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> NetResult<u64> {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::ParentIno, parent_ino);
         enc.add_string(FieldId::Name, name)?;
@@ -487,12 +545,7 @@ impl PowerFuseNetClient {
     }
 
     /// Create a hard link
-    pub async fn link(
-        &self,
-        ino: u64,
-        new_parent_ino: u64,
-        new_name: &str,
-    ) -> NetResult<u64> {
+    pub async fn link(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> NetResult<u64> {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::Ino, ino);
         enc.add_u64(FieldId::ParentIno, new_parent_ino);
@@ -781,35 +834,6 @@ impl PowerFuseNetClient {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_encode_assign_req() {
-        let body =
-            PowerFuseNetClient::encode_assign_req("test_collection", "000", 1, 64 * 1024 * 1024)
-                .unwrap();
-        assert!(!body.is_empty());
-
-        let mut dec = TlvDecoder::new(&body);
-        let name = dec.next_string(FieldId::Name).unwrap();
-        assert_eq!(name, "test_collection");
-        let backend = dec.next_string(FieldId::Backend).unwrap();
-        assert_eq!(backend, "000");
-    }
-
-    #[test]
-    fn test_encode_lookup_volume_req() {
-        let body = PowerFuseNetClient::encode_lookup_volume_req(&["1".to_string()]).unwrap();
-        assert!(!body.is_empty());
-
-        let mut dec = TlvDecoder::new(&body);
-        let vid = dec.next_string(FieldId::Name).unwrap();
-        assert_eq!(vid, "1");
-    }
-}
-
 // ============================================================================
 // SyncFuseNetClient - synchronous wrapper for PowerFuseNetClient
 // ============================================================================
@@ -820,11 +844,20 @@ mod tests {
 pub struct SyncFuseNetClient {
     client: Arc<PowerFuseNetClient>,
     config: NetClientConfig,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl SyncFuseNetClient {
-    pub fn new(client: Arc<PowerFuseNetClient>, config: NetClientConfig) -> Self {
-        Self { client, config }
+    pub fn new(
+        client: Arc<PowerFuseNetClient>,
+        config: NetClientConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            runtime,
+        }
     }
 
     pub fn inner(&self) -> &Arc<PowerFuseNetClient> {
@@ -832,7 +865,10 @@ impl SyncFuseNetClient {
     }
 
     /// Create a new SyncFuseNetClient from config (connects asynchronously)
-    pub async fn connect(config: NetClientConfig) -> NetResult<Self> {
+    pub async fn connect(
+        config: NetClientConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> NetResult<Self> {
         let client = PowerFuseNetClient::new(config.clone()).await?;
 
         info!(
@@ -843,6 +879,7 @@ impl SyncFuseNetClient {
         Ok(Self {
             client: Arc::new(client),
             config,
+            runtime,
         })
     }
 
@@ -850,22 +887,13 @@ impl SyncFuseNetClient {
     where
         F: std::future::Future<Output = NetResult<T>>,
     {
-        thread_local! {
-            static BLOCKING_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Runtime>> =
-                const { std::cell::RefCell::new(None) };
-        }
-
-        BLOCKING_RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            if rt.is_none() {
-                *rt = Some(tokio::runtime::Runtime::new().unwrap());
+        // Use the shared runtime that owns the TCP streams.
+        // This ensures the reactor knows about the streams' readiness events.
+        self.runtime.block_on(async {
+            match tokio::time::timeout(timeout, future).await {
+                Ok(result) => result,
+                Err(_) => Err(powerfs_net::NetError::Timeout),
             }
-            rt.as_ref().unwrap().block_on(async {
-                match tokio::time::timeout(timeout, future).await {
-                    Ok(result) => result,
-                    Err(_) => Err(powerfs_net::NetError::Timeout),
-                }
-            })
         })
     }
 
@@ -985,12 +1013,7 @@ impl SyncFuseNetClient {
     }
 
     /// Create a symbolic link (sync)
-    pub fn symlink(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        target: &str,
-    ) -> NetResult<u64> {
+    pub fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> NetResult<u64> {
         self.block_with_default_timeout(self.client.symlink(parent_ino, name, target))
     }
 
@@ -1000,12 +1023,7 @@ impl SyncFuseNetClient {
     }
 
     /// Create a hard link (sync)
-    pub fn link(
-        &self,
-        ino: u64,
-        new_parent_ino: u64,
-        new_name: &str,
-    ) -> NetResult<u64> {
+    pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> NetResult<u64> {
         self.block_with_default_timeout(self.client.link(ino, new_parent_ino, new_name))
     }
 
@@ -1265,8 +1283,12 @@ impl SyncFuseNetClient {
         limit: u64,
         start_after: &str,
     ) -> Result<Vec<Entry>, String> {
+        // Use a shorter timeout for readdir to avoid blocking FUSE operations
         let entries = self
-            .block_with_default_timeout(self.client.readdir(parent_ino, limit, start_after))
+            .block_with_timeout(
+                self.client.readdir(parent_ino, limit, start_after),
+                Duration::from_secs(2),
+            )
             .map_err(|e| format!("net readdir failed: {}", e))?;
 
         Ok(entries
@@ -1369,4 +1391,33 @@ fn extract_addr_from_url(url: &str) -> String {
         .and_then(|s| s.split(':').next())
         .unwrap_or(url)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_assign_req() {
+        let body =
+            PowerFuseNetClient::encode_assign_req("test_collection", "000", 1, 64 * 1024 * 1024)
+                .unwrap();
+        assert!(!body.is_empty());
+
+        let mut dec = TlvDecoder::new(&body);
+        let name = dec.next_string(FieldId::Name).unwrap();
+        assert_eq!(name, "test_collection");
+        let backend = dec.next_string(FieldId::Backend).unwrap();
+        assert_eq!(backend, "000");
+    }
+
+    #[test]
+    fn test_encode_lookup_volume_req() {
+        let body = PowerFuseNetClient::encode_lookup_volume_req(&["1".to_string()]).unwrap();
+        assert!(!body.is_empty());
+
+        let mut dec = TlvDecoder::new(&body);
+        let vid = dec.next_string(FieldId::Name).unwrap();
+        assert_eq!(vid, "1");
+    }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "powerfs-s3"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "powerfs-s3"
+path = "src/main.rs"
+
+[dependencies]
+powerfs-common = { path = "../powerfs-common" }
+powerfs-master = { path = "../powerfs-master" }
+clap = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

@@ -37,14 +37,14 @@ echo "Host IP: $HOST_IP"
 echo ""
 
 if [ "$BUILD_IMAGES" = true ]; then
-    echo "[1/7] Building Docker images..."
+    echo "[1/8] Building Docker images..."
     cd "$DOCKER_DIR"
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
     echo "  Building Rust binaries..."
     cd "$PROJECT_DIR"
     source "$HOME/.cargo/env" 2>/dev/null || true
-    cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor $SPDK_FEATURE 2>&1 | tail -5
+    cargo build --release --bin powerfs-master --bin powerfs-filer --bin powerfs-s3 --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse $SPDK_FEATURE 2>&1 | tail -5
     echo "  [OK] Binaries built"
 
     echo "  Building Docker image..."
@@ -52,13 +52,13 @@ if [ "$BUILD_IMAGES" = true ]; then
     docker compose build 2>&1 | tail -5
     echo "[OK] Images built"
 else
-    echo "[1/7] Using existing Docker images..."
+    echo "[1/8] Using existing Docker images..."
     echo "  Use --build or -b flag to rebuild images"
     echo "[OK] Using existing images"
 fi
 
 echo ""
-echo "[2/7] Starting Redis..."
+echo "[2/8] Starting Redis..."
 cd "$DOCKER_DIR"
 docker compose up -d redis
 
@@ -79,7 +79,7 @@ if [ $timeout -eq 0 ]; then
 fi
 
 echo ""
-echo "[3/7] Starting Master nodes..."
+echo "[3/8] Starting Master nodes..."
 docker compose up -d --no-deps master-1
 
 echo "  Waiting for master-1 to be ready..."
@@ -133,7 +133,7 @@ if [ $timeout -eq 0 ]; then
 fi
 
 echo ""
-echo "[4/7] Starting Volume nodes..."
+echo "[4/8] Starting Volume nodes..."
 docker compose up -d --no-deps volume-1 volume-2 volume-3
 
 echo "  Waiting for volumes to register..."

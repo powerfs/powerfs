@@ -134,7 +134,7 @@ if [ "$BUILD_IMAGES" = true ]; then
         BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
         log_info "  Step 3b: Starting build at $BUILD_TIME..."
         
-        BUILD_CMD="cargo build --release --bin powerfs --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse --bin powerfs-filer"
+        BUILD_CMD="cargo build --release --bin powerfs-master --bin powerfs-filer --bin powerfs-s3 --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse"
         
         log_debug "  Running: $BUILD_CMD"
         

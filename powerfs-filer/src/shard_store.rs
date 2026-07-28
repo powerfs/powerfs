@@ -480,7 +480,7 @@ impl ShardStore {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o644,
+            mode: 0o100644,
             uid: 0,
             gid: 0,
             blocks: 0,
@@ -554,7 +554,7 @@ impl ShardStore {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o644,
+            mode: 0o100644,
             uid: 0,
             gid: 0,
             blocks: size.div_ceil(4096),
@@ -681,7 +681,7 @@ impl ShardStore {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o755,
+            mode: 0o040755,
             uid: 0,
             gid: 0,
             blocks: 0,
@@ -1113,7 +1113,7 @@ impl ShardStore {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o777,
+            mode: 0o120777,
             uid: 0,
             gid: 0,
             blocks: 0,
@@ -1174,19 +1174,30 @@ impl ShardStore {
             .db
             .put_cf(cf_dir_entries, dir_entry_key.as_bytes(), inode_value);
 
+        // Update directory entries
         {
             let mut dir_entries = self.directory_entries.write().unwrap();
             dir_entries.entry(new_parent_inode).or_default();
             if let Some(dir) = dir_entries.get_mut(&new_parent_inode) {
                 dir.insert(new_name, inode);
             }
+        }
 
-            // Update nlink count
+        // Update nlink count - clone info while holding the lock,
+        // then release before calling update_inode to avoid deadlock
+        // (update_inode also tries to acquire inodes.write())
+        let info_to_update = {
             let mut inodes = self.inodes.write().unwrap();
             if let Some(info) = inodes.get_mut(&inode) {
                 info.nlink += 1;
-                let _ = self.update_inode(info.clone());
+                Some(info.clone())
+            } else {
+                None
             }
+        };
+
+        if let Some(info) = info_to_update {
+            let _ = self.update_inode(info);
         }
 
         info!(

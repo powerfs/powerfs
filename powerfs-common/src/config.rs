@@ -136,7 +136,7 @@ impl Default for VolumeConfig {
             grpc_port: 8080,
             http_port: 8090,
             data_dir: "./data/volume".to_string(),
-            master_addresses: vec!["http://localhost:9333".to_string()],
+            master_addresses: vec!["localhost:9333".to_string()],
             node_id: "volume-server".to_string(),
             max_volume_size: 1073741824,
             initial_volume_count: 2,
@@ -151,7 +151,7 @@ impl Default for FilerConfig {
         Self {
             port: 8888,
             grpc_port: 8889,
-            master_addresses: vec!["http://localhost:9333".to_string()],
+            master_addresses: vec!["localhost:9333".to_string()],
             ip: None,
             data_dir: "./data/filer".to_string(),
             shard_count: 4,
@@ -165,7 +165,7 @@ impl Default for S3Config {
     fn default() -> Self {
         Self {
             port: 9000,
-            master_address: "http://localhost:9333".to_string(),
+            master_address: "localhost:9333".to_string(),
             ip: None,
             dir: "./data/s3".to_string(),
             access_key: "powerfs".to_string(),
@@ -178,7 +178,7 @@ impl Default for FuseConfig {
     fn default() -> Self {
         Self {
             mount_point: "/mnt/powerfs".to_string(),
-            master_addresses: vec!["http://localhost:9333".to_string()],
+            master_addresses: vec!["localhost".to_string()],
             filer_addresses: Vec::new(),
             collection: "default".to_string(),
             replication: "000".to_string(),

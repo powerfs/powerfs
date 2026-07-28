@@ -1,82 +1,38 @@
 #!/bin/bash
-set -e
+# PowerFS Quick Cleanup Script
+# Simple cleanup - delegates to full cleanup in env/cleanup.sh
 
-MOUNT_DIR="${1:-/tmp/powerfs-bench-mount}"
-MASTER_DIR="${2:-/tmp/powerfs-bench-master}"
-VOLUME_DIR="${3:-/tmp/powerfs-bench-volume}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
-cleanup_processes() {
-    echo "Cleaning up powerfs processes..."
-    
-    pkill -f "powerfs master" 2>/dev/null || true
-    pkill -f "powerfs-volume" 2>/dev/null || true
-    pkill -f "powerfs-fuse" 2>/dev/null || true
-    pkill -f "powerfs-server" 2>/dev/null || true
-    pkill -f "powerfs-monitor" 2>/dev/null || true
-    pkill -f "powerfs-s3" 2>/dev/null || true
-    
-    sleep 1
-    
-    for pid in $(pgrep -f "powerfs" 2>/dev/null); do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    
-    sleep 0.5
-}
+echo "=== PowerFS Quick Cleanup ==="
+echo ""
 
-cleanup_test_processes() {
-    echo "Cleaning up leftover test processes..."
-    
-    for proc in "cargo test" "rustc" "sync_test" "coherence_phase" "master_outage" "filer_api_test"; do
-        pids=$(pgrep -f "$proc" 2>/dev/null)
-        for pid in $pids; do
-            kill -9 "$pid" 2>/dev/null || true
-        done
-    done
-    
-    sleep 0.5
-}
+# Use the full cleanup script
+source "$PROJECT_ROOT/scripts/lib/common.sh"
 
-cleanup_mount() {
-    echo "Cleaning up mount points..."
-    
-    if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-        fusermount -uz "$MOUNT_DIR" 2>/dev/null || umount -f "$MOUNT_DIR" 2>/dev/null || true
-        sleep 0.5
-        rm -rf "$MOUNT_DIR" 2>/dev/null || true
-    elif [ -d "$MOUNT_DIR" ]; then
-        rm -rf "$MOUNT_DIR" 2>/dev/null || true
+setup_test_env
+cleanup_test_env
+
+# Also clean up common mount points
+for mp in /tmp/powerfs-perf-test /tmp/powerfs-bench-mount /mnt/powerfs/test; do
+    if mountpoint -q "$mp" 2>/dev/null; then
+        echo "Unmounting $mp..."
+        fusermount -uz "$mp" 2>/dev/null || umount -f "$mp" 2>/dev/null || true
     fi
-}
+done
 
-cleanup_dirs() {
-    echo "Cleaning up data directories..."
-    
-    rm -rf "$MASTER_DIR" 2>/dev/null || true
-    rm -rf "$VOLUME_DIR" 2>/dev/null || true
-}
+# Kill any remaining processes
+pkill -9 -f "powerfs-master" 2>/dev/null || true
+pkill -9 -f "powerfs-filer" 2>/dev/null || true
+pkill -9 -f "powerfs-volume" 2>/dev/null || true
+pkill -9 -f "powerfs-fuse" 2>/dev/null || true
+pkill -9 -f "powerfs-s3" 2>/dev/null || true
+pkill -9 -f "powerfs-monitor" 2>/dev/null || true
 
-cleanup_ports() {
-    echo "Cleaning up leftover port listeners..."
-    
-    for port in 9333 9334 9335 8080 8081 8082 8083; do
-        pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
-        if [ -n "$pid" ]; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-    done
-}
+# Clean up temp directories
+rm -rf /tmp/powerfs-* 2>/dev/null || true
 
-main() {
-    echo "=== PowerFS Cleanup Script ==="
-    
-    cleanup_mount
-    cleanup_processes
-    cleanup_test_processes
-    cleanup_ports
-    cleanup_dirs
-    
-    echo "=== Cleanup complete ==="
-}
-
-main "$@"
+echo ""
+echo "=== Cleanup complete ==="
+echo "For full cleanup including Docker, use: $PROJECT_ROOT/scripts/env/cleanup.sh --docker"

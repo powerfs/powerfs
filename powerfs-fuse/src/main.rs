@@ -3,6 +3,7 @@ use log::{error, info, warn};
 use std::ffi::CString;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use powerfs_fuse::FuseApp;
@@ -17,8 +18,8 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[command(about = "PowerFS FUSE client - mount PowerFS as a filesystem via powerfs-net")]
 struct Args {
     /// Master server addresses (e.g. localhost)
-    #[arg(long, default_value = "localhost")]
-    master: Vec<String>,
+    #[arg(long)]
+    master: Option<Vec<String>>,
 
     /// Master powerfs-net port
     #[arg(long, default_value = "9334")]
@@ -118,8 +119,12 @@ fn main() {
     let cfg = load_config(&args.config);
     let fuse_cfg = cfg.fuse;
 
-    let master_addrs = if !args.master.is_empty() && args.master != vec!["localhost".to_string()] {
-        args.master.clone()
+    let master_addrs = if let Some(addrs) = &args.master {
+        if addrs.is_empty() {
+            fuse_cfg.master_addresses.clone()
+        } else {
+            addrs.clone()
+        }
     } else {
         fuse_cfg.master_addresses.clone()
     };
@@ -279,8 +284,9 @@ fn main() {
 
     // Create tokio runtime
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let runtime_arc = Arc::new(runtime);
 
-    let result = runtime.block_on(async {
+    let result = runtime_arc.block_on(async {
         let fuse_client = FuseApp::new(
             &master_addrs,
             &mount_point,
@@ -290,6 +296,7 @@ fn main() {
             volume_net_port,
             filer_addr,
             filer_net_port,
+            runtime_arc.clone(),
         )
         .await
         .expect("Failed to create FUSE client");

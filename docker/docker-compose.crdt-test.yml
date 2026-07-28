@@ -48,7 +48,7 @@ services:
     environment:
       - REDIS_URL=redis://172.31.0.10:6379
     command: >
-      /app/powerfs master
+      /app/powerfs-master
       --port 9333
       --dir /data/master
       --raft-id 1
@@ -80,17 +80,18 @@ services:
       - "18889:8889"    # gRPC API
     command: >
       /app/powerfs-filer
-      --node-id 1
-      --s3-address 0.0.0.0:8888
-      --grpc-address 0.0.0.0:8889
-      --raft-address 172.31.0.21:8889
-      --data-dir /data/filer
+      --port 8888
+      --grpc-port 8889
+      --net-port 8890
+      --raft-id 1
+      -D /data/filer
       --shard-count 3
-      --master-address 172.31.0.11:9333
-      --redis-address redis://172.31.0.10:6379/
-      --peers 172.31.0.21:8889
-      --peers 172.31.0.22:8889
-      --peers 172.31.0.23:8889
+      --master 172.31.0.11:9333
+      --raft-peer 172.31.0.21:8889
+      --raft-peer 172.31.0.22:8889
+      --raft-peer 172.31.0.23:8889
+    environment:
+      - REDIS_URL=redis://172.31.0.10:6379/
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s
@@ -116,17 +117,18 @@ services:
       - "28889:8889"
     command: >
       /app/powerfs-filer
-      --node-id 2
-      --s3-address 0.0.0.0:8888
-      --grpc-address 0.0.0.0:8889
-      --raft-address 172.31.0.22:8889
-      --data-dir /data/filer
+      --port 8888
+      --grpc-port 8889
+      --net-port 8890
+      --raft-id 2
+      -D /data/filer
       --shard-count 3
-      --master-address 172.31.0.11:9333
-      --redis-address redis://172.31.0.10:6379/
-      --peers 172.31.0.21:8889
-      --peers 172.31.0.22:8889
-      --peers 172.31.0.23:8889
+      --master 172.31.0.11:9333
+      --raft-peer 172.31.0.21:8889
+      --raft-peer 172.31.0.22:8889
+      --raft-peer 172.31.0.23:8889
+    environment:
+      - REDIS_URL=redis://172.31.0.10:6379/
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s
@@ -152,17 +154,18 @@ services:
       - "38889:8889"
     command: >
       /app/powerfs-filer
-      --node-id 3
-      --s3-address 0.0.0.0:8888
-      --grpc-address 0.0.0.0:8889
-      --raft-address 172.31.0.23:8889
-      --data-dir /data/filer
+      --port 8888
+      --grpc-port 8889
+      --net-port 8890
+      --raft-id 3
+      -D /data/filer
       --shard-count 3
-      --master-address 172.31.0.11:9333
-      --redis-address redis://172.31.0.10:6379/
-      --peers 172.31.0.21:8889
-      --peers 172.31.0.22:8889
-      --peers 172.31.0.23:8889
+      --master 172.31.0.11:9333
+      --raft-peer 172.31.0.21:8889
+      --raft-peer 172.31.0.22:8889
+      --raft-peer 172.31.0.23:8889
+    environment:
+      - REDIS_URL=redis://172.31.0.10:6379/
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8889 || exit 1"]
       interval: 5s

@@ -5,13 +5,15 @@
 //! storage, Raft consensus, and CRDT support.
 
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
+use crate::raft_group_manager::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
 use powerfs_net::serialize::{EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     ClientType, FieldId, FrameFlags, MsgType, NetMessage, NetResult, PowerFsNetHandler,
-    STATUS_ERR_NOT_FOUND, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    RequestContext, ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
+    STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 
@@ -45,6 +47,40 @@ impl FilerNetHandler {
         NetMessage::new(header).with_body(body)
     }
 
+    /// Check if current node is the leader for the given shard.
+    /// Returns Ok(()) if leader, or Err(redirect_response) if not.
+    async fn check_leader(&self, msg: &NetMessage, shard_id: ShardId) -> Result<(), NetMessage> {
+        match self
+            .meta_shard_manager
+            .get_shard_leader_status(shard_id)
+            .await
+        {
+            Some((true, _)) => Ok(()),
+            Some((false, leader_addr)) if !leader_addr.is_empty() => {
+                // Return redirect response with leader address
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Owner, &leader_addr);
+                Err(Self::build_response(
+                    msg,
+                    STATUS_ERR_REDIRECT,
+                    enc.into_bytes(),
+                ))
+            }
+            _ => {
+                // Unknown leader status - cluster not ready, reject write
+                warn!(
+                    "Leader status unknown for shard {}, rejecting write",
+                    shard_id.0
+                );
+                Err(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     /// Convert InodeInfo to EntryInfo for powerfs-net response
     fn inode_to_entry_info(info: &InodeInfo) -> EntryInfo {
         let is_dir = matches!(info.file_type, FileType::Directory);
@@ -74,7 +110,10 @@ impl FilerNetHandler {
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
 
-        info!("FILER_NET_LOOKUP: parent_ino={}, name={}", parent_ino, name);
+        info!(
+            "FILER_NET_LOOKUP: seq={}, parent_ino={}, name={}",
+            msg.header.seq, parent_ino, name
+        );
 
         // Root lookup - return root entry
         if parent_ino == POSIX_ROOT_INODE && name.is_empty() {
@@ -195,6 +234,15 @@ impl FilerNetHandler {
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
 
+        // Check leader - redirect write requests to the correct leader
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_CREATE: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
         match self
             .meta_shard_manager
             .create_file_with_shard(parent_ino, &name, shard_id)
@@ -238,6 +286,17 @@ impl FilerNetHandler {
             parent_ino, name, mode
         );
 
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+
+        // Check leader - redirect write requests to the correct leader
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_MKDIR: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
         match self
             .meta_shard_manager
             .create_directory(parent_ino, &name)
@@ -278,6 +337,16 @@ impl FilerNetHandler {
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
             Some(info) => {
                 let shard_id = self.shard_strategy.calculate_shard(info.inode);
+
+                // Check leader - redirect write requests to the correct leader
+                if let Err(redirect) = self.check_leader(msg, shard_id).await {
+                    warn!(
+                        "FILER_NET_UNLINK: not leader for shard {}, redirecting",
+                        shard_id.0
+                    );
+                    return Ok(redirect);
+                }
+
                 match self
                     .meta_shard_manager
                     .delete_file_by_inode(info.inode, shard_id)
@@ -305,6 +374,17 @@ impl FilerNetHandler {
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
 
         info!("FILER_NET_RMDIR: parent_ino={}, name={}", parent_ino, name);
+
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+
+        // Check leader - redirect write requests to the correct leader
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_RMDIR: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
 
         match self
             .meta_shard_manager
@@ -490,14 +570,14 @@ impl FilerNetHandler {
 
 #[async_trait::async_trait]
 impl PowerFsNetHandler for FilerNetHandler {
-    async fn handle_request(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_request(&self, client_id: u64, msg: &NetMessage) -> NetResult<NetMessage> {
         let msg_type = msg
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
         debug!(
-            "FILER_NET: handling request {:?}, seq={}",
-            msg_type, msg.header.seq
+            "FILER_NET: handling request {:?}, client_id={}, seq={}",
+            msg_type, client_id, msg.header.seq
         );
 
         match msg_type {
@@ -533,5 +613,49 @@ impl PowerFsNetHandler for FilerNetHandler {
             "FILER_NET: client connected, id={}, type={:?}",
             _client_id, _client_type
         );
+    }
+}
+
+#[async_trait::async_trait]
+impl ServerRequestHandler for FilerNetHandler {
+    async fn handle(&self, ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+        let msg_type = msg
+            .msg_type()
+            .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
+
+        debug!(
+            "FILER_NET: handling request {:?}, trace={}, client_id={}, seq={}",
+            msg_type,
+            ctx.trace_id(),
+            ctx.client.client_id,
+            msg.header.seq
+        );
+
+        match msg_type {
+            MsgType::Lookup => self.handle_lookup(msg).await,
+            MsgType::GetAttr => self.handle_getattr(msg).await,
+            MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::Create => self.handle_create(msg).await,
+            MsgType::Mkdir => self.handle_mkdir(msg).await,
+            MsgType::Unlink => self.handle_unlink(msg).await,
+            MsgType::Rmdir => self.handle_rmdir(msg).await,
+            MsgType::Rename => self.handle_rename(msg).await,
+            MsgType::ReadDir => self.handle_readdir(msg).await,
+            MsgType::StatFs => self.handle_statfs(msg).await,
+            MsgType::Symlink => self.handle_symlink(msg).await,
+            MsgType::Readlink => self.handle_readlink(msg).await,
+            MsgType::Link => self.handle_link(msg).await,
+            MsgType::Ping => {
+                let flags = FrameFlags::new(FrameFlags::RESPONSE);
+                let header =
+                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
+                        .with_status(STATUS_OK);
+                Ok(NetMessage::new(header))
+            }
+            _ => {
+                warn!("FILER_NET: unsupported message type {:?}", msg_type);
+                Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
+            }
+        }
     }
 }

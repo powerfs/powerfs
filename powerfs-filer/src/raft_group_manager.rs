@@ -246,11 +246,21 @@ impl RaftGroup {
         info!("Starting Raft event loop for shard {}", self.shard_id.0);
 
         let mut tick_interval = interval(Duration::from_millis(200));
+        let mut tick_count = 0u64;
 
         while *self.running.read().await {
             tokio::select! {
                 _ = tick_interval.tick() => {
                     self.node.tick();
+                    tick_count += 1;
+
+                    // Log state periodically
+                    if tick_count.is_multiple_of(50) {
+                        let state = format!("{:?}", self.node.raft.state);
+                        let leader_id = self.node.raft.leader_id;
+                        debug!("Shard {} tick #{}, state={}, leader_id={}", self.shard_id.0, tick_count, state, leader_id);
+                    }
+
                     self.update_leader_address();
                     while self.node.has_ready() {
                         self.process_ready();
@@ -290,6 +300,10 @@ impl RaftGroup {
         if let Some(ss) = ready.ss() {
             let is_leader_now = ss.raft_state == StateRole::Leader;
             let prev = self.leader_state.swap(is_leader_now, Ordering::Relaxed);
+            info!(
+                "Shard {} state change: is_leader={}, prev={}, leader_id={:?}",
+                self.shard_id.0, is_leader_now, prev, self.node.raft.leader_id
+            );
 
             let new_leader_addr = if is_leader_now {
                 self.address.clone()
@@ -460,10 +474,10 @@ impl RaftGroup {
             message: bytes::Bytes::from(buf),
         };
 
-        if self.message_tx.send(outgoing).is_err() {
+        if let Err(e) = self.message_tx.send(outgoing) {
             warn!(
-                "Shard {} failed to send message to {}",
-                self.shard_id.0, to_id
+                "Shard {} failed to send message to {}: {}",
+                self.shard_id.0, to_id, e
             );
         }
     }
@@ -542,7 +556,14 @@ impl RaftGroup {
     }
 
     pub fn is_leader(&self) -> bool {
-        self.node.raft.state == StateRole::Leader
+        let result = self.node.raft.state == StateRole::Leader;
+        if result {
+            debug!(
+                "Shard {}: is_leader()=true, state={:?}",
+                self.shard_id.0, self.node.raft.state
+            );
+        }
+        result
     }
 
     pub fn is_follower(&self) -> bool {
@@ -842,9 +863,14 @@ impl RaftGroupManager {
 
     /// Start the Raft message transmission loop
     pub async fn start_message_transmitter(self: Arc<Self>) {
+        eprintln!("[DEBUG] start_message_transmitter called, creating subscriber");
+        info!("start_message_transmitter called, creating subscriber");
         let mut message_rx = self.message_tx.subscribe();
+        eprintln!("[DEBUG] Subscriber created, spawning transmitter task");
+        info!("Subscriber created, spawning transmitter task");
 
         tokio::spawn(async move {
+            eprintln!("[DEBUG] Raft message transmitter started");
             info!("Raft message transmitter started");
 
             while let Ok(outgoing) = message_rx.recv().await {
@@ -1046,6 +1072,18 @@ impl RaftGroupManager {
         // term and commit_index are not exposed without the group lock; return
         // 0 for both (consistent with RaftGroup::get_status).
         Some((is_leader, 0, 0, applied))
+    }
+
+    /// Get the leader status and address for a given shard.
+    /// Returns (is_leader, leader_address).
+    pub async fn get_shard_leader_status(&self, shard_id: ShardId) -> Option<(bool, String)> {
+        let arcs = self.shard_status_arcs.read().await;
+        let handle = arcs.get(&shard_id)?;
+        let is_leader = handle
+            .leader_state
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let leader_addr = handle.leader_address.read().unwrap().clone();
+        Some((is_leader, leader_addr))
     }
 
     pub async fn list_shards(&self) -> Vec<ShardId> {

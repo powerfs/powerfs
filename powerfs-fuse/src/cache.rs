@@ -176,7 +176,7 @@ impl MetadataCache {
         path_map.get(path).copied()
     }
 
-    /// Insert an entry into the cache
+    /// Insert an entry into the cache (only update path_map, keep existing inode_cache entry for hard links)
     pub fn insert(&self, entry: CachedEntry) {
         let parent = entry.parent;
         let inode = entry.inode;
@@ -215,10 +215,29 @@ impl MetadataCache {
             let mut path_map = self.path_map.write().unwrap();
             path_map.insert(path, inode);
         }
-        {
-            let mut cache = self.inode_cache.write().unwrap();
+        // Update inode_cache:
+        // - If this is a new inode: insert the entry as-is
+        // - If the inode exists but name/parent changed: treat as rename, update the entry
+        // - If the inode exists with same name/parent: treat as hard link, preserve
+        //   the original hard_link_id and update hard_link_counter if provided
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(existing) = cache.get_mut(&inode) {
+            if existing.name != entry.name || existing.parent != entry.parent {
+                // Rename: replace with the new entry's metadata
+                *existing = entry;
+            } else {
+                // Hard link: keep the original hard_link_id, refresh counter
+                if !entry.hard_link_id.is_empty() && existing.hard_link_id.is_empty() {
+                    existing.hard_link_id = entry.hard_link_id.clone();
+                }
+                if entry.hard_link_counter > 0 {
+                    existing.hard_link_counter = entry.hard_link_counter;
+                }
+            }
+        } else {
             cache.put(inode, entry);
         }
+        drop(cache);
         self.invalidate_dir(parent);
     }
 
@@ -239,6 +258,63 @@ impl MetadataCache {
                 path_map.remove(&path);
             }
             drop(path_map);
+            self.invalidate_dir(entry.parent);
+        }
+    }
+
+    /// Remove a specific path for an inode (used for hard links)
+    pub fn remove_path(&self, inode: u64, path: &str) {
+        // Remove the specific path mapping
+        {
+            let mut path_map = self.path_map.write().unwrap();
+            path_map.remove(path);
+        }
+
+        // Check if this was the entry stored in inode_cache (just check if entry exists)
+        let has_cache_entry = {
+            let cache = self.inode_cache.read().unwrap();
+            cache.contains(&inode)
+        };
+
+        // Now check if the path we're removing matches the cached entry's path
+        let should_update = if has_cache_entry {
+            let entry_path = self.get_path_by_parent_chain(inode);
+            if let Some(ep) = entry_path {
+                ep == path
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_update {
+            // Find another path for this inode and update the inode_cache entry
+            {
+                let path_map = self.path_map.read().unwrap();
+                let mut new_path = None;
+                for (p, ino) in path_map.iter() {
+                    if *ino == inode && p != path {
+                        new_path = Some(p.clone());
+                        break;
+                    }
+                }
+                drop(path_map);
+
+                if let Some(np) = new_path {
+                    // Get current entry and update its name
+                    let mut cache = self.inode_cache.write().unwrap();
+                    if let Some(entry) = cache.get_mut(&inode) {
+                        // Extract name from the new path
+                        let name = np.rsplit('/').next().unwrap_or("").to_string();
+                        entry.name = name;
+                    }
+                }
+            }
+        }
+
+        // Invalidate the parent directory cache
+        if let Some(entry) = self.get_inode(inode) {
             self.invalidate_dir(entry.parent);
         }
     }
@@ -326,15 +402,83 @@ impl MetadataCache {
         }
     }
 
-    /// List children of a directory from cache
+    /// List children of a directory from cache (supports hard links via path_map)
     pub fn list_children(&self, parent_inode: u64) -> Vec<(u64, String, bool)> {
-        let cache = self.inode_cache.read().unwrap();
+        let parent_path = match self.inode_to_path(parent_inode) {
+            Some(p) => p,
+            None => {
+                // Fallback: use inode_cache only
+                let cache = self.inode_cache.read().unwrap();
+                let mut children = Vec::new();
+                for (_, entry) in cache.iter() {
+                    if entry.parent == parent_inode && entry.inode != parent_inode {
+                        children.push((entry.inode, entry.name.clone(), entry.is_dir));
+                    }
+                }
+                return children;
+            }
+        };
+
+        let path_map = self.path_map.read().unwrap();
         let mut children = Vec::new();
-        for (_, entry) in cache.iter() {
-            if entry.parent == parent_inode && entry.inode != parent_inode {
-                children.push((entry.inode, entry.name.clone(), entry.is_dir));
+
+        let prefix = if parent_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", parent_path)
+        };
+
+        // Collect all entries from path_map that are direct children
+        // Each path represents a separate directory entry, even if they point to the same inode (hard links)
+        for (path, ino) in path_map.iter() {
+            if path.starts_with(&prefix) && *ino != parent_inode {
+                // Check if it's a direct child (no additional slashes beyond the prefix)
+                let relative = &path[prefix.len()..];
+                if !relative.is_empty() && !relative.contains('/') {
+                    // Get is_dir from inode_cache, but use the name from the path
+                    let is_dir = self.get_inode(*ino).map(|e| e.is_dir).unwrap_or(false);
+                    children.push((*ino, relative.to_string(), is_dir));
+                }
             }
         }
+        drop(path_map);
+
+        // Also check inode_cache for any entries that might not be in path_map
+        // Use a set of (inode, name) pairs to avoid duplicates, but allow hard links with different names
+        let cache = self.inode_cache.read().unwrap();
+        let mut seen_pairs = std::collections::HashSet::new();
+        for (_, entry) in cache.iter() {
+            if entry.parent == parent_inode && entry.inode != parent_inode {
+                let pair = (entry.inode, entry.name.clone());
+                if seen_pairs.insert(pair) {
+                    // Check if this entry is already in children
+                    let already_exists = children
+                        .iter()
+                        .any(|(ino, name, _)| *ino == entry.inode && *name == entry.name);
+                    if !already_exists {
+                        children.push((entry.inode, entry.name.clone(), entry.is_dir));
+                    }
+                }
+            }
+        }
+
+        drop(cache);
+
+        // Debug logging
+        log::debug!(
+            "list_children(parent_inode={}, parent_path={}) returned {} children: {:?}",
+            parent_inode,
+            parent_path,
+            children.len(),
+            children
+                .iter()
+                .map(|(ino, name, is_dir)| format!(
+                    "(inode={}, name={}, is_dir={})",
+                    ino, name, is_dir
+                ))
+                .collect::<Vec<_>>()
+        );
+
         children
     }
 

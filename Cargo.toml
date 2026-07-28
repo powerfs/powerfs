@@ -7,7 +7,7 @@ members = [
     "powerfs-fuse",
     "powerfs-fuse-core",
     "powerfs-common",
-    "powerfs-server",
+    "powerfs-s3",
     "powerfs-cli",
     "powerfs-kv-client",
     "powerfs-monitor",

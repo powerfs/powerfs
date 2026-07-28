@@ -4,6 +4,7 @@
 //! powerfs-net binary protocol.
 
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,9 +77,12 @@ impl PowerFsNetClient {
             return Ok(());
         }
 
-        let addr: SocketAddr = format!("{}:{}", self.config.addr, self.config.port)
-            .parse()
-            .map_err(|e| NetError::Connection(format!("invalid address: {}", e)))?;
+        let addr_str = format!("{}:{}", self.config.addr, self.config.port);
+        let addr: SocketAddr = addr_str
+            .to_socket_addrs()
+            .map_err(|e| NetError::Connection(format!("invalid address: {}", e)))?
+            .next()
+            .ok_or_else(|| NetError::Connection("no addresses resolved".into()))?;
 
         info!("Connecting to {}:{}", self.config.addr, self.config.port);
 
@@ -138,17 +142,44 @@ impl PowerFsNetClient {
     }
 
     /// Send a request and wait for response
+    /// Uses a single lock hold for both send and receive to prevent
+    /// response interleaving with concurrent requests.
+    /// On any error (including timeout), the stream is cleared so the
+    /// next request will establish a fresh connection.
     pub async fn send_request(
         &self,
         msg_type: MsgType,
         body: &[u8],
         data: &[u8],
     ) -> NetResult<NetMessage> {
-        if !self.is_connected() {
-            return Err(NetError::NotConnected);
+        debug!("send_request: type={:?}", msg_type);
+        // Auto-reconnect if stream is broken
+        {
+            let stream = self.stream.lock().await;
+            let connected = !stream.is_none() && *self.connected.lock();
+            debug!(
+                "send_request: stream_is_some={}, connected={}",
+                !stream.is_none(),
+                connected
+            );
+            if !connected {
+                drop(stream);
+                warn!("send_request: stream broken, reconnecting...");
+                self.reconnect().await?;
+            }
         }
 
         let _permit = self.inflight_sem.clone().acquire_owned().await;
+        self.send_request_internal(msg_type, body, data).await
+    }
+
+    /// Internal send request (after connection is verified)
+    async fn send_request_internal(
+        &self,
+        msg_type: MsgType,
+        body: &[u8],
+        data: &[u8],
+    ) -> NetResult<NetMessage> {
         let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let frame = build_frame(
@@ -167,32 +198,88 @@ impl PowerFsNetClient {
             data.len()
         );
 
+        // Hold the stream lock for the entire send+receive to prevent
+        // response interleaving with concurrent requests
+        debug!("send_request_internal: acquiring stream lock");
+        let mut stream = self.stream.lock().await;
+        debug!("send_request_internal: stream lock acquired");
+
+        // Check we have a valid stream
+        if stream.is_none() {
+            *self.connected.lock() = false;
+            warn!("send_request_internal: stream is None");
+            return Err(NetError::NotConnected);
+        }
+
         // Send frame
-        {
-            let mut stream = self.stream.lock().await;
-            let s = stream.as_mut().ok_or(NetError::NotConnected)?;
+        debug!("send_request_internal: sending frame, seq={}", seq);
+        let send_result = tokio::time::timeout(
+            self.config.request_timeout,
+            stream.as_mut().unwrap().write_all(&frame),
+        )
+        .await;
 
-            let send_result =
-                tokio::time::timeout(self.config.request_timeout, s.write_all(&frame)).await;
-
-            match send_result {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    let err_msg = e.to_string();
-                    self.handle_send_error(&e).await?;
-                    return Err(NetError::Protocol(err_msg));
-                }
-                Err(_elapsed) => {
-                    self.handle_timeout().await?;
-                    return Err(NetError::Timeout);
-                }
+        match send_result {
+            Ok(Ok(_)) => {
+                debug!("send_request_internal: frame sent, seq={}", seq);
+            }
+            Ok(Err(e)) => {
+                // Clear stream on send error
+                warn!("send_request_internal: send error: {:?}", e);
+                *stream = None;
+                drop(stream);
+                self.handle_send_error(&e).await?;
+                return Err(NetError::Protocol(e.to_string()));
+            }
+            Err(_elapsed) => {
+                // Clear stream on send timeout
+                warn!("send_request_internal: send timeout");
+                *stream = None;
+                drop(stream);
+                self.handle_timeout().await?;
+                return Err(NetError::Timeout);
             }
         }
 
-        // Receive response
-        let response = self.recv_response(seq).await?;
+        // Receive response (still holding the lock)
+        debug!("send_request_internal: waiting for response, seq={}", seq);
+        match self.recv_response_locked(seq, &mut stream).await {
+            Ok(response) => {
+                debug!("send_request_internal: response received, seq={}", seq);
+                Ok(response)
+            }
+            Err(e) => {
+                // Any receive error (including timeout) means the stream
+                // state is corrupted. Clear it so we reconnect next time.
+                warn!("send_request_internal: recv error: {:?}", e);
+                *stream = None;
+                drop(stream);
+                *self.connected.lock() = false;
+                Err(e)
+            }
+        }
+    }
 
-        Ok(response)
+    /// Reconnect to the server (called after a connection failure)
+    async fn reconnect(&self) -> NetResult<()> {
+        // Try up to 3 times with backoff
+        for attempt in 1..=3 {
+            info!("Reconnect attempt {}", attempt);
+            match self.connect().await {
+                Ok(()) => {
+                    info!("Reconnected successfully");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Reconnect attempt {} failed: {}", attempt, e);
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        error!("Failed to reconnect after 3 attempts");
+        Err(NetError::Connection("reconnection failed".into()))
     }
 
     /// Send a notification (no response expected)
@@ -219,24 +306,41 @@ impl PowerFsNetClient {
         Ok(())
     }
 
-    /// Receive response for a specific sequence number
-    async fn recv_response(&self, expected_seq: u32) -> NetResult<NetMessage> {
-        let mut stream = self.stream.lock().await;
+    /// Receive response for a specific sequence number (called with stream lock already held)
+    async fn recv_response_locked(
+        &self,
+        expected_seq: u32,
+        stream: &mut tokio::sync::MutexGuard<'_, Option<TcpStream>>,
+    ) -> NetResult<NetMessage> {
         let s = stream.as_mut().ok_or(NetError::NotConnected)?;
 
+        debug!(
+            "recv_response_locked: reading header, expected_seq={}",
+            expected_seq
+        );
         // Read header
         let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
         let recv_result =
             tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf)).await;
 
         match recv_result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                debug!(
+                    "recv_response_locked: header received for seq={}",
+                    expected_seq
+                );
+            }
             Ok(Err(e)) => {
                 let err_msg = e.to_string();
+                warn!("recv_response_locked: header read error: {:?}", e);
                 self.handle_recv_error(&e).await?;
                 return Err(NetError::Protocol(err_msg));
             }
             Err(_elapsed) => {
+                warn!(
+                    "recv_response_locked: header read timeout for seq={}",
+                    expected_seq
+                );
                 return Err(NetError::Timeout);
             }
         }
@@ -244,11 +348,19 @@ impl PowerFsNetClient {
         let header = FrameHeader::decode(&hdr_buf)
             .ok_or_else(|| NetError::Protocol("invalid response header".into()))?;
 
+        debug!(
+            "recv_response_locked: got response seq={}, expected={}",
+            header.seq, expected_seq
+        );
         if header.seq != expected_seq {
-            warn!(
+            error!(
                 "Response seq mismatch: expected {}, got {}",
                 expected_seq, header.seq
             );
+            return Err(NetError::Protocol(format!(
+                "seq mismatch: expected {}, got {}",
+                expected_seq, header.seq
+            )));
         }
 
         // Read body + data
@@ -275,6 +387,12 @@ impl PowerFsNetClient {
         );
 
         Ok(message)
+    }
+
+    /// Receive response for a specific sequence number (standalone, acquires its own lock)
+    async fn recv_response(&self, expected_seq: u32) -> NetResult<NetMessage> {
+        let mut stream = self.stream.lock().await;
+        self.recv_response_locked(expected_seq, &mut stream).await
     }
 
     async fn handle_send_error(&self, e: &std::io::Error) -> NetResult<()> {

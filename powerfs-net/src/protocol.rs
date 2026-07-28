@@ -373,6 +373,18 @@ pub enum MsgType {
     ReadNeedleBlob = 0x0066,
     RangeLease = 0x0067,
     VolumeStatus = 0x0068,
+
+    // Master topology & discovery operations
+    GetTopology = 0x0070,
+    WatchTopology = 0x0071,
+    TopologyChanged = 0x0072,
+    AssignVolumeV2 = 0x0073,
+
+    // Extended Lease operations
+    AcquireLease = 0x0080,
+    ReleaseLease = 0x0081,
+    RenewLease = 0x0082,
+    LeaseStatus = 0x0083,
 }
 
 impl MsgType {
@@ -412,6 +424,14 @@ impl MsgType {
             0x0066 => Some(Self::ReadNeedleBlob),
             0x0067 => Some(Self::RangeLease),
             0x0068 => Some(Self::VolumeStatus),
+            0x0070 => Some(Self::GetTopology),
+            0x0071 => Some(Self::WatchTopology),
+            0x0072 => Some(Self::TopologyChanged),
+            0x0073 => Some(Self::AssignVolumeV2),
+            0x0080 => Some(Self::AcquireLease),
+            0x0081 => Some(Self::ReleaseLease),
+            0x0082 => Some(Self::RenewLease),
+            0x0083 => Some(Self::LeaseStatus),
             _ => None,
         }
     }
@@ -447,6 +467,7 @@ pub const STATUS_ERR_IS_DIR: u16 = 7;
 pub const STATUS_ERR_NO_SPACE: u16 = 8;
 pub const STATUS_ERR_BAD_FD: u16 = 9;
 pub const STATUS_ERR_SERVER_ERROR: u16 = 10;
+pub const STATUS_ERR_REDIRECT: u16 = 11;
 
 // ============================================================================
 // TLV Field IDs
@@ -506,6 +527,23 @@ pub enum FieldId {
     // Rename fields
     NewParentIno = 0x50,
     NewName = 0x51,
+
+    // Request tracking fields (for Exactly-Once)
+    RequestId = 0x60,
+    ClientUuid = 0x61,
+    ChannelId = 0x62,
+    ShardHash = 0x63,
+
+    // Master topology fields
+    ShardId = 0x70,
+    ShardLeader = 0x71,
+    VolumeListPayload = 0x72,
+    TopologyVersion = 0x73,
+
+    // Lease extended fields
+    LeaseToken = 0x80,
+    LeaseRangeOffset = 0x81,
+    LeaseRangeLength = 0x82,
 }
 
 impl FieldId {
@@ -550,6 +588,17 @@ impl FieldId {
             0x42 => Some(Self::LeaseEpoch),
             0x50 => Some(Self::NewParentIno),
             0x51 => Some(Self::NewName),
+            0x60 => Some(Self::RequestId),
+            0x61 => Some(Self::ClientUuid),
+            0x62 => Some(Self::ChannelId),
+            0x63 => Some(Self::ShardHash),
+            0x70 => Some(Self::ShardId),
+            0x71 => Some(Self::ShardLeader),
+            0x72 => Some(Self::VolumeListPayload),
+            0x73 => Some(Self::TopologyVersion),
+            0x80 => Some(Self::LeaseToken),
+            0x81 => Some(Self::LeaseRangeOffset),
+            0x82 => Some(Self::LeaseRangeLength),
             _ => None,
         }
     }

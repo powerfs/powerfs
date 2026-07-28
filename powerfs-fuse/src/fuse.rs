@@ -8,7 +8,7 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
-use powerfs_fuse_core::net_client::SyncFuseNetClient;
+use powerfs_fuse_core::SyncFuseClientFacade;
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
-use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 const PREFETCH_CHUNKS: u64 = 2;
@@ -34,7 +33,7 @@ pub struct FuseApp {
     volume_net_port: u16,
     filer_addr: String,
     filer_net_port: u16,
-    runtime_handle: Handle,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl FuseApp {
@@ -48,10 +47,8 @@ impl FuseApp {
         volume_net_port: u16,
         filer_addr: String,
         filer_net_port: u16,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
-        let runtime_handle = Handle::try_current()
-            .map_err(|e| PowerFsError::Internal(format!("no tokio runtime: {}", e)))?;
-
         Ok(FuseApp {
             mount_point: mount_point.to_string(),
             master_addresses: master_addrs.to_vec(),
@@ -61,7 +58,7 @@ impl FuseApp {
             volume_net_port,
             filer_addr,
             filer_net_port,
-            runtime_handle,
+            runtime,
         })
     }
 
@@ -72,17 +69,24 @@ impl FuseApp {
             self.master_addresses.join(", ")
         );
 
-        // Extract IP from master address (config may contain "IP:PORT" for gRPC)
+        // Extract host from master address
+        // Strip protocol prefix (http://, https://) if present
         let master_full = self
             .master_addresses
             .first()
             .unwrap_or(&"127.0.0.1".to_string())
             .clone();
-        let master_addr = master_full
-            .split(':')
-            .next()
-            .unwrap_or("127.0.0.1")
-            .to_string();
+        let master_addr = {
+            let without_proto = master_full
+                .strip_prefix("http://")
+                .or_else(|| master_full.strip_prefix("https://"))
+                .unwrap_or(&master_full);
+            without_proto
+                .split(':')
+                .next()
+                .unwrap_or("127.0.0.1")
+                .to_string()
+        };
 
         let net_config = powerfs_fuse_core::net_client::NetClientConfig {
             master_addr: master_addr.clone(),
@@ -95,14 +99,41 @@ impl FuseApp {
             request_timeout: Duration::from_secs(30),
         };
 
-        let sync_client = Arc::new(SyncFuseNetClient::connect(net_config).await.map_err(|e| {
-            PowerFsError::Internal(format!("Failed to connect to powerfs-net: {}", e))
-        })?);
+        let net_client = Arc::new(
+            powerfs_fuse_core::PowerFuseNetClient::new(net_config)
+                .await
+                .map_err(|e| {
+                    PowerFsError::Internal(format!("Failed to connect to powerfs-net: {}", e))
+                })?,
+        );
 
         info!(
             "Connected to powerfs-net: Master={}:{}, Filer={}:{}",
             master_addr, self.master_net_port, self.filer_addr, self.filer_net_port
         );
+
+        let facade_config = powerfs_fuse_core::FuseClientFacadeConfig {
+            master_addr: master_addr.clone(),
+            master_port: self.master_net_port,
+            volume_net_port: self.volume_net_port,
+            filer_addr: self.filer_addr.clone(),
+            filer_port: self.filer_net_port,
+            request_timeout: Duration::from_secs(30),
+            client_identity: powerfs_fuse_core::ClientIdentity::default(),
+        };
+
+        let facade = Arc::new(
+            powerfs_fuse_core::FuseClientFacade::build_from_net_client(facade_config, net_client)
+                .await
+                .map_err(|e| {
+                    PowerFsError::Internal(format!("Failed to build FuseClientFacade: {}", e))
+                })?,
+        );
+
+        let sync_client = Arc::new(powerfs_fuse_core::SyncFuseClientFacade::new(
+            facade,
+            self.runtime.clone(),
+        ));
 
         let cache = Arc::new(MetadataCache::new());
 
@@ -214,7 +245,7 @@ impl FuseServer {
 type FileLocks = HashMap<u64, Vec<FileLock>>;
 
 struct PowerFsFs {
-    client: Arc<SyncFuseNetClient>,
+    client: Arc<SyncFuseClientFacade>,
     cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
     collection: String,
@@ -257,7 +288,7 @@ impl PowerFsFs {
         let loc = locations
             .first()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
+        let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
         let chunk_size = self.chunk_cache.chunk_size();
 
         let mut chunks = Vec::new();
@@ -330,6 +361,8 @@ impl PowerFsFs {
                 generation: entry.generation,
             };
 
+            // Update entry inline (not in background thread) to avoid
+            // sharing the TCP stream across multiple Tokio runtimes
             if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
                 warn!("Failed to update entry on master: {}", e);
             }
@@ -665,7 +698,7 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        let inode = self.client.create_entry(filer_entry, "").map_err(|e| {
+        let inode = self.client.create_entry(&filer_entry, "").map_err(|e| {
             error!("Failed to create directory entry on master: {}", e);
             std::io::Error::from_raw_os_error(libc::EIO)
         })?;
@@ -715,12 +748,17 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
-        match self.client.delete_entry(parent, name_str, true, "") {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to delete directory entry on master: {}", e);
-            }
-        }
+        // Non-blocking delete: spawn a background thread to delete the entry
+        let client = self.client.clone();
+        let name_owned = name_str.to_string();
+        std::thread::spawn(
+            move || match client.delete_entry(parent, &name_owned, true, "") {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to delete directory entry on master: {}", e);
+                }
+            },
+        );
 
         self.cache.remove(entry.inode);
         Ok(())
@@ -736,13 +774,26 @@ impl FileSystem for PowerFsFs {
 
         let should_delete = self.cache.dec_nlink(entry.inode);
 
+        // Build the correct path for this specific entry (not the inode_cache path)
+        let parent_path = self.cache.inode_to_path(parent);
+        let entry_path: Option<String> = if let Some(pp) = parent_path {
+            if pp == "/" {
+                Some(format!("/{}", name_str))
+            } else {
+                Some(format!("{}/{}", pp, name_str))
+            }
+        } else {
+            None
+        };
+
         if should_delete {
+            // Last hard link - delete the actual data and remove all cache entries
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
                 match self.client.lookup_volume(fid.volume_id) {
                     Ok(locations) => {
                         if let Some(loc) = locations.first() {
-                            let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
+                            let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
                             if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key)
                             {
                                 warn!("Failed to delete remote data: {}", e);
@@ -755,14 +806,24 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            match self.client.delete_entry(parent, name_str, false, "") {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to delete file entry on master: {}", e);
-                }
-            }
+            // Non-blocking delete: spawn a background thread to delete the entry
+            let client = self.client.clone();
+            let name_owned = name_str.to_string();
+            std::thread::spawn(
+                move || match client.delete_entry(parent, &name_owned, false, "") {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Failed to delete file entry on master: {}", e);
+                    }
+                },
+            );
 
             self.cache.remove(entry.inode);
+        } else {
+            // Not the last hard link - just remove the path mapping
+            if let Some(path) = entry_path {
+                self.cache.remove_path(entry.inode, &path);
+            }
         }
 
         Ok(())
@@ -845,7 +906,7 @@ impl FileSystem for PowerFsFs {
             generation: 0,
         };
 
-        let inode = self.client.create_entry(filer_entry, "").map_err(|e| {
+        let inode = self.client.create_entry(&filer_entry, "").map_err(|e| {
             error!("Failed to create file entry on master: {}", e);
             std::io::Error::from_raw_os_error(libc::EIO)
         })?;
@@ -990,7 +1051,7 @@ impl FileSystem for PowerFsFs {
         let loc = locations
             .first()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = SyncFuseNetClient::location_to_grpc_addr(loc);
+        let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
 
         for chunk_idx in start_chunk..=prefetch_end_chunk {
             let chunk_offset = chunk_idx * chunk_size;
@@ -1238,6 +1299,7 @@ impl FileSystem for PowerFsFs {
                 generation: entry.generation,
             };
 
+            // Update entry inline to avoid sharing TCP stream across runtimes
             if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
                 warn!("Failed to update entry on master: {}", e);
             }
@@ -1319,6 +1381,8 @@ impl FileSystem for PowerFsFs {
         // propagates changes to other clients' caches.
         let mut children = self.cache.list_children(inode);
         if children.is_empty() {
+            // Try to get entries from the server, but don't block for too long
+            // Use a short timeout to avoid blocking FUSE operations
             if let Ok(entries) = self.client.list_entries(inode, 1000, "") {
                 for child_entry in entries {
                     let cached = self.entry_to_cached(inode, &child_entry);
@@ -1444,7 +1508,7 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        match self.client.create_entry(filer_entry, "") {
+        match self.client.create_entry(&filer_entry, "") {
             Ok(_) => {}
             Err(e) => {
                 warn!("Failed to create new entry on master during rename: {}", e);
@@ -1559,8 +1623,16 @@ impl FileSystem for PowerFsFs {
         }
 
         // Use powerfs-net protocol to create hard link on server
+        debug!(
+            "link: sending NET_LINK for ino={}, newparent={}, name={}",
+            inode, newparent, name_str
+        );
         match self.client.link(inode, newparent, name_str) {
             Ok(_) => {
+                debug!(
+                    "link: NET_LINK succeeded for ino={}, name={}",
+                    inode, name_str
+                );
                 self.cache.inc_nlink(inode);
 
                 let new_entry = CachedEntry {

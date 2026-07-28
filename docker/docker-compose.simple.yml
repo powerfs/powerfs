@@ -1,0 +1,167 @@
+# PowerFS Simple Test Environment - Single node setup
+# Use for basic functionality testing
+
+networks:
+  powerfs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+          gateway: 172.22.0.1
+
+volumes:
+  master-data:
+  filer-data:
+  volume-data:
+  redis-data:
+
+services:
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: redis-simple
+    networks:
+      powerfs-network:
+        ipv4_address: 172.22.0.50
+    volumes:
+      - redis-data:/data
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 2s
+
+  # Master (single node, Raft with just itself)
+  master:
+    image: powerfs:latest
+    container_name: master-simple
+    networks:
+      powerfs-network:
+        ipv4_address: 172.22.0.11
+    ports:
+      - "9333:9333"   # gRPC / Raft
+      - "9334:9334"   # powerfs-net protocol
+    volumes:
+      - master-data:/data
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis-simple:6379
+    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.22.0.11:9333 --raft-id 1 --peer 172.22.0.11:9333
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 3s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Filer
+  filer:
+    image: powerfs:latest
+    container_name: filer-simple
+    networks:
+      powerfs-network:
+        ipv4_address: 172.22.0.31
+    ports:
+      - "8888:8888"   # HTTP / S3
+      - "8889:8889"   # gRPC
+      - "8890:8890"   # powerfs-net protocol
+    volumes:
+      - filer-data:/data/filer
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis-simple:6379
+    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.22.0.11:9333 -D /data/filer --shard-count 1 --raft-id 1
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      master:
+        condition: service_healthy
+
+  # Volume
+  volume:
+    image: powerfs:latest
+    container_name: volume-simple
+    networks:
+      powerfs-network:
+        ipv4_address: 172.22.0.21
+    ports:
+      - "8080:8080"   # gRPC
+      - "8091:8091"   # HTTP
+      - "8081:8081"   # powerfs-net protocol
+    volumes:
+      - volume-data:/data
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis-simple:6379
+    command: /app/powerfs-volume --grpc-address 172.22.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.22.0.11:9333 --node-id volume-simple
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.22.0.21 8080 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      master:
+        condition: service_healthy
+
+  # FUSE Client
+  fuse:
+    image: powerfs-test:latest
+    container_name: fuse-simple
+    init: true
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
+    networks:
+      powerfs-network:
+    volumes:
+      - /tmp/powerfs/simple:/mnt/powerfs
+    environment:
+      - RUST_LOG=info
+    command:
+      - /app/powerfs-fuse
+      - --master
+      - 172.22.0.11:9333
+      - --master-net-port
+      - "9334"
+      - --filer-addr
+      - 172.22.0.31
+      - --filer-net-port
+      - "8890"
+      - --mount-point
+      - /mnt/powerfs
+      - --collection
+      - default
+      - --replication
+      - "000"
+      - --verbose
+      - --container
+      - --log-file
+      - /var/log/powerfs-fuse.log
+    depends_on:
+      master:
+        condition: service_healthy
+      filer:
+        condition: service_healthy
+      volume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "mountpoint /mnt/powerfs || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 10s

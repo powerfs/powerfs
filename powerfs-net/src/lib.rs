@@ -19,13 +19,27 @@
 pub mod client;
 pub mod connection;
 pub mod errors;
+pub mod handler_adapter;
+pub mod middleware;
 pub mod protocol;
+pub mod request_context;
 pub mod serialize;
 pub mod server;
+pub mod server_connection;
 
 pub use client::{ClientConfig, PowerFsNetClient};
 pub use connection::ConnectionManager;
 pub use errors::{NetError, NetResult};
+pub use handler_adapter::{LegacyHandler, ManagedNetHandler};
+pub use middleware::{
+    FnHandler, LoggingMiddleware, MetricsMiddleware, Middleware, NextHandler, PipelineBuilder,
+    RateLimitMiddleware, RequestMetrics, RequestPipeline, TracingMiddleware,
+};
 pub use protocol::*;
+pub use request_context::{ClientInfo, RequestContext, TraceId};
 pub use serialize::{DirEntry, EntryInfo, TlvDecoder, TlvEncoder};
 pub use server::{PowerFsNetHandler, PowerFsNetServer};
+pub use server_connection::{
+    ClientSession, HealthStatus, MetricsSnapshot, ServerConnectionManager, ServerRequestHandler,
+    SessionState,
+};

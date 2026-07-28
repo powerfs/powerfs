@@ -103,6 +103,65 @@ impl TlvEncoder {
         Ok(self)
     }
 
+    // ========================================================================
+    // New helper methods for extended fields
+    // ========================================================================
+
+    /// Add a RequestId (UUID string)
+    pub fn add_request_id(&mut self, request_id: &str) -> Result<&mut Self, NetError> {
+        self.add_string(FieldId::RequestId, request_id)
+    }
+
+    /// Add a ClientUuid
+    pub fn add_client_uuid(&mut self, client_uuid: &str) -> Result<&mut Self, NetError> {
+        self.add_string(FieldId::ClientUuid, client_uuid)
+    }
+
+    /// Add a ChannelId
+    pub fn add_channel_id(&mut self, channel_id: u16) -> &mut Self {
+        self.add_u16(FieldId::ChannelId, channel_id)
+    }
+
+    /// Add a ShardHash
+    pub fn add_shard_hash(&mut self, shard_hash: u64) -> &mut Self {
+        self.add_u64(FieldId::ShardHash, shard_hash)
+    }
+
+    /// Add a ShardId
+    pub fn add_shard_id(&mut self, shard_id: u32) -> &mut Self {
+        self.add_u32(FieldId::ShardId, shard_id)
+    }
+
+    /// Add a ShardLeader address
+    pub fn add_shard_leader(&mut self, leader: &str) -> Result<&mut Self, NetError> {
+        self.add_string(FieldId::ShardLeader, leader)
+    }
+
+    /// Add a VolumeListPayload (raw serialized topology data)
+    pub fn add_volume_list_payload(&mut self, payload: &[u8]) -> Result<&mut Self, NetError> {
+        self.add_bytes(FieldId::VolumeListPayload, payload)
+    }
+
+    /// Add a TopologyVersion
+    pub fn add_topology_version(&mut self, version: u64) -> &mut Self {
+        self.add_u64(FieldId::TopologyVersion, version)
+    }
+
+    /// Add a LeaseToken
+    pub fn add_lease_token(&mut self, token: &str) -> Result<&mut Self, NetError> {
+        self.add_string(FieldId::LeaseToken, token)
+    }
+
+    /// Add a LeaseRangeOffset
+    pub fn add_lease_range_offset(&mut self, offset: u64) -> &mut Self {
+        self.add_u64(FieldId::LeaseRangeOffset, offset)
+    }
+
+    /// Add a LeaseRangeLength
+    pub fn add_lease_range_length(&mut self, length: u64) -> &mut Self {
+        self.add_u64(FieldId::LeaseRangeLength, length)
+    }
+
     /// Add a nested TLV-encoded field (for repeated/complex types)
     pub fn add_nested(&mut self, field: FieldId, value: &[u8]) -> Result<&mut Self, NetError> {
         if value.len() > MAX_TLV_VALUE_LEN as usize {
@@ -289,6 +348,65 @@ impl<'a> TlvDecoder<'a> {
     /// Decode a nested TLV structure as raw bytes
     pub fn read_nested(&mut self, length: u16) -> Result<&'a [u8], NetError> {
         self.read_bytes(length)
+    }
+
+    // ========================================================================
+    // New helper methods for extended fields
+    // ========================================================================
+
+    /// Read a RequestId (as String)
+    pub fn next_request_id(&mut self) -> Result<String, NetError> {
+        self.next_string(FieldId::RequestId)
+    }
+
+    /// Read a ClientUuid (as String)
+    pub fn next_client_uuid(&mut self) -> Result<String, NetError> {
+        self.next_string(FieldId::ClientUuid)
+    }
+
+    /// Read a ChannelId
+    pub fn next_channel_id(&mut self) -> Result<u16, NetError> {
+        self.next_u16(FieldId::ChannelId)
+    }
+
+    /// Read a ShardHash
+    pub fn next_shard_hash(&mut self) -> Result<u64, NetError> {
+        self.next_u64(FieldId::ShardHash)
+    }
+
+    /// Read a ShardId
+    pub fn next_shard_id(&mut self) -> Result<u32, NetError> {
+        self.next_u32(FieldId::ShardId)
+    }
+
+    /// Read a ShardLeader (as String)
+    pub fn next_shard_leader(&mut self) -> Result<String, NetError> {
+        self.next_string(FieldId::ShardLeader)
+    }
+
+    /// Read a VolumeListPayload (as Vec<u8>)
+    pub fn next_volume_list_payload(&mut self) -> Result<Vec<u8>, NetError> {
+        self.next_bytes(FieldId::VolumeListPayload)
+    }
+
+    /// Read a TopologyVersion
+    pub fn next_topology_version(&mut self) -> Result<u64, NetError> {
+        self.next_u64(FieldId::TopologyVersion)
+    }
+
+    /// Read a LeaseToken (as String)
+    pub fn next_lease_token(&mut self) -> Result<String, NetError> {
+        self.next_string(FieldId::LeaseToken)
+    }
+
+    /// Read a LeaseRangeOffset
+    pub fn next_lease_range_offset(&mut self) -> Result<u64, NetError> {
+        self.next_u64(FieldId::LeaseRangeOffset)
+    }
+
+    /// Read a LeaseRangeLength
+    pub fn next_lease_range_length(&mut self) -> Result<u64, NetError> {
+        self.next_u64(FieldId::LeaseRangeLength)
     }
 
     // ========================================================================
@@ -1055,6 +1173,38 @@ mod tests {
         // Unknown field 0xFE should be automatically skipped by next_field()
         // Since it's the last field, next_field() should return None
         assert!(dec.next_field().is_none());
+
+        assert!(dec.is_empty());
+    }
+
+    #[test]
+    fn test_extended_fields_roundtrip() {
+        let mut enc = TlvEncoder::new();
+        enc.add_request_id("req-12345").unwrap();
+        enc.add_client_uuid("client-uuid-67890").unwrap();
+        enc.add_channel_id(42);
+        enc.add_shard_hash(123456789);
+        enc.add_shard_id(1);
+        enc.add_shard_leader("192.168.1.1:9334").unwrap();
+        enc.add_topology_version(100);
+        enc.add_lease_token("token-abcde").unwrap();
+        enc.add_lease_range_offset(0);
+        enc.add_lease_range_length(65536);
+        let bytes = enc.into_bytes();
+
+        let mut dec = TlvDecoder::new(&bytes);
+
+        // Read and verify each field
+        assert_eq!(dec.next_request_id().unwrap(), "req-12345");
+        assert_eq!(dec.next_client_uuid().unwrap(), "client-uuid-67890");
+        assert_eq!(dec.next_channel_id().unwrap(), 42);
+        assert_eq!(dec.next_shard_hash().unwrap(), 123456789);
+        assert_eq!(dec.next_shard_id().unwrap(), 1);
+        assert_eq!(dec.next_shard_leader().unwrap(), "192.168.1.1:9334");
+        assert_eq!(dec.next_topology_version().unwrap(), 100);
+        assert_eq!(dec.next_lease_token().unwrap(), "token-abcde");
+        assert_eq!(dec.next_lease_range_offset().unwrap(), 0);
+        assert_eq!(dec.next_lease_range_length().unwrap(), 65536);
 
         assert!(dec.is_empty());
     }

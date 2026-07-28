@@ -2,7 +2,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use powerfs_common::{config::PowerFsConfig, types::NodeId};
 use powerfs_core::storage::StorageManager;
-use powerfs_net::PowerFsNetServer;
+use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
@@ -33,8 +33,8 @@ struct Args {
     #[arg(long, default_value = "default")]
     rack: String,
 
-    #[arg(long, default_values = ["localhost:9333"])]
-    master_address: Vec<String>,
+    #[arg(long)]
+    master_address: Option<Vec<String>>,
 
     #[arg(long, default_value = "./data")]
     data_dir: String,
@@ -90,10 +90,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         volume_cfg.node_id.clone()
     };
 
-    let master_address = if !args.master_address.is_empty()
-        && args.master_address != vec!["localhost:9333".to_string()]
-    {
-        args.master_address.clone()
+    let master_address = if let Some(addrs) = &args.master_address {
+        if addrs.is_empty() {
+            volume_cfg.master_addresses.clone()
+        } else {
+            addrs.clone()
+        }
     } else {
         volume_cfg.master_addresses.clone()
     };
@@ -158,8 +160,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
             Arc::new(volume_server.clone()),
         ));
+
+        // Wrap with ManagedNetHandler for session management + middleware
+        let net_manager = Arc::new(ServerConnectionManager::new());
+        let managed_handler = Arc::new(ManagedNetHandler::from_arc(
+            net_manager.clone(),
+            net_handler,
+        ));
+
         info!("Starting powerfs-net Volume server on {}", net_bind_addr);
-        if let Ok(net_server) = PowerFsNetServer::bind(&ip, net_port, net_handler).await {
+        if let Ok(net_server) =
+            PowerFsNetServer::bind_with_manager(&ip, net_port, managed_handler, net_manager).await
+        {
             tokio::spawn(async move {
                 if let Err(e) = net_server.serve().await {
                     error!("powerfs-net Volume server error: {:?}", e);

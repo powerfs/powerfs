@@ -15,6 +15,10 @@ tonic-build = { version = "0.11" }
 tempfile = "3.8"
 rfs_tester = { path = "../rfs_tester" }
 
+[[bin]]
+name = "powerfs-master"
+path = "src/main.rs"
+
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
@@ -51,3 +55,5 @@ hex = "0.4"
 tower = "0.4"
 sysinfo = "0.30"
 tikv-jemallocator = "0.5"
+clap = { workspace = true }
+env_logger = { workspace = true }

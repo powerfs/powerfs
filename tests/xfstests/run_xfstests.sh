@@ -22,7 +22,7 @@ fi
 
 echo "=== Building PowerFS ==="
 cd "$PROJECT_ROOT"
-cargo build --release -p powerfs-server -p powerfs-volume -p powerfs-fuse 2>&1 | tail -5
+cargo build --release -p powerfs-master -p powerfs-filer -p powerfs-volume -p powerfs-fuse 2>&1 | tail -5
 
 echo ""
 echo "=== Starting PowerFS services ==="

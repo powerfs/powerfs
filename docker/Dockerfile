@@ -16,13 +16,14 @@ WORKDIR /app
 RUN mkdir -p /mnt/powerfs && chown root:root /mnt/powerfs && chmod 755 /mnt/powerfs
 RUN mkdir -p /var/log && chown root:root /var/log && chmod 755 /var/log
 
-COPY target/release/powerfs /app/
+COPY target/release/powerfs-master /app/
+COPY target/release/powerfs-filer /app/
+COPY target/release/powerfs-s3 /app/
 COPY target/release/powerfs-volume /app/
 COPY target/release/powerfs-monitor /app/
 COPY target/release/powerfs-fuse /app/
-COPY target/release/powerfs-filer /app/
 COPY config/ /etc/powerfs/
 
-EXPOSE 9333 8080 8081 8888 8889
+EXPOSE 9333 8080 8081 8888 8889 9000
 
-CMD ["/app/powerfs", "master", "--config", "/etc/powerfs/master-1.toml"]
+CMD ["/app/powerfs-master", "--config", "/etc/powerfs/master-1.toml"]

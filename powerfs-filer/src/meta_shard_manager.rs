@@ -151,7 +151,7 @@ impl MetaShardManager {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
-            inode_generator: Arc::new(RwLock::new(1)),
+            inode_generator: Arc::new(RwLock::new(1000)),
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
@@ -806,6 +806,28 @@ impl MetaShardManager {
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+
+        // Wait for the command to be applied
+        if let Some(expected_mode) = mode {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.mode == expected_mode as u32 {
+                            return Ok(());
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
+                }
+                return Err("setattr timeout waiting for apply".to_string());
+            }
+        }
+
         Ok(())
     }
 
@@ -1295,6 +1317,14 @@ impl MetaShardManager {
             write_qps: stats.write_qps,
             read_qps: stats.read_qps,
         })
+    }
+
+    /// Check if current node is the leader for a given shard.
+    /// Returns (is_leader, leader_address).
+    pub async fn get_shard_leader_status(&self, shard_id: ShardId) -> Option<(bool, String)> {
+        self.raft_group_manager
+            .get_shard_leader_status(shard_id)
+            .await
     }
 
     pub async fn get_filer_status(&self) -> FilerStatus {
