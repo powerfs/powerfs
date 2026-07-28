@@ -16,6 +16,7 @@
 //!   TCP Socket  ─────────────────►  Master/Volume Server
 //! ```
 
+pub mod admin_server;
 pub mod client;
 pub mod connection;
 pub mod errors;
@@ -26,6 +27,8 @@ pub mod request_context;
 pub mod serialize;
 pub mod server;
 pub mod server_connection;
+
+pub use admin_server::{AdminServer, AdminServerConfig};
 
 pub use client::{ClientConfig, PowerFsNetClient};
 pub use connection::ConnectionManager;
