@@ -280,6 +280,11 @@ impl FuseClientFacade {
         &self.volume_client
     }
 
+    /// 获取客户端标识（用于 lease holder 校验）
+    pub fn client_id(&self) -> String {
+        self.config.client_identity.client_id.to_string()
+    }
+
     // ======= 通用请求提交方法（支持指定 MsgType）=======
 
     /// 提交元数据请求（支持指定 MsgType）

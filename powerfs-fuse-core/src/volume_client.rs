@@ -12,7 +12,7 @@ use crate::net_client::PowerFuseNetClient;
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
-use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::FieldId;
 
 /// 请求等待者类型别名
@@ -411,6 +411,15 @@ impl VolumeClient {
         leases
             .iter()
             .any(|(&(vid, _), lease)| vid == volume_id && lease.is_valid())
+    }
+
+    /// 获取指定 inode 的有效 lease token（如果存在且有效）
+    pub fn get_valid_lease_token(&self, volume_id: u64, inode: u64) -> Option<String> {
+        let leases = self.leases.read().unwrap();
+        leases
+            .get(&(volume_id, inode))
+            .filter(|l| l.is_valid())
+            .map(|l| l.token.clone())
     }
 
     /// 提交数据请求 (读/写共享队列)
@@ -1002,12 +1011,14 @@ async fn process_data_request_internal(
         RequestKind::Write => {
             // Decode TLV body to extract file_key (inode) for per-inode lease check
             let file_key = TlvDecoder::new(&body).next_u64(FieldId::Name).unwrap_or(0);
-            let (has_lease, lease_token) = {
+
+            // Verify per-inode lease is valid (token already embedded in TLV body by provider_adapter)
+            let has_lease = {
                 let lease_map = leases.read().unwrap();
-                match lease_map.get(&(req.shard_id, file_key)) {
-                    Some(lease) if lease.is_valid() => (true, Some(lease.token.clone())),
-                    _ => (false, None),
-                }
+                lease_map
+                    .get(&(req.shard_id, file_key))
+                    .map(|l| l.is_valid())
+                    .unwrap_or(false)
             };
             if !has_lease {
                 let err = ClientError::NoValidLease;
@@ -1015,36 +1026,8 @@ async fn process_data_request_internal(
                 return Err(err);
             }
 
-            // Inject lease_token into TLV body for server-side validation
-            let final_body = if let Some(token) = lease_token {
-                // Parse existing TLV fields and rebuild with lease_token appended
-                let mut dec = TlvDecoder::new(&body);
-                let mut enc = TlvEncoder::new();
-
-                // Read volume_id (Ino)
-                if let Ok(ino) = dec.next_u64(FieldId::Ino) {
-                    let _ = enc.add_u64(FieldId::Ino, ino);
-                }
-                // Read file_key (Name)
-                let _ = dec.next_u64(FieldId::Name).map(|_| {
-                    let _ = enc.add_u64(FieldId::Name, file_key);
-                });
-                // Read data (DataLen)
-                if let Ok(data) = dec.next_bytes(FieldId::DataLen) {
-                    let _ = enc.add_bytes(FieldId::DataLen, &data);
-                }
-                // Add lease token for server-side validation
-                let _ = enc.add_string(FieldId::LeaseToken, &token);
-                // Add client_id for lease holder validation
-                let _ = enc.add_string(FieldId::ClientId, "fuse-client");
-                enc.into_bytes()
-            } else {
-                body.clone()
-            };
-
-            let msg = vol_client
-                .send_request(resolved_msg_type, &final_body, &[])
-                .await;
+            // Send body as-is (lease_token + client_id already in TLV)
+            let msg = vol_client.send_request(resolved_msg_type, &body, &[]).await;
             match msg {
                 Ok(resp) if resp.is_ok() => {
                     breaker.record_success();

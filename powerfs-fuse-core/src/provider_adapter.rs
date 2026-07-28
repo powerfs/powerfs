@@ -160,12 +160,24 @@ fn build_batch_write_tlv(
     file_key: u64,
     entries_count: usize,
     data: &[u8],
+    lease_token: Option<&str>,
+    client_id: Option<&str>,
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id as u64);
     enc.add_u64(FieldId::Name, file_key);
     enc.add_u64(FieldId::Entries, entries_count as u64);
     let _ = enc.add_bytes(FieldId::DataLen, data);
+    if let Some(token) = lease_token {
+        if !token.is_empty() {
+            let _ = enc.add_string(FieldId::LeaseToken, token);
+        }
+    }
+    if let Some(cid) = client_id {
+        if !cid.is_empty() {
+            let _ = enc.add_string(FieldId::ClientId, cid);
+        }
+    }
     enc.into_bytes()
 }
 
@@ -592,7 +604,18 @@ impl StorageProvider for FacadeStorageProvider {
         _size: i32,
         data: &[u8],
     ) -> Result<()> {
-        let payload = build_write_tlv(volume_id, file_key, data, None, None);
+        let client_id = self.facade.client_id();
+        let lease_token = self
+            .facade
+            .volume_client()
+            .get_valid_lease_token(volume_id as u64, file_key);
+        let payload = build_write_tlv(
+            volume_id,
+            file_key,
+            data,
+            lease_token.as_deref(),
+            Some(&client_id),
+        );
 
         let _result = self
             .facade
@@ -619,7 +642,19 @@ impl StorageProvider for FacadeStorageProvider {
             combined_data.extend_from_slice(data);
         }
 
-        let payload = build_batch_write_tlv(volume_id, file_key, entries.len(), &combined_data);
+        let client_id = self.facade.client_id();
+        let lease_token = self
+            .facade
+            .volume_client()
+            .get_valid_lease_token(volume_id as u64, file_key);
+        let payload = build_batch_write_tlv(
+            volume_id,
+            file_key,
+            entries.len(),
+            &combined_data,
+            lease_token.as_deref(),
+            Some(&client_id),
+        );
 
         let _result = self
             .facade

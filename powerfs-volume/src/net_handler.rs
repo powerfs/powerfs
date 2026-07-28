@@ -250,17 +250,49 @@ impl VolumeNetHandler {
     async fn handle_batch_write_needle(
         &self,
         msg: &NetMessage,
+        session_client_id: u64,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
         let entries = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
+        let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let holder_client_id = dec
+            .next_string(FieldId::ClientId)
+            .unwrap_or_else(|_| session_client_id.to_string());
 
         info!(
-            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, entries={}",
-            volume_id, file_key, entries
+            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, entries={}, has_lease={}, holder={}",
+            volume_id, file_key, entries, !lease_token.is_empty(), holder_client_id
         );
+
+        if !lease_token.is_empty() {
+            let lease_mgr = self.volume_server.range_lease_mgr.clone();
+            let validation_result = lease_mgr.validate_token_with_grace_period(
+                &lease_token,
+                &holder_client_id,
+                file_key,
+                3000,
+            );
+            match validation_result {
+                Ok(()) => {
+                    debug!(
+                        "NET_BATCH_WRITE_NEEDLE: lease validated for file_key={}",
+                        file_key
+                    );
+                }
+                Err(e) => {
+                    warn!("NET_BATCH_WRITE_NEEDLE: lease validation failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
 
         let storage_manager = self.volume_server.storage_manager.clone();
         let vid = VolumeId(volume_id);
@@ -464,7 +496,7 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::WriteNeedle => self.handle_write_needle(msg, client_id).await,
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg).await,
+            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg, client_id).await,
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::Ping => {
@@ -516,7 +548,10 @@ impl ServerRequestHandler for VolumeNetHandler {
             MsgType::WriteNeedle => self.handle_write_needle(msg, ctx.client.client_id).await,
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg).await,
+            MsgType::BatchWriteNeedle => {
+                self.handle_batch_write_needle(msg, ctx.client.client_id)
+                    .await
+            }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::Ping => {
