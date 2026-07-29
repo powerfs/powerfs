@@ -3508,7 +3508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_level = if args.log_level != "info" {
         &args.log_level
     } else {
-        &monitor_cfg.redis_url
+        &cfg.global.log_level
     };
 
     let mut builder =

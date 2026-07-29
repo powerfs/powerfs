@@ -1000,6 +1000,11 @@ async fn process_data_request_internal(
     let msg_type = req.context.msg_type;
     let body = req.context.payload.clone();
 
+    log::debug!(
+        "process_data_request_internal: request_id={:?}, kind={:?}, msg_type={:?}, body_len={}, shard_id={}",
+        request_id, kind, msg_type, body.len(), req.shard_id
+    );
+
     if !breaker.is_available() {
         let result = Err(ClientError::CircuitOpen);
         resolve_waiter_for(&request_id, result.clone(), response_waiters);
@@ -1018,6 +1023,10 @@ async fn process_data_request_internal(
     }
     .ok_or_else(|| {
         let err = ClientError::VolumeNotFound(req.shard_id);
+        log::error!(
+            "process_data_request_internal: volume not found for shard_id={}",
+            req.shard_id
+        );
         resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
         err
     })?;
@@ -1033,11 +1042,19 @@ async fn process_data_request_internal(
         (host, port)
     };
 
+    log::debug!(
+        "process_data_request_internal: connecting to volume at {}:{}",
+        volume_host, volume_port
+    );
+
     let vol_client = nc
         .get_volume_client(&volume_host, volume_port)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+            log::error!(
+                "process_data_request_internal: failed to get volume client: {}", e
+            );
             resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
             err
         })?;
@@ -1048,11 +1065,20 @@ async fn process_data_request_internal(
         _ => powerfs_net::MsgType::ReadNeedleBlob,
     });
 
+    log::debug!(
+        "process_data_request_internal: sending request to volume: msg_type={:?}, body_len={}",
+        resolved_msg_type, body.len()
+    );
+
     let result = match kind {
         RequestKind::Read => {
             let msg = vol_client.send_request(resolved_msg_type, &body, &[]).await;
             match msg {
                 Ok(resp) if resp.is_ok() => {
+                    log::debug!(
+                        "process_data_request_internal: received successful response: body_len={}, data_len={}",
+                        resp.body.len(), resp.data.len()
+                    );
                     breaker.record_success();
                     Ok(RequestResult::success_with_payload(
                         request_id.clone(),
@@ -1061,6 +1087,10 @@ async fn process_data_request_internal(
                     ))
                 }
                 Ok(resp) => {
+                    log::error!(
+                        "process_data_request_internal: received error response: status={}",
+                        resp.header.status
+                    );
                     breaker.record_failure();
                     Err(ClientError::Server(format!(
                         "Server error: {}",
@@ -1068,6 +1098,9 @@ async fn process_data_request_internal(
                     )))
                 }
                 Err(e) => {
+                    log::error!(
+                        "process_data_request_internal: request failed: {}", e
+                    );
                     breaker.record_failure();
                     Err(ClientError::from_net_error(e))
                 }

@@ -138,8 +138,8 @@ impl Default for VolumeConfig {
             data_dir: "./data/volume".to_string(),
             master_addresses: vec!["localhost:9333".to_string()],
             node_id: "volume-server".to_string(),
-            max_volume_size: 1073741824,
-            initial_volume_count: 2,
+            max_volume_size: 10737418240, // 10GB per volume
+            initial_volume_count: 4, // 4 volumes per server
             device_capacity: None,
             net_port: 8081,
         }

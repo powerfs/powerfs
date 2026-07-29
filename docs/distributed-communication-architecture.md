@@ -3,7 +3,7 @@
 > **版本**: v3.0  
 > **日期**: 2026-07-28  
 > **状态**: 设计评审中  
-> **v3.0 变更**: VolumeClient 简化为统一数据队列 + 多传输通道；新增内核文件系统适配层
+> **v3.0 变更**: VolumeClient 简化为统一数据队列 + 多传输通道；新增内核文件系统适配层；新增 FuseClientFacade 门面设计
 
 ---
 
@@ -16,14 +16,15 @@
 5. [Exactly-Once 保证](#5-exactly-once-保证)
 6. [Raft 日志集成](#6-raft-日志集成)
 7. [熔断器与健康管理](#7-熔断器与健康管理)
-8. [协议扩展](#8-协议扩展)
-9. [FUSE 层集成](#9-fuse-层集成)
-10. [内核文件系统适配层](#10-内核文件系统适配层) (v3.0 新增)
-11. [分阶段实施计划](#11-分阶段实施计划)
+8. [熔断器与健康管理](#8-熔断器与健康管理)
+9. [协议扩展](#9-协议扩展)
+10. [FuseClientFacade 设计](#10-fuseclientfacade-设计) (v3.0 新增)
+11. [FUSE 层集成](#11-fuse-层集成)
+12. [动态拓扑管理: ClusterTopologyManager](#12-动态拓扑管理-clustertopologymanager)
+13. [内核文件系统适配层](#13-内核文件系统适配层) (v3.0 新增)
+14. [分阶段实施计划](#14-分阶段实施计划)
 
 ---
-
-## 1. 架构总览
 
 ### 1.1 分层架构
 
@@ -1191,9 +1192,234 @@ impl TlvDecoder {
 
 ---
 
-## 10. FUSE 层集成
+## 10. FuseClientFacade 设计
 
-### 10.1 PowerFsFs 重构
+> **v3.0 新增章节** — 作为 FUSE 客户端的统一门面，协调三个独立客户端，提供简洁的统一接口。
+
+### 10.1 设计理念
+
+`FuseClientFacade` 是 FUSE 层与底层三个客户端（MasterClient、MetaShardClient、VolumeClient）之间的门面层。它的核心职责是：
+
+1. **统一入口**：为 FUSE 回调层（`fuse.rs`）提供简洁的统一接口
+2. **客户端协调**：协调三个独立客户端的初始化、连接和关闭
+3. **请求路由**：根据请求类型自动路由到对应的客户端通道
+4. **拓扑同步**：通过 `ClusterTopologyManager` 保持三个客户端的拓扑一致性
+5. **错误转换**：将底层客户端的错误转换为 FUSE 层可理解的错误
+
+**设计原则**：
+- FuseClientFacade 本身不管理网络连接，每个客户端独立管理自己的连接
+- FuseClientFacade 只做协调和转发，不包含业务逻辑
+- 通过 `ClusterTopologyManager` 实现客户端之间的拓扑信息共享
+
+### 10.2 架构位置
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          FUSE Callbacks                               │
+│     (lookup, create, read, write, mkdir, unlink, statfs...)          │
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      FuseClientFacade (门面)                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  SyncFuseClientFacade (同步适配器, 用于 FUSE 同步回调)         │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+└──────┬──────────────────┬──────────────────┬────────────────────────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│MasterClient │  │MetaShardClient│  │VolumeClient │
+└─────────────┘  └─────────────┘  └─────────────┘
+       │                  │                  │
+       └──────────────────┼──────────────────┘
+                          ▼
+              ┌─────────────────────┐
+              │ ClusterTopologyMgr  │
+              └─────────────────────┘
+```
+
+### 10.3 结构体定义
+
+```rust
+/// FuseClientFacade 配置
+#[derive(Debug, Clone)]
+pub struct FuseClientFacadeConfig {
+    /// Master 节点地址
+    pub master_addr: String,
+    /// Master 端口
+    pub master_port: u16,
+    /// Volume 网络端口
+    pub volume_net_port: u16,
+    /// Volume 地址列表
+    pub volume_addrs: Vec<String>,
+    /// Filer 节点地址
+    pub filer_addr: String,
+    /// Filer 端口
+    pub filer_port: u16,
+    /// 请求超时
+    pub request_timeout: Duration,
+    /// 客户端身份
+    pub client_identity: ClientIdentity,
+}
+
+/// FuseClientFacade - 门面模式，协调 MasterClient、MetaShardClient、VolumeClient
+pub struct FuseClientFacade {
+    /// 配置
+    config: FuseClientFacadeConfig,
+    /// 可选的统一网络客户端（用于复用已建立的连接）
+    net_client: Option<Arc<PowerFuseNetClient>>,
+    /// 拓扑管理器（三个客户端共享）
+    topology_manager: Arc<ClusterTopologyManager>,
+    /// Master 客户端
+    master_client: MasterClient,
+    /// MetaShard 客户端
+    meta_shard_client: MetaShardClient,
+    /// Volume 客户端
+    volume_client: VolumeClient,
+}
+```
+
+### 10.4 核心 API
+
+```rust
+impl FuseClientFacade {
+    /// 创建新的 FuseClientFacade（每个客户端独立管理连接）
+    pub async fn new(config: FuseClientFacadeConfig) -> Result<Self, String> { ... }
+
+    /// 从已有的 PowerFuseNetClient 构建（复用现有连接）
+    pub async fn build_from_net_client(
+        config: FuseClientFacadeConfig,
+        net_client: Arc<PowerFuseNetClient>,
+    ) -> Result<Self, String> { ... }
+
+    // ======= 客户端引用 =======
+    pub fn master_client(&self) -> &MasterClient { ... }
+    pub fn meta_shard_client(&self) -> &MetaShardClient { ... }
+    pub fn volume_client(&self) -> &VolumeClient { ... }
+    pub fn topology_manager(&self) -> &Arc<ClusterTopologyManager> { ... }
+
+    // ======= 标识与配置 =======
+    pub fn client_id(&self) -> String { ... }
+    pub fn volume_addrs(&self) -> Vec<String> { ... }
+    pub fn filer_leader_addr(&self) -> String { ... }
+
+    // ======= 元数据请求（委托给 MetaShardClient）=======
+    pub async fn submit_metadata_request(
+        &self, kind: RequestKind, shard_id: u64, payload: Vec<u8>,
+    ) -> Result<RequestResult, String> { ... }
+
+    pub async fn submit_metadata_request_with_type(
+        &self, kind: RequestKind, shard_id: u64,
+        payload: Vec<u8>, msg_type: MsgType,
+    ) -> Result<RequestResult, String> { ... }
+
+    // ======= 控制请求（委托给 MetaShardClient）=======
+    pub async fn submit_control_request(
+        &self, kind: RequestKind, shard_id: u64, payload: Vec<u8>,
+    ) -> Result<RequestResult, String> { ... }
+
+    // ======= 数据请求（委托给 VolumeClient）=======
+    pub async fn submit_data_request(
+        &self, kind: RequestKind, volume_id: u64, payload: Vec<u8>,
+    ) -> Result<RequestResult, String> { ... }
+
+    // ======= Lease 请求（委托给 VolumeClient）=======
+    pub async fn submit_lease_request(
+        &self, volume_id: u64, payload: Vec<u8>,
+    ) -> Result<RequestResult, String> { ... }
+
+    // ======= 管理请求（委托给 VolumeClient）=======
+    pub async fn submit_mgmt_request(
+        &self, volume_id: u64, payload: Vec<u8>,
+    ) -> Result<RequestResult, String> { ... }
+
+    // ======= Master 请求（委托给 MasterClient）=======
+    pub async fn submit_master_request(
+        &self, msg_type: MsgType, payload: Vec<u8>,
+    ) -> Result<NetMessage, String> { ... }
+
+    // ======= 拓扑管理 =======
+    pub async fn refresh_topology(&self) -> Result<(), String> { ... }
+    pub fn update_master_leader(&self, leader_addr: &str) { ... }
+
+    // ======= 生命周期 =======
+    pub fn close(&self) { ... }
+}
+```
+
+### 10.5 SyncFuseClientFacade - 同步适配器
+
+FUSE 回调使用同步接口（`libfuse` 要求），但底层客户端使用异步接口。`SyncFuseClientFacade` 通过 `tokio::runtime::Runtime::block_on()` 实现同步转异步的适配。
+
+```rust
+/// SyncFuseClientFacade - 同步适配器
+/// 将 FuseClientFacade 的异步接口包装为同步接口，用于在 FUSE 同步回调上下文中使用
+pub struct SyncFuseClientFacade {
+    facade: Arc<FuseClientFacade>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl SyncFuseClientFacade {
+    pub fn new(facade: Arc<FuseClientFacade>, runtime: Arc<tokio::runtime::Runtime>) -> Self { ... }
+
+    pub fn facade(&self) -> &Arc<FuseClientFacade> { ... }
+    pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> { ... }
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output { ... }
+
+    // ======= 便捷同步方法（供 fuse.rs 使用）=======
+    
+    // 元数据操作
+    pub fn get_entry(&self, path: &str) -> Result<ProtoEntry, String> { ... }
+    pub fn get_entry_by_inode(&self, inode: u64) -> Result<(ProtoEntry, String), String> { ... }
+    pub fn create_entry(&self, entry: &ProtoEntry, client_id: &str) -> Result<u64, String> { ... }
+    pub fn update_entry(&self, entry: &ProtoEntry, client_id: &str, old_size: u64, is_truncate: bool) -> Result<u64, String> { ... }
+    pub fn delete_entry(&self, parent_ino: u64, name: &str, is_dir: bool, client_id: &str) -> Result<(), String> { ... }
+    pub fn list_entries(&self, inode: u64, limit: u32, client_id: &str) -> Result<Vec<ProtoEntry>, String> { ... }
+
+    // 卷分配
+    pub fn assign_volume(&self, collection: &str, replication: &str) -> Result<(Fid, Vec<Location>), String> { ... }
+    pub fn lookup_volume(&self, volume_id: VolumeId) -> Result<Vec<Location>, String> { ... }
+
+    // 数据操作
+    pub fn write_blob(&self, volume_addr: &str, volume_id: u32, file_key: u64, offset: i64, size: i32, data: Vec<u8>, cookie: u32) -> Result<(), String> { ... }
+    pub fn read_blob(&self, volume_addr: &str, volume_id: u32, file_key: u64, offset: i64, size: i32) -> Result<Vec<u8>, String> { ... }
+    pub fn delete_blob(&self, volume_id: u32, file_key: u64) -> Result<(), String> { ... }
+}
+```
+
+### 10.6 初始化流程
+
+```
+1. [FUSE 启动]
+2.   └─> 创建 FuseClientFacadeConfig
+3.   └─> FuseClientFacade::new(config)
+        ├─> 创建 ClusterTopologyManager
+        ├─> 创建 MasterClient（独立连接）
+        ├─> 创建 MetaShardClient（独立连接）
+        ├─> 创建 VolumeClient（独立连接）
+        └─> 返回 FuseClientFacade 实例
+4. [FUSE 启动完成]
+5.   └─> SyncFuseClientFacade::new(facade, runtime)
+6.   └─> PowerFsFs { client: sync_client, ... }
+7.   └─> 开始服务 FUSE 回调请求
+```
+
+### 10.7 请求路由规则
+
+| 请求类型 | 路由目标 | 通道类型 |
+|---------|---------|---------|
+| Metadata (lookup, create, mkdir...) | MetaShardClient | DataChannel / ControlChannel |
+| Data (read, write, delete...) | VolumeClient | DataQueue → ChannelPool |
+| Lease (acquire, renew, release) | VolumeClient | LeaseChannel (独占) |
+| Management (statfs, status) | VolumeClient | MgmtChannel (独占) |
+| Cluster (topology, assign volume) | MasterClient | QueryChannel / WatchChannel |
+
+---
+
+## 11. FUSE 层集成
+
+### 11.1 PowerFsFs 重构
 
 ```rust
 pub struct PowerFsFs {
@@ -1211,7 +1437,7 @@ pub struct PowerFsFs {
 }
 ```
 
-### 10.2 回调示例
+### 11.2 回调示例
 
 ```rust
 impl FileSystem for PowerFsFs {
@@ -1289,11 +1515,11 @@ impl FileSystem for PowerFsFs {
 
 ---
 
-## 11. 动态拓扑管理: ClusterTopologyManager
+## 12. 动态拓扑管理: ClusterTopologyManager
 
 > **v3.0 新增核心组件** — 作为客户端动态发现和适应集群变化的引导层。
 
-### 11.1 设计理念
+### 12.1 设计理念
 
 分布式文件系统的客户端不应该硬编码服务端地址。`ClusterTopologyManager` 作为 FUSE 客户端与 Master 之间的桥梁，提供：
 -   **引导 (Bootstrap)**：启动时从 Master 获取最新拓扑快照。
@@ -1301,7 +1527,7 @@ impl FileSystem for PowerFsFs {
 -   **事件驱动**：实时响应用于 Master 推送的拓扑变更通知（如 Leader 切换、节点故障）。
 -   **Master HA**：处理 Master 本身的高可用性（故障切换）。
 
-### 11.2 核心结构体
+### 12.2 核心结构体
 
 ```rust
 pub struct ClusterTopologyManager {
@@ -1340,7 +1566,7 @@ struct VolumeInfo {
 }
 ```
 
-### 11.3 初始化流程 (Bootstrap)
+### 12.3 初始化流程 (Bootstrap)
 
 ```
 1. [FUSE 启动] 
@@ -1357,7 +1583,7 @@ struct VolumeInfo {
 4. [FUSE 启动完成，开始服务用户请求]
 ```
 
-### 11.4 动态更新机制
+### 12.4 动态更新机制
 
 #### 方案：Master Watch + 定期 Poll
 
@@ -1390,7 +1616,7 @@ impl ClusterTopologyManager {
 }
 ```
 
-### 11.5 Master 高可用
+### 12.5 Master 高可用
 
 Master 本身也是一个 Raft 集群。`ClusterTopologyManager` 必须能处理 Master Leader 的切换：
 -   **多地址配置**：FUSE 客户端启动时配置多个 Master 地址 (例如，`master1:9333,master2:9333,master3:9333`)。
@@ -1402,18 +1628,18 @@ Master 本身也是一个 Raft 集群。`ClusterTopologyManager` 必须能处理
 
 ---
 
-## 12. 内核文件系统适配层
+## 13. 内核文件系统适配层
 
 > **v3.0 新增章节** — 确保通信架构在用户态（FUSE）和内核态（powerfs_mod）完全对齐。
 
-### 12.1 设计目标
+### 13.1 设计目标
 
 1. **协议兼容**：用户态和内核态使用相同的二进制协议（powerfs-net wire format）
 2. **语义一致**：相同的请求类型、状态机、重试策略、熔断行为
 3. **结构映射**：用户态的 `MetaShardClient` / `VolumeClient` 可一比一映射到内核态 C 实现
 4. **性能优先**：内核态实现需零拷贝、最少锁、最小内存占用
 
-### 12.2 用户态 ↔ 内核态 结构映射
+### 13.2 用户态 ↔ 内核态 结构映射
 
 #### MetaShardClient 映射
 
@@ -1441,7 +1667,7 @@ Master 本身也是一个 Raft 集群。`ClusterTopologyManager` 必须能处理
 | `Channel.inflight` | `atomic_t inflight` |
 | `Channel.transport` | `struct socket *sock` |
 
-### 12.3 内核态核心结构
+### 13.3 内核态核心结构
 
 ```c
 /* powerfs_transport_client.h — 内核态客户端抽象 */
@@ -1563,7 +1789,7 @@ struct powerfs_volume_client {
 };
 ```
 
-### 12.4 内核态调度核心
+### 13.4 内核态调度核心
 
 ```c
 /* powerfs_volume_client.c — 主调度循环 */
@@ -1675,7 +1901,7 @@ powerfs_select_channel(struct powerfs_volume_client *vc,
 }
 ```
 
-### 12.5 内核态注意事项
+### 13.5 内核态注意事项
 
 #### 内存管理
 ```c
@@ -1737,7 +1963,7 @@ int powerfs_volume_submit_data(struct powerfs_volume_client *vc,
 }
 ```
 
-### 12.6 用户态 ↔ 内核态 接口一致性
+### 13.6 用户态 ↔ 内核态 接口一致性
 
 为使两套实现行为一致，定义统一的**传输抽象层**：
 
@@ -1763,7 +1989,7 @@ int powerfs_volume_submit_data(struct powerfs_volume_client *vc,
 3. 相同的通道选择算法
 4. 相同的熔断器状态机
 
-### 12.7 内核态实施要点
+### 13.7 内核态实施要点
 
 | 优先级 | 要点 | 工时 |
 |--------|------|------|
@@ -1780,7 +2006,7 @@ int powerfs_volume_submit_data(struct powerfs_volume_client *vc,
 
 ---
 
-## 13. 分阶段实施计划
+## 14. 分阶段实施计划
 
 ### Phase 1: 基础类型与协议扩展 + 拓扑管理 (4天)
 

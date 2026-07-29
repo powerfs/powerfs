@@ -551,6 +551,7 @@ pub enum FieldId {
     VolumeId = 0x92,
     Cookie = 0x93,
     FileKey = 0x94,
+    Fid = 0x95,
 }
 
 impl FieldId {
@@ -611,6 +612,7 @@ impl FieldId {
             0x92 => Some(Self::VolumeId),
             0x93 => Some(Self::Cookie),
             0x94 => Some(Self::FileKey),
+            0x95 => Some(Self::Fid),
             _ => None,
         }
     }

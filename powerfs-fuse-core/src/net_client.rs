@@ -103,6 +103,39 @@ impl PowerFuseNetClient {
         })
     }
 
+    /// Create a new wrapper client with a specific master client (for leader redirect)
+    pub fn new_with_master(config: NetClientConfig, master_client: Arc<PowerFsNetClient>) -> Self {
+        let filer_client = Arc::new(PowerFsNetClient::new(ClientConfig {
+            addr: config.filer_addr.clone(),
+            port: config.filer_net_port,
+            client_id: config.client_id,
+            client_type: ClientType::Fuse,
+            connect_timeout: config.connect_timeout,
+            request_timeout: config.request_timeout,
+            max_retries: 3,
+            retry_delay: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(30),
+            max_inflight_requests: 256,
+        }));
+
+        let default_filer_key = format!("{}:{}", config.filer_addr, config.filer_net_port);
+        let mut filer_clients_map = HashMap::new();
+        filer_clients_map.insert(default_filer_key, filer_client.clone());
+
+        Self {
+            master_client,
+            filer_client,
+            filer_clients: Arc::new(RwLock::new(filer_clients_map)),
+            volume_clients: Arc::new(RwLock::new(Vec::new())),
+            config,
+        }
+    }
+
+    /// Get the config
+    pub fn config(&self) -> &NetClientConfig {
+        &self.config
+    }
+
     /// Get or create a filer client for the given "host:port" address string.
     /// Automatically translates Raft/gRPC ports (8888/8889/8890) to the configured filer net port.
     pub async fn get_filer_client(&self, raw_addr: &str) -> NetResult<Arc<PowerFsNetClient>> {

@@ -121,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Masters: {}", master_address.join(", "));
     info!("  Data Dir: {}", data_dir);
     info!("  Initial Volume Count: {}", initial_volume_count);
+    info!("  Volume Size: {}", volume_size);
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
@@ -131,6 +132,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .expect("Failed to create storage manager"),
     );
+
+    // Pre-create volumes at startup (simplified: volumes are pre-configured, not dynamically created)
+    // This allows functional testing without dynamic volume creation overhead
+    let _pre_allocated_volumes = {
+        let mut pre_allocated = Vec::new();
+        let existing_volumes = storage_manager.list_volumes();
+        
+        info!("Pre-creating {} volumes with size {} bytes each", initial_volume_count, volume_size);
+        
+        for i in 0..initial_volume_count {
+            let volume_id = powerfs_common::types::VolumeId(i + 1); // Start from 1
+            
+            // Check if volume already exists
+            if existing_volumes.iter().any(|v| v.id == volume_id) {
+                info!("Volume {} already exists, skipping creation", volume_id.0);
+                pre_allocated.push(volume_id);
+                continue;
+            }
+            
+            match storage_manager.create_volume(volume_id, volume_size) {
+                Ok(_) => {
+                    info!("Pre-created volume {} with size {}", volume_id.0, volume_size);
+                    pre_allocated.push(volume_id);
+                }
+                Err(e) => {
+                    warn!("Failed to pre-create volume {}: {}", volume_id.0, e);
+                }
+            }
+        }
+        
+        info!("Pre-created {} volumes successfully", pre_allocated.len());
+        pre_allocated
+    };
 
     let grpc_port = grpc_address
         .split(':')
@@ -198,9 +232,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("Failed to start heartbeat: {}", e);
         }
 
+        // Spawn background task for heartbeat and volume reporting
+        // Volumes are pre-created at startup, no need to request from master
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
+            // Send initial heartbeat with pre-created volumes
             let volumes = storage_manager.list_volumes();
             let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                 .into_iter()
@@ -216,6 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
 
+            info!(
+                "Sending initial heartbeat with {} pre-created volumes: {:?}",
+                proto_volumes.len(),
+                proto_volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>()
+            );
+
             if master_client.send_heartbeat(proto_volumes).await.is_err() {
                 warn!("Initial heartbeat failed, reconnecting...");
                 if let Err(e) = master_client.start_heartbeat().await {
@@ -223,44 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(20)).await;
-
-            info!("Requesting initial volumes from master...");
-            match master_client
-                .grow("001", "default", initial_volume_count)
-                .await
-            {
-                Ok(response) => {
-                    info!(
-                        "grow response: new_volume_ids={:?}, locations={}, error={}",
-                        response.new_volume_ids,
-                        response.locations.len(),
-                        response.error
-                    );
-                    if !response.new_volume_ids.is_empty() {
-                        info!(
-                            "Received {} new volume IDs from master",
-                            response.new_volume_ids.len()
-                        );
-                        for &vid in &response.new_volume_ids {
-                            if storage_manager
-                                .create_volume(powerfs_common::types::VolumeId(vid), volume_size)
-                                .is_ok()
-                            {
-                                info!("Created volume {}", vid);
-                            } else {
-                                warn!("Failed to create volume {}", vid);
-                            }
-                        }
-                    } else {
-                        warn!("No volume IDs received from master");
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to request volumes from master: {}", e);
-                }
-            }
-
+            // Continuous heartbeat loop
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let volumes = storage_manager.list_volumes();

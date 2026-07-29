@@ -9,6 +9,25 @@ pub use crate::utils::{Checksum, ChecksumAlgorithm};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct VolumeId(pub u32);
 
+impl VolumeId {
+    /// Get the original volume ID (as used by Volume Server)
+    /// Composite ID format: server_idx * 1000 + volume_idx (e.g., 1001 for server-1, volume-1)
+    /// Original ID = volume_idx + 1 = composite_id % 1000
+    pub fn original_id(&self) -> u32 {
+        (self.0 % 1000).max(1) // Ensure at least 1
+    }
+    
+    /// Get the server index (0-based) from composite ID
+    pub fn server_idx(&self) -> u32 {
+        self.0 / 1000
+    }
+    
+    /// Create a composite volume ID from server index and original volume ID
+    pub fn from_server_volume(server_idx: u32, volume_idx: u32) -> Self {
+        VolumeId(server_idx * 1000 + volume_idx)
+    }
+}
+
 impl fmt::Display for VolumeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

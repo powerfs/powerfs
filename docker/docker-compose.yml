@@ -345,6 +345,7 @@ services:
       /app/powerfs-monitor
       --addr 0.0.0.0:8081
       --redis-url redis://redis:6379
+      --master-endpoint 172.20.0.11:9333
       --s3-endpoint http://172.20.0.32:9000
       --s3-backend-endpoint http://172.20.0.32:9000
       --s3-access-key powerfs

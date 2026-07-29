@@ -9,8 +9,8 @@ use log::{debug, error, info, warn};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, RequestContext,
-    ServerRequestHandler, STATUS_ERR_ALREADY_EXISTS, STATUS_ERR_NOT_FOUND, STATUS_ERR_SERVER_ERROR,
-    STATUS_OK,
+    ServerRequestHandler, STATUS_ERR_ALREADY_EXISTS, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
+    STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
@@ -140,14 +140,17 @@ impl MasterNetHandler {
 
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
-            error!(
-                "NET_ASSIGN: not leader; current leader is {}, returning error response",
+            warn!(
+                "NET_ASSIGN: not leader; current leader is {}, returning redirect response",
                 leader
             );
+            // Return redirect response with leader address
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Owner, &leader);
             return Ok(Self::build_response(
                 msg,
-                STATUS_ERR_SERVER_ERROR,
-                Vec::new(),
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
                 Vec::new(),
             ));
         }
@@ -203,10 +206,15 @@ impl MasterNetHandler {
 
         info!("NET_LOOKUP_VOLUME: volume_id={}", volume_id_str);
 
-        let vid: u32 = volume_id_str.parse().unwrap_or(0);
-        let volume_id = powerfs_common::types::VolumeId(vid);
+        let original_id: u32 = volume_id_str.parse().unwrap_or(0);
 
-        if let Some(info) = self.master.get_volume_info(&volume_id) {
+        // Look up by original ID (as used by Volume Server)
+        if let Some(info) = self.master.get_volume_info_by_original_id(original_id) {
+            info!(
+                "NET_LOOKUP_VOLUME: found volume info for original_id={}, composite_id={}, node_id={}",
+                original_id, info.id.0, info.node_id.0
+            );
+            
             if let Some(node) = self.master.get_node(&info.node_id) {
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Limit, 1); // count

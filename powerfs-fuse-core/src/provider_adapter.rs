@@ -36,6 +36,7 @@ fn build_lookup_tlv(parent_ino: u64, name: &str) -> Vec<u8> {
 }
 
 /// Encode a Create/Mkdir request body in TLV format
+#[allow(dead_code)]
 fn build_create_tlv(parent_ino: u64, name: &str, mode: u64, uid: u64, gid: u64) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     let _ = enc.add_u64(FieldId::ParentIno, parent_ino);
@@ -43,6 +44,33 @@ fn build_create_tlv(parent_ino: u64, name: &str, mode: u64, uid: u64, gid: u64) 
     let _ = enc.add_u64(FieldId::Mode, mode);
     let _ = enc.add_u64(FieldId::Uid, uid);
     let _ = enc.add_u64(FieldId::Gid, gid);
+    enc.into_bytes()
+}
+
+/// Encode a Create/Mkdir request body in TLV format, including chunk/fid info
+fn build_create_tlv_with_chunks(
+    parent_ino: u64,
+    name: &str,
+    mode: u64,
+    uid: u64,
+    gid: u64,
+    chunks: &[powerfs_common::traits::FileChunk],
+) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    let _ = enc.add_u64(FieldId::ParentIno, parent_ino);
+    let _ = enc.add_string(FieldId::Name, name);
+    let _ = enc.add_u64(FieldId::Mode, mode);
+    let _ = enc.add_u64(FieldId::Uid, uid);
+    let _ = enc.add_u64(FieldId::Gid, gid);
+
+    // Encode chunk/fid info for persistence on Filer
+    for chunk in chunks {
+        let _ = enc.add_string(FieldId::Fid, &chunk.fid);
+        let _ = enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+        let _ = enc.add_u64(FieldId::FileKey, chunk.offset); // reuse FileKey field
+        let _ = enc.add_u64(FieldId::Size, chunk.size);
+    }
+
     enc.into_bytes()
 }
 
@@ -89,15 +117,36 @@ fn build_readdir_tlv(parent_ino: u64, offset: u64) -> Vec<u8> {
 fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     let mut dec = TlvDecoder::new(data);
     let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
-    let mode = dec.next_u64(FieldId::Mode).unwrap_or(0o644) as u32;
-    let uid = dec.next_u64(FieldId::Uid).unwrap_or(0) as u32;
-    let gid = dec.next_u64(FieldId::Gid).unwrap_or(0) as u32;
+    let mode = dec.next_u32(FieldId::Mode).unwrap_or(0o644);
+    let uid = dec.next_u32(FieldId::Uid).unwrap_or(0);
+    let gid = dec.next_u32(FieldId::Gid).unwrap_or(0);
     let size = dec.next_u64(FieldId::Size).unwrap_or(0);
-    let _nlink = dec.next_u64(FieldId::Nlink).unwrap_or(1) as u32;
+    let _nlink = dec.next_u32(FieldId::Nlink).unwrap_or(1);
     let mtime = dec.next_u64(FieldId::Mtime).unwrap_or(0);
     let atime = dec.next_u64(FieldId::Atime).unwrap_or(0);
     let ctime = dec.next_u64(FieldId::Ctime).unwrap_or(0);
     let name = dec.next_string(FieldId::Name).unwrap_or_default();
+
+    eprintln!("parse_entry_from_tlv: path={}, ino={}, mode={:o}, name={}", path, ino, mode, name);
+
+    // Parse chunk/fid info
+    let fid = dec.next_string(FieldId::Fid).ok();
+    let _volume_id = dec.next_u64(FieldId::VolumeId).ok();
+    let cookie = dec.next_u64(FieldId::Cookie).ok();
+    let file_key = dec.next_u64(FieldId::FileKey).ok();
+    let chunk_size = dec.next_u64(FieldId::Size).ok();
+
+    let mut chunks = Vec::new();
+    if let (Some(fid_str), Some(c)) = (fid, cookie) {
+        chunks.push(powerfs_common::traits::FileChunk {
+            offset: file_key.unwrap_or(0),
+            size: chunk_size.unwrap_or(0),
+            mtime: mtime,
+            fid: fid_str,
+            cookie: c as u32,
+            crc32: 0,
+        });
+    }
 
     let entry_name = if name.is_empty() {
         let path_name = path.rsplit('/').next().unwrap_or(path);
@@ -123,7 +172,7 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         name: entry_name,
         directory: String::new(),
         attributes: Some(attributes),
-        chunks: Vec::new(),
+        chunks,
         hard_link_id: String::new(),
         hard_link_counter: 0,
         extended: std::collections::HashMap::new(),
@@ -376,7 +425,7 @@ impl VolumeProvider for FacadeVolumeProvider {
             }]
         } else {
             vec![Location {
-                url: self.facade.net_client().filer_leader_addr(),
+                url: self.facade.filer_leader_addr(),
                 public_url: String::new(),
                 grpc_port: 0,
                 data_center: String::new(),
@@ -507,7 +556,7 @@ impl MetadataProvider for FacadeMetadataProvider {
         let gid = entry.attributes.as_ref().map(|a| a.gid as u64).unwrap_or(0);
         let is_dir = mode & 0o170000 == 0o040000;
 
-        let payload = build_create_tlv(parent_ino, &name, mode, uid, gid);
+        let payload = build_create_tlv_with_chunks(parent_ino, &name, mode, uid, gid, &entry.chunks);
 
         let msg_type = if is_dir {
             powerfs_net::MsgType::Mkdir

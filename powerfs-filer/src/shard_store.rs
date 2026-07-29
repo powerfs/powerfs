@@ -1,4 +1,4 @@
-use log::info;
+use log::{info, warn};
 use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -325,6 +325,7 @@ impl ShardStore {
         it.seek_to_first();
 
         let mut inodes = self.inodes.write().unwrap();
+        let mut count = 0;
         while it.valid() {
             if let (Some(key), Some(value)) = (it.key(), it.value()) {
                 let mut key_bytes = [0u8; 8];
@@ -332,11 +333,13 @@ impl ShardStore {
                 let inode = u64::from_be_bytes(key_bytes);
                 if let Ok(info) = serde_json::from_slice::<InodeInfo>(value) {
                     inodes.insert(inode, info);
+                    count += 1;
                 }
             }
             it.next();
         }
 
+        info!("Shard {} loaded {} inodes from rocksdb", self.shard_id.0, count);
         Ok(())
     }
 
@@ -370,6 +373,7 @@ impl ShardStore {
             it.next();
         }
 
+        info!("Shard {} loaded {} directory entries from rocksdb", self.shard_id.0, dir_entries.len());
         Ok(())
     }
 
@@ -464,6 +468,16 @@ impl ShardStore {
                 new_name,
             } => {
                 self.create_hard_link(inode, new_parent_inode, new_name);
+            }
+            ShardCommand::SetChunks {
+                inode,
+                fid,
+                volume_id,
+                cookie,
+                offset,
+                size,
+            } => {
+                self.set_chunks(inode, fid, volume_id, cookie, offset, size);
             }
         }
     }
@@ -837,6 +851,51 @@ impl ShardStore {
             "Shard {} renamed: {} -> {}",
             self.shard_id.0, old_name, new_name
         );
+    }
+
+    /// Set chunk/fid info for an existing inode (for data location persistence)
+    fn set_chunks(
+        &self,
+        inode: u64,
+        fid: String,
+        volume_id: u32,
+        cookie: u32,
+        offset: u64,
+        size: u64,
+    ) {
+        let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
+
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            if let Some(info) = inodes.get_mut(&inode) {
+                info.fid = Some(fid.clone());
+                info.volume_id = Some(volume_id);
+                info.chunks.push(StoredFileChunk {
+                    offset,
+                    size,
+                    mtime: chrono::Utc::now().timestamp() as u64,
+                    fid: fid.clone(),
+                    cookie,
+                    crc32: 0,
+                });
+
+                // Persist to RocksDB
+                if let Ok(data) = serde_json::to_vec(info) {
+                    let inode_key = inode.to_be_bytes();
+                    let _ = self.db.put_cf(cf_inodes, inode_key, &data);
+                }
+
+                info!(
+                    "Shard {} set_chunks: inode={}, fid={}, volume_id={}, cookie={}",
+                    self.shard_id.0, inode, fid, volume_id, cookie
+                );
+            } else {
+                warn!(
+                    "Shard {} set_chunks: inode {} not found",
+                    self.shard_id.0, inode
+                );
+            }
+        }
     }
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {

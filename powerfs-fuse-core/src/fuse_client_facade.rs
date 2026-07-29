@@ -5,16 +5,15 @@ use crate::client_identity::ClientIdentity;
 use crate::meta_shard_client::{
     default_msg_type_for_kind, MetaShardClient, MetaShardClientConfig, RequestResult,
 };
-use crate::net_client::{NetClientConfig, PowerFuseNetClient};
-use crate::provider_adapter::parse_response_from_result;
+use crate::net_client::PowerFuseNetClient;
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, MasterClient, MasterClientConfig};
-use crate::volume_client::{VolumeClient, VolumeClientConfig};
+use crate::volume_client::VolumeClient;
+use crate::volume_client::VolumeClientConfig;
 
 // 显式导入 Provider traits 以便在 SyncFuseClientFacade 中调用 provider 方法
 use powerfs_common::traits::{
-    Entry as TraitsEntry, EntryAttributes as TraitsEntryAttributes, FileChunk as TraitsFileChunk,
     MetadataProvider as _MetadataProvider, StorageProvider as _StorageProvider,
     VolumeProvider as _VolumeProvider,
 };
@@ -22,24 +21,31 @@ use powerfs_master::proto::powerfs::{
     Entry as ProtoEntry, FileChunk as ProtoFileChunk, FuseAttributes as ProtoFuseAttributes,
 };
 
-/// 将 proto Entry 转换为 traits Entry（SyncFuseClientFacade 内部使用）
-fn proto_entry_to_traits(entry: &ProtoEntry) -> TraitsEntry {
-    let attributes = entry.attributes.as_ref().map(|a| TraitsEntryAttributes {
-        ino: a.ino,
-        mode: a.mode,
-        uid: a.uid,
-        gid: a.gid,
-        atime: chrono::DateTime::from_timestamp(a.atime as i64, 0).unwrap_or_else(chrono::Utc::now),
-        mtime: chrono::DateTime::from_timestamp(a.mtime as i64, 0).unwrap_or_else(chrono::Utc::now),
-        ctime: chrono::DateTime::from_timestamp(a.ctime as i64, 0).unwrap_or_else(chrono::Utc::now),
-        crtime: chrono::DateTime::from_timestamp(a.crtime as i64, 0)
-            .unwrap_or_else(chrono::Utc::now),
+/// 将 proto Entry 转换为 traits Entry
+pub(crate) fn proto_entry_to_traits(
+    entry: &ProtoEntry,
+) -> powerfs_common::traits::Entry {
+    let attributes = entry.attributes.as_ref().map(|a| {
+        powerfs_common::traits::EntryAttributes {
+            ino: a.ino,
+            mode: a.mode,
+            uid: a.uid,
+            gid: a.gid,
+            atime: chrono::DateTime::from_timestamp(a.atime as i64, 0)
+                .unwrap_or_else(chrono::Utc::now),
+            mtime: chrono::DateTime::from_timestamp(a.mtime as i64, 0)
+                .unwrap_or_else(chrono::Utc::now),
+            ctime: chrono::DateTime::from_timestamp(a.ctime as i64, 0)
+                .unwrap_or_else(chrono::Utc::now),
+            crtime: chrono::DateTime::from_timestamp(a.crtime as i64, 0)
+                .unwrap_or_else(chrono::Utc::now),
+        }
     });
 
     let chunks = entry
         .chunks
         .iter()
-        .map(|c| TraitsFileChunk {
+        .map(|c| powerfs_common::traits::FileChunk {
             offset: c.offset,
             size: c.size,
             mtime: c.mtime,
@@ -49,7 +55,7 @@ fn proto_entry_to_traits(entry: &ProtoEntry) -> TraitsEntry {
         })
         .collect();
 
-    TraitsEntry {
+    powerfs_common::traits::Entry {
         name: entry.name.clone(),
         directory: entry.directory.clone(),
         attributes,
@@ -66,13 +72,10 @@ fn proto_entry_to_traits(entry: &ProtoEntry) -> TraitsEntry {
     }
 }
 
-/// 将 PowerFsError 转换为 String
-fn pfe_to_string(e: powerfs_common::error::PowerFsError) -> String {
-    format!("{}", e)
-}
-
-/// 将 traits Entry 转换为 proto Entry（返回给 fuse.rs 使用）
-fn traits_entry_to_proto(entry: &TraitsEntry) -> ProtoEntry {
+/// 将 traits Entry 转换为 proto Entry
+pub(crate) fn traits_entry_to_proto(
+    entry: &powerfs_common::traits::Entry,
+) -> ProtoEntry {
     let attributes = entry.attributes.as_ref().map(|a| ProtoFuseAttributes {
         ino: a.ino,
         mode: a.mode,
@@ -120,6 +123,11 @@ fn traits_entry_to_proto(entry: &TraitsEntry) -> ProtoEntry {
     }
 }
 
+/// 将 PowerFsError 转换为 String
+pub(crate) fn pfe_to_string(e: powerfs_common::error::PowerFsError) -> String {
+    format!("{}", e)
+}
+
 /// FuseClientFacade 配置
 #[derive(Debug, Clone)]
 pub struct FuseClientFacadeConfig {
@@ -127,9 +135,9 @@ pub struct FuseClientFacadeConfig {
     pub master_addr: String,
     /// Master 端口
     pub master_port: u16,
-    /// Volume 网络端口（用于数据传输）
+    /// Volume 网络端口
     pub volume_net_port: u16,
-    /// Volume 地址列表（用于数据传输）
+    /// Volume 地址列表
     pub volume_addrs: Vec<String>,
     /// Filer 节点地址
     pub filer_addr: String,
@@ -156,11 +164,17 @@ impl Default for FuseClientFacadeConfig {
     }
 }
 
-/// FuseClientFacade - 统一门面，协调 MasterClient、MetaShardClient、VolumeClient
+/// FuseClientFacade - 门面模式，协调 MasterClient、MetaShardClient、VolumeClient
+///
+/// 作为 FUSE 客户端的统一入口，协调三个独立的客户端：
+/// - MasterClient: 集群状态权威，管理拓扑和卷分配
+/// - MetaShardClient: 元数据客户端，处理 inode/dentry 操作
+/// - VolumeClient: 数据客户端，处理数据读写
 pub struct FuseClientFacade {
+    /// 配置
     config: FuseClientFacadeConfig,
-    /// 网络客户端
-    net_client: Arc<PowerFuseNetClient>,
+    /// 网络客户端（可选，用于统一网络管理）
+    net_client: Option<Arc<PowerFuseNetClient>>,
     /// 拓扑管理器
     topology_manager: Arc<ClusterTopologyManager>,
     /// Master 客户端
@@ -174,32 +188,41 @@ pub struct FuseClientFacade {
 impl FuseClientFacade {
     /// 创建新的 FuseClientFacade
     pub async fn new(config: FuseClientFacadeConfig) -> Result<Self, String> {
-        // 创建网络客户端配置
-        let net_config = NetClientConfig {
-            master_addr: config.master_addr.clone(),
-            master_net_port: config.master_port,
-            volume_net_port: config.volume_net_port,
-            volume_addrs: config.volume_addrs.clone(),
-            filer_addr: config.filer_addr.clone(),
-            filer_net_port: config.filer_port,
-            client_id: config.client_identity.client_id,
-            connect_timeout: Duration::from_secs(3),
+        // 创建拓扑管理器
+        let topology_manager = Arc::new(ClusterTopologyManager::new());
+
+        // 创建 Master 客户端
+        let master_client_config = MasterClientConfig {
+            master_addrs: vec![format!("{}:{}", config.master_addr, config.master_port)],
             request_timeout: config.request_timeout,
+            max_retries: 3,
+            circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        // 创建网络客户端
-        let net_client = Arc::new(
-            PowerFuseNetClient::new(net_config)
-                .await
-                .map_err(|e| format!("Failed to create net client: {}", e))?,
-        );
+        let master_client = MasterClient::new(master_client_config, topology_manager.clone());
 
-        Self::build_from_net_client(config, net_client).await
+        // 创建 MetaShard 客户端
+        let meta_config = MetaShardClientConfig::default();
+        let meta_shard_client = MetaShardClient::new(meta_config, topology_manager.clone());
+
+        // 创建 Volume 客户端
+        let volume_config = VolumeClientConfig::default();
+        let volume_client = VolumeClient::new(volume_config, topology_manager.clone());
+
+        Ok(Self {
+            config,
+            net_client: None,
+            topology_manager,
+            master_client,
+            meta_shard_client,
+            volume_client,
+        })
     }
 
     /// 从已有的 PowerFuseNetClient 构建 FuseClientFacade
     ///
     /// 用于已经建立 master/filer 连接的场景，复用现有 net_client。
+    /// 每个客户端通过 set_net_client() 注入自己的网络连接。
     pub async fn build_from_net_client(
         config: FuseClientFacadeConfig,
         net_client: Arc<PowerFuseNetClient>,
@@ -215,7 +238,7 @@ impl FuseClientFacade {
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        let mut master_client = MasterClient::new(master_client_config, topology_manager.clone());
+        let master_client = MasterClient::new(master_client_config, topology_manager.clone());
         master_client.set_net_client(net_client.clone());
 
         // 连接 Master
@@ -245,28 +268,18 @@ impl FuseClientFacade {
 
         let facade = Self {
             config,
-            net_client,
+            net_client: Some(net_client),
             topology_manager,
             master_client,
             meta_shard_client,
             volume_client,
         };
 
-        // 启动后台处理循环，确保 _and_wait 方法能实际处理请求
+        // 启动后台处理循环
         facade.meta_shard_client.start_background_processor();
         facade.volume_client.start_background_processor();
 
         Ok(facade)
-    }
-
-    /// 获取网络客户端引用
-    pub fn net_client(&self) -> &Arc<PowerFuseNetClient> {
-        &self.net_client
-    }
-
-    /// 获取拓扑管理器引用
-    pub fn topology_manager(&self) -> &Arc<ClusterTopologyManager> {
-        &self.topology_manager
     }
 
     /// 获取 Master 客户端引用
@@ -284,9 +297,9 @@ impl FuseClientFacade {
         &self.volume_client
     }
 
-    /// 获取默认 Volume 地址列表
-    pub fn volume_addrs(&self) -> Vec<String> {
-        self.net_client.volume_addrs().to_vec()
+    /// 获取拓扑管理器引用
+    pub fn topology_manager(&self) -> &Arc<ClusterTopologyManager> {
+        &self.topology_manager
     }
 
     /// 获取客户端标识（用于 lease holder 校验）
@@ -294,9 +307,22 @@ impl FuseClientFacade {
         self.config.client_identity.client_id.to_string()
     }
 
-    // ======= 通用请求提交方法（支持指定 MsgType）=======
+    /// 获取默认 Volume 地址列表
+    pub fn volume_addrs(&self) -> Vec<String> {
+        self.config.volume_addrs.clone()
+    }
 
-    /// 提交元数据请求（支持指定 MsgType）
+    /// 获取 Filer Leader 地址（用于 Volume 路由回退）
+    pub fn filer_leader_addr(&self) -> String {
+        self.net_client
+            .as_ref()
+            .map(|nc| nc.filer_leader_addr())
+            .unwrap_or_default()
+    }
+
+    // ======= 元数据请求方法（委托给 MetaShardClient）=======
+
+    /// 提交元数据请求
     pub async fn submit_metadata_request(
         &self,
         kind: RequestKind,
@@ -330,8 +356,10 @@ impl FuseClientFacade {
         self.meta_shard_client
             .submit_metadata_request_and_wait(context, shard_id, timeout)
             .await
-            .map_err(|e| format!("Request failed: {}", e))
+            .map_err(|e| format!("Metadata request failed: {}", e))
     }
+
+    // ======= 控制请求方法（委托给 MetaShardClient）=======
 
     /// 提交控制请求
     pub async fn submit_control_request(
@@ -367,10 +395,12 @@ impl FuseClientFacade {
         self.meta_shard_client
             .submit_control_request_and_wait(context, shard_id, timeout)
             .await
-            .map_err(|e| format!("Request failed: {}", e))
+            .map_err(|e| format!("Control request failed: {}", e))
     }
 
-    /// 提交数据请求 (读/写)
+    // ======= 数据请求方法（委托给 VolumeClient）=======
+
+    /// 提交数据请求
     pub async fn submit_data_request(
         &self,
         kind: RequestKind,
@@ -404,8 +434,10 @@ impl FuseClientFacade {
         self.volume_client
             .submit_data_request_and_wait(context, volume_id, timeout)
             .await
-            .map_err(|e| format!("Request failed: {}", e))
+            .map_err(|e| format!("Data request failed: {}", e))
     }
+
+    // ======= Lease 请求方法（委托给 VolumeClient）=======
 
     /// 提交 Lease 请求
     pub async fn submit_lease_request(
@@ -438,8 +470,10 @@ impl FuseClientFacade {
         self.volume_client
             .submit_lease_request_and_wait(context, volume_id, timeout)
             .await
-            .map_err(|e| format!("Request failed: {}", e))
+            .map_err(|e| format!("Lease request failed: {}", e))
     }
+
+    // ======= 管理请求方法（委托给 VolumeClient）=======
 
     /// 提交管理请求
     pub async fn submit_mgmt_request(
@@ -472,26 +506,108 @@ impl FuseClientFacade {
         self.volume_client
             .submit_mgmt_request_and_wait(context, volume_id, timeout)
             .await
-            .map_err(|e| format!("Request failed: {}", e))
+            .map_err(|e| format!("Mgmt request failed: {}", e))
     }
 
-    /// Submit a request directly to Master via the Master net client.
-    /// Used for volume assignment (MsgType::Assign) and volume lookup (MsgType::LookupVolume).
+    // ======= Master 请求方法（委托给 MasterClient）=======
+
+    /// 提交请求直接到 Master
     pub async fn submit_master_request(
         &self,
         msg_type: powerfs_net::MsgType,
         payload: Vec<u8>,
     ) -> Result<powerfs_net::NetMessage, String> {
-        let net_client = self
-            .master_client
-            .net_client()
-            .ok_or_else(|| "Master net client not available".to_string())?;
+        // 尝试最多3次处理重定向
+        for attempt in 0..3 {
+            let net_client = self
+                .master_client
+                .net_client()
+                .ok_or_else(|| "Master net client not available".to_string())?;
 
-        let master_nc = net_client.master_client();
-        master_nc
-            .send_request(msg_type, &payload, &[])
-            .await
-            .map_err(|e| format!("Master request failed: {}", e))
+            let master_nc = net_client.master_client();
+            let response = master_nc
+                .send_request(msg_type, &payload, &[])
+                .await
+                .map_err(|e| format!("Master request failed: {}", e))?;
+
+            // 检查重定向响应
+            if response.header.status == powerfs_net::STATUS_ERR_REDIRECT {
+                log::warn!(
+                    "submit_master_request: attempt {}, received redirect response",
+                    attempt + 1
+                );
+                let body = if !response.body.is_empty() {
+                    &response.body
+                } else {
+                    &response.data
+                };
+                let mut dec = powerfs_net::TlvDecoder::new(body);
+                let leader_addr = dec.next_string(powerfs_net::FieldId::Owner).unwrap_or_default();
+
+                if leader_addr.is_empty() {
+                    return Err("redirect response has empty leader address".to_string());
+                }
+
+                log::info!(
+                    "submit_master_request: redirecting to leader at {} (attempt {})",
+                    leader_addr,
+                    attempt + 1
+                );
+                self.update_master_leader(&leader_addr);
+
+                // 解析 leader 地址
+                let parts: Vec<&str> = leader_addr.split(':').collect();
+                let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+                let port = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9333);
+
+                // 创建新的内部网络客户端连接到 leader
+                let inner_config = powerfs_net::ClientConfig {
+                    addr: host,
+                    port,
+                    client_type: powerfs_net::ClientType::Fuse,
+                    client_id: self.config.client_identity.as_client_id(),
+                    ..powerfs_net::ClientConfig::default()
+                };
+                let new_inner_client = Arc::new(powerfs_net::PowerFsNetClient::new(inner_config));
+
+                match new_inner_client.connect().await {
+                    Ok(_) => {
+                        log::info!("submit_master_request: connected to leader at {}", leader_addr);
+
+                        let net_client = self.net_client.as_ref().ok_or_else(|| {
+                            "Net client not available for leader redirect".to_string()
+                        })?;
+
+                        // 创建新的包装客户端
+                        let new_wrapper = crate::net_client::PowerFuseNetClient::new_with_master(
+                            net_client.config().clone(),
+                            new_inner_client,
+                        );
+
+                        self.master_client.set_net_client(Arc::new(new_wrapper));
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "submit_master_request: failed to connect to leader at {}: {}",
+                            leader_addr,
+                            e
+                        );
+                        if attempt == 2 {
+                            return Err(format!(
+                                "Failed to connect to leader after 3 attempts: {}",
+                                e
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            return Ok(response);
+        }
+
+        Err("Failed to complete request after 3 attempts".to_string())
     }
 
     /// 从 Master 刷新拓扑
@@ -505,6 +621,12 @@ impl FuseClientFacade {
         Ok(())
     }
 
+    /// 更新 Master leader 地址
+    pub fn update_master_leader(&self, leader_addr: &str) {
+        self.master_client.update_leader_address(leader_addr);
+        log::info!("FuseClientFacade: Updated master leader to {}", leader_addr);
+    }
+
     /// 关闭所有客户端
     pub fn close(&self) {
         self.meta_shard_client.close();
@@ -514,10 +636,17 @@ impl FuseClientFacade {
     }
 }
 
-/// 同步门面适配器 - 将 FuseClientFacade 的异步接口包装为同步接口
+impl Drop for FuseClientFacade {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// SyncFuseClientFacade - 同步适配器
 ///
-/// 用于在 FUSE 同步回调上下文中使用异步的 FuseClientFacade。
-/// 通过 tokio::runtime::Runtime::block_on() 将异步调用转为同步调用。
+/// 将 FuseClientFacade 的异步接口包装为同步接口，
+/// 用于在 FUSE 同步回调上下文中使用。
+/// 通过 tokio::runtime::Runtime::block_on() 实现同步调用。
 pub struct SyncFuseClientFacade {
     facade: Arc<FuseClientFacade>,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -540,6 +669,19 @@ impl SyncFuseClientFacade {
         self.runtime.block_on(future)
     }
 
+    /// Location -> URL 字符串转换
+    pub fn location_to_grpc_addr(
+        loc: &powerfs_common::traits::Location,
+    ) -> String {
+        if loc.url.is_empty() {
+            String::new()
+        } else {
+            loc.url.clone()
+        }
+    }
+
+    // ======= 便捷同步方法（供 fuse.rs 使用）=======
+
     pub fn get_entry(&self, path: &str) -> Result<Option<ProtoEntry>, String> {
         let facade = self.facade.clone();
         let path = path.to_string();
@@ -554,10 +696,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
-            let result = provider
-                .get_entry_by_inode(inode)
-                .await
-                .map_err(pfe_to_string)?;
+            let result = provider.get_entry_by_inode(inode).await.map_err(pfe_to_string)?;
             Ok(result.map(|(e, p)| (traits_entry_to_proto(&e), p)))
         })
     }
@@ -568,10 +707,7 @@ impl SyncFuseClientFacade {
         let client_id = client_id.to_string();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
-            provider
-                .create_entry(&traits_entry, &client_id)
-                .await
-                .map_err(pfe_to_string)
+            provider.create_entry(&traits_entry, &client_id).await.map_err(pfe_to_string)
         })
     }
 
@@ -587,10 +723,7 @@ impl SyncFuseClientFacade {
         let client_id = client_id.to_string();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
-            provider
-                .update_entry(&traits_entry, &client_id, old_size, is_truncate)
-                .await
-                .map_err(pfe_to_string)
+            provider.update_entry(&traits_entry, &client_id, old_size, is_truncate).await.map_err(pfe_to_string)
         })
     }
 
@@ -607,16 +740,11 @@ impl SyncFuseClientFacade {
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
 
-            // Resolve inode by path: try constructing full path
+            // 解析 inode
             let path = if parent_ino == 1 {
                 format!("/{}", name)
             } else {
-                // Try to get parent path via inode lookup
-                match provider
-                    .get_entry_by_inode(parent_ino)
-                    .await
-                    .map_err(pfe_to_string)?
-                {
+                match provider.get_entry_by_inode(parent_ino).await.map_err(pfe_to_string)? {
                     Some((_, parent_path)) if !parent_path.is_empty() => {
                         format!("{}/{}", parent_path, name)
                     }
@@ -624,23 +752,16 @@ impl SyncFuseClientFacade {
                 }
             };
 
-            // Look up the entry to get its inode
             let inode = match provider.get_entry(&path).await.map_err(pfe_to_string)? {
                 Some(entry) => entry.attributes.map(|a| a.ino).unwrap_or(0),
                 None => 0,
             };
 
             if inode == 0 {
-                return Err(format!(
-                    "Failed to resolve inode for deletion: path={}",
-                    path
-                ));
+                return Err(format!("Failed to resolve inode for deletion: path={}", path));
             }
 
-            provider
-                .delete_entry(inode, is_dir, &client_id)
-                .await
-                .map_err(pfe_to_string)
+            provider.delete_entry(inode, is_dir, &client_id).await.map_err(pfe_to_string)
         })
     }
 
@@ -654,10 +775,7 @@ impl SyncFuseClientFacade {
         let client_id = client_id.to_string();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
-            let entries = provider
-                .list_entries(inode, limit, &client_id)
-                .await
-                .map_err(pfe_to_string)?;
+            let entries = provider.list_entries(inode, limit, &client_id).await.map_err(pfe_to_string)?;
             Ok(entries.iter().map(traits_entry_to_proto).collect())
         })
     }
@@ -666,22 +784,13 @@ impl SyncFuseClientFacade {
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<
-        (
-            powerfs_common::types::Fid,
-            Vec<powerfs_common::traits::Location>,
-        ),
-        String,
-    > {
+    ) -> Result<(powerfs_common::types::Fid, Vec<powerfs_common::traits::Location>), String> {
         let facade = self.facade.clone();
         let collection = collection.to_string();
         let replication = replication.to_string();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade);
-            provider
-                .assign_volume(&collection, &replication)
-                .await
-                .map_err(pfe_to_string)
+            provider.assign_volume(&collection, &replication).await.map_err(pfe_to_string)
         })
     }
 
@@ -694,18 +803,15 @@ impl SyncFuseClientFacade {
 
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade.clone());
-            let locations_result = provider
-                .lookup_volume(volume_id)
-                .await;
+            let locations_result = provider.lookup_volume(volume_id).await;
 
             let locations = match locations_result {
                 Ok(locs) => {
                     if !locs.is_empty() {
-                        // Prime VolumeClient router with first location so subsequent data/lease/mgmt calls work
                         if let Some(first) = locs.first() {
                             let url = first.url.clone();
                             log::debug!(
-                                "lookup_volume: updating volume router volume={} -> {} (from Master LookupVolume)",
+                                "lookup_volume: updating volume router volume={} -> {}",
                                 volume_id.0, url
                             );
                             facade.volume_client().set_volume_info(volume_id.0 as u64, url);
@@ -715,7 +821,7 @@ impl SyncFuseClientFacade {
                 }
                 Err(e) => {
                     log::error!(
-                        "lookup_volume: Master LookupVolume failed for volume_id={}: {}. This indicates Master routing is broken — volume assignment is centrally managed by Master.",
+                        "lookup_volume: Master LookupVolume failed for volume_id={}: {}",
                         volume_id.0, pfe_to_string(e)
                     );
                     Vec::new()
@@ -723,14 +829,9 @@ impl SyncFuseClientFacade {
             };
 
             if locations.is_empty() && !volume_addrs.is_empty() {
-                // WARNING: Master LookupVolume returned empty or failed.
-                // This is a fallback for when Master is unreachable or Raft is not yet ready.
-                // Master is the single source of truth for volume→server mapping;
-                // this fallback may route to the wrong volume server if volume_id was reassigned.
                 let addr = volume_addrs[0].clone();
                 log::warn!(
-                    "lookup_volume: FALLBACK to default volume address {} for volume_id={}. \
-                     Master LookupVolume returned no locations — this indicates a routing failure.",
+                    "lookup_volume: FALLBACK to default volume address {} for volume_id={}",
                     addr, volume_id.0
                 );
                 facade.volume_client().set_volume_info(volume_id.0 as u64, addr.clone());
@@ -780,10 +881,10 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
-            provider
-                .read_blob(volume_id, file_key, offset, size)
-                .await
-                .map_err(pfe_to_string)
+            match provider.read_blob(volume_id, file_key, offset, size).await {
+                Ok(data) => Ok(data),
+                Err(e) => Err(pfe_to_string(e)),
+            }
         })
     }
 
@@ -791,14 +892,10 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
-            provider
-                .delete_blob(volume_id, file_key)
-                .await
-                .map_err(pfe_to_string)
+            provider.delete_blob(volume_id, file_key).await.map_err(pfe_to_string)
         })
     }
 
-    /// 兼容 fuse.rs 的 delete_data 接口 - 直接调用 delete_blob
     pub fn delete_data(
         &self,
         _volume_addr: &str,
@@ -808,194 +905,158 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
-            provider
-                .delete_blob(volume_id, file_key)
-                .await
-                .map_err(pfe_to_string)
+            provider.delete_blob(volume_id, file_key).await.map_err(pfe_to_string)
         })
     }
 
-    /// 兼容 fuse.rs 的 assign_fid 接口
     #[allow(clippy::type_complexity)]
     pub fn assign_fid(
         &self,
         collection: &str,
         replication: &str,
-    ) -> Result<
-        (
-            powerfs_common::types::Fid,
-            Option<powerfs_common::traits::Location>,
-            Vec<String>,
-            Vec<powerfs_common::traits::Location>,
-        ),
-        String,
-    > {
+    ) -> Result<(powerfs_common::types::Fid, Option<powerfs_common::traits::Location>, Vec<String>, Vec<powerfs_common::traits::Location>), String> {
         let (fid, locations) = self.assign_volume(collection, replication)?;
         let primary = locations.first().cloned();
         Ok((fid, primary, Vec::new(), locations))
     }
 
-    /// 兼容 fuse.rs 的 symlink 接口
-    pub fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, String> {
+    /// 创建符号链接
+    pub fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, String> {
         let facade = self.facade.clone();
         let name = name.to_string();
         let target = target.to_string();
         self.runtime.block_on(async move {
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "parent_ino": parent_ino,
-                "name": name,
-                "target": target,
-            }))
-            .map_err(|e| format!("json encode failed: {}", e))?;
+            let payload = {
+                let mut enc = powerfs_net::TlvEncoder::new();
+                let _ = enc.add_u64(powerfs_net::FieldId::ParentIno, parent);
+                let _ = enc.add_string(powerfs_net::FieldId::Name, &name);
+                let _ = enc.add_string(powerfs_net::FieldId::SymlinkTarget, &target);
+                enc.into_bytes()
+            };
 
+            let request_id = RequestId::new();
+            let context = RequestContext::new(
+                facade.config.client_identity.clone(),
+                RequestKind::Metadata,
+                powerfs_net::MsgType::Symlink as u16,
+                payload,
+            )
+            .with_request_id(request_id);
+
+            let timeout = facade.config.request_timeout;
             let result = facade
-                .submit_metadata_request_with_type(
-                    crate::request_state::RequestKind::Metadata,
-                    parent_ino,
-                    payload,
-                    powerfs_net::MsgType::Symlink,
-                )
+                .meta_shard_client
+                .submit_metadata_request_and_wait(context, parent, timeout)
                 .await
-                .map_err(|e| format!("Facade symlink failed: {}", e))?;
+                .map_err(|e| format!("symlink failed: {}", e))?;
 
-            let response = parse_response_from_result(result)
-                .map_err(|e| format!("parse response failed: {}", e))?;
-
-            if !response.success {
-                return Err(response
-                    .error
-                    .unwrap_or_else(|| "Symlink failed".to_string()));
-            }
-
-            response
-                .data
-                .as_ref()
-                .and_then(|d| d.get("ino"))
-                .and_then(|i| i.as_u64())
-                .ok_or_else(|| "No inode in response".to_string())
+            // Parse the inode from response
+            let inode = result
+                .payload
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .and_then(|d| {
+                    let mut dec = powerfs_net::TlvDecoder::new(d);
+                    dec.next_u64(powerfs_net::FieldId::Ino).ok()
+                })
+                .or_else(|| {
+                    result
+                        .data
+                        .as_deref()
+                        .filter(|d| !d.is_empty())
+                        .and_then(|d| {
+                            let mut dec = powerfs_net::TlvDecoder::new(d);
+                            dec.next_u64(powerfs_net::FieldId::Ino).ok()
+                        })
+                })
+                .ok_or_else(|| "Failed to parse inode from symlink response".to_string())?;
+            Ok(inode)
         })
     }
 
-    /// 兼容 fuse.rs 的 readlink 接口
+    /// 读取符号链接
     pub fn readlink(&self, inode: u64) -> Result<String, String> {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "ino": inode,
-            }))
-            .map_err(|e| format!("json encode failed: {}", e))?;
+            let payload = {
+                let mut enc = powerfs_net::TlvEncoder::new();
+                let _ = enc.add_u64(powerfs_net::FieldId::Ino, inode);
+                enc.into_bytes()
+            };
 
+            let request_id = RequestId::new();
+            let context = RequestContext::new(
+                facade.config.client_identity.clone(),
+                RequestKind::Metadata,
+                powerfs_net::MsgType::Readlink as u16,
+                payload,
+            )
+            .with_request_id(request_id);
+
+            let timeout = facade.config.request_timeout;
             let result = facade
-                .submit_metadata_request_with_type(
-                    crate::request_state::RequestKind::Metadata,
-                    inode,
-                    payload,
-                    powerfs_net::MsgType::Readlink,
-                )
+                .meta_shard_client
+                .submit_metadata_request_and_wait(context, inode, timeout)
                 .await
-                .map_err(|e| format!("Facade readlink failed: {}", e))?;
+                .map_err(|e| format!("readlink failed: {}", e))?;
 
-            let response = parse_response_from_result(result)
-                .map_err(|e| format!("parse response failed: {}", e))?;
-
-            if !response.success {
-                return Err(response
-                    .error
-                    .unwrap_or_else(|| "Readlink failed".to_string()));
-            }
-
-            let data = response
-                .data
-                .as_ref()
-                .ok_or_else(|| "No data in response".to_string())?;
-            let target = data
-                .get("target")
-                .and_then(|t| t.as_str())
-                .ok_or_else(|| "No symlink target in response".to_string())?;
-            Ok(target.to_string())
+            // Parse the symlink target from response
+            let target = result
+                .payload
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .and_then(|d| {
+                    let mut dec = powerfs_net::TlvDecoder::new(d);
+                    Some(dec.next_string(powerfs_net::FieldId::SymlinkTarget).unwrap_or_default())
+                })
+                .or_else(|| {
+                    result
+                        .data
+                        .as_deref()
+                        .filter(|d| !d.is_empty())
+                        .and_then(|d| {
+                            let mut dec = powerfs_net::TlvDecoder::new(d);
+                            Some(dec.next_string(powerfs_net::FieldId::SymlinkTarget).unwrap_or_default())
+                        })
+                })
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Failed to parse symlink target from response".to_string())?;
+            Ok(target)
         })
     }
 
-    /// 兼容 fuse.rs 的 link（硬链接）接口
-    pub fn link(&self, inode: u64, newparent: u64, newname: &str) -> Result<bool, String> {
+    /// 创建硬链接
+    pub fn link(&self, inode: u64, newparent: u64, name: &str) -> Result<u64, String> {
         let facade = self.facade.clone();
-        let newname = newname.to_string();
+        let name = name.to_string();
         self.runtime.block_on(async move {
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "ino": inode,
-                "new_parent_ino": newparent,
-                "new_name": newname,
-            }))
-            .map_err(|e| format!("json encode failed: {}", e))?;
+            let payload = {
+                let mut enc = powerfs_net::TlvEncoder::new();
+                let _ = enc.add_u64(powerfs_net::FieldId::Ino, inode);
+                let _ = enc.add_u64(powerfs_net::FieldId::ParentIno, newparent);
+                let _ = enc.add_string(powerfs_net::FieldId::Name, &name);
+                enc.into_bytes()
+            };
 
-            let result = facade
-                .submit_metadata_request_with_type(
-                    crate::request_state::RequestKind::Metadata,
-                    newparent,
-                    payload,
-                    powerfs_net::MsgType::Link,
-                )
+            let request_id = RequestId::new();
+            let context = RequestContext::new(
+                facade.config.client_identity.clone(),
+                RequestKind::Metadata,
+                powerfs_net::MsgType::Link as u16,
+                payload,
+            )
+            .with_request_id(request_id);
+
+            let timeout = facade.config.request_timeout;
+            let _result = facade
+                .meta_shard_client
+                .submit_metadata_request_and_wait(context, newparent, timeout)
                 .await
-                .map_err(|e| format!("Facade link failed: {}", e))?;
+                .map_err(|e| format!("link failed: {}", e))?;
 
-            let response = parse_response_from_result(result)
-                .map_err(|e| format!("parse response failed: {}", e))?;
-
-            Ok(response.success)
+            // Parse the inode from response (should be the same as input inode)
+            Ok(inode)
         })
-    }
-
-    /// 兼容 fuse.rs 的 rename 接口
-    #[allow(clippy::too_many_arguments)]
-    pub fn rename_entry(
-        &self,
-        old_parent_ino: u64,
-        old_name: &str,
-        new_parent_ino: u64,
-        new_name: &str,
-    ) -> Result<bool, String> {
-        let facade = self.facade.clone();
-        let old_name = old_name.to_string();
-        let new_name = new_name.to_string();
-        self.runtime.block_on(async move {
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "old_parent_ino": old_parent_ino,
-                "old_name": old_name,
-                "new_parent_ino": new_parent_ino,
-                "new_name": new_name,
-            }))
-            .map_err(|e| format!("json encode failed: {}", e))?;
-
-            let result = facade
-                .submit_metadata_request_with_type(
-                    crate::request_state::RequestKind::Metadata,
-                    new_parent_ino,
-                    payload,
-                    powerfs_net::MsgType::Rename,
-                )
-                .await
-                .map_err(|e| format!("Facade rename failed: {}", e))?;
-
-            let response = parse_response_from_result(result)
-                .map_err(|e| format!("parse response failed: {}", e))?;
-
-            Ok(response.success)
-        })
-    }
-
-    /// Location -> URL 字符串 转换（兼容 fuse.rs）
-    pub fn location_to_grpc_addr(loc: &powerfs_common::traits::Location) -> String {
-        if loc.url.is_empty() {
-            String::new()
-        } else {
-            loc.url.clone()
-        }
-    }
-}
-
-impl Drop for FuseClientFacade {
-    fn drop(&mut self) {
-        self.close();
     }
 }
 

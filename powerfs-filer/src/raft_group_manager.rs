@@ -111,6 +111,15 @@ pub enum ShardCommand {
         new_parent_inode: u64,
         new_name: String,
     },
+    /// Set chunk/fid info for an existing inode (for data location persistence)
+    SetChunks {
+        inode: u64,
+        fid: String,
+        volume_id: u32,
+        cookie: u32,
+        offset: u64,
+        size: u64,
+    },
 }
 
 impl ShardCommand {

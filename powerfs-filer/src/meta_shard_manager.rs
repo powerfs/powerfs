@@ -1,6 +1,7 @@
 use log::{debug, info, warn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -128,7 +129,7 @@ pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManager>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
-    inode_generator: Arc<RwLock<u64>>,
+    inode_generator: Arc<AtomicU64>,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
     leases: RwLock<HashMap<String, LeaseInfo>>,
@@ -146,12 +147,16 @@ impl MetaShardManager {
         raft_group_manager: Arc<RaftGroupManager>,
         shard_strategy: Arc<ShardStrategy>,
         data_path: String,
+        node_id: u64,
     ) -> Self {
+        // Use node_id to offset inode generator so that different Filer nodes
+        // generate unique inodes. Each node gets a range of 1 billion inodes.
+        let inode_base = node_id * 1_000_000_000 + 1000;
         Self {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
-            inode_generator: Arc::new(RwLock::new(1000)),
+            inode_generator: Arc::new(AtomicU64::new(inode_base)),
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
@@ -643,10 +648,7 @@ impl MetaShardManager {
     }
 
     pub fn generate_inode(&self) -> u64 {
-        let mut gen = self.inode_generator.write().unwrap();
-        let inode = *gen;
-        *gen += 1;
-        inode
+        self.inode_generator.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_shard_strategy(&self) -> Arc<ShardStrategy> {
@@ -826,6 +828,52 @@ impl MetaShardManager {
                 }
                 return Err("setattr timeout waiting for apply".to_string());
             }
+        }
+
+        Ok(())
+    }
+
+    /// Set chunk/fid info for an existing inode via Raft consensus
+    pub async fn set_chunks(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        fid: String,
+        volume_id: u32,
+        cookie: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::SetChunks {
+            inode,
+            fid,
+            volume_id,
+            cookie,
+            offset,
+            size,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.fid.is_some() && !info.chunks.is_empty() {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("set_chunks timeout waiting for apply".to_string());
         }
 
         Ok(())

@@ -122,6 +122,7 @@ async fn run_filer(args: Args) -> powerfs_common::error::Result<()> {
         raft_group_manager.clone(),
         shard_strategy.clone(),
         shard_data_path,
+        args.raft_id,
     ));
 
     info!("Initializing {} metadata shards...", args.shard_count);

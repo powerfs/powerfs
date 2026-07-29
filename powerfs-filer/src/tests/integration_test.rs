@@ -23,6 +23,7 @@ fn test_shard_creation_and_file_operations() {
         raft_group_manager,
         shard_strategy.clone(),
         data_path,
+        1, // node_id for testing
     ));
 
     let peers = vec![Peer {
@@ -126,6 +127,7 @@ fn test_path_resolution() {
         raft_group_manager,
         shard_strategy,
         data_path,
+        1, // node_id for testing
     ));
 
     let peers = vec![Peer {

@@ -272,7 +272,7 @@ pub struct MasterClient {
     topology_manager: Arc<ClusterTopologyManager>,
     current_leader: Mutex<Option<String>>,
     /// 网络客户端 (可选，用于真实网络发送)
-    net_client: Option<Arc<PowerFuseNetClient>>,
+    net_client: Mutex<Option<Arc<PowerFuseNetClient>>>,
 }
 
 impl MasterClient {
@@ -282,18 +282,19 @@ impl MasterClient {
             state: Mutex::new(MasterClientState::Disconnected),
             topology_manager,
             current_leader: Mutex::new(None),
-            net_client: None,
+            net_client: Mutex::new(None),
         }
     }
 
     /// 设置网络客户端
-    pub fn set_net_client(&mut self, client: Arc<PowerFuseNetClient>) {
-        self.net_client = Some(client);
+    pub fn set_net_client(&self, client: Arc<PowerFuseNetClient>) {
+        let mut net = self.net_client.lock().unwrap();
+        *net = Some(client);
     }
 
     /// 获取网络客户端引用
-    pub fn net_client(&self) -> Option<&Arc<PowerFuseNetClient>> {
-        self.net_client.as_ref()
+    pub fn net_client(&self) -> Option<Arc<PowerFuseNetClient>> {
+        self.net_client.lock().unwrap().clone()
     }
 
     /// 获取当前状态
@@ -318,6 +319,13 @@ impl MasterClient {
         *self.state.lock().unwrap() = MasterClientState::Connected;
     }
 
+    /// 更新 leader 地址（处理重定向时使用）
+    pub fn update_leader_address(&self, addr: &str) {
+        let mut leader = self.current_leader.lock().unwrap();
+        *leader = Some(addr.to_string());
+        log::info!("MasterClient: Leader address updated to {}", addr);
+    }
+
     /// 连接到 Master
     pub async fn connect(&self) -> Result<(), MasterClientError> {
         if !self.topology_manager.can_request() {
@@ -325,7 +333,7 @@ impl MasterClient {
         }
 
         // 如果有网络客户端，发送真实的连接请求
-        if let Some(net_client) = &self.net_client {
+        if let Some(net_client) = self.net_client() {
             match net_client.master_client().is_connected() {
                 true => {
                     let master_addr = self
@@ -378,7 +386,7 @@ impl MasterClient {
             .ok_or(MasterClientError::NotConnected)?;
 
         // 如果有网络客户端，发送真实的 GetTopology 请求
-        if let Some(net_client) = &self.net_client {
+        if let Some(net_client) = self.net_client() {
             let body = vec![];
             match net_client
                 .master_client()

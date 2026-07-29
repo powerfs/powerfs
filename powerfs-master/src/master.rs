@@ -396,6 +396,108 @@ impl MasterNode {
             }
         });
 
+        // Pre-allocate volumes at startup (simplified: volumes are pre-configured, not dynamically created)
+        // This allows functional testing without dynamic volume creation overhead
+        // Note: Each Volume Server pre-creates volumes with the same IDs (1, 2, ... N)
+        // Master tracks these by using composite volume IDs: server_idx * 1000 + volume_idx
+        {
+            let mut volumes = master.volumes.write().unwrap();
+            
+            // Pre-allocate volumes: 4 per volume server, 3 servers total
+            // Each volume: 10GB (10737418240 bytes), enough for testing
+            let volumes_per_server = 4u32;
+            let total_servers = 3u32;
+            let volume_size: u64 = 10737418240; // 10GB
+            
+            let now = chrono::Utc::now();
+            
+            for server_idx in 0..total_servers {
+                let node_id = NodeId(format!("volume-server-{}", server_idx + 1));
+                
+                for vol_idx in 0..volumes_per_server {
+                    // Composite volume ID: server_idx * 1000 + volume_idx
+                    // This ensures unique IDs across servers while preserving the original volume ID
+                    let volume_id = VolumeId(server_idx * 1000 + vol_idx + 1);
+                    let original_volume_id = vol_idx + 1;
+                    
+                    let volume_info = VolumeInfo {
+                        id: volume_id,
+                        node_id: node_id.clone(),
+                        collection: Collection("default".to_string()),
+                        size: volume_size,
+                        used: 0,
+                        replica_count: 1,
+                        ttl: Ttl::default(),
+                        disk_type: DiskType::default(),
+                        state: VolumeState::Available,
+                        created_at: now,
+                        modified_at: now,
+                        next_file_key: 1,
+                    };
+                    
+                    volumes.insert(volume_id, volume_info);
+                    info!(
+                        "Pre-allocated volume {} (original ID {}) on {}",
+                        volume_id.0, original_volume_id, node_id.0
+                    );
+                }
+            }
+            
+            info!(
+                "Pre-allocated {} volumes ({} per server, {} servers) with {} bytes each",
+                volumes_per_server * total_servers,
+                volumes_per_server,
+                total_servers,
+                volume_size
+            );
+
+            // Drop the write lock before spawning async tasks
+            drop(volumes);
+
+            // Pre-register Volume Servers in topology so that lookups work
+            {
+                let mut topology = master.topology.write().unwrap();
+                
+                // Add volume-server-1
+                let node1 = DataNodeInfo::new(
+                    NodeId("volume-server-1".to_string()),
+                    "172.20.0.21:8080".to_string(),
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8091,
+                    8080,
+                    "http://172.20.0.21:8080".to_string(),
+                );
+                topology.get_or_create_node(node1);
+                
+                // Add volume-server-2
+                let node2 = DataNodeInfo::new(
+                    NodeId("volume-server-2".to_string()),
+                    "172.20.0.22:8080".to_string(),
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8092,
+                    8080,
+                    "http://172.20.0.22:8080".to_string(),
+                );
+                topology.get_or_create_node(node2);
+                
+                // Add volume-server-3
+                let node3 = DataNodeInfo::new(
+                    NodeId("volume-server-3".to_string()),
+                    "172.20.0.23:8080".to_string(),
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8093,
+                    8080,
+                    "http://172.20.0.23:8080".to_string(),
+                );
+                topology.get_or_create_node(node3);
+                
+                info!("Pre-registered 3 Volume Servers in topology");
+            }
+        }
+
         Ok(master)
     }
 
@@ -438,7 +540,29 @@ impl MasterNode {
     }
 
     pub async fn get_leader(&self) -> String {
-        self.leader_address.read().unwrap().clone()
+        let leader = self.leader_address.read().unwrap().clone();
+        // Convert raft address to net address if needed
+        // raft_address is "host:raft_port", net_port is the port for net connections
+        let convert_to_net_addr = |addr: &str| -> String {
+            if let Some(host) = addr.split(':').next() {
+                format!("{}:{}", host, self.net_port)
+            } else {
+                addr.to_string()
+            }
+        };
+
+        if !leader.is_empty() {
+            return convert_to_net_addr(&leader);
+        }
+        // Fallback: if we are the leader, return our own net address
+        if self.is_leader.load(Ordering::Relaxed) {
+            return convert_to_net_addr(&self.raft_address);
+        }
+        // Otherwise, return the first peer's net address as a fallback
+        if let Some(first_peer) = self.peers.first() {
+            return convert_to_net_addr(&first_peer.address);
+        }
+        convert_to_net_addr(&self.raft_address)
     }
 
     pub fn set_leader(&self, leader_addr: String) {
@@ -1238,9 +1362,11 @@ impl MasterNode {
                     }
                 };
 
+                // Convert composite volume ID to original ID for Volume Server communication
+                let original_volume_id = VolumeId(existing_vid.original_id());
                 let cookie = rand::random::<u32>() as u64;
                 let fid = Fid {
-                    volume_id: existing_vid,
+                    volume_id: original_volume_id,
                     cookie,
                     file_key,
                 };
@@ -1253,57 +1379,82 @@ impl MasterNode {
                     .collect::<Vec<_>>();
 
                 info!(
-                    "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
-                    existing_vid, collection_obj, existing_vid.0, cookie, file_key
+                    "Reused existing volume: {} (original: {}) for collection {:?}, fid: {},{},{}",
+                    existing_vid, original_volume_id, collection_obj, original_volume_id.0, cookie, file_key
                 );
 
                 return Ok((fid, host_node));
             }
         }
 
-        self.create_new_volume(replication, collection).await
+        // No available volume in the pre-allocated pool
+        warn!(
+            "No available volume for collection {:?}. Pre-allocated volumes are full.",
+            collection_obj
+        );
+        Err(PowerFsError::InvalidRequest(
+            "no available volume in the pre-allocated pool. Please contact admin to allocate more volumes."
+                .to_string(),
+        ))
     }
 
     /// 批量分配 stripe volumes
-    /// 每次都创建新 volume，确保 stripe 的各条带分布在不同 volume 上
+    /// 使用预分配的 volume 池，从池中选择可用的 volume
     /// 返回 (volume_ids, start_volume_idx) 用于 FileLayout
     pub async fn assign_stripe_volumes(
         &self,
         count: u32,
-        replication: &str,
+        _replication: &str,
         collection: &str,
     ) -> Result<(Vec<u64>, u32)> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
+        let collection_obj = Collection(collection.to_string());
         let mut volume_ids = Vec::with_capacity(count as usize);
 
-        for i in 0..count {
-            // stripe 模式下每个条带都创建新 volume，确保分布在不同 volume server 上
-            match self.create_new_volume(replication, collection).await {
-                Ok((fid, _nodes)) => {
-                    volume_ids.push(fid.volume_id.0 as u64);
-                    info!(
-                        "assign_stripe_volumes: created volume {} for stripe slot {}/{}",
-                        fid.volume_id.0,
-                        i + 1,
-                        count
-                    );
+        // Find available volumes from the pre-allocated pool
+        {
+            let volumes = self.volumes.read().unwrap();
+            let mut available_volumes: Vec<VolumeId> = Vec::new();
+            
+            for (vid, vinfo) in volumes.iter() {
+                if vinfo.collection != collection_obj {
+                    continue;
                 }
-                Err(e) => {
-                    warn!(
-                        "assign_stripe_volumes: create_new_volume failed for slot {}/{}: {}",
-                        i + 1,
-                        count,
-                        e
-                    );
-                    return Err(e);
+                // Writable states: Creating or Available
+                if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+                    continue;
                 }
+                // Check available space
+                if vinfo.used >= vinfo.size {
+                    continue;
+                }
+                available_volumes.push(*vid);
+            }
+            
+            info!(
+                "assign_stripe_volumes: found {} available volumes for collection {:?}, need {}",
+                available_volumes.len(),
+                collection_obj,
+                count
+            );
+            
+            if available_volumes.is_empty() {
+                return Err(PowerFsError::InvalidRequest(
+                    "no available volume in the pre-allocated pool".to_string(),
+                ));
+            }
+            
+            // Use round-robin to select volumes for stripe
+            let start = self.stripe_round_robin.fetch_add(1, Ordering::Relaxed) as usize;
+            for i in 0..count as usize {
+                let idx = (start + i) % available_volumes.len();
+                volume_ids.push(available_volumes[idx].0 as u64);
             }
         }
 
-        // round-robin: 不同文件从不同 volume 开始
         let start_idx = self.stripe_round_robin.fetch_add(1, Ordering::Relaxed) % count;
 
         Ok((volume_ids, start_idx))
@@ -1618,6 +1769,13 @@ impl MasterNode {
 
     pub fn get_volume_info(&self, volume_id: &VolumeId) -> Option<VolumeInfo> {
         self.volumes.read().unwrap().get(volume_id).cloned()
+    }
+    
+    /// Get volume info by original ID (as used by Volume Server)
+    /// Returns the first matching volume with the given original ID
+    pub fn get_volume_info_by_original_id(&self, original_id: u32) -> Option<VolumeInfo> {
+        let volumes = self.volumes.read().unwrap();
+        volumes.values().find(|v| v.id.original_id() == original_id).cloned()
     }
 
     pub fn get_node_info(&self, node_id: &NodeId) -> Option<DataNodeInfo> {

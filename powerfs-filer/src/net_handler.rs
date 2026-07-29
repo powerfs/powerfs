@@ -131,6 +131,10 @@ impl FilerNetHandler {
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
+                info!(
+                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}",
+                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name
+                );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, entry_info.ino);
                 enc.add_u32(FieldId::Mode, entry_info.mode);
@@ -142,6 +146,21 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+
+                // Return chunk/fid info for data access
+                if let Some(ref fid) = info.fid {
+                    enc.add_string(FieldId::Fid, fid)?;
+                }
+                if let Some(volume_id) = info.volume_id {
+                    enc.add_u64(FieldId::VolumeId, volume_id as u64);
+                }
+                // Return the first chunk's cookie and offset
+                if let Some(chunk) = info.chunks.first() {
+                    enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+                    enc.add_u64(FieldId::FileKey, chunk.offset);
+                    enc.add_u64(FieldId::Size, chunk.size);
+                }
+
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
@@ -227,9 +246,15 @@ impl FilerNetHandler {
         let uid = dec.next_u64(FieldId::Uid).unwrap_or(0);
         let gid = dec.next_u64(FieldId::Gid).unwrap_or(0);
 
+        // Parse optional chunk/fid info
+        let fid = dec.next_string(FieldId::Fid).ok();
+        let cookie = dec.next_u64(FieldId::Cookie).ok();
+        let offset = dec.next_u64(FieldId::FileKey).ok();
+        let chunk_size = dec.next_u64(FieldId::Size).ok();
+
         info!(
-            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}",
-            parent_ino, name, mode, uid, gid
+            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, has_fid={}",
+            parent_ino, name, mode, uid, gid, fid.is_some()
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -255,10 +280,40 @@ impl FilerNetHandler {
                     .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
                     .await;
 
+                // Store chunk/fid info if provided
+                if let (Some(fid_str), Some(c), Some(o)) = (fid.clone(), cookie, offset) {
+                    let sz = chunk_size.unwrap_or(0);
+                    // Parse volume_id from Fid string (format: "volume_id,cookie,file_key")
+                    let volume_id = fid_str
+                        .split(',')
+                        .next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let _ = self
+                        .meta_shard_manager
+                        .set_chunks(
+                            ino,
+                            shard_id,
+                            fid_str,
+                            volume_id,
+                            c as u32,
+                            o,
+                            sz,
+                        )
+                        .await;
+                }
+
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
                 enc.add_string(FieldId::Name, &name)?;
+                // Return chunk/fid info in response
+                if let Some(fid_str) = fid {
+                    enc.add_string(FieldId::Fid, &fid_str)?;
+                }
+                if let Some(c) = cookie {
+                    enc.add_u64(FieldId::Cookie, c);
+                }
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
@@ -461,13 +516,35 @@ impl FilerNetHandler {
         let has_more = (limited.len() as u64) < limit && !entries.is_empty();
 
         let mut enc = TlvEncoder::new();
-        enc.add_u64(FieldId::Limit, limited.len() as u64);
+        enc.add_u64(FieldId::Count, limited.len() as u64);
         enc.add_u64(FieldId::HasMore, if has_more { 1 } else { 0 });
 
         for entry in &limited {
-            enc.add_string(FieldId::Name, &entry.name)?;
-            enc.add_u64(FieldId::Ino, entry.inode);
-            enc.add_u32(FieldId::Mode, entry.mode);
+            let mut entry_enc = TlvEncoder::new();
+            entry_enc.add_u64(FieldId::Ino, entry.inode);
+            entry_enc.add_string(FieldId::Name, &entry.name)?;
+            entry_enc.add_u32(FieldId::Mode, entry.mode);
+            entry_enc.add_u64(FieldId::Uid, entry.uid as u64);
+            entry_enc.add_u64(FieldId::Gid, entry.gid as u64);
+            entry_enc.add_u64(FieldId::Size, entry.size);
+            entry_enc.add_u64(FieldId::Atime, entry.atime);
+            entry_enc.add_u64(FieldId::Mtime, entry.mtime);
+            entry_enc.add_u64(FieldId::Ctime, entry.ctime);
+            entry_enc.add_u64(FieldId::Nlink, entry.nlink as u64);
+            // Return chunk/fid info for data access
+            if let Some(ref fid) = entry.fid {
+                entry_enc.add_string(FieldId::Fid, fid)?;
+            }
+            if let Some(volume_id) = entry.volume_id {
+                entry_enc.add_u64(FieldId::VolumeId, volume_id as u64);
+            }
+            // Return first chunk details
+            if let Some(chunk) = entry.chunks.first() {
+                entry_enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+                entry_enc.add_u64(FieldId::FileKey, chunk.offset);
+                entry_enc.add_u64(FieldId::Size, chunk.size);
+            }
+            enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
         }
 
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
