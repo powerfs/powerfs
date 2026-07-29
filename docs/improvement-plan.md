@@ -998,7 +998,7 @@ pub struct DeletedInfo {
 | 实现写路径原子更新 | 数据写入 + RocksDB WriteBatch | 4h | ✅ 完成 |
 | 消除 Volume 冗余统计字段 | 移除 free_space/next_offset，统一从 RocksDB allocation CF 获取 | 2h | ✅ 完成 |
 | 统一删除策略为硬删除 | delete_needle_atomic + restore_needle_atomic + purge_expired_deleted | 3h | ✅ 完成 |
-| 实现崩溃恢复（L1） | WAL replay + 数据截断回滚（内置，仅需测试） | 2h | 待开始 |
+| 实现崩溃恢复（L1） | WAL replay + 数据截断回滚（内置，仅需测试） | 2h | ✅ 完成（3 个测试覆盖） |
 | 实现 Checkpoint 快照（L2） | RocksDB Checkpoint API + 触发策略 + 恢复 | 6h | ✅ 已实现（API 层） |
 | 实现远程备份（L3） | Checkpoint 异步同步到 S3 + 远程恢复 | 4h | 待开始 |
 | 实现 volume.data 扫描重建（L4） | Needle Header 解析 + Checksum 验证 + 索引重建 | 6h | ✅ 已实现（API 层） |

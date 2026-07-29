@@ -76,10 +76,11 @@ impl Volume {
             Err(e) => return Err(backend_err(e)),
         }
 
-        let (used, _next_offset) = Self::rebuild_metadata_from_index(&index, size);
+        let (used, _next_offset, active_count, deleted_count) =
+            index.rebuild_allocation_stats()?;
 
         // 同步 RocksDB allocation CF（启动时确保一致性）
-        Self::sync_allocation_from_index(&index, used, size)?;
+        Self::sync_allocation_from_index(&index, used, size, active_count, deleted_count)?;
 
         let info = VolumeInfo {
             id,
@@ -105,55 +106,34 @@ impl Volume {
         })
     }
 
-    /// 从 needle 索引重建分配状态，并与 RocksDB allocation CF 同步
-    fn rebuild_metadata_from_index(index: &dyn NeedleIndex, volume_size: u64) -> (u64, u64) {
-        let mut max_end: u64 = VOLUME_DATA_OFFSET;
-
-        for (_needle_id, info) in index.iter() {
-            let needle_size =
-                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
-            let end = info.offset.saturating_add(needle_size);
-            if end > max_end {
-                max_end = end;
-            }
-        }
-
-        let used = max_end.saturating_sub(VOLUME_DATA_OFFSET);
-        let used = if used > volume_size {
-            volume_size
-        } else {
-            used
-        };
-
-        (used, max_end)
-    }
-
     /// 启动时同步 allocation CF：如果 RocksDB 中的分配状态与 needle 索引不一致，则更新
     fn sync_allocation_from_index(
         index: &VolumeMetadata,
         rebuilt_used: u64,
         volume_size: u64,
+        active_count: u64,
+        deleted_count: u64,
     ) -> Result<()> {
         let stats = index.get_allocation()?;
         let rebuilt_free = volume_size.saturating_sub(rebuilt_used);
 
-        // 如果 allocation CF 为空（首次启动）或 used_bytes 不匹配（crash 恢复），则更新
-        if stats.used_bytes != rebuilt_used || stats.free_bytes != rebuilt_free {
+        // 如果 allocation CF 为空（首次启动）或统计不匹配（crash 恢复），则更新
+        if stats.used_bytes != rebuilt_used
+            || stats.free_bytes != rebuilt_free
+            || stats.active_count != active_count
+            || stats.deleted_count != deleted_count
+        {
             log::info!(
-                "Syncing allocation CF: rocksdb used={} free={} -> rebuilt used={} free={}",
+                "Syncing allocation CF: rocksdb used={} free={} active={} deleted={} -> rebuilt used={} free={} active={} deleted={}",
                 stats.used_bytes,
                 stats.free_bytes,
+                stats.active_count,
+                stats.deleted_count,
                 rebuilt_used,
-                rebuilt_free
+                rebuilt_free,
+                active_count,
+                deleted_count
             );
-
-            // 重新构建完整的 allocation stats
-            let mut active_count: u64 = 0;
-            for (_, info) in index.iter() {
-                if info.deleted_at.is_none() {
-                    active_count += 1;
-                }
-            }
 
             let new_stats = powerfs_common::volume_config::AllocationStats {
                 used_bytes: rebuilt_used,
@@ -161,7 +141,7 @@ impl Volume {
                 next_needle_id: stats.next_needle_id,
                 append_offset: rebuilt_used + VOLUME_DATA_OFFSET,
                 active_count,
-                deleted_count: stats.deleted_count,
+                deleted_count,
                 last_modified_at: Utc::now().timestamp(),
             };
             index.put_allocation(&new_stats)?;
