@@ -111,18 +111,21 @@ async fn test_request_submission_without_network() {
     assert_eq!(data_len, 1);
     assert_eq!(control_len, 0);
 
-    // 尝试处理请求（没有网络客户端应该返回错误）
+    // 尝试处理请求（没有网络连接应该返回错误）
     let result = client.process_next_data_request().await;
     assert!(result.is_some());
 
     let result = result.unwrap();
     match result {
         Ok(_) => {
-            // 成功（不太可能，因为没有网络客户端）
+            // 成功（不太可能，因为没有网络连接）
         }
         Err(e) => {
-            // 应该是 NoNetworkClient 错误
-            assert!(matches!(e, ClientError::NoNetworkClient));
+            // 应该是网络错误（连接失败或路由未配置）
+            assert!(matches!(
+                e,
+                ClientError::Network(_) | ClientError::VolumeNotFound(_)
+            ));
         }
     }
 }
@@ -156,18 +159,21 @@ async fn test_volume_request_submission_without_network() {
     assert_eq!(lease_len, 0);
     assert_eq!(mgmt_len, 0);
 
-    // 尝试处理请求（没有网络客户端应该返回错误）
+    // 尝试处理请求（没有网络连接应该返回错误）
     let result = client.process_next_data_request().await;
     assert!(result.is_some());
 
     let result = result.unwrap();
     match result {
         Ok(_) => {
-            // 成功（不太可能，因为没有网络客户端）
+            // 成功（不太可能，因为没有网络连接）
         }
         Err(e) => {
-            // 应该是 NoNetworkClient 错误
-            assert!(matches!(e, ClientError::NoNetworkClient));
+            // 应该是网络错误（连接失败或路由未配置）
+            assert!(matches!(
+                e,
+                ClientError::Network(_) | ClientError::VolumeNotFound(_)
+            ));
         }
     }
 }

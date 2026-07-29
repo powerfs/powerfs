@@ -127,7 +127,10 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     let ctime = dec.next_u64(FieldId::Ctime).unwrap_or(0);
     let name = dec.next_string(FieldId::Name).unwrap_or_default();
 
-    eprintln!("parse_entry_from_tlv: path={}, ino={}, mode={:o}, name={}", path, ino, mode, name);
+    eprintln!(
+        "parse_entry_from_tlv: path={}, ino={}, mode={:o}, name={}",
+        path, ino, mode, name
+    );
 
     // Parse chunk/fid info
     let fid = dec.next_string(FieldId::Fid).ok();
@@ -266,14 +269,14 @@ pub struct FacadeResponse {
 
 /// 构建写操作的 TLV 请求体
 fn build_write_tlv(
-    volume_id: u32,
+    volume_id: u64,
     file_key: u64,
     data: &[u8],
     lease_token: Option<&str>,
     client_id: Option<&str>,
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, volume_id as u64);
+    enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::Name, file_key);
     let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
@@ -290,9 +293,9 @@ fn build_write_tlv(
 }
 
 /// 构建读操作的 TLV 请求体
-fn build_read_tlv(volume_id: u32, file_key: u64, offset: i64, size: i32) -> Vec<u8> {
+fn build_read_tlv(volume_id: u64, file_key: u64, offset: i64, size: i32) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, volume_id as u64);
+    enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::Name, file_key);
     enc.add_u64(FieldId::Offset, offset as u64);
     enc.add_u64(FieldId::Size, size as u64);
@@ -301,7 +304,7 @@ fn build_read_tlv(volume_id: u32, file_key: u64, offset: i64, size: i32) -> Vec<
 
 /// 构建批量写操作的 TLV 请求体
 fn build_batch_write_tlv(
-    volume_id: u32,
+    volume_id: u64,
     file_key: u64,
     entries_count: usize,
     data: &[u8],
@@ -309,7 +312,7 @@ fn build_batch_write_tlv(
     client_id: Option<&str>,
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, volume_id as u64);
+    enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::Name, file_key);
     enc.add_u64(FieldId::Entries, entries_count as u64);
     let _ = enc.add_bytes(FieldId::DataLen, data);
@@ -327,9 +330,9 @@ fn build_batch_write_tlv(
 }
 
 /// 构建删除操作的 TLV 请求体
-fn build_delete_tlv(volume_id: u32, file_key: u64) -> Vec<u8> {
+fn build_delete_tlv(volume_id: u64, file_key: u64) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, volume_id as u64);
+    enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::Name, file_key);
     enc.into_bytes()
 }
@@ -394,7 +397,7 @@ impl VolumeProvider for FacadeVolumeProvider {
             hex_dump(body)
         );
         let mut dec = powerfs_net::TlvDecoder::new(body);
-        let volume_id = dec.next_u64(powerfs_net::FieldId::VolumeId).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(powerfs_net::FieldId::VolumeId).unwrap_or(0);
         let cookie = dec.next_u64(powerfs_net::FieldId::Cookie).unwrap_or(0);
         let file_key = dec.next_u64(powerfs_net::FieldId::FileKey).unwrap_or(0);
         let owner_url = dec
@@ -425,7 +428,7 @@ impl VolumeProvider for FacadeVolumeProvider {
             }]
         } else {
             vec![Location {
-                url: self.facade.filer_leader_addr(),
+                url: self.facade.filer_addr(),
                 public_url: String::new(),
                 grpc_port: 0,
                 data_center: String::new(),
@@ -496,14 +499,46 @@ impl FacadeMetadataProvider {
     pub fn new(facade: Arc<crate::fuse_client_facade::FuseClientFacade>) -> Self {
         Self { facade }
     }
+
+    /// Resolve parent_ino from a directory path by walking the path from root
+    async fn resolve_parent_ino(&self, dir_path: &str) -> Result<u64> {
+        let dir_path = dir_path.trim_end_matches('/');
+        if dir_path.is_empty() || dir_path == "/" {
+            return Ok(1); // Root inode
+        }
+
+        // Walk path: split into components, resolve each one from root
+        let parts: Vec<&str> = dir_path.split('/').filter(|p| !p.is_empty()).collect();
+
+        let mut current_ino: u64 = 1; // Start from root
+        for part in &parts {
+            match self.get_entry_by_parent(current_ino, part).await? {
+                Some(entry) => {
+                    current_ino = entry.attributes.as_ref().map(|a| a.ino).ok_or_else(|| {
+                        PowerFsError::Internal(format!("Entry '{}' has no inode", part))
+                    })?;
+                }
+                None => {
+                    return Err(PowerFsError::Internal(format!(
+                        "Directory component '{}' not found in path '{}'",
+                        part, dir_path
+                    )));
+                }
+            }
+        }
+        Ok(current_ino)
+    }
 }
 
 #[async_trait]
 impl MetadataProvider for FacadeMetadataProvider {
     async fn get_entry(&self, path: &str) -> Result<Option<Entry>> {
         let (parent_ino, name) = parse_path_to_parent_name(path);
+        self.get_entry_by_parent(parent_ino, &name).await
+    }
 
-        let payload = build_lookup_tlv(parent_ino, &name);
+    async fn get_entry_by_parent(&self, parent_ino: u64, name: &str) -> Result<Option<Entry>> {
+        let payload = build_lookup_tlv(parent_ino, name);
 
         let result = self
             .facade
@@ -514,9 +549,10 @@ impl MetadataProvider for FacadeMetadataProvider {
                 powerfs_net::MsgType::Lookup,
             )
             .await
-            .map_err(|e| PowerFsError::Internal(format!("Facade get_entry failed: {}", e)))?;
+            .map_err(|e| {
+                PowerFsError::Internal(format!("Facade get_entry_by_parent failed: {}", e))
+            })?;
 
-        // TLV response is in payload field (not data field which is for JSON)
         let response_data = result
             .payload
             .as_deref()
@@ -524,9 +560,15 @@ impl MetadataProvider for FacadeMetadataProvider {
             .or(result.data.as_deref());
 
         match response_data {
-            Some(data) if !data.is_empty() => Ok(parse_entry_from_tlv(data, path)),
+            Some(data) if !data.is_empty() => {
+                let path = if parent_ino == 1 {
+                    format!("/{}", name)
+                } else {
+                    name.to_string()
+                };
+                Ok(parse_entry_from_tlv(data, &path))
+            }
             _ => {
-                // Check if error
                 if let Some(data) = &result.data {
                     if let Ok(facade_resp) = serde_json::from_slice::<FacadeResponse>(data) {
                         if !facade_resp.success {
@@ -545,7 +587,8 @@ impl MetadataProvider for FacadeMetadataProvider {
     }
 
     async fn create_entry(&self, entry: &Entry, _client_id: &str) -> Result<u64> {
-        let parent_ino = 1;
+        // 从 entry.directory 解析 parent_ino
+        let parent_ino = self.resolve_parent_ino(&entry.directory).await?;
         let name = entry.name.clone();
         let mode = entry
             .attributes
@@ -556,7 +599,8 @@ impl MetadataProvider for FacadeMetadataProvider {
         let gid = entry.attributes.as_ref().map(|a| a.gid as u64).unwrap_or(0);
         let is_dir = mode & 0o170000 == 0o040000;
 
-        let payload = build_create_tlv_with_chunks(parent_ino, &name, mode, uid, gid, &entry.chunks);
+        let payload =
+            build_create_tlv_with_chunks(parent_ino, &name, mode, uid, gid, &entry.chunks);
 
         let msg_type = if is_dir {
             powerfs_net::MsgType::Mkdir
@@ -744,16 +788,12 @@ impl FacadeStorageProvider {
     /// 优先读缓存；若缓存未命中或已过期，向 Volume 发起 RangeLease 请求并更新缓存。
     async fn ensure_lease(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> powerfs_common::error::Result<String> {
-        let vid = volume_id as u64;
-        // Fast path: use cached valid lease token
-        if let Some(tok) = self
-            .facade
-            .volume_client()
-            .get_valid_lease_token(vid, file_key)
-        {
+        let vid = volume_id;
+        // Fast path: use cached valid lease token via facade
+        if let Some(tok) = self.facade.get_valid_lease_token(vid, file_key) {
             return Ok(tok);
         }
 
@@ -795,8 +835,8 @@ impl FacadeStorageProvider {
             ))
         })?;
 
-        // Store in VolumeClient lease cache
-        self.facade.volume_client().update_lease(
+        // Store lease via facade
+        self.facade.update_lease(
             vid,
             file_key,
             lease_token.clone(),
@@ -818,7 +858,7 @@ impl FacadeStorageProvider {
 impl StorageProvider for FacadeStorageProvider {
     async fn write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         _offset: i64,
         _size: i32,
@@ -843,7 +883,7 @@ impl StorageProvider for FacadeStorageProvider {
             .facade
             .submit_data_request_with_type(
                 crate::request_state::RequestKind::Write,
-                volume_id as u64,
+                volume_id,
                 payload,
                 powerfs_net::MsgType::WriteNeedle,
             )
@@ -855,7 +895,7 @@ impl StorageProvider for FacadeStorageProvider {
 
     async fn batch_write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         entries: &[(i64, i32, Vec<u8>, u32)],
     ) -> Result<()> {
@@ -884,7 +924,7 @@ impl StorageProvider for FacadeStorageProvider {
             .facade
             .submit_data_request_with_type(
                 crate::request_state::RequestKind::Write,
-                volume_id as u64,
+                volume_id,
                 payload,
                 powerfs_net::MsgType::BatchWriteNeedle,
             )
@@ -898,7 +938,7 @@ impl StorageProvider for FacadeStorageProvider {
 
     async fn read_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         offset: i64,
         size: i32,
@@ -909,7 +949,7 @@ impl StorageProvider for FacadeStorageProvider {
             .facade
             .submit_data_request_with_type(
                 crate::request_state::RequestKind::Read,
-                volume_id as u64,
+                volume_id,
                 payload,
                 powerfs_net::MsgType::ReadNeedleBlob,
             )
@@ -920,13 +960,13 @@ impl StorageProvider for FacadeStorageProvider {
         Ok(data)
     }
 
-    async fn delete_blob(&self, volume_id: u32, file_key: u64) -> Result<()> {
+    async fn delete_blob(&self, volume_id: u64, file_key: u64) -> Result<()> {
         let payload = build_delete_tlv(volume_id, file_key);
 
         let _result = self
             .facade
             .submit_mgmt_request_with_type(
-                volume_id as u64,
+                volume_id,
                 payload,
                 powerfs_net::MsgType::DeleteNeedle,
             )

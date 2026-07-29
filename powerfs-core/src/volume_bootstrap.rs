@@ -86,10 +86,13 @@ impl VolumeBootstrap {
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| PowerFsError::Internal(format!("Failed to create bootstrap file: {}", e)))?;
+            .map_err(|e| {
+                PowerFsError::Internal(format!("Failed to create bootstrap file: {}", e))
+            })?;
 
-        file.write_all(&data)
-            .map_err(|e| PowerFsError::Internal(format!("Failed to write bootstrap file: {}", e)))?;
+        file.write_all(&data).map_err(|e| {
+            PowerFsError::Internal(format!("Failed to write bootstrap file: {}", e))
+        })?;
 
         Ok(())
     }

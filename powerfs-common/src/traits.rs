@@ -113,6 +113,17 @@ pub struct Entry {
 pub trait MetadataProvider: Send + Sync {
     async fn get_entry(&self, path: &str) -> Result<Option<Entry>>;
 
+    async fn get_entry_by_parent(&self, _parent_ino: u64, name: &str) -> Result<Option<Entry>> {
+        // Default implementation: resolve parent path then use get_entry
+        let parent_path = "/";
+        let path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.get_entry(&path).await
+    }
+
     async fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>>;
 
     async fn create_entry(&self, entry: &Entry, client_id: &str) -> Result<u64>;
@@ -161,7 +172,7 @@ pub trait EventProvider: Send + Sync {
 pub trait StorageProvider: Send + Sync {
     async fn write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         offset: i64,
         size: i32,
@@ -170,18 +181,18 @@ pub trait StorageProvider: Send + Sync {
 
     async fn batch_write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         entries: &[(i64, i32, Vec<u8>, u32)],
     ) -> Result<()>;
 
     async fn read_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>>;
 
-    async fn delete_blob(&self, volume_id: u32, file_key: u64) -> Result<()>;
+    async fn delete_blob(&self, volume_id: u64, file_key: u64) -> Result<()>;
 }

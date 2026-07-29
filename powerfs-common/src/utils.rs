@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use uuid::Uuid;
 
 pub fn generate_volume_id() -> VolumeId {
-    VolumeId(rand::thread_rng().gen::<u32>())
+    VolumeId(crate::id_generator::IdGenerator::generate_uuid_based())
 }
 
 pub fn generate_needle_id() -> NeedleId {

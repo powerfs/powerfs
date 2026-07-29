@@ -39,7 +39,7 @@ pub struct MultipartSession {
     pub key: String,
     pub parts: Vec<PartInfo>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub volume_id: u32,
+    pub volume_id: u64,
 }
 
 pub struct S3State {
@@ -686,7 +686,7 @@ pub mod handlers {
             return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid FID format");
         }
 
-        let volume_id: u32 = match fid_parts[0].parse() {
+        let volume_id: u64 = match fid_parts[0].parse() {
             Ok(v) => v,
             Err(_) => {
                 return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid volume ID")
@@ -832,7 +832,7 @@ pub mod handlers {
             let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
             if fid_parts.len() >= 3 {
                 if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
                 {
                     if let Some(volume_info) =
                         state.master.get_volume_info(&VolumeId(volume_id)).await
@@ -1192,7 +1192,7 @@ pub mod handlers {
             let fid_parts: Vec<&str> = part.fid.split(',').collect();
             if fid_parts.len() >= 3 {
                 if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
                 {
                     if let Some(volume_info) =
                         state.master.get_volume_info(&VolumeId(volume_id)).await
@@ -1250,7 +1250,7 @@ pub mod handlers {
             let fid_parts: Vec<&str> = part.fid.split(',').collect();
             if fid_parts.len() >= 3 {
                 if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
                 {
                     if let Some(volume_info) =
                         state.master.get_volume_info(&VolumeId(volume_id)).await
@@ -1317,7 +1317,7 @@ pub mod handlers {
         let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
         if fid_parts.len() >= 3 {
             if let (Ok(volume_id), Ok(file_key)) =
-                (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+                (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
             {
                 if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
                 {
@@ -1382,7 +1382,7 @@ pub mod handlers {
         let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
         if fid_parts.len() >= 3 {
             if let (Ok(volume_id), Ok(file_key)) =
-                (fid_parts[0].parse::<u32>(), fid_parts[2].parse::<u64>())
+                (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
             {
                 if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
                 {

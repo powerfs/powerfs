@@ -94,21 +94,21 @@ impl BucketManager {
         buckets
     }
 
-    pub async fn get_bucket_volume_ids(&self, bucket: &str) -> Option<Vec<u32>> {
+    pub async fn get_bucket_volume_ids(&self, bucket: &str) -> Option<Vec<u64>> {
         self.metadata_store
             .get_bucket(bucket)
             .await
             .map(|b| b.volume_ids)
     }
 
-    pub async fn get_bucket_primary_volume(&self, bucket: &str) -> Option<u32> {
+    pub async fn get_bucket_primary_volume(&self, bucket: &str) -> Option<u64> {
         self.metadata_store
             .get_bucket(bucket)
             .await
             .and_then(|b| b.volume_ids.first().cloned())
     }
 
-    pub async fn allocate_volume_for_bucket(&self, bucket: &str, replication: &str) -> Result<u32> {
+    pub async fn allocate_volume_for_bucket(&self, bucket: &str, replication: &str) -> Result<u64> {
         let (fid, nodes) = self
             .master_api
             .assign_volume(replication, "default")

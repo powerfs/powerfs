@@ -220,7 +220,7 @@ impl S3Handler {
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> axum::response::Response {
         // Resolve object metadata (fid, volume_id, etag, size).
-        let (fid, volume_id, etag, size): (String, u32, String, u64);
+        let (fid, volume_id, etag, size): (String, u64, String, u64);
 
         if let Some(mgr) = &self.meta_shard_manager {
             let root_inode = match mgr.ensure_bucket_root(bucket).await {
@@ -277,7 +277,7 @@ impl S3Handler {
                 .into_response();
         }
 
-        let vid: u32 = match fid_parts[0].parse() {
+        let vid: u64 = match fid_parts[0].parse() {
             Ok(v) => v,
             Err(_) => {
                 return (

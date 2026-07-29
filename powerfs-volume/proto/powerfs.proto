@@ -30,17 +30,17 @@ service VolumeService {
 }
 
 message CreateVolumeRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 size = 2;
 }
 
 message CreateVolumeResponse {
     bool success = 1;
-    uint32 volume_id = 2;
+    uint64 volume_id = 2;
 }
 
 message DeleteVolumeRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
 }
 
 message DeleteVolumeResponse {
@@ -48,7 +48,7 @@ message DeleteVolumeResponse {
 }
 
 message WriteNeedleRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     bytes data = 3;
     uint32 cookie = 4;
@@ -57,14 +57,14 @@ message WriteNeedleRequest {
 
 message WriteNeedleResponse {
     bool success = 1;
-    uint32 volume_id = 2;
+    uint64 volume_id = 2;
     uint64 file_key = 3;
     uint64 offset = 4;
     uint32 cookie = 5;
 }
 
 message ReadNeedleRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     uint32 cookie = 3;
 }
@@ -77,7 +77,7 @@ message ReadNeedleResponse {
 }
 
 message DeleteNeedleRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     uint32 cookie = 3;
 }
@@ -87,7 +87,7 @@ message DeleteNeedleResponse {
 }
 
 message RestoreNeedleRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     uint32 cookie = 3;
 }
@@ -97,7 +97,7 @@ message RestoreNeedleResponse {
 }
 
 message WormLockRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     uint32 cookie = 3;
     int64 retention_days = 4;
@@ -115,7 +115,7 @@ message ListVolumesResponse {
 }
 
 message VolumeInfo {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     string node_id = 2;
     uint64 size = 3;
     uint64 used = 4;
@@ -138,7 +138,7 @@ message GetNodeInfoResponse {
 }
 
 message WriteNeedleBlobRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     int64 offset = 3;
     int32 size = 4;
@@ -151,7 +151,7 @@ message WriteNeedleBlobResponse {
 }
 
 message BatchWriteNeedleBlobRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     repeated NeedleBlobEntry entries = 3;
 }
@@ -169,7 +169,7 @@ message BatchWriteNeedleBlobResponse {
 }
 
 message ReadNeedleBlobRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     int64 offset = 3;
     int32 size = 4;
@@ -181,7 +181,7 @@ message ReadNeedleBlobResponse {
 }
 
 message ReadNeedleMetaRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
 }
 
@@ -211,7 +211,7 @@ message DeleteResult {
 }
 
 message VolumeStatusRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
 }
 
 message VolumeStatusResponse {
@@ -270,7 +270,7 @@ message RangeLeaseRenewResponse {
 
 // WriteNeedleBlob with lease token for validated writes
 message WriteNeedleBlobLeaseRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     int64 offset = 3;
     int32 size = 4;

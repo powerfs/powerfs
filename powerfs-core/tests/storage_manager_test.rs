@@ -90,7 +90,7 @@ fn test_list_volumes() {
 
     let volumes = mgr.list_volumes();
     assert_eq!(volumes.len(), 2);
-    let ids: Vec<u32> = volumes.iter().map(|v| v.id.0).collect();
+    let ids: Vec<u64> = volumes.iter().map(|v| v.id.0).collect();
     assert!(ids.contains(&1));
     assert!(ids.contains(&2));
 }

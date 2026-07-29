@@ -64,17 +64,65 @@ async fn test_raft_client_basic() {
 #[tokio::test]
 async fn test_config_parsing() {
     let config_content = r#"
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
 [master]
 port = 9333
+net_port = 9334
 dir = "./data"
+ip = "0.0.0.0"
+advertise_addr = "127.0.0.1:9333"
 raft_id = 1
+peers = ["127.0.0.1:9333"]
 
 [volume]
 grpc_port = 8080
 http_port = 8081
+net_port = 8901
 data_dir = "./data"
+master_addresses = ["127.0.0.1:9333"]
 node_id = "volume-1"
 max_volume_size = 1073741824
+
+[filer]
+port = 8888
+grpc_port = 8889
+net_port = 9335
+master_addresses = ["127.0.0.1:9333"]
+data_dir = "./data"
+shard_count = 1
+raft_id = 1
+raft_peers = ["127.0.0.1:8889"]
+
+[s3]
+port = 9000
+master_address = "127.0.0.1:9333"
+dir = "./data"
+access_key = "test_key"
+secret_key = "test_secret"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["127.0.0.1"]
+filer_addresses = ["127.0.0.1"]
+volume_addresses = ["127.0.0.1"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9335
+collection = "default"
+replication = "000"
+threads = 4
+verbose = false
+container = false
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://127.0.0.1:6379"
+s3_endpoint = "http://127.0.0.1:9000"
+s3_backend_endpoint = "http://127.0.0.1:9000"
+master_endpoint = "127.0.0.1:9333"
 "#;
 
     let config = powerfs_common::config::PowerFsConfig::load_from_string(config_content).unwrap();
@@ -93,10 +141,65 @@ max_volume_size = 1073741824
 #[tokio::test]
 async fn test_config_with_peers() {
     let config_content = r#"
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
 [master]
 port = 9335
+net_port = 9336
+dir = "./data"
+ip = "0.0.0.0"
+advertise_addr = "127.0.0.1:9335"
 raft_id = 1
 peers = ["127.0.0.1:9336", "127.0.0.1:9337"]
+
+[volume]
+grpc_port = 8080
+http_port = 8081
+net_port = 8901
+data_dir = "./data"
+master_addresses = ["127.0.0.1:9335"]
+node_id = "volume-1"
+max_volume_size = 1073741824
+
+[filer]
+port = 8888
+grpc_port = 8889
+net_port = 9337
+master_addresses = ["127.0.0.1:9335"]
+data_dir = "./data"
+shard_count = 1
+raft_id = 1
+raft_peers = ["127.0.0.1:8889"]
+
+[s3]
+port = 9000
+master_address = "127.0.0.1:9335"
+dir = "./data"
+access_key = "test_key"
+secret_key = "test_secret"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["127.0.0.1"]
+filer_addresses = ["127.0.0.1"]
+volume_addresses = ["127.0.0.1"]
+master_net_port = 9336
+volume_net_port = 8901
+filer_net_port = 9337
+collection = "default"
+replication = "000"
+threads = 4
+verbose = false
+container = false
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://127.0.0.1:6379"
+s3_endpoint = "http://127.0.0.1:9000"
+s3_backend_endpoint = "http://127.0.0.1:9000"
+master_endpoint = "127.0.0.1:9335"
 "#;
 
     let config = powerfs_common::config::PowerFsConfig::load_from_string(config_content).unwrap();

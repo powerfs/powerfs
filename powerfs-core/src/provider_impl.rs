@@ -70,7 +70,7 @@ impl KvCacheProvider for KVCacheEngine {
 impl StorageProvider for StorageManager {
     async fn write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         offset: i64,
         size: i32,
@@ -84,7 +84,7 @@ impl StorageProvider for StorageManager {
 
     async fn batch_write_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         entries: &[(i64, i32, Vec<u8>, u32)],
     ) -> Result<()> {
@@ -106,7 +106,7 @@ impl StorageProvider for StorageManager {
 
     async fn read_blob(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         offset: i64,
         size: i32,
@@ -118,7 +118,7 @@ impl StorageProvider for StorageManager {
         Ok(bytes.to_vec())
     }
 
-    async fn delete_blob(&self, volume_id: u32, file_key: u64) -> Result<()> {
+    async fn delete_blob(&self, volume_id: u64, file_key: u64) -> Result<()> {
         let volume = self
             .get_volume(&VolumeId(volume_id))
             .ok_or_else(|| PowerFsError::VolumeNotFound(VolumeId(volume_id)))?;

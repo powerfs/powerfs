@@ -1,0 +1,72 @@
+# PowerFS FUSE 客户端配置 - 节点1
+# 所有端口和地址必须显式设置，无默认值
+
+[global]
+log_level = "info"
+redis_url = "redis://172.20.0.50:6379"
+
+[master]
+port = 9333
+net_port = 9334
+dir = "/data/master"
+raft_id = 1
+peers = []
+
+[volume]
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data/volume"
+master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
+node_id = "volume-server"
+max_volume_size = 10737418240
+initial_volume_count = 4
+
+[filer]
+port = 8888
+grpc_port = 8889
+net_port = 9334
+master_addresses = ["172.20.0.11:9333"]
+data_dir = "/data/filer"
+shard_count = 2
+raft_id = 1
+raft_peers = []
+
+[s3]
+port = 9000
+master_address = "172.20.0.11:9333"
+dir = "/data/s3"
+access_key = "powerfs"
+secret_key = "powerfs123"
+
+[fuse]
+mount_point = "/mnt/powerfs"   # 挂载点 (必填)
+master_addresses = [            # Master地址列表 (必填)
+    "172.20.0.11",
+    "172.20.0.12",
+    "172.20.0.13"
+]
+filer_addresses = [             # Filer地址列表 (必填)
+    "172.20.0.35",
+    "172.20.0.36"
+]
+volume_addresses = [            # Volume地址列表 (必填)
+    "172.20.0.21",
+    "172.20.0.22",
+    "172.20.0.23"
+]
+master_net_port = 9334          # Master powerfs-net端口 (必填)
+volume_net_port = 8901          # Volume powerfs-net端口 (必填)
+filer_net_port = 9334           # Filer powerfs-net端口 (必填)
+collection = "default"
+replication = "000"
+threads = 8
+verbose = true
+container = true
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://172.20.0.50:6379"
+s3_endpoint = "http://172.20.0.32:9000"
+s3_backend_endpoint = "http://172.20.0.32:9000"
+master_endpoint = "http://172.20.0.11:9333"

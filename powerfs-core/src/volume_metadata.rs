@@ -4,9 +4,9 @@ use powerfs_common::{
     error::{PowerFsError, Result},
     types::{NeedleId, NeedleInfo},
     utils::ChecksumAlgorithm,
-    volume_config::{AllocationStats, DeletedInfo, VolumeConfig},
+    volume_config::{AllocationStats, VolumeConfig},
 };
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, WriteBatch};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, WriteBatch, DB};
 use serde_json;
 use std::path::Path;
 use std::sync::Arc;
@@ -58,7 +58,9 @@ impl VolumeMetadata {
     }
 
     fn cf_needles(&self) -> &ColumnFamily {
-        self.db.cf_handle(CF_NEEDLES).expect("needles CF must exist")
+        self.db
+            .cf_handle(CF_NEEDLES)
+            .expect("needles CF must exist")
     }
 
     fn cf_allocation(&self) -> &ColumnFamily {
@@ -145,7 +147,7 @@ impl VolumeMetadata {
         let key = needle_id.0.to_be_bytes();
         let data = self
             .db
-            .get_cf(self.cf_needles(), &key)
+            .get_cf(self.cf_needles(), key)
             .map_err(|e| PowerFsError::Internal(format!("RocksDB get needle failed: {}", e)))?;
 
         match data {
@@ -166,37 +168,35 @@ impl VolumeMetadata {
             .map_err(|e| PowerFsError::Internal(format!("Serialize needle failed: {}", e)))?;
 
         self.db
-            .put_cf(self.cf_needles(), &key, data)
+            .put_cf(self.cf_needles(), key, data)
             .map_err(|e| PowerFsError::Internal(format!("RocksDB put needle failed: {}", e)))?;
 
         Ok(())
     }
 
-    /// 删除 Needle（从 needles CF 移除，添加到 deleted CF）
+    /// 删除 Needle（从 needles CF 移除，完整 NeedleInfo 存入 deleted CF）
     pub fn delete_needle(&self, needle_id: &NeedleId) -> Result<Option<NeedleInfo>> {
         let key = needle_id.0.to_be_bytes();
 
         // 先读取现有 needle 信息
         let existing = self.get_needle(needle_id)?;
 
-        if let Some(info) = &existing {
-            let now = Utc::now().timestamp();
+        if let Some(mut info) = existing.clone() {
+            let now = Utc::now();
 
-            // 原子操作：从 needles CF 删除 + 写入 deleted CF
+            // 原子操作：从 needles CF 删除 + 写入 deleted CF（保留完整 NeedleInfo）
             let mut batch = WriteBatch::default();
-            batch.delete_cf(self.cf_needles(), &key);
-            let deleted = DeletedInfo {
-                deleted_at: now,
-                original_size: info.data_size as u64,
-            };
-            let deleted_data = serde_json::to_vec(&deleted).map_err(|e| {
-                PowerFsError::Internal(format!("Serialize deleted info failed: {}", e))
+            batch.delete_cf(self.cf_needles(), key);
+            info.deleted_at = Some(now);
+            info.delete_retention_until = Some(now + chrono::Duration::days(7));
+            let deleted_data = serde_json::to_vec(&info).map_err(|e| {
+                PowerFsError::Internal(format!("Serialize deleted needle failed: {}", e))
             })?;
-            batch.put_cf(self.cf_deleted(), &key, deleted_data);
+            batch.put_cf(self.cf_deleted(), key, deleted_data);
 
-            self.db
-                .write(batch)
-                .map_err(|e| PowerFsError::Internal(format!("RocksDB batch delete failed: {}", e)))?;
+            self.db.write(batch).map_err(|e| {
+                PowerFsError::Internal(format!("RocksDB batch delete failed: {}", e))
+            })?;
 
             debug!("Needle {} moved to deleted CF", needle_id.0);
         }
@@ -212,9 +212,8 @@ impl VolumeMetadata {
 
         let mut result = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                PowerFsError::Internal(format!("RocksDB iterator error: {}", e))
-            })?;
+            let (key, value) =
+                item.map_err(|e| PowerFsError::Internal(format!("RocksDB iterator error: {}", e)))?;
 
             if key.len() == 8 {
                 let id = u64::from_be_bytes([
@@ -230,41 +229,75 @@ impl VolumeMetadata {
         Ok(result)
     }
 
-    /// 列出所有已删除的 Needle（用于 compact）
-    pub fn list_deleted(&self) -> Result<Vec<(u64, DeletedInfo)>> {
+    /// 列出所有已删除的 Needle（用于 compact 和 GC）
+    pub fn list_deleted(&self) -> Result<Vec<(NeedleId, NeedleInfo)>> {
         let iter = self
             .db
             .iterator_cf(self.cf_deleted(), rocksdb::IteratorMode::Start);
 
         let mut result = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                PowerFsError::Internal(format!("RocksDB iterator error: {}", e))
-            })?;
+            let (key, value) =
+                item.map_err(|e| PowerFsError::Internal(format!("RocksDB iterator error: {}", e)))?;
 
             if key.len() == 8 {
                 let id = u64::from_be_bytes([
                     key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
                 ]);
-                let info: DeletedInfo = serde_json::from_slice(&value).map_err(|e| {
-                    PowerFsError::Internal(format!("Deserialize deleted info failed: {}", e))
+                let info: NeedleInfo = serde_json::from_slice(&value).map_err(|e| {
+                    PowerFsError::Internal(format!("Deserialize deleted needle failed: {}", e))
                 })?;
-                result.push((id, info));
+                result.push((NeedleId(id), info));
             }
         }
 
         Ok(result)
     }
 
+    /// GC 清理：永久删除 deleted CF 中已过期的条目，返回清理数量
+    pub fn purge_expired_deleted(&self) -> Result<usize> {
+        let now = Utc::now();
+        let deleted_items = self.list_deleted()?;
+        let mut purged = 0;
+
+        for (needle_id, info) in &deleted_items {
+            if let Some(retention_until) = info.delete_retention_until {
+                if retention_until < now {
+                    let key = needle_id.0.to_be_bytes();
+                    self.db
+                        .delete_cf(self.cf_deleted(), key)
+                        .map_err(|e| {
+                            PowerFsError::Internal(format!("RocksDB purge deleted failed: {}", e))
+                        })?;
+                    purged += 1;
+                }
+            }
+        }
+
+        // 更新 deleted_count
+        if purged > 0 {
+            let mut stats = self.get_allocation()?;
+            stats.deleted_count = stats.deleted_count.saturating_sub(purged as u64);
+            stats.last_modified_at = now.timestamp();
+            self.put_allocation(&stats)?;
+        }
+
+        if purged > 0 {
+            info!("GC purged {} expired deleted needles", purged);
+        }
+
+        Ok(purged)
+    }
+
     // ===== 原子写入操作 =====
 
-    /// 原子写入 Needle + 更新分配状态
+    /// 原子写入 Needle + 更新分配状态，返回更新后的 AllocationStats
     pub fn write_needle_atomic(
         &self,
         info: &NeedleInfo,
         data_size: u64,
         volume_size: u64,
-    ) -> Result<()> {
+    ) -> Result<AllocationStats> {
         let _ = volume_size; // volume_size used in stats calculation below
         let mut batch = WriteBatch::default();
 
@@ -272,15 +305,24 @@ impl VolumeMetadata {
         let key = info.id.0.to_be_bytes();
         let needle_data = serde_json::to_vec(info)
             .map_err(|e| PowerFsError::Internal(format!("Serialize needle failed: {}", e)))?;
-        batch.put_cf(self.cf_needles(), &key, needle_data);
+        batch.put_cf(self.cf_needles(), key, needle_data);
 
         // 更新分配状态
         let mut stats = self.get_allocation()?;
+
+        // 检查是否是覆盖写入（同一 needle_id 已存在）
+        let is_update = matches!(self.get_needle(&info.id), Ok(Some(_)));
+
         stats.used_bytes += data_size;
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
         stats.append_offset += data_size;
-        stats.next_needle_id += 1;
-        stats.active_count += 1;
+        stats.next_needle_id = stats.next_needle_id.max(info.id.0 + 1);
+
+        // 仅在新增 needle 时增加 active_count（覆盖写入时 count 不变）
+        if !is_update {
+            stats.active_count += 1;
+        }
+
         stats.last_modified_at = Utc::now().timestamp();
 
         let alloc_data = serde_json::to_vec(&stats)
@@ -296,10 +338,11 @@ impl VolumeMetadata {
             info.id.0, stats.used_bytes, stats.free_bytes, stats.append_offset
         );
 
-        Ok(())
+        Ok(stats)
     }
 
-    /// 原子删除 Needle + 更新分配状态
+    /// 原子删除 Needle + 更新分配状态，返回被删除的 NeedleInfo
+    /// 硬删除策略：从 needles CF 移除，完整 NeedleInfo（含 deleted_at）存入 deleted CF
     pub fn delete_needle_atomic(
         &self,
         needle_id: &NeedleId,
@@ -307,29 +350,28 @@ impl VolumeMetadata {
     ) -> Result<Option<NeedleInfo>> {
         let existing = self.get_needle(needle_id)?;
 
-        if let Some(info) = &existing {
-            let now = Utc::now().timestamp();
+        if let Some(mut info) = existing.clone() {
+            let now = Utc::now();
+            let now_ts = now.timestamp();
             let mut batch = WriteBatch::default();
 
             // 从 needles CF 删除
             let key = needle_id.0.to_be_bytes();
-            batch.delete_cf(self.cf_needles(), &key);
+            batch.delete_cf(self.cf_needles(), key);
 
-            // 写入 deleted CF
-            let deleted = DeletedInfo {
-                deleted_at: now,
-                original_size: info.data_size as u64,
-            };
-            let deleted_data = serde_json::to_vec(&deleted).map_err(|e| {
-                PowerFsError::Internal(format!("Serialize deleted info failed: {}", e))
+            // 标记 deleted_at 和 delete_retention_until，存入 deleted CF（保留完整信息以支持恢复）
+            info.deleted_at = Some(now);
+            info.delete_retention_until = Some(now + chrono::Duration::days(7));
+            let deleted_data = serde_json::to_vec(&info).map_err(|e| {
+                PowerFsError::Internal(format!("Serialize deleted needle failed: {}", e))
             })?;
-            batch.put_cf(self.cf_deleted(), &key, deleted_data);
+            batch.put_cf(self.cf_deleted(), key, deleted_data);
 
             // 更新分配状态（used 不立即减少，等 compact 后才回收）
             let mut stats = self.get_allocation()?;
             stats.active_count = stats.active_count.saturating_sub(1);
             stats.deleted_count += 1;
-            stats.last_modified_at = now;
+            stats.last_modified_at = now_ts;
 
             let alloc_data = serde_json::to_vec(&stats).map_err(|e| {
                 PowerFsError::Internal(format!("Serialize allocation failed: {}", e))
@@ -349,15 +391,73 @@ impl VolumeMetadata {
         Ok(existing)
     }
 
-    /// Compact 后清理 deleted CF 并更新分配状态
-    pub fn compact_cleanup(&self, freed_bytes: u64, volume_size: u64) -> Result<()> {
+    /// 原子恢复 Needle：从 deleted CF 移回 needles CF，更新分配状态
+    pub fn restore_needle_atomic(
+        &self,
+        needle_id: &NeedleId,
+        _volume_size: u64,
+    ) -> Result<Option<NeedleInfo>> {
+        let key = needle_id.0.to_be_bytes();
+
+        // 从 deleted CF 读取
+        let data = self
+            .db
+            .get_cf(self.cf_deleted(), key)
+            .map_err(|e| PowerFsError::Internal(format!("RocksDB get deleted failed: {}", e)))?;
+
+        if let Some(bytes) = data {
+            let mut info: NeedleInfo = serde_json::from_slice(&bytes).map_err(|e| {
+                PowerFsError::Internal(format!("Deserialize deleted needle failed: {}", e))
+            })?;
+
+            let now_ts = Utc::now().timestamp();
+            let mut batch = WriteBatch::default();
+
+            // 清除删除标记，放回 needles CF
+            info.deleted_at = None;
+            info.delete_retention_until = None;
+            let needle_data = serde_json::to_vec(&info)
+                .map_err(|e| PowerFsError::Internal(format!("Serialize needle failed: {}", e)))?;
+            batch.put_cf(self.cf_needles(), key, needle_data);
+
+            // 从 deleted CF 移除
+            batch.delete_cf(self.cf_deleted(), key);
+
+            // 更新分配状态
+            let mut stats = self.get_allocation()?;
+            stats.active_count += 1;
+            stats.deleted_count = stats.deleted_count.saturating_sub(1);
+            stats.last_modified_at = now_ts;
+
+            let alloc_data = serde_json::to_vec(&stats).map_err(|e| {
+                PowerFsError::Internal(format!("Serialize allocation failed: {}", e))
+            })?;
+            batch.put_cf(self.cf_allocation(), KEY_ALLOCATION, alloc_data);
+
+            self.db.write(batch).map_err(|e| {
+                PowerFsError::Internal(format!("RocksDB atomic restore failed: {}", e))
+            })?;
+
+            debug!(
+                "Atomic restore: needle={}, active={}, deleted={}",
+                needle_id.0, stats.active_count, stats.deleted_count
+            );
+
+            Ok(Some(info))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Compact 后清理 deleted CF 并更新分配状态，返回更新后的 AllocationStats
+    pub fn compact_cleanup(&self, freed_bytes: u64, volume_size: u64) -> Result<AllocationStats> {
         let mut batch = WriteBatch::default();
 
         // 清空 deleted CF
         let deleted_items = self.list_deleted()?;
         for (id, _) in &deleted_items {
-            let key = id.to_be_bytes();
-            batch.delete_cf(self.cf_deleted(), &key);
+            let key = id.0.to_be_bytes();
+            batch.delete_cf(self.cf_deleted(), key);
         }
 
         // 更新分配状态
@@ -371,9 +471,9 @@ impl VolumeMetadata {
             .map_err(|e| PowerFsError::Internal(format!("Serialize allocation failed: {}", e)))?;
         batch.put_cf(self.cf_allocation(), KEY_ALLOCATION, alloc_data);
 
-        self.db
-            .write(batch)
-            .map_err(|e| PowerFsError::Internal(format!("RocksDB compact cleanup failed: {}", e)))?;
+        self.db.write(batch).map_err(|e| {
+            PowerFsError::Internal(format!("RocksDB compact cleanup failed: {}", e))
+        })?;
 
         info!(
             "Compact cleanup: freed={} bytes, {} deleted needles removed, used={}, free={}",
@@ -383,7 +483,7 @@ impl VolumeMetadata {
             stats.free_bytes
         );
 
-        Ok(())
+        Ok(stats)
     }
 
     /// 创建 RocksDB Checkpoint（L2 快照）
@@ -432,14 +532,10 @@ impl VolumeMetadata {
             return Ok(0);
         }
 
-        let mut file = std::fs::File::open(data_path).map_err(|e| {
-            PowerFsError::Internal(format!("Failed to open data file: {}", e))
-        })?;
+        let mut file = std::fs::File::open(data_path)
+            .map_err(|e| PowerFsError::Internal(format!("Failed to open data file: {}", e)))?;
 
-        let file_size = file
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         if file_size == 0 {
             warn!("Data file is empty, nothing to rebuild");
@@ -525,6 +621,79 @@ impl Drop for VolumeMetadata {
     fn drop(&mut self) {
         // RocksDB 在 Arc 引用计数归零时自动关闭
         debug!("VolumeMetadata dropped");
+    }
+}
+
+// ===== NeedleIndex trait 实现 =====
+
+use crate::index::NeedleIndex;
+
+impl NeedleIndex for VolumeMetadata {
+    fn get(&self, needle_id: &NeedleId) -> Option<NeedleInfo> {
+        match self.get_needle(needle_id) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!("NeedleIndex::get failed for needle {}: {}", needle_id.0, e);
+                None
+            }
+        }
+    }
+
+    fn insert(&self, needle_id: NeedleId, info: NeedleInfo) {
+        debug_assert_eq!(needle_id.0, info.id.0, "needle_id mismatch in insert");
+        if let Err(e) = self.put_needle(&info) {
+            warn!(
+                "NeedleIndex::insert failed for needle {}: {}",
+                needle_id.0, e
+            );
+        }
+    }
+
+    fn remove(&self, needle_id: &NeedleId) -> Option<NeedleInfo> {
+        match self.delete_needle(needle_id) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(
+                    "NeedleIndex::remove failed for needle {}: {}",
+                    needle_id.0, e
+                );
+                None
+            }
+        }
+    }
+
+    fn contains(&self, needle_id: &NeedleId) -> bool {
+        match self.get_needle(needle_id) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(
+                    "NeedleIndex::contains failed for needle {}: {}",
+                    needle_id.0, e
+                );
+                false
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self.needle_count() {
+            Ok(count) => count as usize,
+            Err(e) => {
+                warn!("NeedleIndex::len failed: {}", e);
+                0
+            }
+        }
+    }
+
+    fn iter(&self) -> Vec<(NeedleId, NeedleInfo)> {
+        match self.list_needles() {
+            Ok(list) => list,
+            Err(e) => {
+                warn!("NeedleIndex::iter failed: {}", e);
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -633,7 +802,9 @@ mod tests {
         meta.write_needle_atomic(&info, 120, volume_size).unwrap();
 
         // 删除
-        let deleted = meta.delete_needle_atomic(&NeedleId(1), volume_size).unwrap();
+        let deleted = meta
+            .delete_needle_atomic(&NeedleId(1), volume_size)
+            .unwrap();
         assert!(deleted.is_some());
 
         // needles CF 中应不存在

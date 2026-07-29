@@ -20,7 +20,7 @@ fi
 echo ""
 echo "[2/5] Checking Master nodes..."
 MASTER_COUNT=0
-for port in 9333 9334 9335; do
+for port in 9333 9336 9337; do
     if nc -z localhost $port >/dev/null 2>&1; then
         echo "  [OK] Master $port is healthy"
         MASTER_COUNT=$((MASTER_COUNT + 1))

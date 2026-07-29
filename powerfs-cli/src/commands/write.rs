@@ -7,7 +7,7 @@ pub struct WriteArgs {
     volume_server: String,
 
     #[arg(short = 'i', long)]
-    volume_id: u32,
+    volume_id: u64,
 
     #[arg(long)]
     file_key: u64,

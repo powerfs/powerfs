@@ -1,0 +1,59 @@
+# PowerFS Filer 节点配置 - 节点1
+[global]
+log_level = "info"
+redis_url = "redis://172.20.0.50:6379"
+
+[master]
+port = 9333
+net_port = 9334
+dir = "/data/master"
+raft_id = 1
+peers = []
+
+[volume]
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data/volume"
+master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
+node_id = "volume-server-1"
+max_volume_size = 10737418240
+initial_volume_count = 4
+
+[filer]
+port = 8888                    # HTTP端口
+grpc_port = 8889               # gRPC端口
+net_port = 9334                # powerfs-net端口
+master_addresses = ["172.20.0.11:9333"]
+data_dir = "/data/filer"
+shard_count = 2
+raft_id = 1
+raft_peers = ["172.20.0.35:8889", "172.20.0.36:8889"]
+
+[s3]
+port = 9000
+master_address = "172.20.0.11:9333"
+dir = "/data/s3"
+access_key = "powerfs"
+secret_key = "powerfs123"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["172.20.0.11"]
+filer_addresses = ["172.20.0.35"]
+volume_addresses = ["172.20.0.21", "172.20.0.22", "172.20.0.23"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9334
+collection = "default"
+replication = "000"
+threads = 8
+verbose = false
+container = false
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://172.20.0.50:6379"
+s3_endpoint = "http://172.20.0.32:9000"
+s3_backend_endpoint = "http://172.20.0.32:9000"
+master_endpoint = "http://172.20.0.11:9333"

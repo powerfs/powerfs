@@ -48,7 +48,7 @@ impl VolumeClientPool {
     pub async fn create_volume_with_retry(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         size: u64,
         max_retries: u32,
         retry_delay: std::time::Duration,
@@ -111,7 +111,7 @@ impl VolumeClientPool {
     pub async fn write_needle(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         data: &[u8],
     ) -> Result<(), String> {
@@ -148,7 +148,7 @@ impl VolumeClientPool {
     pub async fn read_needle(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> Result<Vec<u8>, String> {
         let channel = match self.get_or_create_channel(address).await {
@@ -182,7 +182,7 @@ impl VolumeClientPool {
     pub async fn delete_needle(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> Result<(), String> {
         let channel = match self.get_or_create_channel(address).await {
@@ -216,7 +216,7 @@ impl VolumeClientPool {
     pub async fn restore_needle(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> Result<(), String> {
         let channel = match self.get_or_create_channel(address).await {
@@ -250,7 +250,7 @@ impl VolumeClientPool {
     pub async fn worm_lock(
         &self,
         address: &str,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         retention_days: i64,
     ) -> Result<String, String> {

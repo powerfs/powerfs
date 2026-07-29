@@ -4,7 +4,7 @@ use powerfs_core::storage_backend::LocalFsBackend;
 use powerfs_core::volume::Volume;
 use std::sync::Arc;
 
-fn create_test_volume(vol_id: u32, size: u64) -> (tempfile::TempDir, Volume) {
+fn create_test_volume(vol_id: u64, size: u64) -> (tempfile::TempDir, Volume) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
     let backend = Arc::new(
@@ -378,10 +378,11 @@ fn test_volume_scrub_skips_deleted() {
     volume.write_needle(2, Bytes::from("delete this")).unwrap();
     volume.delete_needle(&NeedleId(2)).unwrap();
 
+    // 硬删除策略：已删除 needle 从 needles CF 移除，scrub 只看到活跃 needle
     let result = volume.scrub_volume();
     assert_eq!(result.total, 1);
     assert_eq!(result.verified, 1);
-    assert_eq!(result.skipped, 1);
+    assert_eq!(result.skipped, 0); // 硬删除后 deleted needle 不在 needles CF
     assert_eq!(result.corrupted, 0);
 }
 

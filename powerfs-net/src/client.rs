@@ -3,8 +3,7 @@
 //! Provides a client that connects to PowerFS servers using the
 //! powerfs-net binary protocol.
 
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,12 +76,19 @@ impl PowerFsNetClient {
             return Ok(());
         }
 
-        let addr_str = format!("{}:{}", self.config.addr, self.config.port);
-        let addr: SocketAddr = addr_str
-            .to_socket_addrs()
-            .map_err(|e| NetError::Connection(format!("invalid address: {}", e)))?
-            .next()
-            .ok_or_else(|| NetError::Connection("no addresses resolved".into()))?;
+        // Fast path: if addr is already an IP, construct SocketAddr directly (no DNS)
+        let addr: SocketAddr = match self.config.addr.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, self.config.port),
+            Err(_) => {
+                // Hostname: use DNS resolution
+                let addr_str = format!("{}:{}", self.config.addr, self.config.port);
+                addr_str
+                    .to_socket_addrs()
+                    .map_err(|e| NetError::Connection(format!("DNS resolution failed: {}", e)))?
+                    .next()
+                    .ok_or_else(|| NetError::Connection("no addresses resolved".into()))?
+            }
+        };
 
         info!("Connecting to {}:{}", self.config.addr, self.config.port);
 

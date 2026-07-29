@@ -6,10 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::circuit_breaker::CircuitBreaker;
 use crate::client_error::{ClientError, ClientResult};
-use crate::net_client::PowerFuseNetClient;
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
+use powerfs_net::{ClientConfig, PowerFsNetClient};
 
 /// 根据 RequestKind 获取默认 MsgType
 pub(crate) fn default_msg_type_for_kind(kind: RequestKind) -> powerfs_net::MsgType {
@@ -230,8 +230,8 @@ pub struct MetaShardClient {
     breaker: Arc<CircuitBreaker>,
     /// 拓扑管理器引用
     topology_manager: Arc<ClusterTopologyManager>,
-    /// 网络客户端 (可选，用于真实网络发送)
-    net_client: Option<Arc<PowerFuseNetClient>>,
+    /// Filer 连接池 (addr -> PowerFsNetClient)
+    filer_connections: Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
     /// 请求完成监听器
     listeners: Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     /// 后台处理是否在运行
@@ -241,7 +241,7 @@ pub struct MetaShardClient {
     /// 事件通知器（替代 10ms 轮询）
     notify: Arc<tokio::sync::Notify>,
     /// 默认 Filer 地址（当 shard_id 不在路由表中时回退使用，例如 inode 作为 shard_id 时）
-    default_filer_addr: std::sync::Mutex<String>,
+    default_filer_addr: Arc<Mutex<String>>,
 }
 
 impl MetaShardClient {
@@ -260,12 +260,54 @@ impl MetaShardClient {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             config,
             topology_manager,
-            net_client: None,
+            filer_connections: Arc::new(Mutex::new(HashMap::new())),
             listeners: Arc::new(Mutex::new(Vec::new())),
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
-            default_filer_addr: std::sync::Mutex::new(String::new()),
+            default_filer_addr: Arc::new(Mutex::new(String::new())),
         }
+    }
+
+    /// 获取或创建到指定 filer 地址的连接
+    async fn get_or_create_filer_client(&self, addr: &str) -> ClientResult<Arc<PowerFsNetClient>> {
+        // 先检查是否已有连接
+        {
+            let connections = self.filer_connections.lock().unwrap();
+            if let Some(client) = connections.get(addr) {
+                if client.is_connected() {
+                    return Ok(client.clone());
+                }
+            }
+        }
+
+        // 创建新连接
+        let (host, port) = parse_addr(addr)?;
+        let client_config = ClientConfig {
+            addr: host,
+            port,
+            client_id: 0,
+            client_type: powerfs_net::ClientType::Fuse,
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(30),
+            max_inflight_requests: 256,
+        };
+
+        let client = Arc::new(PowerFsNetClient::new(client_config));
+        client
+            .connect()
+            .await
+            .map_err(ClientError::from_net_error)?;
+
+        // 保存到连接池
+        {
+            let mut connections = self.filer_connections.lock().unwrap();
+            connections.insert(addr.to_string(), client.clone());
+        }
+
+        Ok(client)
     }
 
     /// 添加请求完成监听器
@@ -378,12 +420,13 @@ impl MetaShardClient {
         let shard_router = self.shard_router.clone();
         let breaker = self.breaker.clone();
         let topology_manager = self.topology_manager.clone();
-        let net_client = self.net_client.clone();
+        let filer_connections = self.filer_connections.clone();
         let listeners = self.listeners.clone();
         let background_running = self.background_running.clone();
         let state = self.state.clone();
         let response_waiters = self.response_waiters.clone();
         let notify = self.notify.clone();
+        let default_filer_addr = self.default_filer_addr.clone();
 
         tokio::spawn(async move {
             log::info!("MetaShardClient: Background processor started");
@@ -411,7 +454,8 @@ impl MetaShardClient {
                     &data_channel,
                     &control_channel,
                     &breaker,
-                    &net_client,
+                    &filer_connections,
+                    &default_filer_addr,
                     &shard_router,
                     &topology_manager,
                     &listeners,
@@ -441,14 +485,14 @@ impl MetaShardClient {
         log::info!("MetaShardClient: Stopping background processor...");
     }
 
-    /// 设置网络客户端
-    pub fn set_net_client(&mut self, client: Arc<PowerFuseNetClient>) {
-        self.net_client = Some(client);
+    /// 设置默认 filer 地址（用于初始化连接池和路由）
+    pub fn set_default_filer_addr(&self, addr: String) {
+        *self.default_filer_addr.lock().unwrap() = addr;
     }
 
-    /// 获取网络客户端引用
-    pub fn net_client(&self) -> Option<&Arc<PowerFuseNetClient>> {
-        self.net_client.as_ref()
+    /// 获取默认 filer 地址
+    pub fn default_filer_addr(&self) -> String {
+        self.default_filer_addr.lock().unwrap().clone()
     }
 
     /// 初始化客户端
@@ -472,14 +516,8 @@ impl MetaShardClient {
 
     /// 设置默认分片路由 - 将 filer leader 地址设为所有分片的默认目标
     fn setup_default_routes(&self) {
-        // 从 net_client 获取 filer leader 地址
-        let default_addr = {
-            if let Some(nc) = &self.net_client {
-                nc.filer_leader_addr()
-            } else {
-                String::new()
-            }
-        };
+        // 使用默认 filer 地址
+        let default_addr = self.default_filer_addr();
 
         if default_addr.is_empty() {
             log::warn!("MetaShardClient: no filer leader address available for default routes");
@@ -745,6 +783,7 @@ impl MetaShardClient {
         let kind = req.context.kind;
         let msg_type = req.context.msg_type;
         let body = req.context.payload.clone();
+        let shard_id = req.shard_id;
 
         // 检查熔断器
         if !self.breaker.is_available() {
@@ -753,19 +792,29 @@ impl MetaShardClient {
             return result;
         }
 
-        // 检查网络客户端是否可用
-        let net_client = self.net_client.as_ref().ok_or_else(|| {
-            let err = ClientError::NoNetworkClient;
-            self.resolve_waiter(&request_id, Err(err.clone()));
-            err
-        })?;
+        // 获取分片 Leader 地址，或使用默认地址
+        let leader_addr = {
+            let router = self.shard_router.read().unwrap();
+            router
+                .get(&shard_id)
+                .map(|s| s.leader_addr.clone())
+                .unwrap_or_else(|| self.default_filer_addr())
+        };
 
-        // 获取分片 Leader
-        let _leader = self.get_shard_leader(req.shard_id).ok_or_else(|| {
-            let err = ClientError::NoShardLeader(req.shard_id);
+        if leader_addr.is_empty() {
+            let err = ClientError::NoShardLeader(shard_id);
             self.resolve_waiter(&request_id, Err(err.clone()));
-            err
-        })?;
+            return Err(err);
+        }
+
+        // 获取或创建到该 leader 的连接
+        let filer_client = self
+            .get_or_create_filer_client(&leader_addr)
+            .await
+            .map_err(|e| {
+                self.resolve_waiter(&request_id, Err(e.clone()));
+                e
+            })?;
 
         // 从 context 获取 MsgType，若无效则回退到默认值
         let resolved_msg_type = powerfs_net::MsgType::from_u16(msg_type)
@@ -773,40 +822,8 @@ impl MetaShardClient {
 
         // 发送请求
         let result = match kind {
-            RequestKind::Metadata => {
-                let msg = net_client
-                    .filer_client()
-                    .send_request(resolved_msg_type, &body, &[])
-                    .await;
-
-                match msg {
-                    Ok(resp) => {
-                        log::debug!("MetaShardClient: response: is_ok={}, status={}, is_response={}, body_len={}, data_len={}",
-                            resp.is_ok(), resp.header.status, resp.is_response(), resp.body.len(), resp.data.len());
-                        if resp.is_ok() {
-                            self.breaker.record_success();
-                            Ok(RequestResult::success_with_payload(
-                                request_id.clone(),
-                                resp.body,
-                                resp.data,
-                            ))
-                        } else {
-                            self.breaker.record_failure();
-                            Err(ClientError::Server(format!(
-                                "Server error: {}",
-                                resp.header.status
-                            )))
-                        }
-                    }
-                    Err(e) => {
-                        self.breaker.record_failure();
-                        Err(ClientError::from_net_error(e))
-                    }
-                }
-            }
-            RequestKind::Control => {
-                let msg = net_client
-                    .filer_client()
+            RequestKind::Metadata | RequestKind::Control => {
+                let msg = filer_client
                     .send_request(resolved_msg_type, &body, &[])
                     .await;
 
@@ -889,7 +906,8 @@ async fn process_available_requests(
     data_channel: &Arc<TransportChannel>,
     control_channel: &Arc<TransportChannel>,
     breaker: &Arc<CircuitBreaker>,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    default_filer_addr: &Arc<Mutex<String>>,
     shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
     topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
@@ -907,7 +925,8 @@ async fn process_available_requests(
             let request_id = req.context.request_id.clone();
             let result = process_request_internal(
                 req,
-                net_client,
+                filer_connections,
+                default_filer_addr,
                 breaker,
                 data_channel,
                 control_channel,
@@ -944,7 +963,8 @@ async fn process_available_requests(
             let request_id = req.context.request_id.clone();
             let result = process_request_internal(
                 req,
-                net_client,
+                filer_connections,
+                default_filer_addr,
                 breaker,
                 data_channel,
                 control_channel,
@@ -975,7 +995,8 @@ async fn process_available_requests(
 /// 内部请求处理逻辑（供后台处理器使用）
 async fn process_request_internal(
     req: PendingRequest,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    default_filer_addr: &Arc<Mutex<String>>,
     breaker: &Arc<CircuitBreaker>,
     _data_channel: &Arc<TransportChannel>,
     _control_channel: &Arc<TransportChannel>,
@@ -993,9 +1014,6 @@ async fn process_request_internal(
         return Err(ClientError::CircuitOpen);
     }
 
-    // 检查网络客户端是否可用
-    let nc = net_client.as_ref().ok_or(ClientError::NoNetworkClient)?;
-
     // 从 context 获取 MsgType
     let resolved_msg_type =
         powerfs_net::MsgType::from_u16(msg_type).unwrap_or_else(|| default_msg_type_for_kind(kind));
@@ -1010,23 +1028,27 @@ async fn process_request_internal(
     const MAX_ATTEMPTS: u32 = 2;
     let mut attempt: u32 = 0;
 
+    // 获取默认 filer 地址作为回退
+    let fallback_addr = default_filer_addr.lock().unwrap().clone();
+
     loop {
         attempt += 1;
 
-        // 1) 获取当前分片的 leader 地址
+        // 1) 获取当前分片的 leader 地址，或使用默认地址
         let leader_addr = {
             let router = shard_router.read().unwrap();
             router
                 .get(&shard_id)
                 .map(|s| s.leader_addr.clone())
-                .ok_or(ClientError::NoShardLeader(shard_id))?
+                .unwrap_or_else(|| fallback_addr.clone())
         };
 
+        if leader_addr.is_empty() {
+            return Err(ClientError::NoShardLeader(shard_id));
+        }
+
         // 2) 获取或创建到该 leader 的连接
-        let filer_client = nc
-            .get_filer_client(&leader_addr)
-            .await
-            .map_err(ClientError::from_net_error)?;
+        let filer_client = get_or_create_filer_client(filer_connections, &leader_addr).await?;
 
         // 3) 发送请求
         let send_result = filer_client
@@ -1094,6 +1116,67 @@ async fn process_request_internal(
                 return Err(ClientError::from_net_error(e));
             }
         }
+    }
+}
+
+/// 获取或创建到指定地址的 filer 连接（自由函数版本，供后台处理器使用）
+async fn get_or_create_filer_client(
+    connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    addr: &str,
+) -> ClientResult<Arc<PowerFsNetClient>> {
+    // 先检查是否已有连接
+    {
+        let conns = connections.lock().unwrap();
+        if let Some(client) = conns.get(addr) {
+            if client.is_connected() {
+                return Ok(client.clone());
+            }
+        }
+    }
+
+    // 解析地址
+    let (host, port) = parse_addr(addr)?;
+
+    // 创建新连接
+    let client_config = ClientConfig {
+        addr: host,
+        port,
+        client_id: 0,
+        client_type: powerfs_net::ClientType::Fuse,
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        max_retries: 3,
+        retry_delay: Duration::from_millis(100),
+        heartbeat_interval: Duration::from_secs(30),
+        max_inflight_requests: 256,
+    };
+
+    let client = Arc::new(PowerFsNetClient::new(client_config));
+    client
+        .connect()
+        .await
+        .map_err(ClientError::from_net_error)?;
+
+    // 保存到连接池
+    {
+        let mut conns = connections.lock().unwrap();
+        conns.insert(addr.to_string(), client.clone());
+    }
+
+    Ok(client)
+}
+
+/// 解析地址字符串为 (host, port)
+fn parse_addr(addr: &str) -> ClientResult<(String, u16)> {
+    let parts: Vec<&str> = addr.split(':').collect();
+    if parts.len() == 2 {
+        let host = parts[0].to_string();
+        let port = parts[1]
+            .parse::<u16>()
+            .map_err(|_| ClientError::InvalidAddress(addr.to_string()))?;
+        Ok((host, port))
+    } else {
+        Err(ClientError::InvalidAddress(addr.to_string()))
     }
 }
 

@@ -839,7 +839,7 @@ impl MetaShardManager {
         inode: u64,
         shard_id: ShardId,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         cookie: u32,
         offset: u64,
         size: u64,
@@ -1204,7 +1204,7 @@ impl MetaShardManager {
         key: &str,
         size: u64,
         fid: &str,
-        volume_id: u32,
+        volume_id: u64,
         etag: &str,
     ) -> Result<u64, String> {
         let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);

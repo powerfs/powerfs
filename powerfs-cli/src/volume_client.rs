@@ -42,7 +42,7 @@ impl VolumeServerClient {
     #[allow(dead_code)]
     pub async fn create_volume(
         &mut self,
-        volume_id: u32,
+        volume_id: u64,
         size: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut service = self.service().await?;
@@ -58,7 +58,7 @@ impl VolumeServerClient {
 
     pub async fn write_needle(
         &mut self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -85,7 +85,7 @@ impl VolumeServerClient {
 
     pub async fn read_needle(
         &mut self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut service = self.service().await?;
@@ -106,7 +106,7 @@ impl VolumeServerClient {
     #[allow(dead_code)]
     pub async fn delete_needle(
         &mut self,
-        volume_id: u32,
+        volume_id: u64,
         file_key: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut service = self.service().await?;

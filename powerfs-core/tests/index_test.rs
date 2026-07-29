@@ -6,7 +6,7 @@ use powerfs_core::index::{MemoryIndex, NeedleIndex};
 // Helper to create test NeedleInfo
 // ============================================================================
 
-fn make_info(id: u64, vid: u32, size: u32, offset: u64) -> NeedleInfo {
+fn make_info(id: u64, vid: u64, size: u32, offset: u64) -> NeedleInfo {
     NeedleInfo {
         id: NeedleId(id),
         volume_id: VolumeId(vid),

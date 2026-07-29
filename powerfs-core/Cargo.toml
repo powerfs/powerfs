@@ -17,7 +17,6 @@ tokio = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
-sled = { workspace = true }
 async-trait = "0.1"
 blake3 = { workspace = true }
 crossbeam = { workspace = true }

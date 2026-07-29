@@ -87,7 +87,7 @@ pub enum ShardCommand {
         inode: u64,
         size: u64,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         etag: String,
     },
     /// Set inode attributes (size, mode, uid, gid)
@@ -115,7 +115,7 @@ pub enum ShardCommand {
     SetChunks {
         inode: u64,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         cookie: u32,
         offset: u64,
         size: u64,

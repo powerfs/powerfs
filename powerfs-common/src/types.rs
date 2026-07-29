@@ -7,24 +7,32 @@ use std::str::FromStr;
 pub use crate::utils::{Checksum, ChecksumAlgorithm};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct VolumeId(pub u32);
+pub struct VolumeId(pub u64);
 
 impl VolumeId {
-    /// Get the original volume ID (as used by Volume Server)
-    /// Composite ID format: server_idx * 1000 + volume_idx (e.g., 1001 for server-1, volume-1)
-    /// Original ID = volume_idx + 1 = composite_id % 1000
-    pub fn original_id(&self) -> u32 {
-        (self.0 % 1000).max(1) // Ensure at least 1
+    /// 从 UUID v4 派生生成全局唯一的 VolumeId
+    pub fn generate() -> Self {
+        Self(crate::id_generator::IdGenerator::generate_uuid_based())
     }
-    
-    /// Get the server index (0-based) from composite ID
-    pub fn server_idx(&self) -> u32 {
-        self.0 / 1000
+
+    /// 生成带时间戳的雪花 ID（更可读、可排序）
+    pub fn generate_snowflake() -> Self {
+        Self(crate::id_generator::IdGenerator::generate_snowflake())
     }
-    
-    /// Create a composite volume ID from server index and original volume ID
-    pub fn from_server_volume(server_idx: u32, volume_idx: u32) -> Self {
-        VolumeId(server_idx * 1000 + volume_idx)
+
+    /// 从 u32 创建（用于向后兼容或内部索引）
+    pub fn from_u32(v: u32) -> Self {
+        Self(v as u64)
+    }
+
+    /// 转换为 u32（可能截断，仅用于兼容旧接口）
+    pub fn as_u32(&self) -> u32 {
+        self.0 as u32
+    }
+
+    /// 从 u64 直接创建
+    pub fn from_u64(v: u64) -> Self {
+        Self(v)
     }
 }
 
@@ -36,6 +44,12 @@ impl fmt::Display for VolumeId {
 
 impl From<u32> for VolumeId {
     fn from(v: u32) -> Self {
+        VolumeId(v as u64)
+    }
+}
+
+impl From<u64> for VolumeId {
+    fn from(v: u64) -> Self {
         VolumeId(v)
     }
 }
@@ -43,7 +57,7 @@ impl From<u32> for VolumeId {
 impl FromStr for VolumeId {
     type Err = std::num::ParseIntError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(VolumeId(u32::from_str(s)?))
+        Ok(VolumeId(u64::from_str(s)?))
     }
 }
 
@@ -278,7 +292,7 @@ impl Fid {
         let file_key =
             session_id.len() as u64 * 1_000_000 + layer_id as u64 * 1_000 + block_index as u64;
         Fid {
-            volume_id: VolumeId(volume_id),
+            volume_id: VolumeId(volume_id as u64),
             cookie,
             file_key,
         }
@@ -310,6 +324,51 @@ pub enum VolumeState {
     Full,
     ReadOnly,
     Deleting,
+}
+
+/// VolumeRoute: 卷路由信息，支持序列化和地址变更
+/// 用于 Master 维护的全局 volume 路由表
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeRoute {
+    pub volume_id: u64,
+    pub addr: String,
+    pub size: u64,
+    pub used: u64,
+    pub state: VolumeState,
+    pub node_id: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl VolumeRoute {
+    pub fn new(volume_id: u64, addr: String, size: u64, node_id: String) -> Self {
+        Self {
+            volume_id,
+            addr,
+            size,
+            used: 0,
+            state: VolumeState::Available,
+            node_id,
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// 更新卷地址（用于卷迁移/重定位）
+    pub fn update_addr(&mut self, new_addr: String) {
+        self.addr = new_addr;
+        self.updated_at = Utc::now();
+    }
+
+    /// 更新使用空间
+    pub fn update_used(&mut self, used: u64) {
+        self.used = used;
+        self.updated_at = Utc::now();
+    }
+
+    /// 更新状态
+    pub fn update_state(&mut self, state: VolumeState) {
+        self.state = state;
+        self.updated_at = Utc::now();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,7 +436,29 @@ pub struct DataNodeInfo {
 
 impl DataNodeInfo {
     pub fn url(&self) -> String {
-        format!("{}:{}", self.address, self.http_port)
+        let addr = if self.address.contains(':') {
+            // Address already contains port (grpc_address:port format), strip it
+            self.address
+                .split(':')
+                .next()
+                .unwrap_or(&self.address)
+                .to_string()
+        } else {
+            self.address.clone()
+        };
+        let result = if self.http_port > 0 {
+            format!("{}:{}", addr, self.http_port)
+        } else {
+            addr.clone()
+        };
+        log::debug!(
+            "DataNodeInfo::url: address={}, http_port={}, grpc_port={}, result={}",
+            self.address,
+            self.http_port,
+            self.grpc_port,
+            result
+        );
+        result
     }
 
     pub fn new(

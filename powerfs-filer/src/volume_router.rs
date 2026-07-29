@@ -11,14 +11,14 @@ impl VolumeRouter {
         Self { metadata_store }
     }
 
-    pub async fn get_server_addr(&self, volume_id: u32) -> Option<String> {
+    pub async fn get_server_addr(&self, volume_id: u64) -> Option<String> {
         self.metadata_store
             .get_volume_route(volume_id)
             .await
             .map(|r| r.server_addr)
     }
 
-    pub async fn get_volume_route(&self, volume_id: u32) -> Option<VolumeRoute> {
+    pub async fn get_volume_route(&self, volume_id: u64) -> Option<VolumeRoute> {
         self.metadata_store.get_volume_route(volume_id).await
     }
 
@@ -28,14 +28,14 @@ impl VolumeRouter {
             .await
     }
 
-    pub async fn invalidate_volume_cache(&self, volume_id: u32) {
+    pub async fn invalidate_volume_cache(&self, volume_id: u64) {
         self.metadata_store.delete_volume_route(volume_id).await;
     }
 
     pub async fn get_all_volume_routes(&self) -> Vec<VolumeRoute> {
         let mut routes = Vec::new();
         for i in 1..=1000 {
-            if let Some(route) = self.metadata_store.get_volume_route(i).await {
+            if let Some(route) = self.metadata_store.get_volume_route(i as u64).await {
                 routes.push(route);
             }
         }

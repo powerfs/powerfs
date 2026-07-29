@@ -23,7 +23,7 @@ impl VolumeNetHandler {
         session_client_id: u64,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
@@ -126,7 +126,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
 
         info!(
@@ -189,7 +189,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
 
         info!(
@@ -253,7 +253,7 @@ impl VolumeNetHandler {
         session_client_id: u64,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
         let entries = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
@@ -357,7 +357,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
         let offset = dec.next_u64(FieldId::Offset).unwrap_or(0) as i64;
         let size = dec.next_u64(FieldId::Size).unwrap_or(0);
@@ -472,6 +472,34 @@ impl VolumeNetHandler {
         Self::build_response(msg, STATUS_OK, response_bytes, Vec::new())
     }
 
+    /// 处理 StatFs 请求：返回本 Volume 的容量统计
+    fn handle_statfs(&self, msg: &NetMessage) -> NetMessage {
+        info!("NET_STATFS: handling statfs request");
+
+        let storage = &self.volume_server.storage_manager;
+        let total_space = storage.total_space();
+        let used_space = storage.used_space();
+        let free_space = storage.free_space();
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Size, total_space);
+        enc.add_u64(FieldId::Blocks, used_space);
+        enc.add_u64(FieldId::Blksize, free_space);
+        enc.add_u64(FieldId::Count, storage.volume_count() as u64);
+
+        let body = enc.into_bytes();
+
+        info!(
+            "NET_STATFS: total={}, used={}, free={}, volumes={}",
+            total_space,
+            used_space,
+            free_space,
+            storage.volume_count()
+        );
+
+        Self::build_response(msg, STATUS_OK, body, Vec::new())
+    }
+
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         let flags = FrameFlags::new(FrameFlags::RESPONSE);
         let header = powerfs_net::FrameHeader::new(
@@ -516,6 +544,7 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
+            MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -572,6 +601,7 @@ impl ServerRequestHandler for VolumeNetHandler {
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
+            MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

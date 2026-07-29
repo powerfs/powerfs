@@ -77,7 +77,9 @@ impl FuseApp {
         let master_full = self
             .master_addresses
             .first()
-            .unwrap_or(&"127.0.0.1".to_string())
+            .ok_or_else(|| {
+                PowerFsError::Internal("master_addresses is empty (must be configured)".to_string())
+            })?
             .clone();
         let master_addr = {
             let without_proto = master_full
@@ -87,34 +89,14 @@ impl FuseApp {
             without_proto
                 .split(':')
                 .next()
-                .unwrap_or("127.0.0.1")
+                .ok_or_else(|| {
+                    PowerFsError::Internal(format!(
+                        "Cannot parse host from master address: {}",
+                        master_full
+                    ))
+                })?
                 .to_string()
         };
-
-        let net_config = powerfs_fuse_core::net_client::NetClientConfig {
-            master_addr: master_addr.clone(),
-            master_net_port: self.master_net_port,
-            volume_net_port: self.volume_net_port,
-            volume_addrs: self.volume_addrs.clone(),
-            filer_addr: self.filer_addr.clone(),
-            filer_net_port: self.filer_net_port,
-            client_id: 0,
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(30),
-        };
-
-        let net_client = Arc::new(
-            powerfs_fuse_core::PowerFuseNetClient::new(net_config)
-                .await
-                .map_err(|e| {
-                    PowerFsError::Internal(format!("Failed to connect to powerfs-net: {}", e))
-                })?,
-        );
-
-        info!(
-            "Connected to powerfs-net: Master={}:{}, Filer={}:{}",
-            master_addr, self.master_net_port, self.filer_addr, self.filer_net_port
-        );
 
         let facade_config = powerfs_fuse_core::FuseClientFacadeConfig {
             master_addr: master_addr.clone(),
@@ -128,7 +110,7 @@ impl FuseApp {
         };
 
         let facade = Arc::new(
-            powerfs_fuse_core::FuseClientFacade::build_from_net_client(facade_config, net_client)
+            powerfs_fuse_core::FuseClientFacade::build_from_config(facade_config)
                 .await
                 .map_err(|e| {
                     PowerFsError::Internal(format!("Failed to build FuseClientFacade: {}", e))
@@ -338,15 +320,15 @@ impl PowerFsFs {
             .fid
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
 
-        let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-            error!("lookup_volume failed: {}", e);
-            std::io::Error::from_raw_os_error(libc::EIO)
-        })?;
+        // Use cached volume address
+        let addr = self
+            .client
+            .get_volume_addr(fid.volume_id.0 as u64)
+            .map_err(|e| {
+                error!("get_volume_addr failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
-        let loc = locations
-            .first()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
         let chunk_size = self.chunk_cache.chunk_size();
 
         let mut chunks = Vec::new();
@@ -546,6 +528,35 @@ impl PowerFsFs {
             generation: entry.generation,
         }
     }
+
+    /// 解析路径到 inode，优先缓存，然后查 Filer
+    pub fn resolve_path_inode(&self, path: &str) -> Option<u64> {
+        if path.is_empty() || path == "/" {
+            return Some(ROOT_INODE);
+        }
+
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut current: u64 = ROOT_INODE;
+
+        for part in &parts {
+            // Try cache first
+            if let Some(entry) = self.cache.lookup_in_cache(current, part) {
+                current = entry.inode;
+                continue;
+            }
+            // Try filer
+            match self.client.get_entry_by_parent(current, part) {
+                Ok(Some(entry)) => {
+                    // Cache it
+                    let cached = self.entry_to_cached(current, &entry);
+                    self.cache.insert(cached.clone());
+                    current = cached.inode;
+                }
+                _ => return None,
+            }
+        }
+        Some(current)
+    }
 }
 
 impl FileSystem for PowerFsFs {
@@ -556,7 +567,8 @@ impl FileSystem for PowerFsFs {
         &self,
         _capable: fuse_backend_rs::api::filesystem::FsOptions,
     ) -> std::io::Result<fuse_backend_rs::api::filesystem::FsOptions> {
-        Ok(fuse_backend_rs::api::filesystem::FsOptions::WRITEBACK_CACHE)
+        // Disable WRITEBACK_CACHE for immediate metadata sync across clients
+        Ok(fuse_backend_rs::api::filesystem::FsOptions::empty())
     }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {
@@ -567,21 +579,13 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
-        let parent_path = self
-            .cache
-            .inode_to_path(parent)
-            .unwrap_or_else(|| "/".to_string());
-        let lookup_path = if parent_path == "/" {
-            format!("/{}", name_str)
-        } else {
-            format!("{}/{}", parent_path, name_str)
-        };
-
-        match self.client.get_entry(&lookup_path) {
+        // 使用 parent_ino 直接查询，避免路径解析错误
+        match self.client.get_entry_by_parent(parent, name_str) {
             Ok(Some(entry)) => {
                 info!(
-                    "lookup found entry: path={}, chunks={}, content_size={}",
-                    lookup_path,
+                    "lookup found entry: parent={}, name={}, chunks={}, content_size={}",
+                    parent,
+                    name_str,
                     entry.chunks.len(),
                     entry.content_size
                 );
@@ -611,9 +615,43 @@ impl FileSystem for PowerFsFs {
         debug!("getattr: inode={}", inode);
 
         if let Some(entry) = self.cache.get_inode(inode) {
-            Ok((self.create_stat(&entry), TTL))
-        } else {
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            return Ok((self.create_stat(&entry), TTL));
+        }
+
+        // Cache miss: 查询 Filer 获取真实属性
+        debug!("getattr: cache miss for inode={}, querying filer", inode);
+        match self.client.get_entry_by_inode(inode) {
+            Ok(Some((filer_entry, path))) => {
+                // Resolve parent inode from the path
+                let parent = if path.is_empty() || path == "/" {
+                    ROOT_INODE
+                } else {
+                    // Get parent path (strip last component)
+                    let parent_path = match path.rfind('/') {
+                        Some(0) => "/".to_string(),
+                        Some(pos) => path[..pos].to_string(),
+                        None => "/".to_string(),
+                    };
+                    // Try to resolve parent inode via lookup chain
+                    self.resolve_path_inode(&parent_path).unwrap_or(ROOT_INODE)
+                };
+
+                let cached = self.entry_to_cached(parent, &filer_entry);
+                self.cache.insert(cached.clone());
+                info!(
+                    "getattr: fetched inode={} from filer, name={}, parent={}",
+                    inode, cached.name, parent
+                );
+                Ok((self.create_stat(&cached), TTL))
+            }
+            Ok(None) => {
+                warn!("getattr: inode={} not found in filer", inode);
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            Err(e) => {
+                warn!("getattr: failed to query filer for inode={}: {}", inode, e);
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
         }
     }
 
@@ -680,7 +718,58 @@ impl FileSystem for PowerFsFs {
             },
         );
 
+        // Persist the updated entry to Filer
         if let Some(updated) = self.cache.get_inode(inode) {
+            let filer_entry = FilerEntry {
+                name: updated.name.clone(),
+                directory: String::new(), // not used in update flow
+                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
+                    ino: updated.inode,
+                    mode: updated.mode,
+                    nlink: 1,
+                    uid: updated.uid,
+                    gid: updated.gid,
+                    rdev: 0,
+                    size: updated.size,
+                    blksize: 4096,
+                    blocks: updated.size.div_ceil(512),
+                    atime: updated.atime as u64,
+                    mtime: updated.mtime as u64,
+                    ctime: updated.ctime as u64,
+                    crtime: chrono::Utc::now().timestamp() as u64,
+                    perm: 0,
+                }),
+                chunks: updated
+                    .chunks
+                    .iter()
+                    .map(|c| powerfs_master::proto::powerfs::FileChunk {
+                        offset: c.offset,
+                        size: c.size,
+                        mtime: c.mtime,
+                        fid: c.fid.clone(),
+                        cookie: c.cookie,
+                        crc32: c.crc32,
+                    })
+                    .collect(),
+                hard_link_id: updated.hard_link_id.clone(),
+                hard_link_counter: updated.hard_link_counter,
+                extended: HashMap::new(),
+                content_size: updated.content_size,
+                disk_size: updated.disk_size,
+                ttl: String::new(),
+                symlink_target: updated.symlink_target.clone().unwrap_or_default(),
+                owner: String::new(),
+                generation: updated.generation,
+            };
+
+            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
+                warn!(
+                    "setattr: failed to persist to filer for inode={}: {}",
+                    inode, e
+                );
+                // Continue anyway - local cache is already updated
+            }
+
             Ok((self.create_stat(&updated), TTL))
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -842,18 +931,14 @@ impl FileSystem for PowerFsFs {
             // Last hard link - delete the actual data and remove all cache entries
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
-                match self.client.lookup_volume(fid.volume_id) {
-                    Ok(locations) => {
-                        if let Some(loc) = locations.first() {
-                            let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
-                            if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key)
-                            {
-                                warn!("Failed to delete remote data: {}", e);
-                            }
+                match self.client.get_volume_addr(fid.volume_id.0 as u64) {
+                    Ok(addr) => {
+                        if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key) {
+                            warn!("Failed to delete remote data: {}", e);
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to lookup volume for deletion: {}", e);
+                        warn!("Failed to get volume addr for deletion: {}", e);
                     }
                 }
             }
@@ -1075,13 +1160,41 @@ impl FileSystem for PowerFsFs {
             .fid
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
 
-        let file_size = entry.size;
-        if offset >= file_size {
+        let chunk_size = self.chunk_cache.chunk_size();
+
+        let file_size = if entry.size > 0 {
+            entry.size
+        } else if !entry.chunks.is_empty() {
+            // Fallback: use chunk info to estimate file size
+            let max_chunk_end = entry
+                .chunks
+                .iter()
+                .map(|c| c.offset + if c.size > 0 { c.size } else { chunk_size })
+                .max()
+                .unwrap_or(0);
+            if max_chunk_end > 0 {
+                log::warn!(
+                    "read: file_size=0, using chunk-based size estimate={}",
+                    max_chunk_end
+                );
+                max_chunk_end
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if offset >= file_size && !entry.chunks.is_empty() {
+            log::warn!(
+                "read: offset >= file_size but chunks exist, proceeding. inode={}",
+                inode
+            );
+        } else if offset >= file_size {
             return Ok(0);
         }
 
         let end_offset = std::cmp::min(offset + size as u64, file_size);
-        let chunk_size = self.chunk_cache.chunk_size();
 
         let start_chunk = self.chunk_cache.get_chunk_index(offset);
         let _end_chunk = self
@@ -1099,23 +1212,24 @@ impl FileSystem for PowerFsFs {
             "read: inode={}, fid={:?}, volume_id={}",
             inode, fid, fid.volume_id
         );
-        let locations = self.client.lookup_volume(fid.volume_id).map_err(|e| {
-            error!(
-                "lookup_volume failed: volume_id={}, error={}",
-                fid.volume_id, e
-            );
-            std::io::Error::from_raw_os_error(libc::EIO)
-        })?;
 
-        let loc = locations
-            .first()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-        let addr = SyncFuseClientFacade::location_to_grpc_addr(loc);
+        // Use cached volume address (only queries Master as fallback)
+        let addr = self
+            .client
+            .get_volume_addr(fid.volume_id.0 as u64)
+            .map_err(|e| {
+                error!(
+                    "get_volume_addr failed: volume_id={}, error={}",
+                    fid.volume_id, e
+                );
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
         for chunk_idx in start_chunk..=prefetch_end_chunk {
             let chunk_offset = chunk_idx * chunk_size;
             if self.chunk_cache.get(inode, chunk_offset).is_none() {
-                let read_size = std::cmp::min(chunk_size, file_size - chunk_offset);
+                let remaining = file_size.saturating_sub(chunk_offset);
+                let read_size = std::cmp::min(chunk_size, remaining);
                 match self.client.read_blob(
                     &addr,
                     fid.volume_id.0,
@@ -1752,17 +1866,48 @@ impl FileSystem for PowerFsFs {
     fn statfs(&self, _ctx: &Context, _inode: Self::Inode) -> std::io::Result<libc::statvfs64> {
         debug!("statfs");
 
+        let stats = match self.client.statfs() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("statfs failed: {}, using defaults", e);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        };
+
+        let block_size: u64 = 4096;
+        let total_blocks = if stats.total_size > 0 {
+            stats.total_size / block_size
+        } else {
+            0
+        };
+        let free_blocks = if stats.free_size > 0 {
+            stats.free_size / block_size
+        } else {
+            0
+        };
+        let bavail = free_blocks;
+
         let mut st: libc::statvfs64 = unsafe { std::mem::zeroed() };
-        st.f_bsize = 4096;
-        st.f_frsize = 4096;
-        let total_blocks: u64 = (1u64 << 40) / 4096;
+        st.f_bsize = block_size as libc::c_ulong;
+        st.f_frsize = block_size as libc::c_ulong;
         st.f_blocks = total_blocks;
-        st.f_bfree = total_blocks * 8 / 10;
-        st.f_bavail = total_blocks * 8 / 10;
+        st.f_bfree = free_blocks;
+        st.f_bavail = bavail;
         st.f_files = 10_000_000;
         st.f_ffree = 9_900_000;
         st.f_favail = 9_900_000;
         st.f_namemax = 255;
+
+        info!(
+            "statfs: total={}, used={}, free={}, volumes={}, blocks={}, bfree={}",
+            stats.total_size,
+            stats.used_size,
+            stats.free_size,
+            stats.volume_count,
+            total_blocks,
+            free_blocks
+        );
+
         Ok(st)
     }
 

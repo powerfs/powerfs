@@ -32,7 +32,7 @@ pub struct InodeInfo {
     #[serde(default)]
     pub fid: Option<String>,
     #[serde(default)]
-    pub volume_id: Option<u32>,
+    pub volume_id: Option<u64>,
     #[serde(default)]
     pub etag: Option<String>,
     // File chunks for data layout (stored in Filer, not Master)
@@ -339,7 +339,10 @@ impl ShardStore {
             it.next();
         }
 
-        info!("Shard {} loaded {} inodes from rocksdb", self.shard_id.0, count);
+        info!(
+            "Shard {} loaded {} inodes from rocksdb",
+            self.shard_id.0, count
+        );
         Ok(())
     }
 
@@ -373,7 +376,11 @@ impl ShardStore {
             it.next();
         }
 
-        info!("Shard {} loaded {} directory entries from rocksdb", self.shard_id.0, dir_entries.len());
+        info!(
+            "Shard {} loaded {} directory entries from rocksdb",
+            self.shard_id.0,
+            dir_entries.len()
+        );
         Ok(())
     }
 
@@ -554,7 +561,7 @@ impl ShardStore {
         inode: u64,
         size: u64,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         etag: String,
     ) {
         let now = chrono::Utc::now().timestamp() as u64;
@@ -858,7 +865,7 @@ impl ShardStore {
         &self,
         inode: u64,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         cookie: u32,
         offset: u64,
         size: u64,

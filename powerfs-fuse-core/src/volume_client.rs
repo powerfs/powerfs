@@ -8,12 +8,11 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::client_error::{ClientError, ClientResult};
 use crate::meta_shard_client::RequestResult;
 use crate::meta_shard_client::{ChannelConfig, PendingRequest, RequestQueue, TransportChannel};
-use crate::net_client::PowerFuseNetClient;
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::serialize::TlvDecoder;
-use powerfs_net::FieldId;
+use powerfs_net::{ClientConfig, FieldId, PowerFsNetClient};
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
@@ -193,8 +192,10 @@ pub struct VolumeClient {
     breaker: Arc<CircuitBreaker>,
     /// 拓扑管理器
     topology_manager: Arc<ClusterTopologyManager>,
-    /// 网络客户端 (可选，用于真实网络发送)
-    net_client: Option<Arc<PowerFuseNetClient>>,
+    /// Volume 连接池 (addr -> PowerFsNetClient)
+    volume_connections: Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    /// 默认 Volume 地址列表
+    default_volume_addrs: Arc<Mutex<Vec<String>>>,
     /// 请求等待者映射 (request_id -> oneshot sender)
     response_waiters: Arc<Mutex<VolumeResponseWaiters>>,
     /// 后台处理器运行状态
@@ -230,18 +231,22 @@ impl VolumeClient {
             notify: Arc::new(tokio::sync::Notify::new()),
             config,
             topology_manager,
-            net_client: None,
+            volume_connections: Arc::new(Mutex::new(HashMap::new())),
+            default_volume_addrs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// 设置网络客户端
-    pub fn set_net_client(&mut self, client: Arc<PowerFuseNetClient>) {
-        self.net_client = Some(client);
+    /// 设置默认 Volume 地址列表
+    pub fn set_default_volume_addrs(&self, addrs: Vec<String>) {
+        *self.default_volume_addrs.lock().unwrap() = addrs;
     }
 
-    /// 获取网络客户端引用
-    pub fn net_client(&self) -> Option<&Arc<PowerFuseNetClient>> {
-        self.net_client.as_ref()
+    /// 获取或创建到指定地址的 volume 连接
+    pub async fn get_or_create_volume_client(
+        &self,
+        addr: &str,
+    ) -> ClientResult<Arc<PowerFsNetClient>> {
+        get_or_create_volume_client_from_pool(&self.volume_connections, addr).await
     }
 
     /// 注册请求等待者
@@ -360,18 +365,10 @@ impl VolumeClient {
 
     /// 设置默认 Volume 路由 - 将已知 volume 地址预填到路由表
     fn setup_default_volume_routes(&self) {
-        // 从 net_client 获取 volume 地址信息
         let volume_addrs: Vec<String> = {
-            if let Some(nc) = &self.net_client {
-                let addrs = nc.volume_addrs();
-                if !addrs.is_empty() {
-                    addrs.to_vec()
-                } else {
-                    // Fallback: 使用 filer 主机作为 volume 路由的基础（filer 通常 co-locate 或代理 volume）
-                    let host = nc.filer_host();
-                    let port = nc.volume_port();
-                    vec![format!("{}:{}", host, port)]
-                }
+            let addrs = self.default_volume_addrs.lock().unwrap();
+            if !addrs.is_empty() {
+                addrs.clone()
             } else {
                 return;
             }
@@ -383,7 +380,6 @@ impl VolumeClient {
         );
 
         let mut router = self.volume_router.write().unwrap();
-        // 预填 volume 路由
         for (vol_id, addr) in volume_addrs.iter().enumerate() {
             router.insert(
                 vol_id as u64,
@@ -399,7 +395,16 @@ impl VolumeClient {
     fn sync_volume_router(&self) {
         let topology = self.topology_manager.get_topology();
         let mut router = self.volume_router.write().unwrap();
+        let old_len = router.len();
         *router = topology.volumes.clone();
+        log::info!(
+            "sync_volume_router: updated volume_router from {} to {} entries",
+            old_len,
+            router.len()
+        );
+        for (vid, info) in router.iter() {
+            log::debug!("sync_volume_router: volume_id={}, addr={}", vid, info.addr);
+        }
     }
 
     /// 直接设置 Volume 信息（用于测试或动态路由更新）
@@ -409,6 +414,40 @@ impl VolumeClient {
             volume_id,
             VolumeInfo::new(volume_id, format!("vol-{}", volume_id), addr),
         );
+    }
+
+    /// 解析并更新 Volume 路由：给定 volume_id 和 locations，自动选择第一个地址作为路由
+    /// 若 locations 为空，使用默认 volume 地址列表中的第一个作为回退
+    pub fn resolve_and_set_volume_route(
+        &self,
+        volume_id: u64,
+        locations: &[powerfs_common::traits::Location],
+    ) {
+        if let Some(first) = locations.first() {
+            let url = first.url.clone();
+            if !url.is_empty() {
+                log::debug!("VolumeClient: routing volume={} -> {}", volume_id, url);
+                self.set_volume_info(volume_id, url);
+                return;
+            }
+        }
+
+        // 回退：使用默认 volume 地址
+        let default_addrs = self.default_volume_addrs.lock().unwrap();
+        if let Some(addr) = default_addrs.first() {
+            log::warn!(
+                "VolumeClient: FALLBACK routing volume={} -> {}",
+                volume_id,
+                addr
+            );
+            self.set_volume_info(volume_id, addr.clone());
+        }
+    }
+
+    /// 从默认 volume 地址获取指定 volume 的路由地址
+    pub fn get_default_volume_addr(&self, volume_id: u64) -> Option<String> {
+        let router = self.volume_router.read().unwrap();
+        router.get(&volume_id).map(|v| v.addr.clone())
     }
 
     fn cleanup_expired_leases(&self) {
@@ -432,7 +471,21 @@ impl VolumeClient {
     /// 获取 Volume 信息
     pub fn get_volume(&self, volume_id: u64) -> Option<VolumeInfo> {
         let router = self.volume_router.read().unwrap();
-        router.get(&volume_id).cloned()
+        let result = router.get(&volume_id).cloned();
+        if result.is_some() {
+            log::debug!(
+                "get_volume: found volume_id={}, total_routes={}",
+                volume_id,
+                router.len()
+            );
+        } else {
+            log::debug!(
+                "get_volume: volume_id={} not found in cache, total_routes={}",
+                volume_id,
+                router.len()
+            );
+        }
+        result
     }
 
     /// 获取指定 inode 的 Lease 状态
@@ -770,7 +823,8 @@ impl VolumeClient {
         let lease_channel = self.lease_channel.clone();
         let mgmt_channel = self.mgmt_channel.clone();
         let breaker = self.breaker.clone();
-        let net_client = self.net_client.clone();
+        let volume_connections = self.volume_connections.clone();
+        let default_volume_addrs = self.default_volume_addrs.clone();
         let background_running = self.background_running.clone();
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
@@ -794,6 +848,25 @@ impl VolumeClient {
                     continue;
                 }
 
+                // Debug: 输出通道和队列状态
+                let data_queue_len = data_queue.lock().unwrap().len();
+                let data_channel_states: Vec<String> = data_channels
+                    .iter()
+                    .map(|c| format!("name={}, can_accept={}", c.config.name, c.can_accept()))
+                    .collect();
+                let breaker_state = if breaker.is_available() {
+                    "closed"
+                } else {
+                    "open"
+                };
+                log::debug!(
+                    "VolumeClient: state={:?}, data_queue_len={}, breaker={}, channels={:?}",
+                    current_state,
+                    data_queue_len,
+                    breaker_state,
+                    data_channel_states
+                );
+
                 // 尝试处理请求
                 let processed = process_volume_available_requests(
                     &data_queue,
@@ -803,7 +876,8 @@ impl VolumeClient {
                     &lease_channel,
                     &mgmt_channel,
                     &breaker,
-                    &net_client,
+                    &volume_connections,
+                    &default_volume_addrs,
                     &volume_router,
                     &leases,
                     &response_waiters,
@@ -834,7 +908,8 @@ impl VolumeClient {
     pub async fn process_data_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_data_request_internal(
             req,
-            &self.net_client,
+            &self.volume_connections,
+            &self.default_volume_addrs,
             &self.breaker,
             &self.data_channels,
             &self.volume_router,
@@ -848,7 +923,8 @@ impl VolumeClient {
     pub async fn process_lease_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_lease_request_internal(
             req,
-            &self.net_client,
+            &self.volume_connections,
+            &self.default_volume_addrs,
             &self.breaker,
             &self.lease_channel,
             &self.volume_router,
@@ -861,7 +937,8 @@ impl VolumeClient {
     pub async fn process_mgmt_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_mgmt_request_internal(
             req,
-            &self.net_client,
+            &self.volume_connections,
+            &self.default_volume_addrs,
             &self.breaker,
             &self.mgmt_channel,
             &self.volume_router,
@@ -906,6 +983,60 @@ fn resolve_waiter_for(
     }
 }
 
+/// 从连接池获取或创建到指定地址的 volume 客户端
+async fn get_or_create_volume_client_from_pool(
+    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    addr: &str,
+) -> ClientResult<Arc<PowerFsNetClient>> {
+    // 先检查是否已有连接
+    {
+        let connections = volume_connections.lock().unwrap();
+        if let Some(client) = connections.get(addr) {
+            if client.is_connected() {
+                return Ok(client.clone());
+            }
+        }
+    }
+
+    // 解析地址
+    let parts: Vec<&str> = addr.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ClientError::InvalidAddress(addr.to_string()));
+    }
+    let host = parts[0].to_string();
+    let port = parts[1]
+        .parse::<u16>()
+        .map_err(|_| ClientError::InvalidAddress(addr.to_string()))?;
+
+    // 创建新连接
+    let client_config = ClientConfig {
+        addr: host,
+        port,
+        client_id: 0,
+        client_type: powerfs_net::ClientType::Fuse,
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(10),
+        max_retries: 3,
+        retry_delay: Duration::from_millis(100),
+        heartbeat_interval: Duration::from_secs(30),
+        max_inflight_requests: 256,
+    };
+
+    let client = Arc::new(PowerFsNetClient::new(client_config));
+    client
+        .connect()
+        .await
+        .map_err(ClientError::from_net_error)?;
+
+    // 保存到连接池
+    {
+        let mut connections = volume_connections.lock().unwrap();
+        connections.insert(addr.to_string(), client.clone());
+    }
+
+    Ok(client)
+}
+
 /// 处理 Volume 队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
 async fn process_volume_available_requests(
@@ -916,7 +1047,8 @@ async fn process_volume_available_requests(
     lease_channel: &Arc<TransportChannel>,
     mgmt_channel: &Arc<TransportChannel>,
     breaker: &Arc<CircuitBreaker>,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
     leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
@@ -930,7 +1062,8 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_lease_request_internal(
                 req,
-                net_client,
+                volume_connections,
+                default_volume_addrs,
                 breaker,
                 lease_channel,
                 volume_router,
@@ -950,7 +1083,8 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_mgmt_request_internal(
                 req,
-                net_client,
+                volume_connections,
+                default_volume_addrs,
                 breaker,
                 mgmt_channel,
                 volume_router,
@@ -970,7 +1104,8 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_data_request_internal(
                 req,
-                net_client,
+                volume_connections,
+                default_volume_addrs,
                 breaker,
                 data_channels,
                 volume_router,
@@ -988,7 +1123,8 @@ async fn process_volume_available_requests(
 /// 数据请求处理（自由函数版本）
 async fn process_data_request_internal(
     req: PendingRequest,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breaker: &Arc<CircuitBreaker>,
     _data_channels: &[Arc<TransportChannel>],
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
@@ -1011,12 +1147,6 @@ async fn process_data_request_internal(
         return result;
     }
 
-    let nc = net_client.as_ref().ok_or_else(|| {
-        let err = ClientError::NoNetworkClient;
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
-
     let volume = {
         let router = volume_router.read().unwrap();
         router.get(&req.shard_id).cloned()
@@ -1031,29 +1161,21 @@ async fn process_data_request_internal(
         err
     })?;
 
-    // Parse volume address: split "host:port" into host and port
-    let (volume_host, volume_port) = {
-        let parts: Vec<&str> = volume.addr.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(nc.volume_net_port());
-        (host, port)
-    };
+    // 从 volume.addr 解析主机和端口
+    let volume_addr = volume.addr.clone();
 
     log::debug!(
-        "process_data_request_internal: connecting to volume at {}:{}",
-        volume_host, volume_port
+        "process_data_request_internal: connecting to volume at {}",
+        volume_addr
     );
 
-    let vol_client = nc
-        .get_volume_client(&volume_host, volume_port)
+    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
             log::error!(
-                "process_data_request_internal: failed to get volume client: {}", e
+                "process_data_request_internal: failed to get volume client: {}",
+                e
             );
             resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
             err
@@ -1067,7 +1189,8 @@ async fn process_data_request_internal(
 
     log::debug!(
         "process_data_request_internal: sending request to volume: msg_type={:?}, body_len={}",
-        resolved_msg_type, body.len()
+        resolved_msg_type,
+        body.len()
     );
 
     let result = match kind {
@@ -1098,9 +1221,7 @@ async fn process_data_request_internal(
                     )))
                 }
                 Err(e) => {
-                    log::error!(
-                        "process_data_request_internal: request failed: {}", e
-                    );
+                    log::error!("process_data_request_internal: request failed: {}", e);
                     breaker.record_failure();
                     Err(ClientError::from_net_error(e))
                 }
@@ -1197,7 +1318,8 @@ async fn process_data_request_internal(
 /// Lease 请求处理（自由函数版本）
 async fn process_lease_request_internal(
     req: PendingRequest,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breaker: &Arc<CircuitBreaker>,
     _lease_channel: &Arc<TransportChannel>,
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
@@ -1212,12 +1334,6 @@ async fn process_lease_request_internal(
         return result;
     }
 
-    let nc = net_client.as_ref().ok_or_else(|| {
-        let err = ClientError::NoNetworkClient;
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
-
     let volume = {
         let router = volume_router.read().unwrap();
         router.get(&req.shard_id).cloned()
@@ -1228,19 +1344,9 @@ async fn process_lease_request_internal(
         err
     })?;
 
-    // Parse volume address: split "host:port" into host and port
-    let (volume_host, volume_port) = {
-        let parts: Vec<&str> = volume.addr.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(nc.volume_net_port());
-        (host, port)
-    };
+    let volume_addr = volume.addr.clone();
 
-    let vol_client = nc
-        .get_volume_client(&volume_host, volume_port)
+    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
@@ -1273,7 +1379,8 @@ async fn process_lease_request_internal(
 /// 管理请求处理（自由函数版本）
 async fn process_mgmt_request_internal(
     req: PendingRequest,
-    net_client: &Option<Arc<PowerFuseNetClient>>,
+    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breaker: &Arc<CircuitBreaker>,
     _mgmt_channel: &Arc<TransportChannel>,
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
@@ -1288,12 +1395,6 @@ async fn process_mgmt_request_internal(
         return result;
     }
 
-    let nc = net_client.as_ref().ok_or_else(|| {
-        let err = ClientError::NoNetworkClient;
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
-
     let volume = {
         let router = volume_router.read().unwrap();
         router.get(&req.shard_id).cloned()
@@ -1304,19 +1405,9 @@ async fn process_mgmt_request_internal(
         err
     })?;
 
-    // Parse volume address: split "host:port" into host and port
-    let (volume_host, volume_port) = {
-        let parts: Vec<&str> = volume.addr.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(nc.volume_net_port());
-        (host, port)
-    };
+    let volume_addr = volume.addr.clone();
 
-    let vol_client = nc
-        .get_volume_client(&volume_host, volume_port)
+    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
@@ -1344,6 +1435,145 @@ async fn process_mgmt_request_internal(
 
     resolve_waiter_for(&request_id, final_result.clone(), response_waiters);
     final_result
+}
+
+/// 聚合的文件系统统计信息
+#[derive(Debug, Clone, Default)]
+pub struct FsStats {
+    /// 总容量 (字节)
+    pub total_size: u64,
+    /// 已使用容量 (字节)
+    pub used_size: u64,
+    /// 剩余容量 (字节)
+    pub free_size: u64,
+    /// Volume 数量
+    pub volume_count: u64,
+}
+
+impl VolumeClient {
+    /// 查询所有 Volume 的 statfs 并聚合成集群级统计
+    pub async fn statfs(&self, timeout: Duration) -> ClientResult<FsStats> {
+        let volumes: Vec<(u64, String)> = {
+            let router = self.volume_router.read().unwrap();
+            router
+                .iter()
+                .map(|(vid, info)| (*vid, info.addr.clone()))
+                .collect()
+        };
+
+        if volumes.is_empty() {
+            return Ok(FsStats::default());
+        }
+
+        let mut total_size: u64 = 0;
+        let mut used_size: u64 = 0;
+        let mut free_size: u64 = 0;
+        let mut volume_count: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (volume_id, addr) in &volumes {
+            match self
+                .query_single_volume_statfs(*volume_id, addr, timeout)
+                .await
+            {
+                Ok(stats) => {
+                    total_size += stats.total_size;
+                    used_size += stats.used_size;
+                    free_size += stats.free_size;
+                    volume_count += 1;
+                }
+                Err(e) => {
+                    errors.push(format!("volume {}: {}", volume_id, e));
+                }
+            }
+        }
+
+        if !errors.is_empty() && volume_count == 0 {
+            return Err(ClientError::Internal(format!(
+                "All statfs queries failed: {}",
+                errors.join("; ")
+            )));
+        }
+
+        log::debug!(
+            "statfs aggregated: total={}, used={}, free={}, volumes={}, errors={}",
+            total_size,
+            used_size,
+            free_size,
+            volume_count,
+            errors.len()
+        );
+
+        Ok(FsStats {
+            total_size,
+            used_size,
+            free_size,
+            volume_count,
+        })
+    }
+
+    /// 查询单个 Volume 的 statfs
+    async fn query_single_volume_statfs(
+        &self,
+        volume_id: u64,
+        addr: &str,
+        timeout: Duration,
+    ) -> ClientResult<FsStats> {
+        // 通过 VolumeClient 现有的 get_or_create_volume_client 保证连接复用
+        let _vol_client = self.get_or_create_volume_client(addr).await.map_err(|e| {
+            ClientError::Network(format!("Failed to connect volume {}: {}", volume_id, e))
+        })?;
+
+        let request_id = RequestId::new();
+        let context = RequestContext::new(
+            crate::client_identity::ClientIdentity::new(),
+            RequestKind::Management,
+            powerfs_net::MsgType::StatFs as u16,
+            Vec::new(),
+        )
+        .with_request_id(request_id.clone());
+
+        let (tx, rx) = oneshot::channel();
+        self.register_waiter(request_id.clone(), tx);
+
+        self.submit_management_request(context, volume_id)
+            .map_err(ClientError::Internal)?;
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(response))) => self.decode_statfs_response(&response),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err(ClientError::Cancelled),
+            Err(_) => {
+                let mut waiters = self.response_waiters.lock().unwrap();
+                waiters.remove(&request_id);
+                Err(ClientError::Timeout(timeout))
+            }
+        }
+    }
+
+    fn decode_statfs_response(&self, result: &RequestResult) -> ClientResult<FsStats> {
+        let body = match result.data.as_ref() {
+            Some(b) => b,
+            None => {
+                return Err(ClientError::Internal(
+                    "Empty statfs response body".to_string(),
+                ))
+            }
+        };
+
+        let mut dec = TlvDecoder::new(body);
+        let total_size = dec.next_u64(FieldId::Size).unwrap_or(0);
+        let used_size = dec.next_u64(FieldId::Blocks).unwrap_or(0);
+        let free_size = dec.next_u64(FieldId::Blksize).unwrap_or(0);
+        let volume_count = dec.next_u64(FieldId::Count).unwrap_or(0);
+
+        Ok(FsStats {
+            total_size,
+            used_size,
+            free_size,
+            volume_count,
+        })
+    }
 }
 
 #[cfg(test)]

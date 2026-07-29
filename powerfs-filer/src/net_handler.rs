@@ -152,7 +152,7 @@ impl FilerNetHandler {
                     enc.add_string(FieldId::Fid, fid)?;
                 }
                 if let Some(volume_id) = info.volume_id {
-                    enc.add_u64(FieldId::VolumeId, volume_id as u64);
+                    enc.add_u64(FieldId::VolumeId, volume_id);
                 }
                 // Return the first chunk's cookie and offset
                 if let Some(chunk) = info.chunks.first() {
@@ -254,7 +254,12 @@ impl FilerNetHandler {
 
         info!(
             "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, has_fid={}",
-            parent_ino, name, mode, uid, gid, fid.is_some()
+            parent_ino,
+            name,
+            mode,
+            uid,
+            gid,
+            fid.is_some()
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -287,19 +292,11 @@ impl FilerNetHandler {
                     let volume_id = fid_str
                         .split(',')
                         .next()
-                        .and_then(|v| v.parse::<u32>().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(0);
                     let _ = self
                         .meta_shard_manager
-                        .set_chunks(
-                            ino,
-                            shard_id,
-                            fid_str,
-                            volume_id,
-                            c as u32,
-                            o,
-                            sz,
-                        )
+                        .set_chunks(ino, shard_id, fid_str, volume_id, c as u32, o, sz)
                         .await;
                 }
 
@@ -536,7 +533,7 @@ impl FilerNetHandler {
                 entry_enc.add_string(FieldId::Fid, fid)?;
             }
             if let Some(volume_id) = entry.volume_id {
-                entry_enc.add_u64(FieldId::VolumeId, volume_id as u64);
+                entry_enc.add_u64(FieldId::VolumeId, volume_id);
             }
             // Return first chunk details
             if let Some(chunk) = entry.chunks.first() {

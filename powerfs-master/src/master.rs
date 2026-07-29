@@ -481,7 +481,8 @@ impl MasterNode {
                     }
                     info!(
                         "Pre-populated volume routes for server {}: addr={}",
-                        server_idx + 1, addr
+                        server_idx + 1,
+                        addr
                     );
                 }
                 info!("Pre-populated {} volume routes", routes.len());
@@ -495,36 +496,36 @@ impl MasterNode {
                 // Add volume-server-1: IP=172.20.0.21, grpc=8080, http=8091
                 let node1 = DataNodeInfo::new(
                     NodeId("volume-server-1".to_string()),
-                    "172.20.0.21:8080".to_string(),  // gRPC address
+                    "172.20.0.21:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),
-                    8091,  // HTTP port for management
-                    8080,  // gRPC port
-                    "http://172.20.0.21:8091".to_string(),  // Public URL
+                    8091,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.21:8091".to_string(), // Public URL
                 );
                 topology.get_or_create_node(node1);
 
                 // Add volume-server-2: IP=172.20.0.22, grpc=8080, http=8092
                 let node2 = DataNodeInfo::new(
                     NodeId("volume-server-2".to_string()),
-                    "172.20.0.22:8080".to_string(),  // gRPC address
+                    "172.20.0.22:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),
-                    8092,  // HTTP port for management
-                    8080,  // gRPC port
-                    "http://172.20.0.22:8092".to_string(),  // Public URL
+                    8092,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.22:8092".to_string(), // Public URL
                 );
                 topology.get_or_create_node(node2);
 
                 // Add volume-server-3: IP=172.20.0.23, grpc=8080, http=8093
                 let node3 = DataNodeInfo::new(
                     NodeId("volume-server-3".to_string()),
-                    "172.20.0.23:8080".to_string(),  // gRPC address
+                    "172.20.0.23:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),
-                    8093,  // HTTP port for management
-                    8080,  // gRPC port
-                    "http://172.20.0.23:8093".to_string(),  // Public URL
+                    8093,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.23:8093".to_string(), // Public URL
                 );
                 topology.get_or_create_node(node3);
 

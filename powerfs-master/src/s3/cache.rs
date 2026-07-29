@@ -74,7 +74,7 @@ impl Default for BucketCache {
 /// Volume位置缓存
 /// 缓存volume_id -> volume_server地址的映射
 pub struct VolumeLocationCache {
-    cache: Arc<RwLock<HashMap<u32, CacheEntry<String>>>>,
+    cache: Arc<RwLock<HashMap<u64, CacheEntry<String>>>>,
     ttl: Duration,
 }
 
@@ -86,7 +86,7 @@ impl VolumeLocationCache {
         }
     }
 
-    pub async fn get(&self, volume_id: u32) -> Option<String> {
+    pub async fn get(&self, volume_id: u64) -> Option<String> {
         let cache = self.cache.read().await;
         cache.get(&volume_id).and_then(|entry| {
             if entry.is_expired() {
@@ -97,12 +97,12 @@ impl VolumeLocationCache {
         })
     }
 
-    pub async fn set(&self, volume_id: u32, address: String) {
+    pub async fn set(&self, volume_id: u64, address: String) {
         let mut cache = self.cache.write().await;
         cache.insert(volume_id, CacheEntry::new(address, self.ttl));
     }
 
-    pub async fn remove(&self, volume_id: u32) {
+    pub async fn remove(&self, volume_id: u64) {
         let mut cache = self.cache.write().await;
         cache.remove(&volume_id);
     }
