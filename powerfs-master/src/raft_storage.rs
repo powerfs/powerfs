@@ -33,7 +33,7 @@ pub enum RaftCommand {
     },
     AssignVolume {
         node_id: String,
-        volume_id: u32,
+        volume_id: u64,
         collection: String,
         replica_count: u32,
         ttl: i32,
@@ -41,7 +41,7 @@ pub enum RaftCommand {
         size: u64,
     },
     UpdateVolumeState {
-        volume_id: u32,
+        volume_id: u64,
         state: String,
     },
     UpdateNodeVolumes {
@@ -49,6 +49,7 @@ pub enum RaftCommand {
         volumes: Vec<RaftVolumeShortInfo>,
         ip: String,
         grpc_port: u32,
+        net_port: u32,
     },
     Heartbeat {
         node_id: String,
@@ -64,14 +65,14 @@ pub enum RaftCommand {
         name: String,
     },
     DeleteVolume {
-        volume_id: u32,
+        volume_id: u64,
     },
 }
 
 /// Volume info for Raft serialization (serde-compatible)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RaftVolumeShortInfo {
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub size: u64,
     pub read_only: bool,
     pub used: u64,
@@ -95,7 +96,7 @@ impl From<&crate::proto::VolumeShortInfo> for RaftVolumeShortInfo {
 pub struct RaftSnapshotData {
     pub nodes: Vec<RaftNodeSnapshot>,
     pub volumes: Vec<RaftVolumeSnapshot>,
-    pub next_volume_id: u32,
+    pub next_volume_id: u64,
     pub max_file_key: u64,
 }
 
@@ -114,7 +115,7 @@ pub struct RaftNodeSnapshot {
 /// Volume snapshot for serialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftVolumeSnapshot {
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub node_id: String,
     pub collection: String,
     pub size: u64,

@@ -101,7 +101,7 @@ impl MasterNetHandler {
         enc.add_u64(FieldId::Entries, volumes.len() as u64);
 
         for vol in volumes {
-            enc.add_u64(FieldId::Ino, vol.volume_id as u64);
+            enc.add_u64(FieldId::Ino, vol.volume_id);
             enc.add_u64(FieldId::Size, vol.size);
             enc.add_u64(FieldId::Mode, vol.read_only as u64);
             enc.add_string(FieldId::Name, &vol.collection)?;
@@ -161,7 +161,7 @@ impl MasterNetHandler {
             Ok((fid, nodes)) => {
                 let mut enc = TlvEncoder::new();
                 // Return structured fields so the client can directly use them
-                let _ = enc.add_u64(FieldId::VolumeId, fid.volume_id.0 as u64);
+                let _ = enc.add_u64(FieldId::VolumeId, fid.volume_id.0);
                 let _ = enc.add_u64(FieldId::Cookie, fid.cookie);
                 let _ = enc.add_u64(FieldId::FileKey, fid.file_key);
                 if let Some(node) = nodes.first() {
@@ -206,7 +206,7 @@ impl MasterNetHandler {
 
         info!("NET_LOOKUP_VOLUME: volume_id={}", volume_id_str);
 
-        let original_id: u32 = volume_id_str.parse().unwrap_or(0);
+        let original_id: u64 = volume_id_str.parse().unwrap_or(0);
 
         // Look up by original ID (as used by Volume Server)
         if let Some(info) = self.master.get_volume_info_by_original_id(original_id) {
@@ -214,8 +214,15 @@ impl MasterNetHandler {
                 "NET_LOOKUP_VOLUME: found volume info for original_id={}, composite_id={}, node_id={}",
                 original_id, info.id.0, info.node_id.0
             );
-            
+
             if let Some(node) = self.master.get_node(&info.node_id) {
+                info!(
+                    "NET_LOOKUP_VOLUME: node address={}, http_port={}, grpc_port={}, url={}",
+                    node.address,
+                    node.http_port,
+                    node.grpc_port,
+                    node.url()
+                );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Limit, 1); // count
                 enc.add_string(FieldId::Owner, &node.url())?;
@@ -265,7 +272,7 @@ impl MasterNetHandler {
                 let collection = dec.next_string(FieldId::Name).unwrap_or_default();
 
                 volumes.push(VolumeShortInfo {
-                    volume_id: volume_id as u32,
+                    volume_id,
                     size,
                     read_only: state == 2, // VolumeState::ReadOnly
                     collection,
@@ -306,6 +313,7 @@ impl MasterNetHandler {
                     ip: ip.clone(),
                     grpc_port: port,
                     http_port: port,
+                    net_port: 0,
                 })
                 .await;
 
@@ -844,18 +852,38 @@ impl MasterNetHandler {
         }
     }
 
-    /// Handle GetTopology request
+    /// Handle GetTopology request - returns leader address AND volume routes
     async fn handle_get_topology(
         &self,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        info!("NET_GET_TOPOLOGY: returning topology info");
+        info!("NET_GET_TOPOLOGY: returning topology info with volume routes");
 
         let leader = self.master.get_leader().await;
 
+        // Build volume routes from the route table
+        let routes = self.master.list_volume_routes();
+        let volume_count = routes.len() as u64;
+
         let mut enc = TlvEncoder::new();
         enc.add_string(FieldId::Owner, &leader)?;
-        enc.add_u64(FieldId::Entries, 0);
+        enc.add_u64(FieldId::Entries, volume_count);
+
+        // Encode each volume route: volume_id + addr + size
+        for route in routes.iter() {
+            info!(
+                "NET_GET_TOPOLOGY: volume_id={}, addr={}, size={}",
+                route.volume_id, route.addr, route.size
+            );
+            enc.add_u64(FieldId::VolumeId, route.volume_id);
+            let _ = enc.add_string(FieldId::Owner, &route.addr);
+            enc.add_u64(FieldId::Size, route.size);
+        }
+
+        info!(
+            "NET_GET_TOPOLOGY: leader={}, volumes={}",
+            leader, volume_count
+        );
 
         Ok(Self::build_response(
             msg,

@@ -180,6 +180,7 @@ impl MasterService for MasterGrpcServer {
                     if let Err(e) = add_result {
                         warn!("GRPC_DEBUG: add_node failed for {}: {}", node_id.0, e);
                         let leader = master.get_leader().await;
+                        info!("GRPC_DEBUG: returning leader address: {}", leader);
                         let (error_code, error_msg) = match e {
                             powerfs_common::error::PowerFsError::NotLeader => {
                                 ("LEADER_CHANGED".to_string(), e.to_string())
@@ -213,6 +214,7 @@ impl MasterService for MasterGrpcServer {
                             ip: heartbeat.ip.clone(),
                             grpc_port: heartbeat.grpc_port,
                             http_port: heartbeat.port,
+                            net_port: heartbeat.net_port,
                         })
                         .await;
                     if let Err(e) = update_result {
@@ -221,6 +223,7 @@ impl MasterService for MasterGrpcServer {
                             node_id.0, e
                         );
                         let leader = master.get_leader().await;
+                        info!("GRPC_DEBUG: returning leader address: {}", leader);
                         let (error_code, error_msg) = match e {
                             powerfs_common::error::PowerFsError::NotLeader => {
                                 ("LEADER_CHANGED".to_string(), e.to_string())
@@ -292,7 +295,7 @@ impl MasterService for MasterGrpcServer {
                 &volume_id_str
             };
 
-            if let Ok(vid) = u32::from_str(vid_str) {
+            if let Ok(vid) = u64::from_str(vid_str) {
                 let volume_id = VolumeId(vid);
                 match self.master.get_volume(&volume_id).await {
                     Ok(info) => {
@@ -377,7 +380,7 @@ impl MasterService for MasterGrpcServer {
                     let mut stripe_locations = Vec::new();
 
                     for &vid in &volume_ids {
-                        let vid_vol = VolumeId(vid as u32);
+                        let vid_vol = VolumeId(vid);
                         let cookie = rand::random::<u32>() as u64;
                         let file_key = self.master.allocate_file_key(&vid_vol).unwrap_or(1);
                         let fid = powerfs_common::types::Fid {
