@@ -35,6 +35,7 @@ fn test_facade_config_custom_values() {
         master_addr: "192.168.1.100".to_string(),
         master_port: 8000,
         volume_net_port: 8002,
+        volume_addrs: Vec::new(),
         filer_addr: "192.168.1.200".to_string(),
         filer_port: 8001,
         request_timeout: Duration::from_secs(10),

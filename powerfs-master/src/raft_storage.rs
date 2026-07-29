@@ -870,15 +870,10 @@ impl Storage for RocksDbStorage {
             }
         }
 
-        // Return empty snapshot
-        let hs = self.hard_state.read().unwrap();
-        let cs = self.conf_state.read().unwrap();
-        let mut snapshot = Snapshot::new();
-        let meta = snapshot.mut_metadata();
-        meta.set_index(request_index);
-        meta.set_term(hs.term);
-        meta.set_conf_state(cs.clone());
-        Ok(snapshot)
+        // No snapshot available - return Err so raft::RawNode knows to start fresh
+        Err(raft::Error::Store(
+            raft::StorageError::SnapshotTemporarilyUnavailable,
+        ))
     }
 }
 

@@ -544,6 +544,13 @@ pub enum FieldId {
     LeaseToken = 0x80,
     LeaseRangeOffset = 0x81,
     LeaseRangeLength = 0x82,
+
+    // AssignVolume fields
+    Collection = 0x90,
+    Replication = 0x91,
+    VolumeId = 0x92,
+    Cookie = 0x93,
+    FileKey = 0x94,
 }
 
 impl FieldId {
@@ -599,6 +606,11 @@ impl FieldId {
             0x80 => Some(Self::LeaseToken),
             0x81 => Some(Self::LeaseRangeOffset),
             0x82 => Some(Self::LeaseRangeLength),
+            0x90 => Some(Self::Collection),
+            0x91 => Some(Self::Replication),
+            0x92 => Some(Self::VolumeId),
+            0x93 => Some(Self::Cookie),
+            0x94 => Some(Self::FileKey),
             _ => None,
         }
     }

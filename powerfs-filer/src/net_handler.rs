@@ -594,6 +594,7 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -645,6 +646,7 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

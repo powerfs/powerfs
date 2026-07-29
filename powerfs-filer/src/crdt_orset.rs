@@ -938,7 +938,7 @@ mod tests {
         orset
             .tombstones
             .entry("1:test.txt".to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(tombstone);
 
         assert_eq!(orset.tombstone_count(), 1);

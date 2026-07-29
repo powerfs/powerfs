@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, default_value = "8081")]
     volume_net_port: u16,
 
+    /// Volume server addresses (e.g. 172.20.0.21:8091), can be specified multiple times
+    #[arg(long)]
+    volume_addr: Vec<String>,
+
     /// Filer powerfs-net port
     #[arg(long, default_value = "9334")]
     filer_net_port: u16,
@@ -149,6 +153,7 @@ fn main() {
 
     let master_net_port = args.master_net_port;
     let volume_net_port = args.volume_net_port;
+    let volume_addrs = args.volume_addr.clone();
 
     // Determine filer address: CLI arg > config > default to master address
     let (filer_addr, filer_net_port) = if !args.filer_addr.is_empty() {
@@ -294,6 +299,7 @@ fn main() {
             &replication,
             master_net_port,
             volume_net_port,
+            volume_addrs,
             filer_addr,
             filer_net_port,
             runtime_arc.clone(),

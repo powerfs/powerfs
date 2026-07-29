@@ -148,7 +148,7 @@ services:
       - "8091:8091"
     command: >
       /app/powerfs-volume
-      --grpc-address 0.0.0.0:8080
+      --grpc-address 172.20.0.21:8080
       --http-port 8091
       --net-port 8091
       --node-id volume-server-1
@@ -179,7 +179,7 @@ services:
       - "8092:8092"
     command: >
       /app/powerfs-volume
-      --grpc-address 0.0.0.0:8080
+      --grpc-address 172.20.0.22:8080
       --http-port 8092
       --net-port 8092
       --node-id volume-server-2
@@ -210,7 +210,7 @@ services:
       - "8093:8093"
     command: >
       /app/powerfs-volume
-      --grpc-address 0.0.0.0:8080
+      --grpc-address 172.20.0.23:8080
       --http-port 8093
       --net-port 8093
       --node-id volume-server-3
@@ -409,6 +409,9 @@ services:
       --master 172.20.0.11:9333
       --master-net-port 9334
       --volume-net-port 8091
+      --volume-addr 172.20.0.21:8091
+      --volume-addr 172.20.0.22:8092
+      --volume-addr 172.20.0.23:8093
       --filer-net-port 9334
       --filer-addr 172.20.0.35
       --collection default

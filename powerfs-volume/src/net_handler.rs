@@ -463,6 +463,15 @@ impl VolumeNetHandler {
         }
     }
 
+    fn handle_lookup_volume(&self, msg: &NetMessage) -> NetMessage {
+        info!("NET_LOOKUP_VOLUME: handling lookup volume request");
+
+        let response_json = r#"{"success":true,"data":{"locations":[]}}"#;
+        let response_bytes = response_json.as_bytes().to_vec();
+
+        Self::build_response(msg, STATUS_OK, response_bytes, Vec::new())
+    }
+
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         let flags = FrameFlags::new(FrameFlags::RESPONSE);
         let header = powerfs_net::FrameHeader::new(
@@ -487,9 +496,16 @@ impl PowerFsNetHandler for VolumeNetHandler {
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
-        debug!(
-            "NET_VOLUME: handling request {:?}, client_id={}, seq={}",
-            msg_type, client_id, msg.header.seq
+        info!(
+            "NET_VOLUME: handling request {:?} (raw={}), client_id={}, seq={}",
+            msg_type, msg.header.msg_type, client_id, msg.header.seq
+        );
+
+        let is_lookup = matches!(msg_type, MsgType::LookupVolume);
+        info!(
+            "NET_VOLUME: is_lookup_volume={}, msg_type_as_u16={}",
+            is_lookup,
+            msg_type.as_u16()
         );
 
         match msg_type {
@@ -499,6 +515,7 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg, client_id).await,
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -554,6 +571,7 @@ impl ServerRequestHandler for VolumeNetHandler {
             }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

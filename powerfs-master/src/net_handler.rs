@@ -157,12 +157,22 @@ impl MasterNetHandler {
         match result {
             Ok((fid, nodes)) => {
                 let mut enc = TlvEncoder::new();
-                enc.add_string(FieldId::Name, &fid.to_string())?;
+                // Return structured fields so the client can directly use them
+                let _ = enc.add_u64(FieldId::VolumeId, fid.volume_id.0 as u64);
+                let _ = enc.add_u64(FieldId::Cookie, fid.cookie);
+                let _ = enc.add_u64(FieldId::FileKey, fid.file_key);
                 if let Some(node) = nodes.first() {
-                    enc.add_string(FieldId::Owner, &node.url())?;
-                    enc.add_string(FieldId::Backend, &node.data_center_id.to_string())?;
+                    let _ = enc.add_string(FieldId::Owner, &node.url());
                 }
-                enc.add_u64(FieldId::Entries, nodes.len() as u64);
+                let _ = enc.add_u64(FieldId::Entries, nodes.len() as u64);
+
+                info!(
+                    "NET_ASSIGN: assigned volume_id={}, cookie={}, file_key={}, nodes={}",
+                    fid.volume_id.0,
+                    fid.cookie,
+                    fid.file_key,
+                    nodes.len()
+                );
 
                 Ok(Self::build_response(
                     msg,

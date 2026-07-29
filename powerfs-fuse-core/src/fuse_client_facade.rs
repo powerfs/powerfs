@@ -129,6 +129,8 @@ pub struct FuseClientFacadeConfig {
     pub master_port: u16,
     /// Volume 网络端口（用于数据传输）
     pub volume_net_port: u16,
+    /// Volume 地址列表（用于数据传输）
+    pub volume_addrs: Vec<String>,
     /// Filer 节点地址
     pub filer_addr: String,
     /// Filer 端口
@@ -145,6 +147,7 @@ impl Default for FuseClientFacadeConfig {
             master_addr: "127.0.0.1".to_string(),
             master_port: 9333,
             volume_net_port: 9344,
+            volume_addrs: Vec::new(),
             filer_addr: "127.0.0.1".to_string(),
             filer_port: 9343,
             request_timeout: Duration::from_secs(5),
@@ -176,6 +179,7 @@ impl FuseClientFacade {
             master_addr: config.master_addr.clone(),
             master_net_port: config.master_port,
             volume_net_port: config.volume_net_port,
+            volume_addrs: config.volume_addrs.clone(),
             filer_addr: config.filer_addr.clone(),
             filer_net_port: config.filer_port,
             client_id: config.client_identity.client_id,
@@ -278,6 +282,11 @@ impl FuseClientFacade {
     /// 获取 Volume 客户端引用
     pub fn volume_client(&self) -> &VolumeClient {
         &self.volume_client
+    }
+
+    /// 获取默认 Volume 地址列表
+    pub fn volume_addrs(&self) -> Vec<String> {
+        self.net_client.volume_addrs().to_vec()
     }
 
     /// 获取客户端标识（用于 lease holder 校验）
@@ -464,6 +473,25 @@ impl FuseClientFacade {
             .submit_mgmt_request_and_wait(context, volume_id, timeout)
             .await
             .map_err(|e| format!("Request failed: {}", e))
+    }
+
+    /// Submit a request directly to Master via the Master net client.
+    /// Used for volume assignment (MsgType::Assign) and volume lookup (MsgType::LookupVolume).
+    pub async fn submit_master_request(
+        &self,
+        msg_type: powerfs_net::MsgType,
+        payload: Vec<u8>,
+    ) -> Result<powerfs_net::NetMessage, String> {
+        let net_client = self
+            .master_client
+            .net_client()
+            .ok_or_else(|| "Master net client not available".to_string())?;
+
+        let master_nc = net_client.master_client();
+        master_nc
+            .send_request(msg_type, &payload, &[])
+            .await
+            .map_err(|e| format!("Master request failed: {}", e))
     }
 
     /// 从 Master 刷新拓扑
@@ -662,12 +690,59 @@ impl SyncFuseClientFacade {
         volume_id: powerfs_common::types::VolumeId,
     ) -> Result<Vec<powerfs_common::traits::Location>, String> {
         let facade = self.facade.clone();
+        let volume_addrs = facade.volume_addrs();
+
         self.runtime.block_on(async move {
-            let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade);
-            provider
+            let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade.clone());
+            let locations_result = provider
                 .lookup_volume(volume_id)
-                .await
-                .map_err(pfe_to_string)
+                .await;
+
+            let locations = match locations_result {
+                Ok(locs) => {
+                    if !locs.is_empty() {
+                        // Prime VolumeClient router with first location so subsequent data/lease/mgmt calls work
+                        if let Some(first) = locs.first() {
+                            let url = first.url.clone();
+                            log::debug!(
+                                "lookup_volume: updating volume router volume={} -> {} (from Master LookupVolume)",
+                                volume_id.0, url
+                            );
+                            facade.volume_client().set_volume_info(volume_id.0 as u64, url);
+                        }
+                    }
+                    locs
+                }
+                Err(e) => {
+                    log::error!(
+                        "lookup_volume: Master LookupVolume failed for volume_id={}: {}. This indicates Master routing is broken — volume assignment is centrally managed by Master.",
+                        volume_id.0, pfe_to_string(e)
+                    );
+                    Vec::new()
+                }
+            };
+
+            if locations.is_empty() && !volume_addrs.is_empty() {
+                // WARNING: Master LookupVolume returned empty or failed.
+                // This is a fallback for when Master is unreachable or Raft is not yet ready.
+                // Master is the single source of truth for volume→server mapping;
+                // this fallback may route to the wrong volume server if volume_id was reassigned.
+                let addr = volume_addrs[0].clone();
+                log::warn!(
+                    "lookup_volume: FALLBACK to default volume address {} for volume_id={}. \
+                     Master LookupVolume returned no locations — this indicates a routing failure.",
+                    addr, volume_id.0
+                );
+                facade.volume_client().set_volume_info(volume_id.0 as u64, addr.clone());
+                Ok(vec![powerfs_common::traits::Location {
+                    public_url: addr.clone(),
+                    url: addr,
+                    grpc_port: 0,
+                    data_center: String::new(),
+                }])
+            } else {
+                Ok(locations)
+            }
         })
     }
 
@@ -946,6 +1021,7 @@ mod tests {
             master_addr: "192.168.1.100".to_string(),
             master_port: 9000,
             volume_net_port: 9002,
+            volume_addrs: Vec::new(),
             filer_addr: "192.168.1.101".to_string(),
             filer_port: 9001,
             request_timeout: Duration::from_secs(10),

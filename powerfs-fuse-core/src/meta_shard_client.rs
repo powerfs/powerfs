@@ -240,6 +240,8 @@ pub struct MetaShardClient {
     response_waiters: Arc<Mutex<ResponseWaiters>>,
     /// 事件通知器（替代 10ms 轮询）
     notify: Arc<tokio::sync::Notify>,
+    /// 默认 Filer 地址（当 shard_id 不在路由表中时回退使用，例如 inode 作为 shard_id 时）
+    default_filer_addr: std::sync::Mutex<String>,
 }
 
 impl MetaShardClient {
@@ -262,6 +264,7 @@ impl MetaShardClient {
             listeners: Arc::new(Mutex::new(Vec::new())),
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
+            default_filer_addr: std::sync::Mutex::new(String::new()),
         }
     }
 
@@ -452,8 +455,57 @@ impl MetaShardClient {
     pub fn init(&self) {
         // 从拓扑管理器加载分片信息
         self.sync_shard_router();
+
+        // 如果分片路由表为空（新集群或拓扑未就绪），设置默认路由
+        // 这确保所有分片请求都能被路由到 filer 进行处理
+        {
+            let router = self.shard_router.read().unwrap();
+            if router.is_empty() {
+                drop(router);
+                self.setup_default_routes();
+            }
+        }
+
         *self.state.lock().unwrap() = MetaShardClientState::Ready;
         log::info!("MetaShardClient: Initialized");
+    }
+
+    /// 设置默认分片路由 - 将 filer leader 地址设为所有分片的默认目标
+    fn setup_default_routes(&self) {
+        // 从 net_client 获取 filer leader 地址
+        let default_addr = {
+            if let Some(nc) = &self.net_client {
+                nc.filer_leader_addr()
+            } else {
+                String::new()
+            }
+        };
+
+        if default_addr.is_empty() {
+            log::warn!("MetaShardClient: no filer leader address available for default routes");
+            return;
+        }
+
+        log::info!(
+            "MetaShardClient: setting default shard routes to filer leader: {}",
+            default_addr
+        );
+
+        // 预填 256 个分片的默认路由（覆盖常用分片范围）
+        let mut router = self.shard_router.write().unwrap();
+        for shard_id in 0..256 {
+            router.insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
+        }
+        // Store default address for fallback when shard_id > 255 (e.g. inode numbers)
+        self.default_filer_addr
+            .lock()
+            .unwrap()
+            .clone_from(&default_addr);
+        log::info!(
+            "MetaShardClient: default routes configured for {} shards, fallback={}",
+            router.len(),
+            default_addr
+        );
     }
 
     /// 同步分片路由表
@@ -475,9 +527,20 @@ impl MetaShardClient {
     }
 
     /// 获取指定分片的 Leader
+    /// 当 shard_id 不在路由表中时（例如 inode 作为 shard_id 超出预配置范围），
+    /// 回退到 default_filer_addr 确保请求可达。
     pub fn get_shard_leader(&self, shard_id: u64) -> Option<String> {
         let router = self.shard_router.read().unwrap();
-        router.get(&shard_id).map(|s| s.leader_addr.clone())
+        if let Some(addr) = router.get(&shard_id).map(|s| s.leader_addr.clone()) {
+            return Some(addr);
+        }
+        drop(router);
+        let default_addr = self.default_filer_addr.lock().unwrap();
+        if !default_addr.is_empty() {
+            Some(default_addr.clone())
+        } else {
+            None
+        }
     }
 
     /// 提交元数据请求
@@ -717,20 +780,23 @@ impl MetaShardClient {
                     .await;
 
                 match msg {
-                    Ok(resp) if resp.is_ok() => {
-                        self.breaker.record_success();
-                        Ok(RequestResult::success_with_payload(
-                            request_id.clone(),
-                            resp.body,
-                            resp.data,
-                        ))
-                    }
                     Ok(resp) => {
-                        self.breaker.record_failure();
-                        Err(ClientError::Server(format!(
-                            "Server error: {}",
-                            resp.header.status
-                        )))
+                        log::debug!("MetaShardClient: response: is_ok={}, status={}, is_response={}, body_len={}, data_len={}",
+                            resp.is_ok(), resp.header.status, resp.is_response(), resp.body.len(), resp.data.len());
+                        if resp.is_ok() {
+                            self.breaker.record_success();
+                            Ok(RequestResult::success_with_payload(
+                                request_id.clone(),
+                                resp.body,
+                                resp.data,
+                            ))
+                        } else {
+                            self.breaker.record_failure();
+                            Err(ClientError::Server(format!(
+                                "Server error: {}",
+                                resp.header.status
+                            )))
+                        }
                     }
                     Err(e) => {
                         self.breaker.record_failure();
@@ -745,20 +811,23 @@ impl MetaShardClient {
                     .await;
 
                 match msg {
-                    Ok(resp) if resp.is_ok() => {
-                        self.breaker.record_success();
-                        Ok(RequestResult::success_with_payload(
-                            request_id.clone(),
-                            resp.body,
-                            resp.data,
-                        ))
-                    }
                     Ok(resp) => {
-                        self.breaker.record_failure();
-                        Err(ClientError::Server(format!(
-                            "Server error: {}",
-                            resp.header.status
-                        )))
+                        log::debug!("MetaShardClient: response: is_ok={}, status={}, is_response={}, body_len={}, data_len={}",
+                            resp.is_ok(), resp.header.status, resp.is_response(), resp.body.len(), resp.data.len());
+                        if resp.is_ok() {
+                            self.breaker.record_success();
+                            Ok(RequestResult::success_with_payload(
+                                request_id.clone(),
+                                resp.body,
+                                resp.data,
+                            ))
+                        } else {
+                            self.breaker.record_failure();
+                            Err(ClientError::Server(format!(
+                                "Server error: {}",
+                                resp.header.status
+                            )))
+                        }
                     }
                     Err(e) => {
                         self.breaker.record_failure();
@@ -917,6 +986,7 @@ async fn process_request_internal(
     let kind = req.context.kind;
     let msg_type = req.context.msg_type;
     let body = req.context.payload.clone();
+    let shard_id = req.shard_id;
 
     // 检查熔断器
     if !breaker.is_available() {
@@ -926,74 +996,104 @@ async fn process_request_internal(
     // 检查网络客户端是否可用
     let nc = net_client.as_ref().ok_or(ClientError::NoNetworkClient)?;
 
-    // 获取分片 Leader
-    let _leader = shard_router
-        .read()
-        .unwrap()
-        .get(&req.shard_id)
-        .ok_or(ClientError::NoShardLeader(req.shard_id))?
-        .leader_addr
-        .clone();
-
     // 从 context 获取 MsgType
     let resolved_msg_type =
         powerfs_net::MsgType::from_u16(msg_type).unwrap_or_else(|| default_msg_type_for_kind(kind));
 
-    // 发送请求
-    match kind {
-        RequestKind::Metadata => {
-            let msg = nc
-                .filer_client()
-                .send_request(resolved_msg_type, &body, &[])
-                .await;
+    // 检查是否为需要路由到 filer 的请求类型
+    let needs_filer_route = matches!(kind, RequestKind::Metadata | RequestKind::Control);
+    if !needs_filer_route {
+        return Err(ClientError::UnsupportedRequest(format!("{:?}", kind)));
+    }
 
-            match msg {
-                Ok(resp) if resp.is_ok() => {
+    // 尝试最多两次（第二次用于重定向重试）
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+
+        // 1) 获取当前分片的 leader 地址
+        let leader_addr = {
+            let router = shard_router.read().unwrap();
+            router
+                .get(&shard_id)
+                .map(|s| s.leader_addr.clone())
+                .ok_or(ClientError::NoShardLeader(shard_id))?
+        };
+
+        // 2) 获取或创建到该 leader 的连接
+        let filer_client = nc
+            .get_filer_client(&leader_addr)
+            .await
+            .map_err(ClientError::from_net_error)?;
+
+        // 3) 发送请求
+        let send_result = filer_client
+            .send_request(resolved_msg_type, &body, &[])
+            .await;
+
+        match send_result {
+            Ok(resp) => {
+                log::debug!(
+                    "process_request_internal: attempt={} shard={} leader={} kind={:?} status={} body_len={} data_len={}",
+                    attempt, shard_id, leader_addr, kind, resp.header.status, resp.body.len(), resp.data.len()
+                );
+
+                if resp.is_ok() {
                     breaker.record_success();
-                    Ok(RequestResult::success_with_payload(
+                    return Ok(RequestResult::success_with_payload(
                         request_id, resp.body, resp.data,
-                    ))
+                    ));
                 }
-                Ok(resp) => {
-                    breaker.record_failure();
-                    Err(ClientError::Server(format!(
-                        "Server error: {}",
-                        resp.header.status
-                    )))
+
+                // 非 200 响应
+                let status = resp.header.status;
+
+                // STATUS_ERR_REDIRECT = 11, 需要解析重定向地址并重试
+                const STATUS_ERR_REDIRECT: u16 = 11;
+                if status == STATUS_ERR_REDIRECT && attempt < MAX_ATTEMPTS {
+                    // 从 TLV body 中解析 Owner 字段获取新的 leader 地址
+                    let new_leader = {
+                        use powerfs_net::serialize::TlvDecoder;
+                        let mut dec = TlvDecoder::new(&resp.body);
+                        match dec.next_string(powerfs_net::FieldId::Owner) {
+                            Ok(addr) if !addr.is_empty() => Some(addr),
+                            _ => None,
+                        }
+                    };
+
+                    if let Some(new_addr) = new_leader {
+                        log::info!(
+                            "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying",
+                            shard_id, leader_addr, new_addr
+                        );
+
+                        // 更新分片路由表
+                        {
+                            let mut router = shard_router.write().unwrap();
+                            router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
+                        }
+
+                        // 重试请求
+                        continue;
+                    } else {
+                        log::warn!(
+                            "process_request_internal: redirect response with empty owner for shard={}",
+                            shard_id
+                        );
+                    }
                 }
-                Err(e) => {
-                    breaker.record_failure();
-                    Err(ClientError::from_net_error(e))
-                }
+
+                // 其他错误或超过重试次数
+                breaker.record_failure();
+                return Err(ClientError::Server(format!("Server error: {}", status)));
+            }
+            Err(e) => {
+                breaker.record_failure();
+                return Err(ClientError::from_net_error(e));
             }
         }
-        RequestKind::Control => {
-            let msg = nc
-                .filer_client()
-                .send_request(resolved_msg_type, &body, &[])
-                .await;
-
-            match msg {
-                Ok(resp) if resp.is_ok() => {
-                    breaker.record_success();
-                    Ok(RequestResult::success_with_payload(
-                        request_id, resp.body, resp.data,
-                    ))
-                }
-                Ok(resp) => {
-                    breaker.record_failure();
-                    Err(ClientError::Server(format!(
-                        "Server error: {}",
-                        resp.header.status
-                    )))
-                }
-                Err(e) => {
-                    breaker.record_failure();
-                    Err(ClientError::from_net_error(e))
-                }
-            }
-        }
-        _ => Err(ClientError::UnsupportedRequest(format!("{:?}", kind))),
     }
 }
 
