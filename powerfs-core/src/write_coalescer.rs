@@ -238,37 +238,49 @@ impl WriteCoalescer {
 
         inner.dirty_bytes_total = inner.dirty_bytes_total.saturating_add(new_len);
 
-        // ---- 3. Total budget eviction. ----
+        // ---- 3. Total dirty-bytes budget handling.
+        // Instead of synchronously evicting victims on THIS caller's thread
+        // (which introduces tail latency: writing needle B blocks on
+        // flushing needle A's backend I/O), we simply mark victims'
+        // `flush_after` to the past.  An external caller (the Volume's
+        // periodic opportunistic flush or the FUSE scheduler ticker) will
+        // subsequently call flush_expired() to drain them asynchronously.
+        // If _we_ are the oldest, just mark ourselves for self-flush: the
+        // next round of flush_expired picks us, or the size/age trigger
+        // fires synchronously on a subsequent write.
         let mut need_flush_this = need_flush_now;
-        let mut evicted: Option<(NeedleId, DirtyEntry)> = None;
-        while inner.dirty_bytes_total > cfg.max_dirty_bytes_total {
+        if inner.dirty_bytes_total > cfg.max_dirty_bytes_total {
             let oldest_key = inner
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.flush_after)
                 .map(|(k, _)| k.clone());
             match oldest_key {
-                None => break,
+                None => {}
                 Some(ref k) if k == needle_id => {
                     need_flush_this = true;
-                    break;
                 }
                 Some(k) => {
-                    if let Some(victim) = inner.entries.remove(&k) {
-                        inner.dirty_bytes_total =
-                            inner.dirty_bytes_total.saturating_sub(victim.merged.len());
-                        evicted = Some((k, victim));
+                    // Non-blocking eviction: just push flush_after into
+                    // the past so flush_expired() will pick it up ASAP.
+                    if let Some(victim) = inner.entries.get_mut(&k) {
+                        victim.flush_after =
+                            now.checked_sub(Duration::from_nanos(1)).unwrap_or(now);
                     }
+                    // We deliberately mark at most one victim per call to
+                    // keep the latency of record_write bounded; the
+                    // budget overshoot is temporary – flush_expired drains
+                    // all expired entries in bulk on its next invocation.
                 }
             }
         }
 
         drop(inner);
 
-        // ---- 4. Return victim (if any) or ourselves as synchronous flush ----
-        if let Some((k, v)) = evicted {
-            Some((k, v.merged, v.is_new_needle))
-        } else if need_flush_this {
+        // ---- 4. Return self flush ONLY when the caller's own needle hit
+        // a per-entry synchronous trigger (size / count / age).  Victims
+        // are never returned synchronously – they flow via flush_expired.
+        if need_flush_this {
             let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
             if let Some(e) = inner.entries.remove(needle_id) {
                 inner.dirty_bytes_total = inner.dirty_bytes_total.saturating_sub(e.merged.len());
@@ -350,6 +362,40 @@ impl WriteCoalescer {
             let _ = op(id, entry.merged, entry.is_new_needle);
         }
         total
+    }
+
+    /// Flush only the entries whose `flush_after` deadline has elapsed at
+    /// `now`.  Returns how many were flushed.  Called from the Volume's
+    /// periodic daemon to make sure dirty writes do not sit around forever
+    /// waiting for min_pending_writes / size triggers that never arrive.
+    pub fn flush_expired<F: FnMut(NeedleId, Vec<u8>, bool) -> Result<(), ()>>(
+        &self,
+        mut op: F,
+    ) -> usize {
+        let now = Instant::now();
+        let expired: Vec<(NeedleId, DirtyEntry)> = {
+            let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
+            let ids: Vec<NeedleId> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| now >= e.flush_after)
+                .map(|(k, _)| k.clone())
+                .collect();
+            let mut out = Vec::with_capacity(ids.len());
+            for k in &ids {
+                if let Some(v) = inner.entries.remove(k) {
+                    inner.dirty_bytes_total =
+                        inner.dirty_bytes_total.saturating_sub(v.merged.len());
+                    out.push((k.clone(), v));
+                }
+            }
+            out
+        };
+        let n = expired.len();
+        for (id, e) in expired {
+            let _ = op(id, e.merged, e.is_new_needle);
+        }
+        n
     }
 }
 
@@ -457,12 +503,24 @@ mod tests {
         // id=1 first, so it has the earliest deadline.
         let r1 = coal.record_write(&NeedleId(1), 0, b"1234567890", 10, None);
         assert!(r1.is_none());
-        // id=2 exceeds budget -> evict id=1
-        let evict = coal.record_write(&NeedleId(2), 0, b"aa", 2, None);
-        let (k, v, _) = evict.expect("should evict oldest (id=1)");
-        assert_eq!(k.0, 1);
-        assert_eq!(v, b"1234567890");
-        // id=2 is still dirty in the buffer.
+        // id=2 exceeds budget: record_write no longer blocks the caller by
+        // returning a victim synchronously.  Instead it marks id=1 as
+        // expired (flush_after pushed to the past) and returns None.
+        let evict_from_write = coal.record_write(&NeedleId(2), 0, b"aa", 2, None);
+        assert!(evict_from_write.is_none(), "budget path is non-blocking");
+        assert_eq!(coal.dirty_entry_count(), 2, "both still in buffer");
+        // On the next flush_expired() call, id=1 is drained out of the
+        // buffer and handed to the caller-provided op.
+        let mut flushed = Vec::new();
+        let n = coal.flush_expired(|id, v, _is_new| {
+            flushed.push((id.0, v));
+            Ok(())
+        });
+        assert_eq!(n, 1);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].0, 1);
+        assert_eq!(flushed[0].1, b"1234567890");
+        // id=2 is still dirty in the buffer since we only drained expired.
         assert_eq!(coal.dirty_entry_count(), 1);
         assert!(coal.is_dirty(&NeedleId(2)));
     }

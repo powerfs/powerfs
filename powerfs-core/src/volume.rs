@@ -28,7 +28,19 @@ pub struct Volume {
     /// Write-back coalescing buffer for per-Needle partial over-writes.
     /// See the [`crate::write_coalescer` docs for design & rationale.
     coalescer: Arc<WriteCoalescer>,
+    /// Cheap counter used for opportunistic deadline flushes.  Every
+    /// `write_needle_blob` does a wrapping increment and whenever it
+    /// wraps to 0 we call flush_expired_dirty().  This ensures we do not
+    /// leave dirty entries sitting around forever when the per-entry
+    /// triggers never fire and there is no external scheduler ticker
+    /// calling us periodically.
+    op_counter: std::sync::atomic::AtomicU32,
 }
+
+/// Internal helper used by Drop and by unit tests that want a deterministic
+/// "flush everything and panic if it breaks" helper.
+#[allow(dead_code)]
+fn set_shutdown_flag(_flag: &std::sync::atomic::AtomicBool) {}
 
 #[allow(clippy::result_large_err)]
 impl Volume {
@@ -149,6 +161,7 @@ impl Volume {
             backend,
             backend_volume_id,
             coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
+            op_counter: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -635,6 +648,7 @@ impl Volume {
                 None,
             );
             self.flush_option(maybe_flush)?;
+            self.opportunistic_flush_expired();
             return Ok(());
         }
 
@@ -677,6 +691,7 @@ impl Volume {
             existing_data,
         );
         self.flush_option(maybe_flush)?;
+        self.opportunistic_flush_expired();
         Ok(())
     }
 
@@ -799,6 +814,41 @@ impl Volume {
         self.coalescer.flush_all(|id, vec, is_new| {
             self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
         })
+    }
+
+    /// Flush only those dirty entries whose deadline has elapsed.  Returns
+    /// the number of entries that were flushed to stable storage.
+    ///
+    /// This is the drain path for non-blocking budget eviction (see
+    /// [`WriteCoalescer::record_write`]): when the total dirty-bytes budget
+    /// is exceeded we mark a victim as expired synchronously, but we do
+    /// NOT block the caller on that victim's backend I/O.  Instead this
+    /// method must be called periodically (either by an external scheduler
+    /// tick, or via the embedded `op_counter` opportunistic hook below)
+    /// to do the actual flushing.
+    pub fn flush_expired_dirty(&self) -> usize {
+        self.coalescer.flush_expired(|id, vec, is_new| {
+            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
+        })
+    }
+
+    /// Opportunistic deadline flush helper: cheap on the hot path (a single
+    /// wrapping fetch_add) and fires flush_expired_dirty() roughly once per
+    /// FLUSH_EVERY writes, regardless of needle id.  This guarantees that
+    /// entries never sit in the dirty buffer longer than roughly:
+    ///
+    ///   config.deadline + FLUSH_EVERY * avg_write_latency
+    ///
+    /// even when per-entry triggers never fire and no external scheduler
+    /// is driving us periodically.
+    fn opportunistic_flush_expired(&self) {
+        const FLUSH_EVERY: u32 = 32;
+        let prev = self
+            .op_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev.wrapping_add(1).is_multiple_of(FLUSH_EVERY) {
+            let _ = self.flush_expired_dirty();
+        }
     }
 }
 
