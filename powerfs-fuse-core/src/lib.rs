@@ -29,5 +29,5 @@ pub use topology::{
     MasterClientState, ShardInfo, TopologyUpdateListener, VolumeInfo,
 };
 pub use volume_client::{
-    LeaseInfo, LeaseState, VolumeClient, VolumeClientConfig, VolumeClientState,
+    LeaseInfo, LeaseState, SchedulerStats, VolumeClient, VolumeClientConfig, VolumeClientState,
 };

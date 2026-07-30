@@ -1,10 +1,12 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use tokio::sync::oneshot;
 
-use crate::circuit_breaker::CircuitBreaker;
+use crate::circuit_breaker::CircuitBreakerPool;
 use crate::client_error::{ClientError, ClientResult};
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
@@ -127,30 +129,26 @@ impl TransportChannel {
     }
 }
 
-/// 请求队列
+/// Lock-free request queue using crossbeam ArrayQueue (MPMC)
 pub struct RequestQueue {
-    pub queue: VecDeque<PendingRequest>,
-    pub max_size: usize,
+    queue: crossbeam_queue::ArrayQueue<PendingRequest>,
 }
 
 impl RequestQueue {
     pub fn new(max_size: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
-            max_size,
+            queue: crossbeam_queue::ArrayQueue::new(max_size),
         }
     }
 
-    pub fn enqueue(&mut self, req: PendingRequest) -> Result<(), String> {
-        if self.queue.len() >= self.max_size {
-            return Err("Queue is full".to_string());
-        }
-        self.queue.push_back(req);
-        Ok(())
+    pub fn enqueue(&self, req: PendingRequest) -> Result<(), String> {
+        self.queue
+            .push(req)
+            .map_err(|_| "Queue is full".to_string())
     }
 
-    pub fn dequeue(&mut self) -> Option<PendingRequest> {
-        self.queue.pop_front()
+    pub fn dequeue(&self) -> Option<PendingRequest> {
+        self.queue.pop()
     }
 
     pub fn len(&self) -> usize {
@@ -159,6 +157,10 @@ impl RequestQueue {
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
     }
 }
 
@@ -216,22 +218,22 @@ pub enum MetaShardClientState {
 pub struct MetaShardClient {
     config: MetaShardClientConfig,
     state: Arc<Mutex<MetaShardClientState>>,
-    /// 数据请求队列
-    data_queue: Arc<Mutex<RequestQueue>>,
-    /// 控制请求队列
-    control_queue: Arc<Mutex<RequestQueue>>,
+    /// 数据请求队列 (lock-free)
+    data_queue: Arc<RequestQueue>,
+    /// 控制请求队列 (lock-free)
+    control_queue: Arc<RequestQueue>,
     /// 数据传输通道
     data_channel: Arc<TransportChannel>,
     /// 控制传输通道
     control_channel: Arc<TransportChannel>,
     /// 分片路由表 (shard_id -> ShardInfo)
-    shard_router: Arc<RwLock<HashMap<u64, ShardInfo>>>,
-    /// 熔断器
-    breaker: Arc<CircuitBreaker>,
+    shard_router: Arc<DashMap<u64, ShardInfo>>,
+    /// Per-server circuit breaker pool (one breaker per Filer server address)
+    breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器引用
     topology_manager: Arc<ClusterTopologyManager>,
-    /// Filer 连接池 (addr -> PowerFsNetClient)
-    filer_connections: Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    /// Filer 连接池 (addr -> PowerFsNetClient) - DashMap for lock-free reads
+    filer_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     /// 请求完成监听器
     listeners: Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     /// 后台处理是否在运行
@@ -250,17 +252,19 @@ impl MetaShardClient {
         topology_manager: Arc<ClusterTopologyManager>,
     ) -> Self {
         Self {
-            breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker_config.clone())),
+            breakers: Arc::new(CircuitBreakerPool::new(
+                config.circuit_breaker_config.clone(),
+            )),
             data_channel: Arc::new(TransportChannel::new(config.data_channel.clone())),
             control_channel: Arc::new(TransportChannel::new(config.control_channel.clone())),
-            data_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
-            control_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
-            shard_router: Arc::new(RwLock::new(HashMap::new())),
+            data_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
+            control_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
+            shard_router: Arc::new(DashMap::new()),
             state: Arc::new(Mutex::new(MetaShardClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             config,
             topology_manager,
-            filer_connections: Arc::new(Mutex::new(HashMap::new())),
+            filer_connections: Arc::new(DashMap::new()),
             listeners: Arc::new(Mutex::new(Vec::new())),
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -270,13 +274,10 @@ impl MetaShardClient {
 
     /// 获取或创建到指定 filer 地址的连接
     async fn get_or_create_filer_client(&self, addr: &str) -> ClientResult<Arc<PowerFsNetClient>> {
-        // 先检查是否已有连接
-        {
-            let connections = self.filer_connections.lock().unwrap();
-            if let Some(client) = connections.get(addr) {
-                if client.is_connected() {
-                    return Ok(client.clone());
-                }
+        // 先检查是否已有连接 (DashMap lock-free read)
+        if let Some(entry) = self.filer_connections.get(addr) {
+            if entry.is_connected() {
+                return Ok(entry.clone());
             }
         }
 
@@ -302,10 +303,8 @@ impl MetaShardClient {
             .map_err(ClientError::from_net_error)?;
 
         // 保存到连接池
-        {
-            let mut connections = self.filer_connections.lock().unwrap();
-            connections.insert(addr.to_string(), client.clone());
-        }
+        self.filer_connections
+            .insert(addr.to_string(), client.clone());
 
         Ok(client)
     }
@@ -418,7 +417,7 @@ impl MetaShardClient {
         let data_channel = self.data_channel.clone();
         let control_channel = self.control_channel.clone();
         let shard_router = self.shard_router.clone();
-        let breaker = self.breaker.clone();
+        let breakers = self.breakers.clone();
         let topology_manager = self.topology_manager.clone();
         let filer_connections = self.filer_connections.clone();
         let listeners = self.listeners.clone();
@@ -453,7 +452,7 @@ impl MetaShardClient {
                     &control_queue,
                     &data_channel,
                     &control_channel,
-                    &breaker,
+                    &breakers,
                     &filer_connections,
                     &default_filer_addr,
                     &shard_router,
@@ -473,6 +472,60 @@ impl MetaShardClient {
             }
 
             log::info!("MetaShardClient: Background processor stopped");
+        });
+
+        // ---- Connection health task: periodic ping + graceful reconnect ----
+        // Without this, a connection whose far end silently dropped (NAT /
+        // idle LB / power failure) would only be discovered on the next
+        // user request via a confusing "early eof" error.  Instead we
+        // softly probe every 15s and try reconnect on any error; failed
+        // reconnects are retried on the next tick so transient blips do
+        // not wedge any single request.
+        let filer_connections_cp = self.filer_connections.clone();
+        let background_running_cp = self.background_running.clone();
+        let state_cp = self.state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                if !*background_running_cp.lock().unwrap() {
+                    break;
+                }
+                let s = *state_cp.lock().unwrap();
+                if s == MetaShardClientState::Closed {
+                    break;
+                }
+                ticker.tick().await;
+
+                // Snapshot the pool to avoid long lock holds across network ops.
+                let addrs: Vec<String> = filer_connections_cp
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                for addr in addrs {
+                    let client = match filer_connections_cp.get(&addr) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    if client.is_connected() {
+                        if let Err(e) = client.ping().await {
+                            log::warn!(
+                                "MetaShardClient: ping failed for {}, reconnecting: {:?}",
+                                addr,
+                                e
+                            );
+                            // Try a single reconnect inline; on failure we
+                            // keep the entry but leave !connected so next
+                            // request triggers get_or_create_filer_client
+                            // which calls connect() again.
+                            let _ = client.reconnect_internal().await;
+                        }
+                    } else {
+                        let _ = client.reconnect_internal().await;
+                    }
+                }
+            }
+            log::info!("MetaShardClient: connection health task stopped");
         });
     }
 
@@ -502,12 +555,8 @@ impl MetaShardClient {
 
         // 如果分片路由表为空（新集群或拓扑未就绪），设置默认路由
         // 这确保所有分片请求都能被路由到 filer 进行处理
-        {
-            let router = self.shard_router.read().unwrap();
-            if router.is_empty() {
-                drop(router);
-                self.setup_default_routes();
-            }
+        if self.shard_router.is_empty() {
+            self.setup_default_routes();
         }
 
         *self.state.lock().unwrap() = MetaShardClientState::Ready;
@@ -530,9 +579,9 @@ impl MetaShardClient {
         );
 
         // 预填 256 个分片的默认路由（覆盖常用分片范围）
-        let mut router = self.shard_router.write().unwrap();
         for shard_id in 0..256 {
-            router.insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
+            self.shard_router
+                .insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
         }
         // Store default address for fallback when shard_id > 255 (e.g. inode numbers)
         self.default_filer_addr
@@ -541,7 +590,7 @@ impl MetaShardClient {
             .clone_from(&default_addr);
         log::info!(
             "MetaShardClient: default routes configured for {} shards, fallback={}",
-            router.len(),
+            self.shard_router.len(),
             default_addr
         );
     }
@@ -549,14 +598,16 @@ impl MetaShardClient {
     /// 同步分片路由表
     fn sync_shard_router(&self) {
         let topology = self.topology_manager.get_topology();
-        let mut router = self.shard_router.write().unwrap();
-        *router = topology.shards.clone();
+        self.shard_router.clear();
+        for (k, v) in topology.shards {
+            self.shard_router.insert(k, v);
+        }
     }
 
     /// 直接设置分片 Leader（用于测试或动态路由更新）
     pub fn set_shard_leader(&self, shard_id: u64, leader_addr: String) {
-        let mut router = self.shard_router.write().unwrap();
-        router.insert(shard_id, ShardInfo::new(shard_id, leader_addr));
+        self.shard_router
+            .insert(shard_id, ShardInfo::new(shard_id, leader_addr));
     }
 
     /// 获取当前状态
@@ -568,11 +619,13 @@ impl MetaShardClient {
     /// 当 shard_id 不在路由表中时（例如 inode 作为 shard_id 超出预配置范围），
     /// 回退到 default_filer_addr 确保请求可达。
     pub fn get_shard_leader(&self, shard_id: u64) -> Option<String> {
-        let router = self.shard_router.read().unwrap();
-        if let Some(addr) = router.get(&shard_id).map(|s| s.leader_addr.clone()) {
+        if let Some(addr) = self
+            .shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+        {
             return Some(addr);
         }
-        drop(router);
         let default_addr = self.default_filer_addr.lock().unwrap();
         if !default_addr.is_empty() {
             Some(default_addr.clone())
@@ -593,8 +646,8 @@ impl MetaShardClient {
             return Err(format!("Client not ready: {:?}", self.state()));
         }
 
-        if !self.breaker.is_available() {
-            return Err("Circuit breaker is open".to_string());
+        if !self.breakers.check(&self.resolve_filer_addr(shard_id)) {
+            return Err("Circuit breaker is open for this filer server".to_string());
         }
 
         let req = PendingRequest {
@@ -603,8 +656,7 @@ impl MetaShardClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.data_queue.enqueue(req)?;
 
         *self.state.lock().unwrap() = MetaShardClientState::Processing;
         self.notify.notify_one();
@@ -628,8 +680,7 @@ impl MetaShardClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.control_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.control_queue.enqueue(req)?;
         self.notify.notify_one();
 
         Ok(())
@@ -637,19 +688,28 @@ impl MetaShardClient {
 
     /// 从数据队列获取下一个请求
     pub fn next_data_request(&self) -> Option<PendingRequest> {
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.dequeue()
+        self.data_queue.dequeue()
     }
 
     /// 从控制队列获取下一个请求
     pub fn next_control_request(&self) -> Option<PendingRequest> {
-        let mut queue = self.control_queue.lock().unwrap();
-        queue.dequeue()
+        self.control_queue.dequeue()
+    }
+
+    /// Resolve shard_id to its Filer server address.
+    fn resolve_filer_addr(&self, shard_id: u64) -> String {
+        self.shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+            .unwrap_or_else(|| {
+                let default = self.default_filer_addr.lock().unwrap();
+                default.clone()
+            })
     }
 
     /// 检查数据通道是否可用
     pub fn can_use_data_channel(&self) -> bool {
-        self.data_channel.can_accept() && self.breaker.is_available()
+        self.data_channel.can_accept()
     }
 
     /// 检查控制通道是否可用
@@ -657,23 +717,23 @@ impl MetaShardClient {
         self.control_channel.can_accept()
     }
 
-    /// 记录请求成功
-    pub fn record_success(&self, request_id: &RequestId, kind: RequestKind) {
+    /// 记录请求成功 (per-server breaker)
+    pub fn record_success(&self, request_id: &RequestId, kind: RequestKind, filer_addr: &str) {
         match kind {
             RequestKind::Metadata | RequestKind::Control => {
                 self.data_channel.remove_request(request_id);
-                self.breaker.record_success();
+                self.breakers.record_success(filer_addr);
             }
             _ => {}
         }
     }
 
-    /// 记录请求失败
-    pub fn record_failure(&self, request_id: &RequestId, kind: RequestKind) {
+    /// 记录请求失败 (per-server breaker)
+    pub fn record_failure(&self, request_id: &RequestId, kind: RequestKind, filer_addr: &str) {
         match kind {
             RequestKind::Metadata | RequestKind::Control => {
                 self.data_channel.remove_request(request_id);
-                self.breaker.record_failure();
+                self.breakers.record_failure(filer_addr);
             }
             _ => {}
         }
@@ -691,17 +751,14 @@ impl MetaShardClient {
         *self.state.lock().unwrap() = MetaShardClientState::Suspended;
         log::info!("MetaShardClient: Suspended for leader change");
 
-        // 步骤 2: 保存受影响分片的 pending 请求
-        let mut data_queue = self.data_queue.lock().unwrap();
-        let mut control_queue = self.control_queue.lock().unwrap();
-
+        // 步骤 2: 保存受影响分片的 pending 请求 (lock-free drain)
         let mut affected_data_requests = Vec::new();
         let mut unaffected_data_requests = Vec::new();
         let mut affected_control_requests = Vec::new();
         let mut unaffected_control_requests = Vec::new();
 
         // 分离数据队列中的请求
-        while let Some(req) = data_queue.dequeue() {
+        while let Some(req) = self.data_queue.dequeue() {
             if req.shard_id == shard_id {
                 affected_data_requests.push(req);
             } else {
@@ -710,7 +767,7 @@ impl MetaShardClient {
         }
 
         // 分离控制队列中的请求
-        while let Some(req) = control_queue.dequeue() {
+        while let Some(req) = self.control_queue.dequeue() {
             if req.shard_id == shard_id {
                 affected_control_requests.push(req);
             } else {
@@ -725,46 +782,44 @@ impl MetaShardClient {
         );
 
         // 步骤 3: 更新路由表
-        {
-            let mut router = self.shard_router.write().unwrap();
-            if let Some(shard) = router.get_mut(&shard_id) {
-                let old_leader = shard.leader_addr.clone();
-                shard.leader_addr = new_leader.clone();
-                log::info!(
-                    "MetaShardClient: Updated shard {} leader: {} -> {}",
-                    shard_id,
-                    old_leader,
-                    new_leader
-                );
-            } else {
-                // 如果分片不存在，添加它
-                router.insert(shard_id, ShardInfo::new(shard_id, new_leader.clone()));
-                log::info!(
-                    "MetaShardClient: Added new shard {} with leader {}",
-                    shard_id,
-                    new_leader
-                );
-            }
+        if let Some(mut shard) = self.shard_router.get_mut(&shard_id) {
+            let old_leader = shard.leader_addr.clone();
+            shard.leader_addr = new_leader.clone();
+            log::info!(
+                "MetaShardClient: Updated shard {} leader: {} -> {}",
+                shard_id,
+                old_leader,
+                new_leader
+            );
+        } else {
+            // 如果分片不存在，添加它
+            self.shard_router
+                .insert(shard_id, ShardInfo::new(shard_id, new_leader.clone()));
+            log::info!(
+                "MetaShardClient: Added new shard {} with leader {}",
+                shard_id,
+                new_leader
+            );
         }
 
         // 步骤 4: 将未受影响的请求重新入队
         for req in unaffected_data_requests {
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for req in unaffected_control_requests {
-            control_queue.enqueue(req).ok();
+            self.control_queue.enqueue(req).ok();
         }
 
         // 步骤 5: 将受影响的请求重新入队（将由后台处理器自动重放）
         for mut req in affected_data_requests {
             // 重置请求状态，准备重试
             req.context.state = crate::request_state::RequestState::Init;
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for mut req in affected_control_requests {
             // 重置请求状态，准备重试
             req.context.state = crate::request_state::RequestState::Init;
-            control_queue.enqueue(req).ok();
+            self.control_queue.enqueue(req).ok();
         }
 
         // 步骤 6: 恢复客户端，后台处理器将自动消费队列中的请求
@@ -772,8 +827,8 @@ impl MetaShardClient {
         self.notify.notify_one();
         log::info!(
             "MetaShardClient: Resumed with {} data requests and {} control requests in queue",
-            data_queue.len(),
-            control_queue.len()
+            self.data_queue.len(),
+            self.control_queue.len()
         );
     }
 
@@ -785,21 +840,19 @@ impl MetaShardClient {
         let body = req.context.payload.clone();
         let shard_id = req.shard_id;
 
-        // 检查熔断器
-        if !self.breaker.is_available() {
+        // 获取分片 Leader 地址，或使用默认地址
+        let leader_addr = self
+            .shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+            .unwrap_or_else(|| self.default_filer_addr());
+
+        // Per-server circuit breaker check
+        if !self.breakers.check(&leader_addr) {
             let result = Err(ClientError::CircuitOpen);
             self.resolve_waiter(&request_id, result.clone());
             return result;
         }
-
-        // 获取分片 Leader 地址，或使用默认地址
-        let leader_addr = {
-            let router = self.shard_router.read().unwrap();
-            router
-                .get(&shard_id)
-                .map(|s| s.leader_addr.clone())
-                .unwrap_or_else(|| self.default_filer_addr())
-        };
 
         if leader_addr.is_empty() {
             let err = ClientError::NoShardLeader(shard_id);
@@ -831,14 +884,14 @@ impl MetaShardClient {
                         log::debug!("MetaShardClient: response: is_ok={}, status={}, is_response={}, body_len={}, data_len={}",
                             resp.is_ok(), resp.header.status, resp.is_response(), resp.body.len(), resp.data.len());
                         if resp.is_ok() {
-                            self.breaker.record_success();
+                            self.breakers.record_success(&leader_addr);
                             Ok(RequestResult::success_with_payload(
                                 request_id.clone(),
                                 resp.body,
                                 resp.data,
                             ))
                         } else {
-                            self.breaker.record_failure();
+                            self.breakers.record_failure(&leader_addr);
                             Err(ClientError::Server(format!(
                                 "Server error: {}",
                                 resp.header.status
@@ -846,7 +899,7 @@ impl MetaShardClient {
                         }
                     }
                     Err(e) => {
-                        self.breaker.record_failure();
+                        self.breakers.record_failure(&leader_addr);
                         Err(ClientError::from_net_error(e))
                     }
                 }
@@ -882,8 +935,8 @@ impl MetaShardClient {
 
     /// 获取队列状态
     pub fn queue_stats(&self) -> (usize, usize) {
-        let data_len = self.data_queue.lock().unwrap().len();
-        let control_len = self.control_queue.lock().unwrap().len();
+        let data_len = self.data_queue.len();
+        let control_len = self.control_queue.len();
         (data_len, control_len)
     }
 
@@ -900,24 +953,21 @@ impl MetaShardClient {
 /// 处理队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
 async fn process_available_requests(
-    data_queue: &Arc<Mutex<RequestQueue>>,
-    control_queue: &Arc<Mutex<RequestQueue>>,
+    data_queue: &Arc<RequestQueue>,
+    control_queue: &Arc<RequestQueue>,
     data_channel: &Arc<TransportChannel>,
     control_channel: &Arc<TransportChannel>,
-    breaker: &Arc<CircuitBreaker>,
-    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    breakers: &Arc<CircuitBreakerPool>,
+    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
-    shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
+    shard_router: &Arc<DashMap<u64, ShardInfo>>,
     topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
 ) -> bool {
     // 优先处理控制请求
     if control_channel.can_accept() {
-        let next_req = {
-            let mut queue = control_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = control_queue.dequeue();
 
         if let Some(req) = next_req {
             log::debug!("MetaShardClient: Processing control request");
@@ -926,7 +976,7 @@ async fn process_available_requests(
                 req,
                 filer_connections,
                 default_filer_addr,
-                breaker,
+                breakers,
                 data_channel,
                 control_channel,
                 shard_router,
@@ -950,12 +1000,9 @@ async fn process_available_requests(
         }
     }
 
-    // 处理数据请求
-    if data_channel.can_accept() && breaker.is_available() {
-        let next_req = {
-            let mut queue = data_queue.lock().unwrap();
-            queue.dequeue()
-        };
+    // 处理数据请求 - per-server breaker check happens inside process_request_internal
+    if data_channel.can_accept() {
+        let next_req = data_queue.dequeue();
 
         if let Some(req) = next_req {
             log::debug!("MetaShardClient: Processing data request");
@@ -964,7 +1011,7 @@ async fn process_available_requests(
                 req,
                 filer_connections,
                 default_filer_addr,
-                breaker,
+                breakers,
                 data_channel,
                 control_channel,
                 shard_router,
@@ -995,12 +1042,12 @@ async fn process_available_requests(
 #[allow(clippy::too_many_arguments)]
 async fn process_request_internal(
     req: PendingRequest,
-    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
-    breaker: &Arc<CircuitBreaker>,
+    breakers: &Arc<CircuitBreakerPool>,
     _data_channel: &Arc<TransportChannel>,
     _control_channel: &Arc<TransportChannel>,
-    shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
+    shard_router: &Arc<DashMap<u64, ShardInfo>>,
     _topology_manager: &Arc<ClusterTopologyManager>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
@@ -1008,11 +1055,6 @@ async fn process_request_internal(
     let msg_type = req.context.msg_type;
     let body = req.context.payload.clone();
     let shard_id = req.shard_id;
-
-    // 检查熔断器
-    if !breaker.is_available() {
-        return Err(ClientError::CircuitOpen);
-    }
 
     // 从 context 获取 MsgType
     let resolved_msg_type =
@@ -1024,8 +1066,8 @@ async fn process_request_internal(
         return Err(ClientError::UnsupportedRequest(format!("{:?}", kind)));
     }
 
-    // 尝试最多两次（第二次用于重定向重试）
-    const MAX_ATTEMPTS: u32 = 2;
+    // 尝试最多5次（重定向重试），避免 Leader 切换期间误报失败
+    const MAX_ATTEMPTS: u32 = 5;
     let mut attempt: u32 = 0;
 
     // 获取默认 filer 地址作为回退
@@ -1035,13 +1077,10 @@ async fn process_request_internal(
         attempt += 1;
 
         // 1) 获取当前分片的 leader 地址，或使用默认地址
-        let leader_addr = {
-            let router = shard_router.read().unwrap();
-            router
-                .get(&shard_id)
-                .map(|s| s.leader_addr.clone())
-                .unwrap_or_else(|| fallback_addr.clone())
-        };
+        let leader_addr = shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+            .unwrap_or_else(|| fallback_addr.clone());
 
         if leader_addr.is_empty() {
             return Err(ClientError::NoShardLeader(shard_id));
@@ -1050,7 +1089,12 @@ async fn process_request_internal(
         // 2) 获取或创建到该 leader 的连接
         let filer_client = get_or_create_filer_client(filer_connections, &leader_addr).await?;
 
-        // 3) 发送请求
+        // 3) Per-server circuit breaker check
+        if !breakers.check(&leader_addr) {
+            return Err(ClientError::CircuitOpen);
+        }
+
+        // 4) 发送请求
         let send_result = filer_client
             .send_request(resolved_msg_type, &body, &[])
             .await;
@@ -1063,7 +1107,7 @@ async fn process_request_internal(
                 );
 
                 if resp.is_ok() {
-                    breaker.record_success();
+                    breakers.record_success(&leader_addr);
                     return Ok(RequestResult::success_with_payload(
                         request_id, resp.body, resp.data,
                     ));
@@ -1073,6 +1117,7 @@ async fn process_request_internal(
                 let status = resp.header.status;
 
                 // STATUS_ERR_REDIRECT = 11, 需要解析重定向地址并重试
+                // 注意: 重定向不是服务故障，不记录 breaker failure
                 const STATUS_ERR_REDIRECT: u16 = 11;
                 if status == STATUS_ERR_REDIRECT && attempt < MAX_ATTEMPTS {
                     // 从 TLV body 中解析 Owner 字段获取新的 leader 地址
@@ -1087,15 +1132,16 @@ async fn process_request_internal(
 
                     if let Some(new_addr) = new_leader {
                         log::info!(
-                            "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying",
-                            shard_id, leader_addr, new_addr
+                            "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying (attempt {}/{})",
+                            shard_id, leader_addr, new_addr, attempt, MAX_ATTEMPTS
                         );
 
                         // 更新分片路由表
-                        {
-                            let mut router = shard_router.write().unwrap();
-                            router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
-                        }
+                        shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
+
+                        // 指数退避延迟，避免 Leader 选举期间的请求风暴
+                        let delay_ms = (50u64) << (attempt - 1).min(3); // 50ms, 100ms, 200ms, 400ms
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
                         // 重试请求
                         continue;
@@ -1108,11 +1154,11 @@ async fn process_request_internal(
                 }
 
                 // 其他错误或超过重试次数
-                breaker.record_failure();
+                breakers.record_failure(&leader_addr);
                 return Err(ClientError::Server(format!("Server error: {}", status)));
             }
             Err(e) => {
-                breaker.record_failure();
+                breakers.record_failure(&leader_addr);
                 return Err(ClientError::from_net_error(e));
             }
         }
@@ -1121,16 +1167,13 @@ async fn process_request_internal(
 
 /// 获取或创建到指定地址的 filer 连接（自由函数版本，供后台处理器使用）
 async fn get_or_create_filer_client(
-    connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     addr: &str,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
-    // 先检查是否已有连接
-    {
-        let conns = connections.lock().unwrap();
-        if let Some(client) = conns.get(addr) {
-            if client.is_connected() {
-                return Ok(client.clone());
-            }
+    // 先检查是否已有连接 (DashMap lock-free read)
+    if let Some(entry) = connections.get(addr) {
+        if entry.is_connected() {
+            return Ok(entry.clone());
         }
     }
 
@@ -1158,10 +1201,7 @@ async fn get_or_create_filer_client(
         .map_err(ClientError::from_net_error)?;
 
     // 保存到连接池
-    {
-        let mut conns = connections.lock().unwrap();
-        conns.insert(addr.to_string(), client.clone());
-    }
+    connections.insert(addr.to_string(), client.clone());
 
     Ok(client)
 }
@@ -1183,6 +1223,7 @@ fn parse_addr(addr: &str) -> ClientResult<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit_breaker::CircuitBreakerConfig;
     use crate::client_identity::ClientIdentity;
     use crate::topology::ClusterTopology;
 
@@ -1270,10 +1311,12 @@ mod tests {
             client.submit_metadata_request(ctx, 1).unwrap();
         }
 
-        // 记录失败触发熔断
-        for _ in 0..5 {
+        // 记录失败触发熔断 (使用默认阈值)
+        let threshold = CircuitBreakerConfig::default().failure_threshold as usize;
+        let filer_addr = client.get_shard_leader(1).unwrap_or_default();
+        for _ in 0..threshold {
             let id = RequestId::new();
-            client.record_failure(&id, RequestKind::Metadata);
+            client.record_failure(&id, RequestKind::Metadata, &filer_addr);
         }
 
         // 熔断器打开后，新请求应该被拒绝
@@ -1281,6 +1324,40 @@ mod tests {
         let result = client.submit_metadata_request(ctx, 1);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Circuit breaker is open"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_per_server_isolation() {
+        let (client, _) = create_test_client();
+
+        // 设置两个不同的 shard 路由到不同的 filer 地址
+        client.set_shard_leader(1, "127.0.0.1:9334".to_string());
+        client.set_shard_leader(2, "127.0.0.1:9335".to_string());
+
+        // 对第一个 filer 记录失败触发熔断 (使用默认阈值)
+        let threshold = CircuitBreakerConfig::default().failure_threshold as usize;
+        let addr1 = client.get_shard_leader(1).unwrap_or_default();
+        for _ in 0..threshold {
+            let id = RequestId::new();
+            client.record_failure(&id, RequestKind::Metadata, &addr1);
+        }
+
+        // 第一个 filer 的熔断器应打开
+        assert!(!client.breakers.check(&addr1));
+
+        // 第二个 filer 的熔断器应仍然关闭（可用）
+        let addr2 = client.get_shard_leader(2).unwrap_or_default();
+        assert!(client.breakers.check(&addr2));
+
+        // 对第一个 shard 的请求应该被拒绝
+        let ctx1 = create_test_context(RequestKind::Metadata);
+        let result1 = client.submit_metadata_request(ctx1, 1);
+        assert!(result1.is_err());
+
+        // 对第二个 shard 的请求应该仍然可以提交
+        let ctx2 = create_test_context(RequestKind::Metadata);
+        let result2 = client.submit_metadata_request(ctx2, 2);
+        assert!(result2.is_ok());
     }
 
     #[test]

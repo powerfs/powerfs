@@ -110,11 +110,41 @@ impl PowerFsNetClient {
 
         info!("Connecting to {}:{}", self.config.addr, self.config.port);
 
+        // Connect via tokio TcpStream, then enable TCP keepalive through
+        // socket2 using the raw fd.  Keepalive detects half-dead
+        // connections (idle 60s -> every 10s, 3 retries) that otherwise
+        // reveal themselves as "early eof" on the first user write after
+        // a far-end silent close (NAT idle drop, LB idle timeout, etc.).
         let connect_result =
             tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await;
 
         let mut tcp_stream = connect_result.map_err(|_| NetError::Timeout)??;
         tcp_stream.set_nodelay(true)?;
+
+        #[cfg(unix)]
+        {
+            use socket2::TcpKeepalive;
+            use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+            // SAFETY: fd belongs to tcp_stream and is valid.  We temporarily
+            // re-wrap as socket2 to configure keepalive, then forget the
+            // duplicate fd so the socket lives on owned by tcp_stream.
+            let raw_fd = tcp_stream.as_raw_fd();
+            let sock2 = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+            let ka = TcpKeepalive::new()
+                .with_time(Duration::from_secs(60))
+                .with_interval(Duration::from_secs(10))
+                .with_retries(3);
+            if let Err(e) = sock2.set_tcp_keepalive(&ka) {
+                warn!("failed to set TCP keepalive (continuing): {}", e);
+            }
+            // Don't close the fd on drop – it still belongs to tcp_stream.
+            let _ = sock2.into_raw_fd();
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-unix platforms still get nodelay above; skip keepalive.
+            let _ = socket2::TcpKeepalive::new();
+        }
 
         // Send handshake
         let req = HandshakeRequest::new(self.config.client_type, self.config.client_id);
@@ -189,7 +219,7 @@ impl PowerFsNetClient {
             if !connected {
                 drop(stream);
                 warn!("send_request: stream broken, reconnecting...");
-                self.reconnect().await?;
+                self.reconnect_internal().await?;
             }
         }
 
@@ -284,8 +314,11 @@ impl PowerFsNetClient {
         }
     }
 
-    /// Reconnect to the server (called after a connection failure)
-    async fn reconnect(&self) -> NetResult<()> {
+    /// Reconnect to the server (called after a connection failure or a
+    /// health-check ping failure).  Up to 3 attempts with short linear
+    /// backoff; on final failure the caller should try again later (we
+    /// intentionally do not loop forever here).
+    pub async fn reconnect_internal(&self) -> NetResult<()> {
         // Try up to 3 times with backoff
         for attempt in 1..=3 {
             info!("Reconnect attempt {}", attempt);

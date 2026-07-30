@@ -21,6 +21,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
+crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
+dashmap = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 
