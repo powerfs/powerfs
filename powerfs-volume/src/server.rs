@@ -13,6 +13,7 @@ use powerfs_common::{
     types::{NeedleId, NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
@@ -82,9 +83,15 @@ impl VolumeServer {
 
         // Range lease cleanup task: every 5 seconds remove expired leases
         let lease_mgr = self.range_lease_mgr.clone();
+        let shutdown_flag = lease_mgr.shutdown_flag();
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                interval.tick().await;
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    info!("Volume lease cleanup task shutting down");
+                    break;
+                }
                 let removed = lease_mgr.cleanup_expired();
                 if removed > 0 {
                     debug!("Cleaned up {} expired range leases", removed);

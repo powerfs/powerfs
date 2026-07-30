@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,11 +33,18 @@ impl RangeLease {
     }
 }
 
+#[derive(Clone)]
 pub struct RangeLeaseManager {
     leases: Arc<RwLock<HashMap<String, RangeLease>>>,
     inode_index: Arc<RwLock<HashMap<u64, Vec<String>>>>,
-    epoch_counter: AtomicU64,
+    /// holder -> set of tokens held by this client (for fast disconnect cleanup)
+    holder_index: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// total active holders count
+    holder_count: Arc<AtomicU64>,
+    epoch_counter: Arc<AtomicU64>,
     default_stripe_size: u64,
+    /// Background cleanup task shutdown flag
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl RangeLeaseManager {
@@ -45,13 +52,26 @@ impl RangeLeaseManager {
         Self {
             leases: Arc::new(RwLock::new(HashMap::new())),
             inode_index: Arc::new(RwLock::new(HashMap::new())),
-            epoch_counter: AtomicU64::new(0),
+            holder_index: Arc::new(RwLock::new(HashMap::new())),
+            holder_count: Arc::new(AtomicU64::new(0)),
+            epoch_counter: Arc::new(AtomicU64::new(0)),
             default_stripe_size,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(64 * 1024 * 1024)
+    }
+
+    /// Clone the shutdown flag for background tasks to monitor
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown_flag.clone()
+    }
+
+    /// Signal the background cleanup task to stop (used during graceful shutdown)
+    pub fn request_shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 
     fn generate_token(&self) -> String {
@@ -82,6 +102,7 @@ impl RangeLeaseManager {
 
         let mut leases = self.leases.write().unwrap();
         let mut inode_index = self.inode_index.write().unwrap();
+        let mut holder_index = self.holder_index.write().unwrap();
 
         // Check for conflicts with existing leases on the same inode
         if let Some(existing_tokens) = inode_index.get(&inode) {
@@ -143,7 +164,17 @@ impl RangeLeaseManager {
         let _ = granted_stripes;
 
         leases.insert(token.clone(), lease.clone());
-        inode_index.entry(inode).or_default().push(token);
+        inode_index.entry(inode).or_default().push(token.clone());
+
+        // Update holder index for fast disconnect lookup
+        // First-lease-for-this-holder: create the set and bump holder_count
+        // Subsequent leases: just insert the token without bumping holder_count
+        let holder_entry = holder_index.entry(client_id.to_string()).or_default();
+        let is_new_holder = holder_entry.is_empty();
+        holder_entry.insert(token.clone());
+        if is_new_holder {
+            self.holder_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(lease)
     }
@@ -184,6 +215,18 @@ impl RangeLeaseManager {
             tokens.retain(|t| t != token);
             if tokens.is_empty() {
                 inode_index.remove(&inode);
+            }
+        }
+
+        drop(inode_index);
+
+        // Also remove from holder_index
+        let mut holder_index = self.holder_index.write().unwrap();
+        if let Some(tokens) = holder_index.get_mut(holder) {
+            tokens.remove(token);
+            if tokens.is_empty() {
+                holder_index.remove(holder);
+                self.holder_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -273,6 +316,69 @@ impl RangeLeaseManager {
         leases.values().filter(|l| !l.is_expired()).count()
     }
 
+    /// Number of distinct holders currently holding non-expired leases
+    pub fn get_active_holders_count(&self) -> u64 {
+        self.holder_count.load(Ordering::Relaxed)
+    }
+
+    /// Get all non-expired leases held by a specific client
+    pub fn get_leases_by_holder(&self, holder: &str) -> Vec<RangeLease> {
+        let leases = self.leases.read().unwrap();
+        let holder_index = self.holder_index.read().unwrap();
+        let mut result = Vec::new();
+
+        if let Some(tokens) = holder_index.get(holder) {
+            for token in tokens {
+                if let Some(lease) = leases.get(token) {
+                    if !lease.is_expired() {
+                        result.push(lease.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Disconnect a holder (client): forcibly remove all leases held by this client.
+    /// Used for failover when a client connection is lost.
+    /// Returns the number of leases released.
+    pub fn disconnect_holder(&self, holder: &str) -> usize {
+        let mut leases = self.leases.write().unwrap();
+        let mut inode_index = self.inode_index.write().unwrap();
+        let mut holder_index = self.holder_index.write().unwrap();
+
+        let tokens_to_remove: Vec<String> = holder_index
+            .get(holder)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut removed = 0usize;
+        for token in tokens_to_remove {
+            if let Some(lease) = leases.remove(&token) {
+                removed += 1;
+                if let Some(tokens) = inode_index.get_mut(&lease.inode) {
+                    tokens.retain(|t| t != &token);
+                    if tokens.is_empty() {
+                        inode_index.remove(&lease.inode);
+                    }
+                }
+            }
+            if let Some(tokens) = holder_index.get_mut(holder) {
+                tokens.remove(&token);
+            }
+        }
+
+        // Clean up holder entry if empty
+        if let Some(tokens) = holder_index.get_mut(holder) {
+            if tokens.is_empty() {
+                holder_index.remove(holder);
+                self.holder_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        removed
+    }
+
     pub fn get_leases_for_inode(&self, inode: u64) -> Vec<RangeLease> {
         let leases = self.leases.read().unwrap();
         let inode_index = self.inode_index.read().unwrap();
@@ -293,6 +399,7 @@ impl RangeLeaseManager {
     pub fn cleanup_expired(&self) -> usize {
         let mut leases = self.leases.write().unwrap();
         let mut inode_index = self.inode_index.write().unwrap();
+        let mut holder_index = self.holder_index.write().unwrap();
         let mut removed = 0usize;
 
         let expired_tokens: Vec<String> = leases
@@ -304,10 +411,19 @@ impl RangeLeaseManager {
         for token in expired_tokens {
             if let Some(lease) = leases.remove(&token) {
                 removed += 1;
+                // Remove from inode index
                 if let Some(tokens) = inode_index.get_mut(&lease.inode) {
                     tokens.retain(|t| t != &token);
                     if tokens.is_empty() {
                         inode_index.remove(&lease.inode);
+                    }
+                }
+                // Remove from holder index
+                if let Some(tokens) = holder_index.get_mut(&lease.holder) {
+                    tokens.remove(&token);
+                    if tokens.is_empty() {
+                        holder_index.remove(&lease.holder);
+                        self.holder_count.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -385,5 +501,247 @@ mod tests {
         let removed = mgr.cleanup_expired();
         assert!(removed >= 1);
         assert_eq!(mgr.get_active_leases_count(), 0);
+    }
+
+    #[test]
+    fn test_shared_lease_multiple_holders() {
+        let mgr = RangeLeaseManager::with_defaults();
+        // Shared (read) lease should allow multiple holders
+        let l1 = mgr.acquire(1, 0, 4, "client-a", 30000, false, 0).unwrap();
+        let l2 = mgr.acquire(1, 0, 4, "client-b", 30000, false, 0).unwrap();
+        assert_ne!(l1.token, l2.token);
+        assert_eq!(mgr.get_active_leases_count(), 2);
+    }
+
+    #[test]
+    fn test_shared_vs_exclusive_conflict() {
+        let mgr = RangeLeaseManager::with_defaults();
+        // Shared lease first
+        let _l1 = mgr.acquire(1, 0, 4, "client-a", 30000, false, 0).unwrap();
+        // Exclusive lease on same stripe should fail
+        let result = mgr.acquire(1, 0, 4, "client-b", 30000, true, 0);
+        assert!(result.is_err());
+        // Another shared lease should succeed
+        let l3 = mgr.acquire(1, 0, 4, "client-c", 30000, false, 0).unwrap();
+        assert_eq!(mgr.get_active_leases_count(), 2);
+        let _ = l3;
+    }
+
+    #[test]
+    fn test_different_inodes_no_conflict() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let l1 = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let l2 = mgr.acquire(2, 0, 4, "client-a", 30000, true, 0).unwrap();
+        assert_ne!(l1.inode, l2.inode);
+        assert_eq!(mgr.get_active_leases_count(), 2);
+    }
+
+    #[test]
+    fn test_validate_token_for_inode() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let lease = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+
+        // Valid inode and holder
+        assert!(mgr
+            .validate_token_for_inode(&lease.token, "client-a", 1)
+            .is_ok());
+        // Wrong inode
+        assert!(mgr
+            .validate_token_for_inode(&lease.token, "client-a", 2)
+            .is_err());
+        // Wrong holder
+        assert!(mgr
+            .validate_token_for_inode(&lease.token, "client-b", 1)
+            .is_err());
+        // Bad token
+        assert!(mgr
+            .validate_token_for_inode("bad-token", "client-a", 1)
+            .is_err());
+    }
+
+    #[test]
+    fn test_renew_wrong_holder() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let lease = mgr.acquire(1, 0, 4, "client-a", 1000, true, 0).unwrap();
+        // Renew with wrong holder should fail
+        let result = mgr.renew(&lease.token, "client-b", 30000);
+        assert!(result.is_err());
+        // Renew with correct holder should succeed
+        let result = mgr.renew(&lease.token, "client-a", 30000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_release_wrong_holder() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let lease = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        // Release with wrong holder should fail
+        let result = mgr.release(&lease.token, "client-b");
+        assert!(result.is_err());
+        // Release with correct holder should succeed
+        let result = mgr.release(&lease.token, "client-a");
+        assert!(result.is_ok());
+        assert_eq!(mgr.get_active_leases_count(), 0);
+    }
+
+    #[test]
+    fn test_get_leases_for_inode() {
+        let mgr = RangeLeaseManager::with_defaults();
+        mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        mgr.acquire(1, 8, 4, "client-b", 30000, false, 0).unwrap();
+        mgr.acquire(2, 0, 4, "client-c", 30000, true, 0).unwrap();
+
+        let leases_inode1 = mgr.get_leases_for_inode(1);
+        assert_eq!(leases_inode1.len(), 2);
+        let leases_inode2 = mgr.get_leases_for_inode(2);
+        assert_eq!(leases_inode2.len(), 1);
+        let leases_inode3 = mgr.get_leases_for_inode(3);
+        assert_eq!(leases_inode3.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_only_removes_expired() {
+        let mgr = RangeLeaseManager::with_defaults();
+        // One expired lease
+        let _expired = mgr.acquire(1, 0, 4, "client-a", 1, true, 0).unwrap();
+        // One valid lease
+        let _valid = mgr.acquire(2, 0, 4, "client-b", 30000, true, 0).unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let removed = mgr.cleanup_expired();
+        assert_eq!(removed, 1);
+        // Valid lease should still exist
+        assert_eq!(mgr.get_active_leases_count(), 1);
+    }
+
+    #[test]
+    fn test_multiple_stripe_lease() {
+        let mgr = RangeLeaseManager::with_defaults();
+        // Acquire lease covering multiple stripes
+        let lease = mgr.acquire(1, 0, 8, "client-a", 30000, true, 0).unwrap();
+        assert_eq!(lease.stripe_start, 0);
+        assert_eq!(lease.stripe_count, 8);
+
+        // All covered stripes should be valid
+        for stripe in 0..8 {
+            assert!(mgr.validate_token(&lease.token, "client-a", stripe).is_ok());
+        }
+
+        // Uncovered stripe should be invalid
+        assert!(mgr.validate_token(&lease.token, "client-a", 8).is_err());
+    }
+
+    #[test]
+    fn test_disconnect_holder() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let l1 = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let _l2 = mgr.acquire(2, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let l3 = mgr.acquire(3, 0, 4, "client-b", 30000, true, 0).unwrap();
+
+        assert_eq!(mgr.get_active_leases_count(), 3);
+        assert_eq!(mgr.get_active_holders_count(), 2);
+
+        // Disconnect client-a - should release all their leases
+        let removed = mgr.disconnect_holder("client-a");
+        assert_eq!(removed, 2);
+        assert_eq!(mgr.get_active_leases_count(), 1);
+        assert_eq!(mgr.get_active_holders_count(), 1);
+
+        // client-b's lease still valid
+        assert!(mgr
+            .validate_token_for_inode(&l3.token, "client-b", 3)
+            .is_ok());
+
+        // client-a's token no longer valid
+        assert!(mgr
+            .validate_token_for_inode(&l1.token, "client-a", 1)
+            .is_err());
+
+        // Can now acquire what client-a held
+        assert!(mgr.acquire(1, 0, 4, "client-c", 30000, true, 0).is_ok());
+    }
+
+    #[test]
+    fn test_get_leases_by_holder() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let _l1 = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let _l2 = mgr.acquire(2, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let _l3 = mgr.acquire(3, 0, 4, "client-b", 30000, true, 0).unwrap();
+
+        let a_leases = mgr.get_leases_by_holder("client-a");
+        assert_eq!(a_leases.len(), 2);
+        let b_leases = mgr.get_leases_by_holder("client-b");
+        assert_eq!(b_leases.len(), 1);
+        let c_leases = mgr.get_leases_by_holder("client-c");
+        assert_eq!(c_leases.len(), 0);
+    }
+
+    #[test]
+    fn test_disconnect_holder_empty() {
+        let mgr = RangeLeaseManager::with_defaults();
+        // Disconnect unknown holder - no-op
+        let removed = mgr.disconnect_holder("nobody");
+        assert_eq!(removed, 0);
+        assert_eq!(mgr.get_active_holders_count(), 0);
+    }
+
+    #[test]
+    fn test_holder_count_updates_on_release() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let l1 = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+        let _l2 = mgr.acquire(2, 0, 4, "client-a", 30000, true, 0).unwrap();
+
+        assert_eq!(mgr.get_active_holders_count(), 1);
+        assert_eq!(mgr.get_active_leases_count(), 2);
+
+        // Release one of client-a's leases - holder still active
+        mgr.release(&l1.token, "client-a").unwrap();
+        assert_eq!(mgr.get_active_holders_count(), 1);
+        assert_eq!(mgr.get_active_leases_count(), 1);
+
+        // Release the last - holder count should drop to 0
+        let remaining = mgr.get_leases_by_holder("client-a");
+        mgr.release(&remaining[0].token, "client-a").unwrap();
+        assert_eq!(mgr.get_active_holders_count(), 0);
+        assert_eq!(mgr.get_active_leases_count(), 0);
+    }
+
+    #[test]
+    fn test_following_disconnect_new_client_can_acquire() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let _l1 = mgr.acquire(1, 0, 4, "client-a", 30000, true, 0).unwrap();
+
+        // client-b cannot acquire due to conflict
+        let result = mgr.acquire(1, 0, 4, "client-b", 30000, true, 0);
+        assert!(result.is_err());
+
+        // Disconnect client-a
+        mgr.disconnect_holder("client-a");
+
+        // Now client-b can acquire
+        let result = mgr.acquire(1, 0, 4, "client-b", 30000, true, 0);
+        assert!(result.is_ok());
+        assert_eq!(mgr.get_active_leases_count(), 1);
+    }
+
+    #[test]
+    fn test_expired_leases_do_not_inflate_holder_count() {
+        let mgr = RangeLeaseManager::with_defaults();
+        let _l1 = mgr.acquire(1, 0, 4, "client-a", 10, true, 0).unwrap();
+
+        assert_eq!(mgr.get_active_holders_count(), 1);
+
+        // Wait for lease to expire
+        std::thread::sleep(Duration::from_millis(50));
+
+        // After expiration, holder_count still 1 until cleanup runs
+        // but active leases should be 0
+        assert_eq!(mgr.get_active_leases_count(), 0);
+
+        // Run cleanup
+        let removed = mgr.cleanup_expired();
+        assert_eq!(removed, 1);
+        assert_eq!(mgr.get_active_holders_count(), 0);
     }
 }

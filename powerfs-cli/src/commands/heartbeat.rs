@@ -22,6 +22,10 @@ pub struct HeartbeatArgs {
     #[arg(long, default_value = "8081")]
     grpc_port: u32,
 
+    /// Net (PowerFS protocol) port
+    #[arg(long, default_value = "8901")]
+    net_port: u32,
+
     /// Rack name
     #[arg(long, default_value = "default")]
     rack: String,
@@ -46,8 +50,8 @@ pub struct HeartbeatArgs {
 pub async fn heartbeat(mut client: MasterClient, args: HeartbeatArgs) -> super::CommandResult {
     println!("Sending heartbeat from volume server: {}", args.id);
     println!(
-        "  IP: {}, Port: {}, GRPC: {}",
-        args.ip, args.port, args.grpc_port
+        "  IP: {}, Port: {}, GRPC: {}, Net: {}",
+        args.ip, args.port, args.grpc_port, args.net_port
     );
     println!("  Data Center: {}, Rack: {}", args.data_center, args.rack);
     println!(
@@ -67,6 +71,7 @@ pub async fn heartbeat(mut client: MasterClient, args: HeartbeatArgs) -> super::
     let ip = args.ip.clone();
     let port = args.port;
     let grpc_port = args.grpc_port;
+    let net_port = args.net_port;
     let rack = args.rack.clone();
     let data_center = args.data_center.clone();
     let public_url = args.public_url.clone();
@@ -91,6 +96,7 @@ pub async fn heartbeat(mut client: MasterClient, args: HeartbeatArgs) -> super::
                 has_no_volumes: false,
                 grpc_port,
                 id: id.clone(),
+                net_port,
             };
 
             if tx.send(heartbeat).await.is_err() {

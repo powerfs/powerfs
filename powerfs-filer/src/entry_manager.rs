@@ -25,7 +25,7 @@ impl EntryManager {
         key: &str,
         data: &[u8],
         fid: &str,
-        volume_id: u32,
+        volume_id: u64,
     ) -> Result<EntryInfo> {
         if self.bucket_manager.get_bucket(bucket).await.is_none() {
             return Err(PowerFsError::DirectoryNotFound(bucket.to_string()));

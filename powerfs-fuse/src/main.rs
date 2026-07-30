@@ -2,13 +2,13 @@ use clap::Parser;
 use log::{error, info, warn};
 use std::ffi::CString;
 use std::io::Write;
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use powerfs_fuse::FuseApp;
-
 use powerfs_common::config::PowerFsConfig;
+use powerfs_fuse::FuseApp;
 
 static MOUNT_POINT_PATH: OnceLock<CString> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -17,71 +17,40 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[command(name = "powerfs-fuse")]
 #[command(about = "PowerFS FUSE client - mount PowerFS as a filesystem via powerfs-net")]
 struct Args {
-    /// Master server addresses (e.g. localhost)
+    /// 配置文件路径（必填，所有端口和地址必须在配置文件中设置）
+    #[arg(long, short = 'c', required = true)]
+    config: String,
+
+    /// 可选：覆盖Mount点路径
     #[arg(long)]
-    master: Option<Vec<String>>,
+    mount_point: Option<String>,
 
-    /// Master powerfs-net port
-    #[arg(long, default_value = "9334")]
-    master_net_port: u16,
-
-    /// Volume powerfs-net port
-    #[arg(long, default_value = "8081")]
-    volume_net_port: u16,
-
-    /// Filer powerfs-net port
-    #[arg(long, default_value = "9334")]
-    filer_net_port: u16,
-
-    /// Filer address (host:port or just host)
-    #[arg(long, default_value = "")]
-    filer_addr: String,
-
-    /// Mount point path
+    /// 可选：覆盖Collection名称
     #[arg(long)]
-    mount_point: String,
+    collection: Option<String>,
 
-    /// Collection name
-    #[arg(long, default_value = "default")]
-    collection: String,
+    /// 可选：覆盖Replication设置
+    #[arg(long)]
+    replication: Option<String>,
 
-    /// Replication setting (e.g. "000" for no replicas)
-    #[arg(long, default_value = "000")]
-    replication: String,
-
-    /// Verbose logging
+    /// 启用详细日志
     #[arg(short, long)]
     verbose: bool,
 
-    /// Run as container PID 1: install SIGTERM/SIGINT handlers,
-    /// unmount on exit so the kernel wakes up any blocked FUSE callers
-    /// instead of leaving them in D (disk-sleep) state.
+    /// 容器模式：安装SIGTERM/SIGINT处理器
     #[arg(long)]
     container: bool,
 
-    /// Log file path (if not specified, logs only to stdout)
+    /// 日志文件路径
     #[arg(long)]
     log_file: Option<String>,
 
-    /// Max log file size in MB before rotation (default: 10MB)
-    #[arg(long, default_value = "10")]
-    log_max_size_mb: u64,
-
-    /// Number of rotated log files to keep (default: 5)
-    #[arg(long, default_value = "5")]
-    log_max_files: usize,
-
-    /// Enable data integrity verification (MD5 check after write, default: false)
-    #[arg(long, default_value = "false")]
+    /// 启用数据完整性验证
+    #[arg(long)]
     verify_data: bool,
-
-    #[arg(long, short = 'c')]
-    config: Option<String>,
 }
 
-/// Async-signal-safe handler: only calls write(2) and umount2(2).
-/// Sets a flag so the main loop can exit gracefully after the FUSE session
-/// unblocks (umount2 causes /dev/fuse reads to return ENODEV).
+/// 异步信号安全的处理器：只调用write(2)和umount2(2)
 extern "C" fn handle_signal(sig: i32) {
     let sig_name = match sig {
         libc::SIGTERM => "SIGTERM",
@@ -113,87 +82,81 @@ fn install_signal_handlers(mount_point: &str) {
     info!("Container mode: signal handlers installed (SIGTERM/SIGINT/SIGHUP trigger graceful umount + exit)");
 }
 
+/// 从配置文件加载配置，失败时直接退出
+fn load_config(config_path: &str) -> PowerFsConfig {
+    match PowerFsConfig::load_or_error(config_path) {
+        Ok(cfg) => {
+            info!("Successfully loaded configuration from: {}", config_path);
+            cfg
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to load configuration: {}", e);
+            eprintln!("You must provide a valid configuration file with all required ports and addresses.");
+            eprintln!("Use PowerFsConfig::generate_template() to create a template configuration.");
+            process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
+    // 强制加载配置文件，失败直接退出
     let cfg = load_config(&args.config);
-    let fuse_cfg = cfg.fuse;
+    let fuse_cfg = cfg.fuse.clone();
 
-    let master_addrs = if let Some(addrs) = &args.master {
-        if addrs.is_empty() {
-            fuse_cfg.master_addresses.clone()
-        } else {
-            addrs.clone()
-        }
-    } else {
-        fuse_cfg.master_addresses.clone()
-    };
+    // 从配置获取所有必需的地址和端口
+    let master_addrs = fuse_cfg.master_addresses.clone();
+    let mount_point = args
+        .mount_point
+        .unwrap_or_else(|| fuse_cfg.mount_point.clone());
+    let collection = args
+        .collection
+        .unwrap_or_else(|| fuse_cfg.collection.clone());
+    let replication = args
+        .replication
+        .unwrap_or_else(|| fuse_cfg.replication.clone());
 
-    let mount_point = if !args.mount_point.is_empty() {
-        args.mount_point.clone()
-    } else {
-        fuse_cfg.mount_point.clone()
-    };
+    let master_net_port = fuse_cfg.master_net_port;
+    let volume_net_port = fuse_cfg.volume_net_port;
+    let volume_addrs = fuse_cfg.volume_addresses.clone();
 
-    let collection = if !args.collection.is_empty() && args.collection != "default" {
-        args.collection.clone()
-    } else {
-        fuse_cfg.collection.clone()
-    };
-
-    let replication = if !args.replication.is_empty() && args.replication != "000" {
-        args.replication.clone()
-    } else {
-        fuse_cfg.replication.clone()
-    };
-
-    let master_net_port = args.master_net_port;
-    let volume_net_port = args.volume_net_port;
-
-    // Determine filer address: CLI arg > config > default to master address
-    let (filer_addr, filer_net_port) = if !args.filer_addr.is_empty() {
-        // Parse "host:port" or just "host" from CLI
-        let parts: Vec<&str> = args.filer_addr.split(':').collect();
+    // 从配置获取filer地址（取第一个）
+    let (filer_addr, filer_net_port) = if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
+        // 解析 host:port 或 仅host
+        let parts: Vec<&str> = first_filer.split(':').collect();
         let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(args.filer_net_port);
-        (host, port)
-    } else if !fuse_cfg.filer_addresses.is_empty() {
-        // Use first filer from config
-        let filer_full = &fuse_cfg.filer_addresses[0];
-        let parts: Vec<&str> = filer_full.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(args.filer_net_port);
-        (host, port)
+        (host, fuse_cfg.filer_net_port)
     } else {
-        // Default to master address
-        let default_master = "127.0.0.1".to_string();
-        let master_full = master_addrs.first().unwrap_or(&default_master);
-        let parts: Vec<&str> = master_full.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        (host, args.filer_net_port)
+        // 这个分支不会执行，因为validate已经检查了filer_addresses非空
+        eprintln!("ERROR: filer_addresses is empty in configuration");
+        process::exit(1);
     };
 
-    let verbose = if args.verbose { true } else { fuse_cfg.verbose };
-    let container = if args.container {
-        true
-    } else {
-        fuse_cfg.container
-    };
-
+    let verbose = args.verbose || fuse_cfg.verbose;
+    let container = args.container || fuse_cfg.container;
     let log_level = if verbose { "debug" } else { "info" };
+    let log_file = args.log_file.clone().or(fuse_cfg.log_file);
 
-    let log_file = if args.log_file.is_some() {
-        args.log_file.clone()
-    } else {
-        fuse_cfg.log_file.clone()
-    };
+    // 验证配置完整性
+    if master_addrs.is_empty() {
+        eprintln!("ERROR: fuse.master_addresses must not be empty");
+        process::exit(1);
+    }
+    if volume_addrs.is_empty() {
+        eprintln!("ERROR: fuse.volume_addresses must not be empty");
+        process::exit(1);
+    }
+    if master_net_port == 0 {
+        eprintln!("ERROR: fuse.master_net_port must be set");
+        process::exit(1);
+    }
+    if volume_net_port == 0 {
+        eprintln!("ERROR: fuse.volume_net_port must be set");
+        process::exit(1);
+    }
 
+    // 配置日志
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
 
@@ -234,9 +197,11 @@ fn main() {
         .log_startup();
 
     info!("PowerFS FUSE Client starting (powerfs-net)...");
+    info!("  Config file: {}", args.config);
     info!("  Masters: {}", master_addrs.join(", "));
     info!("  Master net port: {}", master_net_port);
     info!("  Filer: {}:{}", filer_addr, filer_net_port);
+    info!("  Volume addresses: {:?}", volume_addrs);
     info!("  Volume net port: {}", volume_net_port);
     info!("  Mount point: {}", mount_point);
     info!("  Collection: {}", collection);
@@ -244,28 +209,7 @@ fn main() {
     info!("  Container mode: {}", container);
     info!("  Data verification: {}", args.verify_data);
 
-    fn load_config(config_path: &Option<String>) -> PowerFsConfig {
-        match config_path {
-            Some(path) => match PowerFsConfig::load_from_file(path) {
-                Ok(cfg) => {
-                    if let Err(e) = cfg.validate() {
-                        warn!("Config validation failed: {}, using defaults", e);
-                        PowerFsConfig::default()
-                    } else {
-                        info!("Loaded config from: {}", path);
-                        cfg
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to load config file: {}, using defaults", e);
-                    PowerFsConfig::default()
-                }
-            },
-            None => PowerFsConfig::default(),
-        }
-    }
-
-    // Create mount point directory if it doesn't exist
+    // 创建挂载点目录
     let mount_path = std::path::Path::new(&mount_point);
     if !mount_path.exists() {
         std::fs::create_dir_all(mount_path).expect("Failed to create mount point directory");
@@ -274,15 +218,12 @@ fn main() {
         panic!("Mount point path is a file, not a directory");
     }
 
-    // Container mode: SIGTERM (e.g. from `docker stop`) triggers umount so
-    // processes blocked on FUSE reads/writes are woken instead of staying in
-    // D state forever. The session's /dev/fuse read then returns ENODEV and
-    // run() returns naturally — no signal-driven termination.
+    // 容器模式：SIGTERM触发umount
     if container {
         install_signal_handlers(&mount_point);
     }
 
-    // Create tokio runtime
+    // 创建tokio runtime
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let runtime_arc = Arc::new(runtime);
 
@@ -294,6 +235,7 @@ fn main() {
             &replication,
             master_net_port,
             volume_net_port,
+            volume_addrs,
             filer_addr,
             filer_net_port,
             runtime_arc.clone(),
@@ -314,9 +256,7 @@ fn main() {
         info!("Shutdown requested by signal, cleaning up...");
     }
 
-    // Final cleanup: ensure the mount point is unmounted even if the session
-    // exited abnormally. This is critical for container mode — without it,
-    // blocked FUSE callers stay in D state.
+    // 最终清理：确保挂载点被卸载
     let c_path = CString::new(mount_point.as_str()).unwrap();
     let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_FORCE) };
     if ret == 0 {
@@ -324,7 +264,6 @@ fn main() {
     } else {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINVAL) {
-            // EINVAL means "not mounted", which is fine
             warn!(
                 "umount2 on exit returned: {} ({})",
                 err,

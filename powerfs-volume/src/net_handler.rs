@@ -23,8 +23,10 @@ impl VolumeNetHandler {
         session_client_id: u64,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        // inode for lease validation (lease is registered by inode, not file_key)
+        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
         let holder_client_id = dec
@@ -32,9 +34,10 @@ impl VolumeNetHandler {
             .unwrap_or_else(|_| session_client_id.to_string());
 
         info!(
-            "NET_WRITE_NEEDLE: volume_id={}, file_key={}, size={}, has_lease={}, holder={}",
+            "NET_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, size={}, has_lease={}, holder={}",
             volume_id,
             file_key,
+            inode,
             data.len(),
             !lease_token.is_empty(),
             holder_client_id
@@ -45,7 +48,7 @@ impl VolumeNetHandler {
             let validation_result = lease_mgr.validate_token_with_grace_period(
                 &lease_token,
                 &holder_client_id,
-                file_key,
+                inode,
                 3000,
             );
             match validation_result {
@@ -126,7 +129,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
 
         info!(
@@ -189,7 +192,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
 
         info!(
@@ -250,17 +253,50 @@ impl VolumeNetHandler {
     async fn handle_batch_write_needle(
         &self,
         msg: &NetMessage,
+        session_client_id: u64,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
         let entries = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
+        let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let holder_client_id = dec
+            .next_string(FieldId::ClientId)
+            .unwrap_or_else(|_| session_client_id.to_string());
 
         info!(
-            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, entries={}",
-            volume_id, file_key, entries
+            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, entries={}, has_lease={}, holder={}",
+            volume_id, file_key, inode, entries, !lease_token.is_empty(), holder_client_id
         );
+
+        if !lease_token.is_empty() {
+            let lease_mgr = self.volume_server.range_lease_mgr.clone();
+            let validation_result = lease_mgr.validate_token_with_grace_period(
+                &lease_token,
+                &holder_client_id,
+                inode,
+                3000,
+            );
+            match validation_result {
+                Ok(()) => {
+                    debug!(
+                        "NET_BATCH_WRITE_NEEDLE: lease validated for file_key={}",
+                        file_key
+                    );
+                }
+                Err(e) => {
+                    warn!("NET_BATCH_WRITE_NEEDLE: lease validation failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
 
         let storage_manager = self.volume_server.storage_manager.clone();
         let vid = VolumeId(volume_id);
@@ -325,7 +361,7 @@ impl VolumeNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0) as u32;
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
         let offset = dec.next_u64(FieldId::Offset).unwrap_or(0) as i64;
         let size = dec.next_u64(FieldId::Size).unwrap_or(0);
@@ -431,6 +467,160 @@ impl VolumeNetHandler {
         }
     }
 
+    fn handle_acquire_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let stripe_start = dec.next_u64(FieldId::Offset).unwrap_or(0);
+        let stripe_count = dec.next_u64(FieldId::Limit).unwrap_or(1);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let exclusive = dec.next_u64(FieldId::Mode).unwrap_or(0) != 0;
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        info!(
+            "NET_ACQUIRE_LEASE: inode={}, stripe_start={}, stripe_count={}, client={}, exclusive={}",
+            inode, stripe_start, stripe_count, client_id, exclusive
+        );
+
+        match self.volume_server.range_lease_mgr.acquire(
+            inode,
+            stripe_start,
+            stripe_count,
+            &client_id,
+            duration_ms,
+            exclusive,
+            64 * 1024 * 1024,
+        ) {
+            Ok(lease) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::LeaseId, &lease.token)?;
+                enc.add_u64(FieldId::LeaseEpoch, lease.epoch);
+                enc.add_u64(FieldId::LeaseDuration, duration_ms);
+
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                warn!("NET_ACQUIRE_LEASE failed: {}", e);
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::Owner, &e)?;
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn handle_release_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+
+        info!("NET_RELEASE_LEASE: token={}, client={}", token, client_id);
+
+        if token.is_empty() {
+            return Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()));
+        }
+
+        match self
+            .volume_server
+            .range_lease_mgr
+            .release(&token, &client_id)
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new())),
+            Err(e) => {
+                warn!("NET_RELEASE_LEASE failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn handle_renew_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        info!(
+            "NET_RENEW_LEASE: token={}, client={}, duration_ms={}",
+            token, client_id, duration_ms
+        );
+
+        match self
+            .volume_server
+            .range_lease_mgr
+            .renew(&token, &client_id, duration_ms)
+        {
+            Ok(()) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::LeaseDuration, duration_ms);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                warn!("NET_RENEW_LEASE failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn handle_lookup_volume(&self, msg: &NetMessage) -> NetMessage {
+        info!("NET_LOOKUP_VOLUME: handling lookup volume request");
+
+        let response_json = r#"{"success":true,"data":{"locations":[]}}"#;
+        let response_bytes = response_json.as_bytes().to_vec();
+
+        Self::build_response(msg, STATUS_OK, response_bytes, Vec::new())
+    }
+
+    /// 处理 StatFs 请求：返回本 Volume 的容量统计
+    fn handle_statfs(&self, msg: &NetMessage) -> NetMessage {
+        info!("NET_STATFS: handling statfs request");
+
+        let storage = &self.volume_server.storage_manager;
+        let total_space = storage.total_space();
+        let used_space = storage.used_space();
+        let free_space = storage.free_space();
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Size, total_space);
+        enc.add_u64(FieldId::Blocks, used_space);
+        enc.add_u64(FieldId::Blksize, free_space);
+        enc.add_u64(FieldId::Count, storage.volume_count() as u64);
+
+        let body = enc.into_bytes();
+
+        info!(
+            "NET_STATFS: total={}, used={}, free={}, volumes={}",
+            total_space,
+            used_space,
+            free_space,
+            storage.volume_count()
+        );
+
+        Self::build_response(msg, STATUS_OK, body, Vec::new())
+    }
+
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         let flags = FrameFlags::new(FrameFlags::RESPONSE);
         let header = powerfs_net::FrameHeader::new(
@@ -455,18 +645,30 @@ impl PowerFsNetHandler for VolumeNetHandler {
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
-        debug!(
-            "NET_VOLUME: handling request {:?}, client_id={}, seq={}",
-            msg_type, client_id, msg.header.seq
+        info!(
+            "NET_VOLUME: handling request {:?} (raw={}), client_id={}, seq={}",
+            msg_type, msg.header.msg_type, client_id, msg.header.seq
+        );
+
+        let is_lookup = matches!(msg_type, MsgType::LookupVolume);
+        info!(
+            "NET_VOLUME: is_lookup_volume={}, msg_type_as_u16={}",
+            is_lookup,
+            msg_type.as_u16()
         );
 
         match msg_type {
             MsgType::WriteNeedle => self.handle_write_needle(msg, client_id).await,
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg).await,
+            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg, client_id).await,
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::ReleaseLease => self.handle_release_lease(msg),
+            MsgType::RenewLease => self.handle_renew_lease(msg),
+            MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
+            MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -490,6 +692,21 @@ impl PowerFsNetHandler for VolumeNetHandler {
 
     async fn on_disconnect(&self, client_id: u64) {
         info!("NET_VOLUME: client disconnected, id={}", client_id);
+        // Failover: release all leases held by this disconnected client.
+        // Leases may be registered under two forms:
+        //   1. "session-{client_id}" (auto-generated by the server for direct connections)
+        //   2. The client-provided holder string (e.g. UUID-based client_id)
+        // We release the session-scoped leases here; client-provided leases
+        // will be reclaimed by the background expired-lease cleanup task.
+        let lease_mgr = self.volume_server.range_lease_mgr.clone();
+        let session_holder = format!("session-{}", client_id);
+        let removed = lease_mgr.disconnect_holder(&session_holder);
+        if removed > 0 {
+            warn!(
+                "NET_VOLUME: released {} leases for disconnected session client={}",
+                removed, client_id
+            );
+        }
     }
 }
 
@@ -516,9 +733,17 @@ impl ServerRequestHandler for VolumeNetHandler {
             MsgType::WriteNeedle => self.handle_write_needle(msg, ctx.client.client_id).await,
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg).await,
+            MsgType::BatchWriteNeedle => {
+                self.handle_batch_write_needle(msg, ctx.client.client_id)
+                    .await
+            }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::ReleaseLease => self.handle_release_lease(msg),
+            MsgType::RenewLease => self.handle_renew_lease(msg),
+            MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
+            MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

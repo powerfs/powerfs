@@ -1,6 +1,9 @@
 use clap::Parser;
 use log::{error, info, warn};
-use powerfs_common::{config::PowerFsConfig, types::NodeId};
+use powerfs_common::{
+    config::PowerFsConfig,
+    types::{NodeId, VolumeId},
+};
 use powerfs_core::storage::StorageManager;
 use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
 use powerfs_volume::{
@@ -14,42 +17,37 @@ use tokio::time::Duration;
 #[command(version = "0.1.0")]
 #[command(about = "PowerFS Volume Server")]
 struct Args {
-    #[arg(short, long, default_value = "0.0.0.0:8081")]
-    grpc_address: String,
+    /// 配置文件路径（必填，所有端口和地址必须在配置文件中设置）
+    #[arg(short, long, required = true)]
+    config: String,
 
-    #[arg(long, default_value = "8080")]
-    http_port: u32,
-
-    /// powerfs-net binary protocol port (0 = disabled)
-    #[arg(long, default_value = "8081")]
-    net_port: u16,
-
-    #[arg(long, default_value = "volume-server-1")]
-    node_id: String,
-
-    #[arg(long, default_value = "default")]
-    data_center: String,
-
-    #[arg(long, default_value = "default")]
-    rack: String,
-
+    /// 可选：覆盖节点ID
     #[arg(long)]
-    master_address: Option<Vec<String>>,
+    node_id: Option<String>,
 
-    #[arg(long, default_value = "./data")]
-    data_dir: String,
+    /// 可选：覆盖数据中心
+    #[arg(long)]
+    data_center: Option<String>,
 
+    /// 可选：覆盖机架
+    #[arg(long)]
+    rack: Option<String>,
+
+    /// 可选：覆盖数据目录
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// 可选：覆盖卷大小
     #[arg(long)]
     volume_size: Option<u64>,
 
+    /// 可选：覆盖初始卷数量
     #[arg(long)]
     initial_volume_count: Option<u32>,
 
-    #[arg(long, default_value = "true")]
-    register_with_master: bool,
-
-    #[arg(long, short = 'c')]
-    config: Option<String>,
+    /// 可选：是否注册到Master
+    #[arg(long)]
+    register_with_master: Option<bool>,
 }
 
 #[tokio::main]
@@ -57,9 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let cfg = load_config(&args.config);
-    let volume_cfg = cfg.volume;
+    let volume_cfg = cfg.volume.clone();
 
-    let log_level = cfg.global.log_level;
+    let log_level = cfg.global.log_level.clone();
     env_logger::Builder::new()
         .filter_level(match log_level.as_str() {
             "debug" => log::LevelFilter::Debug,
@@ -72,39 +70,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
 
-    let grpc_address = if !args.grpc_address.is_empty() && args.grpc_address != "0.0.0.0:8081" {
-        args.grpc_address.clone()
-    } else {
-        format!("{}:{}", "0.0.0.0", volume_cfg.grpc_port)
-    };
+    // 从配置文件获取所有必需值 - 不再使用硬编码默认值
+    let grpc_port = volume_cfg.grpc_port;
+    let http_port = volume_cfg.http_port;
+    let net_port = volume_cfg.net_port;
 
-    let http_port = if args.http_port != 8080 {
-        args.http_port
-    } else {
-        volume_cfg.http_port as u32
-    };
+    let node_id = args
+        .node_id
+        .clone()
+        .unwrap_or_else(|| volume_cfg.node_id.clone());
 
-    let node_id = if !args.node_id.is_empty() && args.node_id != "volume-server-1" {
-        args.node_id.clone()
-    } else {
-        volume_cfg.node_id.clone()
-    };
+    let data_center = args
+        .data_center
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
-    let master_address = if let Some(addrs) = &args.master_address {
-        if addrs.is_empty() {
-            volume_cfg.master_addresses.clone()
-        } else {
-            addrs.clone()
-        }
-    } else {
-        volume_cfg.master_addresses.clone()
-    };
+    let rack = args.rack.clone().unwrap_or_else(|| "default".to_string());
 
-    let data_dir = if !args.data_dir.is_empty() && args.data_dir != "./data" {
-        args.data_dir.clone()
-    } else {
-        volume_cfg.data_dir.clone()
-    };
+    let master_address = volume_cfg.master_addresses.clone();
+
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| volume_cfg.data_dir.clone());
 
     let volume_size = args.volume_size.unwrap_or(volume_cfg.max_volume_size);
 
@@ -112,15 +100,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .initial_volume_count
         .unwrap_or(volume_cfg.initial_volume_count);
 
+    // Volume server binds to all interfaces, but advertises a specific address for clients
+    let bind_ip = "0.0.0.0".to_string();
+    let grpc_address = format!("{}:{}", bind_ip, grpc_port);
+
+    // Use advertise_addr from config for heartbeat registration
+    // This is the IP that FUSE clients will use to connect to this Volume Server
+    let ip = volume_cfg
+        .advertise_addr
+        .filter(|a| !a.is_empty() && a != "0.0.0.0")
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: volume.advertise_addr must be set to a reachable IP (not 0.0.0.0)");
+            std::process::exit(1);
+        });
+
     info!("Starting PowerFS Volume Server");
     info!("  GRPC Address: {}", grpc_address);
     info!("  HTTP Port: {}", http_port);
+    info!("  Net Port: {}", net_port);
     info!("  Node ID: {}", node_id);
-    info!("  Data Center: {}", args.data_center);
-    info!("  Rack: {}", args.rack);
+    info!("  Data Center: {}", data_center);
+    info!("  Rack: {}", rack);
     info!("  Masters: {}", master_address.join(", "));
     info!("  Data Dir: {}", data_dir);
     info!("  Initial Volume Count: {}", initial_volume_count);
+    info!("  Volume Size: {}", volume_size);
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
@@ -132,29 +136,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to create storage manager"),
     );
 
-    let grpc_port = grpc_address
-        .split(':')
-        .next_back()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(http_port + 1);
+    // Pre-create volumes at startup with UUID-based IDs
+    // First check if volumes already exist on disk (for recovery after restart)
+    let _pre_allocated_volumes = {
+        let mut pre_allocated = Vec::new();
+        let existing_volumes = storage_manager.list_volumes();
 
-    let ip = grpc_address
-        .split(':')
-        .next()
-        .unwrap_or("127.0.0.1")
-        .to_string();
+        info!(
+            "Starting with {} existing volumes in memory",
+            existing_volumes.len()
+        );
+
+        // Check if volumes exist on disk (for recovery)
+        let disk_volumes = discover_volumes_on_disk(&data_dir);
+        if !disk_volumes.is_empty() && existing_volumes.is_empty() {
+            info!(
+                "Recovering {} volumes from disk: {:?}",
+                disk_volumes.len(),
+                disk_volumes
+            );
+            for volume_id in &disk_volumes {
+                match storage_manager.create_volume(*volume_id, volume_size) {
+                    Ok(_) => {
+                        info!("Recovered volume {} with size {}", volume_id.0, volume_size);
+                        pre_allocated.push(*volume_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to recover volume {}: {}", volume_id.0, e);
+                    }
+                }
+            }
+        } else {
+            // Create new volumes with UUID-based IDs
+            info!(
+                "Creating {} new volumes with UUID-based IDs",
+                initial_volume_count
+            );
+            for _i in 0..initial_volume_count {
+                let volume_id = powerfs_common::types::VolumeId::generate();
+
+                match storage_manager.create_volume(volume_id, volume_size) {
+                    Ok(_) => {
+                        info!(
+                            "Created volume {} (UUID-based) with size {}",
+                            volume_id.0, volume_size
+                        );
+                        pre_allocated.push(volume_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to create volume {}: {}", volume_id.0, e);
+                    }
+                }
+            }
+        }
+
+        info!("Total volumes ready: {}", pre_allocated.len());
+        pre_allocated
+    };
 
     let volume_server = VolumeServer::new(
         storage_manager.clone(),
         node_id.clone(),
         &ip,
-        grpc_port,
-        http_port,
+        grpc_port as u32,
+        http_port as u32,
         &data_dir,
     );
 
     // Start powerfs-net binary protocol server for Volume
-    let net_port = args.net_port;
     if net_port > 0 {
         let net_bind_addr = format!("{}:{}", ip, net_port);
         let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
@@ -184,23 +233,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master_client = MasterClient::new(NewMasterClientParams {
         master_addresses: &master_addrs,
         node_id: node_id.clone(),
-        grpc_port,
-        http_port,
-        data_center: &args.data_center,
-        rack: &args.rack,
+        grpc_port: grpc_port as u32,
+        http_port: http_port as u32,
+        net_port: net_port as u32,
+        data_center: &data_center,
+        rack: &rack,
         public_url: &format!("http://{}:{}", ip, http_port),
         ip: &ip,
     });
 
-    if args.register_with_master {
+    let register = args.register_with_master.unwrap_or(true);
+    if register {
         info!("Registering with master...");
         if let Err(e) = master_client.start_heartbeat().await {
             warn!("Failed to start heartbeat: {}", e);
         }
 
+        // Spawn background task for heartbeat and volume reporting
+        // Volumes are pre-created at startup, no need to request from master
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
+            // Send initial heartbeat with pre-created volumes
             let volumes = storage_manager.list_volumes();
             let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                 .into_iter()
@@ -216,6 +270,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
 
+            info!(
+                "Sending initial heartbeat with {} pre-created volumes: {:?}",
+                proto_volumes.len(),
+                proto_volumes
+                    .iter()
+                    .map(|v| v.volume_id)
+                    .collect::<Vec<_>>()
+            );
+
             if master_client.send_heartbeat(proto_volumes).await.is_err() {
                 warn!("Initial heartbeat failed, reconnecting...");
                 if let Err(e) = master_client.start_heartbeat().await {
@@ -223,44 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(20)).await;
-
-            info!("Requesting initial volumes from master...");
-            match master_client
-                .grow("001", "default", initial_volume_count)
-                .await
-            {
-                Ok(response) => {
-                    info!(
-                        "grow response: new_volume_ids={:?}, locations={}, error={}",
-                        response.new_volume_ids,
-                        response.locations.len(),
-                        response.error
-                    );
-                    if !response.new_volume_ids.is_empty() {
-                        info!(
-                            "Received {} new volume IDs from master",
-                            response.new_volume_ids.len()
-                        );
-                        for &vid in &response.new_volume_ids {
-                            if storage_manager
-                                .create_volume(powerfs_common::types::VolumeId(vid), volume_size)
-                                .is_ok()
-                            {
-                                info!("Created volume {}", vid);
-                            } else {
-                                warn!("Failed to create volume {}", vid);
-                            }
-                        }
-                    } else {
-                        warn!("No volume IDs received from master");
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to request volumes from master: {}", e);
-                }
-            }
-
+            // Continuous heartbeat loop
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let volumes = storage_manager.list_volumes();
@@ -291,23 +317,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_config(config_path: &Option<String>) -> PowerFsConfig {
-    match config_path {
-        Some(path) => match PowerFsConfig::load_from_file(path) {
-            Ok(cfg) => {
-                if let Err(e) = cfg.validate() {
-                    warn!("Config validation failed: {}, using defaults", e);
-                    PowerFsConfig::default()
-                } else {
-                    info!("Loaded config from: {}", path);
-                    cfg
+fn load_config(config_path: &str) -> PowerFsConfig {
+    match PowerFsConfig::load_or_error(config_path) {
+        Ok(cfg) => {
+            info!("Successfully loaded configuration from: {}", config_path);
+            cfg
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to load configuration: {}", e);
+            eprintln!("You must provide a valid configuration file with all required ports and addresses.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Discover volumes on disk by scanning for volume_* directories
+fn discover_volumes_on_disk(data_dir: &str) -> Vec<VolumeId> {
+    let mut volumes = Vec::new();
+    let volumes_path = std::path::Path::new(data_dir);
+
+    if !volumes_path.exists() {
+        return volumes;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(volumes_path) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("volume_") {
+                    // Parse volume_id from directory name: volume_{id}
+                    if let Some(id_str) = name.strip_prefix("volume_") {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            volumes.push(VolumeId(id));
+                            info!("Found volume on disk: {} (id={})", name, id);
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                warn!("Failed to load config file: {}, using defaults", e);
-                PowerFsConfig::default()
-            }
-        },
-        None => PowerFsConfig::default(),
+        }
     }
+
+    volumes
 }

@@ -1,0 +1,17 @@
+[package]
+name = "powerfs-init"
+version = "0.1.0"
+edition = "2021"
+authors = ["PowerFS Team <jiangjinhu@fudan.edu.cn>"]
+description = "PowerFS Initialization Tool - Format POSIX root and prepare metadata before service startup"
+
+[[bin]]
+name = "powerfs-init"
+path = "src/main.rs"
+
+[dependencies]
+powerfs-filer = { path = "../powerfs-filer" }
+powerfs-common = { path = "../powerfs-common" }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

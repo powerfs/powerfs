@@ -81,7 +81,7 @@ fn default_node_type() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeStatusEvent {
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub node_id: String,
     pub size: u64,
     pub used: u64,

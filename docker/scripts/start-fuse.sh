@@ -222,7 +222,7 @@ log_info ""
 log_info "[3/8] Starting Master nodes..."
 
 MASTER_NODES=("master-1" "master-2" "master-3")
-MASTER_PORTS=("9333" "9334" "9335")
+MASTER_PORTS=("9333" "9336" "9337")
 MASTER_REQUIRED=("true" "false" "false")
 
 for i in "${!MASTER_NODES[@]}"; do
@@ -570,8 +570,8 @@ log_info "=== Service Status Summary ==="
 ALL_SERVICES=(
     "Redis|6379|redis"
     "Master 1|9333|master-1"
-    "Master 2|9334|master-2"
-    "Master 3|9335|master-3"
+    "Master 2|9336|master-2"
+    "Master 3|9337|master-3"
     "Volume 1|8080|volume-1"
     "Volume 2|8081|volume-2"
     "Volume 3|8082|volume-3"
@@ -613,8 +613,8 @@ log_info ""
 log_info "=== Service Addresses ==="
 log_info "  Redis:           $HOST_IP:6379"
 log_info "  Master 1:        $HOST_IP:9333"
-log_info "  Master 2:        $HOST_IP:9334"
-log_info "  Master 3:        $HOST_IP:9335"
+log_info "  Master 2:        $HOST_IP:9336"
+log_info "  Master 3:        $HOST_IP:9337"
 log_info "  Volume 1:        $HOST_IP:8080"
 log_info "  Volume 2:        $HOST_IP:8081"
 log_info "  Volume 3:        $HOST_IP:8082"

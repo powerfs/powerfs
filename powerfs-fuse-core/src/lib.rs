@@ -4,7 +4,6 @@ pub mod client_identity;
 pub mod error;
 pub mod fuse_client_facade;
 pub mod meta_shard_client;
-pub mod net_client;
 pub mod orset;
 pub mod provider_adapter;
 pub mod request_id;
@@ -22,7 +21,6 @@ pub use meta_shard_client::{
     ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,
     RequestQueue, RequestResult, TransportChannel,
 };
-pub use net_client::{NetClientConfig, PowerFuseNetClient};
 pub use provider_adapter::{FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider};
 pub use request_id::RequestId;
 pub use request_state::{RequestContext, RequestKind, RequestState};

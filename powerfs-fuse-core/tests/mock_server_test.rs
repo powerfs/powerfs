@@ -12,6 +12,7 @@
 #![allow(unused_imports, dead_code)]
 
 use std::net::SocketAddr;
+type MockHandler = Arc<dyn Fn(MsgType, &[u8]) -> Option<(u16, Vec<u8>)> + Send + Sync>;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 struct MockServer {
     addr: String,
     port: u16,
-    handler: Arc<dyn Fn(MsgType, &[u8]) -> Option<(u16, Vec<u8>)> + Send + Sync>,
+    handler: MockHandler,
 }
 
 impl MockServer {
@@ -62,10 +63,7 @@ impl MockServer {
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    handler: Arc<dyn Fn(MsgType, &[u8]) -> Option<(u16, Vec<u8>)> + Send + Sync>,
-) {
+async fn handle_connection(mut stream: TcpStream, handler: MockHandler) {
     // 1. Handle handshake
     let mut hs_buf = vec![0u8; HandshakeRequest::SIZE];
     if stream.read_exact(&mut hs_buf).await.is_err() {
@@ -115,12 +113,7 @@ async fn handle_connection(
             body.len()
         );
 
-        let response = if let Some(resp) = handler(msg_type.unwrap_or(MsgType::Ping), &body) {
-            resp
-        } else {
-            // Default: echo OK with empty body
-            (0u16, vec![])
-        };
+        let response = handler(msg_type.unwrap_or(MsgType::Ping), &body).unwrap_or_default();
 
         let (status, resp_body) = response;
 
@@ -323,6 +316,7 @@ async fn test_facade_end_to_end_with_mock_servers() {
         master_addr: "127.0.0.1".to_string(),
         master_port: 19333,
         volume_net_port: 19344,
+        volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
         filer_port: 19343,
         request_timeout: Duration::from_secs(5),
@@ -499,6 +493,23 @@ async fn test_facade_volume_provider_with_mock() {
     // Setup mock servers (reuse from previous test pattern)
     let master_server = MockServer::new(19433, |msg_type, _body| match msg_type {
         MsgType::GetTopology => Some((0, vec![])),
+        MsgType::Assign => {
+            // Master allocates volume_id via Raft — return TLV-encoded fields
+            let mut enc = powerfs_net::TlvEncoder::new();
+            let _ = enc.add_u64(powerfs_net::FieldId::VolumeId, 1);
+            let _ = enc.add_u64(powerfs_net::FieldId::Cookie, 100);
+            let _ = enc.add_u64(powerfs_net::FieldId::FileKey, 200);
+            let _ = enc.add_string(powerfs_net::FieldId::Owner, "127.0.0.1:19444");
+            let _ = enc.add_u64(powerfs_net::FieldId::Entries, 1);
+            Some((0, enc.into_bytes()))
+        }
+        MsgType::LookupVolume => {
+            // Master returns volume → server mapping as TLV
+            let mut enc = powerfs_net::TlvEncoder::new();
+            let _ = enc.add_u64(powerfs_net::FieldId::Limit, 1);
+            let _ = enc.add_string(powerfs_net::FieldId::Owner, "127.0.0.1:19444");
+            Some((0, enc.into_bytes()))
+        }
         _ => Some((0, vec![])),
     });
     master_server.start().await;
@@ -511,8 +522,8 @@ async fn test_facade_volume_provider_with_mock() {
                 "cookie": 100,
                 "file_key": 200,
                 "locations": [{
-                    "url": "127.0.0.1:9344",
-                    "public_url": "127.0.0.1:9344",
+                    "url": "127.0.0.1:19444",
+                    "public_url": "127.0.0.1:19444",
                 }]
             });
             Some((0, success_response_json(&data)))
@@ -520,8 +531,8 @@ async fn test_facade_volume_provider_with_mock() {
         MsgType::LookupVolume => {
             let data = serde_json::json!({
                 "locations": [{
-                    "url": "127.0.0.1:9344",
-                    "public_url": "127.0.0.1:9344",
+                    "url": "127.0.0.1:19444",
+                    "public_url": "127.0.0.1:19444",
                 }]
             });
             Some((0, success_response_json(&data)))
@@ -530,15 +541,15 @@ async fn test_facade_volume_provider_with_mock() {
     });
     filer_server.start().await;
 
-    let volume_server = MockServer::new(9344, |msg_type, _body| match msg_type {
+    let volume_server = MockServer::new(19444, |msg_type, _body| match msg_type {
         MsgType::ReadNeedleBlob => {
             Some((0, success_response_json(&serde_json::json!({"data": []}))))
         }
         MsgType::LookupVolume => {
             let data = serde_json::json!({
                 "locations": [{
-                    "url": "127.0.0.1:9344",
-                    "public_url": "127.0.0.1:9344",
+                    "url": "127.0.0.1:19444",
+                    "public_url": "127.0.0.1:19444",
                 }]
             });
             Some((0, success_response_json(&data)))
@@ -552,7 +563,8 @@ async fn test_facade_volume_provider_with_mock() {
     let config = FuseClientFacadeConfig {
         master_addr: "127.0.0.1".to_string(),
         master_port: 19433,
-        volume_net_port: 9344,
+        volume_net_port: 19444,
+        volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
         filer_port: 19443,
         request_timeout: Duration::from_secs(5),
@@ -670,7 +682,8 @@ async fn test_facade_metadata_provider_with_mock() {
     let config = FuseClientFacadeConfig {
         master_addr: "127.0.0.1".to_string(),
         master_port: 19533,
-        volume_net_port: 9344,
+        volume_net_port: 19544,
+        volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
         filer_port: 19543,
         request_timeout: Duration::from_secs(5),

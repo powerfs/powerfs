@@ -4,6 +4,7 @@
 //! using MetaShardManager, which is the authoritative metadata manager with sharded
 //! storage, Raft consensus, and CRDT support.
 
+use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
 use crate::raft_group_manager::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
@@ -21,16 +22,55 @@ use std::sync::Arc;
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
     pub shard_strategy: Arc<ShardStrategy>,
+    /// Net port for powerfs-net protocol (used to construct redirect addresses)
+    pub net_port: u16,
+    /// Inode notification broadcaster (optional, for cache invalidation)
+    pub inode_notifier: Option<Arc<InodeNotifier>>,
 }
 
 impl FilerNetHandler {
     pub fn new(
         meta_shard_manager: Arc<MetaShardManager>,
         shard_strategy: Arc<ShardStrategy>,
+        net_port: u16,
     ) -> Self {
         Self {
             meta_shard_manager,
             shard_strategy,
+            net_port,
+            inode_notifier: None,
+        }
+    }
+
+    /// Create a new FilerNetHandler with InodeNotifier support
+    pub fn with_notifier(
+        meta_shard_manager: Arc<MetaShardManager>,
+        shard_strategy: Arc<ShardStrategy>,
+        net_port: u16,
+        inode_notifier: Arc<InodeNotifier>,
+    ) -> Self {
+        Self {
+            meta_shard_manager,
+            shard_strategy,
+            net_port,
+            inode_notifier: Some(inode_notifier),
+        }
+    }
+
+    /// Notify subscribers that an inode's metadata has changed.
+    /// This is called after successful metadata mutations.
+    fn notify_inode_change(&self, inode: u64, version: u64) {
+        if let Some(ref notifier) = self.inode_notifier {
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                let count = notifier.notify(inode, version).await;
+                if count > 0 {
+                    debug!(
+                        "FILER_NET: notified {} clients about inode {} change (v={})",
+                        count, inode, version
+                    );
+                }
+            });
         }
     }
 
@@ -57,9 +97,14 @@ impl FilerNetHandler {
         {
             Some((true, _)) => Ok(()),
             Some((false, leader_addr)) if !leader_addr.is_empty() => {
-                // Return redirect response with leader address
+                // Convert gRPC address to net address for client redirect
+                // leader_addr is in format "ip:grpc_port" (e.g., "172.21.0.33:8889")
+                // Need to return net address (e.g., "172.21.0.33:8890")
+                let net_addr = Self::grpc_addr_to_net_addr(&leader_addr, self.net_port);
+
+                // Return redirect response with leader net address
                 let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Owner, &leader_addr);
+                let _ = enc.add_string(FieldId::Owner, &net_addr);
                 Err(Self::build_response(
                     msg,
                     STATUS_ERR_REDIRECT,
@@ -78,6 +123,18 @@ impl FilerNetHandler {
                     Vec::new(),
                 ))
             }
+        }
+    }
+
+    /// Convert gRPC address to net address by replacing the port.
+    /// gRPC address format: "ip:grpc_port" (e.g., "172.21.0.33:8889")
+    /// Net address format: "ip:net_port" (e.g., "172.21.0.33:8890")
+    fn grpc_addr_to_net_addr(grpc_addr: &str, net_port: u16) -> String {
+        if let Some(colon_pos) = grpc_addr.rfind(':') {
+            let ip_part = &grpc_addr[..colon_pos];
+            format!("{}:{}", ip_part, net_port)
+        } else {
+            grpc_addr.to_string()
         }
     }
 
@@ -101,6 +158,7 @@ impl FilerNetHandler {
             } else {
                 None
             },
+            version: info.version,
         }
     }
 
@@ -115,22 +173,45 @@ impl FilerNetHandler {
             msg.header.seq, parent_ino, name
         );
 
-        // Root lookup - return root entry
-        if parent_ino == POSIX_ROOT_INODE && name.is_empty() {
-            let mut enc = TlvEncoder::new();
-            enc.add_u64(FieldId::Ino, POSIX_ROOT_INODE);
-            enc.add_u32(FieldId::Mode, 0o40755);
-            enc.add_u32(FieldId::Uid, 0);
-            enc.add_u32(FieldId::Gid, 0);
-            enc.add_u64(FieldId::Size, 0);
-            enc.add_u32(FieldId::Nlink, 2);
-            enc.add_string(FieldId::Name, "")?;
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+        // Root lookup: when client looks up the root directory itself
+        // (parent_ino == root and name is empty or "."), return the actual
+        // root inode data from the database instead of hardcoded values
+        if parent_ino == POSIX_ROOT_INODE && (name.is_empty() || name == ".") {
+            info!("FILER_NET_LOOKUP: root lookup, fetching root inode from database");
+            match self.meta_shard_manager.get_inode(POSIX_ROOT_INODE) {
+                Some(info) => {
+                    let entry_info = Self::inode_to_entry_info(&info);
+                    info!(
+                        "FILER_NET_LOOKUP: root ino={}, mode={:o}, is_dir={}",
+                        entry_info.ino, entry_info.mode, entry_info.is_dir
+                    );
+                    let mut enc = TlvEncoder::new();
+                    enc.add_u64(FieldId::Ino, entry_info.ino);
+                    enc.add_u32(FieldId::Mode, entry_info.mode);
+                    enc.add_u32(FieldId::Uid, entry_info.uid);
+                    enc.add_u32(FieldId::Gid, entry_info.gid);
+                    enc.add_u64(FieldId::Size, entry_info.size);
+                    enc.add_u32(FieldId::Nlink, entry_info.nlink);
+                    enc.add_u64(FieldId::Mtime, entry_info.mtime);
+                    enc.add_u64(FieldId::Atime, entry_info.atime);
+                    enc.add_u64(FieldId::Ctime, entry_info.ctime);
+                    enc.add_string(FieldId::Name, &entry_info.name)?;
+                    return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                }
+                None => {
+                    warn!("FILER_NET_LOOKUP: root inode not found in database - init may not have been run");
+                    return Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()));
+                }
+            }
         }
 
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
+                info!(
+                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}",
+                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name
+                );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, entry_info.ino);
                 enc.add_u32(FieldId::Mode, entry_info.mode);
@@ -142,6 +223,21 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+
+                // Return chunk/fid info for data access
+                if let Some(ref fid) = info.fid {
+                    enc.add_string(FieldId::Fid, fid)?;
+                }
+                if let Some(volume_id) = info.volume_id {
+                    enc.add_u64(FieldId::VolumeId, volume_id);
+                }
+                // Return the first chunk's cookie and offset
+                if let Some(chunk) = info.chunks.first() {
+                    enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+                    enc.add_u64(FieldId::FileKey, chunk.offset);
+                    enc.add_u64(FieldId::Size, chunk.size);
+                }
+
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
@@ -154,17 +250,6 @@ impl FilerNetHandler {
         let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
         info!("FILER_NET_GETATTR: ino={}", ino);
-
-        if ino == POSIX_ROOT_INODE {
-            let mut enc = TlvEncoder::new();
-            enc.add_u64(FieldId::Ino, POSIX_ROOT_INODE);
-            enc.add_u32(FieldId::Mode, 0o40755);
-            enc.add_u32(FieldId::Uid, 0);
-            enc.add_u32(FieldId::Gid, 0);
-            enc.add_u64(FieldId::Size, 0);
-            enc.add_u32(FieldId::Nlink, 2);
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
-        }
 
         match self.meta_shard_manager.get_inode(ino) {
             Some(info) => {
@@ -180,13 +265,23 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+                info!(
+                    "FILER_NET_GETATTR: returned info for ino={}, name={}",
+                    ino, entry_info.name
+                );
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
-            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+            None => {
+                warn!(
+                    "FILER_NET_GETATTR: ino={} not found in meta_shard_manager",
+                    ino
+                );
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
         }
     }
 
-    /// Handle SetAttr request
+    /// Handle SetAttr request (legacy unified path)
     async fn handle_setattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -218,6 +313,96 @@ impl FilerNetHandler {
         }
     }
 
+    /// Handle SetAttrData request (strong consistency path for size/chunks)
+    async fn handle_setattr_data(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let size = dec.next_u64(FieldId::Size).ok();
+
+        info!("FILER_NET_SETATTR_DATA: ino={}, size={:?}", ino, size);
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_SETATTR_DATA: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .setattr_data(ino, shard_id, size)
+            .await
+        {
+            Ok(_) => {
+                // Notify other clients that this inode's data (size/chunks) changed
+                let now = chrono::Utc::now().timestamp() as u64;
+                self.notify_inode_change(ino, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SETATTR_DATA failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle SetAttrMeta request (eventual consistency path for mode/uid/gid/timestamps)
+    async fn handle_setattr_meta(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let mode = dec.next_u64(FieldId::Mode).ok();
+        let uid = dec.next_u64(FieldId::Uid).ok();
+        let gid = dec.next_u64(FieldId::Gid).ok();
+        let mtime = dec.next_u64(FieldId::Mtime).ok();
+        let atime = dec.next_u64(FieldId::Atime).ok();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let timestamp = dec.next_u64(FieldId::Seq).unwrap_or(0);
+
+        info!(
+            "FILER_NET_SETATTR_META: ino={}, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, client={}, ts={}",
+            ino, mode, uid, gid, mtime, client_id, timestamp
+        );
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_SETATTR_META: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .setattr_meta(
+                ino, shard_id, mode, uid, gid, mtime, atime, &client_id, timestamp,
+            )
+            .await
+        {
+            Ok(_) => {
+                // Notify other clients that this inode's metadata changed
+                self.notify_inode_change(ino, timestamp);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SETATTR_META failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     /// Handle Create request (create file)
     async fn handle_create(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -227,9 +412,20 @@ impl FilerNetHandler {
         let uid = dec.next_u64(FieldId::Uid).unwrap_or(0);
         let gid = dec.next_u64(FieldId::Gid).unwrap_or(0);
 
+        // Parse optional chunk/fid info
+        let fid = dec.next_string(FieldId::Fid).ok();
+        let cookie = dec.next_u64(FieldId::Cookie).ok();
+        let offset = dec.next_u64(FieldId::FileKey).ok();
+        let chunk_size = dec.next_u64(FieldId::Size).ok();
+
         info!(
-            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}",
-            parent_ino, name, mode, uid, gid
+            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, has_fid={}",
+            parent_ino,
+            name,
+            mode,
+            uid,
+            gid,
+            fid.is_some()
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -255,10 +451,32 @@ impl FilerNetHandler {
                     .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
                     .await;
 
+                // Store chunk/fid info if provided
+                if let (Some(fid_str), Some(c), Some(o)) = (fid.clone(), cookie, offset) {
+                    let sz = chunk_size.unwrap_or(0);
+                    // Parse volume_id from Fid string (format: "volume_id,cookie,file_key")
+                    let volume_id = fid_str
+                        .split(',')
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let _ = self
+                        .meta_shard_manager
+                        .set_chunks(ino, shard_id, fid_str, volume_id, c as u32, o, sz)
+                        .await;
+                }
+
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
                 enc.add_string(FieldId::Name, &name)?;
+                // Return chunk/fid info in response
+                if let Some(fid_str) = fid {
+                    enc.add_string(FieldId::Fid, &fid_str)?;
+                }
+                if let Some(c) = cookie {
+                    enc.add_u64(FieldId::Cookie, c);
+                }
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
@@ -461,13 +679,35 @@ impl FilerNetHandler {
         let has_more = (limited.len() as u64) < limit && !entries.is_empty();
 
         let mut enc = TlvEncoder::new();
-        enc.add_u64(FieldId::Limit, limited.len() as u64);
+        enc.add_u64(FieldId::Count, limited.len() as u64);
         enc.add_u64(FieldId::HasMore, if has_more { 1 } else { 0 });
 
         for entry in &limited {
-            enc.add_string(FieldId::Name, &entry.name)?;
-            enc.add_u64(FieldId::Ino, entry.inode);
-            enc.add_u32(FieldId::Mode, entry.mode);
+            let mut entry_enc = TlvEncoder::new();
+            entry_enc.add_u64(FieldId::Ino, entry.inode);
+            entry_enc.add_string(FieldId::Name, &entry.name)?;
+            entry_enc.add_u32(FieldId::Mode, entry.mode);
+            entry_enc.add_u64(FieldId::Uid, entry.uid as u64);
+            entry_enc.add_u64(FieldId::Gid, entry.gid as u64);
+            entry_enc.add_u64(FieldId::Size, entry.size);
+            entry_enc.add_u64(FieldId::Atime, entry.atime);
+            entry_enc.add_u64(FieldId::Mtime, entry.mtime);
+            entry_enc.add_u64(FieldId::Ctime, entry.ctime);
+            entry_enc.add_u64(FieldId::Nlink, entry.nlink as u64);
+            // Return chunk/fid info for data access
+            if let Some(ref fid) = entry.fid {
+                entry_enc.add_string(FieldId::Fid, fid)?;
+            }
+            if let Some(volume_id) = entry.volume_id {
+                entry_enc.add_u64(FieldId::VolumeId, volume_id);
+            }
+            // Return first chunk details
+            if let Some(chunk) = entry.chunks.first() {
+                entry_enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+                entry_enc.add_u64(FieldId::FileKey, chunk.offset);
+                entry_enc.add_u64(FieldId::Size, chunk.size);
+            }
+            enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
         }
 
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
@@ -584,6 +824,8 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::SetAttrData => self.handle_setattr_data(msg).await,
+            MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,
             MsgType::Unlink => self.handle_unlink(msg).await,
@@ -594,6 +836,7 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -635,6 +878,8 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::SetAttrData => self.handle_setattr_data(msg).await,
+            MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,
             MsgType::Unlink => self.handle_unlink(msg).await,
@@ -645,6 +890,7 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

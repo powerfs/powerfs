@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::net_client::PowerFuseNetClient;
 use powerfs_net as net;
+use powerfs_net::{ClientConfig, PowerFsNetClient};
 
 /// MetaShard 信息
 #[derive(Debug, Clone)]
@@ -271,29 +271,56 @@ pub struct MasterClient {
     state: Mutex<MasterClientState>,
     topology_manager: Arc<ClusterTopologyManager>,
     current_leader: Mutex<Option<String>>,
-    /// 网络客户端 (可选，用于真实网络发送)
-    net_client: Option<Arc<PowerFuseNetClient>>,
+    /// 网络客户端（可热切换以处理 Leader 重定向）
+    net_client: Arc<std::sync::RwLock<Arc<PowerFsNetClient>>>,
 }
 
 impl MasterClient {
     pub fn new(config: MasterClientConfig, topology_manager: Arc<ClusterTopologyManager>) -> Self {
+        let master_full = config
+            .master_addrs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:9334".to_string());
+
+        // Parse host and port from address string (format: "host:port")
+        let (host, port) = match master_full.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p.parse::<u16>().unwrap_or(9334);
+                (h.to_string(), port)
+            }
+            None => (master_full, 9334),
+        };
+
+        let net_client_config = ClientConfig {
+            addr: host,
+            port,
+            client_id: 0,
+            client_type: powerfs_net::ClientType::Fuse,
+            connect_timeout: config.request_timeout,
+            request_timeout: config.request_timeout,
+            max_retries: config.max_retries,
+            retry_delay: std::time::Duration::from_millis(100),
+            heartbeat_interval: std::time::Duration::from_secs(30),
+            max_inflight_requests: 256,
+        };
+
+        let net_client = Arc::new(std::sync::RwLock::new(Arc::new(PowerFsNetClient::new(
+            net_client_config,
+        ))));
+
         Self {
             config,
             state: Mutex::new(MasterClientState::Disconnected),
             topology_manager,
             current_leader: Mutex::new(None),
-            net_client: None,
+            net_client,
         }
     }
 
-    /// 设置网络客户端
-    pub fn set_net_client(&mut self, client: Arc<PowerFuseNetClient>) {
-        self.net_client = Some(client);
-    }
-
-    /// 获取网络客户端引用
-    pub fn net_client(&self) -> Option<&Arc<PowerFuseNetClient>> {
-        self.net_client.as_ref()
+    /// 获取网络客户端引用（当前快照）
+    pub(crate) fn net_client(&self) -> Arc<PowerFsNetClient> {
+        self.net_client.read().unwrap().clone()
     }
 
     /// 获取当前状态
@@ -311,11 +338,137 @@ impl MasterClient {
         self.current_leader.lock().unwrap().clone()
     }
 
-    /// 设置当前 Leader
+    /// 设置当前 Leader（仅用于测试和内部重定向）
+    #[doc(hidden)]
     pub fn set_leader(&self, addr: String) {
         let mut leader = self.current_leader.lock().unwrap();
         *leader = Some(addr);
         *self.state.lock().unwrap() = MasterClientState::Connected;
+    }
+
+    /// 更新 leader 地址（处理重定向时使用）
+    pub(crate) fn update_leader_address(&self, addr: &str) {
+        let mut leader = self.current_leader.lock().unwrap();
+        *leader = Some(addr.to_string());
+        log::info!("MasterClient: Leader address updated to {}", addr);
+    }
+
+    /// 重新连接到新的 Master 地址（处理重定向时使用）
+    pub(crate) async fn reconnect(&self, new_addr: &str) -> Result<(), MasterClientError> {
+        let (host, port) = match new_addr.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p.parse::<u16>().map_err(|_| {
+                    MasterClientError::ConnectionFailed(format!(
+                        "Invalid port in redirect addr: {}",
+                        new_addr
+                    ))
+                })?;
+                (h.to_string(), port)
+            }
+            None => (new_addr.to_string(), 9334),
+        };
+
+        let client_config = ClientConfig {
+            addr: host,
+            port,
+            client_id: 0,
+            client_type: net::ClientType::Fuse,
+            connect_timeout: self.config.request_timeout,
+            request_timeout: self.config.request_timeout,
+            max_retries: self.config.max_retries,
+            retry_delay: std::time::Duration::from_millis(100),
+            heartbeat_interval: std::time::Duration::from_secs(30),
+            max_inflight_requests: 256,
+        };
+
+        let new_client = Arc::new(PowerFsNetClient::new(client_config));
+        new_client.connect().await.map_err(|e| {
+            MasterClientError::ConnectionFailed(format!(
+                "Failed to reconnect to {}: {}",
+                new_addr, e
+            ))
+        })?;
+
+        {
+            let mut guard = self.net_client.write().unwrap();
+            *guard = new_client;
+        }
+        self.set_leader(new_addr.to_string());
+
+        log::info!("MasterClient: Reconnected to new leader at {}", new_addr);
+        Ok(())
+    }
+
+    /// 向 Master 发送请求，自动处理 Leader 重定向
+    pub async fn submit_request(
+        &self,
+        msg_type: net::MsgType,
+        payload: &[u8],
+    ) -> Result<net::NetMessage, MasterClientError> {
+        if !self.topology_manager.can_request() {
+            return Err(MasterClientError::CircuitOpen);
+        }
+
+        let net_client = self.net_client();
+        let response = net_client
+            .send_request(msg_type, payload, &[])
+            .await
+            .map_err(|e| MasterClientError::ConnectionFailed(format!("Network error: {}", e)))?;
+
+        // 检查重定向响应
+        if response.header.status == net::STATUS_ERR_REDIRECT {
+            log::warn!(
+                "MasterClient: Received redirect response for {:?}",
+                msg_type
+            );
+            let body = if !response.body.is_empty() {
+                &response.body
+            } else {
+                &response.data
+            };
+
+            let leader_addr = {
+                let mut dec = net::TlvDecoder::new(body);
+                dec.next_string(net::FieldId::Owner).unwrap_or_default()
+            };
+
+            if leader_addr.is_empty() {
+                return Err(MasterClientError::ConnectionFailed(
+                    "Redirect response has empty leader address".to_string(),
+                ));
+            }
+
+            log::info!(
+                "MasterClient: Redirecting to leader at {}, resending {:?}",
+                leader_addr,
+                msg_type
+            );
+
+            self.reconnect(&leader_addr).await?;
+
+            // 重新发送请求
+            let net_client = self.net_client();
+            let response = net_client
+                .send_request(msg_type, payload, &[])
+                .await
+                .map_err(|e| {
+                    MasterClientError::ConnectionFailed(format!(
+                        "Network error after redirect: {}",
+                        e
+                    ))
+                })?;
+
+            self.topology_manager.record_success();
+            return Ok(response);
+        }
+
+        if response.is_ok() {
+            self.topology_manager.record_success();
+        } else {
+            self.topology_manager.record_failure();
+        }
+
+        Ok(response)
     }
 
     /// 连接到 Master
@@ -324,50 +477,35 @@ impl MasterClient {
             return Err(MasterClientError::CircuitOpen);
         }
 
-        // 如果有网络客户端，发送真实的连接请求
-        if let Some(net_client) = &self.net_client {
-            match net_client.master_client().is_connected() {
-                true => {
-                    let master_addr = self
-                        .config
-                        .master_addrs
-                        .first()
-                        .ok_or(MasterClientError::NoMasterAddress)?
-                        .clone();
-                    self.set_leader(master_addr);
-                    self.topology_manager.record_success();
+        let net_client = self.net_client();
+        match net_client.connect().await {
+            Ok(()) => {
+                let master_addr = self
+                    .config
+                    .master_addrs
+                    .first()
+                    .ok_or(MasterClientError::NoMasterAddress)?
+                    .clone();
+                self.set_leader(master_addr);
+                self.topology_manager.record_success();
 
-                    log::info!(
-                        "MasterClient: Connected to {} via powerfs-net",
-                        self.current_leader().unwrap()
-                    );
-                    Ok(())
-                }
-                false => Err(MasterClientError::ConnectionFailed(
-                    "Master client not connected".to_string(),
-                )),
+                log::info!(
+                    "MasterClient: Connected to {} via powerfs-net",
+                    self.current_leader().unwrap()
+                );
+                Ok(())
             }
-        } else {
-            // 无网络客户端时使用模拟实现
-            let master_addr = self
-                .config
-                .master_addrs
-                .first()
-                .ok_or(MasterClientError::NoMasterAddress)?
-                .clone();
-
-            self.set_leader(master_addr);
-            self.topology_manager.record_success();
-
-            log::info!(
-                "MasterClient: Connected to {} (mock)",
-                self.current_leader().unwrap()
-            );
-            Ok(())
+            Err(e) => {
+                self.topology_manager.record_failure();
+                Err(MasterClientError::ConnectionFailed(format!(
+                    "Failed to connect to Master: {}",
+                    e
+                )))
+            }
         }
     }
 
-    /// 获取拓扑信息
+    /// 获取拓扑信息（带重试机制，处理leader选举不稳定的情况）
     pub async fn fetch_topology(&self) -> Result<ClusterTopology, MasterClientError> {
         if !self.topology_manager.can_request() {
             return Err(MasterClientError::CircuitOpen);
@@ -377,39 +515,129 @@ impl MasterClient {
             .current_leader()
             .ok_or(MasterClientError::NotConnected)?;
 
-        // 如果有网络客户端，发送真实的 GetTopology 请求
-        if let Some(net_client) = &self.net_client {
-            let body = vec![];
-            match net_client
-                .master_client()
+        let body = vec![];
+
+        // Try up to 5 times with exponential backoff: handles leader election instability
+        const MAX_REDIRECT_ATTEMPTS: u32 = 5;
+        for attempt in 1..=MAX_REDIRECT_ATTEMPTS {
+            let net_client = self.net_client();
+            let response = net_client
                 .send_request(net::MsgType::GetTopology, &body, &[])
-                .await
-            {
+                .await;
+
+            match response {
+                Ok(resp) if resp.header.status == net::STATUS_ERR_REDIRECT => {
+                    // Follower redirected us to the actual leader
+                    let resp_body = if !resp.body.is_empty() {
+                        &resp.body
+                    } else {
+                        &resp.data
+                    };
+                    let leader_addr = {
+                        let mut dec = net::TlvDecoder::new(resp_body);
+                        dec.next_string(net::FieldId::Owner).unwrap_or_default()
+                    };
+
+                    if leader_addr.is_empty() {
+                        self.topology_manager.record_failure();
+                        return Err(MasterClientError::ConnectionFailed(
+                            "Redirect response has empty leader address".to_string(),
+                        ));
+                    }
+
+                    log::info!(
+                        "fetch_topology: redirected to leader at {} (attempt {}/{})",
+                        leader_addr,
+                        attempt,
+                        MAX_REDIRECT_ATTEMPTS
+                    );
+
+                    // Exponential backoff before reconnecting
+                    let delay_ms = (100u64) << (attempt - 1).min(4); // 100ms, 200ms, 400ms, 800ms, 1600ms
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                    // Reconnect to the actual leader and retry
+                    self.reconnect(&leader_addr).await?;
+                    continue;
+                }
                 Ok(response) if response.is_ok() => {
                     self.topology_manager.record_success();
-                    Ok(ClusterTopology::new())
+
+                    // Parse the topology response
+                    let resp_body = if !response.body.is_empty() {
+                        &response.body
+                    } else {
+                        &response.data
+                    };
+
+                    let mut topology = ClusterTopology::new();
+
+                    // Parse volume routes from TLV
+                    let mut dec = net::TlvDecoder::new(resp_body);
+
+                    // Skip leader address (Owner field)
+                    let leader_addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
+                    log::info!("fetch_topology: leader={}", leader_addr);
+
+                    // Get volume count
+                    let volume_count = dec.next_u64(net::FieldId::Entries).unwrap_or(0);
+                    log::info!("fetch_topology: volume_count={}", volume_count);
+
+                    // Parse each volume route (volume_id, addr, size)
+                    let mut parsed = 0u64;
+                    while parsed < volume_count {
+                        let volume_id = dec.next_u64(net::FieldId::VolumeId).unwrap_or(0);
+                        let addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
+                        let size = dec.next_u64(net::FieldId::Size).unwrap_or(0);
+
+                        if volume_id > 0 && !addr.is_empty() {
+                            let vol_info = VolumeInfo::new(
+                                volume_id,
+                                format!("vol-{}", volume_id),
+                                addr.clone(),
+                            );
+                            topology.volumes.insert(volume_id, vol_info);
+                            log::info!(
+                                "fetch_topology: volume_id={}, addr={}, size={}",
+                                volume_id,
+                                addr,
+                                size
+                            );
+                        }
+
+                        parsed += 1;
+                    }
+
+                    topology.version = response.header.seq as u64;
+                    log::info!(
+                        "fetch_topology: parsed {} volumes from master",
+                        topology.volumes.len()
+                    );
+
+                    return Ok(topology);
                 }
                 Ok(response) => {
                     self.topology_manager.record_failure();
-                    Err(MasterClientError::ConnectionFailed(format!(
+                    return Err(MasterClientError::ConnectionFailed(format!(
                         "Server error: {}",
                         response.header.status
-                    )))
+                    )));
                 }
                 Err(e) => {
                     self.topology_manager.record_failure();
-                    Err(MasterClientError::ConnectionFailed(format!(
+                    return Err(MasterClientError::ConnectionFailed(format!(
                         "Network error: {}",
                         e
-                    )))
+                    )));
                 }
             }
-        } else {
-            // 无网络客户端时使用模拟实现
-            let topology = ClusterTopology::new();
-            self.topology_manager.record_success();
-            Ok(topology)
         }
+
+        // Exhausted retries
+        self.topology_manager.record_failure();
+        Err(MasterClientError::ConnectionFailed(
+            "Failed to fetch topology after redirect retries".to_string(),
+        ))
     }
 
     /// 更新本地拓扑

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 pub trait VolumeAssigner: Sync + Send {
     fn assign(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         nodes: &[DataNodeInfo],
         replica_count: usize,
     ) -> Vec<DataNodeInfo>;
@@ -16,7 +16,7 @@ pub struct RoundRobinAssigner;
 impl VolumeAssigner for RoundRobinAssigner {
     fn assign(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         nodes: &[DataNodeInfo],
         replica_count: usize,
     ) -> Vec<DataNodeInfo> {
@@ -39,7 +39,7 @@ pub struct ConsistentHashAssigner;
 impl VolumeAssigner for ConsistentHashAssigner {
     fn assign(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         nodes: &[DataNodeInfo],
         replica_count: usize,
     ) -> Vec<DataNodeInfo> {
@@ -126,7 +126,7 @@ impl SmartVolumeAssigner {
     /// Assignment entry point that takes an explicit context.
     pub fn assign_with_context(
         &self,
-        _volume_id: u32,
+        _volume_id: u64,
         nodes: &[DataNodeInfo],
         replica_count: usize,
         ctx: &AssignContext,
@@ -224,7 +224,7 @@ impl SmartVolumeAssigner {
 impl VolumeAssigner for SmartVolumeAssigner {
     fn assign(
         &self,
-        volume_id: u32,
+        volume_id: u64,
         nodes: &[DataNodeInfo],
         replica_count: usize,
     ) -> Vec<DataNodeInfo> {

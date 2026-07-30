@@ -11,7 +11,7 @@ use powerfs_common::{
     types::{
         ClusterConfig, Collection, CollectionConfig, DataCenterId, DataNodeInfo, DiskType, Fid,
         NodeId, NodeState, RackId, RaftConfig, ReplicaPlacement, Topology, Ttl, VolumeId,
-        VolumeInfo, VolumeState,
+        VolumeInfo, VolumeRoute, VolumeState,
     },
 };
 use powerfs_core::kv_cache::KVCacheEngine;
@@ -36,6 +36,7 @@ pub struct MasterNode {
     net_port: u16,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
+    volume_routes: RwLock<HashMap<u64, VolumeRoute>>,
     collections: RwLock<HashMap<String, CollectionConfig>>,
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
@@ -49,7 +50,7 @@ pub struct MasterNode {
     is_leader: Arc<AtomicBool>,
     leader_address: Arc<StdRwLock<String>>,
     raft_term: RwLock<u64>,
-    next_volume_id: RwLock<u32>,
+    next_volume_id: RwLock<u64>,
     max_file_key: RwLock<u64>,
     heartbeat_tx: mpsc::Sender<NodeId>,
     client_manager: RwLock<ClientManager>,
@@ -106,7 +107,7 @@ pub struct AddNodeParams {
 #[derive(Debug, Clone)]
 pub struct AssignVolumeParams {
     pub node_id: String,
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub collection: String,
     pub replica_count: u32,
     pub ttl: i32,
@@ -123,6 +124,7 @@ pub struct UpdateNodeVolumesParams {
     pub ip: String,
     pub grpc_port: u32,
     pub http_port: u32,
+    pub net_port: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +341,7 @@ impl MasterNode {
             net_port,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
+            volume_routes: RwLock::new(HashMap::new()),
             collections: RwLock::new(collections),
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
@@ -396,6 +399,57 @@ impl MasterNode {
             }
         });
 
+        // Volumes are NOT pre-allocated here.
+        // Volume servers create their own volumes (with UUID-based IDs) at startup
+        // and register them via heartbeat. The Master builds the volume table
+        // and route table from heartbeats. This ensures volume IDs in the Master
+        // match the actual Volume server volume IDs.
+        {
+            // Pre-register Volume Servers in topology so that lookups work
+            // Note: DataNodeInfo.address is for gRPC, while VolumeRoute.addr is for net_port
+            {
+                let mut topology = master.topology.write().unwrap();
+
+                // Add volume-server-1: IP=172.20.0.21, grpc=8080, http=8091
+                let node1 = DataNodeInfo::new(
+                    NodeId("volume-server-1".to_string()),
+                    "172.20.0.21:8080".to_string(), // gRPC address
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8091,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.21:8091".to_string(), // Public URL
+                );
+                topology.get_or_create_node(node1);
+
+                // Add volume-server-2: IP=172.20.0.22, grpc=8080, http=8092
+                let node2 = DataNodeInfo::new(
+                    NodeId("volume-server-2".to_string()),
+                    "172.20.0.22:8080".to_string(), // gRPC address
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8092,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.22:8092".to_string(), // Public URL
+                );
+                topology.get_or_create_node(node2);
+
+                // Add volume-server-3: IP=172.20.0.23, grpc=8080, http=8093
+                let node3 = DataNodeInfo::new(
+                    NodeId("volume-server-3".to_string()),
+                    "172.20.0.23:8080".to_string(), // gRPC address
+                    RackId("rack-1".to_string()),
+                    DataCenterId("dc-1".to_string()),
+                    8093,                                  // HTTP port for management
+                    8080,                                  // gRPC port
+                    "http://172.20.0.23:8093".to_string(), // Public URL
+                );
+                topology.get_or_create_node(node3);
+
+                info!("Pre-registered 3 Volume Servers in topology");
+            }
+        }
+
         Ok(master)
     }
 
@@ -438,7 +492,29 @@ impl MasterNode {
     }
 
     pub async fn get_leader(&self) -> String {
-        self.leader_address.read().unwrap().clone()
+        let leader = self.leader_address.read().unwrap().clone();
+        // Convert raft address to net address for FUSE clients that use powerfs-net protocol
+        // raft_address is "host:raft_port", net_port is the port for powerfs-net connections
+        let convert_to_net_addr = |addr: &str| -> String {
+            if let Some(host) = addr.split(':').next() {
+                format!("{}:{}", host, self.net_port)
+            } else {
+                addr.to_string()
+            }
+        };
+
+        if !leader.is_empty() {
+            return convert_to_net_addr(&leader);
+        }
+        // Fallback: if we are the leader, return our own net address
+        if self.is_leader.load(Ordering::Relaxed) {
+            return convert_to_net_addr(&self.raft_address);
+        }
+        // Otherwise, return the first peer's net address as a fallback
+        if let Some(first_peer) = self.peers.first() {
+            return convert_to_net_addr(&first_peer.address);
+        }
+        convert_to_net_addr(&self.raft_address)
     }
 
     pub fn set_leader(&self, leader_addr: String) {
@@ -600,8 +676,9 @@ impl MasterNode {
                 volumes,
                 ip,
                 grpc_port,
+                net_port,
             } => {
-                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port)
+                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port, net_port)
                     .await?;
             }
             RaftCommand::Heartbeat { node_id } => {
@@ -770,7 +847,7 @@ impl MasterNode {
         Ok(())
     }
 
-    fn apply_update_volume_state(&self, volume_id: u32, state: VolumeState) -> Result<()> {
+    fn apply_update_volume_state(&self, volume_id: u64, state: VolumeState) -> Result<()> {
         let vid = VolumeId(volume_id);
         let mut volumes = self.volumes.write().unwrap();
         if let Some(info) = volumes.get_mut(&vid) {
@@ -786,6 +863,7 @@ impl MasterNode {
         volumes: &[crate::raft_storage::RaftVolumeShortInfo],
         ip: &str,
         grpc_port: u32,
+        net_port: u32,
     ) -> Result<()> {
         let nid = NodeId(node_id.to_string());
 
@@ -803,6 +881,7 @@ impl MasterNode {
 
         // Update volumes
         let mut volumes_map = self.volumes.write().unwrap();
+        let mut routes_map = self.volume_routes.write().unwrap();
         for vol in volumes {
             let vid = VolumeId(vol.volume_id);
             let state = if vol.read_only {
@@ -834,6 +913,36 @@ impl MasterNode {
                         modified_at: Utc::now(),
                         next_file_key: 1,
                     },
+                );
+            }
+
+            // 更新路由表
+            // 使用心跳中传递的 net_port 构建 Volume 路由地址
+            if let Some(existing_route) = routes_map.get_mut(&vol.volume_id) {
+                existing_route.used = vol.used;
+                existing_route.state = state;
+                existing_route.updated_at = Utc::now();
+                // 如果 net_port 有效，更新地址（支持 Volume 换地址场景）
+                if net_port > 0 {
+                    let addr = format!("{}:{}", ip, net_port);
+                    if existing_route.addr != addr {
+                        info!(
+                            "Volume {} route address updated: {} -> {}",
+                            vol.volume_id, existing_route.addr, addr
+                        );
+                        existing_route.addr = addr;
+                    }
+                }
+            } else {
+                // 新增 volume（首次注册）
+                let addr = if net_port > 0 {
+                    format!("{}:{}", ip, net_port)
+                } else {
+                    format!("{}:{}", ip, grpc_port)
+                };
+                routes_map.insert(
+                    vol.volume_id,
+                    VolumeRoute::new(vol.volume_id, addr, vol.size, nid.clone().0),
                 );
             }
         }
@@ -958,7 +1067,7 @@ impl MasterNode {
         self.collections.read().unwrap().values().cloned().collect()
     }
 
-    async fn apply_delete_volume(&self, volume_id: u32) -> Result<()> {
+    async fn apply_delete_volume(&self, volume_id: u64) -> Result<()> {
         let vid = VolumeId(volume_id);
         let mut volumes = self.volumes.write().unwrap();
         if volumes.remove(&vid).is_none() {
@@ -1158,6 +1267,7 @@ impl MasterNode {
             volumes: short_volumes,
             ip: params.ip,
             grpc_port: params.grpc_port,
+            net_port: params.net_port,
         };
 
         self.propose_command(cmd).await?;
@@ -1238,9 +1348,11 @@ impl MasterNode {
                     }
                 };
 
+                // Use the volume ID directly (UUID-based u64)
+                let volume_id = existing_vid;
                 let cookie = rand::random::<u32>() as u64;
                 let fid = Fid {
-                    volume_id: existing_vid,
+                    volume_id,
                     cookie,
                     file_key,
                 };
@@ -1254,56 +1366,81 @@ impl MasterNode {
 
                 info!(
                     "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
-                    existing_vid, collection_obj, existing_vid.0, cookie, file_key
+                    volume_id, collection_obj, volume_id.0, cookie, file_key
                 );
 
                 return Ok((fid, host_node));
             }
         }
 
-        self.create_new_volume(replication, collection).await
+        // No available volume in the pre-allocated pool
+        warn!(
+            "No available volume for collection {:?}. Pre-allocated volumes are full.",
+            collection_obj
+        );
+        Err(PowerFsError::InvalidRequest(
+            "no available volume in the pre-allocated pool. Please contact admin to allocate more volumes."
+                .to_string(),
+        ))
     }
 
     /// 批量分配 stripe volumes
-    /// 每次都创建新 volume，确保 stripe 的各条带分布在不同 volume 上
+    /// 使用预分配的 volume 池，从池中选择可用的 volume
     /// 返回 (volume_ids, start_volume_idx) 用于 FileLayout
     pub async fn assign_stripe_volumes(
         &self,
         count: u32,
-        replication: &str,
+        _replication: &str,
         collection: &str,
     ) -> Result<(Vec<u64>, u32)> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
+        let collection_obj = Collection(collection.to_string());
         let mut volume_ids = Vec::with_capacity(count as usize);
 
-        for i in 0..count {
-            // stripe 模式下每个条带都创建新 volume，确保分布在不同 volume server 上
-            match self.create_new_volume(replication, collection).await {
-                Ok((fid, _nodes)) => {
-                    volume_ids.push(fid.volume_id.0 as u64);
-                    info!(
-                        "assign_stripe_volumes: created volume {} for stripe slot {}/{}",
-                        fid.volume_id.0,
-                        i + 1,
-                        count
-                    );
+        // Find available volumes from the pre-allocated pool
+        {
+            let volumes = self.volumes.read().unwrap();
+            let mut available_volumes: Vec<VolumeId> = Vec::new();
+
+            for (vid, vinfo) in volumes.iter() {
+                if vinfo.collection != collection_obj {
+                    continue;
                 }
-                Err(e) => {
-                    warn!(
-                        "assign_stripe_volumes: create_new_volume failed for slot {}/{}: {}",
-                        i + 1,
-                        count,
-                        e
-                    );
-                    return Err(e);
+                // Writable states: Creating or Available
+                if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+                    continue;
                 }
+                // Check available space
+                if vinfo.used >= vinfo.size {
+                    continue;
+                }
+                available_volumes.push(*vid);
+            }
+
+            info!(
+                "assign_stripe_volumes: found {} available volumes for collection {:?}, need {}",
+                available_volumes.len(),
+                collection_obj,
+                count
+            );
+
+            if available_volumes.is_empty() {
+                return Err(PowerFsError::InvalidRequest(
+                    "no available volume in the pre-allocated pool".to_string(),
+                ));
+            }
+
+            // Use round-robin to select volumes for stripe
+            let start = self.stripe_round_robin.fetch_add(1, Ordering::Relaxed) as usize;
+            for i in 0..count as usize {
+                let idx = (start + i) % available_volumes.len();
+                volume_ids.push(available_volumes[idx].0);
             }
         }
 
-        // round-robin: 不同文件从不同 volume 开始
         let start_idx = self.stripe_round_robin.fetch_add(1, Ordering::Relaxed) % count;
 
         Ok((volume_ids, start_idx))
@@ -1620,6 +1757,62 @@ impl MasterNode {
         self.volumes.read().unwrap().get(volume_id).cloned()
     }
 
+    /// Get volume info by original ID (as used by Volume Server)
+    /// Returns the first matching volume with the given original ID
+    pub fn get_volume_info_by_original_id(&self, original_id: u64) -> Option<VolumeInfo> {
+        let volumes = self.volumes.read().unwrap();
+        volumes
+            .values()
+            .find(|v| v.id.0 % 1000 == original_id)
+            .cloned()
+    }
+
+    /// Get volume route by volume ID
+    pub fn get_volume_route(&self, volume_id: u64) -> Option<VolumeRoute> {
+        self.volume_routes.read().unwrap().get(&volume_id).cloned()
+    }
+
+    /// Set or update volume route
+    pub fn set_volume_route(&self, route: VolumeRoute) {
+        self.volume_routes
+            .write()
+            .unwrap()
+            .insert(route.volume_id, route);
+    }
+
+    /// Update volume route address (for volume migration/relocation)
+    pub fn update_volume_route(&self, volume_id: u64, new_addr: String) -> Result<()> {
+        let mut routes = self.volume_routes.write().unwrap();
+        if let Some(route) = routes.get_mut(&volume_id) {
+            route.update_addr(new_addr);
+            info!(
+                "Updated volume route: volume_id={}, new_addr={}",
+                volume_id, route.addr
+            );
+            Ok(())
+        } else {
+            Err(PowerFsError::Internal(format!(
+                "Volume route not found: {}",
+                volume_id
+            )))
+        }
+    }
+
+    /// List all volume routes
+    pub fn list_volume_routes(&self) -> Vec<VolumeRoute> {
+        self.volume_routes
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Remove volume route
+    pub fn remove_volume_route(&self, volume_id: u64) -> Option<VolumeRoute> {
+        self.volume_routes.write().unwrap().remove(&volume_id)
+    }
+
     pub fn get_node_info(&self, node_id: &NodeId) -> Option<DataNodeInfo> {
         self.topology.read().unwrap().get_node(node_id).cloned()
     }
@@ -1707,7 +1900,7 @@ impl MasterNode {
         let topology = self.topology.read().unwrap();
 
         for vid_str in volume_ids {
-            if let Ok(vid) = u32::from_str(vid_str) {
+            if let Ok(vid) = u64::from_str(vid_str) {
                 let volume_id = VolumeId(vid);
                 if let Some(vol) = volumes.get(&volume_id) {
                     if let Some(node) = topology.get_node(&vol.node_id) {
@@ -2154,6 +2347,7 @@ impl Clone for MasterNode {
             net_port: self.net_port,
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
+            volume_routes: RwLock::new(self.volume_routes.read().unwrap().clone()),
             collections: RwLock::new(self.collections.read().unwrap().clone()),
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),

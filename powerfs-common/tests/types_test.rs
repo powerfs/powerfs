@@ -32,12 +32,12 @@ fn test_volume_id_from_str_invalid() {
 #[test]
 fn test_volume_id_from_str_max_value() {
     let vid = VolumeId::from_str("4294967295").unwrap(); // u32::MAX
-    assert_eq!(vid.0, u32::MAX);
+    assert_eq!(vid.0, u32::MAX as u64);
 }
 
 #[test]
 fn test_volume_id_from_str_overflow() {
-    assert!(VolumeId::from_str("4294967296").is_err()); // u32::MAX + 1
+    assert!(VolumeId::from_str("18446744073709551616").is_err()); // u64::MAX + 1
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn test_fid_from_string_volume_id_zero() {
 #[test]
 fn test_fid_from_string_max_values() {
     let fid = Fid::from_string("4294967295,18446744073709551615,18446744073709551615").unwrap();
-    assert_eq!(fid.volume_id, VolumeId(u32::MAX));
+    assert_eq!(fid.volume_id, VolumeId(u32::MAX as u64));
     assert_eq!(fid.cookie, u64::MAX);
     assert_eq!(fid.file_key, u64::MAX);
 }

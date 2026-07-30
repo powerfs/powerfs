@@ -45,9 +45,9 @@ pub enum ClientError {
     #[error("Request queue is full (capacity: {0})")]
     QueueFull(usize),
 
-    /// 没有网络客户端
-    #[error("No network client configured")]
-    NoNetworkClient,
+    /// 无效的地址格式
+    #[error("Invalid address format: {0}")]
+    InvalidAddress(String),
 
     /// 内部错误
     #[error("Internal error: {0}")]

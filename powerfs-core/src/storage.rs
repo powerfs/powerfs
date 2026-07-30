@@ -109,7 +109,7 @@ impl StorageManager {
             volume.set_deleting();
 
             self.backend
-                .delete_volume(volume_id.0 as u64)
+                .delete_volume(volume_id.0)
                 .map_err(backend_err)?;
 
             let volume_path =
@@ -191,7 +191,7 @@ impl StorageManager {
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                     if let Some(stripped) = dir_name.strip_prefix("volume_") {
-                        if let Ok(vid) = stripped.parse::<u32>() {
+                        if let Ok(vid) = stripped.parse::<u64>() {
                             let volume_id = VolumeId(vid);
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 volumes.entry(volume_id)

@@ -93,6 +93,7 @@ message Heartbeat {
     bool has_no_volumes = 12;
     uint32 grpc_port = 20;
     string id = 22;
+    uint32 net_port = 23;
 }
 
 message HeartbeatResponse {
@@ -106,7 +107,7 @@ message HeartbeatResponse {
 }
 
 message VolumeShortInfo {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 size = 2;
     bool read_only = 3;
     string collection = 4;
@@ -231,7 +232,7 @@ message VolumeGrowRequest {
 }
 
 message VolumeGrowResponse {
-    repeated uint32 new_volume_ids = 1;
+    repeated uint64 new_volume_ids = 1;
     repeated Location locations = 2;
     string error = 3;
 }
@@ -290,7 +291,7 @@ message ListCollectionsResponse {
 
 // Volume management messages
 message DeleteVolumeRequest {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
 }
 
 message DeleteVolumeResponse {
@@ -677,7 +678,7 @@ enum StorageBackend {
 }
 
 message ChunkLocation {
-    uint32 volume_id = 1;
+    uint64 volume_id = 1;
     uint64 file_key = 2;
     uint32 cookie = 3;
     string fid = 4;
@@ -690,7 +691,7 @@ message StripeInfo {
     uint32 stripe_index = 1;
     uint64 stripe_offset = 2;
     uint64 stripe_size = 3;
-    uint32 volume_id = 4;
+    uint64 volume_id = 4;
     uint64 file_key = 5;
 }
 

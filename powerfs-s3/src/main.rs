@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{info, warn};
+use log::info;
 use std::sync::Arc;
 
 use powerfs_common::build_info::BuildInfo;
@@ -23,26 +23,9 @@ use powerfs_master::{
 #[command(version = "0.1.0")]
 #[command(about = "PowerFS S3 Gateway - S3-compatible object storage API")]
 struct Args {
-    #[arg(long, short, default_value = "9000")]
-    port: u16,
-
-    #[arg(long, short)]
-    master: Option<String>,
-
-    #[arg(long)]
-    ip: Option<String>,
-
-    #[arg(long, short, default_value = "./data/s3")]
-    dir: String,
-
-    #[arg(long, default_value = "powerfs")]
-    access_key: String,
-
-    #[arg(long, default_value = "powerfs123")]
-    secret_key: String,
-
-    #[arg(long, short = 'c')]
-    config: Option<String>,
+    /// 配置文件路径（必填，所有端口和地址必须在配置文件中设置）
+    #[arg(short, long, required = true)]
+    config: String,
 }
 
 #[tokio::main]
@@ -54,57 +37,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 
     let args = Args::parse();
+    let cfg = load_config(&args.config);
 
-    run_s3(args).await?;
+    run_s3(cfg).await?;
 
     Ok(())
 }
 
-async fn run_s3(args: Args) -> Result<()> {
+async fn run_s3(cfg: PowerFsConfig) -> Result<()> {
     info!("Starting PowerFS S3 Server");
 
-    let cfg = args
-        .config
-        .as_ref()
-        .and_then(|c| match PowerFsConfig::load_from_file(c) {
-            Ok(cfg) => {
-                if let Err(e) = cfg.validate() {
-                    warn!("Config validation failed: {}, using defaults", e);
-                    None
-                } else {
-                    info!("Loaded config from: {}", c);
-                    Some(cfg)
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load config file: {}, using defaults", e);
-                None
-            }
-        });
+    let s3_cfg = cfg.s3.clone();
 
-    let s3_cfg = cfg.as_ref().map(|c| &c.s3);
+    // 所有值从配置获取 - 无硬编码默认值
+    let port = s3_cfg.port;
+    let master_addr = s3_cfg.master_address.clone();
+    let access_key = s3_cfg.access_key.clone();
+    let secret_key = s3_cfg.secret_key.clone();
 
-    let port = s3_cfg.map(|s| s.port).unwrap_or(args.port);
-    let master_addr = args
-        .master
-        .or_else(|| s3_cfg.map(|s| s.master_address.clone()))
-        .unwrap_or_else(|| "127.0.0.1:9333".to_string());
-    let ip = args
-        .ip
-        .or_else(|| cfg.as_ref().and_then(|c| c.s3.ip.clone()));
-    let access_key = s3_cfg
-        .map(|s| s.access_key.clone())
-        .unwrap_or_else(|| args.access_key.clone());
-    let secret_key = s3_cfg
-        .map(|s| s.secret_key.clone())
-        .unwrap_or_else(|| args.secret_key.clone());
-
-    let address = match ip {
-        Some(ref ip) => format!("{}:{}", ip, port),
-        None => format!("0.0.0.0:{}", port),
-    };
+    // 绑定地址
+    let bind_ip = s3_cfg.ip.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+    let address = format!("{}:{}", bind_ip, port);
 
     let s3_addr: std::net::SocketAddr = address.parse()?;
+
+    if master_addr.is_empty() {
+        return Err(PowerFsError::Internal(
+            "s3.master_address must not be empty".to_string(),
+        ));
+    }
 
     let directory_tree: Arc<dyn DirectoryTreeApi> =
         Arc::new(RemoteDirectoryTree::new(&master_addr));
@@ -139,4 +100,18 @@ async fn run_s3(args: Args) -> Result<()> {
         .map_err(|e| PowerFsError::Internal(format!("S3 server error: {}", e)))?;
 
     Ok(())
+}
+
+fn load_config(config_path: &str) -> PowerFsConfig {
+    match PowerFsConfig::load_or_error(config_path) {
+        Ok(cfg) => {
+            info!("Successfully loaded configuration from: {}", config_path);
+            cfg
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to load configuration: {}", e);
+            eprintln!("You must provide a valid configuration file with all required ports and addresses.");
+            std::process::exit(1);
+        }
+    }
 }

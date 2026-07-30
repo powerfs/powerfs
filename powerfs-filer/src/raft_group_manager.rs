@@ -22,7 +22,10 @@ const SNAPSHOT_THRESHOLD: u64 = 10000;
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub id: u64,
+    /// gRPC address for Raft communication (e.g., "172.21.0.31:8889")
     pub address: String,
+    /// powerfs-net address for client connections (e.g., "172.21.0.31:8890")
+    pub net_address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -87,16 +90,32 @@ pub enum ShardCommand {
         inode: u64,
         size: u64,
         fid: String,
-        volume_id: u32,
+        volume_id: u64,
         etag: String,
     },
-    /// Set inode attributes (size, mode, uid, gid)
+    /// Set inode attributes (size, mode, uid, gid) - legacy unified command
     SetAttr {
         inode: u64,
         size: Option<u64>,
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+    },
+    /// Set data-related inode attributes (size, chunks) - strong consistency via Lease
+    SetAttrData {
+        inode: u64,
+        size: Option<u64>,
+    },
+    /// Set metadata-related inode attributes (mode, uid, gid, timestamps) - eventual consistency via CRDT
+    SetAttrMeta {
+        inode: u64,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
+        client_id: String,
+        timestamp: u64,
     },
     /// Create a symbolic link
     CreateSymlink {
@@ -110,6 +129,15 @@ pub enum ShardCommand {
         inode: u64,
         new_parent_inode: u64,
         new_name: String,
+    },
+    /// Set chunk/fid info for an existing inode (for data location persistence)
+    SetChunks {
+        inode: u64,
+        fid: String,
+        volume_id: u64,
+        cookie: u32,
+        offset: u64,
+        size: u64,
     },
 }
 

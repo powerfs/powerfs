@@ -9,7 +9,7 @@ use redis::AsyncCommands;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketInfo {
     pub name: String,
-    pub volume_ids: Vec<u32>,
+    pub volume_ids: Vec<u64>,
     pub size_limit: u64,
     pub used_size: u64,
     pub creation_time: DateTime<Utc>,
@@ -32,7 +32,7 @@ pub struct EntryInfo {
     pub bucket: String,
     pub key: String,
     pub fid: String,
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub size: u64,
     pub mtime: DateTime<Utc>,
     pub etag: String,
@@ -41,7 +41,7 @@ pub struct EntryInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeRoute {
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub server_addr: String,
     pub server_id: String,
     pub size: u64,
@@ -57,7 +57,7 @@ pub struct MetadataStore {
     #[cfg(not(feature = "redis-event"))]
     entries: Arc<RwLock<HashMap<String, EntryInfo>>>,
     #[cfg(not(feature = "redis-event"))]
-    volume_routes: Arc<RwLock<HashMap<u32, VolumeRoute>>>,
+    volume_routes: Arc<RwLock<HashMap<u64, VolumeRoute>>>,
 }
 
 impl MetadataStore {
@@ -281,7 +281,7 @@ impl MetadataStore {
         }
     }
 
-    pub async fn get_volume_route(&self, volume_id: u32) -> Option<VolumeRoute> {
+    pub async fn get_volume_route(&self, volume_id: u64) -> Option<VolumeRoute> {
         #[cfg(feature = "redis-event")]
         {
             let key = format!("volume:{}", volume_id);
@@ -304,7 +304,7 @@ impl MetadataStore {
         }
     }
 
-    pub async fn put_volume_route(&self, volume_id: u32, route: &VolumeRoute) -> bool {
+    pub async fn put_volume_route(&self, volume_id: u64, route: &VolumeRoute) -> bool {
         #[cfg(feature = "redis-event")]
         {
             let key = format!("volume:{}", volume_id);
@@ -328,7 +328,7 @@ impl MetadataStore {
         }
     }
 
-    pub async fn delete_volume_route(&self, volume_id: u32) -> bool {
+    pub async fn delete_volume_route(&self, volume_id: u64) -> bool {
         #[cfg(feature = "redis-event")]
         {
             let key = format!("volume:{}", volume_id);

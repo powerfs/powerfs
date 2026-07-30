@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod fuse;
+pub mod invalidate_handler;
 
 pub mod error {
     pub use powerfs_fuse_core::error::*;

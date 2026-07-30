@@ -18,6 +18,7 @@ pub struct MasterClient {
     node_id: NodeId,
     grpc_port: u32,
     http_port: u32,
+    net_port: u32,
     data_center: String,
     rack: String,
     public_url: String,
@@ -32,6 +33,7 @@ pub struct NewMasterClientParams<'a> {
     pub node_id: NodeId,
     pub grpc_port: u32,
     pub http_port: u32,
+    pub net_port: u32,
     pub data_center: &'a str,
     pub rack: &'a str,
     pub public_url: &'a str,
@@ -52,6 +54,7 @@ impl MasterClient {
             node_id: params.node_id,
             grpc_port: params.grpc_port,
             http_port: params.http_port,
+            net_port: params.net_port,
             data_center: params.data_center.to_string(),
             rack: params.rack.to_string(),
             public_url: params.public_url.to_string(),
@@ -171,10 +174,11 @@ impl MasterClient {
         while let Some(response) = responses.next().await {
             match response {
                 Ok(resp) => {
-                    debug!(
+                    info!(
                         "Heartbeat response: leader={}, volume_size_limit={}, error={}, error_code={}",
                         resp.leader, resp.volume_size_limit, resp.error, resp.error_code
                     );
+                    info!("Master addresses: {:?}", master_addresses);
 
                     if !resp.error.is_empty() {
                         warn!(
@@ -184,12 +188,19 @@ impl MasterClient {
                         match resp.error_code.as_str() {
                             "LEADER_CHANGED" => {
                                 if !resp.leader.is_empty() {
-                                    if let Some(idx) =
-                                        master_addresses.iter().position(|a| a.eq(&resp.leader))
-                                    {
+                                    // Match by host only (ignore port), since leader address
+                                    // may use net port while master_addresses uses gRPC port
+                                    let leader_host =
+                                        resp.leader.split(':').next().unwrap_or(&resp.leader);
+                                    if let Some(idx) = master_addresses.iter().position(|a| {
+                                        a.split(':').next().unwrap_or(a) == leader_host
+                                    }) {
                                         let current = current_master_index.load(Ordering::Relaxed);
                                         if idx != current {
-                                            info!("Switching to leader master: {}", resp.leader);
+                                            info!(
+                                                "Switching to leader master: {} (host: {})",
+                                                resp.leader, leader_host
+                                            );
                                             current_master_index.store(idx, Ordering::Relaxed);
                                         }
                                     }
@@ -210,11 +221,19 @@ impl MasterClient {
                     }
 
                     if !resp.leader.is_empty() {
-                        if let Some(idx) = master_addresses.iter().position(|a| a.eq(&resp.leader))
+                        // Match by host only (ignore port), since leader address
+                        // may use net port while master_addresses uses gRPC port
+                        let leader_host = resp.leader.split(':').next().unwrap_or(&resp.leader);
+                        if let Some(idx) = master_addresses
+                            .iter()
+                            .position(|a| a.split(':').next().unwrap_or(a) == leader_host)
                         {
                             let current = current_master_index.load(Ordering::Relaxed);
                             if idx != current {
-                                info!("Switching to leader master: {}", resp.leader);
+                                info!(
+                                    "Switching to leader master: {} (host: {})",
+                                    resp.leader, leader_host
+                                );
                                 current_master_index.store(idx, Ordering::Relaxed);
                             }
                         }
@@ -249,6 +268,7 @@ impl MasterClient {
             has_no_volumes: volumes.is_empty(),
             grpc_port: self.grpc_port,
             id: self.node_id.0.clone(),
+            net_port: self.net_port,
         };
 
         self.heartbeat_tx

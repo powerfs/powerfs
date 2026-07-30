@@ -14,9 +14,17 @@ use powerfs_fuse_core::*;
 /// 测试 FuseClientFacadeConfig 创建
 #[test]
 fn test_facade_config_creation() {
-    let config = FuseClientFacadeConfig::default();
+    let config = FuseClientFacadeConfig::new(
+        "127.0.0.1".to_string(),
+        9333,
+        8901,
+        vec!["127.0.0.1".to_string()],
+        "127.0.0.1".to_string(),
+        9343,
+    )
+    .unwrap();
 
-    // 验证默认值
+    // 验证配置值
     assert_eq!(config.master_addr, "127.0.0.1");
     assert_eq!(config.master_port, 9333);
     assert_eq!(config.filer_addr, "127.0.0.1");
@@ -35,6 +43,7 @@ fn test_facade_config_custom_values() {
         master_addr: "192.168.1.100".to_string(),
         master_port: 8000,
         volume_net_port: 8002,
+        volume_addrs: Vec::new(),
         filer_addr: "192.168.1.200".to_string(),
         filer_port: 8001,
         request_timeout: Duration::from_secs(10),
@@ -110,18 +119,21 @@ async fn test_request_submission_without_network() {
     assert_eq!(data_len, 1);
     assert_eq!(control_len, 0);
 
-    // 尝试处理请求（没有网络客户端应该返回错误）
+    // 尝试处理请求（没有网络连接应该返回错误）
     let result = client.process_next_data_request().await;
     assert!(result.is_some());
 
     let result = result.unwrap();
     match result {
         Ok(_) => {
-            // 成功（不太可能，因为没有网络客户端）
+            // 成功（不太可能，因为没有网络连接）
         }
         Err(e) => {
-            // 应该是 NoNetworkClient 错误
-            assert!(matches!(e, ClientError::NoNetworkClient));
+            // 应该是网络错误（连接失败或路由未配置）
+            assert!(matches!(
+                e,
+                ClientError::Network(_) | ClientError::VolumeNotFound(_)
+            ));
         }
     }
 }
@@ -155,18 +167,21 @@ async fn test_volume_request_submission_without_network() {
     assert_eq!(lease_len, 0);
     assert_eq!(mgmt_len, 0);
 
-    // 尝试处理请求（没有网络客户端应该返回错误）
+    // 尝试处理请求（没有网络连接应该返回错误）
     let result = client.process_next_data_request().await;
     assert!(result.is_some());
 
     let result = result.unwrap();
     match result {
         Ok(_) => {
-            // 成功（不太可能，因为没有网络客户端）
+            // 成功（不太可能，因为没有网络连接）
         }
         Err(e) => {
-            // 应该是 NoNetworkClient 错误
-            assert!(matches!(e, ClientError::NoNetworkClient));
+            // 应该是网络错误（连接失败或路由未配置）
+            assert!(matches!(
+                e,
+                ClientError::Network(_) | ClientError::VolumeNotFound(_)
+            ));
         }
     }
 }

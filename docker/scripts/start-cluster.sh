@@ -103,7 +103,7 @@ docker compose up -d --no-deps master-2
 echo "  Waiting for master-2 to be ready..."
 timeout=60
 while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9334 >/dev/null 2>&1; then
+    if nc -z localhost 9336 >/dev/null 2>&1; then
         echo "  [OK] master-2 ready"
         break
     fi
@@ -120,7 +120,7 @@ docker compose up -d --no-deps master-3
 echo "  Waiting for master-3 to be ready..."
 timeout=60
 while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9335 >/dev/null 2>&1; then
+    if nc -z localhost 9337 >/dev/null 2>&1; then
         echo "  [OK] master-3 ready"
         break
     fi
@@ -218,8 +218,8 @@ echo ""
 echo "Service Addresses (accessible from other nodes):"
 echo "  Redis:           $HOST_IP:6379"
 echo "  Master 1:        $HOST_IP:9333"
-echo "  Master 2:        $HOST_IP:9334"
-echo "  Master 3:        $HOST_IP:9335"
+echo "  Master 2:        $HOST_IP:9336"
+echo "  Master 3:        $HOST_IP:9337"
 echo "  Volume 1:        $HOST_IP:8080"
 echo "  Volume 2:        $HOST_IP:8081"
 echo "  Volume 3:        $HOST_IP:8082"

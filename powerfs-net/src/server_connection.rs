@@ -2,14 +2,14 @@
 //!
 //! Provides `ClientSession` for per-connection state tracking and
 //! `ServerConnectionManager` for managing multiple client sessions
-//! with automatic cleanup, request pipeline, and metrics.
+//! with automatic cleanup, request pipeline, metrics, and notification push.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::errors::{NetError, NetResult};
 use crate::middleware::{
@@ -132,12 +132,17 @@ pub struct HealthStatus {
     pub total_sessions: usize,
 }
 
-/// ServerConnectionManager - manages client sessions and request processing
+/// ServerConnectionManager - manages client sessions, request processing, and notification push
 pub struct ServerConnectionManager {
     sessions: RwLock<HashMap<u64, ClientSession>>,
     pipeline: RequestPipeline,
     metrics: Arc<MetricsMiddleware>,
+    /// Notification channels for each client (client_id -> sender)
+    notification_channels: RwLock<HashMap<u64, mpsc::Sender<NetMessage>>>,
 }
+
+/// Default channel size for notification queue per client
+pub const DEFAULT_NOTIFICATION_CHANNEL_SIZE: usize = 64;
 
 impl ServerConnectionManager {
     pub fn new() -> Self {
@@ -149,6 +154,7 @@ impl ServerConnectionManager {
             sessions: RwLock::new(HashMap::new()),
             pipeline,
             metrics,
+            notification_channels: RwLock::new(HashMap::new()),
         }
     }
 
@@ -187,8 +193,21 @@ impl ServerConnectionManager {
         );
     }
 
-    /// Remove a client session
+    /// Remove a client session and its notification channel
     pub async fn unregister_session(&self, client_id: u64) {
+        // Remove notification channel first
+        {
+            let mut channels = self.notification_channels.write().await;
+            if let Some(tx) = channels.remove(&client_id) {
+                // Drop the sender, which will signal the receiver to close
+                drop(tx);
+                log::debug!(
+                    "[Server] Removed notification channel for client {}",
+                    client_id
+                );
+            }
+        }
+
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.remove(&client_id) {
             log::info!(
@@ -357,7 +376,111 @@ impl ServerConnectionManager {
         }
     }
 
+    // ========================================================================
+    // Notification Push Support (Server→Client)
+    // ========================================================================
+
+    /// Register a notification channel for a client
+    ///
+    /// This is called by the server when a client connection is established.
+    /// The receiver end of the channel should be polled in the connection's
+    /// message loop to send notifications to the client.
+    pub async fn register_notification_channel(
+        &self,
+        client_id: u64,
+    ) -> mpsc::Receiver<NetMessage> {
+        let (tx, rx) = mpsc::channel(DEFAULT_NOTIFICATION_CHANNEL_SIZE);
+        let mut channels = self.notification_channels.write().await;
+        channels.insert(client_id, tx);
+        log::debug!(
+            "[Server] Registered notification channel for client {}",
+            client_id
+        );
+        rx
+    }
+
+    /// Send a notification message to a specific client
+    ///
+    /// Returns Ok(true) if the notification was queued successfully.
+    /// Returns Ok(false) if the client is not connected or channel is full.
+    /// Returns Err if the client doesn't exist.
+    pub async fn send_notification(&self, client_id: u64, msg: NetMessage) -> NetResult<bool> {
+        let msg_type = msg.msg_type();
+        let channels = self.notification_channels.read().await;
+        if let Some(tx) = channels.get(&client_id) {
+            match tx.try_send(msg) {
+                Ok(_) => {
+                    log::debug!(
+                        "[Server] Queued notification for client {} type={:?}",
+                        client_id,
+                        msg_type
+                    );
+                    Ok(true)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "[Server] Notification channel full for client {}",
+                        client_id
+                    );
+                    Ok(false)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::warn!(
+                        "[Server] Notification channel closed for client {}",
+                        client_id
+                    );
+                    Err(NetError::Connection(format!(
+                        "Client {} notification channel closed",
+                        client_id
+                    )))
+                }
+            }
+        } else {
+            log::debug!("[Server] No notification channel for client {}", client_id);
+            Err(NetError::Connection(format!(
+                "Client {} not found",
+                client_id
+            )))
+        }
+    }
+
+    /// Send a notification to all connected clients
+    ///
+    /// Returns the number of clients that received the notification.
+    pub async fn broadcast_notification(&self, msg: &NetMessage) -> usize {
+        let channels = self.notification_channels.read().await;
+        let mut success_count = 0;
+        for (client_id, tx) in channels.iter() {
+            if tx.try_send(msg.clone()).is_ok() {
+                success_count += 1;
+            } else {
+                log::debug!(
+                    "[Server] Failed to queue notification for client {}",
+                    client_id
+                );
+            }
+        }
+        success_count
+    }
+
+    /// Check if a client has a notification channel registered
+    pub async fn has_notification_channel(&self, client_id: u64) -> bool {
+        let channels = self.notification_channels.read().await;
+        channels.contains_key(&client_id)
+    }
+
+    /// Get the number of clients with notification channels
+    pub async fn notification_channel_count(&self) -> usize {
+        self.notification_channels.read().await.len()
+    }
+
     pub async fn shutdown(&self) {
+        // Clear notification channels
+        {
+            let mut channels = self.notification_channels.write().await;
+            channels.clear();
+        }
+
         let mut sessions = self.sessions.write().await;
         let count = sessions.len();
         for session in sessions.values_mut() {

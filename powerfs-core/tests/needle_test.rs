@@ -402,8 +402,12 @@ fn test_needle_boundary_empty_id() {
 
 #[test]
 fn test_needle_boundary_max_volume_id() {
-    let needle = Needle::new(NeedleId(1), VolumeId(u32::MAX), Bytes::from("max volume"));
-    assert_eq!(needle.volume_id, VolumeId(u32::MAX));
+    let needle = Needle::new(
+        NeedleId(1),
+        VolumeId(u32::MAX as u64),
+        Bytes::from("max volume"),
+    );
+    assert_eq!(needle.volume_id, VolumeId(u32::MAX as u64));
 }
 
 #[test]

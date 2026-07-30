@@ -4,7 +4,7 @@ use powerfs_core::storage_backend::LocalFsBackend;
 use powerfs_core::volume::Volume;
 use std::sync::Arc;
 
-fn create_test_volume(vol_id: u32, size: u64) -> (tempfile::TempDir, Volume) {
+fn create_test_volume(vol_id: u64, size: u64) -> (tempfile::TempDir, Volume) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap();
     let backend = Arc::new(
@@ -378,10 +378,11 @@ fn test_volume_scrub_skips_deleted() {
     volume.write_needle(2, Bytes::from("delete this")).unwrap();
     volume.delete_needle(&NeedleId(2)).unwrap();
 
+    // 硬删除策略：已删除 needle 从 needles CF 移除，scrub 只看到活跃 needle
     let result = volume.scrub_volume();
     assert_eq!(result.total, 1);
     assert_eq!(result.verified, 1);
-    assert_eq!(result.skipped, 1);
+    assert_eq!(result.skipped, 0); // 硬删除后 deleted needle 不在 needles CF
     assert_eq!(result.corrupted, 0);
 }
 
@@ -750,4 +751,174 @@ fn test_storage_manager_compact_volume() {
 
     let (reclaimed, _moved) = manager.compact_volume(&VolumeId(1)).unwrap();
     assert!(reclaimed > 0);
+}
+
+// ============================================================================
+// L1 Crash Recovery Tests (RocksDB WAL + allocation CF sync)
+// ============================================================================
+
+/// 测试 L1 崩溃恢复：写入 + 删除后重启，验证数据完整性和 allocation 一致性
+#[test]
+fn test_l1_crash_recovery_after_write_and_delete() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
+
+    let volume_size = 10 * 1024 * 1024;
+    let (used_before, free_before, count_before, deleted_before);
+    let needle1_data = Bytes::from("persistent data 1");
+    let needle2_data = Bytes::from("persistent data 2");
+
+    {
+        let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+
+        // 写入两个 needle
+        volume.write_needle(1, needle1_data.clone()).unwrap();
+        volume.write_needle(2, needle2_data.clone()).unwrap();
+
+        // 删除 needle 2
+        volume.delete_needle(&NeedleId(2)).unwrap();
+
+        // 记录重启前的状态
+        used_before = volume.used();
+        free_before = volume.free_space();
+        count_before = volume.count();
+        deleted_before = volume.deleted_count();
+
+        assert_eq!(count_before, 1, "should have 1 active needle");
+        assert_eq!(deleted_before, 1, "should have 1 deleted needle");
+        assert!(used_before > 0);
+
+        // Volume drop 模拟崩溃
+    }
+
+    // 重新打开 Volume（模拟重启）
+    let volume2 = Volume::new(VolumeId(1), "node", path, volume_size, backend).unwrap();
+
+    // 验证 allocation 统计一致性
+    assert_eq!(
+        volume2.used(),
+        used_before,
+        "used should match pre-crash value after L1 recovery"
+    );
+    assert_eq!(
+        volume2.free_space(),
+        free_before,
+        "free_space should match pre-crash value after L1 recovery"
+    );
+    assert_eq!(
+        volume2.count(),
+        count_before,
+        "active count should match pre-crash value after L1 recovery"
+    );
+    assert_eq!(
+        volume2.deleted_count(),
+        deleted_before,
+        "deleted count should match pre-crash value after L1 recovery"
+    );
+
+    // 验证活跃 needle 数据完整
+    let data1 = volume2.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(
+        data1, needle1_data,
+        "active needle data must be intact after recovery"
+    );
+
+    // 验证已删除 needle 不可读
+    assert!(
+        volume2.get_needle_info(&NeedleId(2)).is_none(),
+        "deleted needle should not be in needles CF after hard delete recovery"
+    );
+
+    // 验证可以继续写入（allocation CF offset 正确）
+    let needle3_data = Bytes::from("post-recovery data");
+    volume2.write_needle(3, needle3_data.clone()).unwrap();
+    let data3 = volume2.read_needle(&NeedleId(3)).unwrap();
+    assert_eq!(data3, needle3_data);
+
+    assert_eq!(
+        volume2.count(),
+        2,
+        "should have 2 active needles after post-recovery write"
+    );
+}
+
+/// 测试 L1 崩溃恢复：恢复已删除的 needle 后重启
+#[test]
+fn test_l1_crash_recovery_after_restore() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
+
+    let volume_size = 10 * 1024 * 1024;
+    let needle_data = Bytes::from("restorable data");
+
+    {
+        let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+
+        volume.write_needle(1, needle_data.clone()).unwrap();
+        volume.delete_needle(&NeedleId(1)).unwrap();
+
+        // 恢复 needle
+        volume.restore_needle(&NeedleId(1)).unwrap();
+        assert_eq!(volume.count(), 1);
+        assert_eq!(volume.deleted_count(), 0);
+
+        // 模拟崩溃
+    }
+
+    // 重启后验证恢复的 needle 仍然存在
+    let volume2 = Volume::new(VolumeId(1), "node", path, volume_size, backend).unwrap();
+
+    assert_eq!(
+        volume2.count(),
+        1,
+        "restored needle should survive crash recovery"
+    );
+    assert_eq!(
+        volume2.deleted_count(),
+        0,
+        "no deleted needles after restore recovery"
+    );
+
+    let data = volume2.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(data, needle_data, "restored needle data must be intact");
+}
+
+/// 测试 L1 崩溃恢复：空 Volume 首次启动
+#[test]
+fn test_l1_crash_recovery_empty_volume() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
+
+    let volume_size = 10 * 1024 * 1024;
+
+    // 首次启动空 Volume
+    let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+    assert_eq!(volume.used(), 0);
+    assert_eq!(volume.free_space(), volume_size);
+    assert_eq!(volume.count(), 0);
+    drop(volume);
+
+    // 重启后应保持空状态
+    let volume2 = Volume::new(VolumeId(1), "node", path, volume_size, backend).unwrap();
+    assert_eq!(
+        volume2.used(),
+        0,
+        "empty volume should have 0 used after restart"
+    );
+    assert_eq!(
+        volume2.free_space(),
+        volume_size,
+        "empty volume should have full free space"
+    );
+    assert_eq!(volume2.count(), 0);
+    assert_eq!(volume2.deleted_count(), 0);
 }

@@ -9,8 +9,8 @@ use log::{debug, error, info, warn};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, RequestContext,
-    ServerRequestHandler, STATUS_ERR_ALREADY_EXISTS, STATUS_ERR_NOT_FOUND, STATUS_ERR_SERVER_ERROR,
-    STATUS_OK,
+    ServerRequestHandler, STATUS_ERR_ALREADY_EXISTS, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
+    STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
@@ -101,7 +101,7 @@ impl MasterNetHandler {
         enc.add_u64(FieldId::Entries, volumes.len() as u64);
 
         for vol in volumes {
-            enc.add_u64(FieldId::Ino, vol.volume_id as u64);
+            enc.add_u64(FieldId::Ino, vol.volume_id);
             enc.add_u64(FieldId::Size, vol.size);
             enc.add_u64(FieldId::Mode, vol.read_only as u64);
             enc.add_string(FieldId::Name, &vol.collection)?;
@@ -140,14 +140,17 @@ impl MasterNetHandler {
 
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
-            error!(
-                "NET_ASSIGN: not leader; current leader is {}, returning error response",
+            warn!(
+                "NET_ASSIGN: not leader; current leader is {}, returning redirect response",
                 leader
             );
+            // Return redirect response with leader address
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Owner, &leader);
             return Ok(Self::build_response(
                 msg,
-                STATUS_ERR_SERVER_ERROR,
-                Vec::new(),
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
                 Vec::new(),
             ));
         }
@@ -157,12 +160,28 @@ impl MasterNetHandler {
         match result {
             Ok((fid, nodes)) => {
                 let mut enc = TlvEncoder::new();
-                enc.add_string(FieldId::Name, &fid.to_string())?;
-                if let Some(node) = nodes.first() {
-                    enc.add_string(FieldId::Owner, &node.url())?;
-                    enc.add_string(FieldId::Backend, &node.data_center_id.to_string())?;
-                }
-                enc.add_u64(FieldId::Entries, nodes.len() as u64);
+                // Return structured fields so the client can directly use them
+                let _ = enc.add_u64(FieldId::VolumeId, fid.volume_id.0);
+                let _ = enc.add_u64(FieldId::Cookie, fid.cookie);
+                let _ = enc.add_u64(FieldId::FileKey, fid.file_key);
+                // Use volume route addr (net_port) instead of node.url() (http_port)
+                // The FUSE client connects via powerfs-net protocol, not HTTP
+                let route_addr = self
+                    .master
+                    .get_volume_route(fid.volume_id.0)
+                    .map(|r| r.addr)
+                    .unwrap_or_else(|| nodes.first().map(|n| n.url()).unwrap_or_default());
+                let _ = enc.add_string(FieldId::Owner, &route_addr);
+                let _ = enc.add_u64(FieldId::Entries, nodes.len() as u64);
+
+                info!(
+                    "NET_ASSIGN: assigned volume_id={}, cookie={}, file_key={}, route_addr={}, nodes={}",
+                    fid.volume_id.0,
+                    fid.cookie,
+                    fid.file_key,
+                    route_addr,
+                    nodes.len()
+                );
 
                 Ok(Self::build_response(
                     msg,
@@ -193,11 +212,23 @@ impl MasterNetHandler {
 
         info!("NET_LOOKUP_VOLUME: volume_id={}", volume_id_str);
 
-        let vid: u32 = volume_id_str.parse().unwrap_or(0);
-        let volume_id = powerfs_common::types::VolumeId(vid);
+        let original_id: u64 = volume_id_str.parse().unwrap_or(0);
 
-        if let Some(info) = self.master.get_volume_info(&volume_id) {
+        // Look up by original ID (as used by Volume Server)
+        if let Some(info) = self.master.get_volume_info_by_original_id(original_id) {
+            info!(
+                "NET_LOOKUP_VOLUME: found volume info for original_id={}, composite_id={}, node_id={}",
+                original_id, info.id.0, info.node_id.0
+            );
+
             if let Some(node) = self.master.get_node(&info.node_id) {
+                info!(
+                    "NET_LOOKUP_VOLUME: node address={}, http_port={}, grpc_port={}, url={}",
+                    node.address,
+                    node.http_port,
+                    node.grpc_port,
+                    node.url()
+                );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Limit, 1); // count
                 enc.add_string(FieldId::Owner, &node.url())?;
@@ -247,7 +278,7 @@ impl MasterNetHandler {
                 let collection = dec.next_string(FieldId::Name).unwrap_or_default();
 
                 volumes.push(VolumeShortInfo {
-                    volume_id: volume_id as u32,
+                    volume_id,
                     size,
                     read_only: state == 2, // VolumeState::ReadOnly
                     collection,
@@ -288,6 +319,7 @@ impl MasterNetHandler {
                     ip: ip.clone(),
                     grpc_port: port,
                     http_port: port,
+                    net_port: 0,
                 })
                 .await;
 
@@ -826,18 +858,55 @@ impl MasterNetHandler {
         }
     }
 
-    /// Handle GetTopology request
+    /// Handle GetTopology request - returns leader address AND volume routes
+    /// If this node is not the Raft leader, returns STATUS_ERR_REDIRECT with leader address
     async fn handle_get_topology(
         &self,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        info!("NET_GET_TOPOLOGY: returning topology info");
-
         let leader = self.master.get_leader().await;
+
+        // If not leader, redirect client to the actual leader
+        if !self.master.is_leader().await {
+            info!(
+                "NET_GET_TOPOLOGY: not leader, redirecting to leader at {}",
+                leader
+            );
+            let mut enc = TlvEncoder::new();
+            enc.add_string(FieldId::Owner, &leader)?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        info!("NET_GET_TOPOLOGY: returning topology info with volume routes");
+
+        // Build volume routes from the route table
+        let routes = self.master.list_volume_routes();
+        let volume_count = routes.len() as u64;
 
         let mut enc = TlvEncoder::new();
         enc.add_string(FieldId::Owner, &leader)?;
-        enc.add_u64(FieldId::Entries, 0);
+        enc.add_u64(FieldId::Entries, volume_count);
+
+        // Encode each volume route: volume_id + addr + size
+        for route in routes.iter() {
+            info!(
+                "NET_GET_TOPOLOGY: volume_id={}, addr={}, size={}",
+                route.volume_id, route.addr, route.size
+            );
+            enc.add_u64(FieldId::VolumeId, route.volume_id);
+            let _ = enc.add_string(FieldId::Owner, &route.addr);
+            enc.add_u64(FieldId::Size, route.size);
+        }
+
+        info!(
+            "NET_GET_TOPOLOGY: leader={}, volumes={}",
+            leader, volume_count
+        );
 
         Ok(Self::build_response(
             msg,

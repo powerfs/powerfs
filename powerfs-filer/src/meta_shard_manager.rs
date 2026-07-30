@@ -1,6 +1,7 @@
 use log::{debug, info, warn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -128,7 +129,7 @@ pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManager>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
-    inode_generator: Arc<RwLock<u64>>,
+    inode_generator: Arc<AtomicU64>,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
     leases: RwLock<HashMap<String, LeaseInfo>>,
@@ -146,12 +147,16 @@ impl MetaShardManager {
         raft_group_manager: Arc<RaftGroupManager>,
         shard_strategy: Arc<ShardStrategy>,
         data_path: String,
+        node_id: u64,
     ) -> Self {
+        // Use node_id to offset inode generator so that different Filer nodes
+        // generate unique inodes. Each node gets a range of 1 billion inodes.
+        let inode_base = node_id * 1_000_000_000 + 1000;
         Self {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
-            inode_generator: Arc::new(RwLock::new(1000)),
+            inode_generator: Arc::new(AtomicU64::new(inode_base)),
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
@@ -624,6 +629,7 @@ impl MetaShardManager {
                 extended: std::collections::HashMap::new(),
                 symlink_target: None,
                 nlink: 2,
+                version: 0,
             });
         }
 
@@ -643,10 +649,7 @@ impl MetaShardManager {
     }
 
     pub fn generate_inode(&self) -> u64 {
-        let mut gen = self.inode_generator.write().unwrap();
-        let inode = *gen;
-        *gen += 1;
-        inode
+        self.inode_generator.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_shard_strategy(&self) -> Arc<ShardStrategy> {
@@ -826,6 +829,211 @@ impl MetaShardManager {
                 }
                 return Err("setattr timeout waiting for apply".to_string());
             }
+        }
+
+        Ok(())
+    }
+
+    /// Set data-related inode attributes (size, chunks) via Raft consensus (strong consistency)
+    pub async fn setattr_data(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        size: Option<u64>,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::SetAttrData { inode, size };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        if let Some(expected_size) = size {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.size == expected_size {
+                            return Ok(());
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
+                }
+                return Err("setattr_data timeout waiting for apply".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set metadata-related inode attributes (mode, uid, gid, timestamps) via CRDT Delta merge (eventual consistency)
+    ///
+    /// This uses MetaDelta CRDT operations (LWW for mode/uid/gid, Max for timestamps, Counter for nlink)
+    /// to ensure safe concurrent modification without locking.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn setattr_meta(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
+        client_id: &str,
+        timestamp: u64,
+    ) -> Result<(), String> {
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+
+        let store = store.ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+
+        let mut inode_info = store
+            .get_inode(inode)
+            .ok_or_else(|| "inode not found".to_string())?;
+
+        // Build CRDT MetaState from current inode
+        let mut state = crate::crdt_meta::MetaState {
+            mode: Some(inode_info.mode),
+            uid: Some(inode_info.uid),
+            gid: Some(inode_info.gid),
+            mtime: Some(inode_info.mtime),
+            atime: Some(inode_info.atime),
+            ctime: Some(inode_info.ctime),
+            nlink: Some(inode_info.nlink as i32),
+            mode_timestamp: inode_info.version,
+            uid_timestamp: inode_info.version,
+            gid_timestamp: inode_info.version,
+            mtime_timestamp: inode_info.version,
+            atime_timestamp: inode_info.version,
+            ctime_timestamp: inode_info.version,
+            nlink_delta: 0,
+        };
+
+        // Apply CRDT deltas
+        if let Some(m) = mode {
+            let delta = crate::crdt_meta::MetaDelta::SetMode {
+                inode,
+                mode: m as u32,
+                timestamp,
+                client_id: client_id.to_string(),
+            };
+            state.apply_delta(&delta);
+        }
+        if let Some(u) = uid {
+            let delta = crate::crdt_meta::MetaDelta::SetUid {
+                inode,
+                uid: u as u32,
+                timestamp,
+                client_id: client_id.to_string(),
+            };
+            state.apply_delta(&delta);
+        }
+        if let Some(g) = gid {
+            let delta = crate::crdt_meta::MetaDelta::SetGid {
+                inode,
+                gid: g as u32,
+                timestamp,
+                client_id: client_id.to_string(),
+            };
+            state.apply_delta(&delta);
+        }
+        if let Some(mt) = mtime {
+            let delta = crate::crdt_meta::MetaDelta::SetMtime {
+                inode,
+                mtime: mt,
+                timestamp,
+                client_id: client_id.to_string(),
+            };
+            state.apply_delta(&delta);
+        }
+        if let Some(at) = atime {
+            let delta = crate::crdt_meta::MetaDelta::SetAtime {
+                inode,
+                atime: at,
+                timestamp,
+                client_id: client_id.to_string(),
+            };
+            state.apply_delta(&delta);
+        }
+
+        // Write CRDT-merged state back to inode
+        if let Some(m) = state.mode {
+            inode_info.mode = m;
+        }
+        if let Some(u) = state.uid {
+            inode_info.uid = u;
+        }
+        if let Some(g) = state.gid {
+            inode_info.gid = g;
+        }
+        if let Some(mt) = state.mtime {
+            inode_info.mtime = mt;
+        }
+        if let Some(at) = state.atime {
+            inode_info.atime = at;
+        }
+        inode_info.version = timestamp;
+
+        store.update_inode(inode_info)?;
+
+        debug!(
+            "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",
+            inode, mode, uid, gid, client_id, timestamp
+        );
+
+        Ok(())
+    }
+
+    /// Set chunk/fid info for an existing inode via Raft consensus
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_chunks(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        fid: String,
+        volume_id: u64,
+        cookie: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::SetChunks {
+            inode,
+            fid,
+            volume_id,
+            cookie,
+            offset,
+            size,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.fid.is_some() && !info.chunks.is_empty() {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("set_chunks timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -1031,9 +1239,37 @@ impl MetaShardManager {
             name: "/".to_string(),
             inode: POSIX_ROOT_INODE,
         };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        let data = cmd.serialize();
+
+        // Retry propose with backoff to handle leader election
+        let mut propose_retries = 0;
+        loop {
+            match self
+                .raft_group_manager
+                .propose(shard_id, data.clone())
+                .await
+            {
+                Ok(_) => break,
+                Err(e) => {
+                    if e.contains("not the leader") {
+                        propose_retries += 1;
+                        if propose_retries >= 30 {
+                            return Err(format!(
+                                "failed to propose POSIX root: leader election timeout after {} retries",
+                                propose_retries
+                            ));
+                        }
+                        debug!(
+                            "Waiting for Raft leader election (retry {}/30)...",
+                            propose_retries
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    } else {
+                        return Err(format!("failed to propose POSIX root: {}", e));
+                    }
+                }
+            }
+        }
 
         // Wait for apply
         let mut retries = 0;
@@ -1156,7 +1392,7 @@ impl MetaShardManager {
         key: &str,
         size: u64,
         fid: &str,
-        volume_id: u32,
+        volume_id: u64,
         etag: &str,
     ) -> Result<u64, String> {
         let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);
@@ -1609,7 +1845,7 @@ impl MetaShardManager {
                     inode: entry_orset.inode,
                     name: entry_orset.name.clone(),
                     parent_inode: entry_orset.parent_ino,
-                    file_type: crate::shard_store::FileType::File, // Simplified, should check mode
+                    file_type: crate::shard_store::FileType::File,
                     size: 0,
                     mtime: crate::shard_store::ShardStore::current_time(),
                     atime: crate::shard_store::ShardStore::current_time(),
@@ -1625,6 +1861,7 @@ impl MetaShardManager {
                     extended: std::collections::HashMap::new(),
                     symlink_target: None,
                     nlink: 1,
+                    version: 0,
                 };
                 store.create_inode(inode_info)?;
                 store.add_dir_entry(
@@ -1833,6 +2070,69 @@ impl MetaShardManager {
         }
         total_cleaned
     }
+
+    /// 执行 CRDT 维护任务：清理过期 Tombstone、压缩 per-shard Delta Log、
+    /// 统计 OR-Set 状态，用于后台定时调用。
+    ///
+    /// - `tombstone_ttl_hours`: tombstone 过期时间（小时）
+    /// - `compact_delta_logs`: 是否压缩 Delta Log（当单 shard 条目超过 50% 容量时触发）
+    ///
+    /// 返回清理统计 (tombstone_cleaned, orset_state_count, delta_log_trimmed_total)
+    pub fn crdt_maintenance(
+        &self,
+        tombstone_ttl_hours: u64,
+        compact_delta_logs: bool,
+    ) -> (usize, usize, usize) {
+        let tombstone_cleaned = self.cleanup_tombstones(tombstone_ttl_hours);
+
+        let orset_count = self.orset_states.read().unwrap().len();
+
+        let mut delta_trimmed = 0usize;
+        if compact_delta_logs {
+            let logs = self.delta_logs.read().unwrap();
+            for log in logs.values() {
+                let mut entries = log.entries.write().unwrap();
+                if entries.len() > log.max_size / 2 {
+                    let target = log.max_size / 2;
+                    let excess = entries.len() - target;
+                    entries.drain(0..excess);
+                    delta_trimmed += excess;
+                }
+            }
+        }
+
+        (tombstone_cleaned, orset_count, delta_trimmed)
+    }
+
+    /// 启动后台 CRDT 维护任务。
+    ///
+    /// 每 `interval_secs` 秒执行一次 `crdt_maintenance`：
+    /// - Tombstone TTL 默认 24 小时
+    /// - 每个 shard 的 Delta Log 在超过 50% 容量时压缩
+    pub fn spawn_crdt_maintenance(
+        self: &Arc<Self>,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let (tombstone_cleaned, orset_count, delta_trimmed) =
+                    mgr.crdt_maintenance(24, true);
+                if tombstone_cleaned > 0 || delta_trimmed > 0 {
+                    info!(
+                        "CRDT maintenance: tombstones cleaned={}, orset_states={}, delta_log_trimmed={}",
+                        tombstone_cleaned, orset_count, delta_trimmed
+                    );
+                } else {
+                    debug!("CRDT maintenance heartbeat: orset_states={}", orset_count);
+                }
+            }
+        })
+    }
 }
 
 // Helper function to extract sequence number from DeltaOp
@@ -1840,5 +2140,113 @@ fn extract_seq_from_delta(delta: &crate::powerfs::DeltaOp) -> Option<u64> {
     match &delta.op {
         Some(crate::powerfs::delta_op::Op::Add(entry_orset)) => Some(entry_orset.seq),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft_group_manager::RaftGroupManager;
+    use crate::shard_strategy::ShardStrategy;
+
+    fn make_manager() -> Arc<MetaShardManager> {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("powerfs-filer-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let data_path = tmp_dir.to_string_lossy().to_string();
+
+        let raft_addr = "127.0.0.1:19999".to_string();
+        let raft_mgr = Arc::new(RaftGroupManager::new(1, raft_addr, data_path.clone()));
+        let strategy = Arc::new(ShardStrategy::new(4));
+        Arc::new(MetaShardManager::new(raft_mgr, strategy, data_path, 1))
+    }
+
+    #[test]
+    fn test_crdt_maintenance_empty_state() {
+        let mgr = make_manager();
+        let (tombstone_cleaned, orset_count, delta_trimmed) = mgr.crdt_maintenance(24, true);
+        assert_eq!(tombstone_cleaned, 0, "no shard stores yet");
+        assert_eq!(orset_count, 0, "no orset states yet");
+        assert_eq!(delta_trimmed, 0, "no delta logs yet");
+    }
+
+    #[test]
+    fn test_crdt_maintenance_disable_delta_compaction() {
+        let mgr = make_manager();
+        // Populate a delta log manually
+        let log = mgr.get_or_create_delta_log(ShardId(0));
+        for i in 0..200 {
+            log.append(
+                "client-a",
+                i,
+                crate::powerfs::DeltaOp {
+                    op: Some(crate::powerfs::delta_op::Op::Add(
+                        crate::powerfs::DirEntryOrset::default(),
+                    )),
+                },
+            );
+        }
+        let before = log.entries.read().unwrap().len();
+        assert_eq!(before, 200);
+
+        // Disable compaction
+        let (_, _, delta_trimmed) = mgr.crdt_maintenance(24, false);
+        assert_eq!(delta_trimmed, 0, "compaction disabled, nothing trimmed");
+        let after = log.entries.read().unwrap().len();
+        assert_eq!(after, before, "entries untouched");
+    }
+
+    #[test]
+    fn test_crdt_maintenance_delta_log_compaction() {
+        let mgr = make_manager();
+        let log = mgr.get_or_create_delta_log(ShardId(0));
+        // Fill log beyond 50% of capacity (max_size=10000, trigger at >5000)
+        for i in 0..6000 {
+            log.append(
+                "client-a",
+                i,
+                crate::powerfs::DeltaOp {
+                    op: Some(crate::powerfs::delta_op::Op::Add(
+                        crate::powerfs::DirEntryOrset::default(),
+                    )),
+                },
+            );
+        }
+        let before = log.entries.read().unwrap().len();
+        assert_eq!(before, 6000);
+
+        let (_, _, delta_trimmed) = mgr.crdt_maintenance(24, true);
+        assert!(delta_trimmed > 0, "entries should have been trimmed");
+
+        let after = log.entries.read().unwrap().len();
+        // Target is max_size/2 = 5000
+        assert!(after <= 5000, "entries should be <= 5000 after compaction");
+        assert_eq!(
+            delta_trimmed,
+            before - after,
+            "trimmed count should match the reduction"
+        );
+    }
+
+    #[test]
+    fn test_crdt_maintenance_small_log_no_compaction() {
+        let mgr = make_manager();
+        let log = mgr.get_or_create_delta_log(ShardId(0));
+        for i in 0..100 {
+            log.append(
+                "client-a",
+                i,
+                crate::powerfs::DeltaOp {
+                    op: Some(crate::powerfs::delta_op::Op::Add(
+                        crate::powerfs::DirEntryOrset::default(),
+                    )),
+                },
+            );
+        }
+        let (_, _, delta_trimmed) = mgr.crdt_maintenance(24, true);
+        assert_eq!(
+            delta_trimmed, 0,
+            "small delta log should not trigger compaction"
+        );
     }
 }

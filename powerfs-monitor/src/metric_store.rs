@@ -28,7 +28,7 @@ pub struct NodeInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VolumeInfo {
-    pub id: u32,
+    pub id: u64,
     pub node_id: String,
     pub size: u64,
     pub used: u64,
@@ -52,7 +52,7 @@ pub struct KVSessionInfo {
 
 pub struct MetricStore {
     nodes: RwLock<HashMap<String, NodeInfo>>,
-    volumes: RwLock<HashMap<u32, VolumeInfo>>,
+    volumes: RwLock<HashMap<u64, VolumeInfo>>,
     kv_sessions: RwLock<HashMap<String, KVSessionInfo>>,
     cluster_metrics: RwLock<ClusterMetrics>,
     kv_metrics: RwLock<KVMetrics>,
@@ -221,7 +221,7 @@ impl MetricStore {
         self.volumes.read().await.values().cloned().collect()
     }
 
-    pub async fn get_volume(&self, id: u32) -> Option<VolumeInfo> {
+    pub async fn get_volume(&self, id: u64) -> Option<VolumeInfo> {
         self.volumes.read().await.get(&id).cloned()
     }
 

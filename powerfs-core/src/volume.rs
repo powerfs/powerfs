@@ -1,6 +1,7 @@
-use crate::index::{NeedleIndex, PersistentIndex};
+use crate::index::NeedleIndex;
 use crate::needle::Needle;
 use crate::storage_backend::{StorageBackend, StorageBackendError};
+use crate::volume_metadata::VolumeMetadata;
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use powerfs_common::{
@@ -19,9 +20,7 @@ fn backend_err(e: StorageBackendError) -> PowerFsError {
 
 pub struct Volume {
     info: RwLock<VolumeInfo>,
-    index: Box<dyn NeedleIndex>,
-    free_space: RwLock<u64>,
-    next_offset: RwLock<u64>,
+    index: VolumeMetadata,
     checksum_algorithm: ChecksumAlgorithm,
     backend: Arc<dyn StorageBackend>,
     backend_volume_id: u64,
@@ -60,12 +59,12 @@ impl Volume {
             std::fs::create_dir_all(&volume_path)?;
         }
 
-        let index_path = volume_path.join("index");
+        let index_path = volume_path.join("metadata");
 
-        let index: Box<dyn NeedleIndex> =
-            Box::new(PersistentIndex::new(index_path.to_str().unwrap())?);
+        // 使用 RocksDB-based VolumeMetadata 管理索引和分配状态
+        let index = VolumeMetadata::open(&index_path)?;
 
-        let backend_volume_id = id.0 as u64;
+        let backend_volume_id = id.0;
         let physical_size = size + VOLUME_DATA_OFFSET;
         match backend.get_volume_info(backend_volume_id) {
             Ok(_) => {}
@@ -77,8 +76,10 @@ impl Volume {
             Err(e) => return Err(backend_err(e)),
         }
 
-        let (used, next_offset) = Self::rebuild_metadata_from_index(index.as_ref(), size);
-        let free_space = size.saturating_sub(used);
+        let (used, _next_offset, active_count, deleted_count) = index.rebuild_allocation_stats()?;
+
+        // 同步 RocksDB allocation CF（启动时确保一致性）
+        Self::sync_allocation_from_index(&index, used, size, active_count, deleted_count)?;
 
         let info = VolumeInfo {
             id,
@@ -98,34 +99,54 @@ impl Volume {
         Ok(Volume {
             info: RwLock::new(info),
             index,
-            free_space: RwLock::new(free_space),
-            next_offset: RwLock::new(next_offset),
             checksum_algorithm: algorithm,
             backend,
             backend_volume_id,
         })
     }
 
-    fn rebuild_metadata_from_index(index: &dyn NeedleIndex, volume_size: u64) -> (u64, u64) {
-        let mut max_end: u64 = VOLUME_DATA_OFFSET;
+    /// 启动时同步 allocation CF：如果 RocksDB 中的分配状态与 needle 索引不一致，则更新
+    fn sync_allocation_from_index(
+        index: &VolumeMetadata,
+        rebuilt_used: u64,
+        volume_size: u64,
+        active_count: u64,
+        deleted_count: u64,
+    ) -> Result<()> {
+        let stats = index.get_allocation()?;
+        let rebuilt_free = volume_size.saturating_sub(rebuilt_used);
 
-        for (_needle_id, info) in index.iter() {
-            let needle_size =
-                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
-            let end = info.offset.saturating_add(needle_size);
-            if end > max_end {
-                max_end = end;
-            }
+        // 如果 allocation CF 为空（首次启动）或统计不匹配（crash 恢复），则更新
+        if stats.used_bytes != rebuilt_used
+            || stats.free_bytes != rebuilt_free
+            || stats.active_count != active_count
+            || stats.deleted_count != deleted_count
+        {
+            log::info!(
+                "Syncing allocation CF: rocksdb used={} free={} active={} deleted={} -> rebuilt used={} free={} active={} deleted={}",
+                stats.used_bytes,
+                stats.free_bytes,
+                stats.active_count,
+                stats.deleted_count,
+                rebuilt_used,
+                rebuilt_free,
+                active_count,
+                deleted_count
+            );
+
+            let new_stats = powerfs_common::volume_config::AllocationStats {
+                used_bytes: rebuilt_used,
+                free_bytes: rebuilt_free,
+                next_needle_id: stats.next_needle_id,
+                append_offset: rebuilt_used + VOLUME_DATA_OFFSET,
+                active_count,
+                deleted_count,
+                last_modified_at: Utc::now().timestamp(),
+            };
+            index.put_allocation(&new_stats)?;
         }
 
-        let used = max_end.saturating_sub(VOLUME_DATA_OFFSET);
-        let used = if used > volume_size {
-            volume_size
-        } else {
-            used
-        };
-
-        (used, max_end)
+        Ok(())
     }
 
     pub fn id(&self) -> VolumeId {
@@ -149,7 +170,10 @@ impl Volume {
     }
 
     pub fn free_space(&self) -> u64 {
-        *self.free_space.read().unwrap()
+        self.index
+            .get_allocation()
+            .map(|s| s.free_bytes)
+            .unwrap_or(0)
     }
 
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
@@ -166,24 +190,21 @@ impl Volume {
             Needle::new_with_algorithm(needle_id.clone(), volume_id, data, self.checksum_algorithm);
 
         let required_space = needle.size() as u64;
-        let mut free_space_guard = self.free_space.write().unwrap();
-        if *free_space_guard < required_space {
+        let volume_size = info_guard.size;
+
+        // 从 RocksDB allocation CF 读取当前分配状态
+        let alloc_stats = self.index.get_allocation()?;
+        if alloc_stats.free_bytes < required_space {
             info_guard.state = VolumeState::Full;
             return Err(PowerFsError::OutOfSpace);
         }
 
-        let mut next_offset_guard = self.next_offset.write().unwrap();
-        let offset = *next_offset_guard;
+        let offset = alloc_stats.append_offset;
 
         let needle_bytes = needle.to_bytes();
         self.backend
             .write_needle(self.backend_volume_id, offset, &needle_bytes)
             .map_err(backend_err)?;
-
-        *next_offset_guard += required_space;
-        *free_space_guard -= required_space;
-        info_guard.used += required_space;
-        info_guard.modified_at = Utc::now();
 
         let needle_info = NeedleInfo {
             id: needle_id.clone(),
@@ -204,11 +225,14 @@ impl Volume {
             ec_shards: Vec::new(),
         };
 
-        drop(next_offset_guard);
-        drop(free_space_guard);
-        drop(info_guard);
+        // 原子写入：同时更新 needles CF + allocation CF，返回更新后的统计
+        let new_stats =
+            self.index
+                .write_needle_atomic(&needle_info, required_space, volume_size)?;
 
-        self.index.insert(needle_id, needle_info.clone());
+        // 同步 info 中的 used 字段
+        info_guard.used = new_stats.used_bytes;
+        info_guard.modified_at = Utc::now();
 
         Ok(needle_info)
     }
@@ -238,11 +262,13 @@ impl Volume {
     }
 
     pub fn delete_needle(&self, needle_id: &NeedleId) -> Result<()> {
-        if let Some(mut info) = self.index.get(needle_id) {
+        // 先检查 needle 存在且未被删除
+        if let Some(info) = self.index.get(needle_id) {
             if info.deleted_at.is_some() {
                 return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
             }
 
+            // WORM 保护检查
             if info.worm_retention_until.is_some() {
                 if let Some(retention_until) = info.worm_retention_until {
                     if retention_until > Utc::now() {
@@ -251,10 +277,9 @@ impl Volume {
                 }
             }
 
-            info.deleted_at = Some(Utc::now());
-            info.delete_retention_until = Some(Utc::now() + Duration::days(7));
-
-            self.index.insert(needle_id.clone(), info);
+            // 硬删除：从 needles CF 移除，存入 deleted CF
+            let volume_size = self.size();
+            self.index.delete_needle_atomic(needle_id, volume_size)?;
 
             let mut info_guard = self.info.write().unwrap();
             info_guard.modified_at = Utc::now();
@@ -266,27 +291,11 @@ impl Volume {
     }
 
     pub fn restore_needle(&self, needle_id: &NeedleId) -> Result<()> {
-        if let Some(mut info) = self.index.get(needle_id) {
-            if info.deleted_at.is_none() {
-                return Err(PowerFsError::InvalidRequest(
-                    "needle is not deleted".to_string(),
-                ));
-            }
-
-            if let Some(retention_until) = info.delete_retention_until {
-                if retention_until < Utc::now() {
-                    return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
-                }
-            }
-
-            info.deleted_at = None;
-            info.delete_retention_until = None;
-
-            self.index.insert(needle_id.clone(), info);
-
+        // 从 deleted CF 恢复到 needles CF
+        let volume_size = self.size();
+        if let Some(_info) = self.index.restore_needle_atomic(needle_id, volume_size)? {
             let mut info_guard = self.info.write().unwrap();
             info_guard.modified_at = Utc::now();
-
             Ok(())
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))
@@ -316,18 +325,11 @@ impl Volume {
     }
 
     pub fn gc_cleanup(&self) -> Result<usize> {
-        let mut cleaned_count = 0;
-        let now = Utc::now();
+        let cleaned_count = self.index.purge_expired_deleted()?;
 
-        let needles = self.index.iter();
-        for (needle_id, info) in needles {
-            if let Some(retention_until) = info.delete_retention_until {
-                if retention_until < now && self.index.remove(&needle_id).is_some() {
-                    let mut info_guard = self.info.write().unwrap();
-                    info_guard.modified_at = Utc::now();
-                    cleaned_count += 1;
-                }
-            }
+        if cleaned_count > 0 {
+            let mut info_guard = self.info.write().unwrap();
+            info_guard.modified_at = Utc::now();
         }
 
         Ok(cleaned_count)
@@ -369,8 +371,8 @@ impl Volume {
         self.state() == VolumeState::Available
     }
 
-    pub fn index(&self) -> &dyn NeedleIndex {
-        self.index.as_ref()
+    pub fn index(&self) -> &VolumeMetadata {
+        &self.index
     }
 
     pub fn compact(&self) -> Result<(u64, u64)> {
@@ -422,13 +424,15 @@ impl Volume {
             reclaimed = old_used - new_used;
         }
 
+        // 通过 RocksDB compact_cleanup 原子更新 allocation CF
+        let volume_size = self.size();
+        let new_stats = self.index.compact_cleanup(reclaimed, volume_size)?;
+
         {
             let mut info_guard = self.info.write().unwrap();
-            info_guard.used = new_used;
+            info_guard.used = new_stats.used_bytes;
             info_guard.modified_at = Utc::now();
         }
-        *self.next_offset.write().unwrap() = new_offset;
-        *self.free_space.write().unwrap() = self.size().saturating_sub(new_used);
 
         self.backend
             .truncate_volume(self.backend_volume_id, new_offset)
@@ -457,34 +461,28 @@ impl Volume {
             self.checksum_algorithm,
         );
         let new_size = new_needle.size() as u64;
+        let volume_size = info_guard.size;
 
-        let mut free_space_guard = self.free_space.write().unwrap();
-        if *free_space_guard < new_size {
+        // 从 RocksDB allocation CF 读取当前分配状态
+        let alloc_stats = self.index.get_allocation()?;
+        if alloc_stats.free_bytes < new_size {
             info_guard.state = VolumeState::Full;
             return Err(PowerFsError::OutOfSpace);
         }
 
-        let mut next_offset_guard = self.next_offset.write().unwrap();
-        let new_offset = *next_offset_guard;
+        let new_offset = alloc_stats.append_offset;
 
         let needle_bytes = new_needle.to_bytes();
         self.backend
             .write_needle(self.backend_volume_id, new_offset, &needle_bytes)
             .map_err(backend_err)?;
 
-        *next_offset_guard += new_size;
-        *free_space_guard -= new_size;
-        info_guard.used += new_size;
-        info_guard.modified_at = Utc::now();
-
+        // 标记旧 needle 为已删除
         let mut old_updated = old_info.clone();
         old_updated.deleted_at = Some(Utc::now());
-        drop(next_offset_guard);
-        drop(free_space_guard);
-        drop(info_guard);
+        self.index.put_needle(&old_updated)?;
 
-        self.index.insert(needle_id.clone(), old_updated);
-
+        // 构建新 needle 信息
         let new_info = NeedleInfo {
             id: needle_id.clone(),
             volume_id: old_info.volume_id,
@@ -503,7 +501,14 @@ impl Volume {
             ec_m: old_info.ec_m,
             ec_shards: old_info.ec_shards.clone(),
         };
-        self.index.insert(needle_id, new_info);
+
+        // 原子写入新 needle + 更新 allocation CF
+        let new_stats = self
+            .index
+            .write_needle_atomic(&new_info, new_size, volume_size)?;
+
+        info_guard.used = new_stats.used_bytes;
+        info_guard.modified_at = Utc::now();
 
         Ok(())
     }
@@ -552,7 +557,7 @@ impl Volume {
 
     pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
         let needle_id = NeedleId(file_key);
-        if let Some(mut info) = self.index.get(&needle_id) {
+        if let Some(info) = self.index.get(&needle_id) {
             let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
             let raw_data = self
                 .backend
@@ -561,9 +566,9 @@ impl Volume {
             let needle =
                 Needle::from_bytes(&raw_data, self.id(), info.offset, info.checksum_algorithm)?;
 
-            info.last_verified_at = Some(Utc::now());
-            info.verification_count += 1;
-            self.index.insert(needle_id, info);
+            // NOTE: Do NOT write to index during read (no verification_count update).
+            // Writing to RocksDB during a read operation causes lock contention
+            // and can hang concurrent reads from different clients.
 
             let data_offset = offset as usize;
             let data_size = size as usize;
@@ -588,7 +593,10 @@ impl Volume {
     }
 
     pub fn deleted_count(&self) -> usize {
-        0
+        self.index
+            .get_allocation()
+            .map(|s| s.deleted_count as usize)
+            .unwrap_or(0)
     }
 
     pub fn verify_needle(&self, needle_id: &NeedleId) -> Result<bool> {

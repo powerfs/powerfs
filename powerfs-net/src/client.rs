@@ -3,8 +3,7 @@
 //! Provides a client that connects to PowerFS servers using the
 //! powerfs-net binary protocol.
 
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +49,15 @@ impl Default for ClientConfig {
     }
 }
 
+/// Trait for handling server-pushed notifications (Server→Client)
+///
+/// Implement this trait to process asynchronous messages from the server,
+/// such as inode invalidation events.
+pub trait NotificationHandler: Send + Sync {
+    /// Called when a NOTIFY frame is received from the server
+    fn handle_notification(&self, msg: &NetMessage);
+}
+
 /// PowerFS Net Client
 pub struct PowerFsNetClient {
     pub config: ClientConfig,
@@ -57,6 +65,8 @@ pub struct PowerFsNetClient {
     seq_counter: AtomicU32,
     inflight_sem: Arc<Semaphore>,
     connected: Arc<parking_lot::Mutex<bool>>,
+    /// Optional handler for server-pushed notifications
+    notification_handler: Arc<parking_lot::Mutex<Option<Box<dyn NotificationHandler>>>>,
 }
 
 impl PowerFsNetClient {
@@ -67,7 +77,14 @@ impl PowerFsNetClient {
             stream: Arc::new(Mutex::new(None)),
             seq_counter: AtomicU32::new(0),
             connected: Arc::new(parking_lot::Mutex::new(false)),
+            notification_handler: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Set a notification handler to receive server-pushed messages
+    pub fn set_notification_handler(&self, handler: Box<dyn NotificationHandler>) {
+        let mut h = self.notification_handler.lock();
+        *h = Some(handler);
     }
 
     /// Connect to the server
@@ -77,12 +94,19 @@ impl PowerFsNetClient {
             return Ok(());
         }
 
-        let addr_str = format!("{}:{}", self.config.addr, self.config.port);
-        let addr: SocketAddr = addr_str
-            .to_socket_addrs()
-            .map_err(|e| NetError::Connection(format!("invalid address: {}", e)))?
-            .next()
-            .ok_or_else(|| NetError::Connection("no addresses resolved".into()))?;
+        // Fast path: if addr is already an IP, construct SocketAddr directly (no DNS)
+        let addr: SocketAddr = match self.config.addr.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, self.config.port),
+            Err(_) => {
+                // Hostname: use DNS resolution
+                let addr_str = format!("{}:{}", self.config.addr, self.config.port);
+                addr_str
+                    .to_socket_addrs()
+                    .map_err(|e| NetError::Connection(format!("DNS resolution failed: {}", e)))?
+                    .next()
+                    .ok_or_else(|| NetError::Connection("no addresses resolved".into()))?
+            }
+        };
 
         info!("Connecting to {}:{}", self.config.addr, self.config.port);
 
@@ -307,86 +331,106 @@ impl PowerFsNetClient {
     }
 
     /// Receive response for a specific sequence number (called with stream lock already held)
+    ///
+    /// This method loops to handle interleaved NOTIFY frames: if a NOTIFY
+    /// frame arrives while waiting for a RESPONSE, it dispatches the
+    /// notification to the registered handler and continues reading.
     async fn recv_response_locked(
         &self,
         expected_seq: u32,
         stream: &mut tokio::sync::MutexGuard<'_, Option<TcpStream>>,
     ) -> NetResult<NetMessage> {
-        let s = stream.as_mut().ok_or(NetError::NotConnected)?;
+        loop {
+            let s = stream.as_mut().ok_or(NetError::NotConnected)?;
 
-        debug!(
-            "recv_response_locked: reading header, expected_seq={}",
-            expected_seq
-        );
-        // Read header
-        let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
-        let recv_result =
-            tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf)).await;
-
-        match recv_result {
-            Ok(Ok(_)) => {
-                debug!(
-                    "recv_response_locked: header received for seq={}",
-                    expected_seq
-                );
-            }
-            Ok(Err(e)) => {
-                let err_msg = e.to_string();
-                warn!("recv_response_locked: header read error: {:?}", e);
-                self.handle_recv_error(&e).await?;
-                return Err(NetError::Protocol(err_msg));
-            }
-            Err(_elapsed) => {
-                warn!(
-                    "recv_response_locked: header read timeout for seq={}",
-                    expected_seq
-                );
-                return Err(NetError::Timeout);
-            }
-        }
-
-        let header = FrameHeader::decode(&hdr_buf)
-            .ok_or_else(|| NetError::Protocol("invalid response header".into()))?;
-
-        debug!(
-            "recv_response_locked: got response seq={}, expected={}",
-            header.seq, expected_seq
-        );
-        if header.seq != expected_seq {
-            error!(
-                "Response seq mismatch: expected {}, got {}",
-                expected_seq, header.seq
+            debug!(
+                "recv_response_locked: reading header, expected_seq={}",
+                expected_seq
             );
-            return Err(NetError::Protocol(format!(
-                "seq mismatch: expected {}, got {}",
-                expected_seq, header.seq
-            )));
-        }
+            // Read header
+            let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+            let recv_result =
+                tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf)).await;
 
-        // Read body + data
-        let data_len = header.data_len as usize;
-        let mut all_data = Vec::with_capacity(data_len);
-        if data_len > 0 {
-            let mut remaining = data_len;
-            while remaining > 0 {
-                let chunk = std::cmp::min(remaining, 4096);
-                let mut buf = vec![0u8; chunk];
-                s.read_exact(&mut buf).await?;
-                all_data.extend_from_slice(&buf);
-                remaining -= chunk;
+            match recv_result {
+                Ok(Ok(_)) => {
+                    debug!(
+                        "recv_response_locked: header received for seq={}",
+                        expected_seq
+                    );
+                }
+                Ok(Err(e)) => {
+                    let err_msg = e.to_string();
+                    warn!("recv_response_locked: header read error: {:?}", e);
+                    self.handle_recv_error(&e).await?;
+                    return Err(NetError::Protocol(err_msg));
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "recv_response_locked: header read timeout for seq={}",
+                        expected_seq
+                    );
+                    return Err(NetError::Timeout);
+                }
             }
+
+            let header = FrameHeader::decode(&hdr_buf)
+                .ok_or_else(|| NetError::Protocol("invalid response header".into()))?;
+
+            // Read body + data
+            let data_len = header.data_len as usize;
+            let mut all_data = Vec::with_capacity(data_len);
+            if data_len > 0 {
+                let mut remaining = data_len;
+                while remaining > 0 {
+                    let chunk = std::cmp::min(remaining, 4096);
+                    let mut buf = vec![0u8; chunk];
+                    s.read_exact(&mut buf).await?;
+                    all_data.extend_from_slice(&buf);
+                    remaining -= chunk;
+                }
+            }
+
+            let message = NetMessage::new(header).with_body(all_data);
+
+            // Check if this is a NOTIFY frame (server-pushed notification)
+            if message.header.is_notify() {
+                debug!(
+                    "recv_response_locked: received NOTIFY frame type={:?}, dispatching to handler",
+                    message.msg_type()
+                );
+                let handler = self.notification_handler.lock();
+                if let Some(ref h) = *handler {
+                    h.handle_notification(&message);
+                }
+                // Continue reading for the actual response
+                continue;
+            }
+
+            debug!(
+                "recv_response_locked: got response seq={}, expected={}",
+                message.header.seq, expected_seq
+            );
+            if message.header.seq != expected_seq {
+                error!(
+                    "Response seq mismatch: expected {}, got {}",
+                    expected_seq, message.header.seq
+                );
+                return Err(NetError::Protocol(format!(
+                    "seq mismatch: expected {}, got {}",
+                    expected_seq, message.header.seq
+                )));
+            }
+
+            debug!(
+                "Received response: seq={} status={} data_len={}",
+                message.header.seq,
+                message.header.status,
+                message.body.len()
+            );
+
+            return Ok(message);
         }
-
-        let message = NetMessage::new(header).with_body(all_data);
-
-        debug!(
-            "Received response: seq={} status={} data_len={}",
-            message.header.seq,
-            message.header.status,
-            message.body.len()
-        );
-
-        Ok(message)
     }
 
     /// Receive response for a specific sequence number (standalone, acquires its own lock)

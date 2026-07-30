@@ -40,59 +40,68 @@ use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, Volume
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:8081")]
-    addr: String,
+    /// 配置文件路径（必填，所有端口和地址必须在配置文件中设置）
+    #[arg(long, short = 'c', required = true)]
+    config: String,
 
-    #[arg(long, default_value = "redis://localhost:6379")]
-    redis_url: String,
+    /// 可选：覆盖监听地址
+    #[arg(long)]
+    addr: Option<String>,
 
-    #[arg(long, default_value = "powerfs_events")]
-    stream_key: String,
+    /// 可选：覆盖Redis URL
+    #[arg(long)]
+    redis_url: Option<String>,
 
-    #[arg(long, default_value = "http://localhost:9000")]
-    s3_endpoint: String,
+    /// 可选：覆盖S3 endpoint
+    #[arg(long)]
+    s3_endpoint: Option<String>,
 
-    #[arg(long, default_value = "http://localhost:9002")]
-    s3_backend_endpoint: String,
+    /// 可选：覆盖S3 backend endpoint
+    #[arg(long)]
+    s3_backend_endpoint: Option<String>,
 
-    #[arg(long, default_value = "powerfs")]
-    s3_access_key: String,
+    /// 可选：覆盖Master endpoint
+    #[arg(long)]
+    master_endpoint: Option<String>,
 
-    #[arg(long, default_value = "powerfs123")]
-    s3_secret_key: String,
+    /// 可选：覆盖日志级别
+    #[arg(long)]
+    log_level: Option<String>,
 
-    #[arg(long, default_value = "/data/master/auth.db")]
-    auth_db_path: String,
-
-    #[arg(long, default_value = "powerfs-secret-key-change-in-production")]
-    jwt_secret: String,
-
-    #[arg(long, default_value = "powerfs-hmac-secret-change-in-production")]
-    hmac_secret: String,
-
-    #[arg(long, default_value = "admin")]
-    admin_username: String,
-
-    #[arg(long, default_value = "admin123")]
-    admin_password: String,
-
-    #[arg(long, default_value = "localhost:9333")]
-    master_endpoint: String,
-
+    /// 可选：日志文件路径
     #[arg(long)]
     log_file: Option<String>,
 
-    #[arg(long, default_value = "10")]
-    log_max_size_mb: u64,
+    // 以下为非地址类配置，保持可选
+    #[arg(long)]
+    stream_key: Option<String>,
 
-    #[arg(long, default_value = "5")]
-    log_max_files: usize,
+    #[arg(long)]
+    s3_access_key: Option<String>,
 
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    #[arg(long)]
+    s3_secret_key: Option<String>,
 
-    #[arg(long, short = 'c')]
-    config: Option<String>,
+    #[arg(long)]
+    auth_db_path: Option<String>,
+
+    #[arg(long)]
+    jwt_secret: Option<String>,
+
+    #[arg(long)]
+    hmac_secret: Option<String>,
+
+    #[arg(long)]
+    admin_username: Option<String>,
+
+    #[arg(long)]
+    admin_password: Option<String>,
+
+    #[arg(long)]
+    log_max_size_mb: Option<u64>,
+
+    #[arg(long)]
+    log_max_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -462,7 +471,7 @@ async fn get_volume(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<VolumeInfo>> {
-    match id.parse::<u32>() {
+    match id.parse::<u64>() {
         Ok(id) => match state.metric_store.get_volume(id).await {
             Some(volume) => Json(ApiResponse::success(volume)),
             None => Json(ApiResponse::error("Volume not found")),
@@ -2609,7 +2618,7 @@ async fn store_benchmark_result(_state: Arc<AppState>, record: &BenchmarkResultR
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ScrubStatusResponse {
-    volume_id: u32,
+    volume_id: u64,
     state: String,
     progress: f64,
     total_needles: u64,
@@ -2663,7 +2672,7 @@ async fn get_scrub_status(
     State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<ScrubStatusResponse>> {
-    match id.parse::<u32>() {
+    match id.parse::<u64>() {
         Ok(vid) => {
             let statuses = mock_scrub_statuses();
             match statuses.into_iter().find(|s| s.volume_id == vid) {
@@ -3503,13 +3512,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let cfg = load_config(&args.config);
-    let monitor_cfg = cfg.monitor;
+    let monitor_cfg = cfg.monitor.clone();
 
-    let log_level = if args.log_level != "info" {
-        &args.log_level
-    } else {
-        &monitor_cfg.redis_url
-    };
+    // 所有地址类配置从配置文件加载，可选CLI覆盖
+    let addr = args.addr.clone().unwrap_or(monitor_cfg.addr);
+    let redis_url = args.redis_url.clone().unwrap_or(monitor_cfg.redis_url);
+    let s3_endpoint = args.s3_endpoint.clone().unwrap_or(monitor_cfg.s3_endpoint);
+    let s3_backend_endpoint = args
+        .s3_backend_endpoint
+        .clone()
+        .unwrap_or(monitor_cfg.s3_backend_endpoint);
+    let master_endpoint = args
+        .master_endpoint
+        .clone()
+        .unwrap_or(monitor_cfg.master_endpoint);
+
+    let log_level = args.log_level.as_deref().unwrap_or(&cfg.global.log_level);
 
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
@@ -3550,67 +3568,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
 
-    let redis_url = if args.redis_url != "redis://localhost:6379" {
-        &args.redis_url
-    } else {
-        &monitor_cfg.redis_url
-    };
-    let s3_endpoint = if args.s3_endpoint != "http://localhost:9000" {
-        &args.s3_endpoint
-    } else {
-        &monitor_cfg.s3_endpoint
-    };
-    let s3_backend_endpoint = if args.s3_backend_endpoint != "http://localhost:9002" {
-        &args.s3_backend_endpoint
-    } else {
-        &monitor_cfg.s3_backend_endpoint
-    };
-    let master_endpoint = if args.master_endpoint != "localhost:9333" {
-        &args.master_endpoint
-    } else {
-        &monitor_cfg.master_endpoint
-    };
-
     info!("Starting PowerFS Monitor Service...");
-    info!("Listening on: {}", args.addr);
+    info!("Listening on: {}", addr);
     info!("Redis URL: {}", redis_url);
 
-    fn load_config(config_path: &Option<String>) -> PowerFsConfig {
-        match config_path {
-            Some(path) => match PowerFsConfig::load_from_file(path) {
-                Ok(cfg) => {
-                    if let Err(e) = cfg.validate() {
-                        warn!("Config validation failed: {}, using defaults", e);
-                        PowerFsConfig::default()
-                    } else {
-                        info!("Loaded config from: {}", path);
-                        cfg
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to load config file: {}, using defaults", e);
-                    PowerFsConfig::default()
-                }
-            },
-            None => PowerFsConfig::default(),
+    fn load_config(config_path: &str) -> PowerFsConfig {
+        match PowerFsConfig::load_or_error(config_path) {
+            Ok(cfg) => {
+                info!("Successfully loaded configuration from: {}", config_path);
+                cfg
+            }
+            Err(e) => {
+                eprintln!("ERROR: Failed to load configuration: {}", e);
+                eprintln!("You must provide a valid configuration file with all required ports and addresses.");
+                std::process::exit(1);
+            }
         }
     }
 
+    // 非地址类配置 - 提供合理的默认值（可通过CLI或配置覆盖）
+    let auth_db_path = args
+        .auth_db_path
+        .clone()
+        .unwrap_or_else(|| "/data/master/auth.db".to_string());
+    let admin_username = args
+        .admin_username
+        .clone()
+        .unwrap_or_else(|| "admin".to_string());
+    let admin_password = args
+        .admin_password
+        .clone()
+        .unwrap_or_else(|| "admin123".to_string());
+    let jwt_secret = args
+        .jwt_secret
+        .clone()
+        .unwrap_or_else(|| "powerfs-secret-key-change-in-production".to_string());
+    let hmac_secret = args
+        .hmac_secret
+        .clone()
+        .unwrap_or_else(|| "powerfs-hmac-secret-change-in-production".to_string());
+    let stream_key = args
+        .stream_key
+        .clone()
+        .unwrap_or_else(|| "powerfs_events".to_string());
+
     // Initialize auth store
-    let user_store = Arc::new(UserStore::new(&args.auth_db_path)?);
-    user_store.ensure_admin_exists(&args.admin_username, &args.admin_password)?;
+    let user_store = Arc::new(UserStore::new(&auth_db_path)?);
+    user_store.ensure_admin_exists(&admin_username, &admin_password)?;
     let resource_owners = Arc::new(ResourceOwnerStore::from_user_store(&user_store));
     let roles = Arc::new(RoleStore::from_user_store(&user_store));
     roles.ensure_default_roles()?;
     let s3_keys = Arc::new(S3AccessKeyStore::from_user_store(&user_store));
     let api_key_store = Arc::new(KVAccessKeyStore::from_user_store(&user_store));
-    let jwt_validator = JwtValidator::new(&args.jwt_secret);
+    let jwt_validator = JwtValidator::new(&jwt_secret);
 
     let auth_state = Arc::new(AuthState {
         validator: jwt_validator,
         user_store: user_store.clone(),
         api_key_store: api_key_store.clone(),
-        hmac_secret: args.hmac_secret.clone(),
+        hmac_secret: hmac_secret.clone(),
     });
 
     let metric_store = Arc::new(MetricStore::new());
@@ -3619,32 +3635,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_clients = Arc::new(Mutex::new(Vec::new()));
 
-    let kv_client = Arc::new(Mutex::new(KvCacheClient::connect(master_endpoint).await?));
+    // KvCacheClient::connect handles http:// prefix automatically
+    let kv_client = Arc::new(Mutex::new(KvCacheClient::connect(&master_endpoint).await?));
 
-    let master_client = Arc::new(Mutex::new(
-        MasterServiceClient::connect(format!("http://{}", master_endpoint)).await?,
-    ));
+    // Master gRPC client - ensure endpoint has http:// prefix
+    let master_addr =
+        if master_endpoint.starts_with("http://") || master_endpoint.starts_with("https://") {
+            master_endpoint.clone()
+        } else {
+            format!("http://{}", master_endpoint)
+        };
+    let master_client = Arc::new(Mutex::new(MasterServiceClient::connect(master_addr).await?));
+
+    let s3_access_key = args
+        .s3_access_key
+        .clone()
+        .unwrap_or_else(|| "powerfs".to_string());
+    let s3_secret_key = args
+        .s3_secret_key
+        .clone()
+        .unwrap_or_else(|| "powerfs123".to_string());
 
     let app_state = Arc::new(AppState {
         metric_store: metric_store.clone(),
         alert_engine: alert_engine.clone(),
         ws_clients,
-        s3_endpoint: s3_endpoint.to_string(),
-        s3_backend_endpoint: s3_backend_endpoint.to_string(),
-        s3_access_key: args.s3_access_key,
-        s3_secret_key: args.s3_secret_key,
+        s3_endpoint: s3_endpoint.clone(),
+        s3_backend_endpoint: s3_backend_endpoint.clone(),
+        s3_access_key: s3_access_key.clone(),
+        s3_secret_key: s3_secret_key.clone(),
         fuse_mounts: Arc::new(Mutex::new(Vec::new())),
         auth: auth_state.clone(),
         resource_owners: resource_owners.clone(),
         roles: roles.clone(),
         s3_keys: s3_keys.clone(),
-        hmac_secret: args.hmac_secret.clone(),
+        hmac_secret: hmac_secret.clone(),
         rate_limiter: Arc::new(RateLimiter::new()),
         kv_client,
         master_client,
     });
 
-    let event_bus = EventBus::new(redis_url, &args.stream_key);
+    let event_bus = EventBus::new(&redis_url, &stream_key);
 
     tokio::spawn(start_event_processor(
         event_bus,
@@ -3774,7 +3805,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(app_state)
         .layer(cors);
 
-    Server::bind(&args.addr.parse()?)
+    Server::bind(&addr.parse()?)
         .serve(app.into_make_service())
         .await?;
 

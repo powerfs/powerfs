@@ -3,6 +3,7 @@ pub mod config;
 pub mod constants;
 pub mod error;
 pub mod event;
+pub mod id_generator;
 pub mod raft;
 pub mod retry;
 pub mod storage;
@@ -10,6 +11,7 @@ pub mod system_metrics;
 pub mod traits;
 pub mod types;
 pub mod utils;
+pub mod volume_config;
 
 pub use build_info::BuildInfo;
 pub use error::{ErrorKind, PowerFsError};
@@ -17,6 +19,7 @@ pub use event::{
     AlertTriggerEvent, Event, EventEnvelope, KVBlockEvent, KVSessionEvent, MetricUpdateEvent,
     NodeStatusEvent, NullEventProvider, VolumeStatusEvent,
 };
+pub use id_generator::IdGenerator;
 
 #[cfg(feature = "redis-event")]
 pub use event::{EventPublisher, RedisEventProvider};

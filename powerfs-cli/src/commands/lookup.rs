@@ -6,7 +6,7 @@ use clap::Args;
 pub struct LookupArgs {
     /// Volume ID or FID to lookup
     #[arg(short, long)]
-    volume_id: Option<u32>,
+    volume_id: Option<u64>,
 
     /// FID string (e.g., "1,12345,100")
     #[arg(long)]

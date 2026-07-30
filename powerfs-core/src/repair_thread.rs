@@ -37,7 +37,7 @@ impl Ord for RepairPriority {
 
 #[derive(Debug, Clone)]
 pub struct RepairTask {
-    pub volume_id: u32,
+    pub volume_id: u64,
     pub needle_id: u64,
     pub priority: RepairPriority,
     pub error_type: String,
@@ -46,8 +46,8 @@ pub struct RepairTask {
 }
 
 pub struct RepairQueue {
-    queue: RwLock<PriorityQueue<(u32, u64), RepairPriority>>,
-    tasks: RwLock<std::collections::HashMap<(u32, u64), RepairTask>>,
+    queue: RwLock<PriorityQueue<(u64, u64), RepairPriority>>,
+    tasks: RwLock<std::collections::HashMap<(u64, u64), RepairTask>>,
 }
 
 impl Default for RepairQueue {
@@ -94,7 +94,7 @@ impl RepairQueue {
         self.queue.read().await.len()
     }
 
-    pub async fn remove_task(&self, volume_id: u32, needle_id: u64) {
+    pub async fn remove_task(&self, volume_id: u64, needle_id: u64) {
         let key = (volume_id, needle_id);
         {
             let mut queue = self.queue.write().await;

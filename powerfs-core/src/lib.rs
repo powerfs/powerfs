@@ -13,3 +13,5 @@ pub mod repair_thread;
 pub mod storage;
 pub mod storage_backend;
 pub mod volume;
+pub mod volume_bootstrap;
+pub mod volume_metadata;
