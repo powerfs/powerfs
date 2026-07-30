@@ -6,6 +6,7 @@ description = "PowerFS lightweight binary network protocol for metadata and data
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
 bytes = "1"
 log = "0.4"
 parking_lot = "0.12"

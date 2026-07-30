@@ -473,6 +473,60 @@ impl MetaShardClient {
 
             log::info!("MetaShardClient: Background processor stopped");
         });
+
+        // ---- Connection health task: periodic ping + graceful reconnect ----
+        // Without this, a connection whose far end silently dropped (NAT /
+        // idle LB / power failure) would only be discovered on the next
+        // user request via a confusing "early eof" error.  Instead we
+        // softly probe every 15s and try reconnect on any error; failed
+        // reconnects are retried on the next tick so transient blips do
+        // not wedge any single request.
+        let filer_connections_cp = self.filer_connections.clone();
+        let background_running_cp = self.background_running.clone();
+        let state_cp = self.state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                if !*background_running_cp.lock().unwrap() {
+                    break;
+                }
+                let s = *state_cp.lock().unwrap();
+                if s == MetaShardClientState::Closed {
+                    break;
+                }
+                ticker.tick().await;
+
+                // Snapshot the pool to avoid long lock holds across network ops.
+                let addrs: Vec<String> = filer_connections_cp
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                for addr in addrs {
+                    let client = match filer_connections_cp.get(&addr) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    if client.is_connected() {
+                        if let Err(e) = client.ping().await {
+                            log::warn!(
+                                "MetaShardClient: ping failed for {}, reconnecting: {:?}",
+                                addr,
+                                e
+                            );
+                            // Try a single reconnect inline; on failure we
+                            // keep the entry but leave !connected so next
+                            // request triggers get_or_create_filer_client
+                            // which calls connect() again.
+                            let _ = client.reconnect_internal().await;
+                        }
+                    } else {
+                        let _ = client.reconnect_internal().await;
+                    }
+                }
+            }
+            log::info!("MetaShardClient: connection health task stopped");
+        });
     }
 
     /// 停止后台处理循环
