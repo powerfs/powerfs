@@ -277,6 +277,8 @@ fn parse_readdir_response_tlv(data: &[u8]) -> Vec<Entry> {
 
 /// Parse a file path into (parent_ino, name)
 /// Format: "/dir1/dir2/file" -> parent_ino from dir2 inode, name = "file"
+/// Note: This is a simplified helper; the full implementation uses iterative lookup
+#[allow(dead_code)]
 fn parse_path_to_parent_name(path: &str) -> (u64, String) {
     let path = path.trim_start_matches('/');
     if path.is_empty() {
@@ -613,8 +615,33 @@ impl FacadeMetadataProvider {
 #[async_trait]
 impl MetadataProvider for FacadeMetadataProvider {
     async fn get_entry(&self, path: &str) -> Result<Option<Entry>> {
-        let (parent_ino, name) = parse_path_to_parent_name(path);
-        self.get_entry_by_parent(parent_ino, &name).await
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Ok(None);
+        }
+
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(None);
+        }
+
+        let mut current_ino: u64 = 1;
+        for (i, part) in parts.iter().enumerate() {
+            match self.get_entry_by_parent(current_ino, part).await? {
+                Some(entry) => {
+                    if i == parts.len() - 1 {
+                        return Ok(Some(entry));
+                    }
+                    let ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
+                    if ino == 0 {
+                        return Ok(None);
+                    }
+                    current_ino = ino;
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     async fn get_entry_by_parent(&self, parent_ino: u64, name: &str) -> Result<Option<Entry>> {
