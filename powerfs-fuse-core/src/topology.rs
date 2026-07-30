@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::circuit_breaker::CircuitBreaker;
+#[cfg(test)]
+use crate::circuit_breaker::CircuitBreakerConfig;
 use powerfs_net as net;
 use powerfs_net::{ClientConfig, PowerFsNetClient};
 
@@ -790,8 +792,9 @@ mod tests {
         // 初始可用
         assert!(manager.can_request());
 
-        // 模拟失败
-        for _ in 0..5 {
+        // 模拟失败 (使用默认阈值)
+        let threshold = CircuitBreakerConfig::default().failure_threshold as usize;
+        for _ in 0..threshold {
             manager.record_failure();
         }
 

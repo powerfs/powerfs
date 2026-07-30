@@ -329,7 +329,9 @@ async fn test_facade_end_to_end_with_mock_servers() {
 
     // Initialize clients first (loads topology, sets state to Ready)
     // Need to set default filer addr before init for default routes
-    facade.meta_shard_client().set_default_filer_addr("127.0.0.1:19343".to_string());
+    facade
+        .meta_shard_client()
+        .set_default_filer_addr("127.0.0.1:19343".to_string());
     facade.meta_shard_client().init();
     facade.volume_client().init();
 
@@ -703,7 +705,9 @@ async fn test_facade_metadata_provider_with_mock() {
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());
 
     // Initialize clients first
-    facade.meta_shard_client().set_default_filer_addr("127.0.0.1:19543".to_string());
+    facade
+        .meta_shard_client()
+        .set_default_filer_addr("127.0.0.1:19543".to_string());
     facade.meta_shard_client().init();
     facade.volume_client().init();
 

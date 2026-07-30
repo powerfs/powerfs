@@ -132,7 +132,10 @@ async fn test_request_submission_without_network() {
             // 应该是网络错误（连接失败或路由未配置）
             assert!(matches!(
                 e,
-                ClientError::Network(_) | ClientError::VolumeNotFound(_) | ClientError::NoShardLeader(_) | ClientError::CircuitOpen
+                ClientError::Network(_)
+                    | ClientError::VolumeNotFound(_)
+                    | ClientError::NoShardLeader(_)
+                    | ClientError::CircuitOpen
             ));
         }
     }

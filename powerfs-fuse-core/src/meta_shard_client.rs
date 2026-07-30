@@ -1012,8 +1012,8 @@ async fn process_request_internal(
         return Err(ClientError::UnsupportedRequest(format!("{:?}", kind)));
     }
 
-    // 尝试最多两次（第二次用于重定向重试）
-    const MAX_ATTEMPTS: u32 = 2;
+    // 尝试最多5次（重定向重试），避免 Leader 切换期间误报失败
+    const MAX_ATTEMPTS: u32 = 5;
     let mut attempt: u32 = 0;
 
     // 获取默认 filer 地址作为回退
@@ -1063,6 +1063,7 @@ async fn process_request_internal(
                 let status = resp.header.status;
 
                 // STATUS_ERR_REDIRECT = 11, 需要解析重定向地址并重试
+                // 注意: 重定向不是服务故障，不记录 breaker failure
                 const STATUS_ERR_REDIRECT: u16 = 11;
                 if status == STATUS_ERR_REDIRECT && attempt < MAX_ATTEMPTS {
                     // 从 TLV body 中解析 Owner 字段获取新的 leader 地址
@@ -1077,12 +1078,16 @@ async fn process_request_internal(
 
                     if let Some(new_addr) = new_leader {
                         log::info!(
-                            "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying",
-                            shard_id, leader_addr, new_addr
+                            "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying (attempt {}/{})",
+                            shard_id, leader_addr, new_addr, attempt, MAX_ATTEMPTS
                         );
 
                         // 更新分片路由表
                         shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
+
+                        // 指数退避延迟，避免 Leader 选举期间的请求风暴
+                        let delay_ms = (50u64) << (attempt - 1).min(3); // 50ms, 100ms, 200ms, 400ms
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
                         // 重试请求
                         continue;
@@ -1164,6 +1169,7 @@ fn parse_addr(addr: &str) -> ClientResult<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit_breaker::CircuitBreakerConfig;
     use crate::client_identity::ClientIdentity;
     use crate::topology::ClusterTopology;
 
@@ -1251,9 +1257,10 @@ mod tests {
             client.submit_metadata_request(ctx, 1).unwrap();
         }
 
-        // 记录失败触发熔断 (需要 filer_addr 参数)
+        // 记录失败触发熔断 (使用默认阈值)
+        let threshold = CircuitBreakerConfig::default().failure_threshold as usize;
         let filer_addr = client.get_shard_leader(1).unwrap_or_default();
-        for _ in 0..5 {
+        for _ in 0..threshold {
             let id = RequestId::new();
             client.record_failure(&id, RequestKind::Metadata, &filer_addr);
         }
@@ -1273,9 +1280,10 @@ mod tests {
         client.set_shard_leader(1, "127.0.0.1:9334".to_string());
         client.set_shard_leader(2, "127.0.0.1:9335".to_string());
 
-        // 对第一个 filer 记录失败触发熔断
+        // 对第一个 filer 记录失败触发熔断 (使用默认阈值)
+        let threshold = CircuitBreakerConfig::default().failure_threshold as usize;
         let addr1 = client.get_shard_leader(1).unwrap_or_default();
-        for _ in 0..5 {
+        for _ in 0..threshold {
             let id = RequestId::new();
             client.record_failure(&id, RequestKind::Metadata, &addr1);
         }

@@ -52,6 +52,8 @@ nix = { version = "0.28", features = ["mount"] }
 rand = { version = "0.8" }
 blake3 = { version = "1.5" }
 crossbeam = { version = "0.8" }
+crossbeam-queue = { version = "0.3" }
+dashmap = { version = "5" }
 lru = { version = "0.12" }
 rocksdb = { version = "0.22", features = ["snappy", "zstd", "lz4"], default-features = false }
 clap = { version = "4.4", features = ["derive"] }

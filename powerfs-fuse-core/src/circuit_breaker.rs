@@ -43,9 +43,12 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 5,
-            recovery_timeout: std::time::Duration::from_secs(30),
-            half_open_max_requests: 3,
+            // 放宽失败阈值: 5 -> 50，避免瞬时网络波动/Leader切换触发熔断
+            failure_threshold: 50,
+            // 缩短恢复超时: 30s -> 5s，快速从故障中恢复
+            recovery_timeout: std::time::Duration::from_secs(5),
+            // 增加 HalfOpen 探测请求: 3 -> 10，更快验证服务恢复
+            half_open_max_requests: 10,
         }
     }
 }
