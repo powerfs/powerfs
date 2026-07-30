@@ -197,11 +197,11 @@ Containerized test environment:
 
 | Phase | Task | Status | Commit |
 |---|---|---|---|
-| A | A1: NodeInfo add filer type | TODO | |
-| A | A2: FuseMount type fix | TODO | |
-| A | A3: Turn off mock default | TODO | |
-| A | A4: Conflicts downgrade | TODO | |
-| A | A5: Optimizations page rebuild | TODO | |
+| A | A1: NodeInfo add filer type | ✅ Done | eb82660a |
+| A | A2: FuseMount type fix | ✅ Done | eb82660a |
+| A | A3: Turn off mock default | ✅ Done | eb82660a |
+| A | A4: Conflicts downgrade | ✅ Done | eb82660a |
+| A | A5: Optimizations page rebuild | ✅ Done | eb82660a |
 | B | B1: Proto extension | TODO | |
 | B | B2: FUSE client stats reporting | TODO | |
 | B | B3: Monitor API | TODO | |
