@@ -10,7 +10,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const ROOT_INODE: u64 = 1;
-pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB - TLV protocol supports up to 4GB value length
 
 pub fn chunk_from_proto(chunk: FileChunk) -> CachedFileChunk {
     CachedFileChunk {
@@ -47,6 +47,8 @@ pub struct CachedEntry {
     pub content_size: u64,
     pub disk_size: u64,
     pub generation: u64,
+    /// When this cache entry was populated (used for TTL fallback)
+    pub cached_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +67,11 @@ struct DirCacheEntry {
     cached_at: Instant,
 }
 
+/// Default TTL for metadata cache entries (seconds). Entries older than this are
+/// treated as stale and will be fetched from the server on next access.
+/// This provides a safety net when Invalidation notifications are lost.
+const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(2);
+
 /// Metadata cache for FUSE filesystem
 pub struct MetadataCache {
     /// inode -> entry mapping (LRU, capacity 10000)
@@ -77,6 +84,8 @@ pub struct MetadataCache {
     next_inode: AtomicU64,
     /// TTL for directory cache
     dir_cache_ttl: Duration,
+    /// TTL for metadata cache entries (fallback, 1-2s)
+    metadata_ttl: Duration,
     /// Latest known generation per path (from notifications)
     path_generations: RwLock<HashMap<String, u64>>,
 }
@@ -95,6 +104,7 @@ impl MetadataCache {
             dir_cache: RwLock::new(HashMap::new()),
             next_inode: AtomicU64::new(2),
             dir_cache_ttl: Duration::from_secs(5),
+            metadata_ttl: DEFAULT_METADATA_TTL,
             path_generations: RwLock::new(HashMap::new()),
         };
         // Initialize root directory (inode 1)
@@ -124,6 +134,7 @@ impl MetadataCache {
             content_size: 4096,
             disk_size: 4096,
             generation: 1,
+            cached_at: Instant::now(),
         });
         cache
     }
@@ -133,10 +144,24 @@ impl MetadataCache {
         self.next_inode.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Get an entry by inode
+    /// Get an entry by inode. Returns None if the inode is not cached or if
+    /// the entry has exceeded the metadata TTL (used as a fallback when
+    /// Invalidation notifications are lost).
     pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
         let mut cache = self.inode_cache.write().unwrap();
-        cache.get(&inode).cloned()
+        let entry = cache.get(&inode).cloned()?;
+        if entry.cached_at.elapsed() > self.metadata_ttl {
+            // Entry too old, treat as stale
+            debug!(
+                "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}), treating as stale",
+                inode,
+                entry.cached_at.elapsed(),
+                self.metadata_ttl,
+            );
+            None
+        } else {
+            Some(entry)
+        }
     }
 
     /// Get path by walking up parent chain
@@ -364,7 +389,9 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
             entry.size = size;
+            entry.content_size = size;
             entry.mtime = chrono::Utc::now().timestamp();
+            entry.cached_at = Instant::now();
         }
     }
 
@@ -399,6 +426,7 @@ impl MetadataCache {
             }
             let now = chrono::Utc::now().timestamp();
             entry.ctime = now;
+            entry.cached_at = Instant::now();
         }
     }
 
@@ -752,6 +780,7 @@ impl MetadataCache {
                 content_size: 4096,
                 disk_size: 4096,
                 generation: 1,
+            cached_at: Instant::now(),
             },
         );
         drop(cache);
@@ -759,6 +788,40 @@ impl MetadataCache {
         path_map.insert("/".to_string(), 1);
 
         debug!("Metadata cache fully cleared and root re-initialized");
+    }
+
+    /// Invalidate a specific inode from cache (called on server notification)
+    ///
+    /// This removes the inode entry and invalidates its parent directory listing.
+    /// The next access will re-fetch fresh data from the server.
+    pub fn invalidate_inode(&self, inode: u64) {
+        // Get parent before removing
+        let parent = {
+            let cache = self.inode_cache.read().unwrap();
+            cache.peek(&inode).map(|e| e.parent)
+        };
+
+        // Remove the inode entry
+        self.remove(inode);
+
+        // Invalidate parent directory listing
+        if let Some(p) = parent {
+            self.invalidate_dir(p);
+        }
+
+        debug!("Invalidated cache for inode: {}", inode);
+    }
+
+    /// Check if a cached inode's version is stale compared to the given version
+    ///
+    /// Returns true if the cache entry is stale (server version > cached version)
+    /// or if the inode is not in cache.
+    pub fn is_inode_stale(&self, inode: u64, server_version: u64) -> bool {
+        let cache = self.inode_cache.read().unwrap();
+        match cache.peek(&inode) {
+            Some(entry) => server_version > entry.generation,
+            None => true,
+        }
     }
 
     /// Update the latest known generation for a path (from notifications)
@@ -829,6 +892,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -866,6 +930,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -903,6 +968,7 @@ mod tests {
                 content_size: 0,
                 disk_size: 0,
                 generation: 0,
+            cached_at: Instant::now(),
             });
         }
 
@@ -938,6 +1004,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         cache.update_size(inode, 1024);
@@ -973,6 +1040,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -1011,6 +1079,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -1050,6 +1119,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -1059,6 +1129,96 @@ mod tests {
         assert_eq!(
             cache.get_symlink_target(inode),
             Some("/target/path".to_string())
+        );
+    }
+
+    #[test]
+    fn test_metadata_ttl_expiry() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "ttl-file.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            cached_at: Instant::now(),
+        });
+
+        // Fresh entry should be returned
+        assert!(cache.get_inode(inode).is_some());
+
+        // Wait for TTL (2s) to expire
+        std::thread::sleep(Duration::from_secs(3));
+
+        // Now the entry should be treated as stale -> None
+        assert!(
+            cache.get_inode(inode).is_none(),
+            "TTL-expired entry should be treated as stale"
+        );
+    }
+
+    #[test]
+    fn test_metadata_ttl_refresh_on_update() {
+        let cache = MetadataCache::new();
+        let inode = cache.allocate_inode();
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "refresh-file.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            cached_at: Instant::now(),
+        });
+
+        // Wait some time (but less than TTL)
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Refresh the TTL via update_size
+        cache.update_size(inode, 4096);
+
+        // Wait for original TTL to have elapsed, but refreshed entry should still be fresh
+        std::thread::sleep(Duration::from_millis(1600));
+
+        assert!(
+            cache.get_inode(inode).is_some(),
+            "Refresh on update_size should keep entry fresh"
         );
     }
 }
@@ -1561,6 +1721,7 @@ mod chunk_cache_tests {
             content_size: 0,
             disk_size: 0,
             generation: 1,
+            cached_at: Instant::now(),
         });
 
         // No generation tracking -> not stale
@@ -1608,6 +1769,7 @@ mod chunk_cache_tests {
             content_size: 0,
             disk_size: 0,
             generation: 1,
+            cached_at: Instant::now(),
         });
 
         cache.update_path_generation("/clear_test.txt", 5);

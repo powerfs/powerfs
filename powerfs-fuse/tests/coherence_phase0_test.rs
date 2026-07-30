@@ -1,4 +1,5 @@
 use powerfs_fuse::cache::{CachedEntry, MetadataCache};
+use std::time::Instant;
 
 fn make_entry(inode: u64, parent: u64, name: &str, is_dir: bool) -> CachedEntry {
     CachedEntry {
@@ -24,6 +25,7 @@ fn make_entry(inode: u64, parent: u64, name: &str, is_dir: bool) -> CachedEntry 
         content_size: 0,
         disk_size: 0,
         generation: 1,
+            cached_at: Instant::now(),
     }
 }
 

@@ -3,6 +3,7 @@ use powerfs_fuse::cache::{CachedEntry, MetadataCache, UpdateAttrParams, ROOT_INO
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
     CachedEntry {
@@ -28,6 +29,7 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         content_size: 0,
         disk_size: 0,
         generation: 0,
+            cached_at: Instant::now(),
     }
 }
 
@@ -55,6 +57,7 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         content_size: 0,
         disk_size: 0,
         generation: 0,
+            cached_at: Instant::now(),
     }
 }
 
