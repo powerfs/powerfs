@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -205,13 +206,19 @@ pub struct VolumeClient {
     default_volume_addrs: Arc<Mutex<Vec<String>>>,
     /// 请求等待者映射 (request_id -> oneshot sender)
     response_waiters: Arc<Mutex<VolumeResponseWaiters>>,
-    /// 后台处理器运行状态
-    background_running: Arc<Mutex<bool>>,
+    /// 关闭标志 (所有处理器共享)
+    shutdown_flag: Arc<AtomicBool>,
+    /// 数据处理器运行状态
+    data_processor_running: Arc<Mutex<bool>>,
+    /// Lease 处理器运行状态
+    lease_processor_running: Arc<Mutex<bool>>,
+    /// 管理处理器运行状态
+    mgmt_processor_running: Arc<Mutex<bool>>,
     /// Lease 续租器运行状态
     lease_renewer_running: Arc<Mutex<bool>>,
     /// Lease 续租间隔
     lease_renew_interval: Duration,
-    /// 事件通知器
+    /// 事件通知器 (所有处理器共享)
     notify: Arc<tokio::sync::Notify>,
 }
 
@@ -242,7 +249,10 @@ impl VolumeClient {
             leases: Arc::new(DashMap::new()),
             state: Arc::new(Mutex::new(VolumeClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
-            background_running: Arc::new(Mutex::new(false)),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            data_processor_running: Arc::new(Mutex::new(false)),
+            lease_processor_running: Arc::new(Mutex::new(false)),
+            mgmt_processor_running: Arc::new(Mutex::new(false)),
             lease_renewer_running: Arc::new(Mutex::new(false)),
             lease_renew_interval,
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -1052,35 +1062,40 @@ impl VolumeClient {
         log::info!("VolumeClient: Closed");
     }
 
-    /// 启动后台处理循环（事件驱动）
+    /// 启动所有后台处理器（数据 + Lease + 管理）
     pub fn start_background_processor(&self) {
-        let mut running = self.background_running.lock().unwrap();
+        self.start_data_processor();
+        self.start_lease_processor();
+        self.start_mgmt_processor();
+    }
+
+    /// 启动数据请求处理器
+    fn start_data_processor(&self) {
+        let mut running = self.data_processor_running.lock().unwrap();
         if *running {
             return;
         }
         *running = true;
 
         let data_queue = self.data_queue.clone();
-        let lease_queue = self.lease_queue.clone();
-        let mgmt_queue = self.mgmt_queue.clone();
         let data_channels = self.data_channels.clone();
-        let lease_channel = self.lease_channel.clone();
-        let mgmt_channel = self.mgmt_channel.clone();
         let breakers = self.breakers.clone();
         let volume_connections = self.volume_connections.clone();
         let default_volume_addrs = self.default_volume_addrs.clone();
-        let background_running = self.background_running.clone();
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
         let leases = self.leases.clone();
         let response_waiters = self.response_waiters.clone();
         let notify = self.notify.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        let data_processor_running = self.data_processor_running.clone();
 
         tokio::spawn(async move {
-            log::info!("VolumeClient: Background processor started");
+            log::info!("VolumeClient: Data processor started");
 
             loop {
-                if !*background_running.lock().unwrap() {
+                if shutdown_flag.load(Ordering::Relaxed) || !*data_processor_running.lock().unwrap()
+                {
                     break;
                 }
 
@@ -1092,29 +1107,10 @@ impl VolumeClient {
                     continue;
                 }
 
-                // Debug: 输出通道和队列状态
-                let data_queue_len = data_queue.len();
-                let data_channel_states: Vec<String> = data_channels
-                    .iter()
-                    .map(|c| format!("name={}, can_accept={}", c.config.name, c.can_accept()))
-                    .collect();
-                let breaker_state = breakers.len();
-                log::debug!(
-                    "VolumeClient: state={:?}, data_queue_len={}, breakers_count={}, channels={:?}",
-                    current_state,
-                    data_queue_len,
-                    breaker_state,
-                    data_channel_states
-                );
-
-                // 尝试处理请求
-                let processed = process_volume_available_requests(
+                // 尝试处理数据请求
+                let processed = process_data_requests(
                     &data_queue,
-                    &lease_queue,
-                    &mgmt_queue,
                     &data_channels,
-                    &lease_channel,
-                    &mgmt_channel,
                     &breakers,
                     &volume_connections,
                     &default_volume_addrs,
@@ -1128,20 +1124,150 @@ impl VolumeClient {
                     continue;
                 }
 
-                // 队列为空，等待通知
                 notify.notified().await;
             }
 
-            log::info!("VolumeClient: Background processor stopped");
+            log::info!("VolumeClient: Data processor stopped");
         });
     }
 
-    /// 停止后台处理循环
+    /// 启动 Lease 请求处理器 (高优先级)
+    fn start_lease_processor(&self) {
+        let mut running = self.lease_processor_running.lock().unwrap();
+        if *running {
+            return;
+        }
+        *running = true;
+
+        let lease_queue = self.lease_queue.clone();
+        let lease_channel = self.lease_channel.clone();
+        let breakers = self.breakers.clone();
+        let volume_connections = self.volume_connections.clone();
+        let default_volume_addrs = self.default_volume_addrs.clone();
+        let state = self.state.clone();
+        let volume_router = self.volume_router.clone();
+        let response_waiters = self.response_waiters.clone();
+        let notify = self.notify.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        let lease_processor_running = self.lease_processor_running.clone();
+
+        tokio::spawn(async move {
+            log::info!("VolumeClient: Lease processor started (high priority)");
+
+            loop {
+                if shutdown_flag.load(Ordering::Relaxed)
+                    || !*lease_processor_running.lock().unwrap()
+                {
+                    break;
+                }
+
+                let current_state = *state.lock().unwrap();
+                if current_state == VolumeClientState::Closed
+                    || current_state == VolumeClientState::Suspended
+                {
+                    notify.notified().await;
+                    continue;
+                }
+
+                // Lease 处理器优先处理
+                let processed = process_lease_requests(
+                    &lease_queue,
+                    &lease_channel,
+                    &breakers,
+                    &volume_connections,
+                    &default_volume_addrs,
+                    &volume_router,
+                    &response_waiters,
+                )
+                .await;
+
+                if processed {
+                    continue;
+                }
+
+                notify.notified().await;
+            }
+
+            log::info!("VolumeClient: Lease processor stopped");
+        });
+    }
+
+    /// 启动管理请求处理器
+    fn start_mgmt_processor(&self) {
+        let mut running = self.mgmt_processor_running.lock().unwrap();
+        if *running {
+            return;
+        }
+        *running = true;
+
+        let mgmt_queue = self.mgmt_queue.clone();
+        let mgmt_channel = self.mgmt_channel.clone();
+        let breakers = self.breakers.clone();
+        let volume_connections = self.volume_connections.clone();
+        let default_volume_addrs = self.default_volume_addrs.clone();
+        let state = self.state.clone();
+        let volume_router = self.volume_router.clone();
+        let response_waiters = self.response_waiters.clone();
+        let notify = self.notify.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        let mgmt_processor_running = self.mgmt_processor_running.clone();
+
+        tokio::spawn(async move {
+            log::info!("VolumeClient: Management processor started");
+
+            loop {
+                if shutdown_flag.load(Ordering::Relaxed) || !*mgmt_processor_running.lock().unwrap()
+                {
+                    break;
+                }
+
+                let current_state = *state.lock().unwrap();
+                if current_state == VolumeClientState::Closed
+                    || current_state == VolumeClientState::Suspended
+                {
+                    notify.notified().await;
+                    continue;
+                }
+
+                let processed = process_mgmt_requests(
+                    &mgmt_queue,
+                    &mgmt_channel,
+                    &breakers,
+                    &volume_connections,
+                    &default_volume_addrs,
+                    &volume_router,
+                    &response_waiters,
+                )
+                .await;
+
+                if processed {
+                    continue;
+                }
+
+                notify.notified().await;
+            }
+
+            log::info!("VolumeClient: Management processor stopped");
+        });
+    }
+
+    /// 停止所有后台处理器
     pub fn stop_background_processor(&self) {
-        let mut running = self.background_running.lock().unwrap();
-        *running = false;
-        self.notify.notify_one();
-        log::info!("VolumeClient: Stopping background processor...");
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        {
+            let mut running = self.data_processor_running.lock().unwrap();
+            *running = false;
+        }
+        {
+            let mut running = self.lease_processor_running.lock().unwrap();
+            *running = false;
+        }
+        {
+            let mut running = self.mgmt_processor_running.lock().unwrap();
+            *running = false;
+        }
+        self.notify.notify_waiters();
+        log::info!("VolumeClient: Stopping all background processors...");
     }
 
     /// 启动 Lease 续租心跳后台任务
@@ -1423,6 +1549,7 @@ async fn get_or_create_volume_client_from_pool(
 
 /// 处理 Volume 队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn process_volume_available_requests(
     data_queue: &Arc<RequestQueue>,
     lease_queue: &Arc<RequestQueue>,
@@ -1492,6 +1619,98 @@ async fn process_volume_available_requests(
         }
     }
 
+    false
+}
+
+/// 独立的数据请求处理器 (专用 tokio 任务使用)
+#[allow(clippy::too_many_arguments)]
+async fn process_data_requests(
+    data_queue: &Arc<RequestQueue>,
+    data_channels: &[Arc<TransportChannel>],
+    breakers: &Arc<CircuitBreakerPool>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    default_volume_addrs: &Arc<Mutex<Vec<String>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
+    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
+    response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+) -> bool {
+    if data_channels.iter().any(|c| c.can_accept()) {
+        let next_req = data_queue.dequeue();
+        if let Some(req) = next_req {
+            let _ = process_data_request_internal(
+                req,
+                volume_connections,
+                default_volume_addrs,
+                breakers,
+                data_channels,
+                volume_router,
+                leases,
+                response_waiters,
+            )
+            .await;
+            return true;
+        }
+    }
+    false
+}
+
+/// 独立的 Lease 请求处理器 (专用 tokio 任务使用, 高优先级)
+#[allow(clippy::too_many_arguments)]
+async fn process_lease_requests(
+    lease_queue: &Arc<RequestQueue>,
+    lease_channel: &Arc<TransportChannel>,
+    breakers: &Arc<CircuitBreakerPool>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    default_volume_addrs: &Arc<Mutex<Vec<String>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
+    response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+) -> bool {
+    if lease_channel.can_accept() {
+        let next_req = lease_queue.dequeue();
+        if let Some(req) = next_req {
+            let _ = process_lease_request_internal(
+                req,
+                volume_connections,
+                default_volume_addrs,
+                breakers,
+                lease_channel,
+                volume_router,
+                response_waiters,
+            )
+            .await;
+            return true;
+        }
+    }
+    false
+}
+
+/// 独立的管理请求处理器 (专用 tokio 任务使用)
+#[allow(clippy::too_many_arguments)]
+async fn process_mgmt_requests(
+    mgmt_queue: &Arc<RequestQueue>,
+    mgmt_channel: &Arc<TransportChannel>,
+    breakers: &Arc<CircuitBreakerPool>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    default_volume_addrs: &Arc<Mutex<Vec<String>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
+    response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+) -> bool {
+    if mgmt_channel.can_accept() {
+        let next_req = mgmt_queue.dequeue();
+        if let Some(req) = next_req {
+            let _ = process_mgmt_request_internal(
+                req,
+                volume_connections,
+                default_volume_addrs,
+                breakers,
+                mgmt_channel,
+                volume_router,
+                response_waiters,
+            )
+            .await;
+            return true;
+        }
+    }
     false
 }
 
