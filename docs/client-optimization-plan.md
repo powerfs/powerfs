@@ -394,7 +394,14 @@ feat: complete Phase 1 per-server circuit breaker integration
 **Test Execution**:
 - ✅ Unit tests: 87 tests passed in powerfs-fuse-core
 - ✅ Integration tests: 3 mock server tests passed
-- ⚠️ Full workspace tests: 3 powerfs-fuse integration tests failed (environment issue - missing master binary, not code-related)
+- ✅ Full workspace lib tests: 441 tests passed (0 failures, 2 ignored)
+- ✅ Coherence tests: 90 tests passed across 6 suites:
+  - coherence_phase0_test: 12 passed
+  - coherence_phase1_test: 10 passed
+  - coherence_phase2_test: 12 passed
+  - coherence_phase3_test: 12 passed
+  - coherence_failover_test: 36 passed
+  - master_outage_e2e_test: 8 passed (--test-threads=1)
 
 **Phase 4 Summary**:
 - Dedicated background threads for lease, management, and data queues
