@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::sync::oneshot;
 
 use crate::circuit_breaker::CircuitBreakerPool;
@@ -198,8 +199,8 @@ pub struct VolumeClient {
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器
     topology_manager: Arc<ClusterTopologyManager>,
-    /// Volume 连接池 (addr -> PowerFsNetClient)
-    volume_connections: Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    /// Volume 连接池 (addr -> PowerFsNetClient) - DashMap for lock-free reads
+    volume_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     /// 默认 Volume 地址列表
     default_volume_addrs: Arc<Mutex<Vec<String>>>,
     /// 请求等待者映射 (request_id -> oneshot sender)
@@ -247,7 +248,7 @@ impl VolumeClient {
             notify: Arc::new(tokio::sync::Notify::new()),
             config,
             topology_manager,
-            volume_connections: Arc::new(Mutex::new(HashMap::new())),
+            volume_connections: Arc::new(DashMap::new()),
             default_volume_addrs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -1392,16 +1393,13 @@ fn resolve_waiter_for(
 
 /// 从连接池获取或创建到指定地址的 volume 客户端
 async fn get_or_create_volume_client_from_pool(
-    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     addr: &str,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
-    // 先检查是否已有连接
-    {
-        let connections = volume_connections.lock().unwrap();
-        if let Some(client) = connections.get(addr) {
-            if client.is_connected() {
-                return Ok(client.clone());
-            }
+    // 先检查是否已有连接 (DashMap lock-free read)
+    if let Some(entry) = volume_connections.get(addr) {
+        if entry.is_connected() {
+            return Ok(entry.clone());
         }
     }
 
@@ -1436,10 +1434,7 @@ async fn get_or_create_volume_client_from_pool(
         .map_err(ClientError::from_net_error)?;
 
     // 保存到连接池
-    {
-        let mut connections = volume_connections.lock().unwrap();
-        connections.insert(addr.to_string(), client.clone());
-    }
+    volume_connections.insert(addr.to_string(), client.clone());
 
     Ok(client)
 }
@@ -1454,7 +1449,7 @@ async fn process_volume_available_requests(
     lease_channel: &Arc<TransportChannel>,
     mgmt_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
     leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
@@ -1522,7 +1517,7 @@ async fn process_volume_available_requests(
 #[allow(clippy::too_many_arguments)]
 async fn process_data_request_internal(
     req: PendingRequest,
-    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _data_channels: &[Arc<TransportChannel>],
@@ -1717,7 +1712,7 @@ async fn process_data_request_internal(
 /// Lease 请求处理（自由函数版本）
 async fn process_lease_request_internal(
     req: PendingRequest,
-    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _lease_channel: &Arc<TransportChannel>,
@@ -1788,7 +1783,7 @@ async fn process_lease_request_internal(
 /// 管理请求处理（自由函数版本）
 async fn process_mgmt_request_internal(
     req: PendingRequest,
-    volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _mgmt_channel: &Arc<TransportChannel>,

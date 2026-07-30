@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+
 use tokio::sync::oneshot;
 
 use crate::circuit_breaker::CircuitBreakerPool;
@@ -230,8 +232,8 @@ pub struct MetaShardClient {
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器引用
     topology_manager: Arc<ClusterTopologyManager>,
-    /// Filer 连接池 (addr -> PowerFsNetClient)
-    filer_connections: Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    /// Filer 连接池 (addr -> PowerFsNetClient) - DashMap for lock-free reads
+    filer_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     /// 请求完成监听器
     listeners: Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     /// 后台处理是否在运行
@@ -262,7 +264,7 @@ impl MetaShardClient {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             config,
             topology_manager,
-            filer_connections: Arc::new(Mutex::new(HashMap::new())),
+            filer_connections: Arc::new(DashMap::new()),
             listeners: Arc::new(Mutex::new(Vec::new())),
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -272,13 +274,10 @@ impl MetaShardClient {
 
     /// 获取或创建到指定 filer 地址的连接
     async fn get_or_create_filer_client(&self, addr: &str) -> ClientResult<Arc<PowerFsNetClient>> {
-        // 先检查是否已有连接
-        {
-            let connections = self.filer_connections.lock().unwrap();
-            if let Some(client) = connections.get(addr) {
-                if client.is_connected() {
-                    return Ok(client.clone());
-                }
+        // 先检查是否已有连接 (DashMap lock-free read)
+        if let Some(entry) = self.filer_connections.get(addr) {
+            if entry.is_connected() {
+                return Ok(entry.clone());
             }
         }
 
@@ -304,10 +303,8 @@ impl MetaShardClient {
             .map_err(ClientError::from_net_error)?;
 
         // 保存到连接池
-        {
-            let mut connections = self.filer_connections.lock().unwrap();
-            connections.insert(addr.to_string(), client.clone());
-        }
+        self.filer_connections
+            .insert(addr.to_string(), client.clone());
 
         Ok(client)
     }
@@ -912,7 +909,7 @@ async fn process_available_requests(
     data_channel: &Arc<TransportChannel>,
     control_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
     shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
     topology_manager: &Arc<ClusterTopologyManager>,
@@ -996,7 +993,7 @@ async fn process_available_requests(
 #[allow(clippy::too_many_arguments)]
 async fn process_request_internal(
     req: PendingRequest,
-    filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
     breakers: &Arc<CircuitBreakerPool>,
     _data_channel: &Arc<TransportChannel>,
@@ -1122,16 +1119,13 @@ async fn process_request_internal(
 
 /// 获取或创建到指定地址的 filer 连接（自由函数版本，供后台处理器使用）
 async fn get_or_create_filer_client(
-    connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
+    connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     addr: &str,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
-    // 先检查是否已有连接
-    {
-        let conns = connections.lock().unwrap();
-        if let Some(client) = conns.get(addr) {
-            if client.is_connected() {
-                return Ok(client.clone());
-            }
+    // 先检查是否已有连接 (DashMap lock-free read)
+    if let Some(entry) = connections.get(addr) {
+        if entry.is_connected() {
+            return Ok(entry.clone());
         }
     }
 
@@ -1159,10 +1153,7 @@ async fn get_or_create_filer_client(
         .map_err(ClientError::from_net_error)?;
 
     // 保存到连接池
-    {
-        let mut conns = connections.lock().unwrap();
-        conns.insert(addr.to_string(), client.clone());
-    }
+    connections.insert(addr.to_string(), client.clone());
 
     Ok(client)
 }
