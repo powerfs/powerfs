@@ -15,8 +15,8 @@ pub const HEADER_SIZE: usize = 28;
 /// Maximum frame size (header + data)
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024; // 4MB
 
-/// Maximum TLV value length
-pub const MAX_TLV_VALUE_LEN: u16 = 65535; // 64KB - 1
+/// Maximum TLV value length (4GB - 1, using u32 length field)
+pub const MAX_TLV_VALUE_LEN: u32 = 0xFFFFFFFF;
 
 // ============================================================================
 // Frame Flags
@@ -279,6 +279,11 @@ impl FrameHeader {
         self.header_crc == self.calc_header_crc()
     }
 
+    /// Check if this frame is a NOTIFY (server-pushed notification)
+    pub fn is_notify(&self) -> bool {
+        self.flags & FrameFlags::NOTIFY != 0
+    }
+
     pub fn encode(&self, buf: &mut [u8]) {
         buf[0..4].copy_from_slice(&self.magic);
         buf[4] = self.version;
@@ -343,6 +348,8 @@ pub enum MsgType {
     Symlink = 0x0019,
     Readlink = 0x001A,
     Link = 0x001B,
+    SetAttrData = 0x001C, // Strong-consistency SetAttr (size/chunks)
+    SetAttrMeta = 0x001D, // Eventually-consistency SetAttr (mode/uid/gid)
 
     // Data operations
     Read = 0x0020,
@@ -404,6 +411,8 @@ impl MsgType {
             0x0019 => Some(Self::Symlink),
             0x001A => Some(Self::Readlink),
             0x001B => Some(Self::Link),
+            0x001C => Some(Self::SetAttrData),
+            0x001D => Some(Self::SetAttrMeta),
             0x0020 => Some(Self::Read),
             0x0021 => Some(Self::Write),
             0x0030 => Some(Self::PushDelta),
@@ -442,7 +451,7 @@ impl MsgType {
 
     pub fn is_metadata(self) -> bool {
         let v = self.as_u16();
-        (0x0010..=0x001B).contains(&v)
+        (0x0010..=0x001D).contains(&v)
     }
 
     pub fn is_data(self) -> bool {
@@ -504,6 +513,7 @@ pub enum FieldId {
     HardLinkId = 0x16,
     Owner = 0x17,
     Backend = 0x18,
+    Version = 0x19,
 
     // List fields
     Limit = 0x20,
@@ -581,6 +591,7 @@ impl FieldId {
             0x16 => Some(Self::HardLinkId),
             0x17 => Some(Self::Owner),
             0x18 => Some(Self::Backend),
+            0x19 => Some(Self::Version),
             0x20 => Some(Self::Limit),
             0x21 => Some(Self::LastName),
             0x22 => Some(Self::HasMore),

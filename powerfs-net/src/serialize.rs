@@ -4,10 +4,10 @@
 //! compatible with both Rust and C implementations.
 //!
 //! Format per field:
-//!   field_id (1B) | length (2B) | value (length bytes)
+//!   field_id (1B) | length (4B, big-endian u32) | value (length bytes)
 //!
-//! This is simpler than protobuf but supports field addition and
-//! is compact enough for metadata operations.
+//! Supports up to 4GB per value field, suitable for both metadata
+//! operations and large data payloads.
 
 use crate::errors::NetError;
 use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
@@ -84,7 +84,7 @@ impl TlvEncoder {
                 MAX_TLV_VALUE_LEN
             )));
         }
-        self.write_header(field, bytes.len() as u16);
+        self.write_header(field, bytes.len() as u32);
         self.buf.extend_from_slice(bytes);
         Ok(self)
     }
@@ -98,7 +98,7 @@ impl TlvEncoder {
                 MAX_TLV_VALUE_LEN
             )));
         }
-        self.write_header(field, value.len() as u16);
+        self.write_header(field, value.len() as u32);
         self.buf.extend_from_slice(value);
         Ok(self)
     }
@@ -171,7 +171,7 @@ impl TlvEncoder {
                 MAX_TLV_VALUE_LEN
             )));
         }
-        self.write_header(field, value.len() as u16);
+        self.write_header(field, value.len() as u32);
         self.buf.extend_from_slice(value);
         Ok(self)
     }
@@ -180,9 +180,9 @@ impl TlvEncoder {
     // Helper: write TLV header
     // ========================================================================
 
-    fn write_header(&mut self, field: FieldId, length: u16) {
+    fn write_header(&mut self, field: FieldId, length: u32) {
         self.buf.push(field.as_u8());
-        self.buf.extend_from_slice(&length.to_le_bytes());
+        self.buf.extend_from_slice(&length.to_be_bytes());
     }
 }
 
@@ -224,11 +224,16 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Get the next field ID and length, skipping unknown fields
-    pub fn next_field(&mut self) -> Option<(FieldId, u16)> {
-        while self.pos + 3 <= self.buf.len() {
+    pub fn next_field(&mut self) -> Option<(FieldId, u32)> {
+        while self.pos + 5 <= self.buf.len() {
             let field_id = self.buf[self.pos];
-            let length = u16::from_le_bytes([self.buf[self.pos + 1], self.buf[self.pos + 2]]);
-            self.pos += 3;
+            let length = u32::from_be_bytes([
+                self.buf[self.pos + 1],
+                self.buf[self.pos + 2],
+                self.buf[self.pos + 3],
+                self.buf[self.pos + 4],
+            ]);
+            self.pos += 5;
 
             if let Some(field) = FieldId::from_u8(field_id) {
                 return Some((field, length));
@@ -245,7 +250,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Skip the current field
-    pub fn skip(&mut self, length: u16) -> Result<(), NetError> {
+    pub fn skip(&mut self, length: u32) -> Result<(), NetError> {
         let end = self.pos + length as usize;
         if end > self.buf.len() {
             return Err(NetError::Serialize("unexpected end of data".into()));
@@ -255,7 +260,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a uint8 value (current position should be at the value)
-    pub fn read_u8(&mut self, length: u16) -> Result<u8, NetError> {
+    pub fn read_u8(&mut self, length: u32) -> Result<u8, NetError> {
         if length != 1 {
             return Err(NetError::Serialize(format!(
                 "expected 1 byte, got {}",
@@ -271,7 +276,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a uint16 value
-    pub fn read_u16(&mut self, length: u16) -> Result<u16, NetError> {
+    pub fn read_u16(&mut self, length: u32) -> Result<u16, NetError> {
         if length != 2 {
             return Err(NetError::Serialize(format!(
                 "expected 2 bytes, got {}",
@@ -287,7 +292,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a uint32 value
-    pub fn read_u32(&mut self, length: u16) -> Result<u32, NetError> {
+    pub fn read_u32(&mut self, length: u32) -> Result<u32, NetError> {
         if length != 4 {
             return Err(NetError::Serialize(format!(
                 "expected 4 bytes, got {}",
@@ -306,7 +311,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a uint64 value
-    pub fn read_u64(&mut self, length: u16) -> Result<u64, NetError> {
+    pub fn read_u64(&mut self, length: u32) -> Result<u64, NetError> {
         if length != 8 {
             return Err(NetError::Serialize(format!(
                 "expected 8 bytes, got {}",
@@ -325,7 +330,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a string value
-    pub fn read_string(&mut self, length: u16) -> Result<&'a str, NetError> {
+    pub fn read_string(&mut self, length: u32) -> Result<&'a str, NetError> {
         if self.pos + length as usize > self.buf.len() {
             return Err(NetError::Serialize("unexpected end of data".into()));
         }
@@ -336,7 +341,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode raw bytes
-    pub fn read_bytes(&mut self, length: u16) -> Result<&'a [u8], NetError> {
+    pub fn read_bytes(&mut self, length: u32) -> Result<&'a [u8], NetError> {
         if self.pos + length as usize > self.buf.len() {
             return Err(NetError::Serialize("unexpected end of data".into()));
         }
@@ -346,7 +351,7 @@ impl<'a> TlvDecoder<'a> {
     }
 
     /// Decode a nested TLV structure as raw bytes
-    pub fn read_nested(&mut self, length: u16) -> Result<&'a [u8], NetError> {
+    pub fn read_nested(&mut self, length: u32) -> Result<&'a [u8], NetError> {
         self.read_bytes(length)
     }
 
@@ -650,6 +655,7 @@ pub struct EntryInfo {
     pub is_dir: bool,
     pub symlink_target: Option<String>,
     pub name: String,
+    pub version: u64,
 }
 
 impl EntryInfo {
@@ -667,6 +673,7 @@ impl EntryInfo {
             is_dir: false,
             symlink_target: None,
             name: String::new(),
+            version: 0,
         }
     }
 }
@@ -693,6 +700,7 @@ pub fn decode_entry_resp(body: &[u8]) -> Result<EntryInfo, NetError> {
             FieldId::Name => {
                 entry.name = dec.read_string(length)?.to_string();
             }
+            FieldId::Version => entry.version = dec.read_u64(length)?,
             _ => dec.skip(length)?,
         }
     }
@@ -1159,9 +1167,9 @@ mod tests {
     fn test_unknown_field_skipped() {
         let mut enc = TlvEncoder::new();
         enc.add_u32(FieldId::Mode, 42);
-        // Use an unknown field ID (0xFE)
+        // Use an unknown field ID (0xFE) with 4-byte big-endian length
         enc.buf.push(0xFE);
-        enc.buf.extend_from_slice(&3u16.to_le_bytes());
+        enc.buf.extend_from_slice(&3u32.to_be_bytes());
         enc.buf.extend_from_slice(&[1u8, 2, 3]);
         let bytes = enc.into_bytes();
 
