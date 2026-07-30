@@ -426,6 +426,8 @@ feat: complete Phase 1 per-server circuit breaker integration
 | **4** | 4.1 | Dedicated queue threads | ✅ Done | `volume_client.rs` | ✅ | ✅ | ✅ |
 | **4** | 4.2 | Priority-based dispatch | ✅ Done | `volume_client.rs`, `lib.rs` | ✅ | ✅ | ✅ |
 | **4** | 4.3 | Phase 4 final quality check & test | ✅ Done | - | ✅ | ✅ | ✅ |
+| **P1** | - | WriteCoalescer to eliminate RMW for random partial writes | ✅ Done | `write_coalescer.rs`, `volume.rs`, `lib.rs`, `request_state.rs` | ✅ | ✅ | ✅ |
+| **P2** | - | TCP keepalive + MetaShardClient health task for early-eof resilience | ✅ Done | `powerfs-net/Cargo.toml`, `client.rs`, `meta_shard_client.rs` | ✅ | ✅ | ✅ |
 
 ### Phase 1 Summary (Completed)
 
