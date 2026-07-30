@@ -119,10 +119,17 @@ function AppLayout() {
           type: 'group' as const,
           label: '元数据',
           children: [
-            { key: '/filer', icon: <CloudServerOutlined />, label: 'Filer 管理' },
+            {
+              key: 'filer-submenu',
+              icon: <CloudServerOutlined />,
+              label: 'Filer 管理',
+              children: [
+                { key: '/filer', label: '状态总览' },
+                { key: '/conflicts', icon: <WarningOutlined />, label: '冲突检测' },
+              ],
+            },
             { key: '/shards', icon: <ClusterOutlined />, label: '分片管理' },
             { key: '/shard-balancing', icon: <DatabaseOutlined />, label: '分片均衡' },
-            { key: '/conflicts', icon: <WarningOutlined />, label: '冲突管理' },
           ],
         }]
       : []),

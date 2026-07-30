@@ -191,7 +191,7 @@ struct FuseMount {
     mount_point: String,
     collection: String,
     replication: String,
-    master: String,
+    filer_address: String,
     threads: usize,
     status: String,
     mounted_at: String,
@@ -208,7 +208,7 @@ struct CreateFuseMountRequest {
     mount_point: String,
     collection: String,
     replication: String,
-    master: String,
+    filer_address: String,
     threads: usize,
 }
 
@@ -1077,7 +1077,7 @@ async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse
                     mount_point: client.mount_point,
                     collection: client.collection,
                     replication: client.replication,
-                    master: String::new(),
+                    filer_address: String::new(), // TODO: Phase B - add filer_address to proto
                     threads: 0,
                     status: "mounted".to_string(),
                     mounted_at: if client.connected_at > 0 {
@@ -1147,8 +1147,8 @@ async fn create_fuse_mount(
     }
 
     let cmd = tokio::process::Command::new("/app/powerfs-fuse")
-        .arg("--master")
-        .arg(&req.master)
+        .arg("--filer")
+        .arg(&req.filer_address)
         .arg("--mount-point")
         .arg(&req.mount_point)
         .arg("--collection")
@@ -1168,7 +1168,7 @@ async fn create_fuse_mount(
                 mount_point: req.mount_point,
                 collection: req.collection,
                 replication: req.replication,
-                master: req.master,
+                filer_address: req.filer_address,
                 threads: req.threads,
                 status: "mounted".to_string(),
                 mounted_at: chrono::Utc::now().to_rfc3339(),

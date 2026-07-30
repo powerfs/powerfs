@@ -10,7 +10,7 @@ export type RaftRole = 'leader' | 'follower'
 
 export interface NodeInfo {
   id: string
-  node_type: 'master' | 'volume'
+  node_type: 'master' | 'volume' | 'filer'
   address: string
   grpc_port: number
   http_port: number
@@ -228,7 +228,7 @@ export interface FuseMount {
   mount_point: string
   collection: string
   replication: string
-  master: string
+  filer_address: string
   threads: number
   status: 'mounted' | 'unmounted' | 'error'
   mounted_at: string

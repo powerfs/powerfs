@@ -38,7 +38,7 @@ function Fuse() {
         mount_point: values.mount_point,
         collection: values.collection,
         replication: values.replication,
-        master: values.master,
+        filer_address: values.filer_address,
         threads: values.threads,
       })
       setCreateModalVisible(false)
@@ -235,11 +235,11 @@ function Fuse() {
             <Input placeholder="000" />
           </Form.Item>
           <Form.Item
-            name="master"
-            label="Master节点地址"
-            rules={[{ required: true, message: '请输入Master节点地址' }]}
+            name="filer_address"
+            label="Filer地址"
+            rules={[{ required: true, message: '请输入Filer节点地址' }]}
           >
-            <Input placeholder="localhost:9333" />
+            <Input placeholder="localhost:8888" />
           </Form.Item>
           <Form.Item
             name="threads"

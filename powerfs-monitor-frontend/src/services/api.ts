@@ -78,7 +78,7 @@ api.interceptors.response.use(
   },
 )
 
-let useMock = true
+let useMock = import.meta.env.VITE_USE_MOCK === 'true'
 
 let mockKVNamespaces: KVNamespace[] = [
   { id: 'ns-1', name: 'default', owner_id: 'user-1', created_at: Date.now() - 86400000, updated_at: Date.now() - 86400000 },
@@ -348,7 +348,7 @@ export async function createFuseMount(mount: {
   mount_point: string
   collection: string
   replication: string
-  master: string
+  filer_address: string
   threads: number
 }): Promise<FuseMount> {
   if (useMock) {
@@ -786,62 +786,6 @@ export async function getBenchmarkReportById(id: string): Promise<BenchmarkResul
   }
   const response = await api.get(`/benchmarks/report/${id}`)
   return response.data.data
-}
-
-export interface OptimizationFlags {
-  ec_simd_enabled: boolean
-  ec_parallel_encoding: boolean
-  ec_dynamic_sharding: boolean
-  ec_small_file_skip: boolean
-  raft_log_compression: boolean
-  raft_pre_vote: boolean
-  raft_read_scaling: boolean
-  rack_awareness: boolean
-  load_balancing: boolean
-  smart_cache_eviction: boolean
-  hierarchical_index: boolean
-}
-
-export async function getOptimizationFlags(): Promise<{ flags: OptimizationFlags }> {
-  if (useMock) {
-    return {
-      flags: {
-        ec_simd_enabled: true,
-        ec_parallel_encoding: true,
-        ec_dynamic_sharding: true,
-        ec_small_file_skip: false,
-        raft_log_compression: true,
-        raft_pre_vote: true,
-        raft_read_scaling: true,
-        rack_awareness: false,
-        load_balancing: true,
-        smart_cache_eviction: true,
-        hierarchical_index: true,
-      },
-    }
-  }
-  const response = await api.get('/optimizations')
-  return response.data
-}
-
-export async function updateOptimizationFlag(flagName: string, value: boolean): Promise<void> {
-  if (useMock) return
-  await api.put(`/optimizations/${flagName}`, { value })
-}
-
-export async function resetOptimizationFlags(): Promise<void> {
-  if (useMock) return
-  await api.post('/optimizations/reset')
-}
-
-export async function setOptimizationBaseline(): Promise<void> {
-  if (useMock) return
-  await api.post('/optimizations/baseline')
-}
-
-export async function runOptimizationBenchmark(): Promise<void> {
-  if (useMock) return
-  await api.post('/benchmark/run', { test_duration_seconds: 30 })
 }
 
 // ===== Filer & Shard management =====
