@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -192,9 +192,9 @@ pub struct VolumeClient {
     /// 管理通道
     mgmt_channel: Arc<TransportChannel>,
     /// Volume 路由表
-    volume_router: Arc<RwLock<HashMap<u64, VolumeInfo>>>,
+    volume_router: Arc<DashMap<u64, VolumeInfo>>,
     /// Lease 表 ((volume_id, inode) -> LeaseInfo)
-    leases: Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
+    leases: Arc<DashMap<(u64, u64), LeaseInfo>>,
     /// Per-server circuit breaker pool (one breaker per Volume server address)
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器
@@ -238,8 +238,8 @@ impl VolumeClient {
             data_channels,
             lease_channel: Arc::new(TransportChannel::new(config.lease_channel.clone())),
             mgmt_channel: Arc::new(TransportChannel::new(config.mgmt_channel.clone())),
-            volume_router: Arc::new(RwLock::new(HashMap::new())),
-            leases: Arc::new(RwLock::new(HashMap::new())),
+            volume_router: Arc::new(DashMap::new()),
+            leases: Arc::new(DashMap::new()),
             state: Arc::new(Mutex::new(VolumeClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             background_running: Arc::new(Mutex::new(false)),
@@ -368,9 +368,7 @@ impl VolumeClient {
 
         // 如果路由表为空，等待 Volume Server 心跳注册后重试
         {
-            let router = self.volume_router.read().unwrap();
-            if router.is_empty() {
-                drop(router);
+            if self.volume_router.is_empty() {
                 log::warn!(
                     "VolumeClient: volume router empty, waiting for Volume Server heartbeats..."
                 );
@@ -379,8 +377,7 @@ impl VolumeClient {
                 for attempt in 1..=3 {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     self.sync_volume_router();
-                    let router = self.volume_router.read().unwrap();
-                    if !router.is_empty() {
+                    if !self.volume_router.is_empty() {
                         log::info!(
                             "VolumeClient: volume router populated after {} retries",
                             attempt
@@ -396,9 +393,7 @@ impl VolumeClient {
                 }
 
                 // 如果仍然为空，使用默认路由作为 fallback
-                let router = self.volume_router.read().unwrap();
-                if router.is_empty() {
-                    drop(router);
+                if self.volume_router.is_empty() {
                     log::warn!("VolumeClient: using default volume routes as fallback");
                     self.setup_default_volume_routes();
                 }
@@ -430,38 +425,42 @@ impl VolumeClient {
             volume_addrs
         );
 
-        let mut router = self.volume_router.write().unwrap();
         for (vol_id, addr) in volume_addrs.iter().enumerate() {
-            router.insert(
+            self.volume_router.insert(
                 vol_id as u64,
                 VolumeInfo::new(vol_id as u64, format!("vol-{}", vol_id), addr.clone()),
             );
         }
         log::info!(
             "VolumeClient: default routes configured for {} volumes",
-            router.len()
+            self.volume_router.len()
         );
     }
 
     fn sync_volume_router(&self) {
         let topology = self.topology_manager.get_topology();
-        let mut router = self.volume_router.write().unwrap();
-        let old_len = router.len();
-        *router = topology.volumes.clone();
+        let old_len = self.volume_router.len();
+        self.volume_router.clear();
+        for (vid, info) in topology.volumes {
+            self.volume_router.insert(vid, info);
+        }
         log::info!(
             "sync_volume_router: updated volume_router from {} to {} entries",
             old_len,
-            router.len()
+            self.volume_router.len()
         );
-        for (vid, info) in router.iter() {
-            log::debug!("sync_volume_router: volume_id={}, addr={}", vid, info.addr);
+        for entry in self.volume_router.iter() {
+            log::debug!(
+                "sync_volume_router: volume_id={}, addr={}",
+                entry.key(),
+                entry.value().addr
+            );
         }
     }
 
     /// 直接设置 Volume 信息（用于测试或动态路由更新）
     pub fn set_volume_info(&self, volume_id: u64, addr: String) {
-        let mut router = self.volume_router.write().unwrap();
-        router.insert(
+        self.volume_router.insert(
             volume_id,
             VolumeInfo::new(volume_id, format!("vol-{}", volume_id), addr),
         );
@@ -497,13 +496,11 @@ impl VolumeClient {
 
     /// 从默认 volume 地址获取指定 volume 的路由地址
     pub fn get_default_volume_addr(&self, volume_id: u64) -> Option<String> {
-        let router = self.volume_router.read().unwrap();
-        router.get(&volume_id).map(|v| v.addr.clone())
+        self.volume_router.get(&volume_id).map(|v| v.addr.clone())
     }
 
     fn cleanup_expired_leases(&self) {
-        let mut leases = self.leases.write().unwrap();
-        leases.retain(|_, lease| {
+        self.leases.retain(|_, lease| {
             if lease.is_expired() && lease.state == LeaseState::Acquired {
                 lease.state = LeaseState::Expired;
                 log::warn!("VolumeClient: Lease expired for volume");
@@ -521,19 +518,18 @@ impl VolumeClient {
 
     /// 获取 Volume 信息
     pub fn get_volume(&self, volume_id: u64) -> Option<VolumeInfo> {
-        let router = self.volume_router.read().unwrap();
-        let result = router.get(&volume_id).cloned();
+        let result = self.volume_router.get(&volume_id).map(|v| v.clone());
         if result.is_some() {
             log::debug!(
                 "get_volume: found volume_id={}, total_routes={}",
                 volume_id,
-                router.len()
+                self.volume_router.len()
             );
         } else {
             log::debug!(
                 "get_volume: volume_id={} not found in cache, total_routes={}",
                 volume_id,
-                router.len()
+                self.volume_router.len()
             );
         }
         result
@@ -541,8 +537,7 @@ impl VolumeClient {
 
     /// 获取指定 inode 的 Lease 状态
     pub fn get_lease_state(&self, volume_id: u64, inode: u64) -> LeaseState {
-        let leases = self.leases.read().unwrap();
-        leases
+        self.leases
             .get(&(volume_id, inode))
             .map(|l| l.state)
             .unwrap_or(LeaseState::None)
@@ -550,8 +545,7 @@ impl VolumeClient {
 
     /// 检查指定 inode 的 Lease 是否有效
     pub fn has_valid_lease(&self, volume_id: u64, inode: u64) -> bool {
-        let leases = self.leases.read().unwrap();
-        leases
+        self.leases
             .get(&(volume_id, inode))
             .map(|l| l.is_valid())
             .unwrap_or(false)
@@ -559,16 +553,14 @@ impl VolumeClient {
 
     /// 检查指定 volume 是否有任意有效 Lease（粗粒度预检查）
     pub fn has_valid_lease_for_volume(&self, volume_id: u64) -> bool {
-        let leases = self.leases.read().unwrap();
-        leases
+        self.leases
             .iter()
-            .any(|(&(vid, _), lease)| vid == volume_id && lease.is_valid())
+            .any(|entry| entry.key().0 == volume_id && entry.value().is_valid())
     }
 
     /// 获取指定 inode 的有效 lease token（如果存在且有效）
     pub fn get_valid_lease_token(&self, volume_id: u64, inode: u64) -> Option<String> {
-        let leases = self.leases.read().unwrap();
-        leases
+        self.leases
             .get(&(volume_id, inode))
             .filter(|l| l.is_valid())
             .map(|l| l.token.clone())
@@ -682,8 +674,7 @@ impl VolumeClient {
     /// Resolve volume_id to its server address from the routing table.
     /// Returns "unknown" if not found (circuit breaker will auto-create for "unknown").
     fn resolve_volume_addr(&self, volume_id: u64) -> String {
-        let router = self.volume_router.read().unwrap();
-        router
+        self.volume_router
             .get(&volume_id)
             .map(|v| v.addr.clone())
             .unwrap_or_else(|| "unknown".to_string())
@@ -739,9 +730,9 @@ impl VolumeClient {
         token: String,
         duration: std::time::Duration,
     ) {
-        let mut leases = self.leases.write().unwrap();
         let key = (volume_id, inode);
-        let lease = leases
+        let mut lease = self
+            .leases
             .entry(key)
             .or_insert_with(|| LeaseInfo::new(token.clone(), duration));
         lease.renew(duration);
@@ -749,9 +740,8 @@ impl VolumeClient {
 
     /// 释放指定 inode 的 Lease
     pub fn release_lease(&self, volume_id: u64, inode: u64) {
-        let mut leases = self.leases.write().unwrap();
         let key = (volume_id, inode);
-        if let Some(lease) = leases.get_mut(&key) {
+        if let Some(mut lease) = self.leases.get_mut(&key) {
             lease.release();
         }
     }
@@ -768,11 +758,11 @@ impl VolumeClient {
         exclusive: bool,
         duration_ms: u64,
     ) -> ClientResult<String> {
-        let volume = {
-            let router = self.volume_router.read().unwrap();
-            router.get(&volume_id).cloned()
-        }
-        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
         let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
 
@@ -833,11 +823,11 @@ impl VolumeClient {
             .get_valid_lease_token(volume_id, inode)
             .ok_or_else(|| ClientError::Internal("No valid lease to release".into()))?;
 
-        let volume = {
-            let router = self.volume_router.read().unwrap();
-            router.get(&volume_id).cloned()
-        }
-        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
         let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
 
@@ -883,8 +873,6 @@ impl VolumeClient {
     pub async fn renew_lease(&self, volume_id: u64, inode: u64, token: &str) -> ClientResult<()> {
         let duration_ms = self
             .leases
-            .read()
-            .unwrap()
             .get(&(volume_id, inode))
             .map(|l| {
                 l.expire_at
@@ -894,11 +882,11 @@ impl VolumeClient {
             })
             .unwrap_or(30000);
 
-        let volume = {
-            let router = self.volume_router.read().unwrap();
-            router.get(&volume_id).cloned()
-        }
-        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
         let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
 
@@ -1005,15 +993,12 @@ impl VolumeClient {
         );
 
         // 步骤 3: 更新路由表
-        {
-            let mut router = self.volume_router.write().unwrap();
-            let old_info = router.insert(volume_id, new_info.clone());
-            log::info!(
-                "VolumeClient: Updated volume {} (was: {:?})",
-                volume_id,
-                old_info.map(|i| i.addr)
-            );
-        }
+        let old_info = self.volume_router.insert(volume_id, new_info.clone());
+        log::info!(
+            "VolumeClient: Updated volume {} (was: {:?})",
+            volume_id,
+            old_info.map(|i| i.addr)
+        );
 
         // 步骤 4: 将未受影响的请求重新入队
         for req in unaffected_data_requests {
@@ -1192,9 +1177,10 @@ impl VolumeClient {
 
                 // 收集即将过期的 Lease
                 let to_renew: Vec<(u64, u64, String)> = {
-                    let lease_map = leases.read().unwrap();
                     let mut to_renew_inner = Vec::new();
-                    for (&(volume_id, inode), lease) in lease_map.iter() {
+                    for entry in leases.iter() {
+                        let (volume_id, inode) = *entry.key();
+                        let lease = entry.value();
                         if lease.state == LeaseState::Acquired && lease.is_valid() {
                             let remaining = lease.expire_at.saturating_duration_since(now);
                             // 如果剩余时间小于 10 秒，则需要续租
@@ -1218,10 +1204,7 @@ impl VolumeClient {
                 // 逐个进行续租
                 for (volume_id, inode, token) in to_renew {
                     // 获取 volume 路由地址
-                    let volume_addr = {
-                        let router = volume_router.read().unwrap();
-                        router.get(&volume_id).map(|v| v.addr.clone())
-                    };
+                    let volume_addr = volume_router.get(&volume_id).map(|v| v.addr.clone());
 
                     let addr = match volume_addr {
                         Some(a) => a,
@@ -1271,8 +1254,7 @@ impl VolumeClient {
                     match result {
                         Ok(resp) if resp.is_ok() => {
                             // 续租成功，更新本地过期时间
-                            let mut lease_map = leases.write().unwrap();
-                            if let Some(lease_info) = lease_map.get_mut(&(volume_id, inode)) {
+                            if let Some(mut lease_info) = leases.get_mut(&(volume_id, inode)) {
                                 lease_info.renew(Duration::from_millis(duration_ms));
                                 log::debug!(
                                     "VolumeClient: Lease renewed successfully for volume={}, inode={}",
@@ -1451,8 +1433,8 @@ async fn process_volume_available_requests(
     breakers: &Arc<CircuitBreakerPool>,
     volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
-    volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
-    leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
+    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> bool {
     // Lease 通道优先
@@ -1521,8 +1503,8 @@ async fn process_data_request_internal(
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _data_channels: &[Arc<TransportChannel>],
-    volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
-    leases: &Arc<RwLock<HashMap<(u64, u64), LeaseInfo>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
+    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
@@ -1535,19 +1517,18 @@ async fn process_data_request_internal(
         request_id, kind, msg_type, body.len(), req.shard_id
     );
 
-    let volume = {
-        let router = volume_router.read().unwrap();
-        router.get(&req.shard_id).cloned()
-    }
-    .ok_or_else(|| {
-        let err = ClientError::VolumeNotFound(req.shard_id);
-        log::error!(
-            "process_data_request_internal: volume not found for shard_id={}",
-            req.shard_id
-        );
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
+    let volume = volume_router
+        .get(&req.shard_id)
+        .map(|v| v.clone())
+        .ok_or_else(|| {
+            let err = ClientError::VolumeNotFound(req.shard_id);
+            log::error!(
+                "process_data_request_internal: volume not found for shard_id={}",
+                req.shard_id
+            );
+            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            err
+        })?;
 
     let volume_addr = volume.addr.clone();
 
@@ -1648,22 +1629,22 @@ async fn process_data_request_internal(
 
             // Verify per-inode lease is valid (token already embedded in TLV body by provider_adapter)
             let has_lease = {
-                let lease_map = leases.read().unwrap();
-                let found = lease_map
+                let found = leases
                     .get(&(req.shard_id, file_key))
                     .map(|l| l.is_valid())
                     .unwrap_or(false);
                 if !found {
                     log::warn!(
                         "process_worker: per-inode lease MISSING shard={} file_key={}, total leases={}",
-                        req.shard_id, file_key, lease_map.len(),
+                        req.shard_id, file_key, leases.len(),
                     );
-                    for (k, v) in lease_map.iter().take(10) {
+                    for entry in leases.iter().take(10) {
+                        let (k0, k1) = *entry.key();
                         log::warn!(
                             "  existing lease key=({},{}) valid={}",
-                            k.0,
-                            k.1,
-                            v.is_valid()
+                            k0,
+                            k1,
+                            entry.value().is_valid()
                         );
                     }
                 }
@@ -1716,21 +1697,20 @@ async fn process_lease_request_internal(
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _lease_channel: &Arc<TransportChannel>,
-    volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let body = req.context.payload.clone();
 
-    let volume = {
-        let router = volume_router.read().unwrap();
-        router.get(&req.shard_id).cloned()
-    }
-    .ok_or_else(|| {
-        let err = ClientError::VolumeNotFound(req.shard_id);
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
+    let volume = volume_router
+        .get(&req.shard_id)
+        .map(|v| v.clone())
+        .ok_or_else(|| {
+            let err = ClientError::VolumeNotFound(req.shard_id);
+            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            err
+        })?;
 
     let volume_addr = volume.addr.clone();
 
@@ -1787,21 +1767,20 @@ async fn process_mgmt_request_internal(
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _mgmt_channel: &Arc<TransportChannel>,
-    volume_router: &Arc<RwLock<HashMap<u64, VolumeInfo>>>,
+    volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let body = req.context.payload.clone();
 
-    let volume = {
-        let router = volume_router.read().unwrap();
-        router.get(&req.shard_id).cloned()
-    }
-    .ok_or_else(|| {
-        let err = ClientError::VolumeNotFound(req.shard_id);
-        resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
-        err
-    })?;
+    let volume = volume_router
+        .get(&req.shard_id)
+        .map(|v| v.clone())
+        .ok_or_else(|| {
+            let err = ClientError::VolumeNotFound(req.shard_id);
+            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            err
+        })?;
 
     let volume_addr = volume.addr.clone();
 
@@ -1867,13 +1846,11 @@ pub struct FsStats {
 impl VolumeClient {
     /// 查询所有 Volume 的 statfs 并聚合成集群级统计
     pub async fn statfs(&self, timeout: Duration) -> ClientResult<FsStats> {
-        let volumes: Vec<(u64, String)> = {
-            let router = self.volume_router.read().unwrap();
-            router
-                .iter()
-                .map(|(vid, info)| (*vid, info.addr.clone()))
-                .collect()
-        };
+        let volumes: Vec<(u64, String)> = self
+            .volume_router
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().addr.clone()))
+            .collect();
 
         if volumes.is_empty() {
             return Ok(FsStats::default());

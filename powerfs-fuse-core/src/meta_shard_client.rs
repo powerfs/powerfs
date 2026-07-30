@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -227,7 +227,7 @@ pub struct MetaShardClient {
     /// 控制传输通道
     control_channel: Arc<TransportChannel>,
     /// 分片路由表 (shard_id -> ShardInfo)
-    shard_router: Arc<RwLock<HashMap<u64, ShardInfo>>>,
+    shard_router: Arc<DashMap<u64, ShardInfo>>,
     /// Per-server circuit breaker pool (one breaker per Filer server address)
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器引用
@@ -259,7 +259,7 @@ impl MetaShardClient {
             control_channel: Arc::new(TransportChannel::new(config.control_channel.clone())),
             data_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
             control_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
-            shard_router: Arc::new(RwLock::new(HashMap::new())),
+            shard_router: Arc::new(DashMap::new()),
             state: Arc::new(Mutex::new(MetaShardClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             config,
@@ -501,12 +501,8 @@ impl MetaShardClient {
 
         // 如果分片路由表为空（新集群或拓扑未就绪），设置默认路由
         // 这确保所有分片请求都能被路由到 filer 进行处理
-        {
-            let router = self.shard_router.read().unwrap();
-            if router.is_empty() {
-                drop(router);
-                self.setup_default_routes();
-            }
+        if self.shard_router.is_empty() {
+            self.setup_default_routes();
         }
 
         *self.state.lock().unwrap() = MetaShardClientState::Ready;
@@ -529,9 +525,9 @@ impl MetaShardClient {
         );
 
         // 预填 256 个分片的默认路由（覆盖常用分片范围）
-        let mut router = self.shard_router.write().unwrap();
         for shard_id in 0..256 {
-            router.insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
+            self.shard_router
+                .insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
         }
         // Store default address for fallback when shard_id > 255 (e.g. inode numbers)
         self.default_filer_addr
@@ -540,7 +536,7 @@ impl MetaShardClient {
             .clone_from(&default_addr);
         log::info!(
             "MetaShardClient: default routes configured for {} shards, fallback={}",
-            router.len(),
+            self.shard_router.len(),
             default_addr
         );
     }
@@ -548,14 +544,16 @@ impl MetaShardClient {
     /// 同步分片路由表
     fn sync_shard_router(&self) {
         let topology = self.topology_manager.get_topology();
-        let mut router = self.shard_router.write().unwrap();
-        *router = topology.shards.clone();
+        self.shard_router.clear();
+        for (k, v) in topology.shards {
+            self.shard_router.insert(k, v);
+        }
     }
 
     /// 直接设置分片 Leader（用于测试或动态路由更新）
     pub fn set_shard_leader(&self, shard_id: u64, leader_addr: String) {
-        let mut router = self.shard_router.write().unwrap();
-        router.insert(shard_id, ShardInfo::new(shard_id, leader_addr));
+        self.shard_router
+            .insert(shard_id, ShardInfo::new(shard_id, leader_addr));
     }
 
     /// 获取当前状态
@@ -567,11 +565,13 @@ impl MetaShardClient {
     /// 当 shard_id 不在路由表中时（例如 inode 作为 shard_id 超出预配置范围），
     /// 回退到 default_filer_addr 确保请求可达。
     pub fn get_shard_leader(&self, shard_id: u64) -> Option<String> {
-        let router = self.shard_router.read().unwrap();
-        if let Some(addr) = router.get(&shard_id).map(|s| s.leader_addr.clone()) {
+        if let Some(addr) = self
+            .shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+        {
             return Some(addr);
         }
-        drop(router);
         let default_addr = self.default_filer_addr.lock().unwrap();
         if !default_addr.is_empty() {
             Some(default_addr.clone())
@@ -644,8 +644,7 @@ impl MetaShardClient {
 
     /// Resolve shard_id to its Filer server address.
     fn resolve_filer_addr(&self, shard_id: u64) -> String {
-        let router = self.shard_router.read().unwrap();
-        router
+        self.shard_router
             .get(&shard_id)
             .map(|s| s.leader_addr.clone())
             .unwrap_or_else(|| {
@@ -729,26 +728,24 @@ impl MetaShardClient {
         );
 
         // 步骤 3: 更新路由表
-        {
-            let mut router = self.shard_router.write().unwrap();
-            if let Some(shard) = router.get_mut(&shard_id) {
-                let old_leader = shard.leader_addr.clone();
-                shard.leader_addr = new_leader.clone();
-                log::info!(
-                    "MetaShardClient: Updated shard {} leader: {} -> {}",
-                    shard_id,
-                    old_leader,
-                    new_leader
-                );
-            } else {
-                // 如果分片不存在，添加它
-                router.insert(shard_id, ShardInfo::new(shard_id, new_leader.clone()));
-                log::info!(
-                    "MetaShardClient: Added new shard {} with leader {}",
-                    shard_id,
-                    new_leader
-                );
-            }
+        if let Some(mut shard) = self.shard_router.get_mut(&shard_id) {
+            let old_leader = shard.leader_addr.clone();
+            shard.leader_addr = new_leader.clone();
+            log::info!(
+                "MetaShardClient: Updated shard {} leader: {} -> {}",
+                shard_id,
+                old_leader,
+                new_leader
+            );
+        } else {
+            // 如果分片不存在，添加它
+            self.shard_router
+                .insert(shard_id, ShardInfo::new(shard_id, new_leader.clone()));
+            log::info!(
+                "MetaShardClient: Added new shard {} with leader {}",
+                shard_id,
+                new_leader
+            );
         }
 
         // 步骤 4: 将未受影响的请求重新入队
@@ -790,13 +787,11 @@ impl MetaShardClient {
         let shard_id = req.shard_id;
 
         // 获取分片 Leader 地址，或使用默认地址
-        let leader_addr = {
-            let router = self.shard_router.read().unwrap();
-            router
-                .get(&shard_id)
-                .map(|s| s.leader_addr.clone())
-                .unwrap_or_else(|| self.default_filer_addr())
-        };
+        let leader_addr = self
+            .shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+            .unwrap_or_else(|| self.default_filer_addr());
 
         // Per-server circuit breaker check
         if !self.breakers.check(&leader_addr) {
@@ -911,7 +906,7 @@ async fn process_available_requests(
     breakers: &Arc<CircuitBreakerPool>,
     filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
-    shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
+    shard_router: &Arc<DashMap<u64, ShardInfo>>,
     topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
@@ -998,7 +993,7 @@ async fn process_request_internal(
     breakers: &Arc<CircuitBreakerPool>,
     _data_channel: &Arc<TransportChannel>,
     _control_channel: &Arc<TransportChannel>,
-    shard_router: &Arc<RwLock<HashMap<u64, ShardInfo>>>,
+    shard_router: &Arc<DashMap<u64, ShardInfo>>,
     _topology_manager: &Arc<ClusterTopologyManager>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
@@ -1028,13 +1023,10 @@ async fn process_request_internal(
         attempt += 1;
 
         // 1) 获取当前分片的 leader 地址，或使用默认地址
-        let leader_addr = {
-            let router = shard_router.read().unwrap();
-            router
-                .get(&shard_id)
-                .map(|s| s.leader_addr.clone())
-                .unwrap_or_else(|| fallback_addr.clone())
-        };
+        let leader_addr = shard_router
+            .get(&shard_id)
+            .map(|s| s.leader_addr.clone())
+            .unwrap_or_else(|| fallback_addr.clone());
 
         if leader_addr.is_empty() {
             return Err(ClientError::NoShardLeader(shard_id));
@@ -1090,10 +1082,7 @@ async fn process_request_internal(
                         );
 
                         // 更新分片路由表
-                        {
-                            let mut router = shard_router.write().unwrap();
-                            router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
-                        }
+                        shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
 
                         // 重试请求
                         continue;
