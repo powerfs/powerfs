@@ -90,13 +90,29 @@ pub enum ShardCommand {
         volume_id: u64,
         etag: String,
     },
-    /// Set inode attributes (size, mode, uid, gid)
+    /// Set inode attributes (size, mode, uid, gid) - legacy unified command
     SetAttr {
         inode: u64,
         size: Option<u64>,
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+    },
+    /// Set data-related inode attributes (size, chunks) - strong consistency via Lease
+    SetAttrData {
+        inode: u64,
+        size: Option<u64>,
+    },
+    /// Set metadata-related inode attributes (mode, uid, gid, timestamps) - eventual consistency via CRDT
+    SetAttrMeta {
+        inode: u64,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
+        client_id: String,
+        timestamp: u64,
     },
     /// Create a symbolic link
     CreateSymlink {

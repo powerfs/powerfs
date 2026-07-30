@@ -30,7 +30,7 @@ pub mod server_connection;
 
 pub use admin_server::{AdminServer, AdminServerConfig};
 
-pub use client::{ClientConfig, PowerFsNetClient};
+pub use client::{ClientConfig, NotificationHandler, PowerFsNetClient};
 pub use connection::ConnectionManager;
 pub use errors::{NetError, NetResult};
 pub use handler_adapter::{LegacyHandler, ManagedNetHandler};

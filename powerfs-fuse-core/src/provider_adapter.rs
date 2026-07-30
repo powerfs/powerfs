@@ -74,7 +74,8 @@ fn build_create_tlv_with_chunks(
     enc.into_bytes()
 }
 
-/// Encode a SetAttr request body in TLV format
+/// Encode a SetAttr request body in TLV format (legacy unified path, kept for backward compatibility)
+#[allow(dead_code)]
 fn build_setattr_tlv(
     ino: u64,
     size: u64,
@@ -94,6 +95,48 @@ fn build_setattr_tlv(
     if let Some(g) = gid {
         let _ = enc.add_u64(FieldId::Gid, g);
     }
+    enc.into_bytes()
+}
+
+/// Encode a SetAttrData request body in TLV format (strong consistency path for size/chunks)
+fn build_setattr_data_tlv(ino: u64, size: u64) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    let _ = enc.add_u64(FieldId::Ino, ino);
+    let _ = enc.add_u64(FieldId::Size, size);
+    enc.into_bytes()
+}
+
+/// Encode a SetAttrMeta request body in TLV format (eventual consistency path for mode/uid/gid/timestamps)
+#[allow(clippy::too_many_arguments)]
+fn build_setattr_meta_tlv(
+    ino: u64,
+    mode: Option<u64>,
+    uid: Option<u64>,
+    gid: Option<u64>,
+    mtime: Option<u64>,
+    atime: Option<u64>,
+    client_id: &str,
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    let _ = enc.add_u64(FieldId::Ino, ino);
+    if let Some(m) = mode {
+        let _ = enc.add_u64(FieldId::Mode, m);
+    }
+    if let Some(u) = uid {
+        let _ = enc.add_u64(FieldId::Uid, u);
+    }
+    if let Some(g) = gid {
+        let _ = enc.add_u64(FieldId::Gid, g);
+    }
+    if let Some(mt) = mtime {
+        let _ = enc.add_u64(FieldId::Mtime, mt);
+    }
+    if let Some(at) = atime {
+        let _ = enc.add_u64(FieldId::Atime, at);
+    }
+    let _ = enc.add_string(FieldId::ClientId, client_id);
+    let _ = enc.add_u64(FieldId::Seq, timestamp);
     enc.into_bytes()
 }
 
@@ -144,7 +187,7 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         chunks.push(powerfs_common::traits::FileChunk {
             offset: file_key.unwrap_or(0),
             size: chunk_size.unwrap_or(0),
-            mtime: mtime,
+            mtime,
             fid: fid_str,
             cookie: c as u32,
             crc32: 0,
@@ -646,37 +689,70 @@ impl MetadataProvider for FacadeMetadataProvider {
     async fn update_entry(
         &self,
         entry: &Entry,
-        _client_id: &str,
-        _old_size: u64,
-        _is_truncate: bool,
+        client_id: &str,
+        old_size: u64,
+        is_truncate: bool,
     ) -> Result<u64> {
         let ino = entry.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
         let new_size = entry.content_size;
         let mode = entry.attributes.as_ref().map(|a| a.mode as u64);
         let uid = entry.attributes.as_ref().map(|a| a.uid as u64);
         let gid = entry.attributes.as_ref().map(|a| a.gid as u64);
+        let mtime = entry.attributes.as_ref().map(|a| a.mtime.timestamp() as u64);
+        let atime = entry.attributes.as_ref().map(|a| a.atime.timestamp() as u64);
 
-        let payload = build_setattr_tlv(ino, new_size, mode, uid, gid);
+        // Determine what changed
+        let size_changed = new_size != old_size;
+        let has_meta = mode.is_some() || uid.is_some() || gid.is_some();
 
-        let result = self
-            .facade
-            .submit_metadata_request_with_type(
-                crate::request_state::RequestKind::Metadata,
-                ino,
-                payload,
-                powerfs_net::MsgType::SetAttr,
-            )
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("Facade update_entry failed: {}", e)))?;
+        // Split into two paths:
+        // 1. SetAttrData (strong consistency via Lease/Raft) - for size changes
+        // 2. SetAttrMeta (eventual consistency via CRDT) - for mode/uid/gid changes
+        if size_changed || is_truncate {
+            let data_payload = build_setattr_data_tlv(ino, new_size);
+            let result = self
+                .facade
+                .submit_metadata_request_with_type(
+                    crate::request_state::RequestKind::Metadata,
+                    ino,
+                    data_payload,
+                    powerfs_net::MsgType::SetAttrData,
+                )
+                .await
+                .map_err(|e| PowerFsError::Internal(format!("Facade SetAttrData failed: {}", e)))?;
 
-        // If we got a response (payload or data), the operation succeeded
-        if result.payload.is_some() || result.data.is_some() {
-            Ok(new_size)
-        } else {
-            Err(PowerFsError::Internal(
-                "SetAttr returned empty response".to_string(),
-            ))
+            if result.payload.is_none() && result.data.is_none() {
+                return Err(PowerFsError::Internal(
+                    "SetAttrData returned empty response".to_string(),
+                ));
+            }
         }
+
+        if has_meta {
+            let timestamp = Utc::now().timestamp() as u64;
+            let meta_payload = build_setattr_meta_tlv(
+                ino,
+                mode,
+                uid,
+                gid,
+                mtime,
+                atime,
+                client_id,
+                timestamp,
+            );
+            let _result = self
+                .facade
+                .submit_metadata_request_with_type(
+                    crate::request_state::RequestKind::Metadata,
+                    ino,
+                    meta_payload,
+                    powerfs_net::MsgType::SetAttrMeta,
+                )
+                .await
+                .map_err(|e| PowerFsError::Internal(format!("Facade SetAttrMeta failed: {}", e)))?;
+        }
+
+        Ok(new_size)
     }
 
     async fn delete_entry(&self, inode: u64, is_dir: bool, _client_id: &str) -> Result<()> {
@@ -956,7 +1032,17 @@ impl StorageProvider for FacadeStorageProvider {
             .await
             .map_err(|e| PowerFsError::Internal(format!("Facade read_blob failed: {}", e)))?;
 
-        let data = result.payload.unwrap_or_default();
+        // The net client concatenates body+data into resp.body (see client.rs recv_response_locked).
+        // success_with_payload maps resp.body -> result.data and resp.data -> result.payload.
+        // Since the volume server puts file content in the `data` field of NetMessage but the
+        // client reads everything into `body`, the actual content is in result.data.
+        // Merge both to be robust against future protocol changes.
+        let mut data = result.data.unwrap_or_default();
+        if let Some(payload) = result.payload {
+            if !payload.is_empty() {
+                data.extend_from_slice(&payload);
+            }
+        }
         Ok(data)
     }
 
@@ -965,11 +1051,7 @@ impl StorageProvider for FacadeStorageProvider {
 
         let _result = self
             .facade
-            .submit_mgmt_request_with_type(
-                volume_id,
-                payload,
-                powerfs_net::MsgType::DeleteNeedle,
-            )
+            .submit_mgmt_request_with_type(volume_id, payload, powerfs_net::MsgType::DeleteNeedle)
             .await
             .map_err(|e| PowerFsError::Internal(format!("Facade delete_blob failed: {}", e)))?;
 

@@ -86,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ip = args.ip.unwrap_or_else(|| {
         master_cfg.ip.unwrap_or_else(|| {
-            eprintln!("ERROR: master.ip must be set in config or via --ip (no default value allowed)");
+            eprintln!(
+                "ERROR: master.ip must be set in config or via --ip (no default value allowed)"
+            );
             std::process::exit(1);
         })
     });

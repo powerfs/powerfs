@@ -96,15 +96,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let volume_size = args
         .volume_size
-        .unwrap_or_else(|| volume_cfg.max_volume_size);
+        .unwrap_or(volume_cfg.max_volume_size);
 
     let initial_volume_count = args
         .initial_volume_count
-        .unwrap_or_else(|| volume_cfg.initial_volume_count);
+        .unwrap_or(volume_cfg.initial_volume_count);
 
-    // Volume server 默认绑定所有接口
-    let ip = "0.0.0.0".to_string();
-    let grpc_address = format!("{}:{}", ip, grpc_port);
+    // Volume server binds to all interfaces, but advertises a specific address for clients
+    let bind_ip = "0.0.0.0".to_string();
+    let grpc_address = format!("{}:{}", bind_ip, grpc_port);
+
+    // Use advertise_addr from config for heartbeat registration
+    // This is the IP that FUSE clients will use to connect to this Volume Server
+    let ip = volume_cfg
+        .advertise_addr
+        .filter(|a| !a.is_empty() && a != "0.0.0.0")
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: volume.advertise_addr must be set to a reachable IP (not 0.0.0.0)");
+            std::process::exit(1);
+        });
 
     info!("Starting PowerFS Volume Server");
     info!("  GRPC Address: {}", grpc_address);

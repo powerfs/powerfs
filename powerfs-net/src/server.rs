@@ -303,9 +303,22 @@ impl PowerFsNetServer {
         let (client_id, _client_type) =
             Self::handle_handshake(stream.clone(), handler.clone(), manager.clone(), peer).await?;
 
+        // Register notification channel for this client
+        let notification_rx = if let Some(ref mgr) = manager {
+            Some(mgr.register_notification_channel(client_id).await)
+        } else {
+            None
+        };
+
         // Phase 2: Message loop - blocks until client disconnects or error
-        let result =
-            Self::message_loop(stream.clone(), handler.clone(), manager.clone(), client_id).await;
+        let result = Self::message_loop(
+            stream.clone(),
+            handler.clone(),
+            manager.clone(),
+            client_id,
+            notification_rx,
+        )
+        .await;
 
         // Phase 3: Auto session unregistration + notify handler
         if let Some(ref mgr) = manager {
@@ -365,26 +378,72 @@ impl PowerFsNetServer {
     }
 
     /// Main message loop for a connection
+    ///
+    /// Uses tokio::select! to simultaneously handle:
+    /// - Incoming client requests
+    /// - Outgoing notifications from ServerConnectionManager
     async fn message_loop(
         stream: Arc<Mutex<TcpStream>>,
         handler: Arc<dyn PowerFsNetHandler>,
         _manager: Option<Arc<ServerConnectionManager>>,
         client_id: u64,
+        mut notification_rx: Option<tokio::sync::mpsc::Receiver<NetMessage>>,
     ) -> NetResult<()> {
+        use tokio::io::AsyncReadExt;
+
+        // If we have a notification channel, spawn a task to handle notifications
+        // Otherwise, just handle requests
         loop {
-            // Read header
-            let header = {
+            // Try to read a header with a small timeout to allow checking notifications
+            let read_result = {
                 let mut s = stream.lock().await;
                 let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
 
-                let read_result = s.read_exact(&mut hdr_buf).await;
-                if read_result.is_err() {
-                    info!("Client disconnected");
-                    return Ok(());
+                // Use a timeout to periodically check for notifications
+                let read_future = s.read_exact(&mut hdr_buf);
+                match tokio::time::timeout(std::time::Duration::from_millis(100), read_future)
+                    .await
+                {
+                    Ok(result) => result.map(|_| hdr_buf),
+                    Err(_) => {
+                        // Timeout - check for notifications
+                        if let Some(ref mut rx) = notification_rx {
+                            while let Ok(msg) = rx.try_recv() {
+                                // Send notification to client
+                                debug!(
+                                    "Sending notification to client {}: type={:?}",
+                                    client_id,
+                                    msg.msg_type()
+                                );
+                                let mut frame = Vec::with_capacity(
+                                    FrameHeader::SIZE + msg.body.len() + msg.data.len(),
+                                );
+                                let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+                                msg.header.encode(&mut hdr_buf);
+                                frame.extend_from_slice(&hdr_buf);
+                                frame.extend_from_slice(&msg.body);
+                                frame.extend_from_slice(&msg.data);
+                                s.write_all(&frame).await?;
+                            }
+                        }
+                        continue;
+                    }
                 }
+            };
 
-                FrameHeader::decode(&hdr_buf)
-                    .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?
+            // Handle read result
+            let header = match read_result {
+                Ok(hdr_buf) => {
+                    FrameHeader::decode(&hdr_buf)
+                        .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        info!("Client disconnected");
+                        return Ok(());
+                    }
+                    return Err(NetError::Io(e));
+                }
             };
 
             // Read data

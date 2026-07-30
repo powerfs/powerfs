@@ -516,79 +516,122 @@ impl MasterClient {
             .ok_or(MasterClientError::NotConnected)?;
 
         let body = vec![];
-        let net_client = self.net_client();
-        match net_client
-            .send_request(net::MsgType::GetTopology, &body, &[])
-            .await
-        {
-            Ok(response) if response.is_ok() => {
-                self.topology_manager.record_success();
 
-                // Parse the topology response
-                let resp_body = if !response.body.is_empty() {
-                    &response.body
-                } else {
-                    &response.data
-                };
+        // Try up to 2 times: first attempt may return redirect if connected to follower
+        for attempt in 1..=2 {
+            let net_client = self.net_client();
+            let response = net_client
+                .send_request(net::MsgType::GetTopology, &body, &[])
+                .await;
 
-                let mut topology = ClusterTopology::new();
+            match response {
+                Ok(resp) if resp.header.status == net::STATUS_ERR_REDIRECT => {
+                    // Follower redirected us to the actual leader
+                    let resp_body = if !resp.body.is_empty() {
+                        &resp.body
+                    } else {
+                        &resp.data
+                    };
+                    let leader_addr = {
+                        let mut dec = net::TlvDecoder::new(resp_body);
+                        dec.next_string(net::FieldId::Owner).unwrap_or_default()
+                    };
 
-                // Parse volume routes from TLV
-                let mut dec = net::TlvDecoder::new(resp_body);
-
-                // Skip leader address (Owner field)
-                let leader_addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
-                log::info!("fetch_topology: leader={}", leader_addr);
-
-                // Get volume count
-                let volume_count = dec.next_u64(net::FieldId::Entries).unwrap_or(0);
-                log::info!("fetch_topology: volume_count={}", volume_count);
-
-                // Parse each volume route (volume_id, addr, size)
-                let mut parsed = 0u64;
-                while parsed < volume_count {
-                    let volume_id = dec.next_u64(net::FieldId::VolumeId).unwrap_or(0);
-                    let addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
-                    let size = dec.next_u64(net::FieldId::Size).unwrap_or(0);
-
-                    if volume_id > 0 && !addr.is_empty() {
-                        let vol_info =
-                            VolumeInfo::new(volume_id, format!("vol-{}", volume_id), addr.clone());
-                        topology.volumes.insert(volume_id, vol_info);
-                        log::info!(
-                            "fetch_topology: volume_id={}, addr={}, size={}",
-                            volume_id,
-                            addr,
-                            size
-                        );
+                    if leader_addr.is_empty() {
+                        self.topology_manager.record_failure();
+                        return Err(MasterClientError::ConnectionFailed(
+                            "Redirect response has empty leader address".to_string(),
+                        ));
                     }
 
-                    parsed += 1;
+                    log::info!(
+                        "fetch_topology: redirected to leader at {} (attempt {})",
+                        leader_addr,
+                        attempt
+                    );
+
+                    // Reconnect to the actual leader and retry
+                    self.reconnect(&leader_addr).await?;
+                    continue;
                 }
+                Ok(response) if response.is_ok() => {
+                    self.topology_manager.record_success();
 
-                topology.version = response.header.seq as u64;
-                log::info!(
-                    "fetch_topology: parsed {} volumes from master",
-                    topology.volumes.len()
-                );
+                    // Parse the topology response
+                    let resp_body = if !response.body.is_empty() {
+                        &response.body
+                    } else {
+                        &response.data
+                    };
 
-                Ok(topology)
-            }
-            Ok(response) => {
-                self.topology_manager.record_failure();
-                Err(MasterClientError::ConnectionFailed(format!(
-                    "Server error: {}",
-                    response.header.status
-                )))
-            }
-            Err(e) => {
-                self.topology_manager.record_failure();
-                Err(MasterClientError::ConnectionFailed(format!(
-                    "Network error: {}",
-                    e
-                )))
+                    let mut topology = ClusterTopology::new();
+
+                    // Parse volume routes from TLV
+                    let mut dec = net::TlvDecoder::new(resp_body);
+
+                    // Skip leader address (Owner field)
+                    let leader_addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
+                    log::info!("fetch_topology: leader={}", leader_addr);
+
+                    // Get volume count
+                    let volume_count = dec.next_u64(net::FieldId::Entries).unwrap_or(0);
+                    log::info!("fetch_topology: volume_count={}", volume_count);
+
+                    // Parse each volume route (volume_id, addr, size)
+                    let mut parsed = 0u64;
+                    while parsed < volume_count {
+                        let volume_id = dec.next_u64(net::FieldId::VolumeId).unwrap_or(0);
+                        let addr = dec.next_string(net::FieldId::Owner).unwrap_or_default();
+                        let size = dec.next_u64(net::FieldId::Size).unwrap_or(0);
+
+                        if volume_id > 0 && !addr.is_empty() {
+                            let vol_info = VolumeInfo::new(
+                                volume_id,
+                                format!("vol-{}", volume_id),
+                                addr.clone(),
+                            );
+                            topology.volumes.insert(volume_id, vol_info);
+                            log::info!(
+                                "fetch_topology: volume_id={}, addr={}, size={}",
+                                volume_id,
+                                addr,
+                                size
+                            );
+                        }
+
+                        parsed += 1;
+                    }
+
+                    topology.version = response.header.seq as u64;
+                    log::info!(
+                        "fetch_topology: parsed {} volumes from master",
+                        topology.volumes.len()
+                    );
+
+                    return Ok(topology);
+                }
+                Ok(response) => {
+                    self.topology_manager.record_failure();
+                    return Err(MasterClientError::ConnectionFailed(format!(
+                        "Server error: {}",
+                        response.header.status
+                    )));
+                }
+                Err(e) => {
+                    self.topology_manager.record_failure();
+                    return Err(MasterClientError::ConnectionFailed(format!(
+                        "Network error: {}",
+                        e
+                    )));
+                }
             }
         }
+
+        // Exhausted retries
+        self.topology_manager.record_failure();
+        Err(MasterClientError::ConnectionFailed(
+            "Failed to fetch topology after redirect retries".to_string(),
+        ))
     }
 
     /// 更新本地拓扑

@@ -221,6 +221,7 @@ message Entry {
     string symlink_target = 11;
     string owner = 12;
     uint64 generation = 13;
+    uint64 version = 14;
 }
 
 // Lease management types

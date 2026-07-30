@@ -21,6 +21,8 @@ type VolumeResponseWaiters =
 /// Volume 客户端配置
 #[derive(Debug, Clone)]
 pub struct VolumeClientConfig {
+    /// 客户端 ID (用于 Lease 持有者识别等)
+    pub client_id: String,
     /// 数据通道配置 (用于读写请求)
     pub data_channel: ChannelConfig,
     /// Lease 通道配置
@@ -31,11 +33,14 @@ pub struct VolumeClientConfig {
     pub queue_max_size: usize,
     /// 熔断器配置
     pub circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig,
+    /// Lease 续租心跳间隔
+    pub lease_renew_interval: Duration,
 }
 
 impl Default for VolumeClientConfig {
     fn default() -> Self {
         Self {
+            client_id: "powerfs-fuse-client".to_string(),
             data_channel: ChannelConfig {
                 channel_id: 1,
                 name: "data".to_string(),
@@ -56,6 +61,7 @@ impl Default for VolumeClientConfig {
             },
             queue_max_size: 2000,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
+            lease_renew_interval: Duration::from_secs(3),
         }
     }
 }
@@ -200,6 +206,10 @@ pub struct VolumeClient {
     response_waiters: Arc<Mutex<VolumeResponseWaiters>>,
     /// 后台处理器运行状态
     background_running: Arc<Mutex<bool>>,
+    /// Lease 续租器运行状态
+    lease_renewer_running: Arc<Mutex<bool>>,
+    /// Lease 续租间隔
+    lease_renew_interval: Duration,
     /// 事件通知器
     notify: Arc<tokio::sync::Notify>,
 }
@@ -215,6 +225,8 @@ impl VolumeClient {
             })),
         ];
 
+        let lease_renew_interval = config.lease_renew_interval;
+
         Self {
             breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker_config.clone())),
             data_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
@@ -228,6 +240,8 @@ impl VolumeClient {
             state: Arc::new(Mutex::new(VolumeClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             background_running: Arc::new(Mutex::new(false)),
+            lease_renewer_running: Arc::new(Mutex::new(false)),
+            lease_renew_interval,
             notify: Arc::new(tokio::sync::Notify::new()),
             config,
             topology_manager,
@@ -349,18 +363,52 @@ impl VolumeClient {
     pub fn init(&self) {
         self.sync_volume_router();
 
-        // 如果路由表为空，设置默认路由确保数据请求能被路由
+        // 如果路由表为空，等待 Volume Server 心跳注册后重试
         {
             let router = self.volume_router.read().unwrap();
             if router.is_empty() {
                 drop(router);
-                self.setup_default_volume_routes();
+                log::warn!(
+                    "VolumeClient: volume router empty, waiting for Volume Server heartbeats..."
+                );
+
+                // 重试 3 次，每次间隔 2 秒
+                for attempt in 1..=3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    self.sync_volume_router();
+                    let router = self.volume_router.read().unwrap();
+                    if !router.is_empty() {
+                        log::info!(
+                            "VolumeClient: volume router populated after {} retries",
+                            attempt
+                        );
+                        break;
+                    }
+                    if attempt < 3 {
+                        log::warn!(
+                            "VolumeClient: retry {}/3 - volume router still empty",
+                            attempt
+                        );
+                    }
+                }
+
+                // 如果仍然为空，使用默认路由作为 fallback
+                let router = self.volume_router.read().unwrap();
+                if router.is_empty() {
+                    drop(router);
+                    log::warn!("VolumeClient: using default volume routes as fallback");
+                    self.setup_default_volume_routes();
+                }
             }
         }
 
         self.cleanup_expired_leases();
         *self.state.lock().unwrap() = VolumeClientState::Ready;
         log::info!("VolumeClient: Initialized");
+
+        // 启动 Lease 续租心跳后台任务
+        self.start_lease_renewer();
+        log::info!("VolumeClient: Lease renewer started");
     }
 
     /// 设置默认 Volume 路由 - 将已知 volume 地址预填到路由表
@@ -692,6 +740,203 @@ impl VolumeClient {
         }
     }
 
+    /// 异步获取 Lease: 直接构建 TLV 请求发送到 Volume Server
+    pub async fn acquire_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        client_id: &str,
+        exclusive: bool,
+        duration_ms: u64,
+    ) -> ClientResult<String> {
+        let volume = {
+            let router = self.volume_router.read().unwrap();
+            router.get(&volume_id).cloned()
+        }
+        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        let mut enc = powerfs_net::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_u64(FieldId::Offset, stripe_start);
+        enc.add_u64(FieldId::Limit, stripe_count);
+        enc.add_string(FieldId::ClientId, client_id)?;
+        enc.add_u64(FieldId::Mode, if exclusive { 1 } else { 0 });
+        enc.add_u64(FieldId::LeaseDuration, duration_ms);
+
+        let result = vol_client
+            .send_request(powerfs_net::MsgType::AcquireLease, &enc.into_bytes(), &[])
+            .await;
+
+        match result {
+            Ok(resp) if resp.is_ok() => {
+                let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp.body);
+                let token = dec.next_string(FieldId::LeaseId).unwrap_or_default();
+                if token.is_empty() {
+                    return Err(ClientError::Internal(
+                        "AcquireLease response has empty token".into(),
+                    ));
+                }
+                // Update local lease cache
+                self.update_lease(
+                    volume_id,
+                    inode,
+                    token.clone(),
+                    Duration::from_millis(duration_ms),
+                );
+                log::info!(
+                    "acquire_lease: volume={}, inode={}, stripe_start={}, count={}, token={}",
+                    volume_id,
+                    inode,
+                    stripe_start,
+                    stripe_count,
+                    token
+                );
+                Ok(token)
+            }
+            Ok(resp) => Err(ClientError::Server(format!(
+                "AcquireLease failed: status={}",
+                resp.header.status
+            ))),
+            Err(e) => Err(ClientError::from_net_error(e)),
+        }
+    }
+
+    /// 异步释放 Lease: 直接构建 TLV 请求发送到 Volume Server
+    pub async fn release_lease_remote(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        client_id: &str,
+    ) -> ClientResult<()> {
+        let token = self
+            .get_valid_lease_token(volume_id, inode)
+            .ok_or_else(|| ClientError::Internal("No valid lease to release".into()))?;
+
+        let volume = {
+            let router = self.volume_router.read().unwrap();
+            router.get(&volume_id).cloned()
+        }
+        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        let mut enc = powerfs_net::serialize::TlvEncoder::new();
+        enc.add_string(FieldId::LeaseToken, &token)?;
+        enc.add_string(FieldId::ClientId, client_id)?;
+
+        let result = vol_client
+            .send_request(powerfs_net::MsgType::ReleaseLease, &enc.into_bytes(), &[])
+            .await;
+
+        match result {
+            Ok(resp) if resp.is_ok() => {
+                self.release_lease(volume_id, inode);
+                log::info!(
+                    "release_lease_remote: volume={}, inode={}, token={}",
+                    volume_id,
+                    inode,
+                    token
+                );
+                Ok(())
+            }
+            Ok(resp) => {
+                self.release_lease(volume_id, inode);
+                log::warn!(
+                    "release_lease_remote: server returned error but clearing local lease. status={}",
+                    resp.header.status
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.release_lease(volume_id, inode);
+                log::warn!(
+                    "release_lease_remote: network error but clearing local lease. error={}",
+                    e
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// 异步续租 Lease: 直接构建 TLV 请求发送到 Volume Server
+    pub async fn renew_lease(&self, volume_id: u64, inode: u64, token: &str) -> ClientResult<()> {
+        let duration_ms = self
+            .leases
+            .read()
+            .unwrap()
+            .get(&(volume_id, inode))
+            .map(|l| {
+                l.expire_at
+                    .saturating_duration_since(l.acquired_at)
+                    .as_secs()
+                    .saturating_mul(1000)
+            })
+            .unwrap_or(30000);
+
+        let volume = {
+            let router = self.volume_router.read().unwrap();
+            router.get(&volume_id).cloned()
+        }
+        .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        let client_id = self.config.client_id.clone();
+
+        let mut enc = powerfs_net::serialize::TlvEncoder::new();
+        enc.add_string(FieldId::LeaseToken, token)?;
+        enc.add_string(FieldId::ClientId, &client_id)?;
+        enc.add_u64(FieldId::LeaseDuration, duration_ms);
+
+        let result = vol_client
+            .send_request(powerfs_net::MsgType::RenewLease, &enc.into_bytes(), &[])
+            .await;
+
+        match result {
+            Ok(resp) if resp.is_ok() => {
+                let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp.body);
+                let new_duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(duration_ms);
+                let new_duration = Duration::from_millis(new_duration_ms);
+
+                // 更新本地缓存
+                self.update_lease(volume_id, inode, token.to_string(), new_duration);
+
+                log::debug!(
+                    "renew_lease: volume={}, inode={}, new_duration_ms={}",
+                    volume_id,
+                    inode,
+                    new_duration_ms
+                );
+                Ok(())
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "renew_lease: server error for volume={}, inode={}, status={}",
+                    volume_id,
+                    inode,
+                    resp.header.status
+                );
+                Err(ClientError::Server(format!(
+                    "RenewLease failed: status={}",
+                    resp.header.status
+                )))
+            }
+            Err(e) => {
+                log::warn!(
+                    "renew_lease: network error for volume={}, inode={}, error={}",
+                    volume_id,
+                    inode,
+                    e
+                );
+                Err(ClientError::from_net_error(e))
+            }
+        }
+    }
+
     /// 处理 Volume 状态变更 - 完整的请求重放逻辑
     pub fn handle_volume_change(&self, volume_id: u64, new_info: VolumeInfo) {
         log::warn!("VolumeClient: Volume {} changed", volume_id);
@@ -804,6 +1049,7 @@ impl VolumeClient {
     /// 关闭
     pub fn close(&self) {
         self.stop_background_processor();
+        self.stop_lease_renewer();
         *self.state.lock().unwrap() = VolumeClientState::Closed;
         log::info!("VolumeClient: Closed");
     }
@@ -902,6 +1148,159 @@ impl VolumeClient {
         *running = false;
         self.notify.notify_one();
         log::info!("VolumeClient: Stopping background processor...");
+    }
+
+    /// 启动 Lease 续租心跳后台任务
+    pub fn start_lease_renewer(&self) {
+        let mut running = self.lease_renewer_running.lock().unwrap();
+        if *running {
+            return;
+        }
+        *running = true;
+
+        let leases = self.leases.clone();
+        let volume_connections = self.volume_connections.clone();
+        let volume_router = self.volume_router.clone();
+        let lease_renewer_running = self.lease_renewer_running.clone();
+        let interval = self.lease_renew_interval;
+
+        tokio::spawn(async move {
+            log::info!(
+                "VolumeClient: Lease renewer started with interval={:?}",
+                interval
+            );
+
+            let mut interval_timer = tokio::time::interval(interval);
+
+            loop {
+                if !*lease_renewer_running.lock().unwrap() {
+                    break;
+                }
+
+                interval_timer.tick().await;
+
+                let now = Instant::now();
+
+                // 收集即将过期的 Lease
+                let to_renew: Vec<(u64, u64, String)> = {
+                    let lease_map = leases.read().unwrap();
+                    let mut to_renew_inner = Vec::new();
+                    for (&(volume_id, inode), lease) in lease_map.iter() {
+                        if lease.state == LeaseState::Acquired && lease.is_valid() {
+                            let remaining = lease.expire_at.saturating_duration_since(now);
+                            // 如果剩余时间小于 10 秒，则需要续租
+                            if remaining < Duration::from_secs(10) {
+                                to_renew_inner.push((volume_id, inode, lease.token.clone()));
+                            }
+                        }
+                    }
+                    to_renew_inner
+                };
+
+                if to_renew.is_empty() {
+                    continue;
+                }
+
+                log::debug!(
+                    "VolumeClient: Lease renewer found {} leases to renew",
+                    to_renew.len()
+                );
+
+                // 逐个进行续租
+                for (volume_id, inode, token) in to_renew {
+                    // 获取 volume 路由地址
+                    let volume_addr = {
+                        let router = volume_router.read().unwrap();
+                        router.get(&volume_id).map(|v| v.addr.clone())
+                    };
+
+                    let addr = match volume_addr {
+                        Some(a) => a,
+                        None => {
+                            log::warn!(
+                                "VolumeClient: Lease renewer skipped, no route for volume={}",
+                                volume_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    // 获取或创建到 Volume 的连接
+                    let vol_client =
+                        match get_or_create_volume_client_from_pool(&volume_connections, &addr)
+                            .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log::warn!(
+                                    "VolumeClient: Lease renewer failed to connect volume={}: {}",
+                                    volume_id,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                    // 构建续租请求
+                    let mut enc = powerfs_net::serialize::TlvEncoder::new();
+                    if let Err(e) = enc.add_string(FieldId::LeaseToken, &token) {
+                        log::error!(
+                            "VolumeClient: Failed to encode lease token for volume={}, inode={}: {}",
+                            volume_id,
+                            inode,
+                            e
+                        );
+                        continue;
+                    }
+                    let duration_ms = 30000;
+                    enc.add_u64(FieldId::LeaseDuration, duration_ms);
+
+                    let result = vol_client
+                        .send_request(powerfs_net::MsgType::RenewLease, &enc.into_bytes(), &[])
+                        .await;
+
+                    match result {
+                        Ok(resp) if resp.is_ok() => {
+                            // 续租成功，更新本地过期时间
+                            let mut lease_map = leases.write().unwrap();
+                            if let Some(lease_info) = lease_map.get_mut(&(volume_id, inode)) {
+                                lease_info.renew(Duration::from_millis(duration_ms));
+                                log::debug!(
+                                    "VolumeClient: Lease renewed successfully for volume={}, inode={}",
+                                    volume_id,
+                                    inode
+                                );
+                            }
+                        }
+                        Ok(resp) => {
+                            log::warn!(
+                                "VolumeClient: Lease renew failed for volume={}, inode={}, status={}",
+                                volume_id,
+                                inode,
+                                resp.header.status
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "VolumeClient: Lease renew network error for volume={}, inode={}: {}",
+                                volume_id,
+                                inode,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            log::info!("VolumeClient: Lease renewer stopped");
+        });
+    }
+
+    /// 停止 Lease 续租心跳后台任务
+    pub fn stop_lease_renewer(&self) {
+        let mut running = self.lease_renewer_running.lock().unwrap();
+        *running = false;
+        log::info!("VolumeClient: Stopping lease renewer...");
     }
 
     /// 异步处理数据请求 (真实网络发送)
@@ -1121,6 +1520,7 @@ async fn process_volume_available_requests(
 }
 
 /// 数据请求处理（自由函数版本）
+#[allow(clippy::too_many_arguments)]
 async fn process_data_request_internal(
     req: PendingRequest,
     volume_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,
@@ -1582,7 +1982,11 @@ mod tests {
     use crate::client_identity::ClientIdentity;
     use crate::topology::ClusterTopology;
 
-    fn create_test_volume_client() -> (VolumeClient, Arc<ClusterTopologyManager>) {
+    fn create_test_volume_client() -> (
+        VolumeClient,
+        Arc<ClusterTopologyManager>,
+        tokio::runtime::Runtime,
+    ) {
         let topology_manager = Arc::new(ClusterTopologyManager::new());
 
         let mut topology = ClusterTopology::new();
@@ -1594,9 +1998,14 @@ mod tests {
 
         let config = VolumeClientConfig::default();
         let client = VolumeClient::new(config, topology_manager.clone());
-        client.init();
 
-        (client, topology_manager)
+        // 启动 Tokio runtime 以支持异步操作（如 lease renewer）
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            client.init();
+        });
+
+        (client, topology_manager, runtime)
     }
 
     fn create_test_context(kind: RequestKind) -> RequestContext {
@@ -1606,7 +2015,7 @@ mod tests {
 
     #[test]
     fn test_initialization() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
         assert_eq!(client.state(), VolumeClientState::Ready);
         assert!(client.get_volume(1).is_some());
         assert!(client.get_volume(2).is_none());
@@ -1614,7 +2023,7 @@ mod tests {
 
     #[test]
     fn test_submit_read_request() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
         let ctx = create_test_context(RequestKind::Read);
 
         assert!(client.submit_data_request(ctx, 1).is_ok());
@@ -1625,7 +2034,7 @@ mod tests {
 
     #[test]
     fn test_submit_write_without_lease() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
         let ctx = create_test_context(RequestKind::Write);
 
         // 写请求在没有缓存 Lease 时仍可入队（客户端预检查降级为警告，
@@ -1640,7 +2049,7 @@ mod tests {
 
     #[test]
     fn test_submit_write_with_lease() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         // 先获取 Lease
         client.update_lease(
@@ -1657,7 +2066,7 @@ mod tests {
 
     #[test]
     fn test_lease_management() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         // 初始无 Lease
         assert_eq!(client.get_lease_state(1, 100), LeaseState::None);
@@ -1681,7 +2090,7 @@ mod tests {
 
     #[test]
     fn test_queue_processing() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         // 提交多个请求
         for _ in 0..3 {
@@ -1702,7 +2111,7 @@ mod tests {
 
     #[test]
     fn test_different_queue_types() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         // 数据请求
         let ctx1 = create_test_context(RequestKind::Read);
@@ -1729,7 +2138,7 @@ mod tests {
 
     #[test]
     fn test_volume_change() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         assert_eq!(client.get_volume(1).unwrap().addr, "127.0.0.1:9344");
 
@@ -1743,7 +2152,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
 
         // 触发熔断
         for _ in 0..5 {
@@ -1758,7 +2167,7 @@ mod tests {
 
     #[test]
     fn test_closed_client() {
-        let (client, _) = create_test_volume_client();
+        let (client, _, _rt) = create_test_volume_client();
         client.close();
 
         let ctx = create_test_context(RequestKind::Read);

@@ -1,10 +1,10 @@
-# PowerFS Test Environment — Optimized for Fast Startup
+# PowerFS Test Environment — Using config files
 #
 # Images must be pre-built with:
 #   sudo ./build_powerfs_image.sh
 #
 # Start with:
-#   sudo ./start_fuse_env.sh --wait
+#   cd docker && docker compose -f docker-compose.test.yml up -d
 
 networks:
   powerfs-network:
@@ -46,7 +46,7 @@ services:
       retries: 3
       start_period: 3s
 
-  # ── Wave 2: Masters (Raft consensus, serial startup) ──
+  # ── Wave 2: Masters ──
   master-1:
     image: powerfs:latest
     container_name: master-1-test
@@ -55,12 +55,12 @@ services:
         ipv4_address: 172.21.0.11
     volumes:
       - master-1-data:/data
+      - ./config:/config:ro
     ports:
       - "9433:9333"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.11:9333 --raft-id 1 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --config /config/master-1.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
       interval: 2s
@@ -79,12 +79,12 @@ services:
         ipv4_address: 172.21.0.12
     volumes:
       - master-2-data:/data
+      - ./config:/config:ro
     ports:
       - "9434:9333"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.12:9333 --raft-id 2 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --config /config/master-2.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
       interval: 2s
@@ -103,12 +103,12 @@ services:
         ipv4_address: 172.21.0.13
     volumes:
       - master-3-data:/data
+      - ./config:/config:ro
     ports:
       - "9435:9333"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-master --port 9333 --net-port 9334 --dir /data/master --advertise-addr 172.21.0.13:9333 --raft-id 3 --peer 172.21.0.11:9333 --peer 172.21.0.12:9333 --peer 172.21.0.13:9333
+    command: /app/powerfs-master --config /config/master-3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9334 || exit 1"]
       interval: 2s
@@ -119,7 +119,7 @@ services:
       master-2:
         condition: service_healthy
 
-  # ── Wave 3a: Volumes (parallel, depend on master-1 only) ──
+  # ── Wave 3a: Volumes ──
   volume-1:
     image: powerfs:latest
     container_name: volume-1-test
@@ -128,13 +128,13 @@ services:
         ipv4_address: 172.21.0.21
     volumes:
       - volume-1-data:/data
+      - ./config:/config:ro
     ports:
       - "8180:8080"
       - "8191:8091"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-1
+    command: /app/powerfs-volume --config /config/volume-1.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.21 8080 || exit 1"]
       interval: 2s
@@ -153,13 +153,13 @@ services:
         ipv4_address: 172.21.0.22
     volumes:
       - volume-2-data:/data
+      - ./config:/config:ro
     ports:
       - "8181:8080"
       - "8192:8092"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-2
+    command: /app/powerfs-volume --config /config/volume-2.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.22 8080 || exit 1"]
       interval: 2s
@@ -178,13 +178,13 @@ services:
         ipv4_address: 172.21.0.23
     volumes:
       - volume-3-data:/data
+      - ./config:/config:ro
     ports:
       - "8182:8080"
       - "8193:8093"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-3
+    command: /app/powerfs-volume --config /config/volume-3.toml
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.23 8080 || exit 1"]
       interval: 2s
@@ -195,7 +195,7 @@ services:
       master-1:
         condition: service_healthy
 
-  # ── Wave 3b: Filers (Raft consensus, serial startup) ──
+  # ── Wave 3b: Filers ──
   filer-1:
     image: powerfs:latest
     container_name: filer-1-test
@@ -208,10 +208,10 @@ services:
       - "8990:8890"
     environment:
       - RUST_LOG=debug
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 1 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --config /config/filer-1.toml
     volumes:
       - filer-1-data:/data/filer
+      - ./config:/config:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
       interval: 3s
@@ -234,10 +234,10 @@ services:
       - "8993:8890"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 2 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --config /config/filer-2.toml
     volumes:
       - filer-2-data:/data/filer
+      - ./config:/config:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
       interval: 3s
@@ -260,10 +260,10 @@ services:
       - "8996:8890"
     environment:
       - RUST_LOG=info
-      - REDIS_URL=redis://redis-test:6379
-    command: /app/powerfs-filer --port 8888 --grpc-port 8889 --net-port 8890 --master 172.21.0.11:9333 --master 172.21.0.12:9333 --master 172.21.0.13:9333 -D /data/filer --shard-count 4 --raft-id 3 --raft-peer 172.21.0.31:8889 --raft-peer 172.21.0.32:8889 --raft-peer 172.21.0.33:8889
+    command: /app/powerfs-filer --config /config/filer-3.toml
     volumes:
       - filer-3-data:/data/filer
+      - ./config:/config:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
       interval: 3s
@@ -274,7 +274,7 @@ services:
       filer-2:
         condition: service_healthy
 
-  # ── Wave 4: FUSE Client + Benchmark ──
+  # ── Wave 4: FUSE Client ──
   fuse-test:
     image: powerfs-test:latest
     container_name: fuse-test
@@ -299,24 +299,9 @@ services:
     command:
       - -c
       - |
-        # Create FUSE mount directory
         mkdir -p /mnt/fuse
-        # Start FUSE client in background
-        /app/powerfs-fuse \
-          --master 172.21.0.11:9333 \
-          --master 172.21.0.12:9333 \
-          --master 172.21.0.13:9333 \
-          --master-net-port 9334 \
-          --filer-addr 172.21.0.31 \
-          --filer-net-port 8890 \
-          --mount-point /mnt/fuse \
-          --collection default \
-          --replication 000 \
-          --verbose \
-          --container \
-          --log-file /var/log/powerfs-fuse.log &
+        /app/powerfs-fuse --config /config/fuse.toml &
         FUSE_PID=$$!
-        # Wait for FUSE to mount
         for i in $$(seq 1 30); do
           if mount | grep -q "/mnt/fuse"; then
             echo "FUSE mounted at /mnt/fuse"
@@ -325,10 +310,10 @@ services:
           sleep 1
         done
         echo "FUSE ready, mount point: /mnt/fuse"
-        # Keep container running
         wait $$FUSE_PID
     volumes:
       - /tmp/powerfs/test:/tmp/test-results
+      - ./config:/config:ro
     healthcheck:
       test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
       interval: 3s

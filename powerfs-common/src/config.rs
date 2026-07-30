@@ -58,6 +58,9 @@ pub struct VolumeConfig {
     pub device_capacity: Option<u64>,
     /// powerfs-net 二进制协议端口 - 必须配置，必须与http_port不同
     pub net_port: u16,
+    /// 广播地址 - Volume Server对外可达地址（如 "172.20.0.21"），用于Master注册volume路由
+    /// 必须配置，不能使用0.0.0.0，否则FUSE客户端无法连接
+    pub advertise_addr: Option<String>,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -75,6 +78,9 @@ pub struct FilerConfig {
     pub raft_peers: Vec<String>,
     /// powerfs-net 二进制协议端口 - 必须配置
     pub net_port: u16,
+    /// CRDT 后台维护任务执行间隔（秒），默认 60 秒
+    #[serde(default)]
+    pub crdt_maintenance_interval_secs: Option<u64>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
@@ -196,15 +202,19 @@ impl PowerFsConfig {
         }
         if self.master.peers.is_empty() {
             return Err(ConfigError::ValidationError(
-                "master.peers must not be empty (at least one peer required for Raft cluster)".to_string(),
+                "master.peers must not be empty (at least one peer required for Raft cluster)"
+                    .to_string(),
             ));
         }
         if self.master.ip.is_none() || self.master.ip.as_ref().unwrap().is_empty() {
             return Err(ConfigError::ValidationError(
-                "master.ip must be set explicitly (e.g., '0.0.0.0' or specific bind IP)".to_string(),
+                "master.ip must be set explicitly (e.g., '0.0.0.0' or specific bind IP)"
+                    .to_string(),
             ));
         }
-        if self.master.advertise_addr.is_none() || self.master.advertise_addr.as_ref().unwrap().is_empty() {
+        if self.master.advertise_addr.is_none()
+            || self.master.advertise_addr.as_ref().unwrap().is_empty()
+        {
             return Err(ConfigError::ValidationError(
                 "master.advertise_addr must be set explicitly (address used by other nodes to reach this master, e.g., '172.20.0.11:9333')".to_string(),
             ));

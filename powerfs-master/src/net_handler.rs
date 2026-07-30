@@ -164,16 +164,22 @@ impl MasterNetHandler {
                 let _ = enc.add_u64(FieldId::VolumeId, fid.volume_id.0);
                 let _ = enc.add_u64(FieldId::Cookie, fid.cookie);
                 let _ = enc.add_u64(FieldId::FileKey, fid.file_key);
-                if let Some(node) = nodes.first() {
-                    let _ = enc.add_string(FieldId::Owner, &node.url());
-                }
+                // Use volume route addr (net_port) instead of node.url() (http_port)
+                // The FUSE client connects via powerfs-net protocol, not HTTP
+                let route_addr = self
+                    .master
+                    .get_volume_route(fid.volume_id.0)
+                    .map(|r| r.addr)
+                    .unwrap_or_else(|| nodes.first().map(|n| n.url()).unwrap_or_default());
+                let _ = enc.add_string(FieldId::Owner, &route_addr);
                 let _ = enc.add_u64(FieldId::Entries, nodes.len() as u64);
 
                 info!(
-                    "NET_ASSIGN: assigned volume_id={}, cookie={}, file_key={}, nodes={}",
+                    "NET_ASSIGN: assigned volume_id={}, cookie={}, file_key={}, route_addr={}, nodes={}",
                     fid.volume_id.0,
                     fid.cookie,
                     fid.file_key,
+                    route_addr,
                     nodes.len()
                 );
 
@@ -853,13 +859,30 @@ impl MasterNetHandler {
     }
 
     /// Handle GetTopology request - returns leader address AND volume routes
+    /// If this node is not the Raft leader, returns STATUS_ERR_REDIRECT with leader address
     async fn handle_get_topology(
         &self,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        info!("NET_GET_TOPOLOGY: returning topology info with volume routes");
-
         let leader = self.master.get_leader().await;
+
+        // If not leader, redirect client to the actual leader
+        if !self.master.is_leader().await {
+            info!(
+                "NET_GET_TOPOLOGY: not leader, redirecting to leader at {}",
+                leader
+            );
+            let mut enc = TlvEncoder::new();
+            enc.add_string(FieldId::Owner, &leader)?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        info!("NET_GET_TOPOLOGY: returning topology info with volume routes");
 
         // Build volume routes from the route table
         let routes = self.master.list_volume_routes();

@@ -824,5 +824,6 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         symlink_target: "".to_string(),
         owner: "".to_string(),
         generation: 0,
+        version: inode.version,
     }
 }

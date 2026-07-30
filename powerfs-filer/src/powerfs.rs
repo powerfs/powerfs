@@ -284,6 +284,8 @@ pub struct Entry {
     pub owner: ::prost::alloc::string::String,
     #[prost(uint64, tag = "13")]
     pub generation: u64,
+    #[prost(uint64, tag = "14")]
+    pub version: u64,
 }
 /// Lease management types
 #[allow(clippy::derive_partial_eq_without_eq)]

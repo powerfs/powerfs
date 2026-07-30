@@ -495,6 +495,45 @@ impl FuseClientFacade {
 
     // ======= Lease 请求方法（委托给 VolumeClient）=======
 
+    /// 直接获取 Lease (绕过队列，直接网络请求)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        client_id: &str,
+        exclusive: bool,
+        duration_ms: u64,
+    ) -> Result<String, String> {
+        self.volume_client
+            .acquire_lease(
+                volume_id,
+                inode,
+                stripe_start,
+                stripe_count,
+                client_id,
+                exclusive,
+                duration_ms,
+            )
+            .await
+            .map_err(|e| format!("AcquireLease failed: {}", e))
+    }
+
+    /// 直接释放 Lease (绕过队列，直接网络请求)
+    pub async fn release_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        client_id: &str,
+    ) -> Result<(), String> {
+        self.volume_client
+            .release_lease_remote(volume_id, inode, client_id)
+            .await
+            .map_err(|e| format!("ReleaseLease failed: {}", e))
+    }
+
     /// 提交 Lease 请求
     pub async fn submit_lease_request(
         &self,
@@ -647,6 +686,11 @@ impl SyncFuseClientFacade {
         self.runtime.block_on(future)
     }
 
+    /// 获取客户端标识（用于 lease holder 校验）
+    pub fn client_id(&self) -> String {
+        self.facade.client_id()
+    }
+
     /// 从缓存获取 Volume 地址（优先使用缓存，仅在未命中时回退查询）
     pub fn get_volume_addr(&self, volume_id: u64) -> Result<String, String> {
         println!("DEBUG get_volume_addr: volume_id={}", volume_id);
@@ -760,6 +804,43 @@ impl SyncFuseClientFacade {
         })
     }
 
+    /// 同步获取 Lease
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+        stripe_count: u64,
+        client_id: &str,
+        exclusive: bool,
+        duration_ms: u64,
+    ) -> Result<String, String> {
+        let facade = self.facade.clone();
+        let client_id = client_id.to_string();
+        self.runtime.block_on(async move {
+            facade
+                .acquire_lease(
+                    volume_id,
+                    inode,
+                    stripe_start,
+                    stripe_count,
+                    &client_id,
+                    exclusive,
+                    duration_ms,
+                )
+                .await
+        })
+    }
+
+    /// 同步释放 Lease
+    pub fn release_lease(&self, volume_id: u64, inode: u64, client_id: &str) -> Result<(), String> {
+        let facade = self.facade.clone();
+        let client_id = client_id.to_string();
+        self.runtime
+            .block_on(async move { facade.release_lease(volume_id, inode, &client_id).await })
+    }
+
     pub fn delete_entry(
         &self,
         parent_ino: u64,
@@ -849,7 +930,7 @@ impl SyncFuseClientFacade {
 
             // 如果成功，设置卷路由
             if let Ok((fid, locations)) = &result {
-                facade.resolve_volume_route(fid.volume_id.0 as u64, locations);
+                facade.resolve_volume_route(fid.volume_id.0, locations);
                 log::debug!(
                     "assign_volume: resolved volume route for volume_id={}",
                     fid.volume_id.0
@@ -865,7 +946,7 @@ impl SyncFuseClientFacade {
         volume_id: powerfs_common::types::VolumeId,
     ) -> Result<Vec<powerfs_common::traits::Location>, String> {
         let facade = self.facade.clone();
-        let vid = volume_id.0 as u64;
+        let vid = volume_id.0;
 
         log::info!("lookup_volume: starting for volume_id={}", vid);
 
@@ -1089,24 +1170,20 @@ impl SyncFuseClientFacade {
                 .payload
                 .as_deref()
                 .filter(|d| !d.is_empty())
-                .and_then(|d| {
+                .map(|d| {
                     let mut dec = powerfs_net::TlvDecoder::new(d);
-                    Some(
-                        dec.next_string(powerfs_net::FieldId::SymlinkTarget)
-                            .unwrap_or_default(),
-                    )
+                    dec.next_string(powerfs_net::FieldId::SymlinkTarget)
+                            .unwrap_or_default()
                 })
                 .or_else(|| {
                     result
                         .data
                         .as_deref()
                         .filter(|d| !d.is_empty())
-                        .and_then(|d| {
+                        .map(|d| {
                             let mut dec = powerfs_net::TlvDecoder::new(d);
-                            Some(
-                                dec.next_string(powerfs_net::FieldId::SymlinkTarget)
-                                    .unwrap_or_default(),
-                            )
+                            dec.next_string(powerfs_net::FieldId::SymlinkTarget)
+                                    .unwrap_or_default()
                         })
                 })
                 .filter(|s| !s.is_empty())

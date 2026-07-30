@@ -4,6 +4,7 @@
 //! using MetaShardManager, which is the authoritative metadata manager with sharded
 //! storage, Raft consensus, and CRDT support.
 
+use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
 use crate::raft_group_manager::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
@@ -21,6 +22,8 @@ use std::sync::Arc;
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
     pub shard_strategy: Arc<ShardStrategy>,
+    /// Inode notification broadcaster (optional, for cache invalidation)
+    pub inode_notifier: Option<Arc<InodeNotifier>>,
 }
 
 impl FilerNetHandler {
@@ -31,6 +34,37 @@ impl FilerNetHandler {
         Self {
             meta_shard_manager,
             shard_strategy,
+            inode_notifier: None,
+        }
+    }
+
+    /// Create a new FilerNetHandler with InodeNotifier support
+    pub fn with_notifier(
+        meta_shard_manager: Arc<MetaShardManager>,
+        shard_strategy: Arc<ShardStrategy>,
+        inode_notifier: Arc<InodeNotifier>,
+    ) -> Self {
+        Self {
+            meta_shard_manager,
+            shard_strategy,
+            inode_notifier: Some(inode_notifier),
+        }
+    }
+
+    /// Notify subscribers that an inode's metadata has changed.
+    /// This is called after successful metadata mutations.
+    fn notify_inode_change(&self, inode: u64, version: u64) {
+        if let Some(ref notifier) = self.inode_notifier {
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                let count = notifier.notify(inode, version).await;
+                if count > 0 {
+                    debug!(
+                        "FILER_NET: notified {} clients about inode {} change (v={})",
+                        count, inode, version
+                    );
+                }
+            });
         }
     }
 
@@ -101,6 +135,7 @@ impl FilerNetHandler {
             } else {
                 None
             },
+            version: info.version,
         }
     }
 
@@ -205,7 +240,7 @@ impl FilerNetHandler {
         }
     }
 
-    /// Handle SetAttr request
+    /// Handle SetAttr request (legacy unified path)
     async fn handle_setattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -228,6 +263,96 @@ impl FilerNetHandler {
             Ok(_) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
             Err(e) => {
                 warn!("FILER_NET_SETATTR failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle SetAttrData request (strong consistency path for size/chunks)
+    async fn handle_setattr_data(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let size = dec.next_u64(FieldId::Size).ok();
+
+        info!("FILER_NET_SETATTR_DATA: ino={}, size={:?}", ino, size);
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_SETATTR_DATA: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .setattr_data(ino, shard_id, size)
+            .await
+        {
+            Ok(_) => {
+                // Notify other clients that this inode's data (size/chunks) changed
+                let now = chrono::Utc::now().timestamp() as u64;
+                self.notify_inode_change(ino, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SETATTR_DATA failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle SetAttrMeta request (eventual consistency path for mode/uid/gid/timestamps)
+    async fn handle_setattr_meta(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let mode = dec.next_u64(FieldId::Mode).ok();
+        let uid = dec.next_u64(FieldId::Uid).ok();
+        let gid = dec.next_u64(FieldId::Gid).ok();
+        let mtime = dec.next_u64(FieldId::Mtime).ok();
+        let atime = dec.next_u64(FieldId::Atime).ok();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let timestamp = dec.next_u64(FieldId::Seq).unwrap_or(0);
+
+        info!(
+            "FILER_NET_SETATTR_META: ino={}, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, client={}, ts={}",
+            ino, mode, uid, gid, mtime, client_id, timestamp
+        );
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_SETATTR_META: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .setattr_meta(
+                ino, shard_id, mode, uid, gid, mtime, atime, &client_id, timestamp,
+            )
+            .await
+        {
+            Ok(_) => {
+                // Notify other clients that this inode's metadata changed
+                self.notify_inode_change(ino, timestamp);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SETATTR_META failed: {}", e);
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
@@ -658,6 +783,8 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::SetAttrData => self.handle_setattr_data(msg).await,
+            MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,
             MsgType::Unlink => self.handle_unlink(msg).await,
@@ -710,6 +837,8 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::SetAttrData => self.handle_setattr_data(msg).await,
+            MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,
             MsgType::Unlink => self.handle_unlink(msg).await,

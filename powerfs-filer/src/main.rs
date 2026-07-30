@@ -179,6 +179,18 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
 
     info!("ShardScheduler started with {} nodes", peers.len());
 
+    // 启动后台 CRDT 维护任务：定期清理过期 Tombstone、压缩 Delta Log
+    // 默认每 60 秒检查一次；实际清理发生在 tombstone 过期（24h）或
+    // Delta Log 超过 50% 容量时。
+    let crdt_maintenance_interval_secs = filer_cfg
+        .crdt_maintenance_interval_secs
+        .unwrap_or(60);
+    let _crdt_handle = meta_shard_manager.spawn_crdt_maintenance(crdt_maintenance_interval_secs);
+    info!(
+        "CRDT maintenance task started (interval={}s)",
+        crdt_maintenance_interval_secs
+    );
+
     let s3_handler = Arc::new(
         S3Handler::new(
             bucket_manager.clone(),

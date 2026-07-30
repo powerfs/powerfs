@@ -76,8 +76,7 @@ impl Volume {
             Err(e) => return Err(backend_err(e)),
         }
 
-        let (used, _next_offset, active_count, deleted_count) =
-            index.rebuild_allocation_stats()?;
+        let (used, _next_offset, active_count, deleted_count) = index.rebuild_allocation_stats()?;
 
         // 同步 RocksDB allocation CF（启动时确保一致性）
         Self::sync_allocation_from_index(&index, used, size, active_count, deleted_count)?;
@@ -227,9 +226,9 @@ impl Volume {
         };
 
         // 原子写入：同时更新 needles CF + allocation CF，返回更新后的统计
-        let new_stats = self
-            .index
-            .write_needle_atomic(&needle_info, required_space, volume_size)?;
+        let new_stats =
+            self.index
+                .write_needle_atomic(&needle_info, required_space, volume_size)?;
 
         // 同步 info 中的 used 字段
         info_guard.used = new_stats.used_bytes;
@@ -280,8 +279,7 @@ impl Volume {
 
             // 硬删除：从 needles CF 移除，存入 deleted CF
             let volume_size = self.size();
-            self.index
-                .delete_needle_atomic(needle_id, volume_size)?;
+            self.index.delete_needle_atomic(needle_id, volume_size)?;
 
             let mut info_guard = self.info.write().unwrap();
             info_guard.modified_at = Utc::now();
@@ -559,7 +557,7 @@ impl Volume {
 
     pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
         let needle_id = NeedleId(file_key);
-        if let Some(mut info) = self.index.get(&needle_id) {
+        if let Some(info) = self.index.get(&needle_id) {
             let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
             let raw_data = self
                 .backend
@@ -568,9 +566,9 @@ impl Volume {
             let needle =
                 Needle::from_bytes(&raw_data, self.id(), info.offset, info.checksum_algorithm)?;
 
-            info.last_verified_at = Some(Utc::now());
-            info.verification_count += 1;
-            self.index.insert(needle_id, info);
+            // NOTE: Do NOT write to index during read (no verification_count update).
+            // Writing to RocksDB during a read operation causes lock contention
+            // and can hang concurrent reads from different clients.
 
             let data_offset = offset as usize;
             let data_size = size as usize;

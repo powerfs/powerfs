@@ -257,16 +257,17 @@ impl VolumeMetadata {
     /// 启动时重建 allocation 统计：扫描 needles CF + deleted CF，计算物理空间使用
     /// 返回 (used_bytes, append_offset, active_count, deleted_count)
     pub fn rebuild_allocation_stats(&self) -> Result<(u64, u64, u64, u64)> {
-        use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET};
+        use powerfs_common::constants::{
+            NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET,
+        };
 
         let mut max_end: u64 = VOLUME_DATA_OFFSET;
         let mut active_count: u64 = 0;
 
         // 扫描 needles CF（活跃 needle）
         for (_, info) in self.iter() {
-            let needle_size = (NEEDLE_HEADER_SIZE as u64)
-                + (info.data_size as u64)
-                + (NEEDLE_FOOTER_SIZE as u64);
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
             let end = info.offset.saturating_add(needle_size);
             if end > max_end {
                 max_end = end;
@@ -278,9 +279,8 @@ impl VolumeMetadata {
         let deleted_items = self.list_deleted()?;
         let deleted_count = deleted_items.len() as u64;
         for (_, info) in &deleted_items {
-            let needle_size = (NEEDLE_HEADER_SIZE as u64)
-                + (info.data_size as u64)
-                + (NEEDLE_FOOTER_SIZE as u64);
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
             let end = info.offset.saturating_add(needle_size);
             if end > max_end {
                 max_end = end;
@@ -302,11 +302,9 @@ impl VolumeMetadata {
             if let Some(retention_until) = info.delete_retention_until {
                 if retention_until < now {
                     let key = needle_id.0.to_be_bytes();
-                    self.db
-                        .delete_cf(self.cf_deleted(), key)
-                        .map_err(|e| {
-                            PowerFsError::Internal(format!("RocksDB purge deleted failed: {}", e))
-                        })?;
+                    self.db.delete_cf(self.cf_deleted(), key).map_err(|e| {
+                        PowerFsError::Internal(format!("RocksDB purge deleted failed: {}", e))
+                    })?;
                     purged += 1;
                 }
             }

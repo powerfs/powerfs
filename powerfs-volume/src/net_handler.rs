@@ -463,6 +463,123 @@ impl VolumeNetHandler {
         }
     }
 
+    fn handle_acquire_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let stripe_start = dec.next_u64(FieldId::Offset).unwrap_or(0);
+        let stripe_count = dec.next_u64(FieldId::Limit).unwrap_or(1);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let exclusive = dec.next_u64(FieldId::Mode).unwrap_or(0) != 0;
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        info!(
+            "NET_ACQUIRE_LEASE: inode={}, stripe_start={}, stripe_count={}, client={}, exclusive={}",
+            inode, stripe_start, stripe_count, client_id, exclusive
+        );
+
+        match self.volume_server.range_lease_mgr.acquire(
+            inode,
+            stripe_start,
+            stripe_count,
+            &client_id,
+            duration_ms,
+            exclusive,
+            64 * 1024 * 1024,
+        ) {
+            Ok(lease) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::LeaseId, &lease.token)?;
+                enc.add_u64(FieldId::LeaseEpoch, lease.epoch);
+                enc.add_u64(FieldId::LeaseDuration, duration_ms);
+
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                warn!("NET_ACQUIRE_LEASE failed: {}", e);
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::Owner, &e)?;
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn handle_release_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+
+        info!("NET_RELEASE_LEASE: token={}, client={}", token, client_id);
+
+        if token.is_empty() {
+            return Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()));
+        }
+
+        match self
+            .volume_server
+            .range_lease_mgr
+            .release(&token, &client_id)
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new())),
+            Err(e) => {
+                warn!("NET_RELEASE_LEASE failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    fn handle_renew_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        info!(
+            "NET_RENEW_LEASE: token={}, client={}, duration_ms={}",
+            token, client_id, duration_ms
+        );
+
+        match self
+            .volume_server
+            .range_lease_mgr
+            .renew(&token, &client_id, duration_ms)
+        {
+            Ok(()) => {
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::LeaseDuration, duration_ms);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                warn!("NET_RENEW_LEASE failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     fn handle_lookup_volume(&self, msg: &NetMessage) -> NetMessage {
         info!("NET_LOOKUP_VOLUME: handling lookup volume request");
 
@@ -543,6 +660,9 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg, client_id).await,
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::ReleaseLease => self.handle_release_lease(msg),
+            MsgType::RenewLease => self.handle_renew_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {
@@ -568,6 +688,21 @@ impl PowerFsNetHandler for VolumeNetHandler {
 
     async fn on_disconnect(&self, client_id: u64) {
         info!("NET_VOLUME: client disconnected, id={}", client_id);
+        // Failover: release all leases held by this disconnected client.
+        // Leases may be registered under two forms:
+        //   1. "session-{client_id}" (auto-generated by the server for direct connections)
+        //   2. The client-provided holder string (e.g. UUID-based client_id)
+        // We release the session-scoped leases here; client-provided leases
+        // will be reclaimed by the background expired-lease cleanup task.
+        let lease_mgr = self.volume_server.range_lease_mgr.clone();
+        let session_holder = format!("session-{}", client_id);
+        let removed = lease_mgr.disconnect_holder(&session_holder);
+        if removed > 0 {
+            warn!(
+                "NET_VOLUME: released {} leases for disconnected session client={}",
+                removed, client_id
+            );
+        }
     }
 }
 
@@ -600,6 +735,9 @@ impl ServerRequestHandler for VolumeNetHandler {
             }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
+            MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::ReleaseLease => self.handle_release_lease(msg),
+            MsgType::RenewLease => self.handle_renew_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => {

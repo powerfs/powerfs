@@ -399,95 +399,12 @@ impl MasterNode {
             }
         });
 
-        // Pre-allocate volumes at startup (simplified: volumes are pre-configured, not dynamically created)
-        // This allows functional testing without dynamic volume creation overhead
-        // Note: Each Volume Server pre-creates volumes with the same IDs (1, 2, ... N)
-        // Master tracks these by using composite volume IDs: server_idx * 1000 + volume_idx
+        // Volumes are NOT pre-allocated here.
+        // Volume servers create their own volumes (with UUID-based IDs) at startup
+        // and register them via heartbeat. The Master builds the volume table
+        // and route table from heartbeats. This ensures volume IDs in the Master
+        // match the actual Volume server volume IDs.
         {
-            let mut volumes = master.volumes.write().unwrap();
-
-            // Pre-allocate volumes: 4 per volume server, 3 servers total
-            // Each volume: 10GB (10737418240 bytes), enough for testing
-            let volumes_per_server = 4u32;
-            let total_servers = 3u32;
-            let volume_size: u64 = 10737418240; // 10GB
-
-            let now = chrono::Utc::now();
-
-            for server_idx in 0..total_servers {
-                let node_id = NodeId(format!("volume-server-{}", server_idx + 1));
-
-                for vol_idx in 0..volumes_per_server {
-                    // Composite volume ID: server_idx * 1000 + volume_idx
-                    // This ensures unique IDs across servers while preserving the original volume ID
-                    let volume_id = VolumeId((server_idx * 1000 + vol_idx + 1) as u64);
-                    let original_volume_id = vol_idx + 1;
-
-                    let volume_info = VolumeInfo {
-                        id: volume_id,
-                        node_id: node_id.clone(),
-                        collection: Collection("default".to_string()),
-                        size: volume_size,
-                        used: 0,
-                        replica_count: 1,
-                        ttl: Ttl::default(),
-                        disk_type: DiskType::default(),
-                        state: VolumeState::Available,
-                        created_at: now,
-                        modified_at: now,
-                        next_file_key: 1,
-                    };
-
-                    volumes.insert(volume_id, volume_info);
-                    info!(
-                        "Pre-allocated volume {} (original ID {}) on {}",
-                        volume_id.0, original_volume_id, node_id.0
-                    );
-                }
-            }
-
-            info!(
-                "Pre-allocated {} volumes ({} per server, {} servers) with {} bytes each",
-                volumes_per_server * total_servers,
-                volumes_per_server,
-                total_servers,
-                volume_size
-            );
-
-            // Drop the volumes write lock before updating volume_routes
-            drop(volumes);
-
-            // Also pre-populate volume_routes for GetTopology to return
-            // IMPORTANT: Use net_port (8901/8902/8903) NOT grpc_port (8080)
-            {
-                let mut routes = master.volume_routes.write().unwrap();
-                for server_idx in 0..total_servers {
-                    let node_id = NodeId(format!("volume-server-{}", server_idx + 1));
-                    // Volume Server IPs: 172.20.0.21, 172.20.0.22, 172.20.0.23
-                    // Volume Server net ports: 8901, 8902, 8903
-                    let ip_last_octet = 21 + server_idx;
-                    let net_port = 8901 + server_idx;
-                    let addr = format!("172.20.0.{}:{}", ip_last_octet, net_port);
-
-                    for vol_idx in 0..volumes_per_server {
-                        let volume_id = (server_idx * 1000 + vol_idx + 1) as u64;
-                        let route = VolumeRoute::new(
-                            volume_id,
-                            addr.clone(),
-                            volume_size,
-                            node_id.clone().0,
-                        );
-                        routes.insert(volume_id, route);
-                    }
-                    info!(
-                        "Pre-populated volume routes for server {}: addr={}",
-                        server_idx + 1,
-                        addr
-                    );
-                }
-                info!("Pre-populated {} volume routes", routes.len());
-            }
-
             // Pre-register Volume Servers in topology so that lookups work
             // Note: DataNodeInfo.address is for gRPC, while VolumeRoute.addr is for net_port
             {

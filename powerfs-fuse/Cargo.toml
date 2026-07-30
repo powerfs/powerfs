@@ -20,6 +20,7 @@ powerfs-fuse-core = { path = "../powerfs-fuse-core" }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 fuse-backend-rs = { workspace = true }
 libc = { workspace = true }

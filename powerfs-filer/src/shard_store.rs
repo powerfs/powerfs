@@ -47,6 +47,9 @@ pub struct InodeInfo {
     // Hard link count (for hard links)
     #[serde(default)]
     pub nlink: u32,
+    // Version counter for cache coherence. Incremented on every modification.
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Stored file chunk (persisted in Filer InodeInfo)
@@ -461,6 +464,21 @@ impl ShardStore {
             } => {
                 self.setattr(inode, size, mode, uid, gid);
             }
+            ShardCommand::SetAttrData { inode, size } => {
+                self.setattr_data(inode, size);
+            }
+            ShardCommand::SetAttrMeta {
+                inode,
+                mode,
+                uid,
+                gid,
+                mtime,
+                atime,
+                client_id: _,
+                timestamp: _,
+            } => {
+                self.setattr_meta(inode, mode, uid, gid, mtime, atime);
+            }
             ShardCommand::CreateSymlink {
                 parent_inode,
                 name,
@@ -512,6 +530,7 @@ impl ShardStore {
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 1,
+            version: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -586,6 +605,7 @@ impl ShardStore {
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 1,
+            version: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -635,6 +655,7 @@ impl ShardStore {
             info.size = size;
             info.mtime = mtime;
             info.atime = chrono::Utc::now().timestamp() as u64;
+            info.version += 1;
 
             if let Ok(data) = serde_json::to_vec(info) {
                 let inode_key = inode.to_be_bytes();
@@ -713,6 +734,7 @@ impl ShardStore {
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 2,
+            version: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1164,6 +1186,64 @@ impl ShardStore {
         let _ = self.update_inode(info);
     }
 
+    /// Set data-related inode attributes (size) - strong consistency path via Raft
+    fn setattr_data(&self, inode: u64, size: Option<u64>) {
+        let info = match self.get_inode(inode) {
+            Some(mut info) => {
+                if let Some(s) = size {
+                    info.size = s;
+                    info.blocks = s.div_ceil(512);
+                }
+                let now = chrono::Utc::now().timestamp() as u64;
+                info.ctime = now;
+                info.mtime = now;
+                info
+            }
+            None => return,
+        };
+
+        let _ = self.update_inode(info);
+    }
+
+    /// Set metadata-related inode attributes (mode, uid, gid, mtime, atime) - eventual consistency path
+    fn setattr_meta(
+        &self,
+        inode: u64,
+        mode: Option<u64>,
+        uid: Option<u64>,
+        gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
+    ) {
+        let info = match self.get_inode(inode) {
+            Some(mut info) => {
+                if let Some(m) = mode {
+                    info.mode = m as u32;
+                }
+                if let Some(u) = uid {
+                    info.uid = u as u32;
+                }
+                if let Some(g) = gid {
+                    info.gid = g as u32;
+                }
+                if let Some(mt) = mtime {
+                    if mt > info.mtime {
+                        info.mtime = mt;
+                    }
+                }
+                if let Some(at) = atime {
+                    if at > info.atime {
+                        info.atime = at;
+                    }
+                }
+                info
+            }
+            None => return,
+        };
+
+        let _ = self.update_inode(info);
+    }
+
     /// Create a symbolic link
     fn create_symlink(&self, parent_inode: u64, name: String, inode: u64, target: String) {
         let now = chrono::Utc::now().timestamp() as u64;
@@ -1190,6 +1270,7 @@ impl ShardStore {
             extended: HashMap::new(),
             symlink_target: Some(target),
             nlink: 1,
+            version: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();

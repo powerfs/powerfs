@@ -16,7 +16,7 @@ use std::ffi::CStr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(1);
 const PREFETCH_CHUNKS: u64 = 2;
@@ -136,6 +136,8 @@ impl FuseApp {
                 .collect(),
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stripe_size: 64 * 1024 * 1024, // 64MB per stripe
+            lease_duration_ms: 30000,      // 30 seconds lease
         };
 
         let fs_arc = Arc::new(fs);
@@ -243,6 +245,8 @@ struct PowerFsFs {
     dirty_shards: DirtyShards,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
     write_locks: WriteLocks,
+    stripe_size: u64,
+    lease_duration_ms: u64,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -323,7 +327,7 @@ impl PowerFsFs {
         // Use cached volume address
         let addr = self
             .client
-            .get_volume_addr(fid.volume_id.0 as u64)
+            .get_volume_addr(fid.volume_id.0)
             .map_err(|e| {
                 error!("get_volume_addr failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
@@ -498,6 +502,27 @@ impl PowerFsFs {
             entry.name, mode_val, file_type, is_dir, is_symlink
         );
 
+        // Compute file size: prefer attrs.size, fall back to content_size,
+        // and finally compute from chunks if both are 0.
+        let attrs_size = attrs.map(|a| a.size).unwrap_or(0);
+        let computed_size = if attrs_size > 0 {
+            attrs_size
+        } else if entry.content_size > 0 {
+            entry.content_size
+        } else {
+            // Compute from chunks: max(end_offset) across all chunks
+            entry
+                .chunks
+                .iter()
+                .map(|c| c.offset + c.size)
+                .max()
+                .unwrap_or(0)
+        };
+        info!(
+            "entry_to_cached: name={}, attrs_size={}, content_size={}, computed_size={}",
+            entry.name, attrs_size, entry.content_size, computed_size
+        );
+
         CachedEntry {
             inode: attrs.map(|a| a.ino).unwrap_or(0),
             parent,
@@ -511,7 +536,7 @@ impl PowerFsFs {
             },
             nlink: attrs.map(|a| a.nlink).unwrap_or(1),
             fid,
-            size: attrs.map(|a| a.size).unwrap_or(0),
+            size: computed_size,
             mode: attrs.map(|a| a.mode & 0o7777).unwrap_or(0o644),
             uid: attrs.map(|a| a.uid).unwrap_or(0),
             gid: attrs.map(|a| a.gid).unwrap_or(0),
@@ -526,6 +551,7 @@ impl PowerFsFs {
 
             disk_size: entry.disk_size,
             generation: entry.generation,
+            cached_at: Instant::now(),
         }
     }
 
@@ -867,6 +893,7 @@ impl FileSystem for PowerFsFs {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         };
         self.cache.insert(entry.clone());
 
@@ -931,7 +958,7 @@ impl FileSystem for PowerFsFs {
             // Last hard link - delete the actual data and remove all cache entries
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
-                match self.client.get_volume_addr(fid.volume_id.0 as u64) {
+                match self.client.get_volume_addr(fid.volume_id.0) {
                     Ok(addr) => {
                         if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key) {
                             warn!("Failed to delete remote data: {}", e);
@@ -1085,6 +1112,7 @@ impl FileSystem for PowerFsFs {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         };
         self.cache.insert(entry.clone());
 
@@ -1165,7 +1193,6 @@ impl FileSystem for PowerFsFs {
         let file_size = if entry.size > 0 {
             entry.size
         } else if !entry.chunks.is_empty() {
-            // Fallback: use chunk info to estimate file size
             let max_chunk_end = entry
                 .chunks
                 .iter()
@@ -1213,10 +1240,56 @@ impl FileSystem for PowerFsFs {
             inode, fid, fid.volume_id
         );
 
+        let needs_remote_read = (start_chunk..=prefetch_end_chunk).any(|chunk_idx| {
+            self.chunk_cache
+                .get(inode, chunk_idx * chunk_size)
+                .is_none()
+        });
+
+        let client_id = self.client.client_id();
+        let mut acquired_lease_token: Option<String> = None;
+
+        // Acquire shared read lease if we need remote reads
+        if needs_remote_read {
+            let stripe_start = offset / self.stripe_size;
+            let stripe_end = if end_offset > 0 {
+                (end_offset - 1) / self.stripe_size + 1
+            } else {
+                1
+            };
+            let stripe_count = stripe_end - stripe_start;
+
+            debug!(
+                "read: acquiring read lease for inode={}, stripe_start={}, stripe_count={}",
+                inode, stripe_start, stripe_count
+            );
+
+            match self.client.acquire_lease(
+                fid.volume_id.0,
+                inode,
+                stripe_start,
+                stripe_count,
+                &client_id,
+                false, // shared/read lease
+                self.lease_duration_ms,
+            ) {
+                Ok(token) => {
+                    acquired_lease_token = Some(token);
+                    debug!("read: read lease acquired successfully");
+                }
+                Err(e) => {
+                    warn!(
+                        "read: read lease acquisition failed for inode={}: {}",
+                        inode, e
+                    );
+                }
+            }
+        }
+
         // Use cached volume address (only queries Master as fallback)
         let addr = self
             .client
-            .get_volume_addr(fid.volume_id.0 as u64)
+            .get_volume_addr(fid.volume_id.0)
             .map_err(|e| {
                 error!(
                     "get_volume_addr failed: volume_id={}, error={}",
@@ -1225,94 +1298,158 @@ impl FileSystem for PowerFsFs {
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        for chunk_idx in start_chunk..=prefetch_end_chunk {
-            let chunk_offset = chunk_idx * chunk_size;
-            if self.chunk_cache.get(inode, chunk_offset).is_none() {
-                let remaining = file_size.saturating_sub(chunk_offset);
-                let read_size = std::cmp::min(chunk_size, remaining);
-                match self.client.read_blob(
-                    &addr,
-                    fid.volume_id.0,
-                    fid.file_key,
-                    chunk_offset as i64,
-                    read_size as i32,
-                ) {
-                    Ok(data) => {
-                        let mtime = entry.mtime as u64;
-                        self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
-                    }
-                    Err(e) => {
-                        if e.contains("needle not found") {
-                            info!("read_blob: needle not found in volume, checking dirty chunks");
-                            let is_dirty = {
-                                let key = (inode, chunk_idx);
-                                let shard = &self.dirty_shards[Self::dirty_shard_idx(&key)];
-                                let dirty_set = shard.read().unwrap();
-                                dirty_set.contains(&key)
-                            };
-                            if is_dirty {
-                                info!("read_blob: chunk {} is dirty, flushing first", chunk_idx);
-                                let _ = self.flush_dirty_chunks(inode);
-                                match self.client.read_blob(
-                                    &addr,
-                                    fid.volume_id.0,
-                                    fid.file_key,
-                                    chunk_offset as i64,
-                                    read_size as i32,
-                                ) {
-                                    Ok(data) => {
-                                        let mtime = entry.mtime as u64;
-                                        self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
-                                    }
-                                    Err(e2) => {
-                                        error!("read_blob failed after flush: {}", e2);
-                                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                                    }
-                                }
-                            } else {
+        // Use a closure to capture all return paths and ensure lease release
+        let result = (|| -> std::io::Result<usize> {
+            for chunk_idx in start_chunk..=prefetch_end_chunk {
+                let chunk_offset = chunk_idx * chunk_size;
+                if self.chunk_cache.get(inode, chunk_offset).is_none() {
+                    let remaining = file_size.saturating_sub(chunk_offset);
+                    let read_size = std::cmp::min(chunk_size, remaining);
+                    match self.client.read_blob(
+                        &addr,
+                        fid.volume_id.0,
+                        fid.file_key,
+                        chunk_offset as i64,
+                        read_size as i32,
+                    ) {
+                        Ok(ref data) => {
+                            log::info!(
+                                "read_blob: inode={}, chunk_offset={}, data_len={}",
+                                inode,
+                                chunk_offset,
+                                data.len()
+                            );
+                            let mtime = entry.mtime as u64;
+                            self.chunk_cache
+                                .put(inode, chunk_offset, data.clone(), mtime, 0);
+                        }
+                        Err(e) => {
+                            if e.contains("needle not found") {
                                 info!(
+                                    "read_blob: needle not found in volume, checking dirty chunks"
+                                );
+                                let is_dirty = {
+                                    let key = (inode, chunk_idx);
+                                    let shard = &self.dirty_shards[Self::dirty_shard_idx(&key)];
+                                    let dirty_set = shard.read().unwrap();
+                                    dirty_set.contains(&key)
+                                };
+                                if is_dirty {
+                                    info!(
+                                        "read_blob: chunk {} is dirty, flushing first",
+                                        chunk_idx
+                                    );
+                                    let _ = self.flush_dirty_chunks(inode);
+                                    match self.client.read_blob(
+                                        &addr,
+                                        fid.volume_id.0,
+                                        fid.file_key,
+                                        chunk_offset as i64,
+                                        read_size as i32,
+                                    ) {
+                                        Ok(data) => {
+                                            let mtime = entry.mtime as u64;
+                                            self.chunk_cache.put(
+                                                inode,
+                                                chunk_offset,
+                                                data,
+                                                mtime,
+                                                0,
+                                            );
+                                        }
+                                        Err(e2) => {
+                                            error!("read_blob failed after flush: {}", e2);
+                                            return Err(std::io::Error::from_raw_os_error(
+                                                libc::EIO,
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    info!(
                                     "read_blob: chunk {} not in dirty chunks, filling with zeros",
                                     chunk_idx
                                 );
-                                let mtime = entry.mtime as u64;
-                                self.chunk_cache.put(
-                                    inode,
-                                    chunk_offset,
-                                    vec![0; read_size as usize],
-                                    mtime,
-                                    0,
-                                );
+                                    let mtime = entry.mtime as u64;
+                                    self.chunk_cache.put(
+                                        inode,
+                                        chunk_offset,
+                                        vec![0; read_size as usize],
+                                        mtime,
+                                        0,
+                                    );
+                                }
+                            } else {
+                                error!("read_blob failed: {}", e);
+                                return Err(std::io::Error::from_raw_os_error(libc::EIO));
                             }
-                        } else {
-                            error!("read_blob failed: {}", e);
-                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
                         }
                     }
                 }
             }
+
+            let mut total_written = 0usize;
+            let mut current_offset = offset;
+            let end = end_offset;
+
+            log::info!(
+                "read: before copy loop, inode={}, end={}, offset={}",
+                inode,
+                end,
+                offset
+            );
+
+            while current_offset < end {
+                let chunk_data = self
+                    .chunk_cache
+                    .get(inode, current_offset)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+
+                let chunk_start = (current_offset % self.chunk_cache.chunk_size()) as usize;
+                let available_in_chunk = chunk_data.data.len().saturating_sub(chunk_start);
+                let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
+
+                if bytes_left_in_chunk == 0 {
+                    log::info!(
+                        "read: bytes_left_in_chunk=0, breaking. chunk_data_len={}, chunk_start={}",
+                        chunk_data.data.len(),
+                        chunk_start
+                    );
+                    break;
+                }
+
+                let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
+                log::info!(
+                    "read: copying {} bytes from chunk_start={}, total_written={}",
+                    bytes_left_in_chunk,
+                    chunk_start,
+                    total_written + bytes_left_in_chunk
+                );
+                w.write_all(slice)?;
+                total_written += bytes_left_in_chunk;
+                current_offset += bytes_left_in_chunk as u64;
+            }
+
+            log::info!("read: returning total_written={}", total_written);
+            Ok(total_written)
+        })();
+
+        // Release read lease after operation completes (on all paths)
+        if let Some(token) = &acquired_lease_token {
+            debug!(
+                "read: releasing read lease for inode={}, token={}",
+                inode, token
+            );
+            if let Err(e) = self
+                .client
+                .release_lease(fid.volume_id.0, inode, &client_id)
+            {
+                warn!("read: lease release failed for inode={}: {}", inode, e);
+            } else {
+                debug!("read: read lease released successfully for inode={}", inode);
+            }
         }
 
-        let mut total_written = 0usize;
-        let mut current_offset = offset;
-        let end = end_offset;
-
-        while current_offset < end {
-            let chunk_data = self
-                .chunk_cache
-                .get(inode, current_offset)
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-
-            let chunk_start = self.chunk_cache.get_chunk_offset(current_offset) as usize;
-            let bytes_left_in_chunk =
-                (chunk_data.data.len() - chunk_start).min((end - current_offset) as usize);
-
-            let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
-            w.write_all(slice)?;
-            total_written += bytes_left_in_chunk;
-            current_offset += bytes_left_in_chunk as u64;
-        }
-
-        Ok(total_written)
+        result
     }
 
     fn write(
@@ -1339,6 +1476,7 @@ impl FileSystem for PowerFsFs {
         buf.truncate(read_len);
 
         let is_append = (flags & FUSE_APPEND) != 0;
+        let client_id = self.client.client_id();
 
         // Lock for metadata operations (append offset, FID assignment, size update)
         let meta_lock = self.get_write_lock(inode, u64::MAX);
@@ -1358,8 +1496,9 @@ impl FileSystem for PowerFsFs {
         }
 
         let chunk_size = self.chunk_cache.chunk_size();
+        let mut acquired_lease_token: Option<String> = None;
 
-        if let Some(_fid) = &entry.fid {
+        if let Some(ref fid) = entry.fid {
             let end_offset = offset + read_len as u64;
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let end_chunk = if end_offset == 0 {
@@ -1368,6 +1507,44 @@ impl FileSystem for PowerFsFs {
                 self.chunk_cache.get_chunk_index(end_offset - 1)
             };
 
+            // Calculate stripe range for lease acquisition
+            let stripe_start = offset / self.stripe_size;
+            let stripe_end = if end_offset > 0 {
+                (end_offset - 1) / self.stripe_size + 1
+            } else {
+                1
+            };
+            let stripe_count = stripe_end - stripe_start;
+
+            // Acquire Volume Lease before writing
+            debug!(
+                "write: acquiring lease for inode={}, stripe_start={}, stripe_count={}, volume_id={}",
+                inode, stripe_start, stripe_count, fid.volume_id.0
+            );
+
+            match self.client.acquire_lease(
+                fid.volume_id.0,
+                inode,
+                stripe_start,
+                stripe_count,
+                &client_id,
+                true, // exclusive write lease
+                self.lease_duration_ms,
+            ) {
+                Ok(token) => {
+                    acquired_lease_token = Some(token);
+                    debug!("write: lease acquired successfully");
+                }
+                Err(e) => {
+                    // Lease acquisition failed, but we still proceed with local write
+                    // The Volume Server will validate the lease when receiving the data
+                    warn!(
+                        "write: lease acquisition failed for inode={}: {}, proceeding with caution",
+                        inode, e
+                    );
+                }
+            }
+
             // Drop metadata lock before acquiring per-chunk locks so chunk writes
             // to the same file don't serialize on the metadata lock
             drop(_meta_guard);
@@ -1375,8 +1552,6 @@ impl FileSystem for PowerFsFs {
             let new_size = offset + read_len as u64;
 
             // Acquire per-chunk locks in sorted order to prevent deadlock.
-            // We store both the Arc and the guard so the Arc stays alive for
-            // the duration of the guard.
             let mut chunk_locks: Vec<(
                 u64,
                 Arc<std::sync::Mutex<()>>,
@@ -1434,6 +1609,10 @@ impl FileSystem for PowerFsFs {
             if new_size > entry.size {
                 self.cache.update_size(inode, new_size);
             }
+
+            // Synchronously flush dirty chunks to Volume Server while lease is held
+            // This ensures data consistency: write → flush → release lease
+            self.flush_dirty_chunks(inode).ok();
         } else {
             // First write: assign FID under metadata lock
             let (fid, _location, _stripe_fids, _stripe_locations) = self
@@ -1452,6 +1631,30 @@ impl FileSystem for PowerFsFs {
             self.chunk_cache.put(inode, 0, buf, mtime, 0);
 
             self.mark_dirty(inode, 0);
+
+            // Acquire lease for first write too
+            let stripe_start = 0;
+            let stripe_count = 1;
+            match self.client.acquire_lease(
+                fid.volume_id.0,
+                inode,
+                stripe_start,
+                stripe_count,
+                &client_id,
+                true,
+                self.lease_duration_ms,
+            ) {
+                Ok(token) => {
+                    acquired_lease_token = Some(token);
+                    debug!("write: first write lease acquired successfully");
+                }
+                Err(e) => {
+                    warn!(
+                        "write: first write lease acquisition failed for inode={}: {}",
+                        inode, e
+                    );
+                }
+            }
 
             let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
             let filer_entry = powerfs_master::proto::powerfs::Entry {
@@ -1484,8 +1687,8 @@ impl FileSystem for PowerFsFs {
                 hard_link_id: entry.hard_link_id.clone(),
                 hard_link_counter: entry.hard_link_counter,
                 extended: HashMap::new(),
-                content_size: entry.content_size,
-                disk_size: entry.disk_size,
+                content_size: new_size,
+                disk_size: new_size,
                 ttl: String::new(),
                 symlink_target: String::new(),
                 owner: String::new(),
@@ -1495,6 +1698,27 @@ impl FileSystem for PowerFsFs {
             // Update entry inline to avoid sharing TCP stream across runtimes
             if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
                 warn!("Failed to update entry on master: {}", e);
+            }
+        }
+
+        // Release Volume Lease after data is flushed
+        if let Some(token) = &acquired_lease_token {
+            debug!(
+                "write: releasing lease for inode={}, token={}",
+                inode, token
+            );
+            if let Err(e) = self.client.release_lease(
+                entry
+                    .fid
+                    .as_ref()
+                    .map(|f| f.volume_id.0)
+                    .unwrap_or(0),
+                inode,
+                &client_id,
+            ) {
+                warn!("write: lease release failed for inode={}: {}", inode, e);
+            } else {
+                debug!("write: lease released successfully for inode={}", inode);
             }
         }
 
@@ -1762,6 +1986,7 @@ impl FileSystem for PowerFsFs {
             content_size: link_str.len() as u64,
             disk_size: 0,
             generation: 0,
+            cached_at: Instant::now(),
         };
         self.cache.insert(cached_entry.clone());
         Ok(self.create_fuse_entry(&cached_entry))
@@ -1851,6 +2076,7 @@ impl FileSystem for PowerFsFs {
                     content_size: entry.content_size,
                     disk_size: entry.disk_size,
                     generation: 0,
+            cached_at: Instant::now(),
                 };
 
                 self.cache.insert(new_entry.clone());

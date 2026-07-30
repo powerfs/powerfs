@@ -811,9 +811,8 @@ impl MetaShardClient {
         let filer_client = self
             .get_or_create_filer_client(&leader_addr)
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 self.resolve_waiter(&request_id, Err(e.clone()));
-                e
             })?;
 
         // 从 context 获取 MsgType，若无效则回退到默认值
@@ -993,6 +992,7 @@ async fn process_available_requests(
 }
 
 /// 内部请求处理逻辑（供后台处理器使用）
+#[allow(clippy::too_many_arguments)]
 async fn process_request_internal(
     req: PendingRequest,
     filer_connections: &Arc<Mutex<HashMap<String, Arc<PowerFsNetClient>>>>,

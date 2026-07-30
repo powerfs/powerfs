@@ -772,8 +772,7 @@ fn test_l1_crash_recovery_after_write_and_delete() {
     let needle2_data = Bytes::from("persistent data 2");
 
     {
-        let volume =
-            Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+        let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
 
         // 写入两个 needle
         volume.write_needle(1, needle1_data.clone()).unwrap();
@@ -822,7 +821,10 @@ fn test_l1_crash_recovery_after_write_and_delete() {
 
     // 验证活跃 needle 数据完整
     let data1 = volume2.read_needle(&NeedleId(1)).unwrap();
-    assert_eq!(data1, needle1_data, "active needle data must be intact after recovery");
+    assert_eq!(
+        data1, needle1_data,
+        "active needle data must be intact after recovery"
+    );
 
     // 验证已删除 needle 不可读
     assert!(
@@ -836,7 +838,11 @@ fn test_l1_crash_recovery_after_write_and_delete() {
     let data3 = volume2.read_needle(&NeedleId(3)).unwrap();
     assert_eq!(data3, needle3_data);
 
-    assert_eq!(volume2.count(), 2, "should have 2 active needles after post-recovery write");
+    assert_eq!(
+        volume2.count(),
+        2,
+        "should have 2 active needles after post-recovery write"
+    );
 }
 
 /// 测试 L1 崩溃恢复：恢复已删除的 needle 后重启
@@ -852,8 +858,7 @@ fn test_l1_crash_recovery_after_restore() {
     let needle_data = Bytes::from("restorable data");
 
     {
-        let volume =
-            Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+        let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
 
         volume.write_needle(1, needle_data.clone()).unwrap();
         volume.delete_needle(&NeedleId(1)).unwrap();
@@ -869,8 +874,16 @@ fn test_l1_crash_recovery_after_restore() {
     // 重启后验证恢复的 needle 仍然存在
     let volume2 = Volume::new(VolumeId(1), "node", path, volume_size, backend).unwrap();
 
-    assert_eq!(volume2.count(), 1, "restored needle should survive crash recovery");
-    assert_eq!(volume2.deleted_count(), 0, "no deleted needles after restore recovery");
+    assert_eq!(
+        volume2.count(),
+        1,
+        "restored needle should survive crash recovery"
+    );
+    assert_eq!(
+        volume2.deleted_count(),
+        0,
+        "no deleted needles after restore recovery"
+    );
 
     let data = volume2.read_needle(&NeedleId(1)).unwrap();
     assert_eq!(data, needle_data, "restored needle data must be intact");
@@ -888,8 +901,7 @@ fn test_l1_crash_recovery_empty_volume() {
     let volume_size = 10 * 1024 * 1024;
 
     // 首次启动空 Volume
-    let volume =
-        Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
+    let volume = Volume::new(VolumeId(1), "node", path, volume_size, backend.clone()).unwrap();
     assert_eq!(volume.used(), 0);
     assert_eq!(volume.free_space(), volume_size);
     assert_eq!(volume.count(), 0);
@@ -897,8 +909,16 @@ fn test_l1_crash_recovery_empty_volume() {
 
     // 重启后应保持空状态
     let volume2 = Volume::new(VolumeId(1), "node", path, volume_size, backend).unwrap();
-    assert_eq!(volume2.used(), 0, "empty volume should have 0 used after restart");
-    assert_eq!(volume2.free_space(), volume_size, "empty volume should have full free space");
+    assert_eq!(
+        volume2.used(),
+        0,
+        "empty volume should have 0 used after restart"
+    );
+    assert_eq!(
+        volume2.free_space(),
+        volume_size,
+        "empty volume should have full free space"
+    );
     assert_eq!(volume2.count(), 0);
     assert_eq!(volume2.deleted_count(), 0);
 }
