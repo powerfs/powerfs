@@ -94,9 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| volume_cfg.data_dir.clone());
 
-    let volume_size = args
-        .volume_size
-        .unwrap_or(volume_cfg.max_volume_size);
+    let volume_size = args.volume_size.unwrap_or(volume_cfg.max_volume_size);
 
     let initial_volume_count = args
         .initial_volume_count

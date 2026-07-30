@@ -29,7 +29,7 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         content_size: 0,
         disk_size: 0,
         generation: 0,
-            cached_at: Instant::now(),
+        cached_at: Instant::now(),
     }
 }
 
@@ -57,7 +57,7 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         content_size: 0,
         disk_size: 0,
         generation: 0,
-            cached_at: Instant::now(),
+        cached_at: Instant::now(),
     }
 }
 

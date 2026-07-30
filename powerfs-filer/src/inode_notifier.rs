@@ -25,8 +25,8 @@ use std::sync::{Arc, RwLock};
 
 use powerfs_net::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage};
 use powerfs_net::serialize::TlvEncoder;
-use powerfs_net::FieldId;
 use powerfs_net::server_connection::ServerConnectionManager;
+use powerfs_net::FieldId;
 
 /// Result type for InodeNotifier operations
 pub type NotifyResult<T> = std::result::Result<T, String>;
@@ -105,7 +105,9 @@ impl InodeNotifier {
     pub async fn notify(&self, inode: u64, version: u64) -> usize {
         let client_ids: Vec<u64> = {
             let subs = self.subscribers.read().unwrap();
-            subs.get(&inode).map(|s| s.iter().copied().collect()).unwrap_or_default()
+            subs.get(&inode)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
         };
 
         if client_ids.is_empty() {
@@ -117,7 +119,11 @@ impl InodeNotifier {
         let mut success_count = 0;
 
         for client_id in client_ids {
-            match self.connection_manager.send_notification(client_id, msg.clone()).await {
+            match self
+                .connection_manager
+                .send_notification(client_id, msg.clone())
+                .await
+            {
                 Ok(true) => {
                     log::debug!(
                         "InodeNotifier: sent Invalidate(inode={}, v={}) to client {}",

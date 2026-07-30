@@ -350,8 +350,7 @@ impl PowerFsNetClient {
             // Read header
             let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
             let recv_result =
-                tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf))
-                    .await;
+                tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf)).await;
 
             match recv_result {
                 Ok(Ok(_)) => {

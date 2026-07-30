@@ -150,7 +150,9 @@ impl MetaState {
     /// Apply a MetaDelta to this state using CRDT merge rules
     pub fn apply_delta(&mut self, delta: &MetaDelta) -> MergeResult {
         match delta {
-            MetaDelta::SetMode { mode, timestamp, .. } => {
+            MetaDelta::SetMode {
+                mode, timestamp, ..
+            } => {
                 // LWW: update only if timestamp is strictly newer
                 if *timestamp > self.mode_timestamp {
                     self.mode = Some(*mode);
@@ -178,7 +180,9 @@ impl MetaState {
                     MergeResult::Idempotent
                 }
             }
-            MetaDelta::SetMtime { mtime, timestamp, .. } => {
+            MetaDelta::SetMtime {
+                mtime, timestamp, ..
+            } => {
                 // Max strategy: update if timestamp is newer or value is larger
                 let new_val = *mtime;
                 let current = self.mtime.unwrap_or(0);
@@ -190,7 +194,9 @@ impl MetaState {
                     MergeResult::Idempotent
                 }
             }
-            MetaDelta::SetAtime { atime, timestamp, .. } => {
+            MetaDelta::SetAtime {
+                atime, timestamp, ..
+            } => {
                 let new_val = *atime;
                 let current = self.atime.unwrap_or(0);
                 if new_val > current || *timestamp > self.atime_timestamp {
@@ -201,7 +207,9 @@ impl MetaState {
                     MergeResult::Idempotent
                 }
             }
-            MetaDelta::SetCtime { ctime, timestamp, .. } => {
+            MetaDelta::SetCtime {
+                ctime, timestamp, ..
+            } => {
                 let new_val = *ctime;
                 let current = self.ctime.unwrap_or(0);
                 if new_val > current || *timestamp > self.ctime_timestamp {
@@ -684,7 +692,10 @@ mod tests {
         assert_eq!(delta.timestamp(), Some(100));
         assert_eq!(delta.client_id(), Some("client-a"));
 
-        let delta_counter = MetaDelta::IncNlink { inode: 99, delta: 1 };
+        let delta_counter = MetaDelta::IncNlink {
+            inode: 99,
+            delta: 1,
+        };
         assert_eq!(delta_counter.inode(), 99);
         assert_eq!(delta_counter.timestamp(), None);
         assert_eq!(delta_counter.client_id(), None);

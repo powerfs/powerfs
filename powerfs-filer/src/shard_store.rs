@@ -1352,4 +1352,103 @@ impl ShardStore {
             self.shard_id.0, inode, new_parent_inode, new_name_for_log
         );
     }
+
+    /// Force flush all data to disk (for initialization tool to ensure persistence)
+    pub fn flush(&self) -> Result<(), String> {
+        self.db.flush().map_err(|e| format!("flush rocksdb: {}", e))
+    }
+
+    /// Create inode with sync to ensure immediate disk persistence (for init tool)
+    pub fn create_inode_sync(&self, info: InodeInfo) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let inode_key = info.inode.to_be_bytes();
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf_inodes, inode_key, &data, &write_opts)
+            .map_err(|e| format!("put inode to rocksdb: {}", e))?;
+
+        let is_file = matches!(info.file_type, FileType::File);
+        let is_dir = matches!(info.file_type, FileType::Directory);
+
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.insert(info.inode, info);
+        }
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            if is_file {
+                stats.file_count += 1;
+            }
+            if is_dir {
+                stats.dir_count += 1;
+            }
+        }
+        self.save_stats();
+
+        Ok(())
+    }
+
+    /// Save root inodes mapping with sync
+    pub fn set_root_inode_sync(&self, bucket: &str, inode: u64) {
+        let cf = match self.db.cf_handle(CF_METADATA) {
+            Some(cf) => cf,
+            None => return,
+        };
+        let key = format!("root_inode:{}", bucket);
+        let value = inode.to_be_bytes();
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        let _ = self.db.put_cf_opt(cf, key.as_bytes(), value, &write_opts);
+        self.root_inodes
+            .write()
+            .unwrap()
+            .insert(bucket.to_string(), inode);
+    }
+
+    /// Add directory entry with sync (for init tool)
+    pub fn add_dir_entry_sync(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let key = format!("{}:{}", parent_inode, name);
+        let value = inode.to_be_bytes();
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf_dir_entries, key.as_bytes(), value, &write_opts)
+            .map_err(|e| format!("put dir entry to rocksdb: {}", e))?;
+
+        let mut dir_entries = self.directory_entries.write().unwrap();
+        dir_entries.entry(parent_inode).or_default();
+        if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+            dir.insert(name.to_string(), inode);
+        }
+
+        Ok(())
+    }
+
+    /// Verify that an inode exists directly in RocksDB (not just in memory cache)
+    pub fn verify_inode_in_db(&self, inode: u64) -> bool {
+        if let Some(cf) = self.db.cf_handle(CF_INODES) {
+            let key = inode.to_be_bytes();
+            matches!(self.db.get_cf(cf, key), Ok(Some(_)))
+        } else {
+            false
+        }
+    }
 }

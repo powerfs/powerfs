@@ -741,6 +741,7 @@ impl VolumeClient {
     }
 
     /// 异步获取 Lease: 直接构建 TLV 请求发送到 Volume Server
+    #[allow(clippy::too_many_arguments)]
     pub async fn acquire_lease(
         &self,
         volume_id: u64,

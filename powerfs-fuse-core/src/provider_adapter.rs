@@ -35,6 +35,13 @@ fn build_lookup_tlv(parent_ino: u64, name: &str) -> Vec<u8> {
     enc.into_bytes()
 }
 
+/// Encode a GetAttr request body in TLV format
+fn build_getattr_tlv(ino: u64) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    let _ = enc.add_u64(FieldId::Ino, ino);
+    enc.into_bytes()
+}
+
 /// Encode a Create/Mkdir request body in TLV format
 #[allow(dead_code)]
 fn build_create_tlv(parent_ino: u64, name: &str, mode: u64, uid: u64, gid: u64) -> Vec<u8> {
@@ -170,9 +177,12 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     let ctime = dec.next_u64(FieldId::Ctime).unwrap_or(0);
     let name = dec.next_string(FieldId::Name).unwrap_or_default();
 
-    eprintln!(
+    log::debug!(
         "parse_entry_from_tlv: path={}, ino={}, mode={:o}, name={}",
-        path, ino, mode, name
+        path,
+        ino,
+        mode,
+        name
     );
 
     // Parse chunk/fid info
@@ -321,6 +331,33 @@ fn build_write_tlv(
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::Name, file_key);
+    let _ = enc.add_bytes(FieldId::DataLen, data);
+    if let Some(token) = lease_token {
+        if !token.is_empty() {
+            let _ = enc.add_string(FieldId::LeaseToken, token);
+        }
+    }
+    if let Some(cid) = client_id {
+        if !cid.is_empty() {
+            let _ = enc.add_string(FieldId::ClientId, cid);
+        }
+    }
+    enc.into_bytes()
+}
+
+/// 构建写操作的 TLV 请求体（带 inode 用于 lease 校验）
+fn build_write_tlv_with_inode(
+    volume_id: u64,
+    file_key: u64,
+    inode: u64,
+    data: &[u8],
+    lease_token: Option<&str>,
+    client_id: Option<&str>,
+) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, volume_id);
+    enc.add_u64(FieldId::Name, file_key);
+    enc.add_u64(FieldId::FileKey, inode); // inode for lease validation
     let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
         if !token.is_empty() {
@@ -624,9 +661,71 @@ impl MetadataProvider for FacadeMetadataProvider {
         }
     }
 
-    async fn get_entry_by_inode(&self, _inode: u64) -> Result<Option<(Entry, String)>> {
-        // 需要服务端支持 inode -> path 映射
-        Ok(None)
+    async fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(Entry, String)>> {
+        log::debug!(
+            "FacadeMetadataProvider::get_entry_by_inode called: inode={}",
+            inode
+        );
+
+        let payload = build_getattr_tlv(inode);
+
+        let result = self
+            .facade
+            .submit_metadata_request_with_type(
+                crate::request_state::RequestKind::Metadata,
+                inode,
+                payload,
+                powerfs_net::MsgType::GetAttr,
+            )
+            .await
+            .map_err(|e| {
+                PowerFsError::Internal(format!("Facade get_entry_by_inode failed: {}", e))
+            })?;
+
+        let response_data = result
+            .payload
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .or(result.data.as_deref());
+
+        match response_data {
+            Some(data) if !data.is_empty() => match parse_entry_from_tlv(data, "") {
+                Some(entry) => {
+                    log::debug!(
+                        "get_entry_by_inode: parsed entry for inode={}, name={}",
+                        inode,
+                        entry.name
+                    );
+                    Ok(Some((entry, "".to_string())))
+                }
+                None => {
+                    log::debug!(
+                        "get_entry_by_inode: parse_entry_from_tlv returned None for inode={}",
+                        inode
+                    );
+                    Ok(None)
+                }
+            },
+            _ => {
+                log::debug!(
+                    "get_entry_by_inode: no response data for inode={}, result.data={:?}",
+                    inode,
+                    result.data
+                );
+                if let Some(data) = &result.data {
+                    if let Ok(facade_resp) = serde_json::from_slice::<FacadeResponse>(data) {
+                        log::debug!(
+                            "get_entry_by_inode: facade_resp success={}",
+                            facade_resp.success
+                        );
+                        if !facade_resp.success {
+                            return Ok(None);
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn create_entry(&self, entry: &Entry, _client_id: &str) -> Result<u64> {
@@ -698,8 +797,14 @@ impl MetadataProvider for FacadeMetadataProvider {
         let mode = entry.attributes.as_ref().map(|a| a.mode as u64);
         let uid = entry.attributes.as_ref().map(|a| a.uid as u64);
         let gid = entry.attributes.as_ref().map(|a| a.gid as u64);
-        let mtime = entry.attributes.as_ref().map(|a| a.mtime.timestamp() as u64);
-        let atime = entry.attributes.as_ref().map(|a| a.atime.timestamp() as u64);
+        let mtime = entry
+            .attributes
+            .as_ref()
+            .map(|a| a.mtime.timestamp() as u64);
+        let atime = entry
+            .attributes
+            .as_ref()
+            .map(|a| a.atime.timestamp() as u64);
 
         // Determine what changed
         let size_changed = new_size != old_size;
@@ -730,16 +835,8 @@ impl MetadataProvider for FacadeMetadataProvider {
 
         if has_meta {
             let timestamp = Utc::now().timestamp() as u64;
-            let meta_payload = build_setattr_meta_tlv(
-                ino,
-                mode,
-                uid,
-                gid,
-                mtime,
-                atime,
-                client_id,
-                timestamp,
-            );
+            let meta_payload =
+                build_setattr_meta_tlv(ino, mode, uid, gid, mtime, atime, client_id, timestamp);
             let _result = self
                 .facade
                 .submit_metadata_request_with_type(
@@ -927,6 +1024,62 @@ impl FacadeStorageProvider {
         );
 
         Ok(lease_token)
+    }
+
+    /// 写入数据时使用指定的 lease token（若提供），否则自动获取。
+    /// 用于 write->flush 路径传递已获取的 lease，避免重复获取。
+    /// inode 用于 Volume Server 端的 lease 校验（lease 按 inode 注册，非 file_key）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_blob_with_lease(
+        &self,
+        volume_id: u64,
+        file_key: u64,
+        inode: u64,
+        _offset: i64,
+        _size: i32,
+        data: &[u8],
+        lease_token: Option<&str>,
+    ) -> Result<()> {
+        // Use provided lease token if available, otherwise acquire one
+        let token = if let Some(t) = lease_token {
+            if !t.is_empty() {
+                t.to_string()
+            } else {
+                self.ensure_lease(volume_id, file_key).await.map_err(|e| {
+                    PowerFsError::Internal(format!("Failed to acquire lease: {}", e))
+                })?
+            }
+        } else {
+            self.ensure_lease(volume_id, file_key)
+                .await
+                .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?
+        };
+
+        let client_id = self.facade.client_id();
+
+        let payload = build_write_tlv_with_inode(
+            volume_id,
+            file_key,
+            inode,
+            data,
+            Some(&token),
+            Some(&client_id),
+        );
+
+        let _result = self
+            .facade
+            .submit_data_request_with_type(
+                crate::request_state::RequestKind::Write,
+                volume_id,
+                payload,
+                powerfs_net::MsgType::WriteNeedle,
+            )
+            .await
+            .map_err(|e| {
+                PowerFsError::Internal(format!("Facade write_blob_with_lease failed: {}", e))
+            })?;
+
+        Ok(())
     }
 }
 

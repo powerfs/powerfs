@@ -88,12 +88,16 @@ async fn test_invalidation_e2e_single_client_cache_cleared() {
 
     let client_id: u64 = 1001;
     let addr: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    mgr.register_session(client_id, ClientType::Fuse, addr).await;
+    mgr.register_session(client_id, ClientType::Fuse, addr)
+        .await;
     let mut rx = mgr.register_notification_channel(client_id).await;
 
     // Client B has cached entry for inode 100 with generation=1
     cache.insert(make_entry(100, 1, "test.txt", 1));
-    assert!(cache.get_inode(100).is_some(), "Entry should exist before invalidation");
+    assert!(
+        cache.get_inode(100).is_some(),
+        "Entry should exist before invalidation"
+    );
 
     // Simulate server push with newer version (generation=5)
     let processed = simulate_server_push(&mgr, client_id, 100, 5, &handler, &mut rx).await;
@@ -114,7 +118,8 @@ async fn test_invalidation_e2e_older_version_ignored() {
 
     let client_id: u64 = 1002;
     let addr: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
-    mgr.register_session(client_id, ClientType::Fuse, addr).await;
+    mgr.register_session(client_id, ClientType::Fuse, addr)
+        .await;
     let mut rx = mgr.register_notification_channel(client_id).await;
 
     // Client has up-to-date cache (generation=10)
@@ -146,8 +151,10 @@ async fn test_invalidation_e2e_multiple_clients_isolation() {
     let client_b: u64 = 2002;
     let addr_a: std::net::SocketAddr = "127.0.0.1:9101".parse().unwrap();
     let addr_b: std::net::SocketAddr = "127.0.0.1:9102".parse().unwrap();
-    mgr.register_session(client_a, ClientType::Fuse, addr_a).await;
-    mgr.register_session(client_b, ClientType::Fuse, addr_b).await;
+    mgr.register_session(client_a, ClientType::Fuse, addr_a)
+        .await;
+    mgr.register_session(client_b, ClientType::Fuse, addr_b)
+        .await;
     let mut rx_a = mgr.register_notification_channel(client_a).await;
     let mut rx_b = mgr.register_notification_channel(client_b).await;
 
@@ -156,12 +163,14 @@ async fn test_invalidation_e2e_multiple_clients_isolation() {
     cache_b.insert(make_entry(300, 1, "shared.txt", 1));
 
     // Notify only Client A about inode 300 change
-    let processed_a =
-        simulate_server_push(&mgr, client_a, 300, 2, &handler_a, &mut rx_a).await;
+    let processed_a = simulate_server_push(&mgr, client_a, 300, 2, &handler_a, &mut rx_a).await;
     assert_eq!(processed_a, 1);
 
     // Client A's cache should be cleared
-    assert!(cache_a.get_inode(300).is_none(), "Client A should be invalidated");
+    assert!(
+        cache_a.get_inode(300).is_none(),
+        "Client A should be invalidated"
+    );
     // Client B's cache should remain untouched
     assert!(
         cache_b.get_inode(300).is_some(),
@@ -169,10 +178,12 @@ async fn test_invalidation_e2e_multiple_clients_isolation() {
     );
 
     // Now notify Client B as well
-    let processed_b =
-        simulate_server_push(&mgr, client_b, 300, 2, &handler_b, &mut rx_b).await;
+    let processed_b = simulate_server_push(&mgr, client_b, 300, 2, &handler_b, &mut rx_b).await;
     assert_eq!(processed_b, 1);
-    assert!(cache_b.get_inode(300).is_none(), "Client B should now be invalidated too");
+    assert!(
+        cache_b.get_inode(300).is_none(),
+        "Client B should now be invalidated too"
+    );
 }
 
 #[tokio::test]
@@ -195,8 +206,18 @@ async fn test_invalidation_e2e_broadcast_all_clients() {
 
     let client_a: u64 = 3001;
     let client_b: u64 = 3002;
-    mgr.register_session(client_a, ClientType::Fuse, "127.0.0.1:9201".parse().unwrap()).await;
-    mgr.register_session(client_b, ClientType::Fuse, "127.0.0.1:9202".parse().unwrap()).await;
+    mgr.register_session(
+        client_a,
+        ClientType::Fuse,
+        "127.0.0.1:9201".parse().unwrap(),
+    )
+    .await;
+    mgr.register_session(
+        client_b,
+        ClientType::Fuse,
+        "127.0.0.1:9202".parse().unwrap(),
+    )
+    .await;
     let mut rx_a = mgr.register_notification_channel(client_a).await;
     let mut rx_b = mgr.register_notification_channel(client_b).await;
 
@@ -228,7 +249,12 @@ async fn test_invalidation_e2e_zero_inode_ignored() {
     let handler = InvalidateHandler::new(cache.clone());
 
     let client_id: u64 = 4001;
-    mgr.register_session(client_id, ClientType::Fuse, "127.0.0.1:9301".parse().unwrap()).await;
+    mgr.register_session(
+        client_id,
+        ClientType::Fuse,
+        "127.0.0.1:9301".parse().unwrap(),
+    )
+    .await;
     let mut rx = mgr.register_notification_channel(client_id).await;
 
     // Send notification with inode=0 (should be ignored by handler)
@@ -245,7 +271,12 @@ async fn test_invalidation_e2e_multiple_inodes() {
     let handler = InvalidateHandler::new(cache.clone());
 
     let client_id: u64 = 5001;
-    mgr.register_session(client_id, ClientType::Fuse, "127.0.0.1:9401".parse().unwrap()).await;
+    mgr.register_session(
+        client_id,
+        ClientType::Fuse,
+        "127.0.0.1:9401".parse().unwrap(),
+    )
+    .await;
     let mut rx = mgr.register_notification_channel(client_id).await;
 
     // Cache multiple inodes
@@ -280,7 +311,12 @@ async fn test_invalidation_e2e_idempotent_same_version() {
     let handler = InvalidateHandler::new(cache.clone());
 
     let client_id: u64 = 6001;
-    mgr.register_session(client_id, ClientType::Fuse, "127.0.0.1:9501".parse().unwrap()).await;
+    mgr.register_session(
+        client_id,
+        ClientType::Fuse,
+        "127.0.0.1:9501".parse().unwrap(),
+    )
+    .await;
     let mut rx = mgr.register_notification_channel(client_id).await;
 
     cache.insert(make_entry(500, 1, "stable.txt", 5));

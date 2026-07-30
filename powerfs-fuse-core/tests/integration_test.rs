@@ -14,9 +14,17 @@ use powerfs_fuse_core::*;
 /// 测试 FuseClientFacadeConfig 创建
 #[test]
 fn test_facade_config_creation() {
-    let config = FuseClientFacadeConfig::default();
+    let config = FuseClientFacadeConfig::new(
+        "127.0.0.1".to_string(),
+        9333,
+        8901,
+        vec!["127.0.0.1".to_string()],
+        "127.0.0.1".to_string(),
+        9343,
+    )
+    .unwrap();
 
-    // 验证默认值
+    // 验证配置值
     assert_eq!(config.master_addr, "127.0.0.1");
     assert_eq!(config.master_port, 9333);
     assert_eq!(config.filer_addr, "127.0.0.1");

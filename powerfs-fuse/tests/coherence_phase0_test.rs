@@ -25,7 +25,7 @@ fn make_entry(inode: u64, parent: u64, name: &str, is_dir: bool) -> CachedEntry 
         content_size: 0,
         disk_size: 0,
         generation: 1,
-            cached_at: Instant::now(),
+        cached_at: Instant::now(),
     }
 }
 

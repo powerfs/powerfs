@@ -895,7 +895,9 @@ impl MetaShardManager {
 
         let store = store.ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-        let mut inode_info = store.get_inode(inode).ok_or_else(|| "inode not found".to_string())?;
+        let mut inode_info = store
+            .get_inode(inode)
+            .ok_or_else(|| "inode not found".to_string())?;
 
         // Build CRDT MetaState from current inode
         let mut state = crate::crdt_meta::MetaState {
@@ -1237,9 +1239,37 @@ impl MetaShardManager {
             name: "/".to_string(),
             inode: POSIX_ROOT_INODE,
         };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        let data = cmd.serialize();
+
+        // Retry propose with backoff to handle leader election
+        let mut propose_retries = 0;
+        loop {
+            match self
+                .raft_group_manager
+                .propose(shard_id, data.clone())
+                .await
+            {
+                Ok(_) => break,
+                Err(e) => {
+                    if e.contains("not the leader") {
+                        propose_retries += 1;
+                        if propose_retries >= 30 {
+                            return Err(format!(
+                                "failed to propose POSIX root: leader election timeout after {} retries",
+                                propose_retries
+                            ));
+                        }
+                        debug!(
+                            "Waiting for Raft leader election (retry {}/30)...",
+                            propose_retries
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    } else {
+                        return Err(format!("failed to propose POSIX root: {}", e));
+                    }
+                }
+            }
+        }
 
         // Wait for apply
         let mut retries = 0;
@@ -2079,10 +2109,14 @@ impl MetaShardManager {
     /// 每 `interval_secs` 秒执行一次 `crdt_maintenance`：
     /// - Tombstone TTL 默认 24 小时
     /// - 每个 shard 的 Delta Log 在超过 50% 容量时压缩
-    pub fn spawn_crdt_maintenance(self: &Arc<Self>, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_crdt_maintenance(
+        self: &Arc<Self>,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
         let mgr = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -2094,10 +2128,7 @@ impl MetaShardManager {
                         tombstone_cleaned, orset_count, delta_trimmed
                     );
                 } else {
-                    debug!(
-                        "CRDT maintenance heartbeat: orset_states={}",
-                        orset_count
-                    );
+                    debug!("CRDT maintenance heartbeat: orset_states={}", orset_count);
                 }
             }
         })
@@ -2119,7 +2150,8 @@ mod tests {
     use crate::shard_strategy::ShardStrategy;
 
     fn make_manager() -> Arc<MetaShardManager> {
-        let tmp_dir = std::env::temp_dir().join(format!("powerfs-filer-test-{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("powerfs-filer-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_dir);
         let data_path = tmp_dir.to_string_lossy().to_string();
 

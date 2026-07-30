@@ -22,6 +22,8 @@ use std::sync::Arc;
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
     pub shard_strategy: Arc<ShardStrategy>,
+    /// Net port for powerfs-net protocol (used to construct redirect addresses)
+    pub net_port: u16,
     /// Inode notification broadcaster (optional, for cache invalidation)
     pub inode_notifier: Option<Arc<InodeNotifier>>,
 }
@@ -30,10 +32,12 @@ impl FilerNetHandler {
     pub fn new(
         meta_shard_manager: Arc<MetaShardManager>,
         shard_strategy: Arc<ShardStrategy>,
+        net_port: u16,
     ) -> Self {
         Self {
             meta_shard_manager,
             shard_strategy,
+            net_port,
             inode_notifier: None,
         }
     }
@@ -42,11 +46,13 @@ impl FilerNetHandler {
     pub fn with_notifier(
         meta_shard_manager: Arc<MetaShardManager>,
         shard_strategy: Arc<ShardStrategy>,
+        net_port: u16,
         inode_notifier: Arc<InodeNotifier>,
     ) -> Self {
         Self {
             meta_shard_manager,
             shard_strategy,
+            net_port,
             inode_notifier: Some(inode_notifier),
         }
     }
@@ -91,9 +97,14 @@ impl FilerNetHandler {
         {
             Some((true, _)) => Ok(()),
             Some((false, leader_addr)) if !leader_addr.is_empty() => {
-                // Return redirect response with leader address
+                // Convert gRPC address to net address for client redirect
+                // leader_addr is in format "ip:grpc_port" (e.g., "172.21.0.33:8889")
+                // Need to return net address (e.g., "172.21.0.33:8890")
+                let net_addr = Self::grpc_addr_to_net_addr(&leader_addr, self.net_port);
+
+                // Return redirect response with leader net address
                 let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Owner, &leader_addr);
+                let _ = enc.add_string(FieldId::Owner, &net_addr);
                 Err(Self::build_response(
                     msg,
                     STATUS_ERR_REDIRECT,
@@ -112,6 +123,18 @@ impl FilerNetHandler {
                     Vec::new(),
                 ))
             }
+        }
+    }
+
+    /// Convert gRPC address to net address by replacing the port.
+    /// gRPC address format: "ip:grpc_port" (e.g., "172.21.0.33:8889")
+    /// Net address format: "ip:net_port" (e.g., "172.21.0.33:8890")
+    fn grpc_addr_to_net_addr(grpc_addr: &str, net_port: u16) -> String {
+        if let Some(colon_pos) = grpc_addr.rfind(':') {
+            let ip_part = &grpc_addr[..colon_pos];
+            format!("{}:{}", ip_part, net_port)
+        } else {
+            grpc_addr.to_string()
         }
     }
 
@@ -150,17 +173,36 @@ impl FilerNetHandler {
             msg.header.seq, parent_ino, name
         );
 
-        // Root lookup - return root entry
-        if parent_ino == POSIX_ROOT_INODE && name.is_empty() {
-            let mut enc = TlvEncoder::new();
-            enc.add_u64(FieldId::Ino, POSIX_ROOT_INODE);
-            enc.add_u32(FieldId::Mode, 0o40755);
-            enc.add_u32(FieldId::Uid, 0);
-            enc.add_u32(FieldId::Gid, 0);
-            enc.add_u64(FieldId::Size, 0);
-            enc.add_u32(FieldId::Nlink, 2);
-            enc.add_string(FieldId::Name, "")?;
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+        // Root lookup: when client looks up the root directory itself
+        // (parent_ino == root and name is empty or "."), return the actual
+        // root inode data from the database instead of hardcoded values
+        if parent_ino == POSIX_ROOT_INODE && (name.is_empty() || name == ".") {
+            info!("FILER_NET_LOOKUP: root lookup, fetching root inode from database");
+            match self.meta_shard_manager.get_inode(POSIX_ROOT_INODE) {
+                Some(info) => {
+                    let entry_info = Self::inode_to_entry_info(&info);
+                    info!(
+                        "FILER_NET_LOOKUP: root ino={}, mode={:o}, is_dir={}",
+                        entry_info.ino, entry_info.mode, entry_info.is_dir
+                    );
+                    let mut enc = TlvEncoder::new();
+                    enc.add_u64(FieldId::Ino, entry_info.ino);
+                    enc.add_u32(FieldId::Mode, entry_info.mode);
+                    enc.add_u32(FieldId::Uid, entry_info.uid);
+                    enc.add_u32(FieldId::Gid, entry_info.gid);
+                    enc.add_u64(FieldId::Size, entry_info.size);
+                    enc.add_u32(FieldId::Nlink, entry_info.nlink);
+                    enc.add_u64(FieldId::Mtime, entry_info.mtime);
+                    enc.add_u64(FieldId::Atime, entry_info.atime);
+                    enc.add_u64(FieldId::Ctime, entry_info.ctime);
+                    enc.add_string(FieldId::Name, &entry_info.name)?;
+                    return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                }
+                None => {
+                    warn!("FILER_NET_LOOKUP: root inode not found in database - init may not have been run");
+                    return Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()));
+                }
+            }
         }
 
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
@@ -209,17 +251,6 @@ impl FilerNetHandler {
 
         info!("FILER_NET_GETATTR: ino={}", ino);
 
-        if ino == POSIX_ROOT_INODE {
-            let mut enc = TlvEncoder::new();
-            enc.add_u64(FieldId::Ino, POSIX_ROOT_INODE);
-            enc.add_u32(FieldId::Mode, 0o40755);
-            enc.add_u32(FieldId::Uid, 0);
-            enc.add_u32(FieldId::Gid, 0);
-            enc.add_u64(FieldId::Size, 0);
-            enc.add_u32(FieldId::Nlink, 2);
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
-        }
-
         match self.meta_shard_manager.get_inode(ino) {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
@@ -234,9 +265,19 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+                info!(
+                    "FILER_NET_GETATTR: returned info for ino={}, name={}",
+                    ino, entry_info.name
+                );
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
-            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+            None => {
+                warn!(
+                    "FILER_NET_GETATTR: ino={} not found in meta_shard_manager",
+                    ino
+                );
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
         }
     }
 

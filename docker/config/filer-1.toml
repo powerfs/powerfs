@@ -26,11 +26,12 @@ initial_volume_count = 4
 port = 8888                    # HTTP端口
 grpc_port = 8889               # gRPC端口
 net_port = 8890                # powerfs-net端口
+ip = "0.0.0.0"             # 绑定所有接口
 master_addresses = ["172.21.0.11:9333"]
 data_dir = "/data/filer"
 shard_count = 2
 raft_id = 1
-raft_peers = ["172.21.0.31:8889", "172.21.0.32:8889"]
+raft_peers = ["172.21.0.31:8889", "172.21.0.32:8889", "172.21.0.33:8889"]
 
 [s3]
 port = 9000

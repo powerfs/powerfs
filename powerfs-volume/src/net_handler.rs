@@ -25,6 +25,8 @@ impl VolumeNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        // inode for lease validation (lease is registered by inode, not file_key)
+        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
         let holder_client_id = dec
@@ -32,9 +34,10 @@ impl VolumeNetHandler {
             .unwrap_or_else(|_| session_client_id.to_string());
 
         info!(
-            "NET_WRITE_NEEDLE: volume_id={}, file_key={}, size={}, has_lease={}, holder={}",
+            "NET_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, size={}, has_lease={}, holder={}",
             volume_id,
             file_key,
+            inode,
             data.len(),
             !lease_token.is_empty(),
             holder_client_id
@@ -45,7 +48,7 @@ impl VolumeNetHandler {
             let validation_result = lease_mgr.validate_token_with_grace_period(
                 &lease_token,
                 &holder_client_id,
-                file_key,
+                inode,
                 3000,
             );
             match validation_result {
@@ -255,6 +258,7 @@ impl VolumeNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
         let entries = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
@@ -263,8 +267,8 @@ impl VolumeNetHandler {
             .unwrap_or_else(|_| session_client_id.to_string());
 
         info!(
-            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, entries={}, has_lease={}, holder={}",
-            volume_id, file_key, entries, !lease_token.is_empty(), holder_client_id
+            "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, entries={}, has_lease={}, holder={}",
+            volume_id, file_key, inode, entries, !lease_token.is_empty(), holder_client_id
         );
 
         if !lease_token.is_empty() {
@@ -272,7 +276,7 @@ impl VolumeNetHandler {
             let validation_result = lease_mgr.validate_token_with_grace_period(
                 &lease_token,
                 &holder_client_id,
-                file_key,
+                inode,
                 3000,
             );
             match validation_result {

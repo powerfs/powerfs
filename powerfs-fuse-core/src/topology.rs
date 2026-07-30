@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::circuit_breaker::CircuitBreaker;
 use powerfs_net as net;
@@ -505,7 +505,7 @@ impl MasterClient {
         }
     }
 
-    /// 获取拓扑信息
+    /// 获取拓扑信息（带重试机制，处理leader选举不稳定的情况）
     pub async fn fetch_topology(&self) -> Result<ClusterTopology, MasterClientError> {
         if !self.topology_manager.can_request() {
             return Err(MasterClientError::CircuitOpen);
@@ -517,8 +517,9 @@ impl MasterClient {
 
         let body = vec![];
 
-        // Try up to 2 times: first attempt may return redirect if connected to follower
-        for attempt in 1..=2 {
+        // Try up to 5 times with exponential backoff: handles leader election instability
+        const MAX_REDIRECT_ATTEMPTS: u32 = 5;
+        for attempt in 1..=MAX_REDIRECT_ATTEMPTS {
             let net_client = self.net_client();
             let response = net_client
                 .send_request(net::MsgType::GetTopology, &body, &[])
@@ -545,10 +546,15 @@ impl MasterClient {
                     }
 
                     log::info!(
-                        "fetch_topology: redirected to leader at {} (attempt {})",
+                        "fetch_topology: redirected to leader at {} (attempt {}/{})",
                         leader_addr,
-                        attempt
+                        attempt,
+                        MAX_REDIRECT_ATTEMPTS
                     );
+
+                    // Exponential backoff before reconnecting
+                    let delay_ms = (100u64) << (attempt - 1).min(4); // 100ms, 200ms, 400ms, 800ms, 1600ms
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
                     // Reconnect to the actual leader and retry
                     self.reconnect(&leader_addr).await?;

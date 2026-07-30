@@ -201,7 +201,10 @@ impl ServerConnectionManager {
             if let Some(tx) = channels.remove(&client_id) {
                 // Drop the sender, which will signal the receiver to close
                 drop(tx);
-                log::debug!("[Server] Removed notification channel for client {}", client_id);
+                log::debug!(
+                    "[Server] Removed notification channel for client {}",
+                    client_id
+                );
             }
         }
 
@@ -433,10 +436,7 @@ impl ServerConnectionManager {
                 }
             }
         } else {
-            log::debug!(
-                "[Server] No notification channel for client {}",
-                client_id
-            );
+            log::debug!("[Server] No notification channel for client {}", client_id);
             Err(NetError::Connection(format!(
                 "Client {} not found",
                 client_id

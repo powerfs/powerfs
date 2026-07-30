@@ -195,6 +195,52 @@ services:
       master-1:
         condition: service_healthy
 
+  # ── Wave 3a: Initialize Filer Metadata (run once to create POSIX root) ──
+  init-filer-1:
+    image: powerfs:latest
+    container_name: init-filer-1-test
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.30
+    command: /app/powerfs-init --config /config/filer-1.toml
+    volumes:
+      - filer-1-data:/data/filer
+      - ./config:/config:ro
+    depends_on:
+      master-1:
+        condition: service_healthy
+    restart: "no"
+
+  init-filer-2:
+    image: powerfs:latest
+    container_name: init-filer-2-test
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.34
+    command: /app/powerfs-init --config /config/filer-2.toml
+    volumes:
+      - filer-2-data:/data/filer
+      - ./config:/config:ro
+    depends_on:
+      master-1:
+        condition: service_healthy
+    restart: "no"
+
+  init-filer-3:
+    image: powerfs:latest
+    container_name: init-filer-3-test
+    networks:
+      powerfs-network:
+        ipv4_address: 172.21.0.35
+    command: /app/powerfs-init --config /config/filer-3.toml
+    volumes:
+      - filer-3-data:/data/filer
+      - ./config:/config:ro
+    depends_on:
+      master-1:
+        condition: service_healthy
+    restart: "no"
+
   # ── Wave 3b: Filers ──
   filer-1:
     image: powerfs:latest
@@ -219,8 +265,12 @@ services:
       retries: 3
       start_period: 10s
     depends_on:
-      master-1:
-        condition: service_healthy
+      init-filer-1:
+        condition: service_completed_successfully
+      init-filer-2:
+        condition: service_completed_successfully
+      init-filer-3:
+        condition: service_completed_successfully
 
   filer-2:
     image: powerfs:latest
@@ -243,10 +293,14 @@ services:
       interval: 3s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     depends_on:
-      filer-1:
-        condition: service_healthy
+      init-filer-1:
+        condition: service_completed_successfully
+      init-filer-2:
+        condition: service_completed_successfully
+      init-filer-3:
+        condition: service_completed_successfully
 
   filer-3:
     image: powerfs:latest
@@ -269,10 +323,14 @@ services:
       interval: 3s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     depends_on:
-      filer-2:
-        condition: service_healthy
+      init-filer-1:
+        condition: service_completed_successfully
+      init-filer-2:
+        condition: service_completed_successfully
+      init-filer-3:
+        condition: service_completed_successfully
 
   # ── Wave 4: FUSE Client ──
   fuse-test:

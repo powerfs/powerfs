@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use log::error;
+
 use crate::client_identity::ClientIdentity;
 use crate::meta_shard_client::{
     default_msg_type_for_kind, MetaShardClient, MetaShardClientConfig, RequestResult,
@@ -276,11 +278,36 @@ impl FuseClientFacade {
             .await
             .map_err(|e| format!("Failed to connect to master: {}", e))?;
 
-        // 获取初始拓扑
-        let topology = master_client
-            .fetch_topology()
-            .await
-            .map_err(|e| format!("Failed to fetch topology: {}", e))?;
+        // 获取初始拓扑（带重试机制，处理leader选举不稳定的情况）
+        let max_retries = 5;
+        let mut topology = None;
+        for retry in 1..=max_retries {
+            match master_client.fetch_topology().await {
+                Ok(top) => {
+                    topology = Some(top);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "FuseClientFacade: fetch_topology failed (attempt {}/{}): {}",
+                        retry,
+                        max_retries,
+                        e
+                    );
+                    if retry < max_retries {
+                        let delay_ms = (500u64) << (retry - 1).min(3); // 500ms, 1s, 2s, 4s
+                        log::info!("FuseClientFacade: retrying in {}ms...", delay_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    } else {
+                        return Err(format!(
+                            "Failed to fetch topology after {} attempts: {}",
+                            max_retries, e
+                        ));
+                    }
+                }
+            }
+        }
+        let topology = topology.ok_or_else(|| "Failed to get topology".to_string())?;
         master_client.update_topology(topology);
 
         // 创建 MetaShard 客户端（会自动创建自己的网络连接池）
@@ -693,10 +720,8 @@ impl SyncFuseClientFacade {
 
     /// 从缓存获取 Volume 地址（优先使用缓存，仅在未命中时回退查询）
     pub fn get_volume_addr(&self, volume_id: u64) -> Result<String, String> {
-        println!("DEBUG get_volume_addr: volume_id={}", volume_id);
         // 1. 首先尝试从 VolumeClient 缓存获取
         if let Some(vol_info) = self.facade.volume_client().get_volume(volume_id) {
-            println!("DEBUG get_volume_addr: cache hit, addr={}", vol_info.addr);
             log::debug!(
                 "get_volume_addr: cache hit for volume_id={}, addr={}",
                 volume_id,
@@ -761,15 +786,25 @@ impl SyncFuseClientFacade {
     }
 
     pub fn get_entry_by_inode(&self, inode: u64) -> Result<Option<(ProtoEntry, String)>, String> {
+        error!(
+            "[DEBUG_SYNC] SyncFuseClientFacade::get_entry_by_inode called: inode={}",
+            inode
+        );
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        let result = self.runtime.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             let result = provider
                 .get_entry_by_inode(inode)
                 .await
                 .map_err(pfe_to_string)?;
             Ok(result.map(|(e, p)| (traits_entry_to_proto(&e), p)))
-        })
+        });
+        error!(
+            "[DEBUG_SYNC] SyncFuseClientFacade::get_entry_by_inode result: inode={}, is_ok={}",
+            inode,
+            result.is_ok()
+        );
+        result
     }
 
     pub fn create_entry(&self, entry: &ProtoEntry, client_id: &str) -> Result<u64, String> {
@@ -1020,6 +1055,31 @@ impl SyncFuseClientFacade {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_blob_with_lease(
+        &self,
+        volume_addr: &str,
+        volume_id: u64,
+        file_key: u64,
+        inode: u64,
+        offset: i64,
+        size: i32,
+        data: Vec<u8>,
+        lease_token: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = volume_addr;
+        let facade = self.facade.clone();
+        let lease_owned = lease_token.map(|s| s.to_string());
+        self.runtime.block_on(async move {
+            let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
+            let lease_ref = lease_owned.as_deref();
+            provider
+                .write_blob_with_lease(volume_id, file_key, inode, offset, size, &data, lease_ref)
+                .await
+                .map_err(pfe_to_string)
+        })
+    }
+
     pub fn read_blob(
         &self,
         volume_addr: &str,
@@ -1173,18 +1233,14 @@ impl SyncFuseClientFacade {
                 .map(|d| {
                     let mut dec = powerfs_net::TlvDecoder::new(d);
                     dec.next_string(powerfs_net::FieldId::SymlinkTarget)
-                            .unwrap_or_default()
+                        .unwrap_or_default()
                 })
                 .or_else(|| {
-                    result
-                        .data
-                        .as_deref()
-                        .filter(|d| !d.is_empty())
-                        .map(|d| {
-                            let mut dec = powerfs_net::TlvDecoder::new(d);
-                            dec.next_string(powerfs_net::FieldId::SymlinkTarget)
-                                    .unwrap_or_default()
-                        })
+                    result.data.as_deref().filter(|d| !d.is_empty()).map(|d| {
+                        let mut dec = powerfs_net::TlvDecoder::new(d);
+                        dec.next_string(powerfs_net::FieldId::SymlinkTarget)
+                            .unwrap_or_default()
+                    })
                 })
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "Failed to parse symlink target from response".to_string())?;

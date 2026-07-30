@@ -22,7 +22,10 @@ const SNAPSHOT_THRESHOLD: u64 = 10000;
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub id: u64,
+    /// gRPC address for Raft communication (e.g., "172.21.0.31:8889")
     pub address: String,
+    /// powerfs-net address for client connections (e.g., "172.21.0.31:8890")
+    pub net_address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]

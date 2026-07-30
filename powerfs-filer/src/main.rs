@@ -67,7 +67,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let s3_address = format!("{}:{}", bind_ip, port);
     let grpc_address = format!("{}:{}", bind_ip, grpc_port);
     let net_address = format!("{}:{}", bind_ip, net_port);
-    let raft_address = format!("{}:{}", bind_ip, grpc_port + 1);
+    // Raft communication uses gRPC port since Raft messages are sent via gRPC
+    let raft_address = format!("{}:{}", bind_ip, grpc_port);
 
     info!("  S3 Address: {}", s3_address);
     info!("  gRPC Address: {}", grpc_address);
@@ -134,15 +135,26 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         vec![powerfs_filer::Peer {
             id: filer_cfg.raft_id,
             address: raft_address.clone(),
+            net_address: net_address.clone(),
         }]
     } else {
         filer_cfg
             .raft_peers
             .iter()
             .enumerate()
-            .map(|(i, addr)| powerfs_filer::Peer {
-                id: (i + 1) as u64,
-                address: addr.clone(),
+            .map(|(i, addr)| {
+                // Convert gRPC address to net address
+                let net_addr = if let Some(colon_pos) = addr.rfind(':') {
+                    let ip_part = &addr[..colon_pos];
+                    format!("{}:{}", ip_part, net_port)
+                } else {
+                    addr.clone()
+                };
+                powerfs_filer::Peer {
+                    id: (i + 1) as u64,
+                    address: addr.clone(),
+                    net_address: net_addr,
+                }
             })
             .collect()
     };
@@ -160,6 +172,9 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             .map_err(|e| PowerFsError::Internal(format!("failed to create shard {}: {}", i, e)))?;
         info!("Shard {} initialized", i);
     }
+
+    // Load existing root inodes from shard stores (for persistence across restarts)
+    meta_shard_manager.load_root_inodes_from_shards();
 
     let shard_scheduler = Arc::new(ShardScheduler::new(
         raft_group_manager.clone(),
@@ -180,11 +195,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     info!("ShardScheduler started with {} nodes", peers.len());
 
     // 启动后台 CRDT 维护任务：定期清理过期 Tombstone、压缩 Delta Log
-    // 默认每 60 秒检查一次；实际清理发生在 tombstone 过期（24h）或
-    // Delta Log 超过 50% 容量时。
-    let crdt_maintenance_interval_secs = filer_cfg
-        .crdt_maintenance_interval_secs
-        .unwrap_or(60);
+    let crdt_maintenance_interval_secs = filer_cfg.crdt_maintenance_interval_secs.unwrap_or(60);
     let _crdt_handle = meta_shard_manager.spawn_crdt_maintenance(crdt_maintenance_interval_secs);
     info!(
         "CRDT maintenance task started (interval={}s)",
@@ -234,6 +245,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         let net_handler = Arc::new(FilerNetHandler::new(
             meta_shard_manager.clone(),
             shard_strategy.clone(),
+            net_port,
         ));
 
         // Wrap with ManagedNetHandler for session management + middleware

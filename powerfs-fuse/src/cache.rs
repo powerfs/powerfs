@@ -245,6 +245,7 @@ impl MetadataCache {
         // - If the inode exists but name/parent changed: treat as rename, update the entry
         // - If the inode exists with same name/parent: treat as hard link, preserve
         //   the original hard_link_id and update hard_link_counter if provided
+        // Always update cached_at to prevent premature expiration
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(existing) = cache.get_mut(&inode) {
             if existing.name != entry.name || existing.parent != entry.parent {
@@ -258,6 +259,8 @@ impl MetadataCache {
                 if entry.hard_link_counter > 0 {
                     existing.hard_link_counter = entry.hard_link_counter;
                 }
+                // Always update cached_at to prevent TTL expiration issues
+                existing.cached_at = Instant::now();
             }
         } else {
             cache.put(inode, entry);
@@ -780,7 +783,7 @@ impl MetadataCache {
                 content_size: 4096,
                 disk_size: 4096,
                 generation: 1,
-            cached_at: Instant::now(),
+                cached_at: Instant::now(),
             },
         );
         drop(cache);
@@ -968,7 +971,7 @@ mod tests {
                 content_size: 0,
                 disk_size: 0,
                 generation: 0,
-            cached_at: Instant::now(),
+                cached_at: Instant::now(),
             });
         }
 

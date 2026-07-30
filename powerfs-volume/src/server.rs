@@ -13,8 +13,8 @@ use powerfs_common::{
     types::{NeedleId, NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::time;

@@ -401,8 +401,7 @@ impl PowerFsNetServer {
 
                 // Use a timeout to periodically check for notifications
                 let read_future = s.read_exact(&mut hdr_buf);
-                match tokio::time::timeout(std::time::Duration::from_millis(100), read_future)
-                    .await
+                match tokio::time::timeout(std::time::Duration::from_millis(100), read_future).await
                 {
                     Ok(result) => result.map(|_| hdr_buf),
                     Err(_) => {
@@ -433,10 +432,8 @@ impl PowerFsNetServer {
 
             // Handle read result
             let header = match read_result {
-                Ok(hdr_buf) => {
-                    FrameHeader::decode(&hdr_buf)
-                        .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?
-                }
+                Ok(hdr_buf) => FrameHeader::decode(&hdr_buf)
+                    .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         info!("Client disconnected");
