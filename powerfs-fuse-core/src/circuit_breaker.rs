@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use dashmap::DashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// 熔断器状态
@@ -243,6 +244,77 @@ impl Default for CircuitBreakerBuilder {
     }
 }
 
+/// A pool of circuit breakers, one per backend server address.
+/// Provides precise fault isolation: only the failed server's requests are rejected.
+pub struct CircuitBreakerPool {
+    breakers: DashMap<String, Arc<CircuitBreaker>>,
+    default_config: CircuitBreakerConfig,
+}
+
+impl CircuitBreakerPool {
+    pub fn new(default_config: CircuitBreakerConfig) -> Self {
+        Self {
+            breakers: DashMap::new(),
+            default_config,
+        }
+    }
+
+    /// Check if the circuit for the given server address is available.
+    /// Creates a new breaker if none exists for this address.
+    pub fn check(&self, addr: &str) -> bool {
+        self.get_or_create(addr).is_available()
+    }
+
+    /// Record a success for the given server address.
+    pub fn record_success(&self, addr: &str) {
+        self.get_or_create(addr).record_success();
+    }
+
+    /// Record a failure for the given server address.
+    pub fn record_failure(&self, addr: &str) {
+        self.get_or_create(addr).record_failure();
+    }
+
+    /// Get the current circuit state for the given server.
+    pub fn state(&self, addr: &str) -> CircuitState {
+        self.get_or_create(addr).state()
+    }
+
+    /// Reset the circuit for the given server.
+    pub fn reset(&self, addr: &str) {
+        self.get_or_create(addr).reset();
+    }
+
+    /// Remove the circuit for the given server (when server is decommissioned).
+    pub fn remove(&self, addr: &str) {
+        self.breakers.remove(addr);
+    }
+
+    /// Get or create a circuit breaker for the given address.
+    fn get_or_create(&self, addr: &str) -> Arc<CircuitBreaker> {
+        self.breakers
+            .entry(addr.to_string())
+            .or_insert_with(|| Arc::new(CircuitBreaker::new(self.default_config.clone())))
+            .clone()
+    }
+
+    /// Get the number of tracked servers.
+    pub fn len(&self) -> usize {
+        self.breakers.len()
+    }
+
+    /// Check if the pool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.breakers.is_empty()
+    }
+}
+
+impl Default for CircuitBreakerPool {
+    fn default() -> Self {
+        Self::new(CircuitBreakerConfig::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +485,134 @@ mod tests {
             .build();
 
         assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    // CircuitBreakerPool tests
+
+    #[test]
+    fn test_pool_isolation() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let pool = CircuitBreakerPool::new(config);
+
+        let addr_a = "172.20.0.21:8080";
+        let addr_b = "172.20.0.22:8080";
+
+        // Both start available
+        assert!(pool.check(addr_a));
+        assert!(pool.check(addr_b));
+
+        // Fail server A 3 times to trip its breaker
+        for _ in 0..3 {
+            pool.record_failure(addr_a);
+        }
+
+        // Server A should be open, but server B should still be available
+        assert!(!pool.check(addr_a));
+        assert!(pool.check(addr_b));
+        assert_eq!(pool.state(addr_a), CircuitState::Open);
+        assert_eq!(pool.state(addr_b), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_pool_independent_recovery() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            recovery_timeout: Duration::from_millis(50),
+            half_open_max_requests: 1,
+        };
+        let pool = CircuitBreakerPool::new(config);
+
+        let addr_a = "172.20.0.21:8080";
+        let addr_b = "172.20.0.22:8080";
+
+        // Trip server A
+        pool.record_failure(addr_a);
+        pool.record_failure(addr_a);
+        assert!(!pool.check(addr_a));
+
+        // Trip server B
+        pool.record_failure(addr_b);
+        pool.record_failure(addr_b);
+        assert!(!pool.check(addr_b));
+
+        // Reset only server A
+        pool.reset(addr_a);
+        assert!(pool.check(addr_a));
+        assert!(!pool.check(addr_b)); // B still open
+
+        // Server A recovery does NOT affect server B
+        assert_eq!(pool.state(addr_a), CircuitState::Closed);
+        assert_eq!(pool.state(addr_b), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_pool_auto_create() {
+        let pool = CircuitBreakerPool::default();
+
+        // First check auto-creates a breaker
+        assert!(pool.check("new-server:9999"));
+        assert_eq!(pool.len(), 1);
+
+        // Second check on same server reuses the breaker
+        assert!(pool.check("new-server:9999"));
+        assert_eq!(pool.len(), 1);
+
+        // Different address creates a new breaker
+        assert!(pool.check("another-server:8888"));
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_pool_remove() {
+        let pool = CircuitBreakerPool::default();
+
+        pool.check("server-a:8080");
+        pool.check("server-b:8080");
+        assert_eq!(pool.len(), 2);
+
+        pool.remove("server-a:8080");
+        assert_eq!(pool.len(), 1);
+
+        // After removal, a new breaker is created on next check
+        pool.check("server-a:8080");
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_pool_failure_recording() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        };
+        let pool = CircuitBreakerPool::new(config);
+
+        let addr = "server:8080";
+
+        // First failure doesn't trip
+        pool.record_failure(addr);
+        assert!(pool.check(addr));
+        assert_eq!(pool.state(addr), CircuitState::Closed);
+
+        // Second failure trips
+        pool.record_failure(addr);
+        assert!(!pool.check(addr));
+        assert_eq!(pool.state(addr), CircuitState::Open);
+
+        // Success on a different server doesn't affect the failed one
+        pool.record_success("other:9090");
+        assert_eq!(pool.state(addr), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_pool_empty() {
+        let pool = CircuitBreakerPool::default();
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
+
+        pool.check("server:8080");
+        assert!(!pool.is_empty());
     }
 }

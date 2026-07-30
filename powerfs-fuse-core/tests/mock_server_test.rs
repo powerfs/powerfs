@@ -327,7 +327,13 @@ async fn test_facade_end_to_end_with_mock_servers() {
         .await
         .expect("Failed to create facade");
 
-    // ---- Setup routing info ----
+    // Initialize clients first (loads topology, sets state to Ready)
+    // Need to set default filer addr before init for default routes
+    facade.meta_shard_client().set_default_filer_addr("127.0.0.1:19343".to_string());
+    facade.meta_shard_client().init();
+    facade.volume_client().init();
+
+    // ---- Setup routing info AFTER init (init may sync from topology) ----
     // shard 0 is used by FacadeVolumeProvider::assign_volume (hardcoded shard_id=0)
     facade
         .meta_shard_client()
@@ -335,10 +341,14 @@ async fn test_facade_end_to_end_with_mock_servers() {
     facade
         .meta_shard_client()
         .set_shard_leader(1, "127.0.0.1:19343".to_string());
-    // volume addr should be just host, port 9344 is hardcoded in get_volume_client
+    // volume addr should include port for proper connection
     facade
         .volume_client()
-        .set_volume_info(1, "127.0.0.1".to_string());
+        .set_volume_info(1, "127.0.0.1:19344".to_string());
+
+    // Start background processors
+    facade.meta_shard_client().start_background_processor();
+    facade.volume_client().start_background_processor();
 
     // Give background processor time to start and process any pending initial requests
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -691,9 +701,20 @@ async fn test_facade_metadata_provider_with_mock() {
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());
+
+    // Initialize clients first
+    facade.meta_shard_client().set_default_filer_addr("127.0.0.1:19543".to_string());
+    facade.meta_shard_client().init();
+    facade.volume_client().init();
+
+    // Setup routing AFTER init
     facade
         .meta_shard_client()
         .set_shard_leader(1, "127.0.0.1:19543".to_string());
+
+    // Start background processors
+    facade.meta_shard_client().start_background_processor();
+    facade.volume_client().start_background_processor();
 
     let provider = FacadeMetadataProvider::new(facade.clone());
 

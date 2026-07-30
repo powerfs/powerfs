@@ -75,8 +75,8 @@ fn test_meta_shard_client_initialization() {
 }
 
 /// 测试 VolumeClient 初始化（不连接网络）
-#[test]
-fn test_volume_client_initialization() {
+#[tokio::test]
+async fn test_volume_client_initialization() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
     let config = VolumeClientConfig::default();
     let mut client = VolumeClient::new(config, topology_manager);
@@ -132,7 +132,7 @@ async fn test_request_submission_without_network() {
             // 应该是网络错误（连接失败或路由未配置）
             assert!(matches!(
                 e,
-                ClientError::Network(_) | ClientError::VolumeNotFound(_)
+                ClientError::Network(_) | ClientError::VolumeNotFound(_) | ClientError::NoShardLeader(_) | ClientError::CircuitOpen
             ));
         }
     }
@@ -282,8 +282,8 @@ fn test_request_id_uniqueness() {
 }
 
 /// 测试关闭和清理
-#[test]
-fn test_client_cleanup() {
+#[tokio::test]
+async fn test_client_cleanup() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
     let meta_config = MetaShardClientConfig::default();
     let volume_config = VolumeClientConfig::default();
