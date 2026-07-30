@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -127,30 +127,26 @@ impl TransportChannel {
     }
 }
 
-/// 请求队列
+/// Lock-free request queue using crossbeam ArrayQueue (MPMC)
 pub struct RequestQueue {
-    pub queue: VecDeque<PendingRequest>,
-    pub max_size: usize,
+    queue: crossbeam_queue::ArrayQueue<PendingRequest>,
 }
 
 impl RequestQueue {
     pub fn new(max_size: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
-            max_size,
+            queue: crossbeam_queue::ArrayQueue::new(max_size),
         }
     }
 
-    pub fn enqueue(&mut self, req: PendingRequest) -> Result<(), String> {
-        if self.queue.len() >= self.max_size {
-            return Err("Queue is full".to_string());
-        }
-        self.queue.push_back(req);
-        Ok(())
+    pub fn enqueue(&self, req: PendingRequest) -> Result<(), String> {
+        self.queue
+            .push(req)
+            .map_err(|_| "Queue is full".to_string())
     }
 
-    pub fn dequeue(&mut self) -> Option<PendingRequest> {
-        self.queue.pop_front()
+    pub fn dequeue(&self) -> Option<PendingRequest> {
+        self.queue.pop()
     }
 
     pub fn len(&self) -> usize {
@@ -159,6 +155,10 @@ impl RequestQueue {
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
     }
 }
 
@@ -216,10 +216,10 @@ pub enum MetaShardClientState {
 pub struct MetaShardClient {
     config: MetaShardClientConfig,
     state: Arc<Mutex<MetaShardClientState>>,
-    /// 数据请求队列
-    data_queue: Arc<Mutex<RequestQueue>>,
-    /// 控制请求队列
-    control_queue: Arc<Mutex<RequestQueue>>,
+    /// 数据请求队列 (lock-free)
+    data_queue: Arc<RequestQueue>,
+    /// 控制请求队列 (lock-free)
+    control_queue: Arc<RequestQueue>,
     /// 数据传输通道
     data_channel: Arc<TransportChannel>,
     /// 控制传输通道
@@ -255,8 +255,8 @@ impl MetaShardClient {
             )),
             data_channel: Arc::new(TransportChannel::new(config.data_channel.clone())),
             control_channel: Arc::new(TransportChannel::new(config.control_channel.clone())),
-            data_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
-            control_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
+            data_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
+            control_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
             shard_router: Arc::new(RwLock::new(HashMap::new())),
             state: Arc::new(Mutex::new(MetaShardClientState::Init)),
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -605,8 +605,7 @@ impl MetaShardClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.data_queue.enqueue(req)?;
 
         *self.state.lock().unwrap() = MetaShardClientState::Processing;
         self.notify.notify_one();
@@ -630,8 +629,7 @@ impl MetaShardClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.control_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.control_queue.enqueue(req)?;
         self.notify.notify_one();
 
         Ok(())
@@ -639,14 +637,12 @@ impl MetaShardClient {
 
     /// 从数据队列获取下一个请求
     pub fn next_data_request(&self) -> Option<PendingRequest> {
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.dequeue()
+        self.data_queue.dequeue()
     }
 
     /// 从控制队列获取下一个请求
     pub fn next_control_request(&self) -> Option<PendingRequest> {
-        let mut queue = self.control_queue.lock().unwrap();
-        queue.dequeue()
+        self.control_queue.dequeue()
     }
 
     /// Resolve shard_id to its Filer server address.
@@ -705,17 +701,14 @@ impl MetaShardClient {
         *self.state.lock().unwrap() = MetaShardClientState::Suspended;
         log::info!("MetaShardClient: Suspended for leader change");
 
-        // 步骤 2: 保存受影响分片的 pending 请求
-        let mut data_queue = self.data_queue.lock().unwrap();
-        let mut control_queue = self.control_queue.lock().unwrap();
-
+        // 步骤 2: 保存受影响分片的 pending 请求 (lock-free drain)
         let mut affected_data_requests = Vec::new();
         let mut unaffected_data_requests = Vec::new();
         let mut affected_control_requests = Vec::new();
         let mut unaffected_control_requests = Vec::new();
 
         // 分离数据队列中的请求
-        while let Some(req) = data_queue.dequeue() {
+        while let Some(req) = self.data_queue.dequeue() {
             if req.shard_id == shard_id {
                 affected_data_requests.push(req);
             } else {
@@ -724,7 +717,7 @@ impl MetaShardClient {
         }
 
         // 分离控制队列中的请求
-        while let Some(req) = control_queue.dequeue() {
+        while let Some(req) = self.control_queue.dequeue() {
             if req.shard_id == shard_id {
                 affected_control_requests.push(req);
             } else {
@@ -763,22 +756,22 @@ impl MetaShardClient {
 
         // 步骤 4: 将未受影响的请求重新入队
         for req in unaffected_data_requests {
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for req in unaffected_control_requests {
-            control_queue.enqueue(req).ok();
+            self.control_queue.enqueue(req).ok();
         }
 
         // 步骤 5: 将受影响的请求重新入队（将由后台处理器自动重放）
         for mut req in affected_data_requests {
             // 重置请求状态，准备重试
             req.context.state = crate::request_state::RequestState::Init;
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for mut req in affected_control_requests {
             // 重置请求状态，准备重试
             req.context.state = crate::request_state::RequestState::Init;
-            control_queue.enqueue(req).ok();
+            self.control_queue.enqueue(req).ok();
         }
 
         // 步骤 6: 恢复客户端，后台处理器将自动消费队列中的请求
@@ -786,8 +779,8 @@ impl MetaShardClient {
         self.notify.notify_one();
         log::info!(
             "MetaShardClient: Resumed with {} data requests and {} control requests in queue",
-            data_queue.len(),
-            control_queue.len()
+            self.data_queue.len(),
+            self.control_queue.len()
         );
     }
 
@@ -896,8 +889,8 @@ impl MetaShardClient {
 
     /// 获取队列状态
     pub fn queue_stats(&self) -> (usize, usize) {
-        let data_len = self.data_queue.lock().unwrap().len();
-        let control_len = self.control_queue.lock().unwrap().len();
+        let data_len = self.data_queue.len();
+        let control_len = self.control_queue.len();
         (data_len, control_len)
     }
 
@@ -914,8 +907,8 @@ impl MetaShardClient {
 /// 处理队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
 async fn process_available_requests(
-    data_queue: &Arc<Mutex<RequestQueue>>,
-    control_queue: &Arc<Mutex<RequestQueue>>,
+    data_queue: &Arc<RequestQueue>,
+    control_queue: &Arc<RequestQueue>,
     data_channel: &Arc<TransportChannel>,
     control_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
@@ -928,10 +921,7 @@ async fn process_available_requests(
 ) -> bool {
     // 优先处理控制请求
     if control_channel.can_accept() {
-        let next_req = {
-            let mut queue = control_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = control_queue.dequeue();
 
         if let Some(req) = next_req {
             log::debug!("MetaShardClient: Processing control request");
@@ -966,10 +956,7 @@ async fn process_available_requests(
 
     // 处理数据请求 - per-server breaker check happens inside process_request_internal
     if data_channel.can_accept() {
-        let next_req = {
-            let mut queue = data_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = data_queue.dequeue();
 
         if let Some(req) = next_req {
             log::debug!("MetaShardClient: Processing data request");

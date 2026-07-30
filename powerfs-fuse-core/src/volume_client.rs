@@ -178,12 +178,12 @@ impl std::fmt::Display for VolumeClientState {
 pub struct VolumeClient {
     config: VolumeClientConfig,
     state: Arc<Mutex<VolumeClientState>>,
-    /// 数据请求队列 (共享读写)
-    data_queue: Arc<Mutex<RequestQueue>>,
-    /// Lease 请求队列
-    lease_queue: Arc<Mutex<RequestQueue>>,
-    /// 管理请求队列
-    mgmt_queue: Arc<Mutex<RequestQueue>>,
+    /// 数据请求队列 (lock-free)
+    data_queue: Arc<RequestQueue>,
+    /// Lease 请求队列 (lock-free)
+    lease_queue: Arc<RequestQueue>,
+    /// 管理请求队列 (lock-free)
+    mgmt_queue: Arc<RequestQueue>,
     /// 数据通道池
     data_channels: Vec<Arc<TransportChannel>>,
     /// Lease 通道
@@ -231,9 +231,9 @@ impl VolumeClient {
             breakers: Arc::new(CircuitBreakerPool::new(
                 config.circuit_breaker_config.clone(),
             )),
-            data_queue: Arc::new(Mutex::new(RequestQueue::new(config.queue_max_size))),
-            lease_queue: Arc::new(Mutex::new(RequestQueue::new(100))),
-            mgmt_queue: Arc::new(Mutex::new(RequestQueue::new(100))),
+            data_queue: Arc::new(RequestQueue::new(config.queue_max_size)),
+            lease_queue: Arc::new(RequestQueue::new(100)),
+            mgmt_queue: Arc::new(RequestQueue::new(100)),
             data_channels,
             lease_channel: Arc::new(TransportChannel::new(config.lease_channel.clone())),
             mgmt_channel: Arc::new(TransportChannel::new(config.mgmt_channel.clone())),
@@ -606,8 +606,7 @@ impl VolumeClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.data_queue.enqueue(req)?;
 
         *self.state.lock().unwrap() = VolumeClientState::Processing;
         self.notify.notify_one();
@@ -630,8 +629,7 @@ impl VolumeClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.lease_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.lease_queue.enqueue(req)?;
         self.notify.notify_one();
         Ok(())
     }
@@ -652,28 +650,24 @@ impl VolumeClient {
             enqueued_at: Instant::now(),
         };
 
-        let mut queue = self.mgmt_queue.lock().unwrap();
-        queue.enqueue(req)?;
+        self.mgmt_queue.enqueue(req)?;
         self.notify.notify_one();
         Ok(())
     }
 
     /// 获取下一个数据请求
     pub fn next_data_request(&self) -> Option<crate::meta_shard_client::PendingRequest> {
-        let mut queue = self.data_queue.lock().unwrap();
-        queue.dequeue()
+        self.data_queue.dequeue()
     }
 
     /// 获取下一个 Lease 请求
     pub fn next_lease_request(&self) -> Option<crate::meta_shard_client::PendingRequest> {
-        let mut queue = self.lease_queue.lock().unwrap();
-        queue.dequeue()
+        self.lease_queue.dequeue()
     }
 
     /// 获取下一个管理请求
     pub fn next_mgmt_request(&self) -> Option<crate::meta_shard_client::PendingRequest> {
-        let mut queue = self.mgmt_queue.lock().unwrap();
-        queue.dequeue()
+        self.mgmt_queue.dequeue()
     }
 
     /// 获取可用的数据通道
@@ -967,11 +961,7 @@ impl VolumeClient {
         *self.state.lock().unwrap() = VolumeClientState::Suspended;
         log::info!("VolumeClient: Suspended for volume change");
 
-        // 步骤 2: 保存受影响 volume 的 pending 请求
-        let mut data_queue = self.data_queue.lock().unwrap();
-        let mut lease_queue = self.lease_queue.lock().unwrap();
-        let mut mgmt_queue = self.mgmt_queue.lock().unwrap();
-
+        // 步骤 2: 保存受影响 volume 的 pending 请求 (lock-free drain)
         let mut affected_data_requests = Vec::new();
         let mut unaffected_data_requests = Vec::new();
         let mut affected_lease_requests = Vec::new();
@@ -980,7 +970,7 @@ impl VolumeClient {
         let mut unaffected_mgmt_requests = Vec::new();
 
         // 分离数据队列
-        while let Some(req) = data_queue.dequeue() {
+        while let Some(req) = self.data_queue.dequeue() {
             if req.shard_id == volume_id {
                 affected_data_requests.push(req);
             } else {
@@ -989,7 +979,7 @@ impl VolumeClient {
         }
 
         // 分离 lease 队列
-        while let Some(req) = lease_queue.dequeue() {
+        while let Some(req) = self.lease_queue.dequeue() {
             if req.shard_id == volume_id {
                 affected_lease_requests.push(req);
             } else {
@@ -998,7 +988,7 @@ impl VolumeClient {
         }
 
         // 分离管理队列
-        while let Some(req) = mgmt_queue.dequeue() {
+        while let Some(req) = self.mgmt_queue.dequeue() {
             if req.shard_id == volume_id {
                 affected_mgmt_requests.push(req);
             } else {
@@ -1026,27 +1016,27 @@ impl VolumeClient {
 
         // 步骤 4: 将未受影响的请求重新入队
         for req in unaffected_data_requests {
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for req in unaffected_lease_requests {
-            lease_queue.enqueue(req).ok();
+            self.lease_queue.enqueue(req).ok();
         }
         for req in unaffected_mgmt_requests {
-            mgmt_queue.enqueue(req).ok();
+            self.mgmt_queue.enqueue(req).ok();
         }
 
         // 步骤 5: 将受影响的请求重新入队（准备重试）
         for mut req in affected_data_requests {
             req.context.state = crate::request_state::RequestState::Init;
-            data_queue.enqueue(req).ok();
+            self.data_queue.enqueue(req).ok();
         }
         for mut req in affected_lease_requests {
             req.context.state = crate::request_state::RequestState::Init;
-            lease_queue.enqueue(req).ok();
+            self.lease_queue.enqueue(req).ok();
         }
         for mut req in affected_mgmt_requests {
             req.context.state = crate::request_state::RequestState::Init;
-            mgmt_queue.enqueue(req).ok();
+            self.mgmt_queue.enqueue(req).ok();
         }
 
         // 步骤 6: 恢复客户端
@@ -1054,17 +1044,17 @@ impl VolumeClient {
         self.notify.notify_one();
         log::info!(
             "VolumeClient: Resumed with queues: data={}, lease={}, mgmt={}",
-            data_queue.len(),
-            lease_queue.len(),
-            mgmt_queue.len()
+            self.data_queue.len(),
+            self.lease_queue.len(),
+            self.mgmt_queue.len()
         );
     }
 
     /// 获取队列统计
     pub fn queue_stats(&self) -> (usize, usize, usize) {
-        let data_len = self.data_queue.lock().unwrap().len();
-        let lease_len = self.lease_queue.lock().unwrap().len();
-        let mgmt_len = self.mgmt_queue.lock().unwrap().len();
+        let data_len = self.data_queue.len();
+        let lease_len = self.lease_queue.len();
+        let mgmt_len = self.mgmt_queue.len();
         (data_len, lease_len, mgmt_len)
     }
 
@@ -1117,7 +1107,7 @@ impl VolumeClient {
                 }
 
                 // Debug: 输出通道和队列状态
-                let data_queue_len = data_queue.lock().unwrap().len();
+                let data_queue_len = data_queue.len();
                 let data_channel_states: Vec<String> = data_channels
                     .iter()
                     .map(|c| format!("name={}, can_accept={}", c.config.name, c.can_accept()))
@@ -1457,9 +1447,9 @@ async fn get_or_create_volume_client_from_pool(
 /// 处理 Volume 队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
 async fn process_volume_available_requests(
-    data_queue: &Arc<Mutex<RequestQueue>>,
-    lease_queue: &Arc<Mutex<RequestQueue>>,
-    mgmt_queue: &Arc<Mutex<RequestQueue>>,
+    data_queue: &Arc<RequestQueue>,
+    lease_queue: &Arc<RequestQueue>,
+    mgmt_queue: &Arc<RequestQueue>,
     data_channels: &[Arc<TransportChannel>],
     lease_channel: &Arc<TransportChannel>,
     mgmt_channel: &Arc<TransportChannel>,
@@ -1472,10 +1462,7 @@ async fn process_volume_available_requests(
 ) -> bool {
     // Lease 通道优先
     if lease_channel.can_accept() {
-        let next_req = {
-            let mut queue = lease_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = lease_queue.dequeue();
         if let Some(req) = next_req {
             let _ = process_lease_request_internal(
                 req,
@@ -1493,10 +1480,7 @@ async fn process_volume_available_requests(
 
     // Mgmt 通道次优先
     if mgmt_channel.can_accept() {
-        let next_req = {
-            let mut queue = mgmt_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = mgmt_queue.dequeue();
         if let Some(req) = next_req {
             let _ = process_mgmt_request_internal(
                 req,
@@ -1514,10 +1498,7 @@ async fn process_volume_available_requests(
 
     // 数据通道池 - per-server breaker check happens inside process_data_request_internal
     if data_channels.iter().any(|c| c.can_accept()) {
-        let next_req = {
-            let mut queue = data_queue.lock().unwrap();
-            queue.dequeue()
-        };
+        let next_req = data_queue.dequeue();
         if let Some(req) = next_req {
             let _ = process_data_request_internal(
                 req,
