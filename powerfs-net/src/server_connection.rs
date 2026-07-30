@@ -19,6 +19,53 @@ use crate::protocol::{ClientType, NetMessage};
 
 use super::request_context::{ClientInfo, RequestContext};
 
+/// Simple token bucket rate limiter for per-client rate limiting
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    max_tokens: u64,
+    refill_rate: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: u64, refill_rate_per_sec: f64) -> Self {
+        Self {
+            max_tokens,
+            refill_rate: refill_rate_per_sec,
+            tokens: max_tokens as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed.
+    pub fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill);
+        let refill = elapsed.as_secs_f64() * self.refill_rate;
+        self.tokens = (self.tokens + refill).min(self.max_tokens as f64);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn available_tokens(&self) -> u64 {
+        self.tokens as u64
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        // 1000 tokens max, 100 tokens/sec refill (10 req/s sustained)
+        Self::new(1000, 100.0)
+    }
+}
+
 /// State of a client session
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -39,6 +86,7 @@ pub struct ClientSession {
     pub last_activity: Instant,
     pub request_count: u64,
     pub error_count: u64,
+    pub rate_limiter: RateLimiter,
 }
 
 impl ClientSession {
@@ -53,7 +101,28 @@ impl ClientSession {
             last_activity: now,
             request_count: 0,
             error_count: 0,
+            rate_limiter: RateLimiter::default(),
         }
+    }
+
+    pub fn with_rate_limiter(
+        client_id: u64,
+        client_type: ClientType,
+        address: SocketAddr,
+        rate_limiter: RateLimiter,
+    ) -> Self {
+        let mut session = Self::new(client_id, client_type, address);
+        session.rate_limiter = rate_limiter;
+        session
+    }
+
+    /// Check if the client is within the rate limit
+    pub fn check_rate_limit(&mut self) -> bool {
+        self.rate_limiter.try_acquire()
+    }
+
+    pub fn available_rate_tokens(&self) -> u64 {
+        self.rate_limiter.available_tokens()
     }
 
     pub fn duration_secs(&self) -> u64 {

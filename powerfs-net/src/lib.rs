@@ -43,6 +43,6 @@ pub use request_context::{ClientInfo, RequestContext, TraceId};
 pub use serialize::{DirEntry, EntryInfo, TlvDecoder, TlvEncoder};
 pub use server::{PowerFsNetHandler, PowerFsNetServer};
 pub use server_connection::{
-    ClientSession, HealthStatus, MetricsSnapshot, ServerConnectionManager, ServerRequestHandler,
-    SessionState,
+    ClientSession, HealthStatus, MetricsSnapshot, RateLimiter, ServerConnectionManager,
+    ServerRequestHandler, SessionState,
 };
