@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,35 @@ use powerfs_net::{ClientConfig, FieldId, PowerFsNetClient};
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
     HashMap<RequestId, oneshot::Sender<Result<RequestResult, ClientError>>>;
+
+/// 调度器统计信息
+#[derive(Debug, Clone)]
+pub struct SchedulerStats {
+    /// 数据队列当前长度
+    pub data_queue_len: usize,
+    /// Lease 队列当前长度
+    pub lease_queue_len: usize,
+    /// 管理队列当前长度
+    pub mgmt_queue_len: usize,
+    /// 数据请求已处理数
+    pub data_processed: u64,
+    /// Lease 请求已处理数
+    pub lease_processed: u64,
+    /// 管理请求已处理数
+    pub mgmt_processed: u64,
+    /// 数据队列历史高水位
+    pub data_high_watermark: usize,
+    /// Lease 队列历史高水位
+    pub lease_high_watermark: usize,
+    /// 管理队列历史高水位
+    pub mgmt_high_watermark: usize,
+    /// 数据处理器是否运行
+    pub data_processor_running: bool,
+    /// Lease 处理器是否运行
+    pub lease_processor_running: bool,
+    /// 管理处理器是否运行
+    pub mgmt_processor_running: bool,
+}
 
 /// Volume 客户端配置
 #[derive(Debug, Clone)]
@@ -214,6 +243,16 @@ pub struct VolumeClient {
     lease_processor_running: Arc<Mutex<bool>>,
     /// 管理处理器运行状态
     mgmt_processor_running: Arc<Mutex<bool>>,
+    /// 数据请求处理计数
+    data_processed_count: Arc<AtomicU64>,
+    /// Lease 请求处理计数
+    lease_processed_count: Arc<AtomicU64>,
+    /// 管理请求处理计数
+    mgmt_processed_count: Arc<AtomicU64>,
+    /// 队列高水位标记 (数据/Lease/管理)
+    data_queue_high_watermark: Arc<AtomicUsize>,
+    lease_queue_high_watermark: Arc<AtomicUsize>,
+    mgmt_queue_high_watermark: Arc<AtomicUsize>,
     /// Lease 续租器运行状态
     lease_renewer_running: Arc<Mutex<bool>>,
     /// Lease 续租间隔
@@ -253,6 +292,12 @@ impl VolumeClient {
             data_processor_running: Arc::new(Mutex::new(false)),
             lease_processor_running: Arc::new(Mutex::new(false)),
             mgmt_processor_running: Arc::new(Mutex::new(false)),
+            data_processed_count: Arc::new(AtomicU64::new(0)),
+            lease_processed_count: Arc::new(AtomicU64::new(0)),
+            mgmt_processed_count: Arc::new(AtomicU64::new(0)),
+            data_queue_high_watermark: Arc::new(AtomicUsize::new(0)),
+            lease_queue_high_watermark: Arc::new(AtomicUsize::new(0)),
+            mgmt_queue_high_watermark: Arc::new(AtomicUsize::new(0)),
             lease_renewer_running: Arc::new(Mutex::new(false)),
             lease_renew_interval,
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -1046,12 +1091,37 @@ impl VolumeClient {
         );
     }
 
-    /// 获取队列统计
+    /// 获取队列统计 (data_len, lease_len, mgmt_len)
     pub fn queue_stats(&self) -> (usize, usize, usize) {
         let data_len = self.data_queue.len();
         let lease_len = self.lease_queue.len();
         let mgmt_len = self.mgmt_queue.len();
         (data_len, lease_len, mgmt_len)
+    }
+
+    /// 获取详细的调度统计信息
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            data_queue_len: self.data_queue.len(),
+            lease_queue_len: self.lease_queue.len(),
+            mgmt_queue_len: self.mgmt_queue.len(),
+            data_processed: self.data_processed_count.load(Ordering::Relaxed),
+            lease_processed: self.lease_processed_count.load(Ordering::Relaxed),
+            mgmt_processed: self.mgmt_processed_count.load(Ordering::Relaxed),
+            data_high_watermark: self.data_queue_high_watermark.load(Ordering::Relaxed),
+            lease_high_watermark: self.lease_queue_high_watermark.load(Ordering::Relaxed),
+            mgmt_high_watermark: self.mgmt_queue_high_watermark.load(Ordering::Relaxed),
+            data_processor_running: *self.data_processor_running.lock().unwrap(),
+            lease_processor_running: *self.lease_processor_running.lock().unwrap(),
+            mgmt_processor_running: *self.mgmt_processor_running.lock().unwrap(),
+        }
+    }
+
+    /// 重置调度统计 (保留高水位标记)
+    pub fn reset_scheduler_stats(&self) {
+        self.data_processed_count.store(0, Ordering::Relaxed);
+        self.lease_processed_count.store(0, Ordering::Relaxed);
+        self.mgmt_processed_count.store(0, Ordering::Relaxed);
     }
 
     /// 关闭
@@ -1089,6 +1159,8 @@ impl VolumeClient {
         let notify = self.notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let data_processor_running = self.data_processor_running.clone();
+        let processed_count = self.data_processed_count.clone();
+        let high_watermark = self.data_queue_high_watermark.clone();
 
         tokio::spawn(async move {
             log::info!("VolumeClient: Data processor started");
@@ -1107,6 +1179,13 @@ impl VolumeClient {
                     continue;
                 }
 
+                // 更新高水位标记
+                let current_len = data_queue.len();
+                let prev_hwm = high_watermark.load(Ordering::Relaxed);
+                if current_len > prev_hwm {
+                    high_watermark.store(current_len, Ordering::Relaxed);
+                }
+
                 // 尝试处理数据请求
                 let processed = process_data_requests(
                     &data_queue,
@@ -1121,6 +1200,7 @@ impl VolumeClient {
                 .await;
 
                 if processed {
+                    processed_count.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -1150,6 +1230,8 @@ impl VolumeClient {
         let notify = self.notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let lease_processor_running = self.lease_processor_running.clone();
+        let processed_count = self.lease_processed_count.clone();
+        let high_watermark = self.lease_queue_high_watermark.clone();
 
         tokio::spawn(async move {
             log::info!("VolumeClient: Lease processor started (high priority)");
@@ -1169,6 +1251,13 @@ impl VolumeClient {
                     continue;
                 }
 
+                // 更新高水位标记
+                let current_len = lease_queue.len();
+                let prev_hwm = high_watermark.load(Ordering::Relaxed);
+                if current_len > prev_hwm {
+                    high_watermark.store(current_len, Ordering::Relaxed);
+                }
+
                 // Lease 处理器优先处理
                 let processed = process_lease_requests(
                     &lease_queue,
@@ -1182,6 +1271,7 @@ impl VolumeClient {
                 .await;
 
                 if processed {
+                    processed_count.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -1211,6 +1301,8 @@ impl VolumeClient {
         let notify = self.notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let mgmt_processor_running = self.mgmt_processor_running.clone();
+        let processed_count = self.mgmt_processed_count.clone();
+        let high_watermark = self.mgmt_queue_high_watermark.clone();
 
         tokio::spawn(async move {
             log::info!("VolumeClient: Management processor started");
@@ -1229,6 +1321,13 @@ impl VolumeClient {
                     continue;
                 }
 
+                // 更新高水位标记
+                let current_len = mgmt_queue.len();
+                let prev_hwm = high_watermark.load(Ordering::Relaxed);
+                if current_len > prev_hwm {
+                    high_watermark.store(current_len, Ordering::Relaxed);
+                }
+
                 let processed = process_mgmt_requests(
                     &mgmt_queue,
                     &mgmt_channel,
@@ -1241,6 +1340,7 @@ impl VolumeClient {
                 .await;
 
                 if processed {
+                    processed_count.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
