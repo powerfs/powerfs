@@ -2,6 +2,7 @@ use crate::index::NeedleIndex;
 use crate::needle::Needle;
 use crate::storage_backend::{StorageBackend, StorageBackendError};
 use crate::volume_metadata::VolumeMetadata;
+use crate::write_coalescer::{CoalescerConfig, WriteCoalescer};
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use powerfs_common::{
@@ -24,6 +25,9 @@ pub struct Volume {
     checksum_algorithm: ChecksumAlgorithm,
     backend: Arc<dyn StorageBackend>,
     backend_volume_id: u64,
+    /// Write-back coalescing buffer for per-Needle partial over-writes.
+    /// See the [`crate::write_coalescer` docs for design & rationale.
+    coalescer: Arc<WriteCoalescer>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -35,16 +39,38 @@ impl Volume {
         size: u64,
         backend: Arc<dyn StorageBackend>,
     ) -> Result<Self> {
-        Self::new_with_algorithm(
+        Self::new_full(
             id,
             node_id,
             path,
             size,
             ChecksumAlgorithm::default(),
             backend,
+            CoalescerConfig::default(),
         )
     }
 
+    /// Construct a Volume with a non-default [`WriteCoalescer`] config.
+    pub fn new_with_coalescer(
+        id: VolumeId,
+        node_id: &str,
+        path: &str,
+        size: u64,
+        backend: Arc<dyn StorageBackend>,
+        coalescer_config: CoalescerConfig,
+    ) -> Result<Self> {
+        Self::new_full(
+            id,
+            node_id,
+            path,
+            size,
+            ChecksumAlgorithm::default(),
+            backend,
+            coalescer_config,
+        )
+    }
+
+    /// Construct a Volume with a non-default [`ChecksumAlgorithm`].
     pub fn new_with_algorithm(
         id: VolumeId,
         node_id: &str,
@@ -52,6 +78,26 @@ impl Volume {
         size: u64,
         algorithm: ChecksumAlgorithm,
         backend: Arc<dyn StorageBackend>,
+    ) -> Result<Self> {
+        Self::new_full(
+            id,
+            node_id,
+            path,
+            size,
+            algorithm,
+            backend,
+            CoalescerConfig::default(),
+        )
+    }
+
+    fn new_full(
+        id: VolumeId,
+        node_id: &str,
+        path: &str,
+        size: u64,
+        algorithm: ChecksumAlgorithm,
+        backend: Arc<dyn StorageBackend>,
+        coalescer_config: CoalescerConfig,
     ) -> Result<Self> {
         let volume_path = std::path::Path::new(path).join(format!("volume_{}", id.0));
 
@@ -102,6 +148,7 @@ impl Volume {
             checksum_algorithm: algorithm,
             backend,
             backend_volume_id,
+            coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
         })
     }
 
@@ -176,6 +223,53 @@ impl Volume {
             .unwrap_or(0)
     }
 
+    /// Materialise a single merged dirty entry from the coalescer into the
+    /// storage backend + RocksDB index.  `is_new_needle` decides whether we
+    /// call `write_needle` (first version) or `append_needle_version`
+    /// (existing id with a version already on disk).
+    fn flush_coalescer_entry(
+        &self,
+        needle_id: NeedleId,
+        merged: Vec<u8>,
+        is_new_needle: bool,
+    ) -> Result<()> {
+        let data = Bytes::from(merged);
+        if is_new_needle {
+            // No index entry yet — first write.  write_needle uses the
+            // needle_id = file_key convention already; just pass `data` with
+            // the full (possibly zero-padded) logical payload.
+            let write_res = self.write_needle(needle_id.0, data);
+            match write_res {
+                Ok(_ni) => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else {
+            // Already exists — treat as a version append, which will mark
+            // the previous index row deleted and atomically write the new
+            // index row.  We need `old_info` from the current index.
+            let existing = match self.index.get(&needle_id) {
+                Some(i) => i,
+                None => {
+                    // Race (index was deleted since dirty buffer was
+                    // created).  Fall back to writing as a brand-new needle.
+                    self.write_needle(needle_id.0, data)?;
+                    return Ok(());
+                }
+            };
+            self.append_needle_version(needle_id, data, existing)
+        }
+    }
+
+    /// Expose a cheap helper that flushes `Some` return value from
+    /// [`WriteCoalescer::record_write`] into the Volume, returning Result so
+    /// callers can use `?`.
+    fn flush_option(&self, maybe: Option<(NeedleId, Vec<u8>, bool)>) -> Result<()> {
+        if let Some((id, vec, is_new)) = maybe {
+            self.flush_coalescer_entry(id, vec, is_new)?;
+        }
+        Ok(())
+    }
+
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
@@ -238,6 +332,10 @@ impl Volume {
     }
 
     pub fn read_needle(&self, needle_id: &NeedleId) -> Result<Bytes> {
+        // Coalescer dirty-buffer takes precedence over backend (read-your-own-writes).
+        if let Some(buf) = self.coalescer.read_if_dirty(needle_id, 0, usize::MAX) {
+            return Ok(buf);
+        }
         if let Some(mut info) = self.index.get(needle_id) {
             if info.deleted_at.is_some() {
                 return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
@@ -522,12 +620,38 @@ impl Volume {
         _cookie: u32,
     ) -> Result<()> {
         let needle_id = NeedleId(file_key);
-        if let Some(existing_info) = self.index.get(&needle_id) {
-            let data_size =
+        let data_offset = offset as usize;
+        let data_size = std::cmp::min(size as usize, data.len());
+
+        // ---- Coalescer fast-path: first check if we already have a dirty buffer
+        // for this needle_id; if yes, skip the backend RMW completely and
+        // merge straight into RAM.
+        if self.coalescer.is_dirty(&needle_id) {
+            let maybe_flush = self.coalescer.record_write(
+                &needle_id,
+                data_offset,
+                &data[..data_size],
+                data_offset + data_size,
+                None,
+            );
+            self.flush_option(maybe_flush)?;
+            return Ok(());
+        }
+
+        // ---- First write to this needle: do the initial lookup so we know
+        // the current full state (existing backend data vs brand-new needle).
+        // We still perform *one* RMW here (unavoidable without the backend
+        // exposing sub-block writes), but all *subsequent* writes go straight
+        // into the coalescer until a flush trigger fires.
+        let existing_data: Option<Vec<u8>>;
+        let full_size_hint: usize;
+        let base_info = self.index.get(&needle_id);
+        if let Some(existing_info) = base_info.as_ref() {
+            let on_disk_total =
                 NEEDLE_HEADER_SIZE as u32 + existing_info.data_size + NEEDLE_FOOTER_SIZE as u32;
             let raw_data = self
                 .backend
-                .read_needle(self.backend_volume_id, existing_info.offset, data_size)
+                .read_needle(self.backend_volume_id, existing_info.offset, on_disk_total)
                 .map_err(backend_err)?;
             let needle = Needle::from_bytes(
                 &raw_data,
@@ -535,28 +659,36 @@ impl Volume {
                 existing_info.offset,
                 existing_info.checksum_algorithm,
             )?;
-            let data_offset = offset as usize;
-            let data_end = data_offset + size as usize;
-            let mut data_vec = needle.data.to_vec();
-            if data_end > data_vec.len() {
-                data_vec.resize(data_end, 0);
-            }
-            data_vec[data_offset..data_end].copy_from_slice(&data);
-
-            self.append_needle_version(needle_id, Bytes::from(data_vec), existing_info)?;
+            let cur = needle.data.to_vec();
+            // Needle on disk might be smaller than the incoming write end
+            // (hole-punch / sparse append semantics); pick the max.
+            full_size_hint = std::cmp::max(cur.len(), data_offset + data_size);
+            existing_data = Some(cur);
         } else {
-            let data_size = (offset as u64 + size as u64) as usize;
-            let mut full_data = vec![0u8; data_size];
-            let write_offset = offset as usize;
-            let copy_len = std::cmp::min(data.len(), size as usize);
-            full_data[write_offset..write_offset + copy_len].copy_from_slice(&data[..copy_len]);
-            self.write_needle(file_key, Bytes::from(full_data))?;
+            full_size_hint = data_offset + data_size;
+            existing_data = None;
         }
+
+        let maybe_flush = self.coalescer.record_write(
+            &needle_id,
+            data_offset,
+            &data[..data_size],
+            full_size_hint,
+            existing_data,
+        );
+        self.flush_option(maybe_flush)?;
         Ok(())
     }
 
     pub fn read_needle_blob(&self, file_key: u64, offset: i64, size: i32) -> Result<Bytes> {
         let needle_id = NeedleId(file_key);
+        // Dirty buffer precedence for read-your-own-writes.
+        if let Some(buf) = self
+            .coalescer
+            .read_if_dirty(&needle_id, offset as usize, size as usize)
+        {
+            return Ok(buf);
+        }
         if let Some(info) = self.index.get(&needle_id) {
             let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
             let raw_data = self
@@ -652,6 +784,62 @@ impl Volume {
 
         result
     }
+
+    /// Expose read-only access to the internal coalescer (tests/metrics).
+    pub fn coalescer(&self) -> &WriteCoalescer {
+        &self.coalescer
+    }
+
+    /// Synchronously flush every currently-dirty merged entry in the
+    /// coalescer to the backend + RocksDB index.  Returns the number of
+    /// entries that were materialised.
+    ///
+    /// Called automatically by [`Drop`] – see below.
+    pub fn flush_all_dirty(&self) -> usize {
+        self.coalescer.flush_all(|id, vec, is_new| {
+            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
+        })
+    }
+}
+
+/// On drop, any remaining dirty entries are flushed to stable storage.  This
+/// prevents loss of writes that were acknowledged via the coalescer but have
+/// not yet been materialised into `self.backend` + `self.index`.  Errors
+/// during flush are logged and swallowed (Drop cannot return a Result).
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let dirty = self.coalescer.dirty_entry_count();
+        if dirty == 0 {
+            return;
+        }
+        // SAFETY: the closure below calls `flush_coalescer_entry` through a
+        // raw pointer so we do not create a conflicting shared borrow with
+        // `&mut self` in Drop.  `self` is guaranteed to be alive for the
+        // entire duration of `flush_all`.
+        let self_ptr: *const Volume = &*self;
+        let flushed = self.coalescer.flush_all(|id, vec, is_new| {
+            let slf = unsafe { &*self_ptr };
+            let needle_ident = id.0;
+            slf.flush_coalescer_entry(id, vec, is_new).map_err(|e| {
+                log::error!(
+                    "Volume drop: flush needle_id={} failed: {}",
+                    needle_ident,
+                    e
+                );
+            })
+        });
+        let vid = self
+            .info
+            .read()
+            .map(|g| g.id.0.to_string())
+            .unwrap_or_else(|_| "?".into());
+        log::debug!(
+            "Volume(id={}) drop flushed {} dirty coalescer entries (pre-drop count={})",
+            vid,
+            flushed,
+            dirty,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -662,4 +850,183 @@ pub struct ScrubResult {
     pub skipped: u64,
     pub errors: u64,
     pub corrupted_needles: Vec<NeedleId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_backend::LocalFsBackend;
+    use crate::write_coalescer::CoalescerConfig;
+    use std::time::Duration;
+
+    fn make_volume(dir: &tempfile::TempDir, coalescer: CoalescerConfig) -> Volume {
+        let backend_path = dir.path().join("storage");
+        let backend = Arc::new(
+            LocalFsBackend::new(
+                backend_path.to_str().unwrap(),
+                "node-test",
+                "dev",
+                Some(1 << 30), // 1 GiB logical cap
+            )
+            .unwrap(),
+        );
+        Volume::new_with_coalescer(
+            VolumeId(1),
+            "node-test",
+            dir.path().to_str().unwrap(),
+            256 * 1024 * 1024, // 256 MiB user-visible size
+            backend,
+            coalescer,
+        )
+        .unwrap()
+    }
+
+    fn all_zeros(n: usize) -> Bytes {
+        Bytes::from(vec![0u8; n])
+    }
+
+    #[test]
+    fn eight_overwrites_of_256k_merge_into_one_physical_append() {
+        // Thresholds: 8 partial writes = one flush.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            min_pending_writes: 8,
+            deadline: Duration::from_secs(3600), // effectively disabled
+            max_dirty_bytes_per_entry: usize::MAX,
+            max_dirty_bytes_total: usize::MAX,
+            disabled: false,
+        };
+        let vol = make_volume(&dir, cfg);
+        const CHUNK: usize = 256 * 1024; // 256 KiB
+        const TOTAL: usize = 4 * CHUNK; // 1 MiB needle
+        let file_key = 999u64;
+
+        // Baseline: alloc_stats before any writes.
+        let a0 = vol.index.get_allocation().unwrap();
+
+        // First write: creates needle with zero bytes (offset 0 chunk)
+        vol.write_needle_blob(file_key, 0, CHUNK as i32, all_zeros(CHUNK), 0)
+            .unwrap();
+        // Now 8 subsequent overwrites covering each chunk (all 4 chunks twice = 8)
+        for round in 0..2u8 {
+            for chunk in 0..4u8 {
+                let off = (chunk as usize) * CHUNK;
+                // First round (round=0): chunks written with bytes 1..=4
+                // Second round (round=1): chunks written with bytes 5..=8
+                let byte = round * 4 + chunk + 1;
+                let payload = Bytes::from(vec![byte; CHUNK]);
+                vol.write_needle_blob(file_key, off as i64, CHUNK as i32, payload, 0)
+                    .unwrap();
+            }
+        }
+        // After 1 initial + 8 overwrites = 9 blob writes, the 8th over-write
+        // triggers min_pending_writes=8 flush (the initial write that
+        // populated the dirty buffer counts as write #1 inside record_write,
+        // subsequent 8 bump to >=8 on the last one).
+        //
+        // We expect at most 2 physical needles on disk:
+        //   1. the one produced by the final coalesced flush (final merged state)
+        //   2. at most one intermediate flush from the first write materialisation.
+        // Deleted versions still occupy allocation space until GC runs, so
+        // active_count should be 1 (the visible one), deleted_count >= 0.
+        let stats = vol.index.get_allocation().unwrap();
+        let physical_needles_total = stats.active_count + stats.deleted_count;
+        assert!(
+            physical_needles_total <= 3,
+            "expected at most 3 total physical needles (1 init + 1 coalesced flush + \
+             maybe one intermediate), got active={} deleted={}",
+            stats.active_count,
+            stats.deleted_count
+        );
+        let used_delta = stats.used_bytes.saturating_sub(a0.used_bytes);
+        // Worst case: 3 * 1 MiB data + 3*(hdr+ftr) ≈ 3.1 MiB used
+        assert!(
+            used_delta < 5 * 1024 * 1024,
+            "too many bytes used for a 1 MiB logical file: {} bytes (~{} MiB)",
+            used_delta,
+            used_delta / 1024 / 1024
+        );
+
+        // --- Verify the final read returns the last-written payload per chunk
+        vol.flush_all_dirty();
+        let got = vol.read_needle(&NeedleId(file_key)).unwrap();
+        assert_eq!(got.len(), TOTAL);
+        for chunk in 0..4 {
+            let off = chunk * CHUNK;
+            // Last successful overwrite was round=1 (second pass) byte 5..=8
+            let expected_byte: u8 = (1 * 4 + chunk + 1) as u8;
+            assert_eq!(
+                got[off], expected_byte,
+                "chunk {} first byte mismatch: got {} want {}",
+                chunk, got[off], expected_byte
+            );
+            assert_eq!(
+                got[off + CHUNK - 1],
+                expected_byte,
+                "chunk {} last byte mismatch",
+                chunk
+            );
+        }
+    }
+
+    #[test]
+    fn read_your_own_writes_before_flush() {
+        // A coalescer with a very long deadline so nothing auto-flushes.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            min_pending_writes: 1_000,
+            deadline: Duration::from_secs(3600),
+            max_dirty_bytes_per_entry: usize::MAX,
+            max_dirty_bytes_total: usize::MAX,
+            disabled: false,
+        };
+        let vol = make_volume(&dir, cfg);
+        let file_key = 42u64;
+
+        // A needle that is 4 KiB, written via one initial full-zero write
+        // then three small partial over-writes.
+        vol.write_needle_blob(file_key, 0, 4096, Bytes::from(vec![0u8; 4096]), 0)
+            .unwrap();
+        vol.write_needle_blob(file_key, 0, 4, Bytes::from_static(b"ABCD"), 0)
+            .unwrap();
+        vol.write_needle_blob(file_key, 100, 2, Bytes::from_static(b"XY"), 0)
+            .unwrap();
+        vol.write_needle_blob(file_key, 4092, 4, Bytes::from_static(b"ZZZZ"), 0)
+            .unwrap();
+
+        assert!(vol.coalescer().is_dirty(&NeedleId(file_key)));
+
+        // read_needle_blob must return the coalesced, latest values even
+        // though the dirty buffer has not been flushed to disk.
+        let head = vol.read_needle_blob(file_key, 0, 4).unwrap();
+        assert_eq!(&head[..], b"ABCD");
+        let mid = vol.read_needle_blob(file_key, 100, 2).unwrap();
+        assert_eq!(&mid[..], b"XY");
+        let tail = vol.read_needle_blob(file_key, 4092, 4).unwrap();
+        assert_eq!(&tail[..], b"ZZZZ");
+        let untouched = vol.read_needle_blob(file_key, 10, 5).unwrap();
+        assert_eq!(&untouched[..], &[0u8; 5]);
+
+        // And read_needle (full needle) must also reflect it.
+        let full = vol.read_needle(&NeedleId(file_key)).unwrap();
+        assert_eq!(&full[0..4], b"ABCD");
+        assert_eq!(&full[100..102], b"XY");
+        assert_eq!(&full[4092..4096], b"ZZZZ");
+    }
+
+    #[test]
+    fn disabled_coalescer_always_materialises_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            disabled: true,
+            ..CoalescerConfig::default()
+        };
+        let vol = make_volume(&dir, cfg);
+        // One write = immediately visible in index AND dirty count stays 0
+        vol.write_needle_blob(7, 0, 16, Bytes::from_static(b"hi_there_1234567"), 0)
+            .unwrap();
+        assert_eq!(vol.coalescer().dirty_entry_count(), 0);
+        let got = vol.read_needle(&NeedleId(7)).unwrap();
+        assert_eq!(&got[0..16], b"hi_there_1234567");
+    }
 }

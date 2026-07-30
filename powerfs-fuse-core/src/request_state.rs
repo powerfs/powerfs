@@ -109,15 +109,29 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    /// 获取请求的优先级 (数值越小优先级越高)
+    /// 获取请求的优先级 (数值越小优先级越高)。
+    ///
+    /// Ordering rationale (Phase 4 uses 3 dedicated processor queues — data/lease/mgmt —
+    /// so this field is not the primary scheduling knob today, but remains correct for
+    /// any future in-queue prioritisation or observability code):
+    ///
+    ///   Lease      – highest: lease expiry causes I/O errors, must run ASAP.
+    ///   Metadata   – every user operation depends on metadata lookups/updates.
+    ///   Read       – user-blocking I/O, slightly favoured over write.
+    ///   Write      – user I/O; kept one notch below Read to avoid lock-holder
+    ///                priority inversion on the read side, but strictly above the
+    ///                rare housekeeping categories (previously Write=5 was the
+    ///                absolute lowest, which caused starvation under load).
+    ///   Management – infrequent housekeeping: statfs, status queries.
+    ///   Control    – lowest priority: control-plane operations.
     pub fn priority(&self) -> u8 {
         match self {
-            RequestKind::Lease => 0,      // 最高优先级
-            RequestKind::Management => 1, // 高优先级
-            RequestKind::Control => 2,    // 中优先级
-            RequestKind::Metadata => 3,   // 普通优先级
-            RequestKind::Read => 4,       // 低优先级
-            RequestKind::Write => 5,      // 最低优先级
+            RequestKind::Lease => 0,
+            RequestKind::Metadata => 1,
+            RequestKind::Read => 2,
+            RequestKind::Write => 3,
+            RequestKind::Management => 4,
+            RequestKind::Control => 5,
         }
     }
 
@@ -407,11 +421,17 @@ mod tests {
 
     #[test]
     fn test_request_kind_priority() {
-        assert!(RequestKind::Lease.priority() < RequestKind::Management.priority());
-        assert!(RequestKind::Management.priority() < RequestKind::Control.priority());
-        assert!(RequestKind::Control.priority() < RequestKind::Metadata.priority());
+        // Strictly increasing priority numbers (lower = higher priority).
+        // See the doc-comment on RequestKind::priority() for rationale.
+        assert!(RequestKind::Lease.priority() < RequestKind::Metadata.priority());
         assert!(RequestKind::Metadata.priority() < RequestKind::Read.priority());
         assert!(RequestKind::Read.priority() < RequestKind::Write.priority());
+        assert!(RequestKind::Write.priority() < RequestKind::Management.priority());
+        assert!(RequestKind::Management.priority() < RequestKind::Control.priority());
+        // P0 fix guard: previously Write was 5 (= lowest); ensure it is now
+        // strictly above the two housekeeping categories.
+        assert_eq!(RequestKind::Write.priority(), 3);
+        assert!(RequestKind::Write.priority() < RequestKind::Management.priority());
     }
 
     #[test]
