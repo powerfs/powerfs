@@ -73,6 +73,7 @@ impl FilerServer {
             .route("/admin/status", get(admin_status))
             .route("/admin/shards", get(admin_list_shards))
             .route("/admin/shards/:id", get(admin_get_shard))
+            .route("/admin/init-root", post(admin_init_root))
             // CRDT management routes
             .route("/admin/crdt/overview", get(admin_crdt_overview))
             .route("/admin/crdt/shards/:id", get(admin_crdt_shard_states))
@@ -176,6 +177,18 @@ async fn object_delete_handler(
 async fn admin_status(State(state): State<Arc<FilerState>>) -> Json<FilerStatus> {
     let status = state.meta_shard_manager.get_filer_status().await;
     Json(status)
+}
+
+async fn admin_init_root(State(state): State<Arc<FilerState>>) -> axum::response::Response {
+    match state.meta_shard_manager.format_posix_root().await {
+        Ok(inode) => Json(serde_json::json!({
+            "success": true,
+            "inode": inode,
+            "message": format!("POSIX root inode {} initialized", inode)
+        }))
+        .into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn admin_list_shards(State(state): State<Arc<FilerState>>) -> Json<Vec<ShardDetail>> {
