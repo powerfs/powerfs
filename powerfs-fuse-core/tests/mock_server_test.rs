@@ -321,6 +321,10 @@ async fn test_facade_end_to_end_with_mock_servers() {
         filer_port: 19343,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
+        master_grpc_endpoint: None,
+        mount_point: String::new(),
+        collection: String::new(),
+        replication: String::new(),
     };
 
     let facade = FuseClientFacade::new(config)
@@ -581,6 +585,10 @@ async fn test_facade_volume_provider_with_mock() {
         filer_port: 19443,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
+        master_grpc_endpoint: None,
+        mount_point: String::new(),
+        collection: String::new(),
+        replication: String::new(),
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());
@@ -700,6 +708,10 @@ async fn test_facade_metadata_provider_with_mock() {
         filer_port: 19543,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
+        master_grpc_endpoint: None,
+        mount_point: String::new(),
+        collection: String::new(),
+        replication: String::new(),
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());

@@ -310,6 +310,24 @@ impl CircuitBreakerPool {
     pub fn is_empty(&self) -> bool {
         self.breakers.is_empty()
     }
+
+    /// Count breakers by state. Returns (closed, open, half_open).
+    /// Used for stats reporting to master.
+    pub fn count_by_state(&self) -> (u32, u32, u32) {
+        let mut closed = 0u32;
+        let mut open = 0u32;
+        let mut half_open = 0u32;
+        for entry in self.breakers.iter() {
+            // `state()` internally applies the Open -> HalfOpen transition
+            // when the recovery timeout has elapsed.
+            match entry.state() {
+                CircuitState::Closed => closed += 1,
+                CircuitState::Open => open += 1,
+                CircuitState::HalfOpen => half_open += 1,
+            }
+        }
+        (closed, open, half_open)
+    }
 }
 
 impl Default for CircuitBreakerPool {

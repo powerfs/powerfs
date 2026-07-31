@@ -1124,6 +1124,44 @@ impl VolumeClient {
         self.mgmt_processed_count.store(0, Ordering::Relaxed);
     }
 
+    /// Build a `ClientStats` snapshot for master heartbeat reporting.
+    ///
+    /// Aggregates scheduler queue depths, processed counters, circuit breaker
+    /// state counts and active lease count. Latency / pool / coalescer fields
+    /// are left at 0 here because they are owned by other components
+    /// (MetaShardClient / Volume Server) — the caller may overlay them.
+    pub fn client_stats(&self) -> powerfs_master::proto::ClientStats {
+        let s = self.scheduler_stats();
+        let (cb_closed, cb_open, cb_half_open) = self.breakers.count_by_state();
+        let active_leases = self.leases.len() as u32;
+        powerfs_master::proto::ClientStats {
+            data_queue_depth: s.data_queue_len as u32,
+            lease_queue_depth: s.lease_queue_len as u32,
+            admin_queue_depth: s.mgmt_queue_len as u32,
+            data_processed_total: s.data_processed,
+            lease_processed_total: s.lease_processed,
+            admin_processed_total: s.mgmt_processed,
+            cb_closed_count: cb_closed,
+            cb_open_count: cb_open,
+            cb_half_open_count: cb_half_open,
+            cb_trip_total: 0,
+            coalescer_dirty_bytes: 0,
+            coalescer_dirty_entries: 0,
+            coalescer_writes_in_total: 0,
+            coalescer_flushes_out_total: 0,
+            pool_active_connections: 0,
+            pool_reconnect_total: 0,
+            pool_ping_failures: 0,
+            read_latency_p50_us: 0,
+            read_latency_p99_us: 0,
+            write_latency_p50_us: 0,
+            write_latency_p99_us: 0,
+            active_leases,
+            lease_renewals_total: 0,
+            lease_expired_total: 0,
+        }
+    }
+
     /// 关闭
     pub fn close(&self) {
         self.stop_background_processor();

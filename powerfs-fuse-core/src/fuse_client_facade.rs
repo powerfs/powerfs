@@ -126,6 +126,23 @@ pub(crate) fn pfe_to_string(e: powerfs_common::error::PowerFsError) -> String {
     format!("{}", e)
 }
 
+/// Best-effort hostname for stats reporting. Falls back to "unknown" when the
+/// hostname cannot be determined (e.g. inside minimal containers).
+fn hostname_or_unknown() -> String {
+    #[cfg(unix)]
+    {
+        use std::ffi::CStr;
+        let mut buf = [0u8; 256];
+        let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
+        if ret == 0 {
+            if let Ok(cstr) = CStr::from_bytes_until_nul(&buf) {
+                return cstr.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
 /// FuseClientFacade 配置
 /// 所有端口和地址必须由调用方显式提供，无默认值
 #[derive(Debug, Clone)]
@@ -146,6 +163,16 @@ pub struct FuseClientFacadeConfig {
     pub request_timeout: Duration,
     /// 客户端身份
     pub client_identity: ClientIdentity,
+    /// Optional Master gRPC endpoint (e.g. "http://172.20.0.11:9333") used by
+    /// the MasterStatsReporter to push ClientStats via KeepConnected. When
+    /// `None`, stats reporting is disabled.
+    pub master_grpc_endpoint: Option<String>,
+    /// Mount point path (reported to master via KeepConnected heartbeat).
+    pub mount_point: String,
+    /// Collection name (reported to master via KeepConnected heartbeat).
+    pub collection: String,
+    /// Replication placement (reported to master via KeepConnected heartbeat).
+    pub replication: String,
 }
 
 impl FuseClientFacadeConfig {
@@ -187,6 +214,10 @@ impl FuseClientFacadeConfig {
             filer_port,
             request_timeout: Duration::from_secs(5),
             client_identity: ClientIdentity::new(),
+            master_grpc_endpoint: None,
+            mount_point: String::new(),
+            collection: String::new(),
+            replication: String::new(),
         })
     }
 
@@ -219,7 +250,12 @@ pub struct FuseClientFacade {
     /// MetaShard 客户端
     meta_shard_client: MetaShardClient,
     /// Volume 客户端
-    volume_client: VolumeClient,
+    volume_client: Arc<VolumeClient>,
+    /// Master 统计上报器（KeepConnected 心跳）。
+    /// 字段仅持有所有权以保持后台任务存活；Drop 时 `shutdown_tx` 会被释放，
+    /// 上报循环检测到通道关闭后自动退出。
+    #[allow(dead_code)]
+    stats_reporter: Option<crate::stats_reporter::MasterStatsReporter>,
 }
 
 impl FuseClientFacade {
@@ -244,7 +280,7 @@ impl FuseClientFacade {
 
         // 创建 Volume 客户端
         let volume_config = VolumeClientConfig::default();
-        let volume_client = VolumeClient::new(volume_config, topology_manager.clone());
+        let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
 
         Ok(Self {
             config,
@@ -252,6 +288,7 @@ impl FuseClientFacade {
             master_client,
             meta_shard_client,
             volume_client,
+            stats_reporter: None,
         })
     }
 
@@ -319,7 +356,7 @@ impl FuseClientFacade {
 
         // 创建 Volume 客户端（暂时为空，后续改造）
         let volume_config = VolumeClientConfig::default();
-        let volume_client = VolumeClient::new(volume_config, topology_manager.clone());
+        let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
 
         // 设置默认 Volume 地址（从配置获取）
         if !config.volume_addrs.is_empty() {
@@ -332,12 +369,43 @@ impl FuseClientFacade {
 
         volume_client.init();
 
+        // 启动 Master 统计上报器（KeepConnected 心跳）
+        let stats_reporter = match &config.master_grpc_endpoint {
+            Some(endpoint) if !endpoint.is_empty() => {
+                let reporter_config = crate::stats_reporter::StatsReporterConfig {
+                    master_endpoint: endpoint.clone(),
+                    client_type: "fuse".to_string(),
+                    mount_point: config.mount_point.clone(),
+                    collection: config.collection.clone(),
+                    replication: config.replication.clone(),
+                    host: hostname_or_unknown(),
+                    pid: std::process::id() as u64,
+                    report_interval: Duration::from_secs(5),
+                };
+                let mut reporter =
+                    crate::stats_reporter::MasterStatsReporter::new(reporter_config, volume_client.clone());
+                reporter.start();
+                log::info!(
+                    "FuseClientFacade: MasterStatsReporter started (endpoint={})",
+                    endpoint
+                );
+                Some(reporter)
+            }
+            _ => {
+                log::info!(
+                    "FuseClientFacade: master_grpc_endpoint not set, MasterStatsReporter disabled"
+                );
+                None
+            }
+        };
+
         let facade = Self {
             config,
             topology_manager,
             master_client,
             meta_shard_client,
             volume_client,
+            stats_reporter,
         };
 
         // 启动后台处理循环
@@ -359,7 +427,7 @@ impl FuseClientFacade {
 
     /// 获取 Volume 客户端引用
     pub fn volume_client(&self) -> &VolumeClient {
-        &self.volume_client
+        &*self.volume_client
     }
 
     /// 获取拓扑管理器引用

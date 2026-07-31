@@ -238,6 +238,42 @@ export interface FuseMount {
   dirty_chunks?: number
   dirty_bytes?: number
   last_heartbeat?: string
+  /** Runtime stats reported by the FUSE client via KeepConnected heartbeat. */
+  stats?: ClientStats
+}
+
+/** Runtime statistics for a FUSE client (mirrors proto ClientStats). */
+export interface ClientStats {
+  // Multi-queue scheduler
+  data_queue_depth: number
+  lease_queue_depth: number
+  admin_queue_depth: number
+  data_processed_total: number
+  lease_processed_total: number
+  admin_processed_total: number
+  // CircuitBreaker
+  cb_closed_count: number
+  cb_open_count: number
+  cb_half_open_count: number
+  cb_trip_total: number
+  // WriteCoalescer
+  coalescer_dirty_bytes: number
+  coalescer_dirty_entries: number
+  coalescer_writes_in_total: number
+  coalescer_flushes_out_total: number
+  // Connection pool
+  pool_active_connections: number
+  pool_reconnect_total: number
+  pool_ping_failures: number
+  // Request latency (microseconds)
+  read_latency_p50_us: number
+  read_latency_p99_us: number
+  write_latency_p50_us: number
+  write_latency_p99_us: number
+  // Lease
+  active_leases: number
+  lease_renewals_total: number
+  lease_expired_total: number
 }
 
 export type ConflictType = 'CreateCreate' | 'WriteWrite' | 'WriteUnlink' | 'DeleteCreate' | 'RenameConflict'

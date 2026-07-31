@@ -30,6 +30,7 @@ pub struct FuseApp {
     collection: String,
     replication: String,
     master_net_port: u16,
+    master_grpc_port: u16,
     volume_net_port: u16,
     volume_addrs: Vec<String>,
     filer_addr: String,
@@ -45,6 +46,7 @@ impl FuseApp {
         collection: &str,
         replication: &str,
         master_net_port: u16,
+        master_grpc_port: u16,
         volume_net_port: u16,
         volume_addrs: Vec<String>,
         filer_addr: String,
@@ -57,6 +59,7 @@ impl FuseApp {
             collection: collection.to_string(),
             replication: replication.to_string(),
             master_net_port,
+            master_grpc_port,
             volume_net_port,
             volume_addrs,
             filer_addr,
@@ -107,6 +110,10 @@ impl FuseApp {
             filer_port: self.filer_net_port,
             request_timeout: Duration::from_secs(30),
             client_identity: powerfs_fuse_core::ClientIdentity::default(),
+            master_grpc_endpoint: Some(format!("http://{}:{}", master_addr, self.master_grpc_port)),
+            mount_point: self.mount_point.clone(),
+            collection: self.collection.clone(),
+            replication: self.replication.clone(),
         };
 
         let facade = Arc::new(

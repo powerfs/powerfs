@@ -540,6 +540,7 @@ impl MasterService for MasterGrpcServer {
                     last_heartbeat: now,
                     dirty_chunks: first_request.dirty_chunks,
                     dirty_bytes: first_request.dirty_bytes,
+                    stats: first_request.stats,
                 };
 
                 master.register_fuse_client(fuse_info);
@@ -614,6 +615,7 @@ impl MasterService for MasterGrpcServer {
                                     .as_secs(),
                                 dirty_chunks: request.dirty_chunks,
                                 dirty_bytes: request.dirty_bytes,
+                                stats: request.stats.clone(),
                             };
                             master.register_fuse_client(fuse_info);
                         }
@@ -901,6 +903,7 @@ impl MasterService for MasterGrpcServer {
                 last_heartbeat: client.last_heartbeat,
                 dirty_chunks: client.dirty_chunks,
                 dirty_bytes: client.dirty_bytes,
+                stats: client.stats,
             });
         }
         Ok(Response::new(FuseClientsResponse {

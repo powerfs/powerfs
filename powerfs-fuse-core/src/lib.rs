@@ -8,6 +8,7 @@ pub mod orset;
 pub mod provider_adapter;
 pub mod request_id;
 pub mod request_state;
+pub mod stats_reporter;
 pub mod topology;
 pub mod volume_client;
 
@@ -24,6 +25,7 @@ pub use meta_shard_client::{
 pub use provider_adapter::{FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider};
 pub use request_id::RequestId;
 pub use request_state::{RequestContext, RequestKind, RequestState};
+pub use stats_reporter::{MasterStatsReporter, StatsReporterConfig};
 pub use topology::{
     ClusterTopology, ClusterTopologyManager, MasterClient, MasterClientConfig, MasterClientError,
     MasterClientState, ShardInfo, TopologyUpdateListener, VolumeInfo,

@@ -26,6 +26,8 @@ crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

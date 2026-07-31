@@ -201,6 +201,75 @@ struct FuseMount {
     dirty_chunks: Option<u64>,
     dirty_bytes: Option<u64>,
     last_heartbeat: Option<String>,
+    /// Runtime stats reported by the FUSE client via KeepConnected heartbeat.
+    /// `None` when the client hasn't reported yet (e.g. older binary).
+    stats: Option<ClientStatsResponse>,
+}
+
+/// Serialisable view of `powerfs_master::proto::powerfs::ClientStats`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct ClientStatsResponse {
+    // Multi-queue scheduler
+    data_queue_depth: u32,
+    lease_queue_depth: u32,
+    admin_queue_depth: u32,
+    data_processed_total: u64,
+    lease_processed_total: u64,
+    admin_processed_total: u64,
+    // CircuitBreaker
+    cb_closed_count: u32,
+    cb_open_count: u32,
+    cb_half_open_count: u32,
+    cb_trip_total: u64,
+    // WriteCoalescer
+    coalescer_dirty_bytes: u64,
+    coalescer_dirty_entries: u32,
+    coalescer_writes_in_total: u64,
+    coalescer_flushes_out_total: u64,
+    // Connection pool
+    pool_active_connections: u32,
+    pool_reconnect_total: u32,
+    pool_ping_failures: u32,
+    // Request latency (microseconds)
+    read_latency_p50_us: u64,
+    read_latency_p99_us: u64,
+    write_latency_p50_us: u64,
+    write_latency_p99_us: u64,
+    // Lease
+    active_leases: u32,
+    lease_renewals_total: u64,
+    lease_expired_total: u64,
+}
+
+impl From<powerfs_master::proto::powerfs::ClientStats> for ClientStatsResponse {
+    fn from(s: powerfs_master::proto::powerfs::ClientStats) -> Self {
+        Self {
+            data_queue_depth: s.data_queue_depth,
+            lease_queue_depth: s.lease_queue_depth,
+            admin_queue_depth: s.admin_queue_depth,
+            data_processed_total: s.data_processed_total,
+            lease_processed_total: s.lease_processed_total,
+            admin_processed_total: s.admin_processed_total,
+            cb_closed_count: s.cb_closed_count,
+            cb_open_count: s.cb_open_count,
+            cb_half_open_count: s.cb_half_open_count,
+            cb_trip_total: s.cb_trip_total,
+            coalescer_dirty_bytes: s.coalescer_dirty_bytes,
+            coalescer_dirty_entries: s.coalescer_dirty_entries,
+            coalescer_writes_in_total: s.coalescer_writes_in_total,
+            coalescer_flushes_out_total: s.coalescer_flushes_out_total,
+            pool_active_connections: s.pool_active_connections,
+            pool_reconnect_total: s.pool_reconnect_total,
+            pool_ping_failures: s.pool_ping_failures,
+            read_latency_p50_us: s.read_latency_p50_us,
+            read_latency_p99_us: s.read_latency_p99_us,
+            write_latency_p50_us: s.write_latency_p50_us,
+            write_latency_p99_us: s.write_latency_p99_us,
+            active_leases: s.active_leases,
+            lease_renewals_total: s.lease_renewals_total,
+            lease_expired_total: s.lease_expired_total,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1098,6 +1167,7 @@ async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse
                     } else {
                         None
                     },
+                    stats: client.stats.map(ClientStatsResponse::from),
                 });
             }
         }
@@ -1178,6 +1248,7 @@ async fn create_fuse_mount(
                 dirty_chunks: None,
                 dirty_bytes: None,
                 last_heartbeat: None,
+                stats: None,
             };
 
             state.fuse_mounts.lock().await.push(mount.clone());
@@ -1225,6 +1296,71 @@ async fn delete_fuse_mount(
     } else {
         Json(ApiResponse::error("Mount not found"))
     }
+}
+
+/// GET /api/fuse/clients/:id/stats — detailed stats for a single FUSE client.
+///
+/// Queries the master's `get_fuse_clients` and returns the `ClientStats` for
+/// the matching client id. Returns an error payload when the client is not
+/// registered or the master is unreachable.
+async fn get_fuse_client_stats(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<ClientStatsResponse>> {
+    let resp = state
+        .master_client
+        .lock()
+        .await
+        .get_fuse_clients(tonic::Request::new(
+            powerfs_master::proto::powerfs::FuseClientsRequest {},
+        ))
+        .await;
+
+    let clients = match resp {
+        Ok(response) => response.into_inner().clients,
+        Err(e) => {
+            return Json(ApiResponse::error(&format!(
+                "Failed to query master: {}",
+                e
+            )))
+        }
+    };
+
+    for client in clients {
+        if client.client_id == id {
+            let stats = client
+                .stats
+                .map(ClientStatsResponse::from)
+                .unwrap_or_default();
+            return Json(ApiResponse::success(stats));
+        }
+    }
+
+    Json(ApiResponse::error("FUSE client not found"))
+}
+
+/// GET /api/config/circuit-breaker — current default CircuitBreaker config.
+///
+/// These values mirror the defaults compiled into the FUSE client
+/// (`CircuitBreakerConfig::default()`). They are read-only for now; PUT
+/// support will be added once the master can push config updates to clients.
+async fn get_circuit_breaker_config() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "failure_threshold": 50,
+        "recovery_timeout_ms": 5000,
+        "half_open_max_requests": 10,
+    }))
+}
+
+/// GET /api/config/coalescer — current default WriteCoalescer config.
+async fn get_coalescer_config() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "deadline_ms": 2000,
+        "min_pending_writes": 4,
+        "max_dirty_bytes_per_entry": 1048576,
+        "max_dirty_bytes_total": 67108864,
+        "disabled": false,
+    }))
 }
 
 // ===== Conflict management handlers =====
@@ -3757,6 +3893,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/mounts", get(get_fuse_mounts))
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
+        .route("/api/fuse/clients/:id/stats", get(get_fuse_client_stats))
+        .route("/api/config/circuit-breaker", get(get_circuit_breaker_config))
+        .route("/api/config/coalescer", get(get_coalescer_config))
         .route("/api/conflicts", get(list_conflicts))
         .route("/api/conflicts/resolve", post(resolve_conflict_handler))
         .route(

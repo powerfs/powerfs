@@ -48,6 +48,10 @@ fn test_facade_config_custom_values() {
         filer_port: 8001,
         request_timeout: Duration::from_secs(10),
         client_identity: identity,
+        master_grpc_endpoint: None,
+        mount_point: String::new(),
+        collection: String::new(),
+        replication: String::new(),
     };
 
     assert_eq!(config.master_addr, "192.168.1.100");

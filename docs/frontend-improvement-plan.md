@@ -202,9 +202,30 @@ Containerized test environment:
 | A | A3: Turn off mock default | ✅ Done | eb82660a |
 | A | A4: Conflicts downgrade | ✅ Done | eb82660a |
 | A | A5: Optimizations page rebuild | ✅ Done | eb82660a |
-| B | B1: Proto extension | TODO | |
-| B | B2: FUSE client stats reporting | TODO | |
-| B | B3: Monitor API | TODO | |
-| B | B4: Frontend client detail pages | TODO | |
+| B | B1: Proto extension | ✅ Done | (this commit) |
+| B | B2: FUSE client stats reporting | ✅ Done | (this commit) |
+| B | B3: Monitor API | ✅ Done | (this commit) |
+| B | B4: Frontend client detail pages | ✅ Done | (this commit) |
 | C | C1-C4: Storage deep views | TODO | |
 | D | Navigation reorganization | TODO | |
+
+### Phase B Validation
+
+- `cargo build --workspace --all-targets`: ✅ pass (40.66s)
+- `cargo clippy --workspace --all-targets`: ✅ pass (2 pre-existing warnings, no new issues)
+- `npm run build` (frontend): ✅ pass (3789 modules transformed, built in 1.53s)
+
+#### B1 — Proto extension
+- `powerfs-master/proto/master.proto`: added `ClientStats` message (multi-queue / CB / Coalescer / pool / latency / lease fields), extended `KeepConnectedRequest.stats = 15` and `FuseClientInfo.stats = 12`.
+
+#### B2 — FUSE client stats reporting
+- `powerfs-fuse-core/src/stats_reporter.rs` (new): `MasterStatsReporter` runs a KeepConnected gRPC stream, periodically collects `ClientStats` from `VolumeClient` (queue depths, CB pool, WriteCoalescer counters, MetaShardClient health, p50/p99 latency window, lease counters), and auto-reconnects on failure.
+- Integrated into `FuseClientFacade` lifecycle (start on mount, stop on unmount).
+
+#### B3 — Monitor API
+- `powerfs-monitor/src/main.rs`: added `/api/fuse/clients/:id/stats`, `/api/config/circuit-breaker`, `/api/config/coalescer` endpoints returning `ClientStatsResponse` and runtime config snapshots.
+
+#### B4 — Frontend client detail pages
+- `powerfs-monitor-frontend/src/types/index.ts`: added `ClientStats` interface, extended `FuseMount.stats`.
+- `powerfs-monitor-frontend/src/services/api.ts`: added `getFuseClientStats()`.
+- `powerfs-monitor-frontend/src/pages/Fuse/index.tsx`: added summary columns (queue depth / CB / Coalescer) and a 5-tab stats Drawer (Overview / Scheduler / CircuitBreaker / Coalescer / Pool) with latency, lease, queue depth, CB state cards, dirty-bytes progress and coalescing ratio.

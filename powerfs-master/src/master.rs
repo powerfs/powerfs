@@ -140,6 +140,7 @@ pub struct FuseClientInfo {
     pub last_heartbeat: u64,
     pub dirty_chunks: u64,
     pub dirty_bytes: u64,
+    pub stats: Option<crate::proto::ClientStats>,
 }
 
 pub struct ClientManager {
@@ -177,7 +178,21 @@ impl ClientManager {
             "Registering FUSE client: id={}, type={}, mount_point={}, collection={}",
             info.client_id, info.client_type, info.mount_point, info.collection
         );
-        self.fuse_clients.insert(info.client_id.clone(), info);
+        // Preserve the original connected_at if the client already exists.
+        if let Some(existing) = self.fuse_clients.get_mut(&info.client_id) {
+            existing.client_type = info.client_type;
+            existing.mount_point = info.mount_point;
+            existing.collection = info.collection;
+            existing.replication = info.replication;
+            existing.host = info.host;
+            existing.pid = info.pid;
+            existing.last_heartbeat = info.last_heartbeat;
+            existing.dirty_chunks = info.dirty_chunks;
+            existing.dirty_bytes = info.dirty_bytes;
+            existing.stats = info.stats;
+        } else {
+            self.fuse_clients.insert(info.client_id.clone(), info);
+        }
     }
 
     fn update_fuse_client_heartbeat(&mut self, client_id: &str) {
@@ -188,6 +203,17 @@ impl ClientManager {
                 .as_secs();
         } else {
             warn!("FUSE client not found for heartbeat update: {}", client_id);
+        }
+    }
+
+    fn update_fuse_client_stats(&mut self, client_id: &str, stats: crate::proto::ClientStats) {
+        if let Some(client) = self.fuse_clients.get_mut(client_id) {
+            client.stats = Some(stats);
+        } else {
+            warn!(
+                "FUSE client not found for stats update: {}",
+                client_id
+            );
         }
     }
 
@@ -1855,6 +1881,17 @@ impl MasterNode {
             .write()
             .unwrap()
             .update_fuse_client_heartbeat(client_id);
+    }
+
+    pub fn update_fuse_client_stats(
+        &self,
+        client_id: &str,
+        stats: crate::proto::ClientStats,
+    ) {
+        self.client_manager
+            .write()
+            .unwrap()
+            .update_fuse_client_stats(client_id, stats);
     }
 
     pub fn get_fuse_clients(&self) -> Vec<FuseClientInfo> {

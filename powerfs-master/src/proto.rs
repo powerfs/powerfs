@@ -13,7 +13,7 @@ pub use powerfs::{
     BatchGetResponse, BatchPutRequest, BatchPutResponse, ClusterInfoRequest, ClusterInfoResponse,
     CollectionInfo, CollectionStats, CreateCollectionRequest, CreateCollectionResponse,
     CreateEntryRequest, CreateEntryResponse, CreateSessionRequest, CreateSessionResponse,
-    DataCenterStats, DeleteCollectionRequest, DeleteCollectionResponse, DeleteEntryRequest,
+    ClientStats, DataCenterStats, DeleteCollectionRequest, DeleteCollectionResponse, DeleteEntryRequest,
     DeleteEntryResponse, DeleteSessionRequest, DeleteSessionResponse, DeleteVolumeRequest,
     DeleteVolumeResponse, DeltaOp, DirEntryOrset, Entry, EntryId, FileChunk, FuseAttributes,
     FuseClientsRequest, FuseClientsResponse, GetBlockRequest, GetBlockResponse,

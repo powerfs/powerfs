@@ -177,6 +177,46 @@ message KeepConnectedRequest {
     string host = 12;
     uint64 dirty_chunks = 13;
     uint64 dirty_bytes = 14;
+    ClientStats stats = 15;
+}
+
+// Runtime statistics reported by FUSE clients via KeepConnected heartbeat.
+message ClientStats {
+    // Multi-queue scheduler
+    uint32 data_queue_depth = 1;
+    uint32 lease_queue_depth = 2;
+    uint32 admin_queue_depth = 3;
+    uint64 data_processed_total = 4;
+    uint64 lease_processed_total = 5;
+    uint64 admin_processed_total = 6;
+
+    // CircuitBreaker
+    uint32 cb_closed_count = 7;
+    uint32 cb_open_count = 8;
+    uint32 cb_half_open_count = 9;
+    uint64 cb_trip_total = 10;
+
+    // WriteCoalescer
+    uint64 coalescer_dirty_bytes = 11;
+    uint32 coalescer_dirty_entries = 12;
+    uint64 coalescer_writes_in_total = 13;
+    uint64 coalescer_flushes_out_total = 14;
+
+    // Connection pool
+    uint32 pool_active_connections = 15;
+    uint32 pool_reconnect_total = 16;
+    uint32 pool_ping_failures = 17;
+
+    // Request latency (microseconds)
+    uint64 read_latency_p50_us = 20;
+    uint64 read_latency_p99_us = 21;
+    uint64 write_latency_p50_us = 22;
+    uint64 write_latency_p99_us = 23;
+
+    // Lease
+    uint32 active_leases = 30;
+    uint64 lease_renewals_total = 31;
+    uint64 lease_expired_total = 32;
 }
 
 message VolumeLocation {
@@ -443,6 +483,7 @@ message FuseClientsResponse {
         uint64 last_heartbeat = 9;
         uint64 dirty_chunks = 10;
         uint64 dirty_bytes = 11;
+        ClientStats stats = 12;
     }
     repeated FuseClientInfo clients = 1;
     string error = 2;
