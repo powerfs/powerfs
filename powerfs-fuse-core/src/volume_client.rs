@@ -1421,6 +1421,7 @@ impl VolumeClient {
         let volume_router = self.volume_router.clone();
         let lease_renewer_running = self.lease_renewer_running.clone();
         let interval = self.lease_renew_interval;
+        let client_id = self.config.client_id.clone();
 
         tokio::spawn(async move {
             log::info!(
@@ -1508,6 +1509,9 @@ impl VolumeClient {
                         );
                         continue;
                     }
+                    // ClientId is required: server-side renew() checks holder == client_id,
+                    // omitting it causes "Lease holder mismatch" and renewal always fails.
+                    let _ = enc.add_string(FieldId::ClientId, &client_id);
                     let duration_ms = 30000;
                     enc.add_u64(FieldId::LeaseDuration, duration_ms);
 

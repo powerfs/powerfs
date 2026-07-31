@@ -237,7 +237,12 @@ Containerized test environment:
 - Stats update on I/O: ✅ `data_processed=1`, `admin_processed=1`, `cb_closed=1` observed
 - Circuit breaker tracking: ✅ `cb_closed_count=1` on active client
 - Coalescer fields: ✅ Present in API response (writes_in_total, flushes_out_total, dirty_bytes)
-- Data path (large writes): ⚠️ Lease renewal fails (status=10), pre-existing issue unrelated to Phase B
+- Data path (large writes): ✅ Lease renewal fixed (see follow-up fix below)
+
+**Follow-up fix — Lease renewal status=10 (2026-07-31):**
+- Root cause: `VolumeClient::start_lease_renewer()` built the background renew request with only `LeaseToken` + `LeaseDuration`, omitting `ClientId`. The server-side `RangeLeaseManager::renew()` checks `holder == client_id`, so renewal always failed with "Lease holder mismatch" → `STATUS_ERR_SERVER_ERROR` (status=10). Leases expired after TTL (30s) + grace (3s), breaking all subsequent writes.
+- Fix: Capture `self.config.client_id` in the renewer task and add `ClientId` to the renew request TLV (`powerfs-fuse-core/src/volume_client.rs`).
+- Validation: cargo check ✅, clippy ✅ (no new warnings), 3 fuse-core lease tests ✅, 22 volume range_lease tests ✅.
 
 #### B1 — Proto extension
 - `powerfs-master/proto/master.proto`: added `ClientStats` message (multi-queue / CB / Coalescer / pool / latency / lease fields), extended `KeepConnectedRequest.stats = 15` and `FuseClientInfo.stats = 12`.
