@@ -12,7 +12,7 @@
 | 3 | Volume 分配模式 Auto/Manual/Hybrid | P0 | ✅ Done | feat: collection volume allocation modes |
 | 4 | S3 接口支持 collection | P0 | ✅ Done | feat: step 4 S3 support for collection |
 | 5 | KV 接口支持 collection | P1 | ✅ Done | feat: step 5 KV support for collection |
-| 6 | 前端 Collection 管理页面 | P1 | ⏳ Pending | - |
+| 6 | 前端 Collection 管理页面 | P1 | ✅ Done | feat: step 6 collection management UI |
 | 7 | CLI Collection 管理命令 | P1 | ⏳ Pending | - |
 
 ---
@@ -111,9 +111,23 @@
 
 ---
 
-## Step 6: 前端 Collection 管理页面 ⏳
+## Step 6: 前端 Collection 管理页面 ✅
 
-**目标**: Collection 列表/详情/新建/编辑/删除页面。
+**目标**: Collection 列表/详情/新建/删除页面。
+
+**改动范围**:
+- `powerfs-monitor/src/main.rs`: 新增 4 个 HTTP 代理端点（GET/POST `/api/collections`、GET/DELETE `/api/collections/:name`），通过 gRPC 调用 Master 的 ListCollections/GetCollection/CreateCollection/DeleteCollection；新增 `CollectionDetail` DTO 与 `CreateCollectionBody` 请求体；create/delete 要求 admin 权限
+- `powerfs-monitor-frontend/src/types/index.ts`: 新增 `CollectionInfo` 接口
+- `powerfs-monitor-frontend/src/services/api.ts`: 新增 `getCollections`/`getCollection`/`createCollection`/`deleteCollection` API 函数与 `CreateCollectionParams` 类型
+- `powerfs-monitor-frontend/src/pages/Collections/index.tsx`: 新建管理页面（表格 + 新建 Modal + 详情 Modal + 删除确认）
+- `powerfs-monitor-frontend/src/components/Layout/index.tsx`: 在「存储」分组下新增「Collection 管理」菜单项
+- `powerfs-monitor-frontend/src/App.tsx`: 注册 `/collections` 路由（requireAdmin）
+
+**验证**:
+- `cargo build -p powerfs-monitor` 通过
+- `cargo clippy -p powerfs-monitor --all-targets` 无 warning
+- `npm run build`（tsc + vite）通过
+- 列表/详情/新建/删除 UI 完整，权限校验在监控后端完成
 
 ---
 

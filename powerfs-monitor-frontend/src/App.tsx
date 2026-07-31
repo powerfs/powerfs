@@ -5,6 +5,7 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Nodes from './pages/Nodes'
 import Volumes from './pages/Volumes'
+import Collections from './pages/Collections'
 import StorageDevices from './pages/StorageDevices'
 import BitrotScrub from './pages/BitrotScrub'
 import KV from './pages/KV'
@@ -80,6 +81,14 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <Volumes />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="collections"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Collections />
             </ProtectedRoute>
           }
         />

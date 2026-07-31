@@ -105,6 +105,7 @@ function AppLayout() {
           label: '存储',
           children: [
             { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume 管理' },
+            { key: '/collections', icon: <DatabaseOutlined />, label: 'Collection 管理' },
             { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot 扫描' },
           ],
         }]

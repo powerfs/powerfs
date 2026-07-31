@@ -675,6 +675,154 @@ async fn transfer_leader(
     }
 }
 
+// ========================================================================
+// Collection management — proxy to Master gRPC Collection RPCs
+// ========================================================================
+
+#[derive(Debug, Serialize)]
+struct CollectionDetail {
+    name: String,
+    replication: String,
+    ttl: String,
+    disk_type: String,
+    max_volume_count: u64,
+    volume_count: u64,
+    created_at: u64,
+    modified_at: u64,
+}
+
+impl From<powerfs_master::proto::powerfs::CollectionInfo> for CollectionDetail {
+    fn from(c: powerfs_master::proto::powerfs::CollectionInfo) -> Self {
+        Self {
+            name: c.name,
+            replication: c.replication,
+            ttl: c.ttl,
+            disk_type: c.disk_type,
+            max_volume_count: c.max_volume_count,
+            volume_count: c.volume_count,
+            created_at: c.created_at,
+            modified_at: c.modified_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCollectionBody {
+    name: String,
+    replication: Option<String>,
+    ttl: Option<String>,
+    disk_type: Option<String>,
+    max_volume_count: Option<u64>,
+}
+
+async fn list_collections(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<CollectionDetail>>> {
+    let mut client = state.master_client.lock().await;
+    match client
+        .list_collections(tonic::Request::new(
+            powerfs_master::proto::powerfs::ListCollectionsRequest {},
+        ))
+        .await
+    {
+        Ok(resp) => {
+            let collections = resp
+                .into_inner()
+                .collections
+                .into_iter()
+                .map(CollectionDetail::from)
+                .collect();
+            Json(ApiResponse::success(collections))
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
+async fn get_collection(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<ApiResponse<CollectionDetail>> {
+    let mut client = state.master_client.lock().await;
+    match client
+        .get_collection(tonic::Request::new(
+            powerfs_master::proto::powerfs::GetCollectionRequest { name },
+        ))
+        .await
+    {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.success {
+                match inner.collection {
+                    Some(c) => Json(ApiResponse::success(CollectionDetail::from(c))),
+                    None => Json(ApiResponse::error("Collection not found")),
+                }
+            } else {
+                Json(ApiResponse::error(&inner.error))
+            }
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
+async fn create_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<CreateCollectionBody>,
+) -> Json<ApiResponse<CollectionDetail>> {
+    if !user.is_admin() {
+        return Json(ApiResponse::error("Permission denied: admin only"));
+    }
+    let mut client = state.master_client.lock().await;
+    let request = powerfs_master::proto::powerfs::CreateCollectionRequest {
+        name: req.name,
+        replication: req.replication.unwrap_or_else(|| "001".to_string()),
+        ttl: req.ttl.unwrap_or_default(),
+        disk_type: req.disk_type.unwrap_or_else(|| "hdd".to_string()),
+        max_volume_count: req.max_volume_count.unwrap_or(0),
+    };
+    match client.create_collection(tonic::Request::new(request)).await {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.success {
+                match inner.collection {
+                    Some(c) => Json(ApiResponse::success(CollectionDetail::from(c))),
+                    None => Json(ApiResponse::error("Created but no collection returned")),
+                }
+            } else {
+                Json(ApiResponse::error(&inner.error))
+            }
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
+async fn delete_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+) -> Json<ApiResponse<()>> {
+    if !user.is_admin() {
+        return Json(ApiResponse::error("Permission denied: admin only"));
+    }
+    let mut client = state.master_client.lock().await;
+    match client
+        .delete_collection(tonic::Request::new(
+            powerfs_master::proto::powerfs::DeleteCollectionRequest { name },
+        ))
+        .await
+    {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.success {
+                Json(ApiResponse::success(()))
+            } else {
+                Json(ApiResponse::error(&inner.error))
+            }
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
 async fn get_volumes(State(state): State<Arc<AppState>>) -> Json<ApiResponse<Vec<VolumeInfo>>> {
     let volumes = state.metric_store.get_volumes().await;
     Json(ApiResponse::success(volumes))
@@ -4128,6 +4276,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/master/status", get(get_master_status))
         .route("/api/topology", get(get_topology))
         .route("/api/master/transfer-leader", post(transfer_leader))
+        // Collection management (proxy to Master gRPC)
+        .route("/api/collections", get(list_collections))
+        .route("/api/collections", post(create_collection))
+        .route("/api/collections/:name", get(get_collection))
+        .route("/api/collections/:name", delete(delete_collection))
         .route("/api/benchmarks", get(get_benchmark_results))
         .route(
             "/api/benchmarks/report/:id",

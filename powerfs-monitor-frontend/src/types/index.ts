@@ -246,6 +246,19 @@ export interface BucketInfo {
   total_size: number
 }
 
+// ===== Collection management =====
+
+export interface CollectionInfo {
+  name: string
+  replication: string
+  ttl: string
+  disk_type: string
+  max_volume_count: number
+  volume_count: number
+  created_at: number
+  modified_at: number
+}
+
 export interface ObjectInfo {
   key: string
   etag: string
