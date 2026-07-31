@@ -1,0 +1,16 @@
+[package]
+name = "powerfs-master-net"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "High-level TLV client for PowerFS Master (leader discovery + failover)"
+
+[dependencies]
+powerfs-net = { path = "../powerfs-net" }
+tokio = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true }

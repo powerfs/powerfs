@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "powerfs-net",
+    "powerfs-master-net",
     "powerfs-core",
     "powerfs-master",
     "powerfs-volume",

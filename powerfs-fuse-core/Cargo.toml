@@ -7,6 +7,7 @@ edition = "2021"
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-master-net = { path = "../powerfs-master-net" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 libc = { workspace = true }
