@@ -515,47 +515,16 @@ impl MasterService for MasterGrpcServer {
 
         let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
-        let client_id = match stream.message().await {
-            Ok(Some(first_request)) => {
-                let id = if !first_request.client_type.is_empty() {
-                    format!("fuse_{}_{}", first_request.client_type, Uuid::new_v4())
-                } else {
-                    format!("client_{}", Uuid::new_v4())
-                };
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let fuse_info = FuseClientInfo {
-                    client_id: id.clone(),
-                    client_type: first_request.client_type.clone(),
-                    mount_point: first_request.mount_point.clone(),
-                    collection: first_request.collection.clone(),
-                    replication: first_request.replication.clone(),
-                    host: first_request.host.clone(),
-                    pid: first_request.pid,
-                    connected_at: now,
-                    last_heartbeat: now,
-                    dirty_chunks: first_request.dirty_chunks,
-                    dirty_bytes: first_request.dirty_bytes,
-                    stats: first_request.stats,
-                };
-
-                master.register_fuse_client(fuse_info);
-                id
-            }
-            _ => {
-                let id = format!("client_{}", Uuid::new_v4());
-                id
-            }
-        };
-
+        // Generate client_id upfront so we can return the response stream immediately.
+        // This avoids a deadlock where the server waits for the first message while
+        // the client waits for response headers before sending it.
+        let client_id = format!("client_{}", Uuid::new_v4());
         master.add_client(client_id.clone(), tx);
 
+        let cid = client_id.clone();
         let output = async_stream::stream! {
             let mut rx = rx;
+            let mut registered = false;
 
             loop {
                 tokio::select! {
@@ -583,7 +552,9 @@ impl MasterService for MasterGrpcServer {
                         });
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        master.update_fuse_client_heartbeat(&client_id);
+                        if registered {
+                            master.update_fuse_client_heartbeat(&cid);
+                        }
                         let leader = master.get_leader().await;
                         yield Ok(KeepConnectedResponse {
                             volume_location: Some(VolumeLocation {
@@ -598,28 +569,42 @@ impl MasterService for MasterGrpcServer {
                         });
                     }
                     msg = stream.message() => {
-                        if let Ok(Some(request)) = msg {
-                            master.update_fuse_client_heartbeat(&client_id);
-                            let fuse_info = FuseClientInfo {
-                                client_id: client_id.clone(),
-                                client_type: request.client_type.clone(),
-                                mount_point: request.mount_point.clone(),
-                                collection: request.collection.clone(),
-                                replication: request.replication.clone(),
-                                host: request.host.clone(),
-                                pid: request.pid,
-                                connected_at: 0,
-                                last_heartbeat: std::time::SystemTime::now()
+                        match msg {
+                            Ok(Some(request)) => {
+                                let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_secs(),
-                                dirty_chunks: request.dirty_chunks,
-                                dirty_bytes: request.dirty_bytes,
-                                stats: request.stats.clone(),
-                            };
-                            master.register_fuse_client(fuse_info);
+                                    .as_secs();
+
+                                let fuse_info = FuseClientInfo {
+                                    client_id: cid.clone(),
+                                    client_type: request.client_type.clone(),
+                                    mount_point: request.mount_point.clone(),
+                                    collection: request.collection.clone(),
+                                    replication: request.replication.clone(),
+                                    host: request.host.clone(),
+                                    pid: request.pid,
+                                    connected_at: if !registered { now } else { 0 },
+                                    last_heartbeat: now,
+                                    dirty_chunks: request.dirty_chunks,
+                                    dirty_bytes: request.dirty_bytes,
+                                    stats: request.stats.clone(),
+                                };
+                                master.register_fuse_client(fuse_info);
+                                registered = true;
+                                continue;
+                            }
+                            Ok(None) => {
+                                // Client closed the stream; clean up and exit.
+                                master.remove_client(&cid);
+                                return;
+                            }
+                            Err(_) => {
+                                // Stream error; clean up and exit.
+                                master.remove_client(&cid);
+                                return;
+                            }
                         }
-                        continue;
                     }
                 }
             }

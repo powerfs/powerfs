@@ -173,6 +173,12 @@ impl FilerNetHandler {
             msg.header.seq, parent_ino, name
         );
 
+        // Check leadership for the correct shard before reading
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
         // Root lookup: when client looks up the root directory itself
         // (parent_ino == root and name is empty or "."), return the actual
         // root inode data from the database instead of hardcoded values
@@ -251,6 +257,12 @@ impl FilerNetHandler {
 
         info!("FILER_NET_GETATTR: ino={}", ino);
 
+        // Check leadership for the correct shard before reading
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
         match self.meta_shard_manager.get_inode(ino) {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
@@ -296,6 +308,10 @@ impl FilerNetHandler {
         );
 
         let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
         match self
             .meta_shard_manager
             .setattr(ino, shard_id, size, mode, uid, gid)
@@ -662,6 +678,12 @@ impl FilerNetHandler {
             "FILER_NET_READDIR: parent_ino={}, limit={}, last_name={}",
             parent_ino, limit, last_name
         );
+
+        // Check leadership for the correct shard before reading
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
 
         let entries = self.meta_shard_manager.list_directory(parent_ino);
 

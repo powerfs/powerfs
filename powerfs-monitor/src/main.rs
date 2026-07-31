@@ -3983,10 +3983,12 @@ async fn start_event_processor(
     }
 
     let mut stream = event_bus.subscribe().await;
+    let mut backoff_secs: u64 = 1;
 
     loop {
         match stream.read().await {
             Ok(events) => {
+                backoff_secs = 1; // Reset backoff on success
                 for event in events {
                     match &event.event {
                         Event::NodeStatus(e) => {
@@ -4061,7 +4063,9 @@ async fn start_event_processor(
             }
             Err(e) => {
                 warn!("Error reading events: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                // Exponential backoff: 1, 2, 4, 8, max 30
+                backoff_secs = (backoff_secs * 2).min(30);
             }
         }
     }

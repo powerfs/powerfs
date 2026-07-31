@@ -215,6 +215,30 @@ Containerized test environment:
 - `cargo clippy --workspace --all-targets`: ✅ pass (2 pre-existing warnings, no new issues)
 - `npm run build` (frontend): ✅ pass (3789 modules transformed, built in 1.53s)
 
+#### Container Integration Test (2026-07-31)
+
+**Bugs found and fixed during container testing:**
+
+1. **Monitor Redis ephemeral port exhaustion** (`event_bus.rs`):
+   - Root cause: `EventStream::read()` created a new Redis connection per call; 1s retry loop exhausted all 28K+ ephemeral ports
+   - Fix: Reuse connection in `EventStream`, add `block(5000)` to xread, exponential backoff (1→30s) in event processor
+
+2. **Master `keep_connected` gRPC deadlock** (`server.rs`):
+   - Root cause: Handler called `stream.message().await` BEFORE returning `Response::new(stream)`, causing client to wait for response headers while server waited for first message
+   - Fix: Return response stream immediately; read first message inside the stream's `select!` loop; add cleanup on stream end
+
+3. **Filer missing leadership check on read handlers** (`net_handler.rs`):
+   - Root cause: `handle_getattr`, `handle_lookup`, `handle_readdir`, `handle_setattr` read from local RocksDB without checking shard leadership, returning "not found" on non-leader nodes
+   - Fix: Added `check_leader(msg, shard_id)` to all four handlers with `shard_strategy.calculate_shard(ino)` routing
+
+**Test Results:**
+- FUSE client registration: ✅ 2 clients registered, stats reporting every 5s
+- Stats API (`/api/fuse/mounts`): ✅ Returns full ClientStats (queue depth, CB, Coalescer, pool, latency)
+- Stats update on I/O: ✅ `data_processed=1`, `admin_processed=1`, `cb_closed=1` observed
+- Circuit breaker tracking: ✅ `cb_closed_count=1` on active client
+- Coalescer fields: ✅ Present in API response (writes_in_total, flushes_out_total, dirty_bytes)
+- Data path (large writes): ⚠️ Lease renewal fails (status=10), pre-existing issue unrelated to Phase B
+
 #### B1 — Proto extension
 - `powerfs-master/proto/master.proto`: added `ClientStats` message (multi-queue / CB / Coalescer / pool / latency / lease fields), extended `KeepConnectedRequest.stats = 15` and `FuseClientInfo.stats = 12`.
 

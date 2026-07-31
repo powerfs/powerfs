@@ -38,6 +38,7 @@ impl EventBus {
                 client: self.client.clone(),
                 stream_key: self.stream_key.clone(),
                 last_id: "0".to_string(),
+                conn: None,
             }
         }
         #[cfg(not(feature = "redis"))]
@@ -114,24 +115,50 @@ pub struct EventStream {
     stream_key: String,
     #[cfg(feature = "redis")]
     last_id: String,
+    #[cfg(feature = "redis")]
+    conn: Option<redis::aio::Connection>,
 }
 
 impl EventStream {
-    pub async fn read(&mut self) -> Result<Vec<EventEnvelope>, String> {
-        #[cfg(feature = "redis")]
-        {
-            let mut conn = self
+    #[cfg(feature = "redis")]
+    async fn ensure_conn(&mut self) -> Result<&mut redis::aio::Connection, String> {
+        if self.conn.is_none() {
+            let c = self
                 .client
                 .get_async_connection()
                 .await
                 .map_err(|e| format!("Redis connection failed: {}", e))?;
+            self.conn = Some(c);
+        }
+        Ok(self.conn.as_mut().unwrap())
+    }
 
-            let opts = StreamReadOptions::default().count(10);
+    pub async fn read(&mut self) -> Result<Vec<EventEnvelope>, String> {
+        #[cfg(feature = "redis")]
+        {
+            // Clone fields needed for the xread call to avoid borrow conflicts
+            let stream_key = self.stream_key.clone();
+            let last_id = self.last_id.clone();
+
+            let conn = match self.ensure_conn().await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.conn = None;
+                    return Err(e);
+                }
+            };
+
+            // Block up to 5 seconds waiting for new events to avoid busy-looping
+            let opts = StreamReadOptions::default().count(10).block(5000);
 
             let reply: StreamReadReply = conn
-                .xread_options(&[&self.stream_key], &[&self.last_id], &opts)
+                .xread_options(&[&stream_key], &[&last_id], &opts)
                 .await
-                .map_err(|e| format!("Redis xread failed: {}", e))?;
+                .map_err(|e| {
+                    // Drop the broken connection so next read creates a new one
+                    self.conn = None;
+                    format!("Redis xread failed: {}", e)
+                })?;
 
             let mut events = Vec::new();
 
