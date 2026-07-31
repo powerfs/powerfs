@@ -1,3 +1,4 @@
+use crate::collection::{CollectionInfo, CollectionManager, CollectionStats};
 use crate::raft_node::{ApplyEntry, OutgoingMessage, Peer, ProposeRequest, RaftNode};
 use crate::raft_storage::RaftCommand;
 use crate::volume_client::VolumeClientPool;
@@ -38,6 +39,7 @@ pub struct MasterNode {
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
     volume_routes: RwLock<HashMap<u64, VolumeRoute>>,
     collections: RwLock<HashMap<String, CollectionConfig>>,
+    collection_manager: RwLock<CollectionManager>,
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
@@ -366,6 +368,7 @@ impl MasterNode {
             volumes: RwLock::new(HashMap::new()),
             volume_routes: RwLock::new(HashMap::new()),
             collections: RwLock::new(collections),
+            collection_manager: RwLock::new(CollectionManager::with_default()),
             volume_layouts: RwLock::new(HashMap::new()),
             cluster_config: RwLock::new(config),
             raft_config,
@@ -1033,6 +1036,16 @@ impl MasterNode {
                 modified_at: Utc::now(),
             },
         );
+        drop(collections);
+
+        // Sync extended-attribute store so the new collection is visible to
+        // get_collection_info / list_collection_infos / capacity checks.
+        // Use ensure_collection (idempotent) so re-applied raft entries do not
+        // fail when the CollectionManager already knows about this name.
+        self.collection_manager
+            .write()
+            .unwrap()
+            .ensure_collection(name);
 
         info!("Applied CreateCollection: {}", name);
         Ok(())
@@ -1052,6 +1065,15 @@ impl MasterNode {
                 name
             )));
         }
+        drop(collections);
+
+        // Best-effort sync: ignore not-found in CollectionManager since the
+        // extended store may not have been populated for legacy collections.
+        let _ = self
+            .collection_manager
+            .write()
+            .unwrap()
+            .delete_collection(name);
 
         info!("Applied DeleteCollection: {}", name);
         Ok(())
@@ -1104,6 +1126,83 @@ impl MasterNode {
 
     pub async fn list_collections(&self) -> Vec<CollectionConfig> {
         self.collections.read().unwrap().values().cloned().collect()
+    }
+
+    /// Create a collection with P0 extended attributes.
+    ///
+    /// This writes directly to the in-memory [`CollectionManager`] and does
+    /// NOT go through Raft. It is intended for the new HTTP management API
+    /// and administrative tooling. The basic [`CollectionConfig`] is NOT
+    /// modified; callers that need gRPC visibility should also invoke the
+    /// existing [`create_collection`] (raft-backed) path.
+    pub async fn create_collection_ext(&self, info: CollectionInfo) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        self.collection_manager
+            .write()
+            .unwrap()
+            .create_collection(info)
+    }
+
+    /// Update a collection's extended attributes in place.
+    pub async fn update_collection_ext(&self, name: &str, info: CollectionInfo) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        self.collection_manager
+            .write()
+            .unwrap()
+            .update_collection(name, info)
+    }
+
+    /// Delete a collection from the extended-attribute store.
+    pub async fn delete_collection_ext(&self, name: &str) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        self.collection_manager
+            .write()
+            .unwrap()
+            .delete_collection(name)
+    }
+
+    /// Fetch the extended attributes for a collection.
+    pub async fn get_collection_info(&self, name: &str) -> Option<CollectionInfo> {
+        self.collection_manager.read().unwrap().get_collection(name)
+    }
+
+    /// Snapshot all collections with their extended attributes.
+    pub async fn list_collection_infos(&self) -> Vec<CollectionInfo> {
+        self.collection_manager.read().unwrap().list_collections()
+    }
+
+    /// Compute runtime stats for a collection from the current volume table.
+    pub async fn get_collection_stats(&self, name: &str) -> Option<CollectionStats> {
+        let volumes = self.volumes.read().unwrap().clone();
+        let cm = self.collection_manager.read().unwrap();
+        // Bail early if the collection does not exist; the returned
+        // CollectionInfo is intentionally discarded.
+        cm.get_collection(name)?;
+        Some(cm.compute_stats(name, &volumes))
+    }
+
+    /// Check whether a collection is within its capacity quota.
+    ///
+    /// Used by [`assign_volume`] to reject writes that would exceed the
+    /// configured `capacity_quota_bytes`. The `_info` parameter is accepted
+    /// for API symmetry with the task spec; the actual check re-reads the
+    /// volume table to get a fresh `used_bytes` total.
+    pub async fn check_collection_capacity(
+        &self,
+        name: &str,
+        _info: &CollectionInfo,
+    ) -> Result<()> {
+        let volumes = self.volumes.read().unwrap().clone();
+        self.collection_manager
+            .read()
+            .unwrap()
+            .check_capacity(name, &volumes)
     }
 
     async fn apply_delete_volume(&self, volume_id: u64) -> Result<()> {
@@ -1320,6 +1419,19 @@ impl MasterNode {
     ) -> Result<(Fid, Vec<DataNodeInfo>)> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
+        }
+
+        // P0 capacity check: reject writes to non-active or over-quota
+        // collections. Collections absent from the extended store (legacy
+        // or pre-migration) bypass this check to preserve backward compat.
+        if let Some(coll) = self.get_collection_info(collection).await {
+            if !coll.is_writable() {
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "collection {} is not writable (status={:?})",
+                    collection, coll.status
+                )));
+            }
+            self.check_collection_capacity(collection, &coll).await?;
         }
 
         let mut nodes = self.topology.read().unwrap().list_all_nodes();
@@ -2395,6 +2507,7 @@ impl Clone for MasterNode {
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
             volume_routes: RwLock::new(self.volume_routes.read().unwrap().clone()),
             collections: RwLock::new(self.collections.read().unwrap().clone()),
+            collection_manager: RwLock::new(self.collection_manager.read().unwrap().clone()),
             volume_layouts: RwLock::new(self.volume_layouts.read().unwrap().clone()),
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),

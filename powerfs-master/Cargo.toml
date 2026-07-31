@@ -48,6 +48,7 @@ prometheus = "0.13"
 hyper = { version = "1", features = ["full"] }
 lazy_static = "1.4"
 axum = "0.6"
+dashmap = { workspace = true }
 redis = { version = "0.22", features = ["tokio-comp"], optional = true }
 hmac = "0.12"
 sha2 = "0.10"

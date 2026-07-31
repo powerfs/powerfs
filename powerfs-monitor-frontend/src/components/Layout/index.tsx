@@ -29,7 +29,6 @@ import {
   SafetyCertificateOutlined,
   LockOutlined,
   WarningOutlined,
-  HddOutlined,
   SafetyOutlined,
   BulbOutlined,
   BulbFilled,
@@ -92,7 +91,6 @@ function AppLayout() {
           type: 'group' as const,
           label: '基础设施',
           children: [
-            { key: '/nodes', icon: <HddOutlined />, label: '节点管理' },
             { key: '/cluster-topology', icon: <ClusterOutlined />, label: '集群拓扑' },
             { key: '/capacity-planning', icon: <LineChartOutlined />, label: '容量规划' },
             { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
@@ -100,20 +98,17 @@ function AppLayout() {
         }]
       : []),
     // ── 存储 ──
-    {
-      key: 'grp-storage',
-      type: 'group',
-      label: '存储',
-      children: [
-        ...(isAdmin
-          ? [
-              { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume 管理' },
-              { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot 扫描' },
-            ]
-          : []),
-        { key: '/s3', icon: <CloudOutlined />, label: 'S3 管理' },
-      ],
-    },
+    ...(isAdmin
+      ? [{
+          key: 'grp-storage',
+          type: 'group' as const,
+          label: '存储',
+          children: [
+            { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume 管理' },
+            { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot 扫描' },
+          ],
+        }]
+      : []),
     // ── 元数据 ──
     ...(isAdmin
       ? [{
@@ -135,20 +130,20 @@ function AppLayout() {
           ],
         }]
       : []),
-    // ── 性能 & 客户端 ──
+    // ── 客户端 & 性能 ──
     {
-      key: 'grp-perf',
+      key: 'grp-clients',
       type: 'group',
-      label: '性能 & 客户端',
+      label: '客户端 & 性能',
       children: [
-        { key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' },
         ...(isAdmin
           ? [
+              { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FS 管理' },
               { key: '/benchmark', icon: <RocketOutlined />, label: '性能测试' },
-              { key: '/optimizations', icon: <BulbOutlined />, label: '优化建议' },
-              { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
             ]
           : []),
+        { key: '/s3', icon: <CloudOutlined />, label: 'S3 管理' },
+        { key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' },
       ],
     },
     // ── 安全 ──
