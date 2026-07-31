@@ -21,6 +21,7 @@ import AccessKeys from './pages/AccessKeys'
 import Benchmark from './pages/Benchmark'
 import ClusterTopology from './pages/ClusterTopology'
 import CapacityPlanning from './pages/CapacityPlanning'
+import Optimizations from './pages/Optimizations'
 
 function App() {
   return (
@@ -141,6 +142,14 @@ function App() {
           }
         />
         <Route path="alerts" element={<Alerts />} />
+        <Route
+          path="optimizations"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Optimizations />
+            </ProtectedRoute>
+          }
+        />
         <Route path="access-keys" element={<AccessKeys />} />
         <Route
           path="users"

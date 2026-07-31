@@ -73,7 +73,7 @@ function AppLayout() {
 
   const isAdmin = user?.role === 'admin'
 
-  // Group menu items into 5 categories
+  // Group menu items into logical categories
   const menuItems: MenuItem[] = [
     // ── 总览 ──
     {
@@ -96,7 +96,6 @@ function AppLayout() {
             { key: '/cluster-topology', icon: <ClusterOutlined />, label: '集群拓扑' },
             { key: '/capacity-planning', icon: <LineChartOutlined />, label: '容量规划' },
             { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
-            { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
           ],
         }]
       : []),
@@ -136,15 +135,19 @@ function AppLayout() {
           ],
         }]
       : []),
-    // ── 性能 ──
+    // ── 性能 & 客户端 ──
     {
       key: 'grp-perf',
       type: 'group',
-      label: '性能',
+      label: '性能 & 客户端',
       children: [
         { key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' },
         ...(isAdmin
-          ? [{ key: '/benchmark', icon: <RocketOutlined />, label: '性能测试' }]
+          ? [
+              { key: '/benchmark', icon: <RocketOutlined />, label: '性能测试' },
+              { key: '/optimizations', icon: <BulbOutlined />, label: '优化建议' },
+              { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
+            ]
           : []),
       ],
     },
