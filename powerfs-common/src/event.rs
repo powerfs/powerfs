@@ -88,6 +88,18 @@ pub struct VolumeStatusEvent {
     pub file_count: u64,
     pub status: String,
     pub collection: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub replica_placement: u32,
+    #[serde(default)]
+    pub ttl: u32,
+    #[serde(default)]
+    pub disk_type: String,
+    #[serde(default)]
+    pub compact_status: u32,
+    #[serde(default)]
+    pub append_offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

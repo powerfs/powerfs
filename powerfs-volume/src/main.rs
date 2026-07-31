@@ -267,6 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ttl: v.ttl.0 as u32,
                     disk_type: v.disk_type.0.clone(),
                     used: v.used,
+                    file_count: v.next_file_key - 1,
+                    compact_status: 0,
+                    append_offset: 0,
                 })
                 .collect();
 
@@ -301,6 +304,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ttl: v.ttl.0 as u32,
                         disk_type: v.disk_type.0.clone(),
                         used: v.used,
+                        file_count: v.next_file_key - 1,
+                        compact_status: 0,
+                        append_offset: 0,
                     })
                     .collect();
 

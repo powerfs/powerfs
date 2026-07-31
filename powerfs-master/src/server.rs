@@ -487,6 +487,9 @@ impl MasterService for MasterGrpcServer {
                     ttl: volume.ttl.0 as u32,
                     disk_type: volume.disk_type.0.clone(),
                     used: volume.used,
+                    file_count: volume.next_file_key - 1,
+                    compact_status: 0,
+                    append_offset: 0,
                 });
             }
 

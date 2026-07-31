@@ -218,6 +218,12 @@ impl VolumeServer {
                         }
                         .to_string(),
                         collection: volume.collection.0.clone(),
+                        read_only: matches!(volume.state, powerfs_common::types::VolumeState::ReadOnly),
+                        replica_placement: volume.replica_count,
+                        ttl: volume.ttl.0 as u32,
+                        disk_type: volume.disk_type.0.clone(),
+                        compact_status: 0,
+                        append_offset: 0,
                     });
 
                     if let Err(e) = provider
@@ -270,6 +276,12 @@ impl VolumeService for VolumeServer {
                         file_count: 0,
                         status: "available".to_string(),
                         collection: "default".to_string(),
+                        read_only: false,
+                        replica_placement: info.replica_count,
+                        ttl: info.ttl.0 as u32,
+                        disk_type: info.disk_type.0.clone(),
+                        compact_status: 0,
+                        append_offset: 0,
                     });
                     if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                         warn!("Failed to publish volume_status event: {}", e);

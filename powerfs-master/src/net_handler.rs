@@ -286,6 +286,9 @@ impl MasterNetHandler {
                     ttl: 0,
                     disk_type: "ssd".to_string(),
                     used: 0,
+                    file_count: 0,
+                    compact_status: 0,
+                    append_offset: 0,
                 });
             }
         }

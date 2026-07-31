@@ -84,9 +84,15 @@ export interface VolumeInfo {
   size: number
   used: number
   file_count: number
-  status: 'available' | 'full' | 'readonly' | 'creating'
+  status: 'available' | 'full' | 'readonly' | 'creating' | 'read_only' | 'deleting'
   collection: string
   created_at: string
+  read_only?: boolean
+  replica_placement?: number
+  ttl?: number
+  disk_type?: string
+  compact_status?: number
+  append_offset?: number
 }
 
 export interface FilerNodeInfo {

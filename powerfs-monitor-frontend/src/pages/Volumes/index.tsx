@@ -278,12 +278,14 @@ function Volumes() {
 
             <div>
               <h4 style={{ margin: '0 0 12px' }}>基本信息</h4>
-              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                 <div>
                   <span style={{ color: '#8c8c8c', fontSize: 12 }}>状态</span>
-                  <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : 'orange'}>
-                    {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : '只读'}
-                  </Tag>
+                  <div>
+                    <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? 'orange' : 'blue'}>
+                      {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? '只读' : selectedVolume.status === 'deleting' ? '删除中' : '创建中'}
+                    </Tag>
+                  </div>
                 </div>
                 <div>
                   <span style={{ color: '#8c8c8c', fontSize: 12 }}>Collection</span>
@@ -296,6 +298,38 @@ function Volumes() {
                 <div>
                   <span style={{ color: '#8c8c8c', fontSize: 12 }}>创建时间</span>
                   <p style={{ margin: '4px 0', fontWeight: 500 }}>{new Date(selectedVolume.created_at).toLocaleString()}</p>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <h4 style={{ margin: '0 0 12px' }}>存储配置</h4>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>只读模式</span>
+                  <div>
+                    {selectedVolume.read_only ? <Tag color="orange">只读</Tag> : <Tag color="green">读写</Tag>}
+                  </div>
+                </div>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>副本数</span>
+                  <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.replica_placement ?? '-'}</p>
+                </div>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>TTL</span>
+                  <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.ttl ? `${selectedVolume.ttl}s` : '-'}</p>
+                </div>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>磁盘类型</span>
+                  <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.disk_type || '-'}</p>
+                </div>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>追加偏移</span>
+                  <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.append_offset ? formatBytes(selectedVolume.append_offset) : '-'}</p>
+                </div>
+                <div>
+                  <span style={{ color: '#8c8c8c', fontSize: 12 }}>压缩状态</span>
+                  <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.compact_status ?? 0}</p>
                 </div>
               </div>
             </div>

@@ -864,6 +864,12 @@ impl MasterNode {
                 file_count: 0,
                 status: "creating".to_string(),
                 collection: coll_str,
+                read_only: false,
+                replica_placement: 0,
+                ttl: 0,
+                disk_type: String::new(),
+                compact_status: 0,
+                append_offset: 0,
             });
             if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                 warn!("Failed to publish volume_status event: {}", e);

@@ -36,6 +36,18 @@ pub struct VolumeInfo {
     pub status: String,
     pub collection: String,
     pub created_at: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub replica_placement: u32,
+    #[serde(default)]
+    pub ttl: u32,
+    #[serde(default)]
+    pub disk_type: String,
+    #[serde(default)]
+    pub compact_status: u32,
+    #[serde(default)]
+    pub append_offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +118,12 @@ impl MetricStore {
                     status: event.status,
                     collection: event.collection.clone(),
                     created_at: chrono::Utc::now().to_rfc3339(),
+                    read_only: event.read_only,
+                    replica_placement: event.replica_placement,
+                    ttl: event.ttl,
+                    disk_type: event.disk_type,
+                    compact_status: event.compact_status,
+                    append_offset: event.append_offset,
                 },
             );
         }
