@@ -92,6 +92,7 @@ function AppLayout() {
           label: '基础设施',
           children: [
             { key: '/nodes', icon: <HddOutlined />, label: '节点管理' },
+            { key: '/cluster-topology', icon: <ClusterOutlined />, label: '集群拓扑' },
             { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
             { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
           ],

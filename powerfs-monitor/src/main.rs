@@ -432,6 +432,133 @@ impl<T> ApiResponse<T> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct FilerNodeInfo {
+    node_id: String,
+    address: String,
+    grpc_port: u32,
+    http_port: u32,
+    is_healthy: bool,
+    leader_count: u64,
+    total_shards: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct VolumeServerInfo {
+    node: NodeInfo,
+    volumes: Vec<VolumeInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct TopologyResponse {
+    masters: Vec<NodeInfo>,
+    filers: Vec<FilerNodeInfo>,
+    volume_servers: Vec<VolumeServerInfo>,
+}
+
+async fn get_topology(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<TopologyResponse>> {
+    let nodes = state.metric_store.get_nodes().await;
+    let volumes = state.metric_store.get_volumes().await;
+
+    let masters: Vec<NodeInfo> = nodes
+        .iter()
+        .filter(|n| n.node_type == "master")
+        .cloned()
+        .collect();
+
+    let mut volume_servers: Vec<VolumeServerInfo> = nodes
+        .iter()
+        .filter(|n| n.node_type == "volume")
+        .map(|n| {
+            let server_volumes: Vec<VolumeInfo> = volumes
+                .iter()
+                .filter(|v| v.node_id == n.id)
+                .cloned()
+                .collect();
+            VolumeServerInfo {
+                node: n.clone(),
+                volumes: server_volumes,
+            }
+        })
+        .collect();
+
+    // Volume servers with no node_type set (legacy) but having volumes
+    let volume_node_ids: std::collections::HashSet<String> =
+        volume_servers.iter().map(|vs| vs.node.id.clone()).collect();
+    for vol in &volumes {
+        if !volume_node_ids.contains(&vol.node_id) {
+            if let Some(server) = volume_servers.iter_mut().find(|s| s.node.id == vol.node_id) {
+                server.volumes.push(vol.clone());
+            } else {
+                volume_servers.push(VolumeServerInfo {
+                    node: NodeInfo {
+                        id: vol.node_id.clone(),
+                        node_type: "volume".to_string(),
+                        address: String::new(),
+                        grpc_port: 0,
+                        http_port: 0,
+                        status: "unknown".to_string(),
+                        cpu_usage: 0.0,
+                        mem_usage: 0.0,
+                        disk_usage: 0.0,
+                        network_rx: 0,
+                        network_tx: 0,
+                        uptime: 0,
+                        volume_count: 0,
+                        is_leader: false,
+                        raft_term: 0,
+                    },
+                    volumes: vec![vol.clone()],
+                });
+            }
+        }
+    }
+
+    // Fetch filer list from Master gRPC
+    let filers = match get_filers_via_grpc(&state).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Failed to fetch filers for topology: {}", e);
+            Vec::new()
+        }
+    };
+
+    Json(ApiResponse::success(TopologyResponse {
+        masters,
+        filers,
+        volume_servers,
+    }))
+}
+
+async fn get_filers_via_grpc(
+    state: &Arc<AppState>,
+) -> Result<Vec<FilerNodeInfo>, String> {
+    let mut client = state.master_client.lock().await;
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+
+    match client.list_filers(tonic::Request::new(request)).await {
+        Ok(response) => {
+            let resp = response.into_inner();
+            Ok(resp
+                .filers
+                .into_iter()
+                .map(|f| FilerNodeInfo {
+                    node_id: f.node_id,
+                    address: f.address,
+                    grpc_port: f.grpc_port,
+                    http_port: f.http_port,
+                    is_healthy: f.is_healthy,
+                    leader_count: f.leader_count,
+                    total_shards: f.total_shards,
+                })
+                .collect())
+        }
+        Err(e) => Err(format!("gRPC error: {}", e)),
+    }
+}
+
 async fn get_cluster_metrics(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<ClusterMetrics>> {
@@ -3924,6 +4051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/bitrot/scrub/trigger/:id", post(trigger_scrub_volume))
         .route("/api/bitrot/scrub/trigger-all", post(trigger_scrub_all))
         .route("/api/master/status", get(get_master_status))
+        .route("/api/topology", get(get_topology))
         .route("/api/master/transfer-leader", post(transfer_leader))
         .route("/api/benchmarks", get(get_benchmark_results))
         .route(

@@ -89,6 +89,27 @@ export interface VolumeInfo {
   created_at: string
 }
 
+export interface FilerNodeInfo {
+  node_id: string
+  address: string
+  grpc_port: number
+  http_port: number
+  is_healthy: boolean
+  leader_count: number
+  total_shards: number
+}
+
+export interface VolumeServerInfo {
+  node: NodeInfo
+  volumes: VolumeInfo[]
+}
+
+export interface TopologyData {
+  masters: NodeInfo[]
+  filers: FilerNodeInfo[]
+  volume_servers: VolumeServerInfo[]
+}
+
 export interface KVSessionInfo {
   id: string
   model_name: string

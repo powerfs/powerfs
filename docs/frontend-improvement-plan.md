@@ -142,6 +142,74 @@ Client Detail Drawer (Tab layout)
 | C3 | Cluster topology | Master GetClusterInfo | Master→Filer→Volume→Device visual map |
 | C4 | Capacity planning | Master historical metrics | Growth trend + projected full dates |
 
+#### Phase C Data Gap Analysis (2026-07-31)
+
+Investigated current backend data sources against C1-C4 requirements:
+
+**Existing data:**
+- `VolumeShortInfo` proto (master.proto:L109): `volume_id, size, read_only, collection, replica_placement, ttl, disk_type, used`
+- `VolumeInfo` (metric_store.rs:L30): `id, node_id, size, used, file_count, status, collection, created_at`
+- `Heartbeat` proto (master.proto:L82): Volume Server reports `VolumeShortInfo` list + `max_file_key` — **no I/O metrics**
+- `MasterStatusResponse` (master.proto:L593): master nodes with CPU/mem/disk usage
+- `VolumeListResponse` (master.proto:L238): `DataNodeInfo` list with volumes
+- Monitor APIs: `/api/metrics/volumes`, `/api/metrics/nodes`, `/api/metrics/cluster` already exist
+- Frontend pages: `Volumes/`, `StorageDevices/`, `Nodes/` already exist
+
+**Critical gaps:**
+1. **C1**: `VolumeInfo` missing `read_only, replica_placement, ttl, disk_type, compact_status, append_offset`. `file_count` exists but `compact_status` is not in proto at all.
+2. **C2**: **I/O metrics completely missing**. Volume Server does not collect IOPS/throughput/latency. Heartbeat proto has no performance fields. This is the largest gap.
+3. **C3**: Topology data scattered across `VolumeList` (data_nodes+volumes), `MasterStatus`, `ListFilers`. Needs aggregation API + visualization.
+4. **C4**: `get_metric_history` (main.rs:L1689) returns **mock random data** (`rand::random`). No real time-series storage. Must implement historical metric persistence.
+
+#### Phase C Implementation Plan
+
+**Recommended order: C3 → C1 → C2 → C4** (start with what uses existing data, defer new metrics collection)
+
+##### C3: Cluster Topology (uses existing data, medium effort)
+
+Backend:
+- New Monitor endpoint `GET /api/topology` aggregating: master nodes (from `MasterStatus`), filer nodes (from `ListFilers`/`GetShardMapping`), volume servers + volumes (from `VolumeList`)
+- Response shape: `{ masters: [...], filers: [...], volume_servers: [{ id, address, volumes: [...] }] }`
+
+Frontend:
+- New `ClusterTopology` page with a tree/graph visualization: Master → Filer (shards) and Master → Volume Server → Volumes
+- Use Ant Design Tree or a simple card-based hierarchy
+
+##### C1: Volume Detail (minor proto + data extension, small effort)
+
+Backend:
+- Extend `VolumeShortInfo` proto with `uint64 file_count`, `uint32 compact_status`, `uint64 append_offset`
+- Extend monitor `VolumeInfo` + `VolumeStatusEvent` with `read_only, replica_placement, ttl, disk_type, compact_status`
+- Volume Server populates new fields in Heartbeat
+
+Frontend:
+- Enhance `Volumes` page detail drawer: show compact status, replica placement, disk type, TTL, read-only flag
+- Add per-volume needle count and append offset (write position)
+
+##### C2: I/O Performance (new metrics collection, large effort)
+
+Backend:
+- New module `powerfs-volume/src/io_stats.rs`: per-volume counters (read/write ops, bytes, latency histogram)
+- Instrument `handle_write_needle` / `handle_read_needle` / `handle_read_needle_blob` to record stats
+- Extend `Heartbeat` proto with `VolumeIoStats` message (iops, throughput, p50/p99 latency)
+- Master stores and forwards to Monitor; Monitor exposes `GET /api/metrics/volumes/:id/io`
+
+Frontend:
+- New `VolumePerformance` page (or tab in Volumes detail): real-time IOPS/throughput chart + p50/p99 latency
+- Use existing chart components
+
+##### C4: Capacity Planning (time-series storage, large effort)
+
+Backend:
+- Replace mock `get_metric_history` with real time-series: store periodic snapshots of per-volume `used`/`size` and cluster-level storage
+- Use ring buffer or Redis sorted sets (Redis already in stack) for time-series
+- New endpoint `GET /api/metrics/volumes/:id/capacity-history`
+- Compute projected full date: `current_used + growth_rate * days_until_full`
+
+Frontend:
+- New `CapacityPlanning` page: per-volume growth trend chart + projected full date badges
+- Alert when projected full date < threshold (e.g., 7 days)
+
 ### Phase D: Navigation Reorganization
 
 ```

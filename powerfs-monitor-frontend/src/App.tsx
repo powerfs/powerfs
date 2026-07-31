@@ -19,6 +19,7 @@ import Users from './pages/Users'
 import Roles from './pages/Roles'
 import AccessKeys from './pages/AccessKeys'
 import Benchmark from './pages/Benchmark'
+import ClusterTopology from './pages/ClusterTopology'
 
 function App() {
   return (
@@ -45,6 +46,14 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <Nodes />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="cluster-topology"
+          element={
+            <ProtectedRoute requireAdmin>
+              <ClusterTopology />
             </ProtectedRoute>
           }
         />
