@@ -93,6 +93,23 @@ export interface VolumeInfo {
   disk_type?: string
   compact_status?: number
   append_offset?: number
+  // I/O performance counters (cumulative)
+  read_ops?: number
+  write_ops?: number
+  read_bytes?: number
+  write_bytes?: number
+  read_avg_latency_us?: number
+  write_avg_latency_us?: number
+}
+
+export interface VolumeIoStats {
+  volume_id: number
+  read_ops: number
+  write_ops: number
+  read_bytes: number
+  write_bytes: number
+  read_avg_latency_us: number
+  write_avg_latency_us: number
 }
 
 export interface FilerNodeInfo {

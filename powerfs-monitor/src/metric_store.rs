@@ -48,6 +48,19 @@ pub struct VolumeInfo {
     pub compact_status: u32,
     #[serde(default)]
     pub append_offset: u64,
+    // I/O performance counters
+    #[serde(default)]
+    pub read_ops: u64,
+    #[serde(default)]
+    pub write_ops: u64,
+    #[serde(default)]
+    pub read_bytes: u64,
+    #[serde(default)]
+    pub write_bytes: u64,
+    #[serde(default)]
+    pub read_avg_latency_us: u64,
+    #[serde(default)]
+    pub write_avg_latency_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +137,12 @@ impl MetricStore {
                     disk_type: event.disk_type,
                     compact_status: event.compact_status,
                     append_offset: event.append_offset,
+                    read_ops: event.read_ops,
+                    write_ops: event.write_ops,
+                    read_bytes: event.read_bytes,
+                    write_bytes: event.write_bytes,
+                    read_avg_latency_us: event.read_avg_latency_us,
+                    write_avg_latency_us: event.write_avg_latency_us,
                 },
             );
         }

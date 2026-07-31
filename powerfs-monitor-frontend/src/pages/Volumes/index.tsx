@@ -333,6 +333,38 @@ function Volumes() {
                 </div>
               </div>
             </div>
+
+            {selectedVolume.read_ops !== undefined && selectedVolume.read_ops > 0 && (
+              <div>
+                <h4 style={{ margin: '0 0 12px' }}>I/O 性能 (累计)</h4>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>读操作</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{(selectedVolume.read_ops ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>写操作</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{(selectedVolume.write_ops ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>读流量</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatBytes(selectedVolume.read_bytes ?? 0)}</p>
+                  </div>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>写流量</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatBytes(selectedVolume.write_bytes ?? 0)}</p>
+                  </div>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>平均读延迟</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.read_avg_latency_us ? `${(selectedVolume.read_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</p>
+                  </div>
+                  <div>
+                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>平均写延迟</span>
+                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.write_avg_latency_us ? `${(selectedVolume.write_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</p>
+                  </div>
+                </div>
+              </div>
+            )}
           </Space>
         )}
       </Modal>

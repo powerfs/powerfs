@@ -100,6 +100,19 @@ pub struct VolumeStatusEvent {
     pub compact_status: u32,
     #[serde(default)]
     pub append_offset: u64,
+    // I/O performance counters (cumulative since Volume Server start)
+    #[serde(default)]
+    pub read_ops: u64,
+    #[serde(default)]
+    pub write_ops: u64,
+    #[serde(default)]
+    pub read_bytes: u64,
+    #[serde(default)]
+    pub write_bytes: u64,
+    #[serde(default)]
+    pub read_avg_latency_us: u64,
+    #[serde(default)]
+    pub write_avg_latency_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

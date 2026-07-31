@@ -870,6 +870,12 @@ impl MasterNode {
                 disk_type: String::new(),
                 compact_status: 0,
                 append_offset: 0,
+                read_ops: 0,
+                write_ops: 0,
+                read_bytes: 0,
+                write_bytes: 0,
+                read_avg_latency_us: 0,
+                write_avg_latency_us: 0,
             });
             if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                 warn!("Failed to publish volume_status event: {}", e);

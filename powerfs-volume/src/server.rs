@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 
+use crate::io_stats::IoStatsCollector;
 use crate::proto::{VolumeService, VolumeServiceServer};
 use crate::range_lease::RangeLeaseManager;
 use bytes::Bytes;
@@ -33,6 +34,7 @@ pub struct VolumeServer {
     http_port: u32,
     data_dir: String,
     pub range_lease_mgr: Arc<RangeLeaseManager>,
+    pub io_stats: Arc<IoStatsCollector>,
 }
 
 impl VolumeServer {
@@ -69,6 +71,7 @@ impl VolumeServer {
             http_port,
             data_dir: data_dir.to_string(),
             range_lease_mgr: Arc::new(RangeLeaseManager::new(DEFAULT_STRIPE_SIZE)),
+            io_stats: Arc::new(IoStatsCollector::new()),
         }
     }
 
@@ -165,6 +168,7 @@ impl VolumeServer {
         let http_port = self.http_port;
         let data_dir = self.data_dir.clone();
         let storage_manager = self.storage_manager.clone();
+        let io_stats = self.io_stats.clone();
 
         tokio::spawn(async move {
             info!("Starting node status publisher");
@@ -202,7 +206,9 @@ impl VolumeServer {
                 }
 
                 let volumes = storage_manager.list_volumes();
+                let io_snapshot = io_stats.snapshot();
                 for volume in volumes {
+                    let io = io_snapshot.get(&volume.id.0);
                     let volume_event = Event::VolumeStatus(VolumeStatusEvent {
                         volume_id: volume.id.0,
                         node_id: node_id_str.clone(),
@@ -224,6 +230,12 @@ impl VolumeServer {
                         disk_type: volume.disk_type.0.clone(),
                         compact_status: 0,
                         append_offset: 0,
+                        read_ops: io.map(|s| s.read_ops).unwrap_or(0),
+                        write_ops: io.map(|s| s.write_ops).unwrap_or(0),
+                        read_bytes: io.map(|s| s.read_bytes).unwrap_or(0),
+                        write_bytes: io.map(|s| s.write_bytes).unwrap_or(0),
+                        read_avg_latency_us: io.map(|s| s.read_avg_latency_us).unwrap_or(0),
+                        write_avg_latency_us: io.map(|s| s.write_avg_latency_us).unwrap_or(0),
                     });
 
                     if let Err(e) = provider
@@ -282,6 +294,12 @@ impl VolumeService for VolumeServer {
                         disk_type: info.disk_type.0.clone(),
                         compact_status: 0,
                         append_offset: 0,
+                        read_ops: 0,
+                        write_ops: 0,
+                        read_bytes: 0,
+                        write_bytes: 0,
+                        read_avg_latency_us: 0,
+                        write_avg_latency_us: 0,
                     });
                     if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                         warn!("Failed to publish volume_status event: {}", e);
@@ -330,7 +348,7 @@ impl VolumeService for VolumeServer {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
         let file_key = req.file_key;
-        let data_size = req.data.len();
+        let data_size = req.data.len() as u64;
 
         debug!(
             "write_needle: volume_id={}, file_key={}, size={}",
@@ -339,6 +357,8 @@ impl VolumeService for VolumeServer {
 
         let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
+        let io_stats = self.io_stats.clone();
+        let vid = volume_id.0;
 
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
@@ -367,6 +387,8 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
+                let elapsed = start.elapsed().as_micros() as u64;
+                io_stats.record_write(vid, data_size, elapsed);
                 debug!("write_needle completed in {:?}", start.elapsed());
                 r
             }
@@ -392,17 +414,22 @@ impl VolumeService for VolumeServer {
 
         let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
+        let io_stats = self.io_stats.clone();
+        let vid = volume_id.0;
 
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.read_needle(&needle_id);
                 match result {
-                    Ok(data) => Ok(Response::new(crate::proto::ReadNeedleResponse {
-                        success: true,
-                        data: data.to_vec(),
-                        cookie: 0,
-                        last_modified: 0,
-                    })),
+                    Ok(data) => {
+                        let size = data.len() as u64;
+                        Ok((Response::new(crate::proto::ReadNeedleResponse {
+                            success: true,
+                            data: data.to_vec(),
+                            cookie: 0,
+                            last_modified: 0,
+                        }), size))
+                    }
                     Err(e) => {
                         warn!("read_needle failed: {}", e);
                         Err(Status::internal(format!("{}", e)))
@@ -418,10 +445,13 @@ impl VolumeService for VolumeServer {
         })
         .await
         {
-            Ok(r) => {
+            Ok(Ok((r, size))) => {
+                let elapsed = start.elapsed().as_micros() as u64;
+                io_stats.record_read(vid, size, elapsed);
                 debug!("read_needle completed in {:?}", start.elapsed());
-                r
+                Ok(r)
             }
+            Ok(Err(status)) => Err(status),
             Err(e) => {
                 error!("read_needle task failed: {}", e);
                 Err(Status::internal(format!("task failed: {}", e)))
@@ -632,7 +662,7 @@ impl VolumeService for VolumeServer {
         let offset = req.offset;
         let size = req.size;
         let cookie = req.cookie;
-        let data_size = req.needle_blob.len();
+        let data_size = req.needle_blob.len() as u64;
 
         debug!(
             "write_needle_blob: volume_id={}, file_key={}, offset={}, size={}, data_size={}",
@@ -641,6 +671,8 @@ impl VolumeService for VolumeServer {
 
         let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
+        let io_stats = self.io_stats.clone();
+        let vid = volume_id.0;
 
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
@@ -671,6 +703,8 @@ impl VolumeService for VolumeServer {
         .await
         {
             Ok(r) => {
+                let elapsed = start.elapsed().as_micros() as u64;
+                io_stats.record_write(vid, data_size, elapsed);
                 debug!("write_needle_blob completed in {:?}", start.elapsed());
                 r
             }
@@ -964,15 +998,20 @@ impl VolumeService for VolumeServer {
 
         let start = time::Instant::now();
         let storage_manager = self.storage_manager.clone();
+        let io_stats = self.io_stats.clone();
+        let vid = volume_id.0;
 
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
                 let result = volume.read_needle_blob(file_key, offset, size);
                 match result {
-                    Ok(data) => Ok(Response::new(crate::proto::ReadNeedleBlobResponse {
-                        success: true,
-                        needle_blob: data.to_vec(),
-                    })),
+                    Ok(data) => {
+                        let resp_size = data.len() as u64;
+                        Ok((Response::new(crate::proto::ReadNeedleBlobResponse {
+                            success: true,
+                            needle_blob: data.to_vec(),
+                        }), resp_size))
+                    }
                     Err(e) => {
                         warn!("read_needle_blob failed: {}", e);
                         Err(Status::internal(format!("{}", e)))
@@ -988,10 +1027,13 @@ impl VolumeService for VolumeServer {
         })
         .await
         {
-            Ok(r) => {
+            Ok(Ok((r, resp_size))) => {
+                let elapsed = start.elapsed().as_micros() as u64;
+                io_stats.record_read(vid, resp_size, elapsed);
                 debug!("read_needle_blob completed in {:?}", start.elapsed());
-                r
+                Ok(r)
             }
+            Ok(Err(status)) => Err(status),
             Err(e) => {
                 error!("read_needle_blob task failed: {}", e);
                 Err(Status::internal(format!("task failed: {}", e)))

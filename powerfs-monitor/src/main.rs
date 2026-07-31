@@ -676,6 +676,38 @@ async fn get_volume(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct VolumeIoMetricsResponse {
+    volume_id: u64,
+    read_ops: u64,
+    write_ops: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    read_avg_latency_us: u64,
+    write_avg_latency_us: u64,
+}
+
+async fn get_volume_io(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<VolumeIoMetricsResponse>> {
+    match id.parse::<u64>() {
+        Ok(id) => match state.metric_store.get_volume(id).await {
+            Some(volume) => Json(ApiResponse::success(VolumeIoMetricsResponse {
+                volume_id: volume.id,
+                read_ops: volume.read_ops,
+                write_ops: volume.write_ops,
+                read_bytes: volume.read_bytes,
+                write_bytes: volume.write_bytes,
+                read_avg_latency_us: volume.read_avg_latency_us,
+                write_avg_latency_us: volume.write_avg_latency_us,
+            })),
+            None => Json(ApiResponse::error("Volume not found")),
+        },
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
+    }
+}
+
 async fn get_kv_metrics(State(state): State<Arc<AppState>>) -> Json<ApiResponse<KVMetrics>> {
     let metrics = state.metric_store.get_kv_metrics().await;
     Json(ApiResponse::success(metrics))
@@ -3984,6 +4016,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/nodes/:id", get(get_node))
         .route("/api/metrics/volumes", get(get_volumes))
         .route("/api/metrics/volumes/:id", get(get_volume))
+        .route("/api/metrics/volumes/:id/io", get(get_volume_io))
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
