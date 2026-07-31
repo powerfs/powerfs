@@ -1,6 +1,7 @@
 use axum::{
     body::Bytes,
     extract::{Path, State},
+    http::HeaderMap,
     response::IntoResponse,
     routing::{delete, get, head, post, put},
     Json, Router, Server,
@@ -114,8 +115,16 @@ async fn list_buckets(State(state): State<Arc<FilerState>>) -> axum::response::R
 async fn create_bucket(
     State(state): State<Arc<FilerState>>,
     Path(bucket): Path<String>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
-    state.s3_handler.create_bucket(&bucket).await
+    // Optional collection selection via the `x-powerfs-collection` header.
+    // Missing/empty header falls back to the "default" collection.
+    let collection = headers
+        .get("x-powerfs-collection")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    state.s3_handler.create_bucket(&bucket, &collection).await
 }
 
 async fn delete_bucket(

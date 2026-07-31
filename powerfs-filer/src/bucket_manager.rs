@@ -18,14 +18,25 @@ impl BucketManager {
         }
     }
 
-    pub async fn create_bucket(&self, bucket: &str, replication: &str) -> Result<BucketInfo> {
+    pub async fn create_bucket(
+        &self,
+        bucket: &str,
+        replication: &str,
+        collection: &str,
+    ) -> Result<BucketInfo> {
         if self.metadata_store.get_bucket(bucket).await.is_some() {
             return Err(PowerFsError::FileExists(bucket.to_string()));
         }
 
+        let collection = if collection.is_empty() {
+            "default"
+        } else {
+            collection
+        };
+
         let (fid, nodes) = self
             .master_api
-            .assign_volume(replication, "default")
+            .assign_volume(replication, collection)
             .await?;
 
         let bucket_info = BucketInfo {
@@ -35,7 +46,7 @@ impl BucketManager {
             used_size: 0,
             creation_time: Utc::now(),
             replication: replication.to_string(),
-            collection: "default".to_string(),
+            collection: collection.to_string(),
         };
 
         self.metadata_store.put_bucket(bucket, &bucket_info).await;
@@ -109,9 +120,18 @@ impl BucketManager {
     }
 
     pub async fn allocate_volume_for_bucket(&self, bucket: &str, replication: &str) -> Result<u64> {
+        // Use the bucket's recorded collection so newly allocated volumes stay
+        // in the same collection pool.
+        let collection = self
+            .metadata_store
+            .get_bucket(bucket)
+            .await
+            .map(|b| b.collection)
+            .unwrap_or_else(|| "default".to_string());
+
         let (fid, nodes) = self
             .master_api
-            .assign_volume(replication, "default")
+            .assign_volume(replication, &collection)
             .await?;
 
         if let Some(mut bucket_info) = self.metadata_store.get_bucket(bucket).await {
@@ -134,5 +154,47 @@ impl BucketManager {
         }
 
         Ok(fid.volume_id.0)
+    }
+
+    /// Dynamically assign a volume for an S3 object using the bucket's
+    /// collection. Returns `(volume_id, server_addr, fid_string)` so the
+    /// caller can write the needle and record metadata.
+    ///
+    /// This replaces the legacy behaviour of always writing to
+    /// `bucket_info.volume_ids[0]`: objects now spread across the
+    /// collection's writable volume pool.
+    pub async fn assign_volume_for_object(&self, bucket: &str) -> Result<(u64, String, String)> {
+        let bucket_info = self
+            .metadata_store
+            .get_bucket(bucket)
+            .await
+            .ok_or_else(|| PowerFsError::DirectoryNotFound(bucket.to_string()))?;
+
+        let (fid, nodes) = self
+            .master_api
+            .assign_volume(&bucket_info.replication, &bucket_info.collection)
+            .await?;
+
+        let node = nodes.into_iter().next().ok_or_else(|| {
+            PowerFsError::InvalidRequest("no volume server for assigned volume".to_string())
+        })?;
+        let server_addr = format!("{}:{}", node.address, node.grpc_port);
+
+        // Cache the route so subsequent reads can resolve the volume.
+        let route = VolumeRoute {
+            volume_id: fid.volume_id.0,
+            server_addr: server_addr.clone(),
+            server_id: node.id.to_string(),
+            size: 0,
+            used: 0,
+            state: "available".to_string(),
+        };
+        self.metadata_store
+            .put_volume_route(fid.volume_id.0, &route)
+            .await;
+
+        let volume_id = fid.volume_id.0;
+        let fid_str = format!("{},{},{}", fid.volume_id.0, fid.cookie, fid.file_key);
+        Ok((volume_id, server_addr, fid_str))
     }
 }

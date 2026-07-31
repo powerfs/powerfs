@@ -10,7 +10,7 @@
 | 1 | 核心数据结构与 Master Collection API | P0 | ✅ Done | (已完成) |
 | 2 | Volume 创建支持 collection 参数 | P0 | ✅ Done | feat: volume create accepts collection param |
 | 3 | Volume 分配模式 Auto/Manual/Hybrid | P0 | ✅ Done | feat: collection volume allocation modes |
-| 4 | S3 接口支持 collection | P0 | ⏳ Pending | - |
+| 4 | S3 接口支持 collection | P0 | ✅ Done | feat: step 4 S3 support for collection |
 | 5 | KV 接口支持 collection | P1 | ⏳ Pending | - |
 | 6 | 前端 Collection 管理页面 | P1 | ⏳ Pending | - |
 | 7 | CLI Collection 管理命令 | P1 | ⏳ Pending | - |
@@ -72,9 +72,20 @@
 
 ---
 
-## Step 4: S3 接口支持 collection ⏳
+## Step 4: S3 接口支持 collection ✅
 
 **目标**: S3 Bucket 创建与 put_object 支持 collection 参数，动态分配 Volume。
+
+**改动范围**:
+- `powerfs-filer/src/bucket_manager.rs`: `create_bucket` 增加 `collection` 参数（空值归一化为 "default"），存入 `BucketInfo`；新增 `assign_volume_for_object` 方法用 bucket 的 collection 动态分配 Volume
+- `powerfs-filer/src/s3_handler.rs`: `create_bucket` 接收 collection；`put_object` 改用 `assign_volume_for_object` 动态分配（替代固定写 `volume_ids[0]` 的旧逻辑）
+- `powerfs-filer/src/server.rs`: `create_bucket` 处理函数从 HTTP 头 `x-powerfs-collection` 提取 collection
+
+**验证**:
+- `cargo fmt` / `cargo clippy -p powerfs-filer --all-targets` 通过（无新增 warning）
+- `cargo build -p powerfs-filer` 通过
+- `cargo test -p powerfs-filer --lib`: 49 测试通过
+- `cargo test -p powerfs-master --lib`: 85 测试通过（含 Step 1-3 的 collection 测试）
 
 ---
 

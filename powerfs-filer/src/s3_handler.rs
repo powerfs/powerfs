@@ -41,8 +41,12 @@ impl S3Handler {
         self
     }
 
-    pub async fn create_bucket(&self, bucket: &str) -> axum::response::Response {
-        match self.bucket_manager.create_bucket(bucket, "001").await {
+    pub async fn create_bucket(&self, bucket: &str, collection: &str) -> axum::response::Response {
+        match self
+            .bucket_manager
+            .create_bucket(bucket, "001", collection)
+            .await
+        {
             Ok(_) => {
                 // Ensure a root directory inode exists in the shard backend for this bucket.
                 if let Some(mgr) = &self.meta_shard_manager {
@@ -132,26 +136,31 @@ impl S3Handler {
         key: &str,
         data: &[u8],
     ) -> axum::response::Response {
-        let bucket_info = match self.bucket_manager.get_bucket(bucket).await {
-            Some(b) => b,
-            None => return (StatusCode::NOT_FOUND, "Bucket not found".to_string()).into_response(),
-        };
+        // Verify the bucket exists, then dynamically assign a volume from the
+        // bucket's collection pool (Step 4 unified Collection design).
+        if self.bucket_manager.get_bucket(bucket).await.is_none() {
+            return (StatusCode::NOT_FOUND, "Bucket not found".to_string()).into_response();
+        }
 
-        let volume_id = bucket_info.volume_ids[0];
-        let server_addr = match self.volume_router.get_server_addr(volume_id).await {
-            Some(a) => a,
-            None => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Volume route not found".to_string(),
-                )
-                    .into_response()
-            }
-        };
+        let (volume_id, server_addr, fid_str) =
+            match self.bucket_manager.assign_volume_for_object(bucket).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Failed to assign volume for object: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to assign volume".to_string(),
+                    )
+                        .into_response();
+                }
+            };
 
-        let cookie = rand::random::<u64>();
-        let file_key = rand::random::<u64>();
-        let fid_str = format!("{},{},{}", volume_id, cookie, file_key);
+        // fid_str = "volume_id,cookie,file_key"; extract file_key for write_needle.
+        let file_key: u64 = fid_str
+            .split(',')
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         if let Err(e) = self
             .volume_client_pool
