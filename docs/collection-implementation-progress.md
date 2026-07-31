@@ -9,7 +9,7 @@
 |------|------|--------|------|--------|
 | 1 | 核心数据结构与 Master Collection API | P0 | ✅ Done | (已完成) |
 | 2 | Volume 创建支持 collection 参数 | P0 | ✅ Done | feat: volume create accepts collection param |
-| 3 | Volume 分配模式 Auto/Manual/Hybrid | P0 | ⏳ Pending | - |
+| 3 | Volume 分配模式 Auto/Manual/Hybrid | P0 | ✅ Done | feat: collection volume allocation modes |
 | 4 | S3 接口支持 collection | P0 | ⏳ Pending | - |
 | 5 | KV 接口支持 collection | P1 | ⏳ Pending | - |
 | 6 | 前端 Collection 管理页面 | P1 | ⏳ Pending | - |
@@ -53,9 +53,22 @@
 
 ---
 
-## Step 3: Volume 分配模式 Auto/Manual/Hybrid ⏳
+## Step 3: Volume 分配模式 Auto/Manual/Hybrid ✅
 
-**目标**: 在 Master 的 `assign_volume` 中根据 `VolumeAllocationMode` 选择 Volume（自动/手动/混合）。
+**目标**: 在 Master 的 `assign_volume` 中根据 `VolumeAllocationMode` 选择 Volume（自动/手动/混合），并应用 `excluded_volume_ids` 黑名单。
+
+**改动范围**:
+- `powerfs-master/src/master.rs`:
+  - `assign_volume` 解析 collection 的 `volume_allocation` 与 `excluded_volume_ids`
+  - 新增 `select_writable_volume` 方法 + 纯函数 `select_writable_volume_from`（可单测）
+  - Auto 模式扫描全部匹配卷；Manual 仅在 pinned 列表内查找且不回退；Hybrid 先查 pinned 再回退 Auto
+  - 黑名单在所有模式下生效，且优先于 Manual pin
+  - `assign_stripe_volumes` 同步应用黑名单
+
+**验证**:
+- `cargo build` / `cargo fmt` / `cargo clippy` 通过（无新增 warning）
+- 8 个新单测覆盖：Auto 选取匹配卷、Manual 仅选 pinned、Manual 不回退、Hybrid 回退 Auto、黑名单排除、黑名单覆盖 Manual pin、节点离开拓扑跳过、ReadOnly 状态跳过
+- powerfs-master 85 个 lib 测试全部通过
 
 ---
 

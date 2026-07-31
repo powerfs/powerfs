@@ -1,4 +1,4 @@
-use crate::collection::{CollectionInfo, CollectionManager, CollectionStats};
+use crate::collection::{CollectionInfo, CollectionManager, CollectionStats, VolumeAllocationMode};
 use crate::raft_node::{ApplyEntry, OutgoingMessage, Peer, ProposeRequest, RaftNode};
 use crate::raft_storage::RaftCommand;
 use crate::volume_client::VolumeClientPool;
@@ -1462,68 +1462,55 @@ impl MasterNode {
 
         let _replica_count = _replica_placement.get_copy_count();
 
-        // Try to find an existing writable volume for this collection with available space.
-        // This reuses volumes already created on volume servers (via grow), avoiding
-        // "volume not found" errors when writing.
+        // Resolve the collection's allocation mode + blacklist. Collections
+        // absent from the extended store fall back to Auto with no blacklist
+        // (legacy/default behaviour).
+        let coll_info = self.get_collection_info(collection).await;
+        let (allocation_mode, excluded) = match &coll_info {
+            Some(info) => (
+                info.volume_allocation.clone(),
+                info.excluded_volume_ids.clone(),
+            ),
+            None => (VolumeAllocationMode::default(), Vec::new()),
+        };
+
+        // Try to find an existing writable volume for this collection with
+        // available space, honouring the allocation mode and blacklist.
+        if let Some((existing_vid, host_node_id)) =
+            self.select_writable_volume(&collection_obj, &nodes, &allocation_mode, &excluded)
         {
-            let volumes = self.volumes.read().unwrap();
-            let mut best: Option<(VolumeId, NodeId)> = None;
-            for (vid, vinfo) in volumes.iter() {
-                if vinfo.collection != collection_obj {
-                    continue;
+            let file_key = {
+                let mut volumes = self.volumes.write().unwrap();
+                if let Some(vol_info) = volumes.get_mut(&existing_vid) {
+                    let key = vol_info.next_file_key;
+                    vol_info.next_file_key += 1;
+                    key
+                } else {
+                    1
                 }
-                // Writable states: Creating or Available
-                if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
-                    continue;
-                }
-                // Check available space
-                if vinfo.used >= vinfo.size {
-                    continue;
-                }
-                // Check the hosting node is still in topology
-                if !nodes.iter().any(|n| n.id == vinfo.node_id) {
-                    continue;
-                }
-                best = Some((*vid, vinfo.node_id.clone()));
-                break;
-            }
-            if let Some((existing_vid, host_node_id)) = best {
-                // Found an existing volume - just allocate a new file_key on it
-                drop(volumes);
-                let file_key = {
-                    let mut volumes = self.volumes.write().unwrap();
-                    if let Some(vol_info) = volumes.get_mut(&existing_vid) {
-                        let key = vol_info.next_file_key;
-                        vol_info.next_file_key += 1;
-                        key
-                    } else {
-                        1
-                    }
-                };
+            };
 
-                // Use the volume ID directly (UUID-based u64)
-                let volume_id = existing_vid;
-                let cookie = rand::random::<u32>() as u64;
-                let fid = Fid {
-                    volume_id,
-                    cookie,
-                    file_key,
-                };
+            let volume_id = existing_vid;
+            let cookie = rand::random::<u32>() as u64;
+            let fid = Fid {
+                volume_id,
+                cookie,
+                file_key,
+            };
 
-                let host_node = nodes
-                    .iter()
-                    .find(|n| n.id == host_node_id)
-                    .cloned()
-                    .into_iter()
-                    .collect::<Vec<_>>();
+            let host_node = nodes
+                .iter()
+                .find(|n| n.id == host_node_id)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>();
 
-                info!(
-                    "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
-                    volume_id, collection_obj, volume_id.0, cookie, file_key
-                );
+            info!(
+                "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
+                volume_id, collection_obj, volume_id.0, cookie, file_key
+            );
 
-                return Ok((fid, host_node));
-            }
+            return Ok((fid, host_node));
         }
 
         // No available volume in the pre-allocated pool
@@ -1535,6 +1522,26 @@ impl MasterNode {
             "no available volume in the pre-allocated pool. Please contact admin to allocate more volumes."
                 .to_string(),
         ))
+    }
+
+    /// Select a writable volume for a collection honouring the allocation mode.
+    ///
+    /// - `Auto`: scan all volumes matching the collection.
+    /// - `Manual`: only consider the pinned volume ids.
+    /// - `Hybrid`: try pinned ids first, then fall back to Auto.
+    ///
+    /// Volumes in `excluded` (blacklist) are never selected. The scan reuses
+    /// volumes already created on volume servers, avoiding "volume not found"
+    /// errors when writing.
+    fn select_writable_volume(
+        &self,
+        collection: &Collection,
+        nodes: &[DataNodeInfo],
+        mode: &VolumeAllocationMode,
+        excluded: &[u64],
+    ) -> Option<(VolumeId, NodeId)> {
+        let volumes = self.volumes.read().unwrap();
+        select_writable_volume_from(&volumes, collection, nodes, mode, excluded)
     }
 
     /// 批量分配 stripe volumes
@@ -1553,12 +1560,23 @@ impl MasterNode {
         let collection_obj = Collection(collection.to_string());
         let mut volume_ids = Vec::with_capacity(count as usize);
 
+        // Resolve the collection blacklist (stripe assignment always uses Auto
+        // semantics but still honours excluded volumes).
+        let excluded: Vec<u64> = self
+            .get_collection_info(collection)
+            .await
+            .map(|c| c.excluded_volume_ids.clone())
+            .unwrap_or_default();
+
         // Find available volumes from the pre-allocated pool
         {
             let volumes = self.volumes.read().unwrap();
             let mut available_volumes: Vec<VolumeId> = Vec::new();
 
             for (vid, vinfo) in volumes.iter() {
+                if excluded.contains(&vid.0) {
+                    continue;
+                }
                 if vinfo.collection != collection_obj {
                     continue;
                 }
@@ -2537,5 +2555,224 @@ impl Clone for MasterNode {
             shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
             stripe_round_robin: self.stripe_round_robin.clone(),
         }
+    }
+}
+
+/// Pure volume-selection logic extracted from [`MasterNode::select_writable_volume`].
+///
+/// Operates on a borrowed volume table so it can be unit-tested without
+/// spinning up a full Master node.
+fn select_writable_volume_from(
+    volumes: &HashMap<VolumeId, VolumeInfo>,
+    collection: &Collection,
+    nodes: &[DataNodeInfo],
+    mode: &VolumeAllocationMode,
+    excluded: &[u64],
+) -> Option<(VolumeId, NodeId)> {
+    // Build the candidate id list according to the allocation mode. `None`
+    // means "scan all volumes" (Auto).
+    let pinned: Option<&[u64]> = match mode {
+        VolumeAllocationMode::Manual { volume_ids } => Some(volume_ids.as_slice()),
+        VolumeAllocationMode::Hybrid {
+            fixed_volume_ids, ..
+        } => Some(fixed_volume_ids.as_slice()),
+        VolumeAllocationMode::Auto { .. } => None,
+    };
+
+    // First pass: try the pinned list (Manual / Hybrid fixed set).
+    if let Some(ids) = pinned {
+        for vid in ids {
+            if excluded.contains(vid) {
+                continue;
+            }
+            if let Some(vinfo) = volumes.get(&VolumeId(*vid)) {
+                if vinfo.collection != *collection {
+                    continue;
+                }
+                if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+                    continue;
+                }
+                if vinfo.used >= vinfo.size {
+                    continue;
+                }
+                if !nodes.iter().any(|n| n.id == vinfo.node_id) {
+                    continue;
+                }
+                return Some((VolumeId(*vid), vinfo.node_id.clone()));
+            }
+        }
+        // Manual mode never falls back to auto-scan.
+        if matches!(mode, VolumeAllocationMode::Manual { .. }) {
+            return None;
+        }
+    }
+
+    // Auto pass (also the Hybrid fallback): scan all volumes.
+    for (vid, vinfo) in volumes.iter() {
+        if excluded.contains(&vid.0) {
+            continue;
+        }
+        if vinfo.collection != *collection {
+            continue;
+        }
+        if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+            continue;
+        }
+        if vinfo.used >= vinfo.size {
+            continue;
+        }
+        if !nodes.iter().any(|n| n.id == vinfo.node_id) {
+            continue;
+        }
+        return Some((*vid, vinfo.node_id.clone()));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use powerfs_common::types::{DataCenterId, DiskType, NodeId, RackId, Ttl};
+
+    fn node(id: &str) -> DataNodeInfo {
+        DataNodeInfo::new(
+            NodeId(id.to_string()),
+            "127.0.0.1".to_string(),
+            RackId(String::new()),
+            DataCenterId(String::new()),
+            8080,
+            8081,
+            String::new(),
+        )
+    }
+
+    fn vol(vid: u64, collection: &str, node_id: &str, used: u64, size: u64) -> VolumeInfo {
+        VolumeInfo {
+            id: VolumeId(vid),
+            node_id: NodeId(node_id.to_string()),
+            collection: Collection(collection.to_string()),
+            size,
+            used,
+            replica_count: 1,
+            ttl: Ttl::default(),
+            disk_type: DiskType::default(),
+            state: VolumeState::Available,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            next_file_key: 1,
+        }
+    }
+
+    fn build_volumes(entries: &[(u64, &str, &str, u64, u64)]) -> HashMap<VolumeId, VolumeInfo> {
+        entries
+            .iter()
+            .map(|(vid, coll, nid, used, size)| {
+                (VolumeId(*vid), vol(*vid, coll, nid, *used, *size))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_auto_mode_picks_matching_writable_volume() {
+        let volumes = build_volumes(&[
+            (1, "default", "n1", 0, 100),
+            (2, "user", "n1", 0, 100),
+            (3, "default", "n1", 100, 100), // full
+        ]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::default(); // Auto
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert_eq!(pick.map(|(v, _)| v.0), Some(1));
+    }
+
+    #[test]
+    fn test_manual_mode_only_considers_pinned_ids() {
+        let volumes = build_volumes(&[(1, "default", "n1", 0, 100), (2, "default", "n1", 0, 100)]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::Manual {
+            volume_ids: vec![2],
+        };
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert_eq!(pick.map(|(v, _)| v.0), Some(2));
+    }
+
+    #[test]
+    fn test_manual_mode_returns_none_when_pinned_unavailable() {
+        let volumes = build_volumes(&[
+            (1, "default", "n1", 0, 100),   // not pinned
+            (2, "default", "n1", 100, 100), // pinned but full
+        ]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::Manual {
+            volume_ids: vec![2],
+        };
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert!(pick.is_none(), "Manual must not fall back to auto-scan");
+    }
+
+    #[test]
+    fn test_hybrid_mode_falls_back_to_auto() {
+        let volumes = build_volumes(&[
+            (1, "default", "n1", 100, 100), // pinned but full
+            (2, "default", "n1", 0, 100),   // auto fallback
+        ]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::Hybrid {
+            fixed_volume_ids: vec![1],
+            auto_count: 1,
+        };
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert_eq!(pick.map(|(v, _)| v.0), Some(2));
+    }
+
+    #[test]
+    fn test_blacklist_excludes_volumes() {
+        let volumes = build_volumes(&[
+            (1, "default", "n1", 0, 100), // blacklisted
+            (2, "default", "n1", 0, 100),
+        ]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::default();
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1]);
+        assert_eq!(pick.map(|(v, _)| v.0), Some(2));
+    }
+
+    #[test]
+    fn test_blacklist_blocks_manual_pinned_volume() {
+        let volumes = build_volumes(&[(1, "default", "n1", 0, 100)]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::Manual {
+            volume_ids: vec![1],
+        };
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1]);
+        assert!(pick.is_none(), "blacklist must override Manual pin");
+    }
+
+    #[test]
+    fn test_skips_volume_whose_node_left_topology() {
+        let volumes = build_volumes(&[(1, "default", "ghost", 0, 100)]);
+        let nodes = vec![node("n1")]; // ghost not present
+        let mode = VolumeAllocationMode::default();
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert!(pick.is_none());
+    }
+
+    #[test]
+    fn test_skips_readonly_state() {
+        let mut volumes = build_volumes(&[(1, "default", "n1", 0, 100)]);
+        volumes.get_mut(&VolumeId(1)).unwrap().state = VolumeState::ReadOnly;
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::default();
+        let coll = Collection("default".to_string());
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        assert!(pick.is_none());
     }
 }
