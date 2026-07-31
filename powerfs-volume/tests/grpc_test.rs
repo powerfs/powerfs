@@ -62,6 +62,7 @@ async fn test_volume_create() {
         .create_volume(CreateVolumeRequest {
             volume_id: 1,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -72,6 +73,7 @@ async fn test_volume_create() {
         .create_volume(CreateVolumeRequest {
             volume_id: 1,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await;
     assert!(response.is_err());
@@ -85,6 +87,7 @@ async fn test_volume_delete() {
         .create_volume(CreateVolumeRequest {
             volume_id: 2,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -110,6 +113,7 @@ async fn test_volume_write_needle() {
         .create_volume(CreateVolumeRequest {
             volume_id: 3,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -140,6 +144,7 @@ async fn test_volume_read_needle() {
         .create_volume(CreateVolumeRequest {
             volume_id: 4,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -178,6 +183,7 @@ async fn test_volume_delete_needle() {
         .create_volume(CreateVolumeRequest {
             volume_id: 5,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -222,6 +228,7 @@ async fn test_volume_write_blob() {
         .create_volume(CreateVolumeRequest {
             volume_id: 6,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -250,6 +257,7 @@ async fn test_volume_read_blob() {
         .create_volume(CreateVolumeRequest {
             volume_id: 7,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();
@@ -289,6 +297,7 @@ async fn test_volume_read_meta() {
         .create_volume(CreateVolumeRequest {
             volume_id: 8,
             size: 10 * 1024 * 1024,
+            collection: String::new(),
         })
         .await
         .unwrap();

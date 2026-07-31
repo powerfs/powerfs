@@ -217,6 +217,18 @@ impl Volume {
         self.info.read().unwrap().clone()
     }
 
+    /// Set the collection this volume belongs to.
+    ///
+    /// Used by the Volume Server when `CreateVolumeRequest` carries an
+    /// explicit collection name. The change is in-memory only; collection
+    /// membership is reconciled by Master through heartbeat-reported
+    /// `VolumeInfo`.
+    pub fn set_collection(&self, collection: Collection) {
+        let mut info = self.info.write().unwrap();
+        info.collection = collection;
+        info.modified_at = Utc::now();
+    }
+
     pub fn state(&self) -> VolumeState {
         self.info.read().unwrap().state
     }

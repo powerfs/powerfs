@@ -812,6 +812,7 @@ impl MasterNode {
         if let Some(node) = node_info {
             let grpc_addr = format!("{}:{}", node.address, node.grpc_port);
             let vid_clone = vid.0;
+            let coll_name = coll.0.clone();
             let pool = self.volume_client_pool.clone();
             // master 的 size 是逻辑上限（volume_size_limit，默认 1TB），
             // 但 volume server 的存储设备容量通常较小（如 100GB 虚拟设备）。
@@ -825,14 +826,15 @@ impl MasterNode {
             };
             tokio::spawn(async move {
                 info!(
-                    "Notifying volume server {} to create volume {} (size={})",
-                    grpc_addr, vid_clone, create_size
+                    "Notifying volume server {} to create volume {} (size={}, collection={})",
+                    grpc_addr, vid_clone, create_size, coll_name
                 );
                 if let Err(e) = pool
                     .create_volume_with_retry(
                         &grpc_addr,
                         vid_clone,
                         create_size,
+                        &coll_name,
                         5,
                         Duration::from_millis(500),
                     )

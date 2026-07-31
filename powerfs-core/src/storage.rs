@@ -2,7 +2,7 @@ use crate::storage_backend::{LocalFsBackend, StorageBackend, StorageBackendError
 use crate::volume::{ScrubResult, Volume};
 use powerfs_common::{
     error::{PowerFsError, Result},
-    types::{ChecksumAlgorithm, NeedleId, NodeId, VolumeId, VolumeInfo},
+    types::{ChecksumAlgorithm, Collection, NeedleId, NodeId, VolumeId, VolumeInfo},
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -77,6 +77,20 @@ impl StorageManager {
     }
 
     pub fn create_volume(&self, volume_id: VolumeId, size: u64) -> Result<VolumeInfo> {
+        self.create_volume_with_collection(volume_id, size, Collection::default())
+    }
+
+    /// Create a volume bound to a specific collection.
+    ///
+    /// The collection is recorded in the in-memory `VolumeInfo` and reported
+    /// back to the Master via heartbeats. An empty `collection` name is
+    /// normalized to the default collection.
+    pub fn create_volume_with_collection(
+        &self,
+        volume_id: VolumeId,
+        size: u64,
+        collection: Collection,
+    ) -> Result<VolumeInfo> {
         let mut volumes = self.volumes.write().unwrap();
 
         if volumes.contains_key(&volume_id) {
@@ -91,6 +105,13 @@ impl StorageManager {
             self.checksum_algorithm,
             self.backend.clone(),
         )?);
+
+        let normalized = if collection.0.is_empty() {
+            Collection::default()
+        } else {
+            collection
+        };
+        volume.set_collection(normalized);
 
         let info = volume.info();
         volumes.insert(volume_id, volume);
@@ -262,5 +283,80 @@ impl StorageManager {
             }
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manager(dir: &tempfile::TempDir) -> StorageManager {
+        StorageManager::new(
+            NodeId("test-node".to_string()),
+            dir.path().to_str().unwrap().to_string(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_create_volume_defaults_to_default_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = make_manager(&dir);
+
+        let info = mgr.create_volume(VolumeId(1), 10 * 1024 * 1024).unwrap();
+        assert_eq!(info.collection, Collection::default());
+        assert_eq!(info.collection.0, "default");
+    }
+
+    #[test]
+    fn test_create_volume_with_collection_records_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = make_manager(&dir);
+
+        let info = mgr
+            .create_volume_with_collection(
+                VolumeId(2),
+                10 * 1024 * 1024,
+                Collection("user-uploads".to_string()),
+            )
+            .unwrap();
+        assert_eq!(info.collection.0, "user-uploads");
+
+        // The in-memory volume carries the collection too.
+        let vol = mgr.get_volume(&VolumeId(2)).unwrap();
+        assert_eq!(vol.info().collection.0, "user-uploads");
+    }
+
+    #[test]
+    fn test_create_volume_with_empty_collection_normalizes_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = make_manager(&dir);
+
+        let info = mgr
+            .create_volume_with_collection(VolumeId(3), 10 * 1024 * 1024, Collection(String::new()))
+            .unwrap();
+        assert_eq!(info.collection.0, "default");
+    }
+
+    #[test]
+    fn test_create_volume_duplicate_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = make_manager(&dir);
+
+        mgr.create_volume_with_collection(
+            VolumeId(4),
+            10 * 1024 * 1024,
+            Collection("dup".to_string()),
+        )
+        .unwrap();
+        let err = mgr
+            .create_volume_with_collection(
+                VolumeId(4),
+                10 * 1024 * 1024,
+                Collection("dup".to_string()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, PowerFsError::VolumeExists(_)));
     }
 }

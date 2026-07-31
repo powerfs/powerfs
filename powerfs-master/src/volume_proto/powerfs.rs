@@ -6,6 +6,9 @@ pub struct CreateVolumeRequest {
     pub volume_id: u64,
     #[prost(uint64, tag = "2")]
     pub size: u64,
+    /// Collection name; empty defaults to "default"
+    #[prost(string, tag = "3")]
+    pub collection: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

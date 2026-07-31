@@ -32,6 +32,7 @@ service VolumeService {
 message CreateVolumeRequest {
     uint64 volume_id = 1;
     uint64 size = 2;
+    string collection = 3;   // Collection name; empty defaults to "default"
 }
 
 message CreateVolumeResponse {

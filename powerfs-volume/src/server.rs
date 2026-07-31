@@ -268,14 +268,23 @@ impl VolumeService for VolumeServer {
     ) -> std::result::Result<Response<crate::proto::CreateVolumeResponse>, Status> {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
+        let collection = if req.collection.is_empty() {
+            "default".to_string()
+        } else {
+            req.collection
+        };
 
         info!(
-            "create_volume: volume_id={}, size={}",
-            volume_id.0, req.size
+            "create_volume: volume_id={}, size={}, collection={}",
+            volume_id.0, req.size, collection
         );
 
         let start = time::Instant::now();
-        let result = self.storage_manager.create_volume(volume_id, req.size);
+        let result = self.storage_manager.create_volume_with_collection(
+            volume_id,
+            req.size,
+            powerfs_common::types::Collection(collection.clone()),
+        );
 
         match result {
             Ok(info) => {
@@ -294,7 +303,7 @@ impl VolumeService for VolumeServer {
                         used,
                         file_count: 0,
                         status: "available".to_string(),
-                        collection: "default".to_string(),
+                        collection,
                         read_only: false,
                         replica_placement: info.replica_count,
                         ttl: info.ttl.0 as u32,

@@ -46,7 +46,11 @@ impl VolumeServerClient {
         size: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut service = self.service().await?;
-        let request = CreateVolumeRequest { volume_id, size };
+        let request = CreateVolumeRequest {
+            volume_id,
+            size,
+            collection: String::new(),
+        };
         let response = service.create_volume(tonic::Request::new(request)).await?;
         let result = response.into_inner();
         if result.success {

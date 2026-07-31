@@ -50,6 +50,7 @@ impl VolumeClientPool {
         address: &str,
         volume_id: u64,
         size: u64,
+        collection: &str,
         max_retries: u32,
         retry_delay: std::time::Duration,
     ) -> Result<(), String> {
@@ -69,13 +70,22 @@ impl VolumeClientPool {
             };
 
             let mut service = VolumeServiceClient::new(channel);
-            let request = CreateVolumeRequest { volume_id, size };
+            let request = CreateVolumeRequest {
+                volume_id,
+                size,
+                collection: collection.to_string(),
+            };
 
             match service.create_volume(tonic::Request::new(request)).await {
                 Ok(resp) => {
                     let inner = resp.into_inner();
                     if inner.success {
-                        log::info!("create_volume: volume {} created on {}", volume_id, address);
+                        log::info!(
+                            "create_volume: volume {} (collection={}) created on {}",
+                            volume_id,
+                            collection,
+                            address
+                        );
                         return Ok(());
                     } else {
                         log::warn!(
