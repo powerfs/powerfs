@@ -2,11 +2,21 @@
 //!
 //! This module provides RocksDbStorage which implements the raft::Storage trait
 //! for persistent storage of Raft state and logs.
+//!
+//! The implementation closely mirrors raft-rs's MemStorage:
+//! - `term(idx)` returns the actual term of entry at index `idx`, or the
+//!   snapshot term when `idx` equals the snapshot index.
+//! - `first_index()` returns `snapshot.index + 1` when the log is empty.
+//! - `last_index()` returns `snapshot.index` when the log is empty.
+//! - Snapshot metadata (index + term) is tracked explicitly so that the
+//!   Storage trait can answer term/first_index/last_index correctly even
+//!   after a snapshot has been applied and the log has been compacted.
 
 use log::{info, warn};
 use protobuf::Message;
-use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
-use raft::storage::{RaftState, Storage};
+use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
+use raft::storage::{GetEntriesContext, RaftState, Storage};
+use raft::{Error as RaftError, StorageError};
 use rocksdb::{ColumnFamilyDescriptor, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -15,6 +25,7 @@ use std::sync::{Arc, RwLock};
 const CF_RAFT_LOG: &str = "raft_log";
 const CF_RAFT_STATE: &str = "raft_state";
 const CF_SNAPSHOT: &str = "raft_snapshot";
+const KEY_SNAPSHOT_META: &[u8] = b"snapshot_metadata";
 
 /// Raft commands that can be proposed to the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +148,8 @@ pub struct RocksDbStorage {
     hard_state: RwLock<HardState>,
     /// Conf state cache
     conf_state: RwLock<ConfState>,
+    /// Snapshot metadata (index + term + conf_state), mirrors raft-rs MemStorage
+    snapshot_meta: RwLock<SnapshotMetadata>,
 }
 
 impl Clone for RocksDbStorage {
@@ -147,6 +160,7 @@ impl Clone for RocksDbStorage {
             applied_index: RwLock::new(*self.applied_index.read().unwrap()),
             hard_state: RwLock::new(self.hard_state.read().unwrap().clone()),
             conf_state: RwLock::new(self.conf_state.read().unwrap().clone()),
+            snapshot_meta: RwLock::new(self.snapshot_meta.read().unwrap().clone()),
         }
     }
 }
@@ -157,7 +171,12 @@ impl RocksDbStorage {
         Self::new_with_peers(path, &[])
     }
 
-    /// Create a new RocksDbStorage with initial peers
+    /// Create a new RocksDbStorage with initial peers.
+    ///
+    /// Note: after loading persisted state we *must* overwrite the conf_state
+    /// with the current peers and call save_state(), otherwise stale voters
+    /// from a previous run will prevent leader election (see Bug #5 in
+    /// docs/raft-storage-bugs-fixes.md).
     pub fn new_with_peers(path: &str, peers: &[u64]) -> Result<Self, String> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
@@ -184,15 +203,30 @@ impl RocksDbStorage {
             ..Default::default()
         };
 
+        let snapshot_meta = SnapshotMetadata::default();
+
         let storage = Self {
             db: Arc::new(db),
             entries: RwLock::new(VecDeque::new()),
             applied_index: RwLock::new(0),
             hard_state: RwLock::new(hard_state),
             conf_state: RwLock::new(conf_state),
+            snapshot_meta: RwLock::new(snapshot_meta),
         };
 
+        // Load persisted state (may load old hard_state/conf_state/snapshot_meta).
         storage.load_state()?;
+
+        // CRITICAL: Overwrite the loaded conf_state with the current peers
+        // configuration and persist it, so that stale voter lists from a
+        // previous run do not poison the new Raft node.  hard_state is
+        // preserved (so higher terms from prior runs are kept).
+        {
+            let mut cs = storage.conf_state.write().unwrap();
+            cs.voters.clear();
+            cs.voters.extend_from_slice(peers);
+        }
+        storage.save_state()?;
 
         info!(
             "RocksDbStorage initialized at {} with peers {:?}",
@@ -226,12 +260,15 @@ impl RocksDbStorage {
             ..Default::default()
         };
 
+        let snapshot_meta = SnapshotMetadata::default();
+
         let storage = Self {
             db: Arc::new(db),
             entries: RwLock::new(VecDeque::new()),
             applied_index: RwLock::new(0),
             hard_state: RwLock::new(hard_state),
             conf_state: RwLock::new(conf_state),
+            snapshot_meta: RwLock::new(snapshot_meta),
         };
 
         storage.save_state()?;
@@ -259,6 +296,14 @@ impl RocksDbStorage {
             let applied = *self.applied_index.read().unwrap();
             batch.put_cf(cf, b"applied_index", applied.to_string().as_bytes());
 
+            // Persist snapshot metadata so term()/first_index()/last_index()
+            // can answer correctly after restart.
+            let sm = self.snapshot_meta.read().unwrap();
+            let mut buf = Vec::new();
+            if sm.write_to_vec(&mut buf).is_ok() {
+                batch.put_cf(cf, KEY_SNAPSHOT_META, &buf);
+            }
+
             if let Err(e) = self.db.write(batch) {
                 warn!("Failed to write state batch: {}", e);
             }
@@ -266,7 +311,7 @@ impl RocksDbStorage {
         Ok(())
     }
 
-    /// Load hard state and conf state from RocksDB.
+    /// Load hard state, conf state, and snapshot metadata from RocksDB.
     ///
     /// This is best-effort: corrupt or missing state is logged and skipped
     /// rather than propagated as an error, so a partially-damaged Raft DB can
@@ -298,6 +343,19 @@ impl RocksDbStorage {
                 info!("Loaded conf state: voters={:?}", cs.voters);
             } else {
                 warn!("Failed to parse conf_state; keeping default");
+            }
+        }
+
+        // Load snapshot metadata (index + term + conf_state)
+        if let Ok(Some(data)) = self.db.get_cf(cf, KEY_SNAPSHOT_META) {
+            if let Ok(sm) = <SnapshotMetadata as Message>::parse_from_bytes(&data) {
+                *self.snapshot_meta.write().unwrap() = sm.clone();
+                info!(
+                    "Loaded snapshot metadata: index={}, term={}",
+                    sm.index, sm.term
+                );
+            } else {
+                warn!("Failed to parse snapshot_metadata; keeping default");
             }
         }
 
@@ -431,31 +489,51 @@ impl RocksDbStorage {
         }
     }
 
-    /// Apply snapshot
+    /// Apply snapshot — mirrors raft-rs MemStorage::apply_snapshot.
+    /// Updates snapshot_metadata so term/first_index/last_index are correct
+    /// when the log is empty after applying the snapshot.
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), raft::Error> {
         let meta = snapshot.get_metadata();
         let index = meta.index;
 
-        let first = self.first_index().unwrap_or(1);
-        if first > index {
+        let current_first = self
+            .first_index()
+            .unwrap_or_else(|_| self.snapshot_meta.read().unwrap().index + 1);
+        if current_first > index {
             return Err(raft::Error::Store(raft::StorageError::SnapshotOutOfDate));
         }
 
+        // Update snapshot metadata — critical for correct term/last_index
+        // lookups when the log is empty.
+        {
+            let mut sm = self.snapshot_meta.write().unwrap();
+            sm.index = index;
+            sm.term = meta.term;
+            sm.set_conf_state(meta.get_conf_state().clone());
+        }
+
+        // Clear the in-memory log entries.
         let mut entries = self.entries.write().unwrap();
         entries.clear();
 
+        // Update hard state (term advances to snapshot term, commit to snapshot index).
         let mut hs = self.hard_state.write().unwrap();
         hs.term = meta.term;
         hs.commit = index;
 
+        // Update conf state from snapshot.
         *self.conf_state.write().unwrap() = meta.get_conf_state().clone();
 
+        // Persist snapshot to snapshot column family.
         if let Some(cf) = self.db.cf_handle(CF_SNAPSHOT) {
             let mut buf = Vec::new();
             if let Ok(()) = snapshot.write_to_vec(&mut buf) {
                 let _ = self.db.put_cf(cf, b"latest_snapshot", &buf);
             }
         }
+
+        // Persist snapshot metadata to raft_state column family.
+        let _ = self.save_state();
 
         Ok(())
     }
@@ -779,6 +857,16 @@ pub struct RaftVerifyReport {
     pub error: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Raft Storage trait implementation for RocksDbStorage.
+//
+// CRITICAL: This implementation MUST mirror the semantics of raft-rs MemStorage
+// (see `raft-rs/src/storage.rs`).  Six subtle bugs in the earlier version
+// caused a 3-node Raft cluster to never elect a stable leader.
+//
+// For the full bug list, root-cause analysis, and fixes, see:
+//     docs/raft-storage-bugs-fixes.md
+// ---------------------------------------------------------------------------
 impl Storage for RocksDbStorage {
     fn initial_state(&self) -> Result<RaftState, raft::Error> {
         Ok(RaftState {
@@ -792,9 +880,25 @@ impl Storage for RocksDbStorage {
         low: u64,
         high: u64,
         max_size: impl Into<Option<u64>>,
-        _context: raft::storage::GetEntriesContext,
+        _context: GetEntriesContext,
     ) -> Result<Vec<Entry>, raft::Error> {
         let max_size = max_size.into().unwrap_or(u64::MAX);
+
+        // Match raft-rs: return Compacted if low < first_index.
+        let first_idx = self.first_index()?;
+        if low < first_idx {
+            return Err(RaftError::Store(StorageError::Compacted));
+        }
+
+        // Match raft-rs: panic if high > last_index + 1.
+        let last_idx = self.last_index()?;
+        if high > last_idx + 1 {
+            panic!(
+                "entries range [{}, {}) out of bounds (last_index={})",
+                low, high, last_idx
+            );
+        }
+
         let entries = self.entries.read().unwrap();
         let mut result = Vec::new();
         let mut size = 0u64;
@@ -806,7 +910,6 @@ impl Storage for RocksDbStorage {
             if entry.index >= high {
                 break;
             }
-            // Calculate size by serializing
             let entry_size = {
                 let mut buf = Vec::new();
                 if entry.write_to_vec(&mut buf).is_ok() {
@@ -825,12 +928,22 @@ impl Storage for RocksDbStorage {
         Ok(result)
     }
 
+    /// Returns the term of entry `idx`.
+    /// Mirrors raft-rs MemStorage::term:
+    /// - If `idx` equals the snapshot index, return the snapshot term.
+    /// - Otherwise look up the entry at `idx` and return its term.
+    /// - Returns Compacted if `idx < first_index`.
+    /// - Returns Unavailable if `idx > last_index`.
     fn term(&self, idx: u64) -> Result<u64, raft::Error> {
-        let hs = self.hard_state.read().unwrap();
-
-        // Committed index has the term
-        if idx == hs.commit {
-            return Ok(hs.term);
+        // Check snapshot boundary first (mirrors MemStorage).
+        {
+            let sm = self.snapshot_meta.read().unwrap();
+            if idx == sm.index {
+                return Ok(sm.term);
+            }
+            if idx < sm.index {
+                return Err(RaftError::Store(StorageError::Compacted));
+            }
         }
 
         let entries = self.entries.read().unwrap();
@@ -840,40 +953,71 @@ impl Storage for RocksDbStorage {
             }
         }
 
-        Err(raft::Error::Store(raft::StorageError::Unavailable))
+        Err(RaftError::Store(StorageError::Unavailable))
     }
 
+    /// Returns first log index or snapshot.index + 1 when log is empty.
     fn first_index(&self) -> Result<u64, raft::Error> {
         let entries = self.entries.read().unwrap();
-        Ok(entries.front().map_or(1, |e| e.index))
+        if let Some(e) = entries.front() {
+            Ok(e.index)
+        } else {
+            // Log is empty — first index is right after the snapshot.
+            let sm = self.snapshot_meta.read().unwrap();
+            Ok(sm.index + 1)
+        }
     }
 
+    /// Returns last log index or snapshot.index when log is empty.
     fn last_index(&self) -> Result<u64, raft::Error> {
         let entries = self.entries.read().unwrap();
-        let hs = self.hard_state.read().unwrap();
-        Ok(entries.back().map_or(hs.commit, |e| e.index))
+        if let Some(e) = entries.back() {
+            Ok(e.index)
+        } else {
+            // Log is empty — last index is the snapshot index.
+            let sm = self.snapshot_meta.read().unwrap();
+            Ok(sm.index)
+        }
     }
 
-    fn snapshot(
-        &self,
-        request_index: u64,
-        _request_from_log_id: u64,
-    ) -> Result<Snapshot, raft::Error> {
-        // Try to load from RocksDB first
-        let snapshot_cf = self.db.cf_handle(CF_SNAPSHOT);
-        if let Some(cf) = snapshot_cf {
+    /// Returns the most recent snapshot if its index >= request_index.
+    fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, raft::Error> {
+        // Try to load from RocksDB snapshot CF.
+        if let Some(cf) = self.db.cf_handle(CF_SNAPSHOT) {
             if let Ok(Some(data)) = self.db.get_cf(cf, b"latest_snapshot") {
-                if let Ok(snap) = <Snapshot as Message>::parse_from_bytes(&data) {
+                if let Ok(mut snap) = <Snapshot as Message>::parse_from_bytes(&data) {
                     if snap.get_metadata().get_index() >= request_index {
+                        // Ensure snapshot_meta is also up-to-date.
+                        let sm = self.snapshot_meta.read().unwrap();
+                        if sm.index == snap.get_metadata().get_index()
+                            && sm.term == snap.get_metadata().get_term()
+                        {
+                            return Ok(snap);
+                        }
+                        // Update snapshot metadata from snapshot.
+                        drop(sm);
+                        {
+                            let mut sm = self.snapshot_meta.write().unwrap();
+                            sm.index = snap.get_metadata().get_index();
+                            sm.term = snap.get_metadata().get_term();
+                        }
+                        // Update conf_state if snapshot has it.
+                        if snap.get_metadata().get_conf_state().voters.is_empty() {
+                            let sm = self.snapshot_meta.read().unwrap();
+                            if !sm.get_conf_state().voters.is_empty() {
+                                snap.mut_metadata()
+                                    .set_conf_state(sm.get_conf_state().clone());
+                            }
+                        }
                         return Ok(snap);
                     }
                 }
             }
         }
 
-        // No snapshot available - return Err so raft::RawNode knows to start fresh
-        Err(raft::Error::Store(
-            raft::StorageError::SnapshotTemporarilyUnavailable,
+        // No snapshot available.
+        Err(RaftError::Store(
+            StorageError::SnapshotTemporarilyUnavailable,
         ))
     }
 }

@@ -210,10 +210,7 @@ impl ClientManager {
         if let Some(client) = self.fuse_clients.get_mut(client_id) {
             client.stats = Some(stats);
         } else {
-            warn!(
-                "FUSE client not found for stats update: {}",
-                client_id
-            );
+            warn!("FUSE client not found for stats update: {}", client_id);
         }
     }
 
@@ -1899,11 +1896,7 @@ impl MasterNode {
             .update_fuse_client_heartbeat(client_id);
     }
 
-    pub fn update_fuse_client_stats(
-        &self,
-        client_id: &str,
-        stats: crate::proto::ClientStats,
-    ) {
+    pub fn update_fuse_client_stats(&self, client_id: &str, stats: crate::proto::ClientStats) {
         self.client_manager
             .write()
             .unwrap()

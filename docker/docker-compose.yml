@@ -3,8 +3,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
-          gateway: 172.20.0.1
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
 
 volumes:
   master-1-data:
@@ -25,7 +25,7 @@ services:
     container_name: redis
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.50
+        ipv4_address: 172.30.0.50
     volumes:
       - redis-data:/data
     ports:
@@ -45,17 +45,19 @@ services:
     container_name: master-1
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.11
+        ipv4_address: 172.30.0.11
     volumes:
       - master-1-data:/data
       - ./config/master-1.toml:/app/config/master.toml:ro
     ports:
       - "9333:9333"
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.11 9333 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.11 9333 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -71,17 +73,19 @@ services:
     container_name: master-2
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.12
+        ipv4_address: 172.30.0.12
     volumes:
       - master-2-data:/data
       - ./config/master-2.toml:/app/config/master.toml:ro
     ports:
       - "9336:9333"
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.12 9333 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.12 9333 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -97,17 +101,19 @@ services:
     container_name: master-3
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.13
+        ipv4_address: 172.30.0.13
     volumes:
       - master-3-data:/data
       - ./config/master-3.toml:/app/config/master.toml:ro
     ports:
       - "9337:9333"
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.13 9333 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.13 9333 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -123,7 +129,7 @@ services:
     container_name: volume-1
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.21
+        ipv4_address: 172.30.0.21
     volumes:
       - volume-1-data:/data
       - ./config/volume-1.toml:/app/config/volume.toml:ro
@@ -131,11 +137,13 @@ services:
       - "8080:8080"    # gRPC端口
       - "8091:8091"    # HTTP管理端口
       - "8901:8901"    # powerfs-net端口 (与HTTP端口不同!)
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.21 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.21 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -151,7 +159,7 @@ services:
     container_name: volume-2
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.22
+        ipv4_address: 172.30.0.22
     volumes:
       - volume-2-data:/data
       - ./config/volume-2.toml:/app/config/volume.toml:ro
@@ -159,11 +167,13 @@ services:
       - "8081:8080"    # gRPC端口
       - "8092:8092"    # HTTP管理端口
       - "8902:8902"    # powerfs-net端口 (与HTTP端口不同!)
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.22 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -179,7 +189,7 @@ services:
     container_name: volume-3
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.23
+        ipv4_address: 172.30.0.23
     volumes:
       - volume-3-data:/data
       - ./config/volume-3.toml:/app/config/volume.toml:ro
@@ -187,11 +197,13 @@ services:
       - "8082:8080"    # gRPC端口
       - "8093:8093"    # HTTP管理端口
       - "8903:8903"    # powerfs-net端口 (与HTTP端口不同!)
+    environment:
+      - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.20.0.23 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -207,7 +219,7 @@ services:
     container_name: filer-1
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.35
+        ipv4_address: 172.30.0.35
     volumes:
       - filer-1-data:/data/filer
       - ./config/filer-1.toml:/app/config/filer.toml:ro
@@ -237,7 +249,7 @@ services:
     container_name: filer-2
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.36
+        ipv4_address: 172.30.0.36
     volumes:
       - filer-2-data:/data/filer
       - ./config/filer-2.toml:/app/config/filer.toml:ro
@@ -267,7 +279,7 @@ services:
     container_name: filer-3
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.37
+        ipv4_address: 172.30.0.37
     volumes:
       - filer-3-data:/data/filer
       - ./config/filer-3.toml:/app/config/filer.toml:ro
@@ -297,7 +309,7 @@ services:
     container_name: s3
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.32
+        ipv4_address: 172.30.0.32
     volumes:
       - s3-data:/data
       - ./config/s3.toml:/app/config/s3.toml:ro
@@ -323,7 +335,7 @@ services:
     container_name: monitor
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.30
+        ipv4_address: 172.30.0.30
     volumes:
       - ./config/monitor.toml:/app/config/monitor.toml:ro
     ports:
@@ -350,7 +362,7 @@ services:
     container_name: frontend
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.31
+        ipv4_address: 172.30.0.31
     ports:
       - "8084:80"
     healthcheck:
@@ -373,7 +385,7 @@ services:
     init: true
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.41
+        ipv4_address: 172.30.0.41
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -410,7 +422,7 @@ services:
     init: true
     networks:
       powerfs-network:
-        ipv4_address: 172.20.0.42
+        ipv4_address: 172.30.0.42
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:

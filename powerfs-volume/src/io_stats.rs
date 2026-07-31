@@ -100,8 +100,7 @@ impl IoStatsCollector {
     /// Ensure a volume entry exists.
     pub fn ensure_volume(&self, volume_id: u64) {
         let mut vols = self.volumes.write().unwrap();
-        vols.entry(volume_id)
-            .or_insert_with(VolumeIoStats::default);
+        vols.entry(volume_id).or_default();
     }
 
     /// Record a read operation with its size and elapsed time.
@@ -111,7 +110,9 @@ impl IoStatsCollector {
         if let Some(stats) = vols.get(&volume_id) {
             stats.read_ops.fetch_add(1, Ordering::Relaxed);
             stats.read_bytes.fetch_add(bytes, Ordering::Relaxed);
-            stats.read_latency_us.fetch_add(elapsed_us, Ordering::Relaxed);
+            stats
+                .read_latency_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
             stats.read_samples.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut samples) = stats.latency_samples.lock() {
                 samples.push_read(elapsed_us);
@@ -126,7 +127,9 @@ impl IoStatsCollector {
         if let Some(stats) = vols.get(&volume_id) {
             stats.write_ops.fetch_add(1, Ordering::Relaxed);
             stats.write_bytes.fetch_add(bytes, Ordering::Relaxed);
-            stats.write_latency_us.fetch_add(elapsed_us, Ordering::Relaxed);
+            stats
+                .write_latency_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
             stats.write_samples.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut samples) = stats.latency_samples.lock() {
                 samples.push_write(elapsed_us);
@@ -148,16 +151,8 @@ impl IoStatsCollector {
                 let read_samples = s.read_samples.load(Ordering::Relaxed);
                 let write_samples = s.write_samples.load(Ordering::Relaxed);
 
-                let read_avg = if read_samples > 0 {
-                    read_latency / read_samples
-                } else {
-                    0
-                };
-                let write_avg = if write_samples > 0 {
-                    write_latency / write_samples
-                } else {
-                    0
-                };
+                let read_avg = read_latency.checked_div(read_samples).unwrap_or(0);
+                let write_avg = write_latency.checked_div(write_samples).unwrap_or(0);
 
                 // Compute p50/p99 from recent latency samples
                 let (read_p50, read_p99, write_p50, write_p99) = {

@@ -216,7 +216,10 @@ async fn run_one_session(
     }
 }
 
-fn build_request(config: &StatsReporterConfig, volume_client: &VolumeClient) -> KeepConnectedRequest {
+fn build_request(
+    config: &StatsReporterConfig,
+    volume_client: &VolumeClient,
+) -> KeepConnectedRequest {
     let stats = Some(volume_client.client_stats());
     KeepConnectedRequest {
         client_type: config.client_type.clone(),

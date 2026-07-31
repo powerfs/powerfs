@@ -224,7 +224,10 @@ impl VolumeServer {
                         }
                         .to_string(),
                         collection: volume.collection.0.clone(),
-                        read_only: matches!(volume.state, powerfs_common::types::VolumeState::ReadOnly),
+                        read_only: matches!(
+                            volume.state,
+                            powerfs_common::types::VolumeState::ReadOnly
+                        ),
                         replica_placement: volume.replica_count,
                         ttl: volume.ttl.0 as u32,
                         disk_type: volume.disk_type.0.clone(),
@@ -431,12 +434,15 @@ impl VolumeService for VolumeServer {
                 match result {
                     Ok(data) => {
                         let size = data.len() as u64;
-                        Ok((Response::new(crate::proto::ReadNeedleResponse {
-                            success: true,
-                            data: data.to_vec(),
-                            cookie: 0,
-                            last_modified: 0,
-                        }), size))
+                        Ok((
+                            Response::new(crate::proto::ReadNeedleResponse {
+                                success: true,
+                                data: data.to_vec(),
+                                cookie: 0,
+                                last_modified: 0,
+                            }),
+                            size,
+                        ))
                     }
                     Err(e) => {
                         warn!("read_needle failed: {}", e);
@@ -1015,10 +1021,13 @@ impl VolumeService for VolumeServer {
                 match result {
                     Ok(data) => {
                         let resp_size = data.len() as u64;
-                        Ok((Response::new(crate::proto::ReadNeedleBlobResponse {
-                            success: true,
-                            needle_blob: data.to_vec(),
-                        }), resp_size))
+                        Ok((
+                            Response::new(crate::proto::ReadNeedleBlobResponse {
+                                success: true,
+                                needle_blob: data.to_vec(),
+                            }),
+                            resp_size,
+                        ))
                     }
                     Err(e) => {
                         warn!("read_needle_blob failed: {}", e);

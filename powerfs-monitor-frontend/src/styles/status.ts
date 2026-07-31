@@ -11,11 +11,14 @@
 
 export type NodeStatus =
   | 'online'
+  | 'healthy'
   | 'degraded'
   | 'maintenance'
   | 'isolated'
   | 'offline'
   | 'initializing'
+  | 'leader'
+  | 'follower'
 
 export type DeviceStatus =
   | 'online'
@@ -63,6 +66,14 @@ export const nodeStatusPalette: Record<NodeStatus, StatusPalette> = {
     tag: 'success',
     label: '在线',
   },
+  healthy: {
+    bg: '#F6FFED',
+    border: '#B7EB8F',
+    text: '#389E0D',
+    dot: '#52C41A',
+    tag: 'success',
+    label: '健康',
+  },
   degraded: {
     bg: '#FFF7E6',
     border: '#FFD591',
@@ -102,6 +113,22 @@ export const nodeStatusPalette: Record<NodeStatus, StatusPalette> = {
     dot: '#1890FF',
     tag: 'cyan',
     label: '初始化',
+  },
+  leader: {
+    bg: '#FFF7E6',
+    border: '#FFD591',
+    text: '#D46B08',
+    dot: '#FAAD14',
+    tag: 'gold',
+    label: 'Leader',
+  },
+  follower: {
+    bg: '#E6F7FF',
+    border: '#91D5FF',
+    text: '#096DD9',
+    dot: '#1890FF',
+    tag: 'blue',
+    label: 'Follower',
   },
 }
 

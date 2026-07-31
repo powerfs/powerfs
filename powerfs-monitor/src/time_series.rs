@@ -70,6 +70,10 @@ impl TimeSeries {
     pub fn len(&self) -> usize {
         self.points.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -114,7 +118,13 @@ impl RedisBackend {
         }
     }
 
-    async fn query_range(&self, prefix: &str, id: &str, start_ts: i64, end_ts: i64) -> Vec<DataPoint> {
+    async fn query_range(
+        &self,
+        prefix: &str,
+        id: &str,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Vec<DataPoint> {
         let key = Self::key(prefix, id);
         if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
             let results: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
@@ -155,9 +165,18 @@ pub struct TimeSeriesStore {
 impl std::fmt::Debug for TimeSeriesStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TimeSeriesStore")
-            .field("volume_size_entries", &self.volume_size.try_read().map(|m| m.len()).unwrap_or(0))
-            .field("volume_io_entries", &self.volume_io.try_read().map(|m| m.len()).unwrap_or(0))
-            .field("disk_usage_entries", &self.disk_usage.try_read().map(|m| m.len()).unwrap_or(0))
+            .field(
+                "volume_size_entries",
+                &self.volume_size.try_read().map(|m| m.len()).unwrap_or(0),
+            )
+            .field(
+                "volume_io_entries",
+                &self.volume_io.try_read().map(|m| m.len()).unwrap_or(0),
+            )
+            .field(
+                "disk_usage_entries",
+                &self.disk_usage.try_read().map(|m| m.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -213,7 +232,10 @@ impl TimeSeriesStore {
     /// Load historical data from Redis into in-memory ring buffers
     pub async fn load_from_redis(&self, minutes: i64) {
         if let Some(ref redis) = self.redis {
-            log::info!("Loading time-series history from Redis (last {} minutes)", minutes);
+            log::info!(
+                "Loading time-series history from Redis (last {} minutes)",
+                minutes
+            );
             let volumes: Vec<u64> = {
                 let store = self.volume_size.read().await;
                 store.keys().copied().collect()
@@ -221,7 +243,9 @@ impl TimeSeriesStore {
             let end = chrono::Utc::now().timestamp();
             let start = end - minutes * 60;
             for vid in &volumes {
-                let history = redis.query_range("volume_size", &vid.to_string(), start, end).await;
+                let history = redis
+                    .query_range("volume_size", &vid.to_string(), start, end)
+                    .await;
                 if !history.is_empty() {
                     let mut series = TimeSeries::new(self.capacity);
                     for p in &history {
@@ -241,7 +265,9 @@ impl TimeSeriesStore {
         if let Some(ref redis) = self.redis {
             let redis = redis.clone();
             let vid_str = volume_id.to_string();
-            redis.add_point("volume_size", &vid_str, timestamp, used_bytes).await;
+            redis
+                .add_point("volume_size", &vid_str, timestamp, used_bytes)
+                .await;
         }
         let mut store = self.volume_size.write().await;
         let series = store
@@ -256,7 +282,9 @@ impl TimeSeriesStore {
         if let Some(ref redis) = self.redis {
             let redis = redis.clone();
             let vid_str = volume_id.to_string();
-            redis.add_point("volume_io", &vid_str, timestamp, ops_per_sec).await;
+            redis
+                .add_point("volume_io", &vid_str, timestamp, ops_per_sec)
+                .await;
         }
         let mut store = self.volume_io.write().await;
         let series = store
@@ -271,7 +299,9 @@ impl TimeSeriesStore {
         if let Some(ref redis) = self.redis {
             let redis = redis.clone();
             let nid = node_id.to_string();
-            redis.add_point("disk_usage", &nid, timestamp, used_percent).await;
+            redis
+                .add_point("disk_usage", &nid, timestamp, used_percent)
+                .await;
         }
         let mut store = self.disk_usage.write().await;
         let series = store
@@ -328,9 +358,7 @@ impl TimeSeriesStore {
         if points.is_empty() {
             #[cfg(feature = "redis")]
             if let Some(ref redis) = self.redis {
-                let history = redis
-                    .query_range("disk_usage", node_id, start, now)
-                    .await;
+                let history = redis.query_range("disk_usage", node_id, start, now).await;
                 if !history.is_empty() {
                     let mut series = TimeSeries::new(self.capacity);
                     for p in &history {

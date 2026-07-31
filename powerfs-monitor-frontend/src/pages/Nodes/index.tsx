@@ -109,7 +109,7 @@ function Nodes() {
   // ── KPI summary ──
   const kpiItems: StatCardProps[] = useMemo(() => {
     const total = nodes.length
-    const online = nodes.filter(n => n.status === 'online').length
+    const online = nodes.filter(n => n.status === 'online' || n.status === 'healthy' || n.status === 'leader' || n.status === 'follower').length
     const maintenance = nodes.filter(n => n.status === 'maintenance').length
     const degraded = nodes.filter(n => n.status === 'degraded').length
     const isolated = nodes.filter(n => n.status === 'isolated').length

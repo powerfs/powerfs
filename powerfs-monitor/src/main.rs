@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -460,9 +460,7 @@ struct TopologyResponse {
     volume_servers: Vec<VolumeServerInfo>,
 }
 
-async fn get_topology(
-    State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<TopologyResponse>> {
+async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<TopologyResponse>> {
     let nodes = state.metric_store.get_nodes().await;
     let volumes = state.metric_store.get_volumes().await;
 
@@ -520,14 +518,31 @@ async fn get_topology(
         }
     }
 
-    // Fetch filer list from Master gRPC
-    let filers = match get_filers_via_grpc(&state).await {
+    // Fetch filer list from Master gRPC, and also from event store
+    let grpc_filers = match get_filers_via_grpc(&state).await {
         Ok(f) => f,
         Err(e) => {
-            warn!("Failed to fetch filers for topology: {}", e);
+            warn!("Failed to fetch filers for topology via gRPC: {}", e);
             Vec::new()
         }
     };
+
+    // Also include filers from the event store (nodes with node_type == "filer")
+    let mut filers: Vec<FilerNodeInfo> = grpc_filers;
+    let existing_ids: HashSet<String> = filers.iter().map(|f| f.node_id.clone()).collect();
+    for node in &nodes {
+        if node.node_type == "filer" && !existing_ids.contains(&node.id) {
+            filers.push(FilerNodeInfo {
+                node_id: node.id.clone(),
+                address: node.address.clone(),
+                grpc_port: node.grpc_port,
+                http_port: node.http_port,
+                is_healthy: node.status == "healthy",
+                leader_count: 0,
+                total_shards: 0,
+            });
+        }
+    }
 
     Json(ApiResponse::success(TopologyResponse {
         masters,
@@ -536,9 +551,7 @@ async fn get_topology(
     }))
 }
 
-async fn get_filers_via_grpc(
-    state: &Arc<AppState>,
-) -> Result<Vec<FilerNodeInfo>, String> {
+async fn get_filers_via_grpc(state: &Arc<AppState>) -> Result<Vec<FilerNodeInfo>, String> {
     let mut client = state.master_client.lock().await;
     let request = powerfs_master::proto::powerfs::ListFilersRequest {};
 
@@ -4035,8 +4048,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/volumes", get(get_volumes))
         .route("/api/metrics/volumes/:id", get(get_volume))
         .route("/api/metrics/volumes/:id/io", get(get_volume_io))
-        .route("/api/metrics/volumes/:id/capacity-history", get(get_capacity_history))
-        .route("/api/metrics/volumes/:id/capacity-projection", get(get_capacity_projection))
+        .route(
+            "/api/metrics/volumes/:id/capacity-history",
+            get(get_capacity_history),
+        )
+        .route(
+            "/api/metrics/volumes/:id/capacity-projection",
+            get(get_capacity_projection),
+        )
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
@@ -4074,7 +4093,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
         .route("/api/fuse/clients/:id/stats", get(get_fuse_client_stats))
-        .route("/api/config/circuit-breaker", get(get_circuit_breaker_config))
+        .route(
+            "/api/config/circuit-breaker",
+            get(get_circuit_breaker_config),
+        )
         .route("/api/config/coalescer", get(get_coalescer_config))
         .route("/api/conflicts", get(list_conflicts))
         .route("/api/conflicts/resolve", post(resolve_conflict_handler))
@@ -4352,7 +4374,10 @@ async fn get_capacity_history(
 
     match id.parse::<u64>() {
         Ok(vid) => {
-            let points = state.time_series.get_volume_size_history(vid, minutes).await;
+            let points = state
+                .time_series
+                .get_volume_size_history(vid, minutes)
+                .await;
             Json(ApiResponse::success(CapacityHistoryResponse {
                 volume_id: vid,
                 data_points: points,
@@ -4374,7 +4399,10 @@ async fn get_capacity_projection(
 
     match id.parse::<u64>() {
         Ok(vid) => {
-            let projection = state.time_series.project_volume_size(vid, hours_ahead).await;
+            let projection = state
+                .time_series
+                .project_volume_size(vid, hours_ahead)
+                .await;
             let volumes = state.metric_store.get_volumes().await;
             let current = volumes
                 .iter()

@@ -1,10 +1,13 @@
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::Arc;
+use std::time::Duration;
 
 use powerfs_common::build_info::BuildInfo;
 use powerfs_common::config::PowerFsConfig;
 use powerfs_common::error::PowerFsError;
+use powerfs_common::traits::EventProvider;
+use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventProvider};
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
 use powerfs_master::volume_client::VolumeClientPool;
@@ -86,6 +89,60 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         redis::Client::open(redis_url).map_err(|e| PowerFsError::Internal(e.to_string()))?;
 
     let metadata_store = Arc::new(MetadataStore::new(redis_client));
+
+    // Setup event provider for Redis-based node status publishing
+    let event_provider: Arc<dyn EventProvider> = match std::env::var("REDIS_URL") {
+        #[cfg(feature = "redis-event")]
+        Ok(url) => {
+            info!("Filer event provider enabled with Redis: {}", url);
+            Arc::new(powerfs_common::event::RedisEventProvider::new(
+                &url,
+                "powerfs_events",
+                "filer",
+            ))
+        }
+        _ => {
+            warn!("REDIS_URL not set, using null event provider");
+            Arc::new(NullEventProvider)
+        }
+    };
+
+    let node_id = format!("filer-{}", filer_cfg.raft_id);
+    let grpc_port_for_event = grpc_port;
+    let event_bind_ip = bind_ip.clone();
+    let event_provider_clone = event_provider.clone();
+    let data_dir_for_event = filer_cfg.data_dir.clone();
+    tokio::spawn(async move {
+        let mut sys = sysinfo::System::new_all();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            sys.refresh_all();
+
+            let metrics = collect_system_metrics(&mut sys, &data_dir_for_event);
+
+            let event = Event::NodeStatus(NodeStatusEvent {
+                node_id: node_id.clone(),
+                node_type: "filer".to_string(),
+                address: event_bind_ip.clone(),
+                grpc_port: grpc_port_for_event as u32,
+                http_port: grpc_port_for_event as u32,
+                status: "healthy".to_string(),
+                cpu_usage: metrics.cpu_usage,
+                mem_usage: metrics.mem_usage,
+                disk_usage: metrics.disk_usage,
+                network_rx: metrics.network_rx,
+                network_tx: metrics.network_tx,
+                uptime: metrics.uptime,
+                volume_count: 0,
+                is_leader: false,
+                raft_term: 0,
+            });
+
+            if let Err(e) = event_provider_clone.publish(event, &node_id).await {
+                warn!("Failed to publish filer node_status event: {}", e);
+            }
+        }
+    });
 
     // Master 地址列表从配置获取 - 必须非空
     let master_addresses = filer_cfg.master_addresses.clone();

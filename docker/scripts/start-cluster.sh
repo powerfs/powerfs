@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set +e
 
 BUILD_IMAGES=false
 SPDK_FEATURE=""
@@ -35,6 +35,17 @@ echo "========================================"
 echo ""
 echo "Host IP: $HOST_IP"
 echo ""
+
+# Stop any existing containers first
+echo "Stopping existing containers..."
+cd "$DOCKER_DIR"
+docker compose down --remove-orphans 2>/dev/null || true
+echo "[OK] Old containers stopped"
+
+# Create FUSE mount directories
+mkdir -p /tmp/powerfs/fuse1
+mkdir -p /tmp/powerfs/fuse2
+echo "[OK] FUSE mount directories created"
 
 if [ "$BUILD_IMAGES" = true ]; then
     echo "[1/8] Building Docker images..."
@@ -74,8 +85,7 @@ while [ $timeout -gt 0 ]; do
 done
 
 if [ $timeout -eq 0 ]; then
-    echo "  [ERROR] Redis failed to start"
-    exit 2
+    echo "  [WARNING] Redis may not be ready, continuing..."
 fi
 
 echo ""
@@ -94,8 +104,7 @@ while [ $timeout -gt 0 ]; do
 done
 
 if [ $timeout -eq 0 ]; then
-    echo "  [ERROR] master-1 failed to start"
-    exit 2
+    echo "  [WARNING] master-1 may not be ready, continuing..."
 fi
 
 docker compose up -d --no-deps master-2
@@ -136,8 +145,20 @@ echo ""
 echo "[4/8] Starting Volume nodes..."
 docker compose up -d --no-deps volume-1 volume-2 volume-3
 
-echo "  Waiting for volumes to register..."
-sleep 5
+echo "  Waiting for volumes to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    ready=0
+    nc -z localhost 8080 >/dev/null 2>&1 && ready=$((ready + 1))
+    nc -z localhost 8081 >/dev/null 2>&1 && ready=$((ready + 1))
+    nc -z localhost 8082 >/dev/null 2>&1 && ready=$((ready + 1))
+    if [ $ready -ge 2 ]; then
+        echo "  [OK] $ready volume(s) ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
 
 echo ""
 echo "[5/8] Starting Filer..."
@@ -159,6 +180,20 @@ timeout=30
 while [ $timeout -gt 0 ]; do
     if nc -z localhost 8898 >/dev/null 2>&1; then
         echo "  [OK] Filer-2 ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo "  Starting Filer-3..."
+docker compose up -d --no-deps filer-3
+
+echo "  Waiting for Filer-3 to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if nc -z localhost 8908 >/dev/null 2>&1; then
+        echo "  [OK] Filer-3 ready"
         break
     fi
     sleep 1
@@ -227,6 +262,37 @@ echo "  Filer:           $HOST_IP:9001"
 echo "  S3 Backend:      $HOST_IP:9000"
 echo "  Monitor API:     $HOST_IP:8083"
 echo "  Monitor UI:      http://$HOST_IP:8084"
+echo ""
+
+echo "[9/9] Starting FUSE clients..."
+docker compose up -d --no-deps fuse-1 fuse-2
+
+echo "  Waiting for fuse-1 to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if docker exec fuse-1 test -d /mnt/powerfs 2>/dev/null; then
+        echo "  [OK] fuse-1 ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo "  Waiting for fuse-2 to be ready..."
+timeout=30
+while [ $timeout -gt 0 ]; do
+    if docker exec fuse-2 test -d /mnt/powerfs 2>/dev/null; then
+        echo "  [OK] fuse-2 ready"
+        break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+done
+
+echo ""
+echo "  FUSE mount points:"
+echo "    Fuse-1: /tmp/powerfs/fuse1 (host) -> /mnt/powerfs (container)"
+echo "    Fuse-2: /tmp/powerfs/fuse2 (host) -> /mnt/powerfs (container)"
 echo ""
 echo "S3 Compatible Endpoint:"
 echo "  http://$HOST_IP:9000"

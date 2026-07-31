@@ -502,12 +502,14 @@ fn test_write_needle_blob_growth_updates_used() {
     volume
         .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
     let used_after_first = volume.used();
     assert!(used_after_first > 0);
 
     volume
         .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
     let used_after_second = volume.used();
     assert!(used_after_second > used_after_first);
 }
@@ -519,6 +521,7 @@ fn test_write_needle_blob_append_only_offset() {
     volume
         .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
 
     let info1 = volume.get_needle_info(&NeedleId(1)).unwrap();
     let offset1 = info1.offset;
@@ -526,6 +529,7 @@ fn test_write_needle_blob_append_only_offset() {
     volume
         .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
 
     let info2 = volume.get_needle_info(&NeedleId(1)).unwrap();
     let offset2 = info2.offset;
@@ -703,9 +707,11 @@ fn test_compact_after_append_only_growth() {
     volume
         .write_needle_blob(1, 0, 1024, Bytes::from(vec![0u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
     volume
         .write_needle_blob(1, 1024, 1024, Bytes::from(vec![1u8; 1024]), 0)
         .unwrap();
+    volume.flush_all_dirty();
 
     let used_before = volume.used();
     let (reclaimed, moved) = volume.compact().unwrap();

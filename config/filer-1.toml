@@ -5,6 +5,7 @@ redis_url = "redis://redis:6379"
 [filer]
 port = 8888
 grpc_port = 8889
+net_port = 9334
 data_dir = "/data/filer"
 shard_count = 2
 raft_id = 1

@@ -1,10 +1,13 @@
 export type NodeStatus =
   | 'online'
+  | 'healthy'
   | 'degraded'
   | 'maintenance'
   | 'isolated'
   | 'offline'
   | 'initializing'
+  | 'leader'
+  | 'follower'
 
 export type RaftRole = 'leader' | 'follower'
 

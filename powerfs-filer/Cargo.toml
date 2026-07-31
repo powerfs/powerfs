@@ -35,6 +35,7 @@ tonic = { workspace = true }
 prost = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
+sysinfo = "0.30"
 
 [build-dependencies]
 tonic-build = "0.11"

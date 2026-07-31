@@ -186,7 +186,7 @@ function ClusterTopology() {
       title: (
         <Tooltip title={`${vs.node.address}:${vs.node.grpc_port}`}>
           <span>
-            {vs.node.status === 'online' ? (
+            {vs.node.status === 'online' || vs.node.status === 'healthy' ? (
               <CheckCircleFilled style={{ color: '#52c41a', marginRight: 4 }} />
             ) : (
               <WarningFilled style={{ color: '#faad14', marginRight: 4 }} />

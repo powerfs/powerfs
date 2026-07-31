@@ -382,8 +382,10 @@ impl FuseClientFacade {
                     pid: std::process::id() as u64,
                     report_interval: Duration::from_secs(5),
                 };
-                let mut reporter =
-                    crate::stats_reporter::MasterStatsReporter::new(reporter_config, volume_client.clone());
+                let mut reporter = crate::stats_reporter::MasterStatsReporter::new(
+                    reporter_config,
+                    volume_client.clone(),
+                );
                 reporter.start();
                 log::info!(
                     "FuseClientFacade: MasterStatsReporter started (endpoint={})",
@@ -427,7 +429,7 @@ impl FuseClientFacade {
 
     /// 获取 Volume 客户端引用
     pub fn volume_client(&self) -> &VolumeClient {
-        &*self.volume_client
+        self.volume_client.as_ref()
     }
 
     /// 获取拓扑管理器引用
