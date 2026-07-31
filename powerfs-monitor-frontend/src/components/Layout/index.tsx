@@ -38,6 +38,7 @@ import {
   RocketOutlined,
   CloudServerOutlined,
   ClusterOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -93,6 +94,7 @@ function AppLayout() {
           children: [
             { key: '/nodes', icon: <HddOutlined />, label: '节点管理' },
             { key: '/cluster-topology', icon: <ClusterOutlined />, label: '集群拓扑' },
+            { key: '/capacity-planning', icon: <LineChartOutlined />, label: '容量规划' },
             { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
             { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FUSE 管理' },
           ],

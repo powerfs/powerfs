@@ -142,6 +142,34 @@ export async function getVolume(id: number): Promise<VolumeInfo> {
   return response.data.data
 }
 
+export interface DataPoint {
+  timestamp: number
+  value: number
+}
+
+export interface CapacityHistoryResponse {
+  volume_id: number
+  data_points: DataPoint[]
+}
+
+export interface CapacityProjectionResponse {
+  volume_id: number
+  current_bytes: number
+  projected_bytes: number | null
+  hours_ahead: number
+  growth_rate_bytes_per_hour: number | null
+}
+
+export async function getCapacityHistory(volumeId: number, minutes: number = 1440): Promise<CapacityHistoryResponse> {
+  const response = await api.get(`/metrics/volumes/${volumeId}/capacity-history`, { params: { minutes } })
+  return response.data.data
+}
+
+export async function getCapacityProjection(volumeId: number, hours: number = 24): Promise<CapacityProjectionResponse> {
+  const response = await api.get(`/metrics/volumes/${volumeId}/capacity-projection`, { params: { hours } })
+  return response.data.data
+}
+
 export async function getKVSessions(): Promise<KVSessionInfo[]> {
   if (useMock) {
     return mockKVSessions

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +37,7 @@ use powerfs_monitor::auth::{
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
 use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, VolumeInfo};
+use powerfs_monitor::time_series::{DataPoint, TimeSeriesStore};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -144,6 +146,8 @@ struct AppState {
     kv_client: Arc<Mutex<KvCacheClient>>,
     /// Master gRPC 客户端
     master_client: Arc<Mutex<MasterServiceClient<tonic::transport::Channel>>>,
+    /// Time-series store for capacity planning
+    time_series: Arc<TimeSeriesStore>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3968,6 +3972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: Arc::new(RateLimiter::new()),
         kv_client,
         master_client,
+        time_series: Arc::new(TimeSeriesStore::new()),
     });
 
     let event_bus = EventBus::new(&redis_url, &stream_key);
@@ -3985,6 +3990,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     tokio::spawn(start_metric_broadcaster(
+        metric_store.clone(),
+        app_state.clone(),
+    ));
+
+    tokio::spawn(start_time_series_sampler(
         metric_store.clone(),
         app_state.clone(),
     ));
@@ -4017,6 +4027,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/volumes", get(get_volumes))
         .route("/api/metrics/volumes/:id", get(get_volume))
         .route("/api/metrics/volumes/:id/io", get(get_volume_io))
+        .route("/api/metrics/volumes/:id/capacity-history", get(get_capacity_history))
+        .route("/api/metrics/volumes/:id/capacity-projection", get(get_capacity_projection))
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
@@ -4274,5 +4286,117 @@ async fn start_metric_broadcaster(metric_store: Arc<MetricStore>, app_state: Arc
         broadcast_message(app_state.clone(), serde_json::to_value(kv_msg).unwrap()).await;
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn start_time_series_sampler(metric_store: Arc<MetricStore>, app_state: Arc<AppState>) {
+    info!("Time-series sampler started (sampling every 60s)");
+
+    loop {
+        let now = chrono::Utc::now().timestamp();
+
+        // Sample volume sizes
+        let volumes = metric_store.get_volumes().await;
+        for vol in &volumes {
+            app_state
+                .time_series
+                .record_volume_size(vol.id, now, vol.used as f64)
+                .await;
+        }
+
+        // Sample disk usage from nodes
+        let nodes = metric_store.get_nodes().await;
+        for node in &nodes {
+            app_state
+                .time_series
+                .record_disk_usage(&node.id, now, node.disk_usage)
+                .await;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CapacityHistoryResponse {
+    volume_id: u64,
+    data_points: Vec<DataPoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct CapacityProjectionResponse {
+    volume_id: u64,
+    current_bytes: u64,
+    projected_bytes: Option<f64>,
+    hours_ahead: i64,
+    growth_rate_bytes_per_hour: Option<f64>,
+}
+
+async fn get_capacity_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<CapacityHistoryResponse>> {
+    let minutes: i64 = params
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1440); // default 24h
+
+    match id.parse::<u64>() {
+        Ok(vid) => {
+            let points = state.time_series.get_volume_size_history(vid, minutes).await;
+            Json(ApiResponse::success(CapacityHistoryResponse {
+                volume_id: vid,
+                data_points: points,
+            }))
+        }
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
+    }
+}
+
+async fn get_capacity_projection(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<CapacityProjectionResponse>> {
+    let hours_ahead: i64 = params
+        .get("hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+
+    match id.parse::<u64>() {
+        Ok(vid) => {
+            let projection = state.time_series.project_volume_size(vid, hours_ahead).await;
+            let volumes = state.metric_store.get_volumes().await;
+            let current = volumes
+                .iter()
+                .find(|v| v.id == vid)
+                .map(|v| v.used)
+                .unwrap_or(0);
+
+            // Calculate growth rate from history
+            let history = state.time_series.get_volume_size_history(vid, 1440).await;
+            let growth_rate = if history.len() >= 2 {
+                let first = &history[0];
+                let last = &history[history.len() - 1];
+                let hours = (last.timestamp - first.timestamp) as f64 / 3600.0;
+                if hours > 0.0 {
+                    Some((last.value - first.value) / hours)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            Json(ApiResponse::success(CapacityProjectionResponse {
+                volume_id: vid,
+                current_bytes: current,
+                projected_bytes: projection,
+                hours_ahead,
+                growth_rate_bytes_per_hour: growth_rate,
+            }))
+        }
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
     }
 }

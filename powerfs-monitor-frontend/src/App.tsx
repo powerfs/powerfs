@@ -20,6 +20,7 @@ import Roles from './pages/Roles'
 import AccessKeys from './pages/AccessKeys'
 import Benchmark from './pages/Benchmark'
 import ClusterTopology from './pages/ClusterTopology'
+import CapacityPlanning from './pages/CapacityPlanning'
 
 function App() {
   return (
@@ -54,6 +55,14 @@ function App() {
           element={
             <ProtectedRoute requireAdmin>
               <ClusterTopology />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="capacity-planning"
+          element={
+            <ProtectedRoute requireAdmin>
+              <CapacityPlanning />
             </ProtectedRoute>
           }
         />
