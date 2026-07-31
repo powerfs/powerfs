@@ -3972,8 +3972,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: Arc::new(RateLimiter::new()),
         kv_client,
         master_client,
-        time_series: Arc::new(TimeSeriesStore::new()),
+        time_series: Arc::new(TimeSeriesStore::with_redis(&redis_url)),
     });
+
+    // Load time-series history from Redis on startup (if available)
+    {
+        let ts = app_state.time_series.clone();
+        tokio::spawn(async move {
+            ts.load_from_redis(1440).await;
+        });
+    }
 
     let event_bus = EventBus::new(&redis_url, &stream_key);
 
