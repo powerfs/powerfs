@@ -61,6 +61,14 @@ pub struct VolumeInfo {
     pub read_avg_latency_us: u64,
     #[serde(default)]
     pub write_avg_latency_us: u64,
+    #[serde(default)]
+    pub read_p50_latency_us: u64,
+    #[serde(default)]
+    pub read_p99_latency_us: u64,
+    #[serde(default)]
+    pub write_p50_latency_us: u64,
+    #[serde(default)]
+    pub write_p99_latency_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +151,10 @@ impl MetricStore {
                     write_bytes: event.write_bytes,
                     read_avg_latency_us: event.read_avg_latency_us,
                     write_avg_latency_us: event.write_avg_latency_us,
+                    read_p50_latency_us: event.read_p50_latency_us,
+                    read_p99_latency_us: event.read_p99_latency_us,
+                    write_p50_latency_us: event.write_p50_latency_us,
+                    write_p99_latency_us: event.write_p99_latency_us,
                 },
             );
         }

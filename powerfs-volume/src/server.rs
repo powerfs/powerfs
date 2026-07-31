@@ -236,6 +236,10 @@ impl VolumeServer {
                         write_bytes: io.map(|s| s.write_bytes).unwrap_or(0),
                         read_avg_latency_us: io.map(|s| s.read_avg_latency_us).unwrap_or(0),
                         write_avg_latency_us: io.map(|s| s.write_avg_latency_us).unwrap_or(0),
+                        read_p50_latency_us: io.map(|s| s.read_p50_us).unwrap_or(0),
+                        read_p99_latency_us: io.map(|s| s.read_p99_us).unwrap_or(0),
+                        write_p50_latency_us: io.map(|s| s.write_p50_us).unwrap_or(0),
+                        write_p99_latency_us: io.map(|s| s.write_p99_us).unwrap_or(0),
                     });
 
                     if let Err(e) = provider
@@ -300,6 +304,10 @@ impl VolumeService for VolumeServer {
                         write_bytes: 0,
                         read_avg_latency_us: 0,
                         write_avg_latency_us: 0,
+                        read_p50_latency_us: 0,
+                        read_p99_latency_us: 0,
+                        write_p50_latency_us: 0,
+                        write_p99_latency_us: 0,
                     });
                     if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                         warn!("Failed to publish volume_status event: {}", e);

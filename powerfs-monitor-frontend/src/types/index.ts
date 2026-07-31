@@ -100,6 +100,10 @@ export interface VolumeInfo {
   write_bytes?: number
   read_avg_latency_us?: number
   write_avg_latency_us?: number
+  read_p50_latency_us?: number
+  read_p99_latency_us?: number
+  write_p50_latency_us?: number
+  write_p99_latency_us?: number
 }
 
 export interface VolumeIoStats {

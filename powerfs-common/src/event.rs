@@ -113,6 +113,15 @@ pub struct VolumeStatusEvent {
     pub read_avg_latency_us: u64,
     #[serde(default)]
     pub write_avg_latency_us: u64,
+    // p50/p99 latency from recent samples (last 1000 ops)
+    #[serde(default)]
+    pub read_p50_latency_us: u64,
+    #[serde(default)]
+    pub read_p99_latency_us: u64,
+    #[serde(default)]
+    pub write_p50_latency_us: u64,
+    #[serde(default)]
+    pub write_p99_latency_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

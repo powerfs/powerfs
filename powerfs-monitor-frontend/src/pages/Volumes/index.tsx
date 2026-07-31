@@ -354,13 +354,21 @@ function Volumes() {
                     <span style={{ color: '#8c8c8c', fontSize: 12 }}>写流量</span>
                     <p style={{ margin: '4px 0', fontWeight: 500 }}>{formatBytes(selectedVolume.write_bytes ?? 0)}</p>
                   </div>
-                  <div>
-                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>平均读延迟</span>
-                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.read_avg_latency_us ? `${(selectedVolume.read_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</p>
+                </div>
+
+                <h4 style={{ margin: '16px 0 12px' }}>延迟分布 (最近采样)</h4>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                  <div style={{ padding: '8px', background: '#e6f4ff', borderRadius: 4 }}>
+                    <div style={{ color: '#8c8c8c', fontSize: 12, marginBottom: 4 }}>读取</div>
+                    <div>平均: {selectedVolume.read_avg_latency_us ? `${(selectedVolume.read_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
+                    <div>P50: {selectedVolume.read_p50_latency_us ? `${(selectedVolume.read_p50_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
+                    <div>P99: {selectedVolume.read_p99_latency_us ? `${(selectedVolume.read_p99_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
                   </div>
-                  <div>
-                    <span style={{ color: '#8c8c8c', fontSize: 12 }}>平均写延迟</span>
-                    <p style={{ margin: '4px 0', fontWeight: 500 }}>{selectedVolume.write_avg_latency_us ? `${(selectedVolume.write_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</p>
+                  <div style={{ padding: '8px', background: '#f6ffed', borderRadius: 4 }}>
+                    <div style={{ color: '#8c8c8c', fontSize: 12, marginBottom: 4 }}>写入</div>
+                    <div>平均: {selectedVolume.write_avg_latency_us ? `${(selectedVolume.write_avg_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
+                    <div>P50: {selectedVolume.write_p50_latency_us ? `${(selectedVolume.write_p50_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
+                    <div>P99: {selectedVolume.write_p99_latency_us ? `${(selectedVolume.write_p99_latency_us / 1000).toFixed(1)}ms` : '-'}</div>
                   </div>
                 </div>
               </div>

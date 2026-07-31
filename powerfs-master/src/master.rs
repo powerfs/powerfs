@@ -876,6 +876,10 @@ impl MasterNode {
                 write_bytes: 0,
                 read_avg_latency_us: 0,
                 write_avg_latency_us: 0,
+                read_p50_latency_us: 0,
+                read_p99_latency_us: 0,
+                write_p50_latency_us: 0,
+                write_p99_latency_us: 0,
             });
             if let Err(e) = provider.publish(event, &format!("{}", vid_clone)).await {
                 warn!("Failed to publish volume_status event: {}", e);
