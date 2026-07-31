@@ -8,8 +8,8 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    ConflictsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs,
-    VolumeListArgs, WriteArgs,
+    CollectionArgs, ConflictsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs,
+    ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
 };
 
 /// PowerFS CLI tool for testing and administration
@@ -69,6 +69,9 @@ enum Commands {
     /// Transfer leadership to another node
     ClusterTransfer(ClusterTransferArgs),
 
+    /// Collection management (list/info/create/delete/stats)
+    Collection(CollectionArgs),
+
     /// Mount PowerFS as a FUSE filesystem
     Mount(MountArgs),
 
@@ -111,6 +114,7 @@ async fn main() {
         Commands::ClusterRemove(args) => commands::cluster_remove(client, args).await,
         Commands::ClusterStatus(args) => commands::cluster_status(client, args).await,
         Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
+        Commands::Collection(args) => commands::collection(client, args).await,
         Commands::Mount(args) => commands::mount(args),
         Commands::Kv(args) => {
             let kv_client = kv_client::KvCacheClient::new(&cli.master);

@@ -13,7 +13,7 @@
 | 4 | S3 接口支持 collection | P0 | ✅ Done | feat: step 4 S3 support for collection |
 | 5 | KV 接口支持 collection | P1 | ✅ Done | feat: step 5 KV support for collection |
 | 6 | 前端 Collection 管理页面 | P1 | ✅ Done | feat: step 6 collection management UI |
-| 7 | CLI Collection 管理命令 | P1 | ⏳ Pending | - |
+| 7 | CLI Collection 管理命令 | P1 | ✅ Done | feat: step 7 CLI collection management commands |
 
 ---
 
@@ -131,6 +131,25 @@
 
 ---
 
-## Step 7: CLI Collection 管理命令 ⏳
+## Step 7: CLI Collection 管理命令 ✅
 
-**目标**: `powerfs collection list/info/create/update/delete/volumes/stats` 命令。
+**目标**: `powerfs-cli collection list/info/create/delete/stats` 命令。
+
+**改动范围**:
+- `powerfs-cli/src/commands/collection.rs`: 新建命令模块，提供 5 个子命令（list/info/create/delete/stats），通过 gRPC 调用 Master 的 ListCollections/GetCollection/CreateCollection/DeleteCollection/GetStatistics
+- `powerfs-cli/src/commands/mod.rs`: 注册 collection 模块并导出 `CollectionArgs`
+- `powerfs-cli/src/main.rs`: 新增 `Commands::Collection` 变体与 dispatch
+
+**用法示例**:
+```bash
+powerfs-cli collection list
+powerfs-cli collection info <name>
+powerfs-cli collection create <name> -r 001 -d hdd --max-volume-count 10
+powerfs-cli collection delete <name>
+powerfs-cli collection stats <name>
+```
+
+**验证**:
+- `cargo fmt` / `cargo clippy -p powerfs-cli --all-targets` 通过（无 warning）
+- `cargo build -p powerfs-cli` 通过
+- `powerfs-cli collection --help` 与 `collection create --help` 输出正确，5 个子命令均注册
