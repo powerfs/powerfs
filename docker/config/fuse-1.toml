@@ -59,7 +59,6 @@ volume_addresses = [            # Volume地址列表 (必填)
     "172.30.0.23"
 ]
 master_net_port = 9334          # Master powerfs-net端口 (必填)
-master_grpc_port = 9333         # Master gRPC端口 (必填，KeepConnected心跳上报)
 volume_net_port = 8901          # Volume powerfs-net端口 (必填)
 filer_net_port = 9334           # Filer powerfs-net端口 (必填)
 collection = "default"

@@ -7,12 +7,23 @@ use std::time::Duration;
 use log::{info, warn};
 use parking_lot::RwLock;
 use powerfs_net::{
-    ClientConfig, ClientType, FieldId, MsgType, NetMessage, PowerFsNetClient, TlvDecoder,
-    TlvEncoder, STATUS_ERR_REDIRECT, STATUS_OK,
+    ClientConfig, ClientType, FieldId, MsgType, NetMessage, NotificationHandler, PowerFsNetClient,
+    TlvDecoder, TlvEncoder, STATUS_ERR_REDIRECT, STATUS_OK,
 };
 
 use crate::error::{MasterNetError, MasterNetResult};
 use crate::types::{AssignResult, TopologyInfo, VolumeLocation, VolumeRoute};
+
+/// Wrapper that turns an `Arc<dyn NotificationHandler>` into a `Box<dyn
+/// NotificationHandler>` so it can be re-installed on every new
+/// `PowerFsNetClient` after a reconnect/failover.
+struct ArcNotificationHandler(Arc<dyn NotificationHandler + Send + Sync>);
+
+impl NotificationHandler for ArcNotificationHandler {
+    fn handle_notification(&self, msg: &NetMessage) {
+        self.0.handle_notification(msg);
+    }
+}
 
 /// Configuration for [`TlvMasterClient`].
 #[derive(Debug, Clone)]
@@ -60,6 +71,10 @@ pub struct TlvMasterClient {
     leader: RwLock<Option<String>>,
     /// Active network client — swapped atomically on redirect.
     net_client: Arc<RwLock<Arc<PowerFsNetClient>>>,
+    /// Optional notification handler, re-installed on every reconnect so
+    /// server-pushed `NOTIFY` frames (e.g. `TopologyChanged`) keep being
+    /// delivered after a leader switch or endpoint failover.
+    notification_handler: Arc<RwLock<Option<Arc<dyn NotificationHandler + Send + Sync>>>>,
     config: TlvMasterClientConfig,
 }
 
@@ -80,7 +95,25 @@ impl TlvMasterClient {
             current_idx: AtomicUsize::new(0),
             leader: RwLock::new(None),
             net_client: Arc::new(RwLock::new(Arc::new(net_client))),
+            notification_handler: Arc::new(RwLock::new(None)),
             config,
+        }
+    }
+
+    /// Install a notification handler to receive server-pushed `NOTIFY`
+    /// frames (e.g. `TopologyChanged`).  The handler is preserved across
+    /// reconnects and endpoint failovers.
+    pub fn set_notification_handler(&self, handler: Arc<dyn NotificationHandler + Send + Sync>) {
+        *self.notification_handler.write() = Some(handler.clone());
+        let net_client = self.net_client.read().clone();
+        net_client.set_notification_handler(Box::new(ArcNotificationHandler(handler)));
+    }
+
+    /// Re-apply the cached notification handler (if any) to a freshly
+    /// built `PowerFsNetClient`.  Called after every reconnect/failover.
+    fn apply_notification_handler(&self, net_client: &PowerFsNetClient) {
+        if let Some(h) = self.notification_handler.read().clone() {
+            net_client.set_notification_handler(Box::new(ArcNotificationHandler(h)));
         }
     }
 
@@ -342,6 +375,7 @@ impl TlvMasterClient {
             let new = (old + 1) % len;
             let (host, port) = &self.endpoints[new];
             let new_client = Self::build_net_client(host, *port, &self.config);
+            self.apply_notification_handler(&new_client);
             *self.net_client.write() = Arc::new(new_client);
             info!(
                 "TlvMasterClient: advanced to endpoint {}/{} ({}:{})",
@@ -370,6 +404,7 @@ impl TlvMasterClient {
             MasterNetError::ConnectionFailed(format!("reconnect to {}: {}", addr, e))
         })?;
 
+        self.apply_notification_handler(&new_client);
         *self.net_client.write() = Arc::new(new_client);
         *self.leader.write() = Some(addr.to_string());
 

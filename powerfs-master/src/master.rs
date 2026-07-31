@@ -55,8 +55,15 @@ pub struct MasterNode {
     next_volume_id: RwLock<u64>,
     max_file_key: RwLock<u64>,
     heartbeat_tx: mpsc::Sender<NodeId>,
-    client_manager: RwLock<ClientManager>,
+    /// Shared across all clones so that FUSE clients registered via the
+    /// TLV handler are visible to the gRPC monitor/frontend and vice
+    /// versa.
+    client_manager: Arc<RwLock<ClientManager>>,
     notify_tx: mpsc::Sender<VolumeLocationUpdate>,
+    /// Shared `ServerConnectionManager` used to push NOTIFY frames
+    /// (e.g. VolumeLocation updates) to TLV clients.  Set when the net
+    /// server starts; `None` before that.
+    net_manager: Arc<RwLock<Option<Arc<ServerConnectionManager>>>>,
     pub kv_cache: Arc<KVCacheEngine>,
     pub kv_persist: Arc<KVPersistStore>,
     pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
@@ -384,8 +391,9 @@ impl MasterNode {
             next_volume_id: RwLock::new(1),
             max_file_key: RwLock::new(0),
             heartbeat_tx,
-            client_manager: RwLock::new(ClientManager::new()),
+            client_manager: Arc::new(RwLock::new(ClientManager::new())),
             notify_tx,
+            net_manager: Arc::new(RwLock::new(None)),
             kv_cache,
             kv_persist,
             directory_tree: dir_tree,
@@ -407,11 +415,38 @@ impl MasterNode {
         let master_clone = master.clone();
         tokio::spawn(async move {
             while let Some(update) = notify_rx.recv().await {
+                // 1. Push to gRPC KeepConnected streams (legacy path).
                 master_clone
                     .client_manager
                     .read()
                     .unwrap()
                     .broadcast(&update);
+
+                // 2. Push a TopologyChanged NOTIFY to all TLV clients
+                //    (FUSE / kernel FS).  Clients react by re-fetching
+                //    the full topology, which is simpler and more robust
+                //    than shipping volume deltas.
+                let net_mgr_opt = master_clone.net_manager.read().unwrap().clone();
+                if let Some(net_mgr) = net_mgr_opt {
+                    let header = powerfs_net::FrameHeader::new(
+                        powerfs_net::MsgType::TopologyChanged.as_u16(),
+                        powerfs_net::FrameFlags::new(powerfs_net::FrameFlags::NOTIFY),
+                        0,
+                        0,
+                    )
+                    .with_status(powerfs_net::STATUS_OK);
+                    let notify_msg = powerfs_net::NetMessage::new(header);
+                    let n = net_mgr.broadcast_notification(&notify_msg).await;
+                    if n > 0 {
+                        debug!(
+                            "Broadcast TopologyChanged NOTIFY to {} TLV clients (new={}, del={}, leader={})",
+                            n,
+                            update.new_vids.len(),
+                            update.deleted_vids.len(),
+                            update.leader
+                        );
+                    }
+                }
             }
         });
 
@@ -2484,6 +2519,9 @@ impl MasterNode {
 
             // Wrap with ManagedNetHandler for session management + middleware
             let net_manager = Arc::new(ServerConnectionManager::new());
+            // Share the manager so the broadcast task can push NOTIFY
+            // frames (e.g. VolumeLocation updates) to TLV clients.
+            *self.net_manager.write().unwrap() = Some(net_manager.clone());
             let managed_handler = Arc::new(ManagedNetHandler::from_arc(
                 net_manager.clone(),
                 net_handler,
@@ -2575,8 +2613,9 @@ impl Clone for MasterNode {
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),
             max_file_key: RwLock::new(*self.max_file_key.read().unwrap()),
             heartbeat_tx: self.heartbeat_tx.clone(),
-            client_manager: RwLock::new(ClientManager::new()),
+            client_manager: self.client_manager.clone(),
             notify_tx: self.notify_tx.clone(),
+            net_manager: self.net_manager.clone(),
             kv_cache: self.kv_cache.clone(),
             kv_persist: self.kv_persist.clone(),
             directory_tree: self.directory_tree.clone(),

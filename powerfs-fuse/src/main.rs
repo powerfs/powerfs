@@ -118,7 +118,6 @@ fn main() {
         .unwrap_or_else(|| fuse_cfg.replication.clone());
 
     let master_net_port = fuse_cfg.master_net_port;
-    let master_grpc_port = fuse_cfg.master_grpc_port;
     let volume_net_port = fuse_cfg.volume_net_port;
     let volume_addrs = fuse_cfg.volume_addresses.clone();
 
@@ -150,10 +149,6 @@ fn main() {
     }
     if master_net_port == 0 {
         eprintln!("ERROR: fuse.master_net_port must be set");
-        process::exit(1);
-    }
-    if master_grpc_port == 0 {
-        eprintln!("ERROR: fuse.master_grpc_port must be set");
         process::exit(1);
     }
     if volume_net_port == 0 {
@@ -239,7 +234,6 @@ fn main() {
             &collection,
             &replication,
             master_net_port,
-            master_grpc_port,
             volume_net_port,
             volume_addrs,
             filer_addr,

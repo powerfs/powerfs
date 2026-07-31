@@ -163,11 +163,7 @@ pub struct FuseClientFacadeConfig {
     pub request_timeout: Duration,
     /// 客户端身份
     pub client_identity: ClientIdentity,
-    /// Optional Master gRPC endpoint (e.g. "http://172.20.0.11:9333") used by
-    /// the MasterStatsReporter to push ClientStats via KeepConnected. When
-    /// `None`, stats reporting is disabled.
-    pub master_grpc_endpoint: Option<String>,
-    /// Mount point path (reported to master via KeepConnected heartbeat).
+    /// Mount point path (reported to master via TLV KeepConnected heartbeat).
     pub mount_point: String,
     /// Collection name (reported to master via KeepConnected heartbeat).
     pub collection: String,
@@ -214,7 +210,6 @@ impl FuseClientFacadeConfig {
             filer_port,
             request_timeout: Duration::from_secs(5),
             client_identity: ClientIdentity::new(),
-            master_grpc_endpoint: None,
             mount_point: String::new(),
             collection: String::new(),
             replication: String::new(),
@@ -246,7 +241,7 @@ pub struct FuseClientFacade {
     /// 拓扑管理器
     topology_manager: Arc<ClusterTopologyManager>,
     /// Master 客户端
-    master_client: MasterClient,
+    master_client: Arc<MasterClient>,
     /// MetaShard 客户端
     meta_shard_client: MetaShardClient,
     /// Volume 客户端
@@ -272,7 +267,10 @@ impl FuseClientFacade {
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        let master_client = MasterClient::new(master_client_config, topology_manager.clone());
+        let master_client = Arc::new(MasterClient::new(
+            master_client_config,
+            topology_manager.clone(),
+        ));
 
         // 创建 MetaShard 客户端
         let meta_config = MetaShardClientConfig::default();
@@ -307,7 +305,10 @@ impl FuseClientFacade {
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        let master_client = MasterClient::new(master_client_config, topology_manager.clone());
+        let master_client = Arc::new(MasterClient::new(
+            master_client_config,
+            topology_manager.clone(),
+        ));
 
         // 连接 Master
         master_client
@@ -369,37 +370,28 @@ impl FuseClientFacade {
 
         volume_client.init();
 
-        // 启动 Master 统计上报器（KeepConnected 心跳）
-        let stats_reporter = match &config.master_grpc_endpoint {
-            Some(endpoint) if !endpoint.is_empty() => {
-                let reporter_config = crate::stats_reporter::StatsReporterConfig {
-                    master_endpoint: endpoint.clone(),
-                    client_type: "fuse".to_string(),
-                    mount_point: config.mount_point.clone(),
-                    collection: config.collection.clone(),
-                    replication: config.replication.clone(),
-                    host: hostname_or_unknown(),
-                    pid: std::process::id() as u64,
-                    report_interval: Duration::from_secs(5),
-                };
-                let mut reporter = crate::stats_reporter::MasterStatsReporter::new(
-                    reporter_config,
-                    volume_client.clone(),
-                );
-                reporter.start();
-                log::info!(
-                    "FuseClientFacade: MasterStatsReporter started (endpoint={})",
-                    endpoint
-                );
-                Some(reporter)
-            }
-            _ => {
-                log::info!(
-                    "FuseClientFacade: master_grpc_endpoint not set, MasterStatsReporter disabled"
-                );
-                None
-            }
+        // 启动 Master 统计上报器（TLV KeepConnected 心跳 + 拓扑变更通知）
+        let reporter_config = crate::stats_reporter::StatsReporterConfig {
+            client_id: config.client_identity.client_id.to_string(),
+            client_type: "fuse".to_string(),
+            mount_point: config.mount_point.clone(),
+            collection: config.collection.clone(),
+            replication: config.replication.clone(),
+            host: hostname_or_unknown(),
+            pid: std::process::id() as u64,
+            report_interval: Duration::from_secs(5),
         };
+        let mut reporter = crate::stats_reporter::MasterStatsReporter::new(
+            reporter_config,
+            master_client.clone(),
+            topology_manager.clone(),
+        );
+        reporter.start();
+        log::info!(
+            "FuseClientFacade: MasterStatsReporter started (TLV KeepConnected, client_id={})",
+            config.client_identity.client_id
+        );
+        let stats_reporter = Some(reporter);
 
         let facade = Self {
             config,
@@ -418,7 +410,7 @@ impl FuseClientFacade {
     }
 
     /// 获取 Master 客户端引用
-    pub fn master_client(&self) -> &MasterClient {
+    pub fn master_client(&self) -> &Arc<MasterClient> {
         &self.master_client
     }
 
@@ -815,15 +807,6 @@ impl SyncFuseClientFacade {
                     Ok(addr)
                 }
             })
-    }
-
-    /// Location -> URL 字符串转换
-    pub fn location_to_grpc_addr(loc: &powerfs_common::traits::Location) -> String {
-        if loc.url.is_empty() {
-            String::new()
-        } else {
-            loc.url.clone()
-        }
     }
 
     // ======= 便捷同步方法（供 fuse.rs 使用）=======

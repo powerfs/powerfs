@@ -346,6 +346,76 @@ impl MasterNetHandler {
         ))
     }
 
+    /// Handle KeepConnected request from a TLV FUSE/kernel client.
+    ///
+    /// This is the TLV equivalent of the gRPC `keep_connected` bidi
+    /// stream's inbound `KeepConnectedRequest`.  The client periodically
+    /// sends this message to (a) register itself with the Master and
+    /// (b) refresh its heartbeat/stats.  Topology updates are pushed
+    /// back asynchronously via `TopologyChanged` NOTIFY frames, so this
+    /// method only needs to return the current leader.
+    async fn handle_keep_connected(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let client_id = dec.next_string(FieldId::ClientUuid).unwrap_or_default();
+        let client_type = dec
+            .next_string(FieldId::Backend)
+            .unwrap_or_else(|_| "fuse".to_string());
+        let mount_point = dec.next_string(FieldId::Name).unwrap_or_default();
+        let collection = dec.next_string(FieldId::Collection).unwrap_or_default();
+        let replication = dec.next_string(FieldId::Replication).unwrap_or_default();
+        let host = dec.next_string(FieldId::Owner).unwrap_or_default();
+        let pid = dec.next_u64(FieldId::Limit).unwrap_or(0);
+
+        if client_id.is_empty() {
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let fuse_info = crate::master::FuseClientInfo {
+            client_id: client_id.clone(),
+            client_type,
+            mount_point,
+            collection,
+            replication,
+            host,
+            pid,
+            connected_at: now,
+            last_heartbeat: now,
+            dirty_chunks: 0,
+            dirty_bytes: 0,
+            stats: None,
+        };
+        self.master.register_fuse_client(fuse_info);
+
+        debug!(
+            "NET_KEEP_CONNECTED: registered/refreshed fuse client {}",
+            client_id
+        );
+
+        let leader = self.master.get_leader().await;
+        let mut enc = TlvEncoder::new();
+        enc.add_string(FieldId::Owner, &leader)?;
+
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
+
     /// Handle Lookup request (metadata lookup)
     async fn handle_lookup(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -953,6 +1023,7 @@ impl PowerFsNetHandler for MasterNetHandler {
             MsgType::Assign => self.handle_assign(msg).await,
             MsgType::LookupVolume => self.handle_lookup_volume(msg).await,
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
+            MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,
@@ -1010,6 +1081,7 @@ impl ServerRequestHandler for MasterNetHandler {
             MsgType::Assign => self.handle_assign(msg).await,
             MsgType::LookupVolume => self.handle_lookup_volume(msg).await,
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
+            MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::Lookup => self.handle_lookup(msg).await,
             MsgType::Create => self.handle_create(msg).await,
             MsgType::Mkdir => self.handle_mkdir(msg).await,

@@ -112,8 +112,6 @@ pub struct FuseConfig {
     pub volume_addresses: Vec<String>,
     /// Master net端口 - 必须配置
     pub master_net_port: u16,
-    /// Master gRPC端口 - 必须配置（用于 KeepConnected 心跳上报）
-    pub master_grpc_port: u16,
     /// Volume net端口 - 必须配置
     pub volume_net_port: u16,
     /// Filer net端口 - 必须配置
@@ -331,11 +329,6 @@ impl PowerFsConfig {
                 "fuse.master_net_port must be set (> 0)".to_string(),
             ));
         }
-        if self.fuse.master_grpc_port == 0 {
-            return Err(ConfigError::ValidationError(
-                "fuse.master_grpc_port must be set (> 0)".to_string(),
-            ));
-        }
         if self.fuse.volume_net_port == 0 {
             return Err(ConfigError::ValidationError(
                 "fuse.volume_net_port must be set (> 0)".to_string(),
@@ -428,7 +421,6 @@ master_addresses = ["172.20.0.11"]          # (必填)
 filer_addresses = ["172.20.0.35"]           # (必填)
 volume_addresses = ["172.20.0.21", "172.20.0.22", "172.20.0.23"]  # (必填)
 master_net_port = 9334                       # (必填)
-master_grpc_port = 9333                      # (必填，Master gRPC端口，用于KeepConnected心跳上报)
 volume_net_port = 8901                       # (必填)
 filer_net_port = 9334                        # (必填)
 collection = "default"

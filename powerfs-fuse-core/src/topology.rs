@@ -438,6 +438,48 @@ impl MasterClient {
         self.topology_manager.update_topology(topology);
     }
 
+    /// Install a handler for server-pushed `NOTIFY` frames (e.g.
+    /// `TopologyChanged`).  Delegated to [`TlvMasterClient`], which
+    /// preserves the handler across reconnects.
+    pub fn set_notification_handler(
+        &self,
+        handler: Arc<dyn net::NotificationHandler + Send + Sync>,
+    ) {
+        self.tlv_client.set_notification_handler(handler);
+    }
+
+    /// Send a `KeepConnected` heartbeat to Master, (re)registering this
+    /// FUSE/kernel client and refreshing its heartbeat timestamp.
+    ///
+    /// Topology updates are delivered asynchronously via `TopologyChanged`
+    /// NOTIFY frames (see [`Self::set_notification_handler`]); this method
+    /// only needs to carry the client identity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_keep_connected(
+        &self,
+        client_id: &str,
+        client_type: &str,
+        mount_point: &str,
+        collection: &str,
+        replication: &str,
+        host: &str,
+        pid: u64,
+    ) -> Result<(), MasterClientError> {
+        let mut enc = net::TlvEncoder::new();
+        let _ = enc.add_string(net::FieldId::ClientUuid, client_id);
+        let _ = enc.add_string(net::FieldId::Backend, client_type);
+        let _ = enc.add_string(net::FieldId::Name, mount_point);
+        let _ = enc.add_string(net::FieldId::Collection, collection);
+        let _ = enc.add_string(net::FieldId::Replication, replication);
+        let _ = enc.add_string(net::FieldId::Owner, host);
+        let _ = enc.add_u64(net::FieldId::Limit, pid);
+        let payload = enc.into_bytes();
+
+        self.submit_request(net::MsgType::KeepConnected, &payload)
+            .await?;
+        Ok(())
+    }
+
     /// 断开连接
     pub fn disconnect(&self) {
         *self.state.lock().unwrap() = MasterClientState::Disconnected;
