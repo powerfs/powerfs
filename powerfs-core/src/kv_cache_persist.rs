@@ -151,6 +151,10 @@ pub struct SessionMeta {
     pub dtype: String,
     pub block_ids: Vec<u64>,
     pub ttl_seconds: u64,
+    /// Collection this session's blocks belong to. Missing/empty for old
+    /// records is treated as "default" on restore.
+    #[serde(default)]
+    pub collection: String,
 }
 
 impl SessionMeta {
@@ -181,6 +185,7 @@ impl PersistentKVCache {
         head_dim: u32,
         dtype: KVDtype,
         ttl_seconds: u64,
+        collection: &str,
     ) -> Result<(), String> {
         self.engine.create_session(
             session_id,
@@ -192,6 +197,7 @@ impl PersistentKVCache {
             head_dim,
             dtype,
             ttl_seconds,
+            collection,
         )?;
 
         let meta = SessionMeta {
@@ -203,6 +209,7 @@ impl PersistentKVCache {
             dtype: dtype.as_str().to_string(),
             block_ids: Vec::new(),
             ttl_seconds,
+            collection: collection.to_string(),
         };
         self.store.save_session(session_id, &meta)?;
 

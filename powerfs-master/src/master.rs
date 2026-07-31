@@ -494,6 +494,7 @@ impl MasterNode {
                         meta.head_dim,
                         dtype,
                         meta.ttl_seconds,
+                        &meta.collection,
                     );
                     for block_id in &meta.block_ids {
                         if let Ok(Some(fid)) = kv_persist.load_block_fid(*block_id) {

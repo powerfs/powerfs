@@ -39,7 +39,18 @@ fn put_block_helper(
 fn test_create_delete_session() {
     let engine = make_engine(10);
     assert!(engine
-        .create_session("s1", "", "", "llama-7b", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama-7b",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default"
+        )
         .is_ok());
 
     let sess = engine.get_session("s1").unwrap();
@@ -55,10 +66,21 @@ fn test_create_delete_session() {
 fn test_create_duplicate_session_fails() {
     let engine = make_engine(10);
     assert!(engine
-        .create_session("s1", "", "", "model-a", 1, 1, 1, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "model-a",
+            1,
+            1,
+            1,
+            KVDtype::FP16,
+            0,
+            "default"
+        )
         .is_ok());
     assert!(engine
-        .create_session("s1", "", "", "model-b", 2, 2, 2, KVDtype::FP8, 0)
+        .create_session("s1", "", "", "model-b", 2, 2, 2, KVDtype::FP8, 0, "default")
         .is_err());
 }
 
@@ -66,7 +88,18 @@ fn test_create_duplicate_session_fails() {
 fn test_put_get_block() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -93,7 +126,18 @@ fn test_put_block_without_session_fails() {
 fn test_batch_put_get() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data1 = make_data(512);
@@ -139,7 +183,18 @@ fn test_batch_put_get() {
 fn test_lru_eviction() {
     let engine = make_engine(5); // 5MB limit, 1MB blocks
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024 * 1024); // 1MB
@@ -166,7 +221,18 @@ fn test_lru_eviction() {
 fn test_stats_counter() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -188,7 +254,18 @@ fn test_stats_counter() {
 fn test_session_block_list() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(100);
@@ -204,13 +281,35 @@ fn test_session_block_list() {
 fn test_list_sessions() {
     let engine = make_engine(10);
     engine
-        .create_session("alpha-1", "", "", "m1", 1, 1, 1, KVDtype::FP16, 0)
+        .create_session(
+            "alpha-1",
+            "",
+            "",
+            "m1",
+            1,
+            1,
+            1,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
     engine
-        .create_session("alpha-2", "", "", "m2", 1, 1, 1, KVDtype::FP16, 0)
+        .create_session(
+            "alpha-2",
+            "",
+            "",
+            "m2",
+            1,
+            1,
+            1,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
     engine
-        .create_session("beta-1", "", "", "m3", 1, 1, 1, KVDtype::FP16, 0)
+        .create_session("beta-1", "", "", "m3", 1, 1, 1, KVDtype::FP16, 0, "default")
         .unwrap();
 
     let (ids, total) = engine.list_sessions(100, "");
@@ -230,7 +329,18 @@ fn test_list_sessions() {
 fn test_concurrent_access() {
     let engine = Arc::new(make_engine(50));
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = Arc::new(make_data(4096));
@@ -286,7 +396,18 @@ fn test_dtype_from_str() {
 fn test_ttl_expiry() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 1)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            1,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -306,7 +427,18 @@ fn test_ttl_expiry() {
 fn test_block_meta_fid_field() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -323,7 +455,18 @@ fn test_block_meta_fid_field() {
 fn test_block_meta_index_field() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -349,7 +492,18 @@ fn test_block_meta_index_field() {
 fn test_block_id_mapping_add_get() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -365,7 +519,18 @@ fn test_block_id_mapping_add_get() {
 fn test_block_id_mapping_remove() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -383,7 +548,18 @@ fn test_block_id_mapping_remove() {
 fn test_block_id_mapping_persistence() {
     let engine = make_engine(10);
     engine
-        .create_session("s1", "", "", "llama", 32, 32, 128, KVDtype::FP16, 0)
+        .create_session(
+            "s1",
+            "",
+            "",
+            "llama",
+            32,
+            32,
+            128,
+            KVDtype::FP16,
+            0,
+            "default",
+        )
         .unwrap();
 
     let data = make_data(1024);
@@ -396,4 +572,26 @@ fn test_block_id_mapping_persistence() {
     engine.delete_session("s1").unwrap();
 
     assert!(engine.get_fid_by_block_id(block_id).is_none());
+}
+
+#[test]
+fn test_session_collection_stored() {
+    let engine = make_engine(10);
+
+    // Empty collection is stored verbatim (service layer normalizes to "default").
+    assert!(engine
+        .create_session("s1", "", "", "m", 1, 1, 1, KVDtype::FP16, 0, "")
+        .is_ok());
+    assert_eq!(engine.get_session("s1").unwrap().collection, "");
+
+    // Custom collection is persisted on the session.
+    assert!(engine
+        .create_session("s2", "", "", "m", 1, 1, 1, KVDtype::FP16, 0, "ml-cache")
+        .is_ok());
+    let sess = engine.get_session("s2").unwrap();
+    assert_eq!(sess.collection, "ml-cache");
+    assert_ne!(
+        sess.collection,
+        engine.get_session("s1").unwrap().collection
+    );
 }

@@ -49,6 +49,7 @@ impl KvCacheClient {
             ttl_seconds,
             owner_id: "".to_string(),
             namespace_id: "".to_string(),
+            collection: String::new(),
         };
 
         let resp = self.client.create_session(req).await?.into_inner();

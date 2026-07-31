@@ -1013,6 +1013,7 @@ message CreateSessionRequest {
     uint64 ttl_seconds = 7;
     string owner_id = 8;
     string namespace_id = 9;
+    string collection = 10;
 }
 
 message CreateSessionResponse {

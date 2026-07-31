@@ -67,10 +67,16 @@ impl KvCacheService for KvCacheServiceImpl {
             req.head_dim,
             dtype,
             req.ttl_seconds,
+            &req.collection,
         );
 
         match result {
             Ok(()) => {
+                let collection = if req.collection.is_empty() {
+                    "default".to_string()
+                } else {
+                    req.collection.clone()
+                };
                 let meta = powerfs_core::kv_cache_persist::SessionMeta {
                     session_id: req.session_id.clone(),
                     model_name: req.model_name.clone(),
@@ -80,6 +86,7 @@ impl KvCacheService for KvCacheServiceImpl {
                     dtype: dtype.as_str().to_string(),
                     block_ids: Vec::new(),
                     ttl_seconds: req.ttl_seconds,
+                    collection,
                 };
                 let _ = self.master.kv_persist.save_session(&req.session_id, &meta);
 
@@ -170,7 +177,21 @@ impl KvCacheService for KvCacheServiceImpl {
             }));
         }
 
-        let (fid, nodes) = match self.master.assign_volume("001", "default").await {
+        // Use the session's collection so KV blocks land in the same volume
+        // pool as FUSE/S3 data for that collection.
+        let collection = self
+            .engine
+            .get_session(&req.session_id)
+            .map(|s| {
+                if s.collection.is_empty() {
+                    "default".to_string()
+                } else {
+                    s.collection.clone()
+                }
+            })
+            .unwrap_or_else(|| "default".to_string());
+
+        let (fid, nodes) = match self.master.assign_volume("001", &collection).await {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Response::new(PutBlockResponse {

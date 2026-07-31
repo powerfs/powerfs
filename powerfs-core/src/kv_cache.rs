@@ -119,6 +119,8 @@ pub struct KVSession {
     pub last_accessed: u64,
     pub block_ids: Vec<u64>,
     pub ttl: Option<u64>,
+    /// Collection this session's blocks are stored in. Empty means "default".
+    pub collection: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -273,6 +275,7 @@ impl KVCacheEngine {
         head_dim: u32,
         dtype: KVDtype,
         ttl_seconds: u64,
+        collection: &str,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.write().unwrap();
         if sessions.contains_key(session_id) {
@@ -302,6 +305,7 @@ impl KVCacheEngine {
             last_accessed: now,
             block_ids: Vec::new(),
             ttl,
+            collection: collection.to_string(),
         };
 
         sessions.insert(session_id.to_string(), session);

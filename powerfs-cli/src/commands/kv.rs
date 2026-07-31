@@ -145,6 +145,7 @@ async fn kv_session(mut client: KvCacheClient, args: KvSessionArgs) -> super::Co
                 ttl_seconds,
                 owner_id: owner_id.unwrap_or_default(),
                 namespace_id: namespace_id.unwrap_or_default(),
+                collection: String::new(),
             };
 
             let resp = svc.create_session(req).await.map_err(|e| {

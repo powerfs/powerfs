@@ -11,7 +11,7 @@
 | 2 | Volume 创建支持 collection 参数 | P0 | ✅ Done | feat: volume create accepts collection param |
 | 3 | Volume 分配模式 Auto/Manual/Hybrid | P0 | ✅ Done | feat: collection volume allocation modes |
 | 4 | S3 接口支持 collection | P0 | ✅ Done | feat: step 4 S3 support for collection |
-| 5 | KV 接口支持 collection | P1 | ⏳ Pending | - |
+| 5 | KV 接口支持 collection | P1 | ✅ Done | feat: step 5 KV support for collection |
 | 6 | 前端 Collection 管理页面 | P1 | ⏳ Pending | - |
 | 7 | CLI Collection 管理命令 | P1 | ⏳ Pending | - |
 
@@ -89,9 +89,25 @@
 
 ---
 
-## Step 5: KV 接口支持 collection ⏳
+## Step 5: KV 接口支持 collection ✅
 
 **目标**: KV Session 关联 collection，put_block 使用 session 的 collection 分配 Volume。
+
+**改动范围**:
+- `powerfs-master/proto/master.proto`: `CreateSessionRequest` 增加 `collection` 字段 (field 10)
+- `powerfs-core/src/kv_cache.rs`: `KVSession` 增加 `collection` 字段；`create_session` 增加 `collection` 参数
+- `powerfs-core/src/kv_cache_persist.rs`: `SessionMeta` 增加 `collection` 字段（`#[serde(default)]` 兼容旧记录）；`PersistentKVCache::create_session` 透传 collection
+- `powerfs-master/src/kv_cache_service.rs`: `create_session` 将 collection 传给 engine 并归一化后存入 SessionMeta；`put_block` 改用 session 的 collection 调用 `assign_volume`（替代硬编码 "default"）
+- `powerfs-master/src/master.rs`: `restore_kv_sessions` 恢复时传入 `meta.collection`
+- `powerfs-kv-client/src/client.rs`、`powerfs-cli/src/commands/kv.rs`: 适配 proto 新字段
+- `powerfs-core/tests/kv_cache_test.rs`: 适配新签名并新增 `test_session_collection_stored` 测试
+
+**验证**:
+- `cargo fmt` / `cargo build --workspace` 通过
+- `cargo clippy --workspace --all-targets` 无新增 warning（仅 2 个预存 warning 在未改动文件中）
+- `cargo test -p powerfs-core --lib`: 43 测试通过
+- `cargo test -p powerfs-core --test kv_cache_test`: 18 测试通过（含新增 collection 测试）
+- `cargo test -p powerfs-master --lib`: 85 测试通过
 
 ---
 
