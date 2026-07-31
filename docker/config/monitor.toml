@@ -62,3 +62,9 @@ s3_backend_endpoint = "http://172.30.0.32:9000"
 # Note: master_endpoint should be IP:PORT without protocol prefix
 # KvCacheClient adds http:// prefix automatically
 master_endpoint = "172.30.0.11:9333"
+# All master gRPC endpoints for resilient client (leader discovery + failover)
+master_endpoints = [
+    "172.30.0.11:9333",
+    "172.30.0.12:9333",
+    "172.30.0.13:9333",
+]

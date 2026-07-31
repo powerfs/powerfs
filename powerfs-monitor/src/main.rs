@@ -22,7 +22,6 @@ use tower_http::cors::CorsLayer;
 
 use powerfs_common::config::PowerFsConfig;
 use powerfs_kv_client::KvCacheClient;
-use powerfs_master::proto::powerfs::master_service_client::MasterServiceClient;
 use powerfs_master::proto::powerfs::{
     AutoResolveConflictsRequest, BatchIgnoreConflictsRequest, BatchResolveConflictsRequest,
     GetConflictStatsRequest, GetConflictsRequest, ResolveConflictRequest,
@@ -37,6 +36,7 @@ use powerfs_monitor::auth::{
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
 use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, VolumeInfo};
+use powerfs_monitor::resilient_master_client;
 use powerfs_monitor::time_series::{DataPoint, TimeSeriesStore};
 
 #[derive(Parser, Debug)]
@@ -144,8 +144,8 @@ struct AppState {
     rate_limiter: Arc<RateLimiter>,
     /// KV Cache 客户端
     kv_client: Arc<Mutex<KvCacheClient>>,
-    /// Master gRPC 客户端
-    master_client: Arc<Mutex<MasterServiceClient<tonic::transport::Channel>>>,
+    /// Master gRPC 客户端 (resilient, 支持 leader 发现和 failover)
+    master_client: resilient_master_client::SharedMasterClient,
     /// Time-series store for capacity planning
     time_series: Arc<TimeSeriesStore>,
 }
@@ -552,10 +552,19 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
 }
 
 async fn get_filers_via_grpc(state: &Arc<AppState>) -> Result<Vec<FilerNodeInfo>, String> {
-    let mut client = state.master_client.lock().await;
     let request = powerfs_master::proto::powerfs::ListFilersRequest {};
 
-    match client.list_filers(tonic::Request::new(request)).await {
+    match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
         Ok(response) => {
             let resp = response.into_inner();
             Ok(resp
@@ -653,12 +662,21 @@ async fn transfer_leader(
     );
 
     // 通过 gRPC 调用 master 的 transfer_leader 接口
-    let mut client = state.master_client.lock().await;
     let request = powerfs_master::proto::powerfs::TransferLeaderRequest {
         target_node_id: req.target_node_id,
     };
 
-    match client.transfer_leader(tonic::Request::new(request)).await {
+    match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.transfer_leader(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
         Ok(response) => {
             let resp = response.into_inner();
             if resp.success {
@@ -718,11 +736,16 @@ struct CreateCollectionBody {
 async fn list_collections(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<Vec<CollectionDetail>>> {
-    let mut client = state.master_client.lock().await;
-    match client
-        .list_collections(tonic::Request::new(
-            powerfs_master::proto::powerfs::ListCollectionsRequest {},
-        ))
+    match state
+        .master_client
+        .call(|client| async move {
+            let mut client = client;
+            client
+                .list_collections(tonic::Request::new(
+                    powerfs_master::proto::powerfs::ListCollectionsRequest {},
+                ))
+                .await
+        })
         .await
     {
         Ok(resp) => {
@@ -742,11 +765,19 @@ async fn get_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Json<ApiResponse<CollectionDetail>> {
-    let mut client = state.master_client.lock().await;
-    match client
-        .get_collection(tonic::Request::new(
-            powerfs_master::proto::powerfs::GetCollectionRequest { name },
-        ))
+    match state
+        .master_client
+        .call(|client| {
+            let name = name.clone();
+            async move {
+                let mut client = client;
+                client
+                    .get_collection(tonic::Request::new(
+                        powerfs_master::proto::powerfs::GetCollectionRequest { name },
+                    ))
+                    .await
+            }
+        })
         .await
     {
         Ok(resp) => {
@@ -772,7 +803,6 @@ async fn create_collection(
     if !user.is_admin() {
         return Json(ApiResponse::error("Permission denied: admin only"));
     }
-    let mut client = state.master_client.lock().await;
     let request = powerfs_master::proto::powerfs::CreateCollectionRequest {
         name: req.name,
         replication: req.replication.unwrap_or_else(|| "001".to_string()),
@@ -780,7 +810,17 @@ async fn create_collection(
         disk_type: req.disk_type.unwrap_or_else(|| "hdd".to_string()),
         max_volume_count: req.max_volume_count.unwrap_or(0),
     };
-    match client.create_collection(tonic::Request::new(request)).await {
+    match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.create_collection(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
         Ok(resp) => {
             let inner = resp.into_inner();
             if inner.success {
@@ -804,11 +844,19 @@ async fn delete_collection(
     if !user.is_admin() {
         return Json(ApiResponse::error("Permission denied: admin only"));
     }
-    let mut client = state.master_client.lock().await;
-    match client
-        .delete_collection(tonic::Request::new(
-            powerfs_master::proto::powerfs::DeleteCollectionRequest { name },
-        ))
+    match state
+        .master_client
+        .call(|client| {
+            let name = name.clone();
+            async move {
+                let mut client = client;
+                client
+                    .delete_collection(tonic::Request::new(
+                        powerfs_master::proto::powerfs::DeleteCollectionRequest { name },
+                    ))
+                    .await
+            }
+        })
         .await
     {
         Ok(resp) => {
@@ -1455,11 +1503,14 @@ async fn get_fuse_mounts(State(state): State<Arc<AppState>>) -> Json<ApiResponse
 
     match state
         .master_client
-        .lock()
-        .await
-        .get_fuse_clients(tonic::Request::new(
-            powerfs_master::proto::powerfs::FuseClientsRequest {},
-        ))
+        .call(|client| async move {
+            let mut client = client;
+            client
+                .get_fuse_clients(tonic::Request::new(
+                    powerfs_master::proto::powerfs::FuseClientsRequest {},
+                ))
+                .await
+        })
         .await
     {
         Ok(response) => {
@@ -1633,11 +1684,14 @@ async fn get_fuse_client_stats(
 ) -> Json<ApiResponse<ClientStatsResponse>> {
     let resp = state
         .master_client
-        .lock()
-        .await
-        .get_fuse_clients(tonic::Request::new(
-            powerfs_master::proto::powerfs::FuseClientsRequest {},
-        ))
+        .call(|client| async move {
+            let mut client = client;
+            client
+                .get_fuse_clients(tonic::Request::new(
+                    powerfs_master::proto::powerfs::FuseClientsRequest {},
+                ))
+                .await
+        })
         .await;
 
     let clients = match resp {
@@ -1702,9 +1756,13 @@ async fn list_conflicts(
 
     match state
         .master_client
-        .lock()
-        .await
-        .get_conflicts(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.get_conflicts(tonic::Request::new(request)).await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -1775,9 +1833,13 @@ async fn resolve_conflict_handler(
     };
     match state
         .master_client
-        .lock()
-        .await
-        .resolve_conflict(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.resolve_conflict(tonic::Request::new(request)).await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -1813,9 +1875,15 @@ async fn auto_resolve_conflicts_handler(
     };
     match state
         .master_client
-        .lock()
-        .await
-        .auto_resolve_conflicts(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client
+                    .auto_resolve_conflicts(tonic::Request::new(request))
+                    .await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -1848,9 +1916,15 @@ async fn get_conflict_stats_handler(
     };
     match state
         .master_client
-        .lock()
-        .await
-        .get_conflict_stats(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client
+                    .get_conflict_stats(tonic::Request::new(request))
+                    .await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -1916,9 +1990,15 @@ async fn batch_resolve_conflicts_handler(
     };
     match state
         .master_client
-        .lock()
-        .await
-        .batch_resolve_conflicts(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client
+                    .batch_resolve_conflicts(tonic::Request::new(request))
+                    .await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -1951,9 +2031,15 @@ async fn batch_ignore_conflicts_handler(
     };
     match state
         .master_client
-        .lock()
-        .await
-        .batch_ignore_conflicts(tonic::Request::new(request))
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client
+                    .batch_ignore_conflicts(tonic::Request::new(request))
+                    .await
+            }
+        })
         .await
     {
         Ok(response) => {
@@ -2338,9 +2424,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             match state
                 .master_client
-                .lock()
-                .await
-                .create_entry(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.create_entry(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 Ok(_) => success_count += 1,
@@ -2377,9 +2467,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             match state
                 .master_client
-                .lock()
-                .await
-                .create_entry(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.create_entry(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 Ok(response) => {
@@ -2411,9 +2505,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             match state
                 .master_client
-                .lock()
-                .await
-                .get_entry(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.get_entry(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 Ok(_) => success_count += 1,
@@ -2441,9 +2539,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             match state
                 .master_client
-                .lock()
-                .await
-                .list_entries(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.list_entries(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 Ok(_) => success_count += 1,
@@ -2475,9 +2577,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             match state
                 .master_client
-                .lock()
-                .await
-                .delete_entry(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.delete_entry(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 Ok(_) => success_count += 1,
@@ -2502,9 +2608,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
             };
             if let Ok(response) = state
                 .master_client
-                .lock()
-                .await
-                .get_entry(tonic::Request::new(request))
+                .call(|client| {
+                    let request = request.clone();
+                    async move {
+                        let mut client = client;
+                        client.get_entry(tonic::Request::new(request)).await
+                    }
+                })
                 .await
             {
                 let inner = response.into_inner();
@@ -2520,9 +2630,13 @@ async fn run_metadata_benchmark(state: Arc<AppState>, config: &BenchmarkConfig) 
                     };
                     let _ = state
                         .master_client
-                        .lock()
-                        .await
-                        .delete_entry(tonic::Request::new(request))
+                        .call(|client| {
+                            let request = request.clone();
+                            async move {
+                                let mut client = client;
+                                client.delete_entry(tonic::Request::new(request)).await
+                            }
+                        })
                         .await;
                 }
             }
@@ -4098,14 +4212,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // KvCacheClient::connect handles http:// prefix automatically
     let kv_client = Arc::new(Mutex::new(KvCacheClient::connect(&master_endpoint).await?));
 
-    // Master gRPC client - ensure endpoint has http:// prefix
-    let master_addr =
-        if master_endpoint.starts_with("http://") || master_endpoint.starts_with("https://") {
-            master_endpoint.clone()
-        } else {
-            format!("http://{}", master_endpoint)
-        };
-    let master_client = Arc::new(Mutex::new(MasterServiceClient::connect(master_addr).await?));
+    // Master gRPC client — resilient client that supports multiple
+    // endpoints with automatic leader discovery and failover.  When
+    // `master_endpoints` is configured, all listed masters are used;
+    // otherwise we fall back to the single `master_endpoint`.
+    let master_endpoints: Vec<String> = if !monitor_cfg.master_endpoints.is_empty() {
+        monitor_cfg.master_endpoints.clone()
+    } else {
+        vec![master_endpoint.clone()]
+    };
+    let master_client = Arc::new(
+        resilient_master_client::ResilientMasterClient::new(master_endpoints)
+            .map_err(|e| format!("Failed to init master client: {}", e))?,
+    );
 
     let s3_access_key = args
         .s3_access_key

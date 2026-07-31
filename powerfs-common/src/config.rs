@@ -88,8 +88,12 @@ pub struct FilerConfig {
 pub struct S3Config {
     /// 服务端口 - 必须配置
     pub port: u16,
-    /// Master地址 - 必须配置
+    /// Master地址 - 必须配置（向后兼容；当 master_endpoints 为空时使用此地址）
     pub master_address: String,
+    /// 所有 master gRPC 端点列表，用于 leader 发现和 failover。
+    /// 为空时回退到 master_address 单点模式。
+    #[serde(default)]
+    pub master_endpoints: Vec<String>,
     pub ip: Option<String>,
     pub dir: String,
     pub access_key: String,
@@ -131,6 +135,10 @@ pub struct MonitorConfig {
     pub s3_endpoint: String,
     pub s3_backend_endpoint: String,
     pub master_endpoint: String,
+    /// 所有 master gRPC 端点列表，用于 leader 发现和 failover。
+    /// 为空时回退到 master_endpoint 单点模式。
+    #[serde(default)]
+    pub master_endpoints: Vec<String>,
 }
 
 impl PowerFsConfig {
@@ -408,6 +416,8 @@ raft_peers = []
 [s3]
 port = 9000              # 服务端口 (必填)
 master_address = "172.20.0.11:9333"
+# 所有 master gRPC 端点，用于 leader 发现和 failover（为空时回退到 master_address）
+master_endpoints = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
 dir = "./data/s3"
 access_key = "powerfs"
 secret_key = "powerfs123"

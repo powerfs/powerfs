@@ -152,8 +152,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         ));
     }
 
-    let master_addr = master_addresses.first().unwrap().clone();
-    let master_client = Arc::new(S3MasterClient::new(&master_addr));
+    info!("Filer master endpoints: {:?}", master_addresses);
+    let master_client = Arc::new(S3MasterClient::new(master_addresses.clone())?);
     let master_api = Arc::new(MasterApi::Remote(master_client));
 
     let bucket_manager = Arc::new(BucketManager::new(metadata_store.clone(), master_api));

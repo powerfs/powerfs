@@ -12,6 +12,7 @@ pub mod raft_client;
 pub mod raft_node;
 pub mod raft_server;
 pub mod raft_storage;
+pub mod resilient_client;
 pub mod s3;
 pub mod server;
 pub mod tracking_allocator;

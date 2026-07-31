@@ -34,7 +34,8 @@ raft_peers = []
 
 [s3]
 port = 9000                     # 服务端口 (必填)
-master_address = "172.30.0.11:9333"  # Master地址 (必填)
+master_address = "172.30.0.11:9333"  # Master地址 (必填，向后兼容)
+master_endpoints = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]  # 所有 master 端点，用于 leader 发现和 failover
 dir = "/data/s3"
 access_key = "powerfs"
 secret_key = "powerfs123"

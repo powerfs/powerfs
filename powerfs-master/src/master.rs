@@ -544,6 +544,37 @@ impl MasterNode {
         convert_to_net_addr(&self.raft_address)
     }
 
+    /// Returns the leader's gRPC address (`host:grpc_port`).
+    ///
+    /// Unlike `get_leader()` which returns the net (powerfs-net) port for
+    /// FUSE clients, this method returns the gRPC port so that intra-cluster
+    /// gRPC forwarding (e.g. `get_leader_client`) connects to the right
+    /// service. All master nodes share the same port layout, so we reuse
+    /// `self.address.port()` (the local gRPC port) when rebuilding the
+    /// leader address.
+    pub async fn get_leader_grpc_addr(&self) -> String {
+        let leader = self.leader_address.read().unwrap().clone();
+        let grpc_port = self.address.port();
+        let convert_to_grpc_addr = |addr: &str| -> String {
+            if let Some(host) = addr.split(':').next() {
+                format!("{}:{}", host, grpc_port)
+            } else {
+                addr.to_string()
+            }
+        };
+
+        if !leader.is_empty() {
+            return convert_to_grpc_addr(&leader);
+        }
+        if self.is_leader.load(Ordering::Relaxed) {
+            return convert_to_grpc_addr(&self.raft_address);
+        }
+        if let Some(first_peer) = self.peers.first() {
+            return convert_to_grpc_addr(&first_peer.address);
+        }
+        convert_to_grpc_addr(&self.raft_address)
+    }
+
     pub fn set_leader(&self, leader_addr: String) {
         *self.leader_address.write().unwrap() = leader_addr;
     }

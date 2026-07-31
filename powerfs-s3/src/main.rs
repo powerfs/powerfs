@@ -67,12 +67,22 @@ async fn run_s3(cfg: PowerFsConfig) -> Result<()> {
         ));
     }
 
+    // Build the list of master endpoints for resilient client (leader discovery
+    // + failover).  Fall back to [master_address] when master_endpoints is not
+    // configured so that single-master setups keep working.
+    let master_endpoints: Vec<String> = if s3_cfg.master_endpoints.is_empty() {
+        vec![master_addr.clone()]
+    } else {
+        s3_cfg.master_endpoints.clone()
+    };
+    info!("S3 master endpoints: {:?}", master_endpoints);
+
     let directory_tree: Arc<dyn DirectoryTreeApi> =
-        Arc::new(RemoteDirectoryTree::new(&master_addr));
+        Arc::new(RemoteDirectoryTree::new(master_endpoints.clone())?);
 
     let master_api = Arc::new(MasterApi::Remote(Arc::new(S3MasterClient::new(
-        &master_addr,
-    ))));
+        master_endpoints,
+    )?)));
 
     let volume_client_pool = Arc::new(VolumeClientPool::new());
     let lock_manager = Arc::new(LockManager::new());

@@ -8,29 +8,23 @@ use log::{debug, info, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::StreamExt;
-use tonic::{transport::Channel, transport::Server, Request, Response, Status, Streaming};
+use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 pub struct MasterGrpcServer {
     master: Arc<MasterNode>,
     kv_cache: Arc<KVCacheEngine>,
-    leader_channels: Arc<tokio::sync::RwLock<HashMap<String, Channel>>>,
 }
 
 impl MasterGrpcServer {
     pub fn new(master: Arc<MasterNode>, kv_cache: Arc<KVCacheEngine>) -> Self {
-        MasterGrpcServer {
-            master,
-            kv_cache,
-            leader_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }
+        MasterGrpcServer { master, kv_cache }
     }
 
     pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
@@ -51,53 +45,6 @@ impl MasterGrpcServer {
             .serve(addr)
             .await?;
         Ok(())
-    }
-
-    async fn get_leader_client(
-        &self,
-    ) -> Option<crate::proto::powerfs::master_service_client::MasterServiceClient<Channel>> {
-        let leader = self.master.get_leader().await;
-        if leader.is_empty() {
-            return None;
-        }
-
-        {
-            let channels = self.leader_channels.read().await;
-            if let Some(ch) = channels.get(&leader) {
-                return Some(
-                    crate::proto::powerfs::master_service_client::MasterServiceClient::new(
-                        ch.clone(),
-                    ),
-                );
-            }
-        }
-
-        let addr = format!("http://{}", leader);
-        let channel = match Channel::from_shared(addr)
-            .map_err(|e| {
-                warn!("Invalid leader address: {}", e);
-                e
-            })
-            .ok()?
-            .connect()
-            .await
-        {
-            Ok(ch) => ch,
-            Err(e) => {
-                warn!("Failed to connect to leader {}: {}", leader, e);
-                return None;
-            }
-        };
-
-        let mut channels = self.leader_channels.write().await;
-        // Check again after acquiring write lock to avoid duplicate insertions
-        if let Some(ch) = channels.get(&leader) {
-            return Some(
-                crate::proto::powerfs::master_service_client::MasterServiceClient::new(ch.clone()),
-            );
-        }
-        channels.insert(leader, channel.clone());
-        Some(crate::proto::powerfs::master_service_client::MasterServiceClient::new(channel))
     }
 }
 
@@ -729,16 +676,10 @@ impl MasterService for MasterGrpcServer {
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         if !self.master.is_leader().await {
-            if let Some(mut client) = self.get_leader_client().await {
-                let req = request.into_inner();
-                match client.create_collection(Request::new(req)).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(Status::unavailable(
-                "not leader and no leader client available",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                self.master.get_leader_grpc_addr().await
+            )));
         }
 
         let req = request.into_inner();
@@ -783,16 +724,10 @@ impl MasterService for MasterGrpcServer {
         request: Request<DeleteCollectionRequest>,
     ) -> Result<Response<DeleteCollectionResponse>, Status> {
         if !self.master.is_leader().await {
-            if let Some(mut client) = self.get_leader_client().await {
-                let req = request.into_inner();
-                match client.delete_collection(Request::new(req)).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(Status::unavailable(
-                "not leader and no leader client available",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                self.master.get_leader_grpc_addr().await
+            )));
         }
 
         let req = request.into_inner();
@@ -1316,16 +1251,10 @@ impl MasterService for MasterGrpcServer {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         if !self.master.is_leader().await {
-            if let Some(mut client) = self.get_leader_client().await {
-                let req = request.into_inner();
-                match client.delete_volume(Request::new(req)).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(Status::unavailable(
-                "not leader and no leader client available",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                self.master.get_leader_grpc_addr().await
+            )));
         }
 
         let req = request.into_inner();
