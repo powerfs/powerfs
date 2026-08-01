@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use powerfs_coherence::ChunkWire;
 use powerfs_common::{
     error::{PowerFsError, Result},
     traits::{
@@ -186,22 +187,42 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     );
 
     // Parse chunk/fid info
+    // 优先解析 FieldId::Chunks 完整列表（新协议，多 chunk 支持）；
+    // 缺失时回退到 Fid/Cookie/FileKey/Size 单 chunk 字段（旧协议兼容）。
+    let chunks_bytes = dec.next_bytes(FieldId::Chunks).ok();
     let fid = dec.next_string(FieldId::Fid).ok();
     let _volume_id = dec.next_u64(FieldId::VolumeId).ok();
     let cookie = dec.next_u64(FieldId::Cookie).ok();
     let file_key = dec.next_u64(FieldId::FileKey).ok();
     let chunk_size = dec.next_u64(FieldId::Size).ok();
 
-    let mut chunks = Vec::new();
-    if let (Some(fid_str), Some(c)) = (fid, cookie) {
-        chunks.push(powerfs_common::traits::FileChunk {
-            offset: file_key.unwrap_or(0),
-            size: chunk_size.unwrap_or(0),
-            mtime,
-            fid: fid_str,
-            cookie: c as u32,
-            crc32: 0,
-        });
+    let mut chunks: Vec<powerfs_common::traits::FileChunk> = Vec::new();
+    if let Some(json_bytes) = chunks_bytes {
+        if let Ok(wire_list) = serde_json::from_slice::<Vec<ChunkWire>>(&json_bytes) {
+            for w in wire_list {
+                chunks.push(powerfs_common::traits::FileChunk {
+                    offset: w.offset,
+                    size: w.size,
+                    mtime: w.mtime,
+                    fid: w.fid,
+                    cookie: w.cookie,
+                    crc32: w.crc32,
+                });
+            }
+        }
+    }
+    // 回退：旧协议仅有首 chunk 字段
+    if chunks.is_empty() {
+        if let (Some(fid_str), Some(c)) = (fid, cookie) {
+            chunks.push(powerfs_common::traits::FileChunk {
+                offset: file_key.unwrap_or(0),
+                size: chunk_size.unwrap_or(0),
+                mtime,
+                fid: fid_str,
+                cookie: c as u32,
+                crc32: 0,
+            });
+        }
     }
 
     let entry_name = if name.is_empty() {
@@ -610,6 +631,60 @@ impl FacadeMetadataProvider {
         }
         Ok(current_ino)
     }
+
+    /// Create an entry using a known parent inode, avoiding path resolution.
+    /// This is used by FUSE create/mkdir callbacks which already know the
+    /// parent inode, eliminating a round-trip lookup that can fail due to
+    /// Raft apply lag on the Filer.
+    pub async fn create_entry_with_parent_ino(
+        &self,
+        entry: &Entry,
+        parent_ino: u64,
+        _client_id: &str,
+    ) -> Result<u64> {
+        let name = entry.name.clone();
+        let mode = entry
+            .attributes
+            .as_ref()
+            .map(|a| a.mode as u64)
+            .unwrap_or(0o644);
+        let uid = entry.attributes.as_ref().map(|a| a.uid as u64).unwrap_or(0);
+        let gid = entry.attributes.as_ref().map(|a| a.gid as u64).unwrap_or(0);
+        let is_dir = mode & 0o170000 == 0o040000;
+
+        let payload =
+            build_create_tlv_with_chunks(parent_ino, &name, mode, uid, gid, &entry.chunks);
+
+        let msg_type = if is_dir {
+            powerfs_net::MsgType::Mkdir
+        } else {
+            powerfs_net::MsgType::Create
+        };
+
+        let result = self
+            .facade
+            .submit_metadata_request_with_type(
+                crate::request_state::RequestKind::Metadata,
+                parent_ino,
+                payload,
+                msg_type,
+            )
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("Facade create_entry failed: {}", e)))?;
+
+        let response_data = result
+            .payload
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .or(result.data.as_deref());
+
+        match response_data {
+            Some(data) if !data.is_empty() => Ok(parse_create_response_tlv(data)),
+            _ => Err(PowerFsError::Internal(
+                "Create returned empty response".to_string(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -984,27 +1059,33 @@ fn parse_range_lease_response(payload: &[u8]) -> Option<(String, u64)> {
 }
 
 impl FacadeStorageProvider {
-    /// 获取/续期指定 (volume, file_key) 的有效 lease 并返回 token。
+    /// 获取/续期指定 (volume, inode) 的有效 lease 并返回 token。
     /// 优先读缓存；若缓存未命中或已过期，向 Volume 发起 RangeLease 请求并更新缓存。
+    /// inode 用于 Volume Server 端的 lease 校验（lease 按 inode 注册）。
     async fn ensure_lease(
         &self,
         volume_id: u64,
         file_key: u64,
+        inode: u64,
     ) -> powerfs_common::error::Result<String> {
         let vid = volume_id;
         // Fast path: use cached valid lease token via facade
-        if let Some(tok) = self.facade.get_valid_lease_token(vid, file_key) {
+        // Cache key is (volume_id, inode) to match server-side lease registration
+        if let Some(tok) = self.facade.get_valid_lease_token(vid, inode) {
             return Ok(tok);
         }
 
         let client_id = self.facade.client_id();
         let duration_ms = 60_000; // 1 min default exclusive lease
-        let payload = build_range_lease_tlv(file_key, 0, 1, &client_id, true, duration_ms);
+                                  // Register lease with real inode (not file_key) so server-side
+                                  // validate_token_with_grace_period(token, holder, inode) matches
+        let payload = build_range_lease_tlv(inode, 0, 1, &client_id, true, duration_ms);
 
         log::debug!(
-            "ensure_lease: acquiring for volume={} file_key={} client={}",
+            "ensure_lease: acquiring for volume={} file_key={} inode={} client={}",
             volume_id,
             file_key,
+            inode,
             client_id
         );
 
@@ -1035,19 +1116,19 @@ impl FacadeStorageProvider {
             ))
         })?;
 
-        // Store lease via facade
+        // Store lease via facade with inode as cache key
         self.facade.update_lease(
             vid,
-            file_key,
+            inode,
             lease_token.clone(),
             Duration::from_millis(duration_ms),
         );
 
         log::debug!(
-            "ensure_lease: acquired token={:.16}... for volume={} file_key={}",
+            "ensure_lease: acquired token={:.16}... for volume={} inode={}",
             lease_token,
             volume_id,
-            file_key
+            inode
         );
 
         Ok(lease_token)
@@ -1072,12 +1153,14 @@ impl FacadeStorageProvider {
             if !t.is_empty() {
                 t.to_string()
             } else {
-                self.ensure_lease(volume_id, file_key).await.map_err(|e| {
-                    PowerFsError::Internal(format!("Failed to acquire lease: {}", e))
-                })?
+                self.ensure_lease(volume_id, file_key, inode)
+                    .await
+                    .map_err(|e| {
+                        PowerFsError::Internal(format!("Failed to acquire lease: {}", e))
+                    })?
             }
         } else {
-            self.ensure_lease(volume_id, file_key)
+            self.ensure_lease(volume_id, file_key, inode)
                 .await
                 .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?
         };
@@ -1093,14 +1176,21 @@ impl FacadeStorageProvider {
             Some(&client_id),
         );
 
-        let _result = self
-            .facade
-            .submit_data_request_with_type(
-                crate::request_state::RequestKind::Write,
-                volume_id,
-                payload,
-                powerfs_net::MsgType::WriteNeedle,
-            )
+        // 阶段1.5 临时方案：直接发送 WriteNeedle，绕过 data_queue。
+        //
+        // 根因：data_queue 的 response 路由有 2 层间接
+        //   (pending_requests → process_data_request_internal → response_waiters → submit_data_request_and_wait)
+        // process_data_request_internal 的 spawn 任务在 80 核环境下仍出现调度延迟，
+        // 导致 response 卡在中间层，10s 超时。
+        //
+        // send_write_needle_direct 只有 1 层间接 (pending_requests → recv_loop → oneshot)，
+        // 实测 64K write 从 54s 降到 1.72s。
+        //
+        // TODO: 修复 data_queue 的 response 路由（去掉 response_waiters 中间层），
+        //       让 process_data_request_internal 直接返回结果给 submit_data_request_and_wait，
+        //       然后恢复走 data_queue 以获得并发控制能力。
+        self.facade
+            .send_write_needle_direct(volume_id, payload)
             .await
             .map_err(|e| {
                 PowerFsError::Internal(format!("Facade write_blob_with_lease failed: {}", e))
@@ -1121,8 +1211,11 @@ impl StorageProvider for FacadeStorageProvider {
         data: &[u8],
     ) -> Result<()> {
         // Acquire a valid lease BEFORE submitting the write
+        // write_blob (trait method) uses build_write_tlv which does NOT include
+        // FieldId::FileKey, so server-side falls back to file_key as inode.
+        // Register lease with file_key as inode to match.
         let lease_token = self
-            .ensure_lease(volume_id, file_key)
+            .ensure_lease(volume_id, file_key, file_key)
             .await
             .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?;
         let client_id = self.facade.client_id();
@@ -1161,8 +1254,11 @@ impl StorageProvider for FacadeStorageProvider {
         }
 
         // Acquire a valid lease BEFORE submitting the write
+        // batch_write_blob uses build_batch_write_tlv which does NOT include
+        // FieldId::FileKey, so server-side falls back to file_key as inode.
+        // Register lease with file_key as inode to match.
         let lease_token = self
-            .ensure_lease(volume_id, file_key)
+            .ensure_lease(volume_id, file_key, file_key)
             .await
             .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?;
         let client_id = self.facade.client_id();

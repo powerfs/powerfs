@@ -1,5 +1,66 @@
 # PowerFS 元数据缓存一致性修复方案 —— 回归原设计
 
+## 0. 实施进展（2026-08-01 更新）
+
+| Phase | 内容 | 状态 | 关键文件 |
+|-------|------|------|---------|
+| 1 | filer 端 delta 补齐 + inode 授权接口 | ✅ 完成 | shard_store.rs, net_handler.rs |
+| 2 | fuse 端 CRDT 副本骨架 | ✅ 完成 | powerfs-coherence/, meta_shard_client.rs |
+| 3 | fuse 写路径解耦 + lease 协调 | ✅ 完成 | fuse.rs, crdt_client.rs |
+| 3.5 | filer 端延迟删除 GC | ✅ 完成 | shard_store.rs, meta_shard_manager.rs |
+| 3.5.2 | GC 数据块回收（delete_needle） | ✅ 完成 | meta_shard_manager.rs, main.rs |
+| 3.5.3 | open_count 追踪（GC 第三条件） | ✅ 完成 | shard_store.rs, net_handler.rs, fuse.rs |
+| 4 | 读路径切本地副本 + open 附带账本 | ✅ 完成 | fuse.rs |
+| 4.5 | GetAttr/Lookup/ReadDir chunks 序列化补齐 | ✅ 完成 | net_handler.rs, provider_adapter.rs, protocol.rs |
+| 5 | fsck 工具（孤儿数据块修复） | ✅ WAL 机制完成 | shard_store.rs, meta_shard_manager.rs |
+| 验证 | cp/rm/tar/md5 + fio | 🔲 待执行 | — |
+
+### 实现偏离记录
+
+1. **§4.4 open lease 附带账本**：方案原设"filer 在 lease 响应附带 size/chunks"，但实际 lease 由 Volume Server 管理（非 filer）。实现改为：open() 时直接从 filer 刷新 size/chunks（`get_entry_by_inode`）+ `open_inodes` 追踪 + getattr 差异化 TTL（已打开文件 30s，未打开 1s）。
+2. **§4.3 getattr 差异化**：方案原设"lease 有效用缓存"，实现改为"inode 在 open_inodes 中用长 TTL"（open→release 期间数据 lease 排他，size/chunks 权威）。
+3. **§4.5 chunks 字段序列化补齐（2026-08-01 新增）**：发现 `handle_getattr` 完全缺失 chunks 序列化（历史 bug），导致 fuse 端 `get_entry_by_inode`（用于 open 时刷新账本）拿到的 chunks 恒为空，跨客户端读文件时触发 I/O error。同时 `handle_lookup`/`handle_readdir` 只返回首 chunk，对多 chunk 文件（>64MB）布局不完整。修复方案：
+   - TLV 协议新增 `FieldId::Chunks (0x96)`，承载 JSON 序列化的 `Vec<ChunkWire>` 完整列表
+   - filer 端抽出 `encode_chunks_fields` 辅助函数，统一为 `handle_getattr`/`handle_lookup`/`handle_readdir` 输出"完整列表 + 兼容旧单 chunk 字段"
+   - fuse 端 `parse_entry_from_tlv` 优先解析 `Chunks` JSON 列表，缺失时回退到 `Fid`/`Cookie`/`FileKey`/`Size` 旧字段
+   - `ChunkWire` 复用 `powerfs-coherence::ChunkWire`（中性 wire 类型），避免类型重复定义
+
+### 待验证项
+
+- 跨客户端读文件不再 I/O error（fuse-1 写 → fuse-2 读）
+- 多 chunk 文件（>64MB）跨客户端读取数据布局完整
+- cp -prf / rm -rf / tar -czf / tar -xzf / md5 三轮无 entry 空
+- fio 标准命令测试通过
+
+### 验证进展（2026-08-01 容器内测试）
+
+**Phase 4.5 chunks 序列化修复验证**：
+- ✅ 跨客户端小文件读写 md5 一致（fuse-1 写 `verify.txt` → fuse-2 md5sum 匹配）
+- ✅ `handle_getattr` 返回的 chunks 字段被 fuse 端正确解析（log: `chunks=1, fid=Some(...)`）
+- ✅ `get_entry_by_inode` open 时刷新账本生效（log: `open: refreshed size/chunks from filer`）
+- ✅ stat 跨客户端 size 一致（fuse-1/fuse-2 stat 同一文件 size 匹配）
+
+**发现的遗留问题（独立任务，不阻塞本修复）**：
+
+1. **VFS dentry cache 缓存负条目**：fuse-2 上 `cat` 新文件报 "No such file or directory"，
+   但 `ls` 后 `md5sum` 能成功读取。根因：FUSE 挂载未设 `entry_timeout=0`，VFS 缓存了
+   早期 lookup 失败的负条目，新文件创建后未通知 VFS 失效。需在 fuse 挂载选项中
+   设置 `entry_timeout=0` 或实现内核 dentry 失效通知。
+
+2. **volume_client 写超时**：`write_blob failed: Data request failed: Request timeout after 10s`。
+   大文件（>10MB）写入间歇性超时，部分文件 size=0 或数据未落盘。根因：
+   `data_processor` 串行 await 模型（已在前期会话定位，待实施 `tokio::spawn` 并发改造）。
+
+3. **背景 puller 缓存抖动**：fuse-2 后台 puller 每秒全量拉取 delta 并失效所有 inode 缓存
+   （log: 连续 `Invalidated cache for inode: 3,4,5,...,38`）。即使无变更也重复失效，
+   导致 cache 命中率下降。需在 puller 中加入 vclock 对比，无变更时跳过失效。
+
+4. **setattr(truncate) 未走强一致路径**：fuse-1 `truncate -s 100M` 后 fuse-2 仍见旧 size。
+   根因：`setattr` 调用 legacy `update_entry`（gRPC），未走 `update_inode_size_chunks`
+   强一致路径。需将 setattr 的 size 变更部分改走 Phase 3.4 强一致 sync。
+
+---
+
 ## 1. 问题本质：实现偏离原设计
 
 ### 1.1 原设计（docs/posix-metadata-service-design.md 0.1-0.3）
@@ -90,23 +151,25 @@ epoch/lease 不在本方案实施，作为未来可选实现预留 trait 扩展�
 - 新增 `rename_dir_entry_atomic(old_parent, old_name, new_parent, new_name, inode)`：WriteBatch delete old + put new
 - `meta_shard_manager.rs:1866-1894` push_delta 的 Add/Remove/Rename 改调原子版本
 
-**1.2 B4 leader 校验** — `powerfs-filer/src/grpc_service.rs`
-- push_delta/pull_delta handler 入口调 `is_shard_leader(shard_id)`，follower 返回 `not-leader + leader_addr`
+**1.2 B4 leader 校验** — `powerfs-filer/src/net_handler.rs`（fuse→filer 统一走 net 层）
+- push_delta/pull_delta net handler 入口调 `check_leader(shard_id)`，follower 返回 `STATUS_ERR_REDIRECT + leader_addr`
 - 不转发请求（遵循架构原则：Raft 服务不转发）
+- **gRPC handler 保留作管理/测试接口**（grpc_service.rs/posix_service.rs 已实现的 handler 不删，但 fuse 路径不走 gRPC）
 
 **1.3 delta 广播** — `powerfs-filer/src/net_handler.rs`
 - create/unlink/mkdir/rmdir/rename 成功后调 `coherence.on_write_committed(parent_ino, op)`
 - `CrdtCoherenceAuthority.on_write_committed`：compute_delta + `notifier.broadcast_delta(parent_ino, delta)`（复用 InodeNotifier 通道，推 DirDelta）
 - fuse 端 `on_remote_delta` merge 到本地 DirORSet（Phase 2 接入）
 
-**1.4 inode 批量授权接口** — `powerfs-filer/src/shard_store.rs` + `grpc_service.rs`
+**1.4 inode 批量授权接口** — `powerfs-filer/src/shard_store.rs` + `net_handler.rs`
 - `shard_store.rs`：新增 `next_inode: AtomicU64`（持久化到 RocksDB CF_META，Raft 复制）；`alloc_inode_batch(size) -> (start, end)` 原子自增
-- `grpc_service.rs`：新增 `alloc_inode_batch` gRPC handler（leader only）
-- `meta_shard_manager.rs`：暴露 `alloc_inode_batch` 给 gRPC 层
+- `net_handler.rs`：新增 `handle_alloc_inode_batch` net handler（leader only，fuse 路径走 net 层）
+- `meta_shard_manager.rs`：暴露 `alloc_inode_batch`（gRPC handler 已有，保留作管理接口）
 
-**1.5 size/chunks 强一致接口** — `powerfs-filer/src/shard_store.rs`
+**1.5 size/chunks 强一致接口** — `powerfs-filer/src/shard_store.rs` + `net_handler.rs`
 - 新增 `update_inode_size_chunks_atomic(inode, size, chunks)`：WriteBatch 更新 CF_INODES 的 size/chunks 字段（close sync 账本用，Phase 3 接入）
 - 通过 Raft 提交（强一致）
+- `net_handler.rs`：新增 `handle_update_inode_size_chunks` net handler（fuse 路径走 net 层）
 
 **验证**：
 - filer 单测：create_inode_atomic 后 list_directory/lookup 一致；崩溃重启不丢
@@ -117,29 +180,37 @@ epoch/lease 不在本方案实施，作为未来可选实现预留 trait 扩展�
 ### Phase 2: fuse 端 CRDT 副本骨架
 **目标**：fuse 端持 DirORSet 本地副本，能 pull + merge
 
+**2.0 net 层 delta 传输通道** — `powerfs-filer/src/net_handler.rs` + `powerfs-fuse-core/src/meta_shard_client.rs`
+- **背景**：fuse→filer 统一走 net 层（TLV/NetMessage），不走 gRPC。filer 端 net_handler 需新增 PushDelta/PullDelta/AllocInodeBatch/UpdateInodeSizeChunks 四个 handler。
+- **传输格式**：`powerfs-coherence` 定义 `DeltaWire`/`VectorClockWire` 中性 JSON 类型（不依赖 fuse 的 `powerfs_orset::DeltaOp` 或 filer 的 `crate::powerfs::DeltaOp`），两端各自做类型转换。
+- filer `net_handler.rs`：handle_push_delta/handle_pull_delta/handle_alloc_inode_batch/handle_update_inode_size_chunks，调用 meta_shard_manager 对应方法，check_leader 校验。
+- fuse `meta_shard_client.rs`：新增 push_delta/pull_delta/alloc_inode_batch/update_inode_size_chunks 方法，通过 PowerFsNetClient 发送 MsgType::PushDelta 等。
+
 **2.1 建 `powerfs-coherence` crate**
-- `Cargo.toml`：依赖 powerfs-common, powerfs-orset, powerfs-net
-- `src/lib.rs`：定义 `CacheCoherence`/`CoherenceAuthority` trait + WriteOp/ValidationResult/DirDelta 类型
-- `src/crdt_client.rs`：`CrdtReplicaCoherence`（fuse 端）
+- `Cargo.toml`：依赖 powerfs-common, powerfs-orset, powerfs-net, serde, tokio, lru, dashmap
+- `src/lib.rs`：定义 `CacheCoherence`/`CoherenceAuthority` trait + WriteOp/ValidationResult 类型 + `DeltaWire`/`VectorClockWire`/`ChunkWire` 中性传输类型
+- `src/crdt_client.rs`：`CrdtReplicaCoherence`（fuse 端）+ ShardedDirCache + DeltaSyncChannel + do_pull_and_apply_deltas + 后台 puller
 - `src/crdt_server.rs`：`CrdtCoherenceAuthority`（filer 端，包装 meta_shard_manager）
+- `src/mock.rs`：测试 mock
 
 **2.2 ShardedDirCache** — `powerfs-coherence/src/crdt_client.rs`
-- `dir_ino -> Arc<RwLock<DirORSet>>` 容器（HashMap + RwLock）
+- `dir_ino -> Arc<RwLock<DirORSet>>` 容器（DashMap + LRU 淘汰，容量上限可配）
 - `ensure_replica(dir_ino)`：本地无副本时触发 pull
-- 复用 `powerfs-orset::DirORSet` 的 apply_local_op/merge/lookup/get_entries
+- 复用 `powerfs-orset::DirORSet` 的 add/remove/rename_entry/merge/lookup/get_entries
 
 **2.3 do_pull_and_apply_deltas** — `powerfs-coherence/src/crdt_client.rs`
-- 接入 `meta_shard_client.pull_delta(dir_ino, vclock)`
-- merge 到本地 DirORSet
+- 接入 `DeltaSyncChannel.pull_delta(dir_ino, vclock)`
+- merge 到本地 DirORSet（DeltaWire→powerfs_orset::DeltaOp 转换后 merge）
 - merge 后对变更 inode 调 `metadata_cache.invalidate_inode`（联动失效）
 
 **2.4 后台 puller** — `powerfs-coherence/src/crdt_client.rs`
-- tokio task 定时 pull_delta（间隔可配）
+- tokio task 定时 pull_delta（间隔可配，默认 1s）
 - 首次访问目录/lookup miss 时触发即时 pull
 
 **2.5 DeltaSyncChannel** — `powerfs-coherence/src/crdt_client.rs`
-- 封装 meta_shard_client 的 push_delta/pull_delta
-- leader 重试：收到 not-leader 后更新 leader_addr 重试
+- 封装 meta_shard_client 的 push_delta/pull_delta（powerfs_orset::DeltaOp→DeltaWire 转换后发送）
+- leader 重试：收到 STATUS_ERR_REDIRECT 后更新 leader_addr 重试
+- inflight 信号量：push_delta 并发上限（复用 powerfs-net inflight_sem）
 
 **验证**：
 - fuse 启动后 pull 根目录副本，readdir 读本地 DirORSet 与 filer 一致
@@ -219,17 +290,34 @@ epoch/lease 不在本方案实施，作为未来可选实现预留 trait 扩展�
 - 其他 attr：MetadataCache + 短 TTL
 
 **4.4 open lease 附带账本** — `powerfs-fuse/src/fuse.rs` open
-- 获取 lease 时，filer 在 lease 响应附带最新 size/chunks
-- fuse 用附带账本填 MetadataCache，省一次 getattr
+- ~~获取 lease 时，filer 在 lease 响应附带最新 size/chunks~~（偏离：lease 由 Volume Server 管理）
+- **实际实现**：open() 时从 filer 刷新 size/chunks（`get_entry_by_inode`）→ 填充 MetadataCache
+- 新增 `open_inodes: RwLock<HashSet<u64>>` 追踪已打开文件 → getattr 使用长 TTL（30s）
+- open() 调用 `open_count_inc` 通知 filer（GC 第三条件）
+- release() 移除 `open_inodes` 追踪 + 调用 `open_count_dec`
 
 **4.5 delta 应用联动** — `powerfs-coherence/src/crdt_client.rs`
 - `do_pull_and_apply_deltas` merge 后，对变更 inode 调 `metadata_cache.invalidate_inode`
 - size/chunks 不被 delta 失效（强一致，仅 lease 刷新）
 
+**4.6 chunks 字段序列化补齐（2026-08-01 新增）** — `powerfs-net/src/protocol.rs` + `powerfs-filer/src/net_handler.rs` + `powerfs-fuse-core/src/provider_adapter.rs`
+- **背景**：4.4 实现"open 时通过 `get_entry_by_inode` 刷新账本"后，跨客户端读文件仍触发 I/O error。根因调查发现：
+  - `handle_getattr` 完全缺失 chunks 序列化（历史 bug），filer 返回的 TLV 中无任何 chunk 字段
+  - `handle_lookup`/`handle_readdir` 仅输出首 chunk（`Fid`/`Cookie`/`FileKey`/`Size`），多 chunk 文件（>64MB）布局不完整
+  - fuse 端 `parse_entry_from_tlv` 解析逻辑支持单 chunk，但因 filer 端未输出而拿不到
+- **修复**：
+  - TLV 协议新增 `FieldId::Chunks (0x96)`，承载 JSON 序列化的 `Vec<ChunkWire>` 完整列表
+  - filer 端抽 `encode_chunks_fields(enc, info)` 辅助函数，统一为 `handle_getattr`/`handle_lookup`/`handle_readdir` 输出"完整列表 + 兼容旧单 chunk 字段"
+  - fuse 端 `parse_entry_from_tlv` 优先解析 `Chunks` JSON 列表，缺失时回退到旧单 chunk 字段
+  - `ChunkWire` 复用 `powerfs-coherence::ChunkWire`（中性 wire 类型，与 delta sync 共用）
+- **影响**：修复跨客户端读文件 I/O error；为多 chunk 文件读取（>64MB）提供完整数据布局
+
 **验证**：
 - 单客户端 cp -prf/rm -rf/tar -czf/tar -xzf/md5 3 轮无 entry 空
 - 读写全程读本地 DirORSet 副本
 - open 拿到 lease 附带账本，读数据正确
+- 跨客户端读文件无 I/O error（fuse-1 写 → fuse-2 读）
+- 多 chunk 文件（>64MB）跨客户端读取数据正确
 
 ### inode 批量授权设计说明（Phase 1.4 / 3.1 背景）
 
@@ -483,9 +571,10 @@ attr_ttl_ms = 1000            # MetadataCache 其他 attr TTL（size/chunks 不�
 ```
 
 ## 8. 验证清单
-- [ ] Phase 1: filer 原子性单测（create_inode_atomic 后 list_directory/lookup 一致）；push/pull 拒绝非 leader；alloc_inode_batch 区间不重叠
-- [ ] Phase 2: fuse 启动 pull 副本，readdir 读本地 DirORSet 与 filer 一致
-- [ ] Phase 3: create 本地立即返回；close 后 filer size/chunks 全局一致；其他客户端 open 拿到最新账本
+- [x] Phase 1: filer 原子性单测（create_inode_atomic 后 list_directory/lookup 一致）；push/pull 拒绝非 leader；alloc_inode_batch 区间不重叠
+- [x] Phase 2: fuse 启动 pull 副本，readdir 读本地 DirORSet 与 filer 一致
+- [x] Phase 3: create 本地立即返回；close 后 filer size/chunks 全局一致；其他客户端 open 拿到最新账本
+- [x] Phase 3.5: GC 三条件检查（nlink==0 + 无活跃 lease + open_count==0）；tombstone 跳过；数据块回收
 - [ ] Phase 4: 单客户端 cp -prf/rm -rf/tar -czf/tar -xzf/md5 3 轮无 entry 空
 - [ ] 多客户端：A 写 B pull 后可见（弱一致窗口 = sync_interval）；A close 后 B open 读到正确数据（lease + 账本强一致）
 - [ ] 全部通过后跑 fio（`/tmp/fio_meta_test.fio`），CRDT 模式
@@ -513,11 +602,62 @@ attr_ttl_ms = 1000            # MetadataCache 其他 attr TTL（size/chunks 不�
 - **配置一致性**：`gc_grace_period` 多 filer 必须一致（否则 GC 时机不同）；`sync_interval` fuse 各自配置
 - **监控指标**：delta sync 延迟 / GC 积压 / lease 队列 / inode 耗尽率 / ChangeCache 水位（实施时补）
 
-## 10. 待规划运维工具
-- **fsck**：扫描 volume server orphan chunks，比对 filer 账本修复（解决数据/账本非原子）
+## 10. fsck 工具设计（Phase 5）
+
+### 10.1 问题背景
+close 时数据已持久化（volume server）但账本 sync（filer Raft）失败 → 孤儿 chunks。GC 删除元数据后 `reclaim_data_chunks` 失败也 → 孤儿 chunks。需机制恢复。
+
+### 10.2 方案：GC 集成持久化重试 + filer 端一致性检查
+
+**限制**：Volume Server 无 `list_needles` API，无法全量扫描孤儿块。采用 **WAL 模式**：删除元数据前持久化待回收 chunks，失败重试。
+
+#### 10.2.1 持久化 pending_reclaims（WAL 模式）
+```
+GC run_gc_pass:
+  1. 对每个待删 inode:
+     a. save chunks to pending_reclaims (RocksDB CF_PENDING_RECLAIMS)  ← 先持久化
+     b. remove_inode_atomic (删除元数据)
+  2. 返回 chunks_to_reclaim
+
+GC reclaim_data_chunks:
+  1. 对每个 chunk:
+     a. delete_needle(volume_server, volume_id, file_key)
+     b. 成功 → remove from pending_reclaims
+     c. 失败 → 保留在 pending_reclaims（下次 GC 重试）
+
+GC cycle start:
+  1. retry_pending_reclaims (扫描 CF_PENDING_RECLAIMS，逐个重试 delete_needle)
+  2. run_gc_pass (正常 GC)
+  3. reclaim_data_chunks (回收本轮 chunks)
+```
+
+**崩溃恢复**：filer 重启后从 CF_PENDING_RECLAIMS 加载未回收 chunks，下次 GC 自动重试。
+
+#### 10.2.2 fsck 命令（filer 端一致性检查）
+独立 CLI 工具，扫描 filer 元数据验证 chunk 存在性：
+```
+fsck --filer <addr> [--delete-missing] [--report-only]
+  1. 遍历所有 shard 的所有 inode
+  2. 对每个 inode 的每个 chunk:
+     a. 解析 fid → (volume_id, file_key)
+     b. read_needle_meta(volume_server, volume_id, file_key)
+     c. 不存在 → 报告 missing chunk
+  3. 输出统计：total_inodes / total_chunks / missing_chunks / orphan_pending_reclaims
+```
+
+**注意**：fsck 无法发现 volume server 上的孤儿块（无 list_needles API）。孤儿块由 §10.2.1 的 pending_reclaims WAL 机制保证不丢失。
+
+### 10.3 实施
+- `shard_store.rs`: 新增 `CF_PENDING_RECLAIMS` + `add_pending_reclaim` / `remove_pending_reclaim` / `list_pending_reclaims`
+- `meta_shard_manager.rs`: `run_gc_pass` 先持久化再删元数据 + `retry_pending_reclaims` 方法
+- `spawn_gc_task`: 每轮先 `retry_pending_reclaims` 再 `run_gc_pass`
+- fsck CLI 工具：后续按需实施（当前 pending_reclaims WAL 已覆盖主要风险）
+
+## 11. 待规划运维工具
+- **fsck CLI**：见 §10.2.2 设计（filer 端一致性检查）
 - **监控仪表盘**：上述指标的 Prometheus exporter + Grafana
 
-## 11. 工作量评估
+## 12. 工作量评估
 | 模块 | 复用 | 新增 | 难度 |
 |------|------|------|------|
 | powerfs-orset DirORSet | 全复用 | — | 低 |

@@ -248,15 +248,54 @@ export interface BucketInfo {
 
 // ===== Collection management =====
 
+export interface RedundancyInfo {
+  mode: string // "replication" | "erasure_coding"
+  copies: number | null
+  data_shards: number | null
+  parity_shards: number | null
+  algorithm: string | null
+}
+
+export interface StoragePolicyInfo {
+  name: string
+  redundancy: RedundancyInfo
+  min_write_nodes: number
+}
+
+export interface VolumeAllocationInfo {
+  mode: string // "auto" | "manual" | "hybrid"
+  count: number | null
+  volume_size: number | null
+  volume_ids: number[] | null
+  fixed_volume_ids: number[] | null
+  auto_count: number | null
+}
+
 export interface CollectionInfo {
   name: string
-  replication: string
-  ttl: string
+  status: number
+  status_name: string
+  storage_policy: StoragePolicyInfo | null
   disk_type: string
-  max_volume_count: number
+  capacity_quota_bytes: number
   volume_count: number
+  ttl_seconds: number
   created_at: number
-  modified_at: number
+  updated_at: number
+  description: string
+  volume_allocation: VolumeAllocationInfo | null
+  excluded_volume_ids: number[]
+}
+
+export interface CollectionStats {
+  used_bytes: number
+  file_count: number
+  volume_count: number
+  writable_volume_count: number
+  read_ops: number
+  write_ops: number
+  read_bytes: number
+  write_bytes: number
 }
 
 export interface ObjectInfo {

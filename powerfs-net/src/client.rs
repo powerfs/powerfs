@@ -4,18 +4,42 @@
 //! powerfs-net binary protocol.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::*;
 use crate::serialize::{DirEntry, EntryInfo};
+
+/// Drain all pending requests from a DashMap and notify each waiter with an
+/// error (empty-header) NetMessage.  Used by send_task/recv_loop/disconnect
+/// when the connection breaks so that no caller hangs waiting for a response
+/// that will never arrive.
+///
+/// DashMap has no `drain()` method like HashMap, so we collect keys first
+/// (fast, read-only shard locks), then remove each entry (write shard lock).
+/// This avoids holding any single shard lock for the duration of all sends.
+fn drain_pending_with_error(pr: &DashMap<u32, oneshot::Sender<NetMessage>>) {
+    let keys: Vec<u32> = pr.iter().map(|e| *e.key()).collect();
+    for key in keys {
+        if let Some((_, sender)) = pr.remove(&key) {
+            let _ = sender.send(NetMessage::new(FrameHeader::new(
+                0,
+                FrameFlags::new(0),
+                0,
+                0,
+            )));
+        }
+    }
+}
 
 /// Configuration for the net client
 #[derive(Debug, Clone)]
@@ -61,12 +85,30 @@ pub trait NotificationHandler: Send + Sync {
 /// PowerFS Net Client
 pub struct PowerFsNetClient {
     pub config: ClientConfig,
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    write_half: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    read_half: Arc<Mutex<Option<OwnedReadHalf>>>,
     seq_counter: AtomicU32,
     inflight_sem: Arc<Semaphore>,
     connected: Arc<parking_lot::Mutex<bool>>,
     /// Optional handler for server-pushed notifications
     notification_handler: Arc<parking_lot::Mutex<Option<Box<dyn NotificationHandler>>>>,
+    /// Pending requests waiting for responses (seq → oneshot sender).
+    /// Keys are inserted by send_request_internal and removed by recv_loop.
+    ///
+    /// Uses DashMap (16-way sharded locks) instead of a single Mutex<HashMap>
+    /// to reduce lock contention under high concurrency.  Each shard has its
+    /// own RwLock, so concurrent insert/remove on different seqs proceed in
+    /// parallel.
+    pending_requests: Arc<DashMap<u32, oneshot::Sender<NetMessage>>>,
+    /// Handle for the background receive loop task.
+    recv_loop_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Sender for frames to the dedicated send_task (eliminates write_half lock contention).
+    /// None when not connected. Each frame is a complete NetMessage frame to write_all.
+    frame_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Handle for the background send task.
+    send_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Reconnect coordination flag: prevents concurrent reconnect_internal calls.
+    reconnecting: Arc<AtomicBool>,
 }
 
 impl PowerFsNetClient {
@@ -74,10 +116,16 @@ impl PowerFsNetClient {
         Self {
             inflight_sem: Arc::new(Semaphore::new(config.max_inflight_requests as usize)),
             config,
-            stream: Arc::new(Mutex::new(None)),
+            write_half: Arc::new(Mutex::new(None)),
+            read_half: Arc::new(Mutex::new(None)),
             seq_counter: AtomicU32::new(0),
             connected: Arc::new(parking_lot::Mutex::new(false)),
             notification_handler: Arc::new(parking_lot::Mutex::new(None)),
+            pending_requests: Arc::new(DashMap::new()),
+            recv_loop_handle: Arc::new(Mutex::new(None)),
+            frame_tx: Arc::new(Mutex::new(None)),
+            send_task_handle: Arc::new(Mutex::new(None)),
+            reconnecting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -89,8 +137,8 @@ impl PowerFsNetClient {
 
     /// Connect to the server
     pub async fn connect(&self) -> NetResult<()> {
-        let mut stream = self.stream.lock().await;
-        if stream.is_some() {
+        // Check if already connected (frame_tx exists and connected flag is set)
+        if *self.connected.lock() && self.frame_tx.lock().await.is_some() {
             return Ok(());
         }
 
@@ -110,11 +158,6 @@ impl PowerFsNetClient {
 
         info!("Connecting to {}:{}", self.config.addr, self.config.port);
 
-        // Connect via tokio TcpStream, then enable TCP keepalive through
-        // socket2 using the raw fd.  Keepalive detects half-dead
-        // connections (idle 60s -> every 10s, 3 retries) that otherwise
-        // reveal themselves as "early eof" on the first user write after
-        // a far-end silent close (NAT idle drop, LB idle timeout, etc.).
         let connect_result =
             tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await;
 
@@ -125,9 +168,6 @@ impl PowerFsNetClient {
         {
             use socket2::TcpKeepalive;
             use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-            // SAFETY: fd belongs to tcp_stream and is valid.  We temporarily
-            // re-wrap as socket2 to configure keepalive, then forget the
-            // duplicate fd so the socket lives on owned by tcp_stream.
             let raw_fd = tcp_stream.as_raw_fd();
             let sock2 = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
             let ka = TcpKeepalive::new()
@@ -137,12 +177,10 @@ impl PowerFsNetClient {
             if let Err(e) = sock2.set_tcp_keepalive(&ka) {
                 warn!("failed to set TCP keepalive (continuing): {}", e);
             }
-            // Don't close the fd on drop – it still belongs to tcp_stream.
             let _ = sock2.into_raw_fd();
         }
         #[cfg(not(unix))]
         {
-            // Non-unix platforms still get nodelay above; skip keepalive.
             let _ = socket2::TcpKeepalive::new();
         }
 
@@ -165,27 +203,221 @@ impl PowerFsNetClient {
 
         info!("Connected to server_id={}", resp.server_id);
 
-        *stream = Some(tcp_stream);
+        // Split stream into read and write halves for pipeline mode
+        let (read_half, write_half) = tcp_stream.into_split();
+        *self.write_half.lock().await = Some(write_half);
+        *self.read_half.lock().await = Some(read_half);
         *self.connected.lock() = true;
+
+        // Start background send task (owns write_half via mpsc, no lock contention)
+        self.start_send_task().await;
+
+        // Start background receive loop
+        self.start_recv_loop().await;
 
         Ok(())
     }
 
+    /// Start the background send task that owns write_half and writes frames
+    /// received from the mpsc channel. This eliminates write_half lock contention
+    /// among concurrent requests.
+    async fn start_send_task(&self) {
+        // Abort any existing send_task
+        let mut handle_guard = self.send_task_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+
+        // Take ownership of write_half from the Mutex (send_task owns it)
+        let write_half = self.write_half.lock().await.take();
+        let wh = match write_half {
+            Some(w) => w,
+            None => {
+                warn!("start_send_task: write_half is None");
+                return;
+            }
+        };
+
+        // Create mpsc channel for sending frames
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        *self.frame_tx.lock().await = Some(tx);
+
+        let connected = self.connected.clone();
+        let pending_requests = self.pending_requests.clone();
+        let write_timeout = self.config.request_timeout;
+
+        let handle = tokio::spawn(async move {
+            info!(
+                "PowerFsNetClient: send_task started (write_timeout={:?})",
+                write_timeout
+            );
+            let mut wh = wh;
+            while let Some(frame) = rx.recv().await {
+                // Write frame with a timeout. If write_all blocks (TCP buffer
+                // full because the server is slow or unresponsive), the timeout
+                // fires, the connection is marked dead, and ALL pending requests
+                // are drained with error responses. This prevents a single
+                // stuck write from blocking the entire send queue for 30s.
+                //
+                // Note: a timed-out write_all may leave a partial frame in the
+                // TCP buffer, corrupting the stream.  This is acceptable
+                // because we mark the connection as dead and force a reconnect.
+                match tokio::time::timeout(write_timeout, wh.write_all(&frame)).await {
+                    Ok(Ok(())) => { /* frame sent, response will arrive via recv_loop */ }
+                    Ok(Err(e)) => {
+                        warn!("send_task: write error: {:?}", e);
+                        *connected.lock() = false;
+                        drain_pending_with_error(&pending_requests);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "send_task: write timeout after {:?} (connection may be stuck); \
+                             draining all pending requests and marking connection dead",
+                            write_timeout
+                        );
+                        *connected.lock() = false;
+                        drain_pending_with_error(&pending_requests);
+                        break;
+                    }
+                }
+            }
+            info!("PowerFsNetClient: send_task stopped");
+        });
+
+        *handle_guard = Some(handle);
+    }
+
+    /// Start the background receive loop that reads responses and dispatches
+    /// them to pending requests by seq number.
+    async fn start_recv_loop(&self) {
+        // Abort any existing recv_loop
+        let mut handle_guard = self.recv_loop_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+
+        let read_half = self.read_half.clone();
+        let pending_requests = self.pending_requests.clone();
+        let notification_handler = self.notification_handler.clone();
+        let connected = self.connected.clone();
+
+        let handle = tokio::spawn(async move {
+            info!("PowerFsNetClient: recv_loop started");
+            loop {
+                // Acquire read_half lock just to get a mutable reference,
+                // but we need to hold it for the entire read to prevent
+                // reconnection races.
+                let mut rh = read_half.lock().await;
+                let reader = match rh.as_mut() {
+                    Some(r) => r,
+                    None => {
+                        debug!("recv_loop: read_half is None, exiting");
+                        break;
+                    }
+                };
+
+                // Read header — no timeout; block until data arrives or
+                // connection breaks.  A timeout here would prematurely kill
+                // the recv_loop during idle periods (no pending requests),
+                // causing the next request to fail with "not connected".
+                let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+                let read_result = reader.read_exact(&mut hdr_buf).await;
+
+                let header = match read_result {
+                    Ok(_) => match FrameHeader::decode(&hdr_buf) {
+                        Some(h) => h,
+                        None => {
+                            warn!("recv_loop: invalid header, skipping");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("recv_loop: header read error: {:?}", e);
+                        *connected.lock() = false;
+                        // Notify all pending requests of the error
+                        drain_pending_with_error(&pending_requests);
+                        break;
+                    }
+                };
+
+                // Read body + data (header.data_len covers both body and data segments)
+                let data_len = header.data_len as usize;
+                let mut all_data = Vec::with_capacity(data_len);
+                if data_len > 0 {
+                    all_data.resize(data_len, 0u8);
+                    if let Err(e) = reader.read_exact(&mut all_data).await {
+                        warn!("recv_loop: data read error: {:?}", e);
+                        *connected.lock() = false;
+                        // Notify all pending requests of the error
+                        drain_pending_with_error(&pending_requests);
+                        break;
+                    }
+                }
+
+                let message = NetMessage::new(header).with_body(all_data);
+
+                let seq = message.header.seq;
+
+                // Handle NOTIFY frames (server-pushed notifications)
+                if message.header.is_notify() {
+                    debug!(
+                        "recv_loop: received NOTIFY frame type={:?}",
+                        message.msg_type()
+                    );
+                    let handler = notification_handler.lock();
+                    if let Some(ref h) = *handler {
+                        h.handle_notification(&message);
+                    }
+                    continue;
+                }
+
+                // Dispatch to pending request by seq (DashMap: no async lock)
+                if let Some((_, sender)) = pending_requests.remove(&seq) {
+                    debug!(
+                        "recv_loop: dispatched response seq={}, status={}",
+                        seq, message.header.status
+                    );
+                    let _ = sender.send(message);
+                } else {
+                    warn!("recv_loop: no pending request for seq={}, dropping", seq);
+                }
+            }
+            info!("PowerFsNetClient: recv_loop stopped");
+        });
+
+        *handle_guard = Some(handle);
+    }
+
     /// Disconnect from the server
     pub async fn disconnect(&self) -> NetResult<()> {
-        let mut stream = self.stream.lock().await;
-        if let Some(mut s) = stream.take() {
-            // Send close frame
-            let frame = build_frame(
-                MsgType::Handshake.as_u16(),
-                FrameFlags::new(FrameFlags::REQUEST),
-                0,
-                &[],
-                &[],
-            );
-            let _ = s.write_all(&frame).await;
-            drop(s);
+        // Stop send_task (drop frame_tx to signal send_task to exit)
+        {
+            let mut frame_tx_guard = self.frame_tx.lock().await;
+            *frame_tx_guard = None;
         }
+        {
+            let mut handle_guard = self.send_task_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+
+        // Stop recv_loop
+        {
+            let mut handle_guard = self.recv_loop_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+
+        // Clear write_half and read_half
+        *self.write_half.lock().await = None;
+        *self.read_half.lock().await = None;
+
+        // Clear pending requests
+        drain_pending_with_error(&self.pending_requests);
+
         *self.connected.lock() = false;
         Ok(())
     }
@@ -196,10 +428,10 @@ impl PowerFsNetClient {
     }
 
     /// Send a request and wait for response
-    /// Uses a single lock hold for both send and receive to prevent
-    /// response interleaving with concurrent requests.
-    /// On any error (including timeout), the stream is cleared so the
-    /// next request will establish a fresh connection.
+    /// Uses the background send_task (mpsc channel) to write frames without
+    /// lock contention, and the background recv_loop to dispatch responses.
+    /// On any error (including timeout), the request fails but the connection
+    /// is NOT destroyed (only real I/O errors trigger reconnect).
     pub async fn send_request(
         &self,
         msg_type: MsgType,
@@ -207,19 +439,47 @@ impl PowerFsNetClient {
         data: &[u8],
     ) -> NetResult<NetMessage> {
         debug!("send_request: type={:?}", msg_type);
-        // Auto-reconnect if stream is broken
+        // Auto-reconnect if stream is broken (with coordination to prevent
+        // concurrent reconnect storms)
         {
-            let stream = self.stream.lock().await;
-            let connected = !stream.is_none() && *self.connected.lock();
+            let frame_tx = self.frame_tx.lock().await;
+            let connected = frame_tx.is_some() && *self.connected.lock();
             debug!(
-                "send_request: stream_is_some={}, connected={}",
-                !stream.is_none(),
+                "send_request: frame_tx_is_some={}, connected={}",
+                frame_tx.is_some(),
                 connected
             );
             if !connected {
-                drop(stream);
-                warn!("send_request: stream broken, reconnecting...");
-                self.reconnect_internal().await?;
+                drop(frame_tx);
+                // Coordinate reconnect: only one request reconnects at a time
+                if self
+                    .reconnecting
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    warn!("send_request: stream broken, reconnecting...");
+                    let result = self.reconnect_internal().await;
+                    self.reconnecting.store(false, Ordering::Release);
+                    result?;
+                } else {
+                    // Another request is already reconnecting — wait for it
+                    debug!("send_request: waiting for concurrent reconnect...");
+                    let waited = Duration::from_millis(0);
+                    let max_wait = self.config.connect_timeout * 3;
+                    let start = std::time::Instant::now();
+                    while self.reconnecting.load(Ordering::Acquire) && start.elapsed() < max_wait {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if !*self.connected.lock() {
+                        return Err(NetError::Connection(
+                            "reconnect by concurrent caller failed".into(),
+                        ));
+                    }
+                    debug!(
+                        "send_request: concurrent reconnect done, waited {:?}",
+                        waited
+                    );
+                }
             }
         }
 
@@ -227,7 +487,15 @@ impl PowerFsNetClient {
         self.send_request_internal(msg_type, body, data).await
     }
 
-    /// Internal send request (after connection is verified)
+    /// Internal send request (after connection is verified).
+    ///
+    /// Pipeline mode: register a oneshot channel in `pending_requests`, push
+    /// the frame to the background send_task via mpsc channel (no lock
+    /// contention), then await the response from the background recv_loop.
+    ///
+    /// Key fix: request timeout does NOT destroy the connection. Only real
+    /// I/O errors in send_task trigger connection teardown. This prevents
+    /// in-flight data loss when one request times out.
     async fn send_request_internal(
         &self,
         msg_type: MsgType,
@@ -252,64 +520,60 @@ impl PowerFsNetClient {
             data.len()
         );
 
-        // Hold the stream lock for the entire send+receive to prevent
-        // response interleaving with concurrent requests
-        debug!("send_request_internal: acquiring stream lock");
-        let mut stream = self.stream.lock().await;
-        debug!("send_request_internal: stream lock acquired");
+        // Create oneshot channel and register pending request
+        let (tx, rx) = oneshot::channel::<NetMessage>();
+        self.pending_requests.insert(seq, tx);
 
-        // Check we have a valid stream
-        if stream.is_none() {
-            *self.connected.lock() = false;
-            warn!("send_request_internal: stream is None");
-            return Err(NetError::NotConnected);
-        }
-
-        // Send frame
-        debug!("send_request_internal: sending frame, seq={}", seq);
-        let send_result = tokio::time::timeout(
-            self.config.request_timeout,
-            stream.as_mut().unwrap().write_all(&frame),
-        )
-        .await;
-
-        match send_result {
-            Ok(Ok(_)) => {
-                debug!("send_request_internal: frame sent, seq={}", seq);
-            }
-            Ok(Err(e)) => {
-                // Clear stream on send error
-                warn!("send_request_internal: send error: {:?}", e);
-                *stream = None;
-                drop(stream);
-                self.handle_send_error(&e).await?;
-                return Err(NetError::Protocol(e.to_string()));
-            }
-            Err(_elapsed) => {
-                // Clear stream on send timeout
-                warn!("send_request_internal: send timeout");
-                *stream = None;
-                drop(stream);
-                self.handle_timeout().await?;
-                return Err(NetError::Timeout);
+        // Push frame to send_task via mpsc channel (no write_half lock needed)
+        {
+            let frame_tx = self.frame_tx.lock().await;
+            match frame_tx.as_ref() {
+                Some(sender) => {
+                    if let Err(e) = sender.send(frame) {
+                        // send_task has exited (connection broken)
+                        warn!(
+                            "send_request_internal: frame_tx send failed for seq={}: {}",
+                            seq, e
+                        );
+                        self.pending_requests.remove(&seq);
+                        *self.connected.lock() = false;
+                        return Err(NetError::NotConnected);
+                    }
+                    debug!(
+                        "send_request_internal: frame pushed to send_task, seq={}",
+                        seq
+                    );
+                }
+                None => {
+                    self.pending_requests.remove(&seq);
+                    *self.connected.lock() = false;
+                    warn!("send_request_internal: frame_tx is None");
+                    return Err(NetError::NotConnected);
+                }
             }
         }
 
-        // Receive response (still holding the lock)
+        // Wait for response via oneshot (with timeout).
+        // Timeout here does NOT destroy the connection — the frame may still
+        // be in the send_task's queue or in the TCP buffer. Other requests'
+        // responses can still arrive via recv_loop.
         debug!("send_request_internal: waiting for response, seq={}", seq);
-        match self.recv_response_locked(seq, &mut stream).await {
-            Ok(response) => {
+        match tokio::time::timeout(self.config.request_timeout, rx).await {
+            Ok(Ok(response)) => {
                 debug!("send_request_internal: response received, seq={}", seq);
                 Ok(response)
             }
-            Err(e) => {
-                // Any receive error (including timeout) means the stream
-                // state is corrupted. Clear it so we reconnect next time.
-                warn!("send_request_internal: recv error: {:?}", e);
-                *stream = None;
-                drop(stream);
-                *self.connected.lock() = false;
-                Err(e)
+            Ok(Err(_recv_err)) => {
+                // oneshot sender was dropped (likely recv_loop exited and
+                // drained pending_requests, or send_task drained on error)
+                warn!("send_request_internal: sender dropped for seq={}", seq);
+                Err(NetError::Connection("connection terminated".into()))
+            }
+            Err(_elapsed) => {
+                warn!("send_request_internal: response timeout for seq={}", seq);
+                // Remove pending request on timeout (do NOT set connected=false)
+                self.pending_requests.remove(&seq);
+                Err(NetError::Timeout)
             }
         }
     }
@@ -319,6 +583,30 @@ impl PowerFsNetClient {
     /// backoff; on final failure the caller should try again later (we
     /// intentionally do not loop forever here).
     pub async fn reconnect_internal(&self) -> NetResult<()> {
+        // Stop send_task (drop frame_tx to signal send_task to exit)
+        {
+            let mut frame_tx_guard = self.frame_tx.lock().await;
+            *frame_tx_guard = None;
+        }
+        {
+            let mut handle_guard = self.send_task_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+
+        // Stop recv_loop, clear halves before reconnecting.
+        // connect() will restart send_task, recv_loop and set new halves.
+        {
+            let mut handle_guard = self.recv_loop_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+        *self.write_half.lock().await = None;
+        *self.read_half.lock().await = None;
+        *self.connected.lock() = false;
+
         // Try up to 3 times with backoff
         for attempt in 1..=3 {
             info!("Reconnect attempt {}", attempt);
@@ -355,159 +643,23 @@ impl PowerFsNetClient {
             &[],
         );
 
-        let mut stream = self.stream.lock().await;
-        let s = stream.as_mut().ok_or(NetError::NotConnected)?;
-        s.write_all(&frame).await?;
-
-        debug!("Sent notify: type={:?} seq={}", msg_type, seq);
-        Ok(())
-    }
-
-    /// Receive response for a specific sequence number (called with stream lock already held)
-    ///
-    /// This method loops to handle interleaved NOTIFY frames: if a NOTIFY
-    /// frame arrives while waiting for a RESPONSE, it dispatches the
-    /// notification to the registered handler and continues reading.
-    async fn recv_response_locked(
-        &self,
-        expected_seq: u32,
-        stream: &mut tokio::sync::MutexGuard<'_, Option<TcpStream>>,
-    ) -> NetResult<NetMessage> {
-        loop {
-            let s = stream.as_mut().ok_or(NetError::NotConnected)?;
-
-            debug!(
-                "recv_response_locked: reading header, expected_seq={}",
-                expected_seq
-            );
-            // Read header
-            let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
-            let recv_result =
-                tokio::time::timeout(self.config.request_timeout, s.read_exact(&mut hdr_buf)).await;
-
-            match recv_result {
-                Ok(Ok(_)) => {
-                    debug!(
-                        "recv_response_locked: header received for seq={}",
-                        expected_seq
-                    );
-                }
-                Ok(Err(e)) => {
-                    let err_msg = e.to_string();
-                    warn!("recv_response_locked: header read error: {:?}", e);
-                    self.handle_recv_error(&e).await?;
-                    return Err(NetError::Protocol(err_msg));
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        "recv_response_locked: header read timeout for seq={}",
-                        expected_seq
-                    );
-                    return Err(NetError::Timeout);
-                }
+        // Push to send_task via mpsc (consistent with send_request_internal)
+        let frame_tx = self.frame_tx.lock().await;
+        match frame_tx.as_ref() {
+            Some(sender) => {
+                sender
+                    .send(frame)
+                    .map_err(|_| NetError::Connection("send_task exited".into()))?;
+                debug!("Sent notify: type={:?} seq={}", msg_type, seq);
+                Ok(())
             }
-
-            let header = FrameHeader::decode(&hdr_buf)
-                .ok_or_else(|| NetError::Protocol("invalid response header".into()))?;
-
-            // Read body + data
-            let data_len = header.data_len as usize;
-            let mut all_data = Vec::with_capacity(data_len);
-            if data_len > 0 {
-                let mut remaining = data_len;
-                while remaining > 0 {
-                    let chunk = std::cmp::min(remaining, 4096);
-                    let mut buf = vec![0u8; chunk];
-                    s.read_exact(&mut buf).await?;
-                    all_data.extend_from_slice(&buf);
-                    remaining -= chunk;
-                }
-            }
-
-            let message = NetMessage::new(header).with_body(all_data);
-
-            // Check if this is a NOTIFY frame (server-pushed notification)
-            if message.header.is_notify() {
-                debug!(
-                    "recv_response_locked: received NOTIFY frame type={:?}, dispatching to handler",
-                    message.msg_type()
-                );
-                let handler = self.notification_handler.lock();
-                if let Some(ref h) = *handler {
-                    h.handle_notification(&message);
-                }
-                // Continue reading for the actual response
-                continue;
-            }
-
-            debug!(
-                "recv_response_locked: got response seq={}, expected={}",
-                message.header.seq, expected_seq
-            );
-            if message.header.seq != expected_seq {
-                error!(
-                    "Response seq mismatch: expected {}, got {}",
-                    expected_seq, message.header.seq
-                );
-                return Err(NetError::Protocol(format!(
-                    "seq mismatch: expected {}, got {}",
-                    expected_seq, message.header.seq
-                )));
-            }
-
-            debug!(
-                "Received response: seq={} status={} data_len={}",
-                message.header.seq,
-                message.header.status,
-                message.body.len()
-            );
-
-            return Ok(message);
+            None => Err(NetError::NotConnected),
         }
-    }
-
-    /// Receive response for a specific sequence number (standalone, acquires its own lock)
-    async fn recv_response(&self, expected_seq: u32) -> NetResult<NetMessage> {
-        let mut stream = self.stream.lock().await;
-        self.recv_response_locked(expected_seq, &mut stream).await
-    }
-
-    async fn handle_send_error(&self, e: &std::io::Error) -> NetResult<()> {
-        error!("Send error: {:?}", e);
-        *self.connected.lock() = false;
-        Ok(())
-    }
-
-    async fn handle_recv_error(&self, e: &std::io::Error) -> NetResult<()> {
-        error!("Receive error: {:?}", e);
-        *self.connected.lock() = false;
-        Ok(())
-    }
-
-    async fn handle_timeout(&self) -> NetResult<()> {
-        error!("Request timeout");
-        *self.connected.lock() = false;
-        Ok(())
     }
 
     /// Send a ping
     pub async fn ping(&self) -> NetResult<()> {
-        let frame = build_frame(
-            MsgType::Ping.as_u16(),
-            FrameFlags::new(FrameFlags::REQUEST),
-            0,
-            &[],
-            &[],
-        );
-
-        {
-            let mut stream = self.stream.lock().await;
-            let s = stream.as_mut().ok_or(NetError::NotConnected)?;
-            s.write_all(&frame).await?;
-        }
-
-        // Receive ping response
-        let _resp = self.recv_response(0).await?;
+        let _resp = self.send_request_internal(MsgType::Ping, &[], &[]).await?;
         Ok(())
     }
 

@@ -1,0 +1,22 @@
+[package]
+name = "powerfs-coherence"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "Modular cache coherence (CRDT-based) for PowerFS metadata"
+license = { workspace = true }
+
+[dependencies]
+powerfs-orset = { path = "../powerfs-orset" }
+powerfs-common = { path = "../powerfs-common" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+async-trait = { workspace = true }
+lru = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

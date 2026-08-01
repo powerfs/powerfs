@@ -257,8 +257,17 @@ pub struct VolumeClient {
     lease_renewer_running: Arc<Mutex<bool>>,
     /// Lease 续租间隔
     lease_renew_interval: Duration,
-    /// 事件通知器 (所有处理器共享)
-    notify: Arc<tokio::sync::Notify>,
+    /// 数据通道事件通知器 (仅唤醒 data_processor)
+    ///
+    /// 关键修复：原先 data/lease/mgmt 三个 processor 共用单个 `notify`，
+    /// `notify_one()` 只唤醒一个等待者，可能误唤醒错误 processor 导致目标
+    /// processor 不被唤醒、请求卡在队列直到超时。拆分为 3 个独立 Notify，
+    /// 每个 submit/processor/guard 只操作对应通道，确保精准唤醒。
+    data_notify: Arc<tokio::sync::Notify>,
+    /// Lease 通道事件通知器 (仅唤醒 lease_processor)
+    lease_notify: Arc<tokio::sync::Notify>,
+    /// 管理通道事件通知器 (仅唤醒 mgmt_processor)
+    mgmt_notify: Arc<tokio::sync::Notify>,
 }
 
 impl VolumeClient {
@@ -300,7 +309,9 @@ impl VolumeClient {
             mgmt_queue_high_watermark: Arc::new(AtomicUsize::new(0)),
             lease_renewer_running: Arc::new(Mutex::new(false)),
             lease_renew_interval,
-            notify: Arc::new(tokio::sync::Notify::new()),
+            data_notify: Arc::new(tokio::sync::Notify::new()),
+            lease_notify: Arc::new(tokio::sync::Notify::new()),
+            mgmt_notify: Arc::new(tokio::sync::Notify::new()),
             config,
             topology_manager,
             volume_connections: Arc::new(DashMap::new()),
@@ -657,7 +668,7 @@ impl VolumeClient {
         self.data_queue.enqueue(req)?;
 
         *self.state.lock().unwrap() = VolumeClientState::Processing;
-        self.notify.notify_one();
+        self.data_notify.notify_one();
         Ok(())
     }
 
@@ -678,7 +689,7 @@ impl VolumeClient {
         };
 
         self.lease_queue.enqueue(req)?;
-        self.notify.notify_one();
+        self.lease_notify.notify_one();
         Ok(())
     }
 
@@ -699,7 +710,7 @@ impl VolumeClient {
         };
 
         self.mgmt_queue.enqueue(req)?;
-        self.notify.notify_one();
+        self.mgmt_notify.notify_one();
         Ok(())
     }
 
@@ -868,16 +879,37 @@ impl VolumeClient {
     }
 
     /// 异步释放 Lease: 直接构建 TLV 请求发送到 Volume Server
+    ///
+    /// token 由调用方传入（LeaseGuard 持有的 token 或 leases 表中查到的 token），
+    /// 避免此前从 leases 表查 token 时可能返回过期/错误 token 的 bug。
     pub async fn release_lease_remote(
         &self,
         volume_id: u64,
         inode: u64,
         client_id: &str,
+        token: &str,
     ) -> ClientResult<()> {
-        let token = self
-            .get_valid_lease_token(volume_id, inode)
-            .ok_or_else(|| ClientError::Internal("No valid lease to release".into()))?;
+        if token.is_empty() {
+            // 无 token：尝试从 leases 表取（兼容旧调用路径）
+            let tok = self
+                .get_valid_lease_token(volume_id, inode)
+                .ok_or_else(|| ClientError::Internal("No valid lease to release".into()))?;
+            return self
+                .release_lease_remote_with_token(volume_id, inode, client_id, &tok)
+                .await;
+        }
+        self.release_lease_remote_with_token(volume_id, inode, client_id, token)
+            .await
+    }
 
+    /// 内部：用指定 token 发送 ReleaseLease 请求并清理本地 lease 缓存
+    async fn release_lease_remote_with_token(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> ClientResult<()> {
         let volume = self
             .volume_router
             .get(&volume_id)
@@ -887,7 +919,7 @@ impl VolumeClient {
         let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
 
         let mut enc = powerfs_net::serialize::TlvEncoder::new();
-        enc.add_string(FieldId::LeaseToken, &token)?;
+        enc.add_string(FieldId::LeaseToken, token)?;
         enc.add_string(FieldId::ClientId, client_id)?;
 
         let result = vol_client
@@ -924,8 +956,64 @@ impl VolumeClient {
         }
     }
 
+    /// 直接发送 WriteNeedle 请求 (绕过 data_queue，避免队列延迟导致 lease 过期)
+    ///
+    /// 与 acquire_lease/release_lease 一样使用直接网络发送，确保 WriteNeedle
+    /// 在 lease 有效期内到达 Volume Server。data_queue 的异步处理可能延迟
+    /// 30 秒（request_timeout），导致 lease 被释放后 WriteNeedle 才被处理。
+    pub async fn send_write_needle_direct(
+        &self,
+        volume_id: u64,
+        payload: Vec<u8>,
+    ) -> ClientResult<Vec<u8>> {
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        let result = vol_client
+            .send_request(powerfs_net::MsgType::WriteNeedle, &payload, &[])
+            .await;
+
+        match result {
+            Ok(resp) if resp.is_ok() => {
+                self.breakers.record_success(&volume.addr);
+                log::debug!(
+                    "send_write_needle_direct: volume={}, addr={}",
+                    volume_id,
+                    volume.addr
+                );
+                Ok(resp.body)
+            }
+            Ok(resp) => {
+                self.breakers.record_failure(&volume.addr);
+                Err(ClientError::Server(format!(
+                    "WriteNeedle failed: status={}",
+                    resp.header.status
+                )))
+            }
+            Err(e) => {
+                self.breakers.record_failure(&volume.addr);
+                Err(ClientError::from_net_error(e))
+            }
+        }
+    }
+
     /// 异步续租 Lease: 直接构建 TLV 请求发送到 Volume Server
     pub async fn renew_lease(&self, volume_id: u64, inode: u64, token: &str) -> ClientResult<()> {
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        let client_id = self.config.client_id.clone();
+
         let duration_ms = self
             .leases
             .get(&(volume_id, inode))
@@ -936,16 +1024,6 @@ impl VolumeClient {
                     .saturating_mul(1000)
             })
             .unwrap_or(30000);
-
-        let volume = self
-            .volume_router
-            .get(&volume_id)
-            .map(|v| v.clone())
-            .ok_or(ClientError::VolumeNotFound(volume_id))?;
-
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
-
-        let client_id = self.config.client_id.clone();
 
         let mut enc = powerfs_net::serialize::TlvEncoder::new();
         enc.add_string(FieldId::LeaseToken, token)?;
@@ -1082,7 +1160,10 @@ impl VolumeClient {
 
         // 步骤 6: 恢复客户端
         *self.state.lock().unwrap() = VolumeClientState::Ready;
-        self.notify.notify_one();
+        // 唤醒所有 processor（恢复后三个 queue 都可能有积压请求）
+        self.data_notify.notify_one();
+        self.lease_notify.notify_one();
+        self.mgmt_notify.notify_one();
         log::info!(
             "VolumeClient: Resumed with queues: data={}, lease={}, mgmt={}",
             self.data_queue.len(),
@@ -1194,7 +1275,7 @@ impl VolumeClient {
         let volume_router = self.volume_router.clone();
         let leases = self.leases.clone();
         let response_waiters = self.response_waiters.clone();
-        let notify = self.notify.clone();
+        let notify = self.data_notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let data_processor_running = self.data_processor_running.clone();
         let processed_count = self.data_processed_count.clone();
@@ -1234,6 +1315,7 @@ impl VolumeClient {
                     &volume_router,
                     &leases,
                     &response_waiters,
+                    &notify,
                 )
                 .await;
 
@@ -1265,7 +1347,7 @@ impl VolumeClient {
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
         let response_waiters = self.response_waiters.clone();
-        let notify = self.notify.clone();
+        let notify = self.lease_notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let lease_processor_running = self.lease_processor_running.clone();
         let processed_count = self.lease_processed_count.clone();
@@ -1305,6 +1387,7 @@ impl VolumeClient {
                     &default_volume_addrs,
                     &volume_router,
                     &response_waiters,
+                    &notify,
                 )
                 .await;
 
@@ -1336,7 +1419,7 @@ impl VolumeClient {
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
         let response_waiters = self.response_waiters.clone();
-        let notify = self.notify.clone();
+        let notify = self.mgmt_notify.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let mgmt_processor_running = self.mgmt_processor_running.clone();
         let processed_count = self.mgmt_processed_count.clone();
@@ -1374,6 +1457,7 @@ impl VolumeClient {
                     &default_volume_addrs,
                     &volume_router,
                     &response_waiters,
+                    &notify,
                 )
                 .await;
 
@@ -1404,7 +1488,9 @@ impl VolumeClient {
             let mut running = self.mgmt_processor_running.lock().unwrap();
             *running = false;
         }
-        self.notify.notify_waiters();
+        self.data_notify.notify_waiters();
+        self.lease_notify.notify_waiters();
+        self.mgmt_notify.notify_waiters();
         log::info!("VolumeClient: Stopping all background processors...");
     }
 
@@ -1641,6 +1727,34 @@ fn resolve_waiter_for(
     }
 }
 
+/// 生成 volume 连接的唯一 client_id。
+///
+/// 组合维度：
+/// - **hostname**（容器名/节点名）：区分不同物理/容器节点
+/// - **PID**：区分同一节点上的不同 fuse 进程（不同挂载点）
+/// - **原子计数器**：区分同一进程内的多个连接（不同 volume server）
+///
+/// 输出 u64：高 48 位 = hash(hostname + PID)，低 16 位 = 计数器（65536 连接/进程）
+fn generate_volume_conn_id() -> u64 {
+    use std::hash::{Hash, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // PID: 同节点不同 fuse 进程（挂载点）得到不同 hash
+    std::process::id().hash(&mut hasher);
+    // hostname: 不同容器/节点得到不同 hash
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        hostname.hash(&mut hasher);
+    } else if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
+        hostname.trim().hash(&mut hasher);
+    }
+    let base = hasher.finish();
+
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 高 48 位 base + 低 16 位 counter
+    (base << 16) | (counter & 0xFFFF)
+}
+
 /// 从连接池获取或创建到指定地址的 volume 客户端
 async fn get_or_create_volume_client_from_pool(
     volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
@@ -1664,10 +1778,14 @@ async fn get_or_create_volume_client_from_pool(
         .map_err(|_| ClientError::InvalidAddress(addr.to_string()))?;
 
     // 创建新连接
+    // 生成唯一 client_id：基于 hostname(区分节点) + PID(区分同节点不同挂载点进程) + 计数器(区分同进程多连接)
+    // 避免所有连接共用 client_id=0，导致一个连接断开时 server 清理 session 影响所有连接
+    let conn_client_id = generate_volume_conn_id();
+
     let client_config = ClientConfig {
         addr: host,
         port,
-        client_id: 0,
+        client_id: conn_client_id,
         client_type: powerfs_net::ClientType::Fuse,
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(10),
@@ -1764,7 +1882,28 @@ async fn process_volume_available_requests(
     false
 }
 
+/// 并发派发 guard：RAII 保证 `remove_request` + `notify_one` 在任务结束时执行
+/// （含 panic 情形），避免并发槽位泄漏导致 processor 死锁。
+struct ConcurrencyGuard {
+    channel: Arc<TransportChannel>,
+    request_id: RequestId,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        self.channel.remove_request(&self.request_id);
+        // 唤醒可能因 channel 满而阻塞的 processor，继续派发队列内剩余请求
+        self.notify.notify_one();
+    }
+}
+
 /// 独立的数据请求处理器 (专用 tokio 任务使用)
+///
+/// 并发派发模型：dequeue 后 `tokio::spawn` 独立任务处理，用 TransportChannel
+/// 的 `add_request`/`remove_request` 做真实并发控制（max_concurrent 生效）。
+/// 单个请求的网络超时只影响自身，不会阻塞队列内其他请求。
+/// 这是修复 30 秒延迟根因的关键：旧实现串行 await 单个请求的完整网络往返。
 #[allow(clippy::too_many_arguments)]
 async fn process_data_requests(
     data_queue: &Arc<RequestQueue>,
@@ -1775,28 +1914,65 @@ async fn process_data_requests(
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+    notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
-    if data_channels.iter().any(|c| c.can_accept()) {
-        let next_req = data_queue.dequeue();
-        if let Some(req) = next_req {
+    // 使用第一个 data_channel 做并发控制（max_concurrent=32）
+    let channel = match data_channels.first() {
+        Some(c) => c.clone(),
+        None => return false,
+    };
+
+    let mut processed_any = false;
+    // 持续派发直到 channel 满 或 队列空
+    while channel.can_accept() {
+        let next_req = match data_queue.dequeue() {
+            Some(r) => r,
+            None => break,
+        };
+        let request_id = next_req.context.request_id.clone();
+        channel.add_request(request_id.clone());
+
+        let volume_connections = volume_connections.clone();
+        let default_volume_addrs = default_volume_addrs.clone();
+        let breakers = breakers.clone();
+        let volume_router = volume_router.clone();
+        let leases = leases.clone();
+        let response_waiters = response_waiters.clone();
+        let channel_clone = channel.clone();
+        let notify_clone = notify.clone();
+
+        tokio::spawn(async move {
+            // guard 在任务结束（含 panic）时自动 remove_request + notify_one
+            let _guard = ConcurrencyGuard {
+                channel: channel_clone,
+                request_id,
+                notify: notify_clone,
+            };
+
+            // process_data_request_internal 的 _data_channels 参数未使用，传空 vec
+            let empty_channels: Vec<Arc<TransportChannel>> = Vec::new();
             let _ = process_data_request_internal(
-                req,
-                volume_connections,
-                default_volume_addrs,
-                breakers,
-                data_channels,
-                volume_router,
-                leases,
-                response_waiters,
+                next_req,
+                &volume_connections,
+                &default_volume_addrs,
+                &breakers,
+                &empty_channels,
+                &volume_router,
+                &leases,
+                &response_waiters,
             )
             .await;
-            return true;
-        }
+            // _guard 在此 drop
+        });
+
+        processed_any = true;
     }
-    false
+    processed_any
 }
 
 /// 独立的 Lease 请求处理器 (专用 tokio 任务使用, 高优先级)
+///
+/// 并发派发模型同 `process_data_requests`：spawn 独立任务 + 真实并发控制。
 #[allow(clippy::too_many_arguments)]
 async fn process_lease_requests(
     lease_queue: &Arc<RequestQueue>,
@@ -1806,27 +1982,53 @@ async fn process_lease_requests(
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+    notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
-    if lease_channel.can_accept() {
-        let next_req = lease_queue.dequeue();
-        if let Some(req) = next_req {
+    let mut processed_any = false;
+    while lease_channel.can_accept() {
+        let next_req = match lease_queue.dequeue() {
+            Some(r) => r,
+            None => break,
+        };
+        let request_id = next_req.context.request_id.clone();
+        lease_channel.add_request(request_id.clone());
+
+        let volume_connections = volume_connections.clone();
+        let default_volume_addrs = default_volume_addrs.clone();
+        let breakers = breakers.clone();
+        let volume_router = volume_router.clone();
+        let response_waiters = response_waiters.clone();
+        let channel_clone = lease_channel.clone();
+        let notify_clone = notify.clone();
+
+        tokio::spawn(async move {
+            let guard = ConcurrencyGuard {
+                channel: channel_clone,
+                request_id,
+                notify: notify_clone,
+            };
+            // process_lease_request_internal 的 _lease_channel 参数未使用，借用 guard.channel
             let _ = process_lease_request_internal(
-                req,
-                volume_connections,
-                default_volume_addrs,
-                breakers,
-                lease_channel,
-                volume_router,
-                response_waiters,
+                next_req,
+                &volume_connections,
+                &default_volume_addrs,
+                &breakers,
+                &guard.channel,
+                &volume_router,
+                &response_waiters,
             )
             .await;
-            return true;
-        }
+            // guard 在此 drop
+        });
+
+        processed_any = true;
     }
-    false
+    processed_any
 }
 
 /// 独立的管理请求处理器 (专用 tokio 任务使用)
+///
+/// 并发派发模型同 `process_data_requests`：spawn 独立任务 + 真实并发控制。
 #[allow(clippy::too_many_arguments)]
 async fn process_mgmt_requests(
     mgmt_queue: &Arc<RequestQueue>,
@@ -1836,24 +2038,48 @@ async fn process_mgmt_requests(
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+    notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
-    if mgmt_channel.can_accept() {
-        let next_req = mgmt_queue.dequeue();
-        if let Some(req) = next_req {
+    let mut processed_any = false;
+    while mgmt_channel.can_accept() {
+        let next_req = match mgmt_queue.dequeue() {
+            Some(r) => r,
+            None => break,
+        };
+        let request_id = next_req.context.request_id.clone();
+        mgmt_channel.add_request(request_id.clone());
+
+        let volume_connections = volume_connections.clone();
+        let default_volume_addrs = default_volume_addrs.clone();
+        let breakers = breakers.clone();
+        let volume_router = volume_router.clone();
+        let response_waiters = response_waiters.clone();
+        let channel_clone = mgmt_channel.clone();
+        let notify_clone = notify.clone();
+
+        tokio::spawn(async move {
+            let guard = ConcurrencyGuard {
+                channel: channel_clone,
+                request_id,
+                notify: notify_clone,
+            };
+            // process_mgmt_request_internal 的 _mgmt_channel 参数未使用，借用 guard.channel
             let _ = process_mgmt_request_internal(
-                req,
-                volume_connections,
-                default_volume_addrs,
-                breakers,
-                mgmt_channel,
-                volume_router,
-                response_waiters,
+                next_req,
+                &volume_connections,
+                &default_volume_addrs,
+                &breakers,
+                &guard.channel,
+                &volume_router,
+                &response_waiters,
             )
             .await;
-            return true;
-        }
+            // guard 在此 drop
+        });
+
+        processed_any = true;
     }
-    false
+    processed_any
 }
 
 /// 数据请求处理（自由函数版本）

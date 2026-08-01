@@ -29,6 +29,36 @@ impl ClientIdentity {
         }
     }
 
+    /// 创建稳定的客户端身份（基于 hostname + mount_point hash）
+    ///
+    /// **关键**：CRDT 的 Add-Wins 策略用 client_id 区分操作来源。如果 client_id
+    /// 在重启后变化，filer 端会将同客户端的旧 Add（旧 client_id）和新 Remove
+    /// （新 client_id）误判为不同客户端的并发操作，触发 Add-Wins 跳过 Remove，
+    /// 导致删除不生效。
+    ///
+    /// 此方法基于 hostname（区分节点）+ mount_point（区分同节点不同挂载点）
+    /// hash 生成稳定 client_id，重启后保持不变：
+    /// - 同节点同挂载点重启 → client_id 不变（CRDT 操作连续）
+    /// - 同节点不同挂载点 → client_id 不同（mount_point 不同）
+    /// - 不同节点 → client_id 不同（hostname 不同）
+    pub fn stable_for(mount_point: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // hostname: 不同容器/节点得到不同 hash
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            hostname.hash(&mut hasher);
+        } else if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
+            hostname.trim().hash(&mut hasher);
+        }
+        // mount_point: 同节点不同挂载点得到不同 hash
+        mount_point.hash(&mut hasher);
+        let client_id = hasher.finish() % (i64::MAX as u64);
+        Self {
+            client_id,
+            client_uuid: Uuid::new_v4().to_string(),
+        }
+    }
+
     /// 从文件加载或创建新的身份
     ///
     /// 如果文件存在，则加载；否则创建新的并保存。

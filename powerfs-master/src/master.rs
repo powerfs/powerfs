@@ -796,6 +796,24 @@ impl MasterNode {
             RaftCommand::DeleteCollection { name } => {
                 self.apply_delete_collection(&name).await?;
             }
+            RaftCommand::CreateCollectionExt { info } => {
+                self.collection_manager
+                    .write()
+                    .unwrap()
+                    .create_collection(info)?;
+            }
+            RaftCommand::UpdateCollectionExt { name, info } => {
+                self.collection_manager
+                    .write()
+                    .unwrap()
+                    .update_collection(&name, info)?;
+            }
+            RaftCommand::DeleteCollectionExt { name } => {
+                self.collection_manager
+                    .write()
+                    .unwrap()
+                    .delete_collection(&name)?;
+            }
             RaftCommand::DeleteVolume { volume_id } => {
                 self.apply_delete_volume(volume_id).await?;
             }
@@ -1214,6 +1232,16 @@ impl MasterNode {
             .create_collection(info)
     }
 
+    /// Create a collection with P0 extended attributes via Raft consensus.
+    pub async fn create_collection_via_raft(&self, info: CollectionInfo) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        let cmd = RaftCommand::CreateCollectionExt { info };
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
     /// Update a collection's extended attributes in place.
     pub async fn update_collection_ext(&self, name: &str, info: CollectionInfo) -> Result<()> {
         if !self.is_leader().await {
@@ -1223,6 +1251,31 @@ impl MasterNode {
             .write()
             .unwrap()
             .update_collection(name, info)
+    }
+
+    /// Update a collection with P0 extended attributes via Raft consensus.
+    pub async fn update_collection_via_raft(&self, name: &str, info: CollectionInfo) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        let cmd = RaftCommand::UpdateCollectionExt {
+            name: name.to_string(),
+            info,
+        };
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Delete a collection (extended-attribute store) via Raft consensus.
+    pub async fn delete_collection_via_raft(&self, name: &str) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+        let cmd = RaftCommand::DeleteCollectionExt {
+            name: name.to_string(),
+        };
+        self.propose_command(cmd).await?;
+        Ok(())
     }
 
     /// Delete a collection from the extended-attribute store.

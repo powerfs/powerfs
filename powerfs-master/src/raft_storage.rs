@@ -75,6 +75,16 @@ pub enum RaftCommand {
     DeleteCollection {
         name: String,
     },
+    CreateCollectionExt {
+        info: crate::collection::CollectionInfo,
+    },
+    UpdateCollectionExt {
+        name: String,
+        info: crate::collection::CollectionInfo,
+    },
+    DeleteCollectionExt {
+        name: String,
+    },
     DeleteVolume {
         volume_id: u64,
     },
@@ -414,23 +424,42 @@ impl RocksDbStorage {
             );
         }
 
+        // CRITICAL: RocksDB's raw_iterator returns keys in lexicographic byte
+        // order, but log entry keys are stored as decimal strings ("1", "10",
+        // "100", ...).  This means "99" appears after "874" in iteration order
+        // (because '9' > '8').  Without sorting, entries.back() would return
+        // the lexicographically-last entry (e.g. index 99) instead of the
+        // numerically-last entry (e.g. index 874), causing last_index() to
+        // report a wrong value and breaking Raft leader election with
+        // "commit exceeds last index" errors on restart.
+        //
+        // Sort by entry.index to restore numeric order.
+        entries.make_contiguous().sort_by_key(|e| e.index);
+
         let last_log_index = entries.back().map_or(0, |e| e.index);
+        let snap_idx = self.snapshot_meta.read().unwrap().index;
+        // The effective last index is the max of the log and snapshot, because
+        // after a snapshot the log may be empty but the snapshot covers earlier
+        // indices.  This prevents incorrectly clamping hs.commit below the
+        // snapshot index (which would cause "commit exceeds last index" panics
+        // on restart — same fix as Filer's RocksDbRaftStorage).
+        let effective_last = last_log_index.max(snap_idx);
 
         let mut hs = self.hard_state.write().unwrap();
-        if hs.commit > last_log_index {
+        if hs.commit > effective_last {
             warn!(
-                "Hard state commit {} exceeds last log index {}; clamping to {}",
-                hs.commit, last_log_index, last_log_index
+                "Hard state commit {} exceeds effective last index {} (log={}, snapshot={}); clamping to {}",
+                hs.commit, effective_last, last_log_index, snap_idx, effective_last
             );
-            hs.commit = last_log_index;
+            hs.commit = effective_last;
         }
 
         let mut applied = self.applied_index.write().unwrap();
-        let max_valid_applied = hs.commit.min(last_log_index);
+        let max_valid_applied = hs.commit.min(effective_last);
         if *applied > max_valid_applied {
             warn!(
-                "Applied index {} exceeds valid range [0, min(commit={}, last_log={})]; clamping to {}",
-                *applied, hs.commit, last_log_index, max_valid_applied
+                "Applied index {} exceeds valid range [0, min(commit={}, effective_last={})]; clamping to {}",
+                *applied, hs.commit, effective_last, max_valid_applied
             );
             *applied = max_valid_applied;
         }
@@ -516,9 +545,10 @@ impl RocksDbStorage {
         let mut entries = self.entries.write().unwrap();
         entries.clear();
 
-        // Update hard state (term advances to snapshot term, commit to snapshot index).
+        // Update hard state — term advances but never regresses (mirrors
+        // MemStorage: hs.term = max(hs.term, meta.term)).
         let mut hs = self.hard_state.write().unwrap();
-        hs.term = meta.term;
+        hs.term = std::cmp::max(hs.term, meta.term);
         hs.commit = index;
 
         // Update conf state from snapshot.
@@ -539,6 +569,10 @@ impl RocksDbStorage {
     }
 
     /// Create a snapshot with the given data
+    ///
+    /// Updates snapshot_meta so term()/first_index()/last_index() remain
+    /// correct after compaction removes log entries (mirrors Filer's
+    /// RocksDbRaftStorage::create_snapshot).
     pub fn create_snapshot(
         &mut self,
         index: u64,
@@ -557,9 +591,18 @@ impl RocksDbStorage {
         let meta = snapshot.mut_metadata();
         meta.set_index(index);
         meta.set_term(term);
-        meta.set_conf_state(cs);
+        meta.set_conf_state(cs.clone());
 
         snapshot.set_data(data_bytes.into());
+
+        // Update in-memory snapshot metadata so term/first_index/last_index
+        // remain correct after compaction removes log entries.
+        {
+            let mut sm = self.snapshot_meta.write().unwrap();
+            sm.index = index;
+            sm.term = term;
+            sm.set_conf_state(cs);
+        }
 
         if let Some(cf) = self.db.cf_handle(CF_SNAPSHOT) {
             let mut buf = Vec::new();
@@ -567,6 +610,9 @@ impl RocksDbStorage {
                 let _ = self.db.put_cf(cf, b"latest_snapshot", &buf);
             }
         }
+
+        // Persist snapshot metadata so it survives restart.
+        let _ = self.save_state();
 
         Ok(snapshot)
     }
@@ -1015,10 +1061,19 @@ impl Storage for RocksDbStorage {
             }
         }
 
-        // No snapshot available.
-        Err(RaftError::Store(
-            StorageError::SnapshotTemporarilyUnavailable,
-        ))
+        // No stored snapshot or stored snapshot is too old — synthesize one
+        // from the current snapshot_meta (mirrors MemStorage::snapshot and
+        // Filer's RocksDbRaftStorage::snapshot).  Returning an error here
+        // would leave raft-rs unable to service Snapshot requests in the
+        // common case where no explicit snapshot has been created yet.
+        let sm = self.snapshot_meta.read().unwrap();
+        let cs = self.conf_state.read().unwrap();
+        let mut snapshot = Snapshot::new();
+        let meta = snapshot.mut_metadata();
+        meta.set_index(request_index.max(sm.index));
+        meta.set_term(sm.term);
+        meta.set_conf_state(cs.clone());
+        Ok(snapshot)
     }
 }
 

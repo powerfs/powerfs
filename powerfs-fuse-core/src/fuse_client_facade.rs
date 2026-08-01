@@ -242,8 +242,8 @@ pub struct FuseClientFacade {
     topology_manager: Arc<ClusterTopologyManager>,
     /// Master 客户端
     master_client: Arc<MasterClient>,
-    /// MetaShard 客户端
-    meta_shard_client: MetaShardClient,
+    /// MetaShard 客户端（Arc 包装：供 CrdtReplicaCoherence 作为 DeltaSyncChannel 注入）
+    meta_shard_client: Arc<MetaShardClient>,
     /// Volume 客户端
     volume_client: Arc<VolumeClient>,
     /// Master 统计上报器（KeepConnected 心跳）。
@@ -277,14 +277,20 @@ impl FuseClientFacade {
         let meta_shard_client = MetaShardClient::new(meta_config, topology_manager.clone());
 
         // 创建 Volume 客户端
-        let volume_config = VolumeClientConfig::default();
+        // CRITICAL: sync volume_config.client_id with client_identity.client_id so
+        // that background lease renewal uses the same client_id as acquire/release.
+        // Otherwise the Volume Server rejects renewals with "Lease holder mismatch".
+        let volume_config = VolumeClientConfig {
+            client_id: config.client_identity.client_id.to_string(),
+            ..Default::default()
+        };
         let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
 
         Ok(Self {
             config,
             topology_manager,
             master_client,
-            meta_shard_client,
+            meta_shard_client: Arc::new(meta_shard_client),
             volume_client,
             stats_reporter: None,
         })
@@ -356,7 +362,13 @@ impl FuseClientFacade {
         meta_shard_client.init();
 
         // 创建 Volume 客户端（暂时为空，后续改造）
-        let volume_config = VolumeClientConfig::default();
+        // CRITICAL: sync volume_config.client_id with client_identity.client_id so
+        // that background lease renewal uses the same client_id as acquire/release.
+        // Otherwise the Volume Server rejects renewals with "Lease holder mismatch".
+        let volume_config = VolumeClientConfig {
+            client_id: config.client_identity.client_id.to_string(),
+            ..Default::default()
+        };
         let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
 
         // 设置默认 Volume 地址（从配置获取）
@@ -397,7 +409,7 @@ impl FuseClientFacade {
             config,
             topology_manager,
             master_client,
-            meta_shard_client,
+            meta_shard_client: Arc::new(meta_shard_client),
             volume_client,
             stats_reporter,
         };
@@ -414,8 +426,8 @@ impl FuseClientFacade {
         &self.master_client
     }
 
-    /// 获取 MetaShard 客户端引用
-    pub fn meta_shard_client(&self) -> &MetaShardClient {
+    /// 获取 MetaShard 客户端引用（Arc 包装，便于注入 DeltaSyncChannel）
+    pub fn meta_shard_client(&self) -> &Arc<MetaShardClient> {
         &self.meta_shard_client
     }
 
@@ -432,6 +444,11 @@ impl FuseClientFacade {
     /// 获取客户端标识（用于 lease holder 校验）
     pub fn client_id(&self) -> String {
         self.config.client_identity.client_id.to_string()
+    }
+
+    /// 获取客户端 u64 ID（用于 EntryId / VectorClock / CrdtReplicaCoherence）
+    pub fn client_id_u64(&self) -> u64 {
+        self.config.client_identity.client_id
     }
 
     /// 获取 Volume 路由地址（从 VolumeClient 内部路由表查询）
@@ -582,6 +599,23 @@ impl FuseClientFacade {
             .map_err(|e| format!("Data request failed: {}", e))
     }
 
+    /// 直接发送 WriteNeedle 请求（绕过 data_queue，避免 block_on 死锁）
+    ///
+    /// FUSE write 回调在同步线程中通过 block_on 调用 write_blob_with_lease，
+    /// 若走 data_queue（异步队列+spawn），响应需要 tokio worker 调度才能回到
+    /// block_on 的 waiter。block_on 阻塞 worker 后形成死锁，10s 超时。
+    /// 直接发送用 vol_client.send_request，recv_loop 是独立 task 不受影响。
+    pub async fn send_write_needle_direct(
+        &self,
+        volume_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        self.volume_client
+            .send_write_needle_direct(volume_id, payload)
+            .await
+            .map_err(|e| format!("Direct WriteNeedle failed: {}", e))
+    }
+
     // ======= Lease 请求方法（委托给 VolumeClient）=======
 
     /// 直接获取 Lease (绕过队列，直接网络请求)
@@ -611,14 +645,18 @@ impl FuseClientFacade {
     }
 
     /// 直接释放 Lease (绕过队列，直接网络请求)
+    ///
+    /// token 由调用方传入，避免从 leases 表查到错误 token。
+    /// 传空字符串则内部从 leases 表取（兼容旧路径）。
     pub async fn release_lease(
         &self,
         volume_id: u64,
         inode: u64,
         client_id: &str,
+        token: &str,
     ) -> Result<(), String> {
         self.volume_client
-            .release_lease_remote(volume_id, inode, client_id)
+            .release_lease_remote(volume_id, inode, client_id, token)
             .await
             .map_err(|e| format!("ReleaseLease failed: {}", e))
     }
@@ -771,8 +809,26 @@ impl SyncFuseClientFacade {
         &self.runtime
     }
 
-    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        self.runtime.block_on(future)
+    /// 同步桥接异步 future（不占用 tokio worker 线程）
+    ///
+    /// 通过 handle.spawn 将 future 提交到 tokio runtime，当前线程在
+    /// mpsc::channel 上阻塞等待结果。这样 tokio worker 可以自由调度
+    /// data_queue processor、send_task、recv_loop 等 spawn task，
+    /// 避免 block_on 占用 worker 导致的调度争用和超时。
+    ///
+    /// 详见 docs/communication-optimization-plan.md §12 阶段1.5
+    pub fn block_on<F: std::future::Future + Send + 'static>(&self, future: F) -> F::Output
+    where
+        F::Output: Send + 'static,
+    {
+        let handle = self.runtime.handle().clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        handle.spawn(async move {
+            let result = future.await;
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .expect("block_on: future panicked or runtime dropped")
     }
 
     /// 获取客户端标识（用于 lease holder 校验）
@@ -873,6 +929,25 @@ impl SyncFuseClientFacade {
         })
     }
 
+    /// Create an entry with a known parent inode, avoiding path resolution.
+    pub fn create_entry_with_parent_ino(
+        &self,
+        entry: &ProtoEntry,
+        parent_ino: u64,
+        client_id: &str,
+    ) -> Result<u64, String> {
+        let facade = self.facade.clone();
+        let traits_entry = proto_entry_to_traits(entry);
+        let client_id = client_id.to_string();
+        self.runtime.block_on(async move {
+            let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
+            provider
+                .create_entry_with_parent_ino(&traits_entry, parent_ino, &client_id)
+                .await
+                .map_err(pfe_to_string)
+        })
+    }
+
     pub fn update_entry(
         &self,
         entry: &ProtoEntry,
@@ -922,11 +997,28 @@ impl SyncFuseClientFacade {
     }
 
     /// 同步释放 Lease
-    pub fn release_lease(&self, volume_id: u64, inode: u64, client_id: &str) -> Result<(), String> {
+    ///
+    /// token 由调用方传入（LeaseGuard 持有的 token 或空字符串由内部查表）。
+    pub fn release_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
-        self.runtime
-            .block_on(async move { facade.release_lease(volume_id, inode, &client_id).await })
+        let token = token.to_string();
+        self.runtime.block_on(async move {
+            facade
+                .release_lease(volume_id, inode, &client_id, &token)
+                .await
+        })
+    }
+
+    /// 获取有效的 lease token（委托给 Facade → VolumeClient）
+    pub fn get_valid_lease_token(&self, volume_id: u64, inode: u64) -> Option<String> {
+        self.facade.get_valid_lease_token(volume_id, inode)
     }
 
     pub fn delete_entry(

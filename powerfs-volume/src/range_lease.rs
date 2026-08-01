@@ -45,6 +45,10 @@ pub struct RangeLeaseManager {
     default_stripe_size: u64,
     /// Background cleanup task shutdown flag
     shutdown_flag: Arc<AtomicBool>,
+    /// Grace period (ms) for cleanup_expired: leases expired within this
+    /// window are NOT removed, so validate_token_with_grace_period can still
+    /// find them. Must be >= the grace period used by validation callers.
+    cleanup_grace_ms: u64,
 }
 
 impl RangeLeaseManager {
@@ -57,11 +61,20 @@ impl RangeLeaseManager {
             epoch_counter: Arc::new(AtomicU64::new(0)),
             default_stripe_size,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            cleanup_grace_ms: 5000,
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(64 * 1024 * 1024)
+    }
+
+    /// Set the cleanup grace period (ms). Leases expired within this window
+    /// are not removed by cleanup_expired, allowing validate_token_with_grace_period
+    /// to still find them.
+    pub fn with_cleanup_grace_ms(mut self, grace_ms: u64) -> Self {
+        self.cleanup_grace_ms = grace_ms;
+        self
     }
 
     /// Clone the shutdown flag for background tasks to monitor
@@ -402,9 +415,14 @@ impl RangeLeaseManager {
         let mut holder_index = self.holder_index.write().unwrap();
         let mut removed = 0usize;
 
+        // Only remove leases expired BEYOND the grace period.
+        // Leases within the grace period are kept so that
+        // validate_token_with_grace_period can still find them.
+        let grace = Duration::from_millis(self.cleanup_grace_ms);
+        let now = Instant::now();
         let expired_tokens: Vec<String> = leases
             .iter()
-            .filter(|(_, l)| l.is_expired())
+            .filter(|(_, l)| now > l.expire_at + grace)
             .map(|(t, _)| t.clone())
             .collect();
 
@@ -495,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_expired_cleanup() {
-        let mgr = RangeLeaseManager::with_defaults();
+        let mgr = RangeLeaseManager::with_defaults().with_cleanup_grace_ms(0);
         let _lease = mgr.acquire(1, 0, 4, "client-a", 1, true, 0).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let removed = mgr.cleanup_expired();
@@ -601,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_only_removes_expired() {
-        let mgr = RangeLeaseManager::with_defaults();
+        let mgr = RangeLeaseManager::with_defaults().with_cleanup_grace_ms(0);
         // One expired lease
         let _expired = mgr.acquire(1, 0, 4, "client-a", 1, true, 0).unwrap();
         // One valid lease
@@ -727,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_expired_leases_do_not_inflate_holder_count() {
-        let mgr = RangeLeaseManager::with_defaults();
+        let mgr = RangeLeaseManager::with_defaults().with_cleanup_grace_ms(0);
         let _l1 = mgr.acquire(1, 0, 4, "client-a", 10, true, 0).unwrap();
 
         assert_eq!(mgr.get_active_holders_count(), 1);
@@ -743,5 +761,38 @@ mod tests {
         let removed = mgr.cleanup_expired();
         assert_eq!(removed, 1);
         assert_eq!(mgr.get_active_holders_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_grace_period_preserves_recently_expired() {
+        // With a 500ms grace period, leases expired within 500ms should
+        // NOT be removed by cleanup_expired (so validate_token_with_grace_period
+        // can still find them).
+        let mgr = RangeLeaseManager::with_defaults().with_cleanup_grace_ms(500);
+        let lease = mgr.acquire(1, 0, 4, "client-a", 50, true, 0).unwrap();
+
+        // Wait for lease to expire but stay within grace period
+        std::thread::sleep(Duration::from_millis(100));
+
+        // cleanup_expired should NOT remove it (within 500ms grace)
+        let removed = mgr.cleanup_expired();
+        assert_eq!(
+            removed, 0,
+            "lease within grace period should not be removed"
+        );
+
+        // validate_token_with_grace_period should still find it
+        let result = mgr.validate_token_with_grace_period(&lease.token, "client-a", 1, 3000);
+        assert!(
+            result.is_ok(),
+            "validation should succeed within grace period"
+        );
+
+        // Wait beyond grace period
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Now cleanup_expired should remove it
+        let removed = mgr.cleanup_expired();
+        assert_eq!(removed, 1, "lease beyond grace period should be removed");
     }
 }

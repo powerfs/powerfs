@@ -259,6 +259,21 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         crdt_maintenance_interval_secs
     );
 
+    // Phase 3.5: 启动后台 GC 任务——定期扫描 tombstone 并物理删除超 grace_period 的条目
+    // 物理删除元数据后异步回收 volume server 数据块（delete_needle）
+    let gc_interval_secs = filer_cfg.gc_interval_secs.unwrap_or(300);
+    let gc_grace_period_secs = filer_cfg.gc_grace_period_secs.unwrap_or(86400);
+    let _gc_handle = meta_shard_manager.spawn_gc_task(
+        gc_interval_secs,
+        gc_grace_period_secs,
+        volume_router.clone(),
+        volume_client_pool.clone(),
+    );
+    info!(
+        "GC task started (interval={}s, grace_period={}s, data_reclaim=enabled)",
+        gc_interval_secs, gc_grace_period_secs
+    );
+
     let s3_handler = Arc::new(
         S3Handler::new(
             bucket_manager.clone(),

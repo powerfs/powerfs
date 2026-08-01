@@ -22,6 +22,7 @@ powerfs-core = { path = "../powerfs-core" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
+powerfs-coherence = { path = "../powerfs-coherence" }
 fuse-backend-rs = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }

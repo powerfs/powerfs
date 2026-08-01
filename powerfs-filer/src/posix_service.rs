@@ -594,7 +594,11 @@ impl PosixMetaService for PosixMetaServiceImpl {
         request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
         let req = request.into_inner();
-        let shard_id = ShardId(req.shard_id);
+        // 与 net_handler 一致：req.shard_id 语义为 dir_ino，重映射到实际 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
 
         let result = self
             .meta_shard_manager
@@ -620,11 +624,16 @@ impl PosixMetaService for PosixMetaServiceImpl {
         request: Request<PullDeltaRequest>,
     ) -> Result<Response<PullDeltaResponse>, Status> {
         let req = request.into_inner();
-        let shard_id = ShardId(req.shard_id);
+        // 与 net_handler 一致：req.shard_id 语义为 dir_ino，重映射到实际 shard
+        let dir_ino = req.shard_id;
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(dir_ino);
 
         let result = self
             .meta_shard_manager
-            .pull_delta(shard_id, &req.client_id, &req.client_vclock)
+            .pull_delta(shard_id, dir_ino, &req.client_id, &req.client_vclock)
             .await;
 
         match result {

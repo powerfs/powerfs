@@ -455,7 +455,11 @@ impl FilerMetaService for FilerMetaServiceImpl {
         request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
         let req = request.into_inner();
-        let shard_id = ShardId(req.shard_id);
+        // 与 net_handler 一致：req.shard_id 语义为 dir_ino，重映射到实际 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
 
         // B4: delta sync 必须跟 leader（follower 无最新 commit，且写不被 Raft 复制）
         match self
@@ -517,7 +521,12 @@ impl FilerMetaService for FilerMetaServiceImpl {
         request: Request<PullDeltaRequest>,
     ) -> Result<Response<PullDeltaResponse>, Status> {
         let req = request.into_inner();
-        let shard_id = ShardId(req.shard_id);
+        // 与 net_handler 一致：req.shard_id 语义为 dir_ino，重映射到实际 shard
+        let dir_ino = req.shard_id;
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(dir_ino);
 
         // B4: pull_delta 也跟 leader，保证拿到最新已 commit 的 delta
         match self
@@ -546,7 +555,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
 
         let result = self
             .meta_shard_manager
-            .pull_delta(shard_id, &req.client_id, &req.client_vclock)
+            .pull_delta(shard_id, dir_ino, &req.client_id, &req.client_vclock)
             .await;
 
         match result {

@@ -3,7 +3,7 @@ use lru::LruCache;
 use powerfs_common::types::Fid;
 use powerfs_master::proto::FileChunk;
 use powerfs_orset::CachedFileChunk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -88,6 +88,9 @@ pub struct MetadataCache {
     metadata_ttl: Duration,
     /// Latest known generation per path (from notifications)
     path_generations: RwLock<HashMap<String, u64>>,
+    /// Pinned inodes (open files): skip TTL expiry to prevent cache miss
+    /// during slow writes that exceed metadata_ttl.
+    pinned_inodes: RwLock<HashSet<u64>>,
 }
 
 impl MetadataCache {
@@ -106,6 +109,7 @@ impl MetadataCache {
             dir_cache_ttl: Duration::from_secs(5),
             metadata_ttl: DEFAULT_METADATA_TTL,
             path_generations: RwLock::new(HashMap::new()),
+            pinned_inodes: RwLock::new(HashSet::new()),
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
@@ -150,7 +154,10 @@ impl MetadataCache {
     pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
         let mut cache = self.inode_cache.write().unwrap();
         let entry = cache.get(&inode).cloned()?;
-        if entry.cached_at.elapsed() > self.metadata_ttl {
+        // Pinned inodes (open files) skip TTL expiry to prevent cache miss
+        // during slow writes that exceed metadata_ttl.
+        let is_pinned = self.pinned_inodes.read().unwrap().contains(&inode);
+        if !is_pinned && entry.cached_at.elapsed() > self.metadata_ttl {
             // Entry too old, treat as stale
             debug!(
                 "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}), treating as stale",
@@ -162,6 +169,18 @@ impl MetadataCache {
         } else {
             Some(entry)
         }
+    }
+
+    /// Pin an inode to skip TTL expiry (called on open).
+    /// Pinned inodes stay in cache as long as the file is open,
+    /// preventing cache miss during slow writes.
+    pub fn pin_inode(&self, inode: u64) {
+        self.pinned_inodes.write().unwrap().insert(inode);
+    }
+
+    /// Unpin an inode (called on release/close).
+    pub fn unpin_inode(&self, inode: u64) {
+        self.pinned_inodes.write().unwrap().remove(&inode);
     }
 
     /// Get path by walking up parent chain
@@ -240,6 +259,10 @@ impl MetadataCache {
             let mut path_map = self.path_map.write().unwrap();
             path_map.insert(path, inode);
         }
+        // Invalidate dir cache BEFORE inserting the new entry.
+        // invalidate_dir removes all children of parent from inode_cache;
+        // calling it after insert would evict the just-inserted entry.
+        self.invalidate_dir(parent);
         // Update inode_cache:
         // - If this is a new inode: insert the entry as-is
         // - If the inode exists but name/parent changed: treat as rename, update the entry
@@ -266,7 +289,6 @@ impl MetadataCache {
             cache.put(inode, entry);
         }
         drop(cache);
-        self.invalidate_dir(parent);
     }
 
     /// Remove an entry by inode
@@ -347,7 +369,15 @@ impl MetadataCache {
         }
     }
 
-    /// Invalidate directory listing cache for a parent inode
+    /// Invalidate directory listing cache for a parent inode.
+    ///
+    /// 清空 dir_cache（目录列表缓存），确保 `list_children` 不会返回过时的条目。
+    /// 这是 CRDT delta sync 联动失效的关键：puller 拉取到 Remove delta 后，
+    /// 必须清空 dir_cache 中的旧目录列表，否则 readdir 会继续返回已删除的文件。
+    ///
+    /// 注意：只清空 dir_cache（目录列表），不清空 inode_cache 中的子条目。
+    /// inode_cache 的条目由各自的 TTL 和显式 remove() 管理生命周期。
+    /// 清空 inode_cache 子条目会导致刚 insert 的条目被误删（create→insert→invalidate_dir 竞态）。
     pub fn invalidate_dir(&self, parent_inode: u64) {
         let mut dir_cache = self.dir_cache.write().unwrap();
         dir_cache.remove(&parent_inode);
@@ -403,6 +433,14 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
             entry.fid = Some(fid);
+        }
+    }
+
+    /// Update chunks 列表（write/flush 后调用，确保 close 时 sync 正确的 chunks 到 filer）
+    pub fn update_chunks(&self, inode: u64, chunks: Vec<powerfs_orset::CachedFileChunk>) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.chunks = chunks;
         }
     }
 
@@ -843,6 +881,30 @@ impl MetadataCache {
 impl Default for MetadataCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// MetadataCache 的 MetadataCacheInvalidator trait 适配器。
+///
+/// 供 CrdtReplicaCoherence 注入：delta merge 后联动失效 MetadataCache。
+/// size/chunks 不被失效（强一致，仅 lease 刷新）。
+pub struct MetadataCacheInvalidatorAdapter {
+    cache: std::sync::Arc<MetadataCache>,
+}
+
+impl MetadataCacheInvalidatorAdapter {
+    pub fn new(cache: std::sync::Arc<MetadataCache>) -> Self {
+        Self { cache }
+    }
+}
+
+impl powerfs_coherence::MetadataCacheInvalidator for MetadataCacheInvalidatorAdapter {
+    fn invalidate_inode(&self, inode: u64) {
+        self.cache.invalidate_inode(inode);
+    }
+
+    fn invalidate_dir(&self, parent_inode: u64) {
+        self.cache.invalidate_dir(parent_inode);
     }
 }
 

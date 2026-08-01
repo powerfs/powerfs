@@ -700,37 +700,298 @@ async fn transfer_leader(
 #[derive(Debug, Serialize)]
 struct CollectionDetail {
     name: String,
-    replication: String,
-    ttl: String,
+    status: i32,
+    status_name: String,
+    storage_policy: Option<StoragePolicyDetail>,
     disk_type: String,
-    max_volume_count: u64,
-    volume_count: u64,
-    created_at: u64,
-    modified_at: u64,
+    capacity_quota_bytes: u64,
+    volume_count: u32,
+    ttl_seconds: u32,
+    created_at: i64,
+    updated_at: i64,
+    description: String,
+    volume_allocation: Option<VolumeAllocationDetail>,
+    excluded_volume_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoragePolicyDetail {
+    name: String,
+    redundancy: RedundancyDetail,
+    min_write_nodes: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct RedundancyDetail {
+    mode: String,
+    copies: Option<u32>,
+    data_shards: Option<u32>,
+    parity_shards: Option<u32>,
+    algorithm: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VolumeAllocationDetail {
+    mode: String,
+    count: Option<u32>,
+    volume_size: Option<u64>,
+    volume_ids: Option<Vec<u64>>,
+    fixed_volume_ids: Option<Vec<u64>>,
+    auto_count: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionStatsDetail {
+    used_bytes: u64,
+    file_count: u64,
+    volume_count: u32,
+    writable_volume_count: u32,
+    read_ops: u64,
+    write_ops: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl From<powerfs_master::proto::powerfs::CollectionStatsInfo> for CollectionStatsDetail {
+    fn from(s: powerfs_master::proto::powerfs::CollectionStatsInfo) -> Self {
+        Self {
+            used_bytes: s.used_bytes,
+            file_count: s.file_count,
+            volume_count: s.volume_count,
+            writable_volume_count: s.writable_volume_count,
+            read_ops: s.read_ops,
+            write_ops: s.write_ops,
+            read_bytes: s.read_bytes,
+            write_bytes: s.write_bytes,
+        }
+    }
 }
 
 impl From<powerfs_master::proto::powerfs::CollectionInfo> for CollectionDetail {
     fn from(c: powerfs_master::proto::powerfs::CollectionInfo) -> Self {
+        use powerfs_master::proto::powerfs::{redundancy, volume_allocation, CollectionStatus};
+
+        let status_name = CollectionStatus::try_from(c.status)
+            .map(|s| match s {
+                CollectionStatus::Active => "active",
+                CollectionStatus::Readonly => "readonly",
+                CollectionStatus::Archived => "archived",
+                CollectionStatus::Deleted => "deleted",
+                CollectionStatus::Unspecified => "unspecified",
+            })
+            .unwrap_or("unknown")
+            .to_string();
+
+        let storage_policy = c.storage_policy.map(|p| StoragePolicyDetail {
+            name: p.name,
+            redundancy: p
+                .redundancy
+                .map(|r| {
+                    let (mode, copies, data_shards, parity_shards, algorithm) = match r.mode {
+                        Some(redundancy::Mode::Replication(rep)) => (
+                            "replication".to_string(),
+                            Some(rep.copies),
+                            None,
+                            None,
+                            None,
+                        ),
+                        Some(redundancy::Mode::ErasureCoding(ec)) => (
+                            "erasure_coding".to_string(),
+                            None,
+                            Some(ec.data_shards),
+                            Some(ec.parity_shards),
+                            Some(ec.algorithm),
+                        ),
+                        None => ("replication".to_string(), Some(1), None, None, None),
+                    };
+                    RedundancyDetail {
+                        mode,
+                        copies,
+                        data_shards,
+                        parity_shards,
+                        algorithm,
+                    }
+                })
+                .unwrap_or_else(|| RedundancyDetail {
+                    mode: "replication".to_string(),
+                    copies: Some(1),
+                    data_shards: None,
+                    parity_shards: None,
+                    algorithm: None,
+                }),
+            min_write_nodes: p.min_write_nodes,
+        });
+
+        let volume_allocation = c.volume_allocation.map(|a| {
+            let (mode, count, volume_size, volume_ids, fixed_volume_ids, auto_count) = match a.mode
+            {
+                Some(volume_allocation::Mode::Auto(auto)) => (
+                    "auto".to_string(),
+                    Some(auto.count),
+                    Some(auto.volume_size),
+                    None,
+                    None,
+                    None,
+                ),
+                Some(volume_allocation::Mode::Manual(manual)) => (
+                    "manual".to_string(),
+                    None,
+                    None,
+                    Some(manual.volume_ids),
+                    None,
+                    None,
+                ),
+                Some(volume_allocation::Mode::Hybrid(hybrid)) => (
+                    "hybrid".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(hybrid.fixed_volume_ids),
+                    Some(hybrid.auto_count),
+                ),
+                None => ("auto".to_string(), Some(0), Some(0), None, None, None),
+            };
+            VolumeAllocationDetail {
+                mode,
+                count,
+                volume_size,
+                volume_ids,
+                fixed_volume_ids,
+                auto_count,
+            }
+        });
+
         Self {
             name: c.name,
-            replication: c.replication,
-            ttl: c.ttl,
+            status: c.status,
+            status_name,
+            storage_policy,
             disk_type: c.disk_type,
-            max_volume_count: c.max_volume_count,
+            capacity_quota_bytes: c.capacity_quota_bytes,
             volume_count: c.volume_count,
+            ttl_seconds: c.ttl_seconds,
             created_at: c.created_at,
-            modified_at: c.modified_at,
+            updated_at: c.updated_at,
+            description: c.description,
+            volume_allocation,
+            excluded_volume_ids: c.excluded_volume_ids,
         }
     }
+}
+
+// ----- Request body structs (JSON -> proto) -----
+
+#[derive(Debug, Deserialize)]
+struct RedundancyBody {
+    mode: Option<String>,
+    copies: Option<u32>,
+    data_shards: Option<u32>,
+    parity_shards: Option<u32>,
+    algorithm: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoragePolicyBody {
+    name: Option<String>,
+    redundancy: Option<RedundancyBody>,
+    min_write_nodes: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeAllocationBody {
+    mode: Option<String>,
+    count: Option<u32>,
+    volume_size: Option<u64>,
+    volume_ids: Option<Vec<u64>>,
+    fixed_volume_ids: Option<Vec<u64>>,
+    auto_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateCollectionBody {
     name: String,
-    replication: Option<String>,
-    ttl: Option<String>,
+    status: Option<i32>,
+    storage_policy: Option<StoragePolicyBody>,
     disk_type: Option<String>,
-    max_volume_count: Option<u64>,
+    capacity_quota_bytes: Option<u64>,
+    volume_count: Option<u32>,
+    ttl_seconds: Option<u32>,
+    description: Option<String>,
+    volume_allocation: Option<VolumeAllocationBody>,
+    excluded_volume_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateCollectionBody {
+    status: Option<i32>,
+    storage_policy: Option<StoragePolicyBody>,
+    disk_type: Option<String>,
+    capacity_quota_bytes: Option<u64>,
+    ttl_seconds: Option<u32>,
+    description: Option<String>,
+    volume_allocation: Option<VolumeAllocationBody>,
+    excluded_volume_ids: Option<Vec<u64>>,
+}
+
+fn build_redundancy(r: &RedundancyBody) -> powerfs_master::proto::powerfs::Redundancy {
+    use powerfs_master::proto::powerfs::{
+        redundancy, ErasureCodingMode, Redundancy, ReplicationMode,
+    };
+    let mode = r.mode.as_deref().unwrap_or("replication");
+    let mode = match mode {
+        "erasure_coding" | "ec" => redundancy::Mode::ErasureCoding(ErasureCodingMode {
+            data_shards: r.data_shards.unwrap_or(4),
+            parity_shards: r.parity_shards.unwrap_or(2),
+            algorithm: r
+                .algorithm
+                .clone()
+                .unwrap_or_else(|| "reed_solomon".to_string()),
+        }),
+        _ => redundancy::Mode::Replication(ReplicationMode {
+            copies: r.copies.unwrap_or(1),
+        }),
+    };
+    Redundancy { mode: Some(mode) }
+}
+
+fn build_storage_policy(p: &StoragePolicyBody) -> powerfs_master::proto::powerfs::StoragePolicy {
+    use powerfs_master::proto::powerfs::StoragePolicy;
+    StoragePolicy {
+        name: p.name.clone().unwrap_or_default(),
+        redundancy: Some(build_redundancy(p.redundancy.as_ref().unwrap_or(
+            &RedundancyBody {
+                mode: None,
+                copies: None,
+                data_shards: None,
+                parity_shards: None,
+                algorithm: None,
+            },
+        ))),
+        min_write_nodes: p.min_write_nodes.unwrap_or(1),
+    }
+}
+
+fn build_volume_allocation(
+    a: &VolumeAllocationBody,
+) -> powerfs_master::proto::powerfs::VolumeAllocation {
+    use powerfs_master::proto::powerfs::{
+        volume_allocation, AutoAllocation, HybridAllocation, ManualAllocation, VolumeAllocation,
+    };
+    let mode = a.mode.as_deref().unwrap_or("auto");
+    let mode = match mode {
+        "manual" => volume_allocation::Mode::Manual(ManualAllocation {
+            volume_ids: a.volume_ids.clone().unwrap_or_default(),
+        }),
+        "hybrid" => volume_allocation::Mode::Hybrid(HybridAllocation {
+            fixed_volume_ids: a.fixed_volume_ids.clone().unwrap_or_default(),
+            auto_count: a.auto_count.unwrap_or(0),
+        }),
+        _ => volume_allocation::Mode::Auto(AutoAllocation {
+            count: a.count.unwrap_or(0),
+            volume_size: a.volume_size.unwrap_or(0),
+        }),
+    };
+    VolumeAllocation { mode: Some(mode) }
 }
 
 async fn list_collections(
@@ -803,12 +1064,21 @@ async fn create_collection(
     if !user.is_admin() {
         return Json(ApiResponse::error("Permission denied: admin only"));
     }
+    let storage_policy = req.storage_policy.as_ref().map(build_storage_policy);
+    let volume_allocation = req.volume_allocation.as_ref().map(build_volume_allocation);
     let request = powerfs_master::proto::powerfs::CreateCollectionRequest {
         name: req.name,
-        replication: req.replication.unwrap_or_else(|| "001".to_string()),
-        ttl: req.ttl.unwrap_or_default(),
+        status: req
+            .status
+            .unwrap_or(powerfs_master::proto::powerfs::CollectionStatus::Active as i32),
+        storage_policy,
         disk_type: req.disk_type.unwrap_or_else(|| "hdd".to_string()),
-        max_volume_count: req.max_volume_count.unwrap_or(0),
+        capacity_quota_bytes: req.capacity_quota_bytes.unwrap_or(0),
+        volume_count: req.volume_count.unwrap_or(0),
+        ttl_seconds: req.ttl_seconds.unwrap_or(0),
+        description: req.description.unwrap_or_default(),
+        volume_allocation,
+        excluded_volume_ids: req.excluded_volume_ids.unwrap_or_default(),
     };
     match state
         .master_client
@@ -827,6 +1097,90 @@ async fn create_collection(
                 match inner.collection {
                     Some(c) => Json(ApiResponse::success(CollectionDetail::from(c))),
                     None => Json(ApiResponse::error("Created but no collection returned")),
+                }
+            } else {
+                Json(ApiResponse::error(&inner.error))
+            }
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
+async fn update_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateCollectionBody>,
+) -> Json<ApiResponse<CollectionDetail>> {
+    if !user.is_admin() {
+        return Json(ApiResponse::error("Permission denied: admin only"));
+    }
+    let storage_policy = req.storage_policy.as_ref().map(build_storage_policy);
+    let volume_allocation = req.volume_allocation.as_ref().map(build_volume_allocation);
+    let request = powerfs_master::proto::powerfs::UpdateCollectionRequest {
+        name: name.clone(),
+        status: req
+            .status
+            .unwrap_or(powerfs_master::proto::powerfs::CollectionStatus::Active as i32),
+        storage_policy,
+        disk_type: req.disk_type.unwrap_or_default(),
+        capacity_quota_bytes: req.capacity_quota_bytes.unwrap_or(0),
+        ttl_seconds: req.ttl_seconds.unwrap_or(0),
+        description: req.description.unwrap_or_default(),
+        volume_allocation,
+        excluded_volume_ids: req.excluded_volume_ids.unwrap_or_default(),
+    };
+    match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.update_collection(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.success {
+                match inner.collection {
+                    Some(c) => Json(ApiResponse::success(CollectionDetail::from(c))),
+                    None => Json(ApiResponse::error("Updated but no collection returned")),
+                }
+            } else {
+                Json(ApiResponse::error(&inner.error))
+            }
+        }
+        Err(e) => Json(ApiResponse::error(&format!("gRPC error: {}", e))),
+    }
+}
+
+async fn get_collection_stats(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<ApiResponse<CollectionStatsDetail>> {
+    match state
+        .master_client
+        .call(|client| {
+            let name = name.clone();
+            async move {
+                let mut client = client;
+                client
+                    .get_collection_stats(tonic::Request::new(
+                        powerfs_master::proto::powerfs::GetCollectionStatsRequest { name },
+                    ))
+                    .await
+            }
+        })
+        .await
+    {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.success {
+                match inner.stats {
+                    Some(s) => Json(ApiResponse::success(CollectionStatsDetail::from(s))),
+                    None => Json(ApiResponse::error("No stats returned")),
                 }
             } else {
                 Json(ApiResponse::error(&inner.error))
@@ -4399,7 +4753,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/collections", get(list_collections))
         .route("/api/collections", post(create_collection))
         .route("/api/collections/:name", get(get_collection))
+        .route("/api/collections/:name", put(update_collection))
         .route("/api/collections/:name", delete(delete_collection))
+        .route("/api/collections/:name/stats", get(get_collection_stats))
         .route("/api/benchmarks", get(get_benchmark_results))
         .route(
             "/api/benchmarks/report/:id",

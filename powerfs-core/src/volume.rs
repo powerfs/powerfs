@@ -1016,7 +1016,8 @@ mod tests {
         for chunk in 0..4 {
             let off = chunk * CHUNK;
             // Last successful overwrite was round=1 (second pass) byte 5..=8
-            let expected_byte: u8 = (1 * 4 + chunk + 1) as u8;
+            // round * 4 + chunk + 1, with round=1
+            let expected_byte: u8 = (4 + chunk + 1) as u8;
             assert_eq!(
                 got[off], expected_byte,
                 "chunk {} first byte mismatch: got {} want {}",

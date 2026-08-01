@@ -48,6 +48,224 @@ impl MasterGrpcServer {
     }
 }
 
+// ========================================================================
+// proto <-> Rust conversion helpers for the Collection P0 attribute model
+// ========================================================================
+
+fn rust_status_to_proto(status: crate::collection::CollectionStatus) -> i32 {
+    match status {
+        crate::collection::CollectionStatus::Active => CollectionStatus::Active as i32,
+        crate::collection::CollectionStatus::Readonly => CollectionStatus::Readonly as i32,
+        crate::collection::CollectionStatus::Archived => CollectionStatus::Archived as i32,
+        crate::collection::CollectionStatus::Deleted => CollectionStatus::Deleted as i32,
+    }
+}
+
+fn proto_status_to_rust(status: i32) -> crate::collection::CollectionStatus {
+    match status {
+        x if x == CollectionStatus::Readonly as i32 => {
+            crate::collection::CollectionStatus::Readonly
+        }
+        x if x == CollectionStatus::Archived as i32 => {
+            crate::collection::CollectionStatus::Archived
+        }
+        x if x == CollectionStatus::Deleted as i32 => crate::collection::CollectionStatus::Deleted,
+        // Unspecified (0) or Active (1) both map to Active.
+        _ => crate::collection::CollectionStatus::Active,
+    }
+}
+
+fn redundancy_to_proto(r: &crate::collection::RedundancyMode) -> Redundancy {
+    Redundancy {
+        mode: Some(match r {
+            crate::collection::RedundancyMode::Replication { copies } => {
+                powerfs::redundancy::Mode::Replication(ReplicationMode { copies: *copies })
+            }
+            crate::collection::RedundancyMode::ErasureCoding {
+                data_shards,
+                parity_shards,
+                algorithm,
+            } => powerfs::redundancy::Mode::ErasureCoding(ErasureCodingMode {
+                data_shards: *data_shards,
+                parity_shards: *parity_shards,
+                algorithm: algorithm.clone(),
+            }),
+        }),
+    }
+}
+
+fn storage_policy_to_proto(p: &crate::collection::StoragePolicy) -> StoragePolicy {
+    StoragePolicy {
+        name: p.name.clone(),
+        redundancy: Some(redundancy_to_proto(&p.redundancy)),
+        min_write_nodes: p.min_write_nodes,
+    }
+}
+
+fn volume_allocation_to_proto(a: &crate::collection::VolumeAllocationMode) -> VolumeAllocation {
+    VolumeAllocation {
+        mode: Some(match a {
+            crate::collection::VolumeAllocationMode::Auto { count, volume_size } => {
+                powerfs::volume_allocation::Mode::Auto(AutoAllocation {
+                    count: *count,
+                    volume_size: *volume_size,
+                })
+            }
+            crate::collection::VolumeAllocationMode::Manual { volume_ids } => {
+                powerfs::volume_allocation::Mode::Manual(ManualAllocation {
+                    volume_ids: volume_ids.clone(),
+                })
+            }
+            crate::collection::VolumeAllocationMode::Hybrid {
+                fixed_volume_ids,
+                auto_count,
+            } => powerfs::volume_allocation::Mode::Hybrid(HybridAllocation {
+                fixed_volume_ids: fixed_volume_ids.clone(),
+                auto_count: *auto_count,
+            }),
+        }),
+    }
+}
+
+fn collection_info_to_proto(info: crate::collection::CollectionInfo) -> CollectionInfo {
+    CollectionInfo {
+        name: info.name,
+        status: rust_status_to_proto(info.status),
+        storage_policy: Some(storage_policy_to_proto(&info.storage_policy)),
+        disk_type: info.disk_type,
+        capacity_quota_bytes: info.capacity_quota_bytes,
+        volume_count: info.volume_count,
+        ttl_seconds: info.ttl_seconds,
+        created_at: info.created_at,
+        updated_at: info.updated_at,
+        description: info.description,
+        volume_allocation: Some(volume_allocation_to_proto(&info.volume_allocation)),
+        excluded_volume_ids: info.excluded_volume_ids,
+    }
+}
+
+fn redundancy_from_proto(r: &Redundancy) -> crate::collection::RedundancyMode {
+    match &r.mode {
+        Some(powerfs::redundancy::Mode::Replication(rep)) => {
+            crate::collection::RedundancyMode::Replication { copies: rep.copies }
+        }
+        Some(powerfs::redundancy::Mode::ErasureCoding(ec)) => {
+            crate::collection::RedundancyMode::ErasureCoding {
+                data_shards: ec.data_shards,
+                parity_shards: ec.parity_shards,
+                algorithm: ec.algorithm.clone(),
+            }
+        }
+        None => crate::collection::RedundancyMode::default(),
+    }
+}
+
+fn storage_policy_from_proto(p: &StoragePolicy) -> crate::collection::StoragePolicy {
+    crate::collection::StoragePolicy {
+        name: p.name.clone(),
+        redundancy: p
+            .redundancy
+            .as_ref()
+            .map(redundancy_from_proto)
+            .unwrap_or_default(),
+        min_write_nodes: p.min_write_nodes,
+    }
+}
+
+fn volume_allocation_from_proto(a: &VolumeAllocation) -> crate::collection::VolumeAllocationMode {
+    match &a.mode {
+        Some(powerfs::volume_allocation::Mode::Auto(auto)) => {
+            crate::collection::VolumeAllocationMode::Auto {
+                count: auto.count,
+                volume_size: auto.volume_size,
+            }
+        }
+        Some(powerfs::volume_allocation::Mode::Manual(manual)) => {
+            crate::collection::VolumeAllocationMode::Manual {
+                volume_ids: manual.volume_ids.clone(),
+            }
+        }
+        Some(powerfs::volume_allocation::Mode::Hybrid(hybrid)) => {
+            crate::collection::VolumeAllocationMode::Hybrid {
+                fixed_volume_ids: hybrid.fixed_volume_ids.clone(),
+                auto_count: hybrid.auto_count,
+            }
+        }
+        None => crate::collection::VolumeAllocationMode::default(),
+    }
+}
+
+fn collection_info_from_create_request(
+    req: &CreateCollectionRequest,
+) -> crate::collection::CollectionInfo {
+    let now = chrono::Utc::now().timestamp();
+    crate::collection::CollectionInfo {
+        name: req.name.clone(),
+        status: proto_status_to_rust(req.status),
+        storage_policy: req
+            .storage_policy
+            .as_ref()
+            .map(storage_policy_from_proto)
+            .unwrap_or_default(),
+        disk_type: req.disk_type.clone(),
+        capacity_quota_bytes: req.capacity_quota_bytes,
+        volume_count: req.volume_count,
+        ttl_seconds: req.ttl_seconds,
+        created_at: now,
+        updated_at: now,
+        description: req.description.clone(),
+        volume_allocation: req
+            .volume_allocation
+            .as_ref()
+            .map(volume_allocation_from_proto)
+            .unwrap_or_default(),
+        excluded_volume_ids: req.excluded_volume_ids.clone(),
+    }
+}
+
+fn collection_info_from_update_request(
+    req: &UpdateCollectionRequest,
+    volume_count: u32,
+    created_at: i64,
+) -> crate::collection::CollectionInfo {
+    let now = chrono::Utc::now().timestamp();
+    crate::collection::CollectionInfo {
+        name: req.name.clone(),
+        status: proto_status_to_rust(req.status),
+        storage_policy: req
+            .storage_policy
+            .as_ref()
+            .map(storage_policy_from_proto)
+            .unwrap_or_default(),
+        disk_type: req.disk_type.clone(),
+        capacity_quota_bytes: req.capacity_quota_bytes,
+        volume_count,
+        ttl_seconds: req.ttl_seconds,
+        created_at,
+        updated_at: now,
+        description: req.description.clone(),
+        volume_allocation: req
+            .volume_allocation
+            .as_ref()
+            .map(volume_allocation_from_proto)
+            .unwrap_or_default(),
+        excluded_volume_ids: req.excluded_volume_ids.clone(),
+    }
+}
+
+fn collection_stats_to_proto(stats: crate::collection::CollectionStats) -> CollectionStatsInfo {
+    CollectionStatsInfo {
+        used_bytes: stats.used_bytes,
+        file_count: stats.file_count,
+        volume_count: stats.volume_count,
+        writable_volume_count: stats.writable_volume_count,
+        read_ops: stats.read_ops,
+        write_ops: stats.write_ops,
+        read_bytes: stats.read_bytes,
+        write_bytes: stats.write_bytes,
+    }
+}
+
 #[tonic::async_trait]
 impl MasterService for MasterGrpcServer {
     type SendHeartbeatStream =
@@ -683,33 +901,13 @@ impl MasterService for MasterGrpcServer {
         }
 
         let req = request.into_inner();
+        let info = collection_info_from_create_request(&req);
 
-        let ttl: i32 = req.ttl.parse().unwrap_or(0);
-
-        match self
-            .master
-            .create_collection(
-                &req.name,
-                &req.replication,
-                ttl,
-                &req.disk_type,
-                req.max_volume_count,
-            )
-            .await
-        {
-            Ok(config) => Ok(Response::new(CreateCollectionResponse {
+        match self.master.create_collection_via_raft(info.clone()).await {
+            Ok(()) => Ok(Response::new(CreateCollectionResponse {
                 success: true,
                 error: String::new(),
-                collection: Some(CollectionInfo {
-                    name: config.name.0,
-                    replication: config.replication.to_string_format(),
-                    ttl: config.ttl.to_string(),
-                    disk_type: config.disk_type.0,
-                    max_volume_count: config.max_volume_count,
-                    volume_count: config.volume_count,
-                    created_at: config.created_at.timestamp() as u64,
-                    modified_at: config.modified_at.timestamp() as u64,
-                }),
+                collection: Some(collection_info_to_proto(info)),
             })),
             Err(e) => Ok(Response::new(CreateCollectionResponse {
                 success: false,
@@ -732,7 +930,7 @@ impl MasterService for MasterGrpcServer {
 
         let req = request.into_inner();
 
-        match self.master.delete_collection(&req.name).await {
+        match self.master.delete_collection_via_raft(&req.name).await {
             Ok(_) => Ok(Response::new(DeleteCollectionResponse {
                 success: true,
                 error: String::new(),
@@ -750,20 +948,11 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<GetCollectionResponse>, Status> {
         let req = request.into_inner();
 
-        match self.master.get_collection(&req.name).await {
-            Some(config) => Ok(Response::new(GetCollectionResponse {
+        match self.master.get_collection_info(&req.name).await {
+            Some(info) => Ok(Response::new(GetCollectionResponse {
                 success: true,
                 error: String::new(),
-                collection: Some(CollectionInfo {
-                    name: config.name.0,
-                    replication: config.replication.to_string_format(),
-                    ttl: config.ttl.to_string(),
-                    disk_type: config.disk_type.0,
-                    max_volume_count: config.max_volume_count,
-                    volume_count: config.volume_count,
-                    created_at: config.created_at.timestamp() as u64,
-                    modified_at: config.modified_at.timestamp() as u64,
-                }),
+                collection: Some(collection_info_to_proto(info)),
             })),
             None => Ok(Response::new(GetCollectionResponse {
                 success: false,
@@ -777,26 +966,76 @@ impl MasterService for MasterGrpcServer {
         &self,
         _request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
-        let collections = self.master.list_collections().await;
-
-        let mut collection_infos = Vec::new();
-        for config in collections {
-            collection_infos.push(CollectionInfo {
-                name: config.name.0,
-                replication: config.replication.to_string_format(),
-                ttl: config.ttl.to_string(),
-                disk_type: config.disk_type.0,
-                max_volume_count: config.max_volume_count,
-                volume_count: config.volume_count,
-                created_at: config.created_at.timestamp() as u64,
-                modified_at: config.modified_at.timestamp() as u64,
-            });
-        }
+        let collections = self.master.list_collection_infos().await;
+        let collection_infos = collections
+            .into_iter()
+            .map(collection_info_to_proto)
+            .collect();
 
         Ok(Response::new(ListCollectionsResponse {
             collections: collection_infos,
             error: String::new(),
         }))
+    }
+
+    async fn update_collection(
+        &self,
+        request: Request<UpdateCollectionRequest>,
+    ) -> Result<Response<UpdateCollectionResponse>, Status> {
+        if !self.master.is_leader().await {
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                self.master.get_leader_grpc_addr().await
+            )));
+        }
+
+        let req = request.into_inner();
+        // Preserve volume_count and created_at from the existing collection:
+        // UpdateCollectionRequest does not carry volume_count, and the
+        // CollectionManager preserves created_at on update.
+        let existing = self.master.get_collection_info(&req.name).await;
+        let (volume_count, created_at) = match &existing {
+            Some(e) => (e.volume_count, e.created_at),
+            None => (0, chrono::Utc::now().timestamp()),
+        };
+        let info = collection_info_from_update_request(&req, volume_count, created_at);
+
+        match self
+            .master
+            .update_collection_via_raft(&req.name, info.clone())
+            .await
+        {
+            Ok(()) => Ok(Response::new(UpdateCollectionResponse {
+                success: true,
+                error: String::new(),
+                collection: Some(collection_info_to_proto(info)),
+            })),
+            Err(e) => Ok(Response::new(UpdateCollectionResponse {
+                success: false,
+                error: e.to_string(),
+                collection: None,
+            })),
+        }
+    }
+
+    async fn get_collection_stats(
+        &self,
+        request: Request<GetCollectionStatsRequest>,
+    ) -> Result<Response<GetCollectionStatsResponse>, Status> {
+        let req = request.into_inner();
+
+        match self.master.get_collection_stats(&req.name).await {
+            Some(stats) => Ok(Response::new(GetCollectionStatsResponse {
+                success: true,
+                error: String::new(),
+                stats: Some(collection_stats_to_proto(stats)),
+            })),
+            None => Ok(Response::new(GetCollectionStatsResponse {
+                success: false,
+                error: "collection not found".to_string(),
+                stats: None,
+            })),
+        }
     }
 
     async fn get_statistics(

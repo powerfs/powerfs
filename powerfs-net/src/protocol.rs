@@ -359,6 +359,10 @@ pub enum MsgType {
     PushDelta = 0x0030,
     PullDelta = 0x0031,
     Invalidate = 0x0032,
+    AllocInodeBatch = 0x0033,
+    UpdateInodeSizeChunks = 0x0034,
+    OpenCountInc = 0x0035,
+    OpenCountDec = 0x0036,
 
     // Status
     StatFs = 0x0040,
@@ -418,6 +422,10 @@ impl MsgType {
             0x0030 => Some(Self::PushDelta),
             0x0031 => Some(Self::PullDelta),
             0x0032 => Some(Self::Invalidate),
+            0x0033 => Some(Self::AllocInodeBatch),
+            0x0034 => Some(Self::UpdateInodeSizeChunks),
+            0x0035 => Some(Self::OpenCountInc),
+            0x0036 => Some(Self::OpenCountDec),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -562,6 +570,11 @@ pub enum FieldId {
     Cookie = 0x93,
     FileKey = 0x94,
     Fid = 0x95,
+    /// 完整 chunks 列表（JSON 序列化的 Vec<ChunkWire>）。
+    /// 用于 GetAttr/Lookup/ReadDir 返回多 chunk 文件的完整数据布局，
+    /// 解决旧协议只能返回首 chunk 的问题。fuse 端优先解析此字段，
+    /// 缺失时回退到 Fid/Cookie/FileKey/Size 单 chunk 字段以保持兼容。
+    Chunks = 0x96,
 }
 
 impl FieldId {
@@ -624,6 +637,7 @@ impl FieldId {
             0x93 => Some(Self::Cookie),
             0x94 => Some(Self::FileKey),
             0x95 => Some(Self::Fid),
+            0x96 => Some(Self::Chunks),
             _ => None,
         }
     }

@@ -8,6 +8,7 @@ pub mod orset;
 pub mod provider_adapter;
 pub mod request_id;
 pub mod request_state;
+pub mod sharded_rpc;
 pub mod stats_reporter;
 pub mod topology;
 pub mod volume_client;

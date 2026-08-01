@@ -492,21 +492,54 @@ impl PowerFsNetServer {
                 continue;
             }
 
-            // Handle request
+            // Handle notify (no response expected) — checked before request
+            // handling because the latter moves `message` into a spawned task.
+            if message.header.flags & FrameFlags::NOTIFY != 0 {
+                debug!("Received notify: seq={}", message.header.seq);
+            }
+
+            // Handle request — spawn concurrent task so the loop can continue
+            // reading the next request without waiting for handler completion.
+            // This is critical for volume server throughput: without concurrency,
+            // a slow WriteNeedle blocks all subsequent requests on the same
+            // connection, causing client-side timeouts.
+            //
+            // Concurrency is naturally bounded by the client's
+            // TransportChannel::max_concurrent (data=32, lease=4, mgmt=4).
             if message.is_request() {
+                let handler = handler.clone();
+                let stream = stream.clone();
+                let seq = message.header.seq;
+                let msg_type_u16 = message
+                    .msg_type()
+                    .map(|t| t.as_u16())
+                    .unwrap_or(message.header.msg_type);
                 debug!(
-                    "Processing request seq={} type={:?}",
-                    message.header.seq,
+                    "Spawning handler for request seq={} type={:?}",
+                    seq,
                     message.msg_type()
                 );
-                let response = handler.handle_request(client_id, &message).await?;
-                debug!(
-                    "Request seq={} handled, status={}",
-                    message.header.seq, response.header.status
-                );
+                tokio::spawn(async move {
+                    let response = match handler.handle_request(client_id, &message).await {
+                        Ok(resp) => {
+                            debug!("Request seq={} handled, status={}", seq, resp.header.status);
+                            resp
+                        }
+                        Err(e) => {
+                            error!("Request seq={} handler error: {:?}", seq, e);
+                            let header = FrameHeader::new(
+                                msg_type_u16,
+                                FrameFlags::new(FrameFlags::RESPONSE),
+                                seq,
+                                0,
+                            )
+                            .with_status(STATUS_ERR_SERVER_ERROR);
+                            NetMessage::new(header)
+                        }
+                    };
 
-                // Send response
-                {
+                    // Send response — lock is held only for the duration of
+                    // the write, not during handler processing.
                     let mut s = stream.lock().await;
                     let mut frame = Vec::with_capacity(
                         FrameHeader::SIZE + response.body.len() + response.data.len(),
@@ -516,19 +549,10 @@ impl PowerFsNetServer {
                     frame.extend_from_slice(&hdr_buf);
                     frame.extend_from_slice(&response.body);
                     frame.extend_from_slice(&response.data);
-                    debug!(
-                        "Sending response for seq={}, frame_len={}",
-                        message.header.seq,
-                        frame.len()
-                    );
-                    s.write_all(&frame).await?;
-                    debug!("Response sent for seq={}", message.header.seq);
-                }
-            }
-
-            // Handle notify (no response expected)
-            if message.header.flags & FrameFlags::NOTIFY != 0 {
-                debug!("Received notify: seq={}", message.header.seq);
+                    if let Err(e) = s.write_all(&frame).await {
+                        error!("Failed to send response for seq={}: {:?}", seq, e);
+                    }
+                });
             }
         }
     }

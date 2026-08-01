@@ -168,6 +168,7 @@ fn main() {
                 symlink_target: None,
                 nlink: 2,
                 version: 1,
+                delete_time: 0,
             };
 
             match store.create_inode_sync(root_inode.clone()) {

@@ -9,8 +9,10 @@ use crate::crdt_orset::{
     DirEntryOrset, EntryTag, MergeResult, ServerDirORSet, ServerVectorClock, Tombstone,
 };
 use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
-use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore};
+use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
 use crate::shard_strategy::ShardStrategy;
+use crate::volume_router::VolumeRouter;
+use powerfs_master::volume_client::VolumeClientPool;
 
 // POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
 pub const POSIX_ROOT_INODE: u64 = 1;
@@ -630,6 +632,7 @@ impl MetaShardManager {
                 symlink_target: None,
                 nlink: 2,
                 version: 0,
+                delete_time: 0,
             });
         }
 
@@ -1619,6 +1622,7 @@ impl MetaShardManager {
         client_vclock: &Option<crate::powerfs::VectorClock>,
     ) -> Result<crate::powerfs::VectorClock, String> {
         // CRDT Merge: Apply client deltas to server OR-Set state
+        // 注：每个 delta 自带 parent_ino，按 delta 维度路由到对应 (shard_id, dir_ino) OR-Set
         let delta_log = self.get_or_create_delta_log(shard_id);
         let shard_store = {
             let stores = self.shard_stores.read().unwrap();
@@ -1629,8 +1633,29 @@ impl MetaShardManager {
         // Collect SetAttr operations for batch processing at the end
         let mut pending_setattr_batch: Vec<InodeInfo> = Vec::new();
 
+        // 从 client_vclock 中提取该 client 的最新 seq，用于 Remove/Rename delta
+        // （proto DeltaOp 的 Remove/Rename 不携带 seq，extract_seq_from_delta 返回 None）
+        let client_id_u64: u64 = client_id.parse().unwrap_or(0);
+        let client_vc_seq: u64 = client_vclock
+            .as_ref()
+            .and_then(|vc| {
+                vc.entries
+                    .iter()
+                    .find(|e| e.client_id == client_id_u64)
+                    .map(|e| e.seq)
+            })
+            .unwrap_or(0);
+
         for delta in deltas {
-            let seq = extract_seq_from_delta(delta).unwrap_or(0);
+            let seq = extract_seq_from_delta(delta).unwrap_or_else(|| {
+                // Remove/Rename delta 没有 seq 字段，用 client_vclock 中的 seq
+                // 确保 delta_log.get_since 能正确返回这些 delta（seq > client_vclock[client_id]）
+                if client_vc_seq > 0 {
+                    client_vc_seq
+                } else {
+                    0
+                }
+            });
             if seq > max_seq {
                 max_seq = seq;
             }
@@ -1646,13 +1671,19 @@ impl MetaShardManager {
                 let (_orset, merge_result) = self.modify_orset(shard_id, dir_ino, |orset| {
                     match &delta.op {
                         Some(crate::powerfs::delta_op::Op::Add(entry)) => {
+                            // 通过 mode & S_IFMT 判定 FileType（与 apply_delta_to_store 一致）
+                            let ft = match entry.mode & 0o170000 {
+                                0o040000 => crate::shard_store::FileType::Directory,
+                                0o120000 => crate::shard_store::FileType::Symlink,
+                                _ => crate::shard_store::FileType::File,
+                            };
                             let orset_entry = DirEntryOrset {
                                 tag: tag.clone(),
                                 inode: entry.inode,
                                 name: entry.name.clone(),
                                 parent_ino: entry.parent_ino,
                                 mode: entry.mode,
-                                file_type: crate::shard_store::FileType::File,
+                                file_type: ft,
                                 size: 0,
                                 mtime: 0,
                                 etag: None,
@@ -1737,6 +1768,10 @@ impl MetaShardManager {
                                 }
                             } else {
                                 // Non-SetAttr operations: apply immediately
+                                info!(
+                                    "push_delta: dir {} merge_result={:?}, applying to store",
+                                    dir_ino, merge_result
+                                );
                                 self.apply_delta_to_store(store, delta).await?;
                             }
                         }
@@ -1749,8 +1784,8 @@ impl MetaShardManager {
                         }
                         MergeResult::ConcurrentlyRemoved => {
                             // 并发 Remove: 不物理删除，仅记录 tombstone
-                            debug!(
-                                "Concurrent Remove detected for dir {}: {:?}",
+                            info!(
+                                "Concurrent Remove detected for dir {} (Add-Wins, apply_delta_to_store SKIPPED): {:?}",
                                 dir_ino, merge_result
                             );
                         }
@@ -1791,6 +1826,7 @@ impl MetaShardManager {
     pub async fn pull_delta(
         &self,
         shard_id: ShardId,
+        dir_ino: u64,
         _client_id: &str,
         client_vclock: &Option<crate::powerfs::VectorClock>,
     ) -> Result<(Vec<crate::powerfs::DeltaOp>, crate::powerfs::VectorClock), String> {
@@ -1809,11 +1845,17 @@ impl MetaShardManager {
             None => HashMap::new(),
         };
 
-        // Get deltas that the client hasn't seen yet from delta log
-        let mut deltas = delta_log.get_since(&client_vclock_map);
+        // Get deltas that the client hasn't seen yet from delta log.
+        // 过滤 dir_ino：delta_log 是 per-shard 共享的，需按 parent_ino 过滤
+        // 仅返回该目录的 delta，避免跨目录污染。
+        let mut deltas: Vec<crate::powerfs::DeltaOp> = delta_log
+            .get_since(&client_vclock_map)
+            .into_iter()
+            .filter(|d| self.get_dir_ino_from_delta(d) == Some(dir_ino))
+            .collect();
 
         // Also compute deltas from OR-Set state for more accurate sync
-        let orset_deltas = self.compute_orset_deltas(shard_id, &client_vclock_map);
+        let orset_deltas = self.compute_orset_deltas(shard_id, dir_ino, &client_vclock_map);
         deltas.extend(orset_deltas);
 
         // Return per-shard VectorClock
@@ -1822,16 +1864,18 @@ impl MetaShardManager {
     }
 
     /// 从 OR-Set 状态计算增量变更
+    /// 过滤 (shard_id, dir_ino) 双重维度，避免跨目录污染。
     fn compute_orset_deltas(
         &self,
         shard_id: ShardId,
+        dir_ino: u64,
         client_vclock_map: &HashMap<String, u64>,
     ) -> Vec<crate::powerfs::DeltaOp> {
         let mut deltas = Vec::new();
         let states = self.orset_states.read().unwrap();
 
-        for ((sid, _dir_ino), orset) in states.iter() {
-            if *sid != shard_id {
+        for ((sid, d), orset) in states.iter() {
+            if *sid != shard_id || *d != dir_ino {
                 continue;
             }
 
@@ -1840,9 +1884,15 @@ impl MetaShardManager {
             let diff = orset_vclock.diff_against(&ServerVectorClock::from_map(client_vclock_map));
 
             for (client_id, seq) in diff {
-                // 获取该客户端在这个目录下的所有变更
+                // 仅返回客户端尚未看到的 entry（tag.seq > client_seq）。
+                // 修复：原逻辑 `tag.seq <= seq` 会重复返回已 apply 的 entry，
+                // 导致 puller 每轮都收到相同 delta 并反复失效缓存。
+                let client_seq = client_vclock_map.get(&client_id).copied().unwrap_or(0);
                 for entry in orset.entries.values() {
-                    if entry.tag.client_id == client_id && entry.tag.seq <= seq {
+                    if entry.tag.client_id == client_id
+                        && entry.tag.seq > client_seq
+                        && entry.tag.seq <= seq
+                    {
                         // 添加 Add 操作
                         deltas.push(crate::powerfs::DeltaOp {
                             op: Some(crate::powerfs::delta_op::Op::Add(
@@ -1871,12 +1921,24 @@ impl MetaShardManager {
     ) -> Result<(), String> {
         match &delta.op {
             Some(crate::powerfs::delta_op::Op::Add(entry_orset)) => {
-                // Create inode and directory entry
+                // 通过 mode & S_IFMT 判定 FileType —— fuse 端 mkdir/create 保留
+                // S_IFDIR/S_IFREG 类型位（POSIX 语义），filer 端解析以保持一致。
+                // 兼容历史调用：mode 缺失类型位时默认按 File 处理。
+                let file_type = match entry_orset.mode & 0o170000 {
+                    0o040000 => crate::shard_store::FileType::Directory,
+                    0o120000 => crate::shard_store::FileType::Symlink,
+                    _ => crate::shard_store::FileType::File,
+                };
+                let nlink = if matches!(file_type, crate::shard_store::FileType::Directory) {
+                    2
+                } else {
+                    1
+                };
                 let inode_info = InodeInfo {
                     inode: entry_orset.inode,
                     name: entry_orset.name.clone(),
                     parent_inode: entry_orset.parent_ino,
-                    file_type: crate::shard_store::FileType::File,
+                    file_type,
                     size: 0,
                     mtime: crate::shard_store::ShardStore::current_time(),
                     atime: crate::shard_store::ShardStore::current_time(),
@@ -1891,8 +1953,9 @@ impl MetaShardManager {
                     chunks: vec![],
                     extended: std::collections::HashMap::new(),
                     symlink_target: None,
-                    nlink: 1,
+                    nlink,
                     version: 0,
+                    delete_time: 0,
                 };
                 store.create_inode_atomic(inode_info, entry_orset.parent_ino, &entry_orset.name)?;
                 debug!(
@@ -1901,13 +1964,24 @@ impl MetaShardManager {
                 );
             }
             Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
-                if let Some(inode_info) = store.lookup(entry_id.parent_ino, &entry_id.name) {
-                    let inode = inode_info.inode;
-                    store.remove_inode_atomic(inode, entry_id.parent_ino, &entry_id.name)?;
-                    debug!(
-                        "Applied Remove delta: {}/{} inode={}",
-                        entry_id.parent_ino, entry_id.name, inode
-                    );
+                match store.lookup(entry_id.parent_ino, &entry_id.name) {
+                    Some(inode_info) => {
+                        let inode = inode_info.inode;
+                        // Phase 3.5: 延迟删除——仅标记 tombstone，不物理删除。
+                        // 物理删除由 GC 任务在 grace_period 后执行（需满足 nlink==0、
+                        // 无活跃 lease、open_count==0）。
+                        store.mark_tombstone(inode)?;
+                        info!(
+                            "Applied Remove delta (tombstone marked): {}/{} inode={}",
+                            entry_id.parent_ino, entry_id.name, inode
+                        );
+                    }
+                    None => {
+                        warn!(
+                            "Applied Remove delta: lookup FAILED {}/{} (parent_ino={}, name={})",
+                            entry_id.parent_ino, entry_id.name, entry_id.parent_ino, entry_id.name
+                        );
+                    }
                 }
             }
             Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => {
@@ -2132,6 +2206,402 @@ impl MetaShardManager {
         }
 
         (tombstone_cleaned, orset_count, delta_trimmed)
+    }
+
+    // ========================================================================
+    // Phase 3.5: 延迟删除 GC
+    // ========================================================================
+
+    /// Phase 3.5: 检查指定 inode 是否存在活跃 lease。
+    ///
+    /// GC 物理删除前必须确认无活跃 lease，避免删除正在被写入的数据。
+    pub fn has_active_lease(&self, inode: u64) -> bool {
+        let leases = self.leases.read().unwrap();
+        let now = Instant::now();
+        leases
+            .values()
+            .any(|info| info.inode == inode && info.expires_at > now)
+    }
+
+    /// Phase 3.5.3: 递增 inode 的 open 计数（fuse open 时上报）。
+    /// 返回递增后的 open_count。
+    pub fn increment_open_count(&self, inode: u64) -> Result<u32, String> {
+        let stores = self.shard_stores.read().unwrap();
+        for store in stores.values() {
+            // inode 可能落在任意 shard，逐个尝试
+            if store.get_inode(inode).is_some() {
+                return Ok(store.increment_open_count(inode));
+            }
+        }
+        // inode 不在任意 shard 中，仍记录（可能在创建途中）
+        // 取第一个 store 记录
+        if let Some(store) = stores.values().next() {
+            Ok(store.increment_open_count(inode))
+        } else {
+            Err("no shard store available".to_string())
+        }
+    }
+
+    /// Phase 3.5.3: 递减 inode 的 open 计数（fuse release/close 时上报）。
+    /// 返回递减后的 open_count。
+    pub fn decrement_open_count(&self, inode: u64) -> Result<u32, String> {
+        let stores = self.shard_stores.read().unwrap();
+        for store in stores.values() {
+            let count = store.get_open_count(inode);
+            if count > 0 {
+                return Ok(store.decrement_open_count(inode));
+            }
+        }
+        // open_count 已为 0 或未记录，幂等返回 0
+        Ok(0)
+    }
+
+    /// Phase 3.5: 执行一次 GC 扫描与物理删除。
+    ///
+    /// 对每个 shard 扫描超过 `grace_period_secs` 的 tombstone 条目，逐一检查：
+    /// 1. `nlink == 0`（无硬链接残留）
+    /// 2. 无活跃 lease（`has_active_lease` 返回 false）
+    /// 3. `open_count == 0`（Phase 3.5.3: fuse 端 open/release 上报计数）
+    ///
+    /// 满足条件后调用 `remove_inode_atomic` 物理删除元数据，并收集待回收的数据块。
+    /// 返回 (扫描候选数, 物理删除数, 跳过数, 待回收 chunks 列表)。
+    /// 待回收 chunks 由 GC 任务异步调用 `reclaim_data_chunks` 回收 volume server 数据。
+    pub fn run_gc_pass(
+        &self,
+        grace_period_secs: u64,
+    ) -> (usize, usize, usize, Vec<(u64, Vec<StoredFileChunk>)>) {
+        let stores = self.shard_stores.read().unwrap();
+        let mut scanned = 0usize;
+        let mut deleted = 0usize;
+        let mut skipped = 0usize;
+        let mut chunks_to_reclaim: Vec<(u64, Vec<StoredFileChunk>)> = Vec::new();
+
+        for (shard_id, store) in stores.iter() {
+            let candidates = store.scan_tombstones_for_gc(grace_period_secs);
+            for (inode, parent, name, chunks) in candidates {
+                scanned += 1;
+
+                // 条件 1: nlink == 0
+                let nlink = store.get_inode(inode).map(|i| i.nlink).unwrap_or(0);
+                if nlink > 0 {
+                    debug!(
+                        "GC skip inode {}: nlink={} > 0 (hard links remain)",
+                        inode, nlink
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                // 条件 2: 无活跃 lease
+                if self.has_active_lease(inode) {
+                    debug!(
+                        "GC skip inode {}: active lease exists (data still being written)",
+                        inode
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                // 条件 3: open_count == 0
+                let open_count = store.get_open_count(inode);
+                if open_count > 0 {
+                    debug!(
+                        "GC skip inode {}: open_count={} > 0 (file still open)",
+                        inode, open_count
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                // Phase 5: WAL — 先持久化待回收 chunks，再删元数据
+                // 确保即使 reclaim_data_chunks 失败或 filer 崩溃，chunks 不丢失
+                for chunk in &chunks {
+                    store.add_pending_reclaim(inode, chunk);
+                }
+
+                // 物理删除元数据（CF_INODES + CF_DIR_ENTRIES）
+                match store.remove_inode_atomic(inode, parent, &name) {
+                    Ok(()) => {
+                        deleted += 1;
+                        if chunks.is_empty() {
+                            debug!("GC deleted inode {} (no data chunks)", inode);
+                        } else {
+                            info!(
+                                "GC deleted inode {} metadata, {} data chunks queued for reclamation (WAL persisted)",
+                                inode,
+                                chunks.len()
+                            );
+                            chunks_to_reclaim.push((inode, chunks));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "GC failed to physically delete inode {} in shard {}: {}",
+                            inode, shard_id.0, e
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+
+        if scanned > 0 {
+            info!(
+                "GC pass: scanned={}, deleted={}, skipped={}, chunks_to_reclaim={}, grace_period={}s",
+                scanned,
+                deleted,
+                skipped,
+                chunks_to_reclaim.len(),
+                grace_period_secs
+            );
+        }
+        (scanned, deleted, skipped, chunks_to_reclaim)
+    }
+
+    /// Phase 3.5.2: 异步回收 volume server 上的数据块。
+    ///
+    /// 对每个 chunk，解析 fid（格式 "volume_id,cookie,file_key"），
+    /// 通过 VolumeRouter 查询 volume server 地址，调用 delete_needle 回收数据。
+    /// 回收失败时记录警告，不阻塞后续 chunk 回收（best-effort）。
+    pub async fn reclaim_data_chunks(
+        &self,
+        chunks_to_reclaim: Vec<(u64, Vec<StoredFileChunk>)>,
+        volume_router: &VolumeRouter,
+        volume_client_pool: &VolumeClientPool,
+    ) {
+        for (inode, chunks) in chunks_to_reclaim {
+            for chunk in chunks {
+                // 解析 fid: "volume_id,cookie,file_key"
+                let parts: Vec<&str> = chunk.fid.split(',').collect();
+                if parts.len() < 3 {
+                    warn!(
+                        "GC reclaim: invalid fid format '{}' for inode {}, skipping",
+                        chunk.fid, inode
+                    );
+                    continue;
+                }
+                let volume_id: u64 = match parts[0].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(
+                            "GC reclaim: invalid volume_id in fid '{}' for inode {}, skipping",
+                            chunk.fid, inode
+                        );
+                        continue;
+                    }
+                };
+                let file_key: u64 = match parts[2].parse() {
+                    Ok(k) => k,
+                    Err(_) => {
+                        warn!(
+                            "GC reclaim: invalid file_key in fid '{}' for inode {}, skipping",
+                            chunk.fid, inode
+                        );
+                        continue;
+                    }
+                };
+
+                // 查询 volume server 地址
+                let server_addr = match volume_router.get_server_addr(volume_id).await {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "GC reclaim: volume server not found for volume_id={} (inode {}), skipping",
+                            volume_id, inode
+                        );
+                        continue;
+                    }
+                };
+
+                // 回收数据块
+                match volume_client_pool
+                    .delete_needle(&server_addr, volume_id, file_key)
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            "GC reclaim: deleted needle volume_id={}, file_key={} for inode {}",
+                            volume_id, file_key, inode
+                        );
+                        // Phase 5: WAL — 回收成功，从 pending_reclaims 移除
+                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "GC reclaim: delete_needle failed for inode {} (volume_id={}, file_key={}): {} — will retry next GC cycle",
+                            inode, volume_id, file_key, e
+                        );
+                        // Phase 5: WAL — 回收失败，保留在 pending_reclaims，下次 GC 重试
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase 5: 从所有 shard stores 中移除指定 fid 的 pending_reclaim。
+    /// RocksDB delete 对不存在的 key 是 no-op，所以遍历所有 store 是安全的。
+    fn remove_pending_reclaim_all_stores(&self, fid: &str) {
+        let stores = self.shard_stores.read().unwrap();
+        for store in stores.values() {
+            store.remove_pending_reclaim(fid);
+        }
+    }
+
+    /// Phase 5: 重试 pending_reclaims 中未回收的数据块。
+    ///
+    /// 在每轮 GC 正常扫描前调用，处理上一轮回收失败的 chunks。
+    /// 崩溃恢复：filer 重启后从 RocksDB 加载 pending_reclaims，首次 GC 即重试。
+    pub async fn retry_pending_reclaims(
+        &self,
+        volume_router: &VolumeRouter,
+        volume_client_pool: &VolumeClientPool,
+    ) -> usize {
+        // 先收集所有 pending reclaims，然后释放锁（避免跨 await 持有 RwLockReadGuard）
+        let all_pending: Vec<(ShardId, Vec<(u64, StoredFileChunk)>)> = {
+            let stores = self.shard_stores.read().unwrap();
+            let mut pending_per_shard = Vec::new();
+            for (shard_id, store) in stores.iter() {
+                let pending = store.list_pending_reclaims();
+                if !pending.is_empty() {
+                    pending_per_shard.push((*shard_id, pending));
+                }
+            }
+            pending_per_shard
+        }; // RwLockReadGuard 在此释放
+
+        if all_pending.is_empty() {
+            return 0;
+        }
+
+        let mut retried = 0usize;
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+
+        for (shard_id, pending) in &all_pending {
+            for (inode, chunk) in pending {
+                retried += 1;
+                let parts: Vec<&str> = chunk.fid.split(',').collect();
+                if parts.len() < 3 {
+                    warn!(
+                        "GC retry: invalid fid '{}' for inode {}, removing from pending",
+                        chunk.fid, inode
+                    );
+                    self.remove_pending_reclaim_all_stores(&chunk.fid);
+                    continue;
+                }
+                let volume_id: u64 = match parts[0].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(
+                            "GC retry: invalid volume_id in fid '{}', removing",
+                            chunk.fid
+                        );
+                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                        continue;
+                    }
+                };
+                let file_key: u64 = match parts[2].parse() {
+                    Ok(k) => k,
+                    Err(_) => {
+                        warn!(
+                            "GC retry: invalid file_key in fid '{}', removing",
+                            chunk.fid
+                        );
+                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                        continue;
+                    }
+                };
+
+                let server_addr = match volume_router.get_server_addr(volume_id).await {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "GC retry: volume server not found for volume_id={} (inode {}), will retry next cycle",
+                            volume_id, inode
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                match volume_client_pool
+                    .delete_needle(&server_addr, volume_id, file_key)
+                    .await
+                {
+                    Ok(()) => {
+                        succeeded += 1;
+                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                        debug!(
+                            "GC retry: deleted needle volume_id={}, file_key={} for inode {}",
+                            volume_id, file_key, inode
+                        );
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        warn!(
+                            "GC retry: delete_needle failed for inode {} (volume_id={}, file_key={}): {}",
+                            inode, volume_id, file_key, e
+                        );
+                    }
+                }
+            }
+            debug!(
+                "GC retry: shard {} retried={}, succeeded={}, failed={}",
+                shard_id.0, retried, succeeded, failed
+            );
+        }
+
+        if retried > 0 {
+            info!(
+                "GC retry_pending_reclaims: retried={}, succeeded={}, failed={}",
+                retried, succeeded, failed
+            );
+        }
+        retried
+    }
+
+    /// Phase 3.5: 启动后台 GC 任务。
+    ///
+    /// 每 `interval_secs` 秒执行一次 `run_gc_pass`：
+    /// - `grace_period_secs`: tombstone 标记后等待多久才可被 GC 物理删除（默认与
+    ///   `gc_grace_period` 配置一致，所有 filer 节点必须相同）
+    /// - GC 采用批量扫描 + 限速（单次 pass 内串行删除，避免打满 RocksDB IO）
+    /// - 物理删除元数据后，异步调用 `reclaim_data_chunks` 回收 volume server 数据块
+    /// - Phase 5: 每轮先 `retry_pending_reclaims`（重试上次失败的回收），再 `run_gc_pass`
+    pub fn spawn_gc_task(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        grace_period_secs: u64,
+        volume_router: Arc<VolumeRouter>,
+        volume_client_pool: Arc<VolumeClientPool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                // Phase 5: 先重试上次失败的 pending_reclaims（WAL 崩溃恢复）
+                let retried = mgr
+                    .retry_pending_reclaims(&volume_router, &volume_client_pool)
+                    .await;
+                // 正常 GC 扫描
+                let (scanned, deleted, skipped, chunks_to_reclaim) =
+                    mgr.run_gc_pass(grace_period_secs);
+                if scanned > 0 || retried > 0 {
+                    debug!(
+                        "GC task heartbeat: retried={}, scanned={}, deleted={}, skipped={}, chunks_to_reclaim={}",
+                        retried, scanned, deleted, skipped, chunks_to_reclaim.len()
+                    );
+                }
+                // 异步回收 volume server 数据块（best-effort）
+                if !chunks_to_reclaim.is_empty() {
+                    mgr.reclaim_data_chunks(chunks_to_reclaim, &volume_router, &volume_client_pool)
+                        .await;
+                }
+            }
+        })
     }
 
     /// 启动后台 CRDT 维护任务。

@@ -391,10 +391,17 @@ impl RaftGroup {
                             index: entry.index,
                             command: cmd,
                         };
-                        let tx = self.apply_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(apply_entry).await;
-                        });
+                        // Use try_send (synchronous) instead of spawn+await
+                        // so the apply item is in the channel buffer BEFORE
+                        // we set applied_index.  This prevents the polling
+                        // loop in create_directory/lookup from timing out
+                        // while waiting for the spawned task to be scheduled.
+                        if let Err(e) = self.apply_tx.try_send(apply_entry) {
+                            error!(
+                                "Shard {} failed to send apply item at index {}: {}",
+                                self.shard_id.0, entry.index, e
+                            );
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -426,27 +433,40 @@ impl RaftGroup {
         let committed = light_rd.take_committed_entries();
         if !committed.is_empty() {
             for entry in committed {
-                if !entry.data.is_empty() {
-                    match ShardCommand::deserialize(&entry.data) {
-                        Ok(cmd) => {
-                            let apply_entry = ApplyEntry {
-                                shard_id: self.shard_id,
-                                index: entry.index,
-                                command: cmd,
-                            };
-                            let tx = self.apply_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = tx.send(apply_entry).await;
-                            });
-                        }
-                        Err(e) => {
+                if entry.data.is_empty() {
+                    let mut applied = self.applied_index.write().unwrap();
+                    *applied = entry.index;
+                    continue;
+                }
+
+                match ShardCommand::deserialize(&entry.data) {
+                    Ok(cmd) => {
+                        let apply_entry = ApplyEntry {
+                            shard_id: self.shard_id,
+                            index: entry.index,
+                            command: cmd,
+                        };
+                        // Use try_send (synchronous) so the apply item is in
+                        // the channel buffer BEFORE applied_index is updated.
+                        // This prevents polling loops in create_directory/lookup
+                        // from timing out while waiting for a spawned task to be
+                        // scheduled (same fix as the primary committed_entries
+                        // path above).
+                        if let Err(e) = self.apply_tx.try_send(apply_entry) {
                             error!(
-                                "Shard {} failed to deserialize command at index {}: {}",
+                                "Shard {} failed to send light_rd apply item at index {}: {}",
                                 self.shard_id.0, entry.index, e
                             );
                         }
                     }
+                    Err(e) => {
+                        error!(
+                            "Shard {} failed to deserialize command at index {}: {}",
+                            self.shard_id.0, entry.index, e
+                        );
+                    }
                 }
+
                 let mut applied = self.applied_index.write().unwrap();
                 *applied = entry.index;
             }

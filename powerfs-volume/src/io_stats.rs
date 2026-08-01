@@ -238,7 +238,7 @@ mod tests {
         }
         let p50 = percentile(&data, 0.50);
         let p99 = percentile(&data, 0.99);
-        assert!(p50 >= 49000 && p50 <= 51000); // around 50000
+        assert!((49000..=51000).contains(&p50)); // around 50000
         assert!(p99 >= 98000); // around 99000
     }
 

@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ const CF_STATS: &str = "stats";
 const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persistent metadata
 const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
 const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
+const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -50,6 +51,10 @@ pub struct InodeInfo {
     // Version counter for cache coherence. Incremented on every modification.
     #[serde(default)]
     pub version: u64,
+    // Phase 3.5: 延迟删除标记（0 = 未删除，>0 = 删除时间戳 unix seconds）
+    // GC 任务扫描 delete_time > 0 且超过 grace_period 的条目进行物理删除
+    #[serde(default)]
+    pub delete_time: u64,
 }
 
 /// Stored file chunk (persisted in Filer InodeInfo)
@@ -88,6 +93,9 @@ pub struct ShardStore {
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
     next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
+    // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
+    // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
+    open_counts: RwLock<HashMap<u64, u32>>,
 }
 
 impl ShardStore {
@@ -125,6 +133,7 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_METADATA, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -145,6 +154,7 @@ impl ShardStore {
             }),
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
+            open_counts: RwLock::new(HashMap::new()),
         };
 
         store.load_data()?;
@@ -534,6 +544,7 @@ impl ShardStore {
             symlink_target: None,
             nlink: 1,
             version: 0,
+            delete_time: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -609,6 +620,7 @@ impl ShardStore {
             symlink_target: None,
             nlink: 1,
             version: 0,
+            delete_time: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -738,6 +750,7 @@ impl ShardStore {
             symlink_target: None,
             nlink: 2,
             version: 0,
+            delete_time: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -940,7 +953,13 @@ impl ShardStore {
 
         if let Some(dir) = dir_entries.get(&parent_inode) {
             if let Some(&inode) = dir.get(name) {
-                return inodes.get(&inode).cloned();
+                // Phase 3.5: 跳过 tombstoned 条目（延迟删除期间不可见）
+                if let Some(info) = inodes.get(&inode) {
+                    if info.delete_time > 0 {
+                        return None;
+                    }
+                    return Some(info.clone());
+                }
             }
         }
 
@@ -956,6 +975,10 @@ impl ShardStore {
         if let Some(dir) = dir_entries.get(&parent_inode) {
             for &inode in dir.values() {
                 if let Some(info) = inodes.get(&inode) {
+                    // Phase 3.5: 跳过 tombstoned 条目
+                    if info.delete_time > 0 {
+                        continue;
+                    }
                     result.push(info.clone());
                 }
             }
@@ -1179,7 +1202,7 @@ impl ShardStore {
 
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(cf_inodes, inode_key, &data);
-        batch.put_cf(cf_dir_entries, dir_key.as_bytes(), &dir_value);
+        batch.put_cf(cf_dir_entries, dir_key.as_bytes(), dir_value);
 
         let write_opts = rocksdb::WriteOptions::default();
         self.db
@@ -1265,10 +1288,158 @@ impl ShardStore {
             if is_dir {
                 stats.dir_count = stats.dir_count.saturating_sub(1);
             }
+            drop(stats);
             self.save_stats();
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Phase 3.5: 延迟删除（tombstone + GC）
+    // ========================================================================
+
+    /// Phase 3.5: 标记 inode 为 tombstone（延迟删除）。
+    ///
+    /// 不物理删除 CF_INODES / CF_DIR_ENTRIES，仅设置 delete_time。
+    /// lookup/list_directory 跳过 delete_time > 0 的条目。
+    /// GC 任务在 grace_period 后物理删除。
+    pub fn mark_tombstone(&self, inode: u64) -> Result<(), String> {
+        let now = Self::current_time();
+        let mut inodes = self.inodes.write().unwrap();
+        if let Some(info) = inodes.get_mut(&inode) {
+            info.delete_time = now;
+            let updated = info.clone();
+            drop(inodes);
+            self.update_inode(updated)?;
+            debug!("Phase 3.5: marked tombstone for inode {} at {}", inode, now);
+        }
+        Ok(())
+    }
+
+    /// Phase 3.5: 扫描所有 tombstoned 且超过 grace_period 的条目。
+    ///
+    /// 返回 (inode, parent_inode, name, chunks) 列表供 GC 任务物理删除。
+    /// TODO: 检查 open_count == 0 + 无活跃 lease（当前仅检查 grace_period）
+    pub fn scan_tombstones_for_gc(
+        &self,
+        grace_period_secs: u64,
+    ) -> Vec<(u64, u64, String, Vec<StoredFileChunk>)> {
+        let now = Self::current_time();
+        let inodes = self.inodes.read().unwrap();
+        let dir_entries = self.directory_entries.read().unwrap();
+
+        let mut result = Vec::new();
+
+        for (inode, info) in inodes.iter() {
+            if info.delete_time == 0 {
+                continue;
+            }
+            // 检查 grace_period
+            if now < info.delete_time + grace_period_secs {
+                continue; // 还在 grace period 内
+            }
+            // 查找 parent + name（从 directory_entries 反查）
+            let mut found = false;
+            for (parent, entries) in dir_entries.iter() {
+                if let Some((name, _)) = entries.iter().find(|(_, &i)| i == *inode) {
+                    result.push((*inode, *parent, name.clone(), info.chunks.clone()));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // orphan inode（无 dir_entry 指向），直接加入 GC 列表
+                result.push((*inode, 0, String::new(), info.chunks.clone()));
+            }
+        }
+
+        result
+    }
+
+    // ========================================================================
+    // Phase 3.5.3: open_count 追踪（GC 第三条件）
+    // ========================================================================
+
+    /// Phase 3.5.3: 递增 inode 的 open 计数。
+    /// fuse 端 open 时通过 net 层通知 filer 调用此方法。
+    pub fn increment_open_count(&self, inode: u64) -> u32 {
+        let mut counts = self.open_counts.write().unwrap();
+        let count = counts.entry(inode).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Phase 3.5.3: 递减 inode 的 open 计数，不低于 0。
+    /// fuse 端 release/close 时通过 net 层通知 filer 调用此方法。
+    pub fn decrement_open_count(&self, inode: u64) -> u32 {
+        let mut counts = self.open_counts.write().unwrap();
+        let count = counts.entry(inode).or_insert(0);
+        if *count > 0 {
+            *count -= 1;
+        }
+        let result = *count;
+        if result == 0 {
+            counts.remove(&inode);
+        }
+        result
+    }
+
+    /// Phase 3.5.3: 查询 inode 的 open 计数。GC 物理删除前检查 == 0。
+    pub fn get_open_count(&self, inode: u64) -> u32 {
+        self.open_counts
+            .read()
+            .unwrap()
+            .get(&inode)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    // ========================================================================
+    // Phase 5: pending_reclaims WAL（GC 数据块回收持久化）
+    // ========================================================================
+
+    /// Phase 5: 持久化待回收 chunk（WAL 模式：先持久化再删元数据）。
+    /// key = fid, value = (inode, StoredFileChunk) JSON。
+    pub fn add_pending_reclaim(&self, inode: u64, chunk: &StoredFileChunk) {
+        if let Some(cf) = self.db.cf_handle(CF_PENDING_RECLAIMS) {
+            let entry = serde_json::json!({"inode": inode, "chunk": chunk});
+            if let Ok(data) = serde_json::to_vec(&entry) {
+                let key = chunk.fid.as_bytes();
+                let _ = self.db.put_cf(cf, key, &data);
+            }
+        }
+    }
+
+    /// Phase 5: 删除待回收 chunk（delete_needle 成功后调用）。
+    pub fn remove_pending_reclaim(&self, fid: &str) {
+        if let Some(cf) = self.db.cf_handle(CF_PENDING_RECLAIMS) {
+            let _ = self.db.delete_cf(cf, fid.as_bytes());
+        }
+    }
+
+    /// Phase 5: 列出所有待回收 chunks（GC 重试 + 崩溃恢复用）。
+    pub fn list_pending_reclaims(&self) -> Vec<(u64, StoredFileChunk)> {
+        let mut result = Vec::new();
+        if let Some(cf) = self.db.cf_handle(CF_PENDING_RECLAIMS) {
+            let mut it = self.db.raw_iterator_cf(cf);
+            it.seek_to_first();
+            while it.valid() {
+                if let (Some(_key), Some(value)) = (it.key(), it.value()) {
+                    if let Ok(entry) = serde_json::from_slice::<serde_json::Value>(value) {
+                        let inode = entry.get("inode").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if let Some(chunk) = entry.get("chunk") {
+                            if let Ok(c) = serde_json::from_value::<StoredFileChunk>(chunk.clone())
+                            {
+                                result.push((inode, c));
+                            }
+                        }
+                    }
+                }
+                it.next();
+            }
+        }
+        result
     }
 
     /// 原子地重命名目录条目（WriteBatch delete old + put new）。
@@ -1314,6 +1485,7 @@ impl ShardStore {
     }
 
     /// 初始化 next_inode：从 CF_METADATA 读，若无用 inode_range.start（§4 1.4）
+    /// 保留 inode 0（无效）和 inode 1（POSIX root），shard 0 起始至少为 2
     fn init_next_inode(&self) {
         let start = match self.db.cf_handle(CF_METADATA) {
             Some(cf) => match self.db.get_cf(cf, b"next_inode") {
@@ -1326,6 +1498,8 @@ impl ShardStore {
             },
             None => self.inode_range.0,
         };
+        // 跳过保留 inode：0（无效）和 1（POSIX root）
+        let start = start.max(2);
         *self.next_inode.lock().unwrap() = start;
         info!(
             "Shard {}: init_next_inode = {} (range={:?})",
@@ -1518,6 +1692,7 @@ impl ShardStore {
             symlink_target: Some(target),
             nlink: 1,
             version: 0,
+            delete_time: 0,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1697,5 +1872,176 @@ impl ShardStore {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft_group_manager::ShardId;
+
+    fn make_store() -> ShardStore {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "powerfs-shard-store-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        ShardStore::new(ShardId(1), (1000, 2000), tmp_dir.to_str().unwrap()).unwrap()
+    }
+
+    fn make_inode(inode: u64, parent: u64, name: &str) -> InodeInfo {
+        InodeInfo {
+            inode,
+            name: name.to_string(),
+            parent_inode: parent,
+            file_type: FileType::File,
+            size: 0,
+            mtime: ShardStore::current_time(),
+            atime: ShardStore::current_time(),
+            ctime: ShardStore::current_time(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_mark_tombstone_hides_entry_from_lookup() {
+        let store = make_store();
+        let info = make_inode(1500, 1, "foo");
+        store.create_inode_atomic(info, 1, "foo").unwrap();
+
+        // 删除前 lookup 可见
+        assert!(store.lookup(1, "foo").is_some());
+
+        // 标记 tombstone
+        store.mark_tombstone(1500).unwrap();
+
+        // 删除后 lookup 不可见
+        assert!(store.lookup(1, "foo").is_none());
+        // 但 inode 仍存在于 store（仅标记 delete_time）
+        assert!(store.get_inode(1500).is_some());
+        assert!(store.get_inode(1500).unwrap().delete_time > 0);
+    }
+
+    #[test]
+    fn test_scan_tombstones_respects_grace_period() {
+        let store = make_store();
+        let info = make_inode(1500, 1, "foo");
+        store.create_inode_atomic(info, 1, "foo").unwrap();
+        store.mark_tombstone(1500).unwrap();
+
+        // grace_period 很大时，不应被扫描到
+        let candidates = store.scan_tombstones_for_gc(999999);
+        assert!(candidates.is_empty());
+
+        // grace_period 为 0 时，应被扫描到
+        let candidates = store.scan_tombstones_for_gc(0);
+        assert_eq!(candidates.len(), 1);
+        let (inode, parent, name, chunks) = &candidates[0];
+        assert_eq!(*inode, 1500);
+        assert_eq!(*parent, 1);
+        assert_eq!(name, "foo");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_gc_physical_delete_via_remove_inode_atomic() {
+        let store = make_store();
+        let info = make_inode(1500, 1, "foo");
+        store.create_inode_atomic(info, 1, "foo").unwrap();
+        store.mark_tombstone(1500).unwrap();
+
+        // 模拟 GC：扫描 + 物理删除
+        let candidates = store.scan_tombstones_for_gc(0);
+        assert_eq!(candidates.len(), 1);
+        let (inode, parent, name, _) = &candidates[0];
+        store.remove_inode_atomic(*inode, *parent, name).unwrap();
+
+        // 物理删除后 inode 与 dir_entry 均不存在
+        assert!(store.get_inode(1500).is_none());
+        assert!(store.lookup(1, "foo").is_none());
+        assert!(!store.verify_inode_in_db(1500));
+    }
+
+    #[test]
+    fn test_non_tombstoned_inodes_not_scanned() {
+        let store = make_store();
+        let info = make_inode(1500, 1, "foo");
+        store.create_inode_atomic(info, 1, "foo").unwrap();
+
+        // 未标记 tombstone 的 inode 不应被扫描到
+        let candidates = store.scan_tombstones_for_gc(0);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_open_count_increment_decrement() {
+        let store = make_store();
+
+        // 初始 open_count 为 0
+        assert_eq!(store.get_open_count(1500), 0);
+
+        // open 两次 → open_count = 2
+        assert_eq!(store.increment_open_count(1500), 1);
+        assert_eq!(store.increment_open_count(1500), 2);
+        assert_eq!(store.get_open_count(1500), 2);
+
+        // close 一次 → open_count = 1
+        assert_eq!(store.decrement_open_count(1500), 1);
+        assert_eq!(store.get_open_count(1500), 1);
+
+        // close 再次 → open_count = 0（条目从 map 移除）
+        assert_eq!(store.decrement_open_count(1500), 0);
+        assert_eq!(store.get_open_count(1500), 0);
+    }
+
+    #[test]
+    fn test_open_count_decrement_below_zero_clamped() {
+        let store = make_store();
+        // 未 open 直接 close → 不会变负，返回 0
+        assert_eq!(store.decrement_open_count(1500), 0);
+        assert_eq!(store.get_open_count(1500), 0);
+    }
+
+    #[test]
+    fn test_pending_reclaims_wal() {
+        let store = make_store();
+        let chunk = StoredFileChunk {
+            offset: 0,
+            size: 1024,
+            mtime: 100,
+            fid: "1,100,200".to_string(),
+            cookie: 100,
+            crc32: 0xDEADBEEF,
+        };
+
+        // 初始为空
+        assert!(store.list_pending_reclaims().is_empty());
+
+        // 添加 pending reclaim
+        store.add_pending_reclaim(5000, &chunk);
+        let pending = store.list_pending_reclaims();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 5000);
+        assert_eq!(pending[0].1.fid, "1,100,200");
+
+        // 删除 pending reclaim
+        store.remove_pending_reclaim("1,100,200");
+        assert!(store.list_pending_reclaims().is_empty());
     }
 }

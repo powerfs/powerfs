@@ -10,9 +10,10 @@ use crate::raft_group_manager::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
+use powerfs_coherence::ChunkWire;
 use powerfs_net::serialize::{EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    ClientType, FieldId, FrameFlags, MsgType, NetMessage, NetResult, PowerFsNetHandler,
+    ClientType, FieldId, FrameFlags, MsgType, NetError, NetMessage, NetResult, PowerFsNetHandler,
     RequestContext, ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
     STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
@@ -162,6 +163,51 @@ impl FilerNetHandler {
         }
     }
 
+    /// 将 InodeInfo 的 chunks 列表 + fid/volume_id 序列化到 TLV encoder。
+    ///
+    /// 同时输出两套字段以保证兼容性：
+    /// 1. **完整列表**（新协议）：`FieldId::Chunks` = JSON 序列化的 `Vec<ChunkWire>`，
+    ///    fuse 端优先解析此字段，可获取多 chunk 文件的完整数据布局。
+    /// 2. **首 chunk 字段**（旧协议）：`Fid`/`VolumeId`/`Cookie`/`FileKey`/`Size`，
+    ///    仅包含首 chunk 信息，供旧客户端兼容读取单 chunk 文件。
+    ///
+    /// 修复历史 bug：`handle_getattr` 之前完全缺失 chunks 序列化，
+    /// 导致 `get_entry_by_inode` 拿到的 chunks 列表恒为空，跨客户端读文件时
+    /// 因 chunks 为空而触发 I/O error。
+    fn encode_chunks_fields(enc: &mut TlvEncoder, info: &InodeInfo) -> Result<(), NetError> {
+        // 完整 chunks 列表（JSON）
+        if !info.chunks.is_empty() {
+            let wire_list: Vec<ChunkWire> = info
+                .chunks
+                .iter()
+                .map(|c| ChunkWire {
+                    offset: c.offset,
+                    size: c.size,
+                    mtime: c.mtime,
+                    fid: c.fid.clone(),
+                    cookie: c.cookie,
+                    crc32: c.crc32,
+                })
+                .collect();
+            if let Ok(json) = serde_json::to_vec(&wire_list) {
+                enc.add_bytes(FieldId::Chunks, &json)?;
+            }
+        }
+        // 兼容旧字段：首 chunk + 全局 fid/volume_id
+        if let Some(ref fid) = info.fid {
+            enc.add_string(FieldId::Fid, fid)?;
+        }
+        if let Some(volume_id) = info.volume_id {
+            enc.add_u64(FieldId::VolumeId, volume_id);
+        }
+        if let Some(chunk) = info.chunks.first() {
+            enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+            enc.add_u64(FieldId::FileKey, chunk.offset);
+            enc.add_u64(FieldId::Size, chunk.size);
+        }
+        Ok(())
+    }
+
     /// Handle Lookup request
     async fn handle_lookup(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -230,19 +276,8 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
 
-                // Return chunk/fid info for data access
-                if let Some(ref fid) = info.fid {
-                    enc.add_string(FieldId::Fid, fid)?;
-                }
-                if let Some(volume_id) = info.volume_id {
-                    enc.add_u64(FieldId::VolumeId, volume_id);
-                }
-                // Return the first chunk's cookie and offset
-                if let Some(chunk) = info.chunks.first() {
-                    enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
-                    enc.add_u64(FieldId::FileKey, chunk.offset);
-                    enc.add_u64(FieldId::Size, chunk.size);
-                }
+                // 完整 chunks 列表 + 兼容旧单 chunk 字段
+                Self::encode_chunks_fields(&mut enc, &info)?;
 
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
@@ -277,9 +312,16 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+                // 完整 chunks 列表 + 兼容旧单 chunk 字段。
+                // 修复历史 bug：此前 GetAttr 完全缺失 chunks 序列化，
+                // 导致 fuse 端 get_entry_by_inode 拿到的 chunks 恒为空，
+                // open() 时无法刷新账本，跨客户端读文件触发 I/O error。
+                Self::encode_chunks_fields(&mut enc, &info)?;
                 info!(
-                    "FILER_NET_GETATTR: returned info for ino={}, name={}",
-                    ino, entry_info.name
+                    "FILER_NET_GETATTR: returned info for ino={}, name={}, chunks={}",
+                    ino,
+                    entry_info.name,
+                    info.chunks.len()
                 );
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
@@ -743,19 +785,8 @@ impl FilerNetHandler {
             entry_enc.add_u64(FieldId::Mtime, entry.mtime);
             entry_enc.add_u64(FieldId::Ctime, entry.ctime);
             entry_enc.add_u64(FieldId::Nlink, entry.nlink as u64);
-            // Return chunk/fid info for data access
-            if let Some(ref fid) = entry.fid {
-                entry_enc.add_string(FieldId::Fid, fid)?;
-            }
-            if let Some(volume_id) = entry.volume_id {
-                entry_enc.add_u64(FieldId::VolumeId, volume_id);
-            }
-            // Return first chunk details
-            if let Some(chunk) = entry.chunks.first() {
-                entry_enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
-                entry_enc.add_u64(FieldId::FileKey, chunk.offset);
-                entry_enc.add_u64(FieldId::Size, chunk.size);
-            }
+            // 完整 chunks 列表 + 兼容旧单 chunk 字段
+            Self::encode_chunks_fields(&mut entry_enc, entry)?;
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
         }
 
@@ -855,6 +886,566 @@ impl FilerNetHandler {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: CRDT delta sync handlers（fuse→filer 走 net 层）
+    // -----------------------------------------------------------------------
+
+    /// handle_push_delta：接收客户端 push 的 delta，merge 到 filer OR-Set
+    async fn handle_push_delta(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::PushDeltaRequest = match serde_json::from_slice(&msg.body) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("FILER_NET_PUSH_DELTA: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
+        // push_delta 不需要单独 dir_ino（每个 delta 自带 parent_ino）
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        // B4: leader 校验
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        // DeltaWire → proto DeltaOp
+        let proto_deltas: Vec<crate::powerfs::DeltaOp> =
+            req.deltas.iter().filter_map(wire_to_proto_delta).collect();
+        let proto_vclock = req.client_vclock.as_ref().map(wire_to_proto_vclock);
+
+        match self
+            .meta_shard_manager
+            .push_delta(shard_id, &req.client_id, &proto_deltas, &proto_vclock)
+            .await
+        {
+            Ok(server_vclock) => {
+                let resp = powerfs_coherence::PushDeltaResponse {
+                    success: true,
+                    error: String::new(),
+                    server_vclock: proto_to_wire_vclock(&server_vclock),
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_PUSH_DELTA failed: {}", e);
+                let resp = powerfs_coherence::PushDeltaResponse {
+                    success: false,
+                    error: e,
+                    server_vclock: VectorClockWire::default(),
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+            }
+        }
+    }
+
+    /// handle_pull_delta：返回客户端尚未看到的 delta
+    async fn handle_pull_delta(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::PullDeltaRequest = match serde_json::from_slice(&msg.body) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("FILER_NET_PULL_DELTA: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
+        // dir_ino 保留用于过滤（避免跨目录 delta 污染）
+        let dir_ino = req.shard_id;
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        // B4: leader 校验（pull 也走 leader，确保 delta 一致性）
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        let proto_vclock = req.client_vclock.as_ref().map(wire_to_proto_vclock);
+
+        match self
+            .meta_shard_manager
+            .pull_delta(shard_id, dir_ino, &req.client_id, &proto_vclock)
+            .await
+        {
+            Ok((proto_deltas, server_vclock)) => {
+                let server_vc_wire = proto_to_wire_vclock(&server_vclock);
+                let wire_deltas: Vec<_> = proto_deltas
+                    .iter()
+                    .map(|d| {
+                        let mut wire = proto_to_wire_delta(d);
+                        // 补全 vclock：用 server_vclock 确保客户端 apply 后 vclock 推进。
+                        // proto DeltaOp 不携带 vclock，proto_to_wire_delta 默认为空，
+                        // 导致客户端 vclock 不推进、puller 反复收到相同 delta。
+                        if wire.vclock.entries.is_empty() && !server_vc_wire.entries.is_empty() {
+                            wire.vclock = server_vc_wire.clone();
+                        }
+                        wire
+                    })
+                    .collect();
+                let resp = powerfs_coherence::PullDeltaResponse {
+                    deltas: wire_deltas,
+                    server_vclock: server_vc_wire,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_PULL_DELTA failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// handle_alloc_inode_batch：批量授权 inode 预留段
+    async fn handle_alloc_inode_batch(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::AllocInodeBatchRequest = match serde_json::from_slice(&msg.body)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("FILER_NET_ALLOC_INODE: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .alloc_inode_batch(shard_id, req.count)
+            .await
+        {
+            Ok((start, end)) => {
+                let resp = powerfs_coherence::AllocInodeBatchResponse {
+                    success: true,
+                    error: String::new(),
+                    start_inode: start,
+                    end_inode: end,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_ALLOC_INODE failed: {}", e);
+                let resp = powerfs_coherence::AllocInodeBatchResponse {
+                    success: false,
+                    error: e,
+                    start_inode: 0,
+                    end_inode: 0,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+            }
+        }
+    }
+
+    /// handle_update_inode_size_chunks：close 时强一致 sync 账本
+    async fn handle_update_inode_size_chunks(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::UpdateInodeSizeChunksRequest =
+            match serde_json::from_slice(&msg.body) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("FILER_NET_UPDATE_SIZE_CHUNKS: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        Vec::new(),
+                    ));
+                }
+            };
+
+        // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        let chunks: Vec<crate::shard_store::StoredFileChunk> = req
+            .chunks
+            .iter()
+            .map(|c| crate::shard_store::StoredFileChunk {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                fid: c.fid.clone(),
+                cookie: c.cookie,
+                crc32: c.crc32,
+            })
+            .collect();
+
+        match self
+            .meta_shard_manager
+            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks)
+            .await
+        {
+            Ok(_) => {
+                let resp = powerfs_coherence::UpdateInodeSizeChunksResponse {
+                    success: true,
+                    error: String::new(),
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_UPDATE_SIZE_CHUNKS failed: {}", e);
+                let resp = powerfs_coherence::UpdateInodeSizeChunksResponse {
+                    success: false,
+                    error: e,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+            }
+        }
+    }
+
+    /// Phase 3.5.3: 处理 fuse 端 open 时上报的 open_count 递增请求。
+    async fn handle_open_count_inc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::OpenCountRequest = match serde_json::from_slice(&msg.body) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("FILER_NET_OPEN_COUNT_INC: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.meta_shard_manager.increment_open_count(req.inode) {
+            Ok(count) => {
+                let resp = powerfs_coherence::OpenCountResponse {
+                    success: true,
+                    open_count: count,
+                    error: String::new(),
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_OPEN_COUNT_INC failed: {}", e);
+                let resp = powerfs_coherence::OpenCountResponse {
+                    success: false,
+                    open_count: 0,
+                    error: e,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+            }
+        }
+    }
+
+    /// Phase 3.5.3: 处理 fuse 端 release/close 时上报的 open_count 递减请求。
+    async fn handle_open_count_dec(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let req: powerfs_coherence::OpenCountRequest = match serde_json::from_slice(&msg.body) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("FILER_NET_OPEN_COUNT_DEC: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(req.shard_id);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.meta_shard_manager.decrement_open_count(req.inode) {
+            Ok(count) => {
+                let resp = powerfs_coherence::OpenCountResponse {
+                    success: true,
+                    open_count: count,
+                    error: String::new(),
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_OK, body))
+            }
+            Err(e) => {
+                warn!("FILER_NET_OPEN_COUNT_DEC failed: {}", e);
+                let resp = powerfs_coherence::OpenCountResponse {
+                    success: false,
+                    open_count: 0,
+                    error: e,
+                };
+                let body = serde_json::to_vec(&resp).unwrap_or_default();
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeltaWire ↔ proto DeltaOp 转换（net_handler 专用）
+// ---------------------------------------------------------------------------
+
+use powerfs_coherence::{
+    DeltaOpType, DeltaWire, DirEntryWire, EntryIdWire, SetAttrWire, VectorClockWire,
+};
+
+/// proto VectorClock → wire VectorClock
+fn proto_to_wire_vclock(vc: &crate::powerfs::VectorClock) -> VectorClockWire {
+    VectorClockWire {
+        entries: vc
+            .entries
+            .iter()
+            .map(|e| powerfs_coherence::VectorClockEntryWire {
+                client_id: e.client_id,
+                seq: e.seq,
+            })
+            .collect(),
+    }
+}
+
+/// wire VectorClock → proto VectorClock
+fn wire_to_proto_vclock(w: &VectorClockWire) -> crate::powerfs::VectorClock {
+    crate::powerfs::VectorClock {
+        entries: w
+            .entries
+            .iter()
+            .map(|e| crate::powerfs::VectorClockEntry {
+                client_id: e.client_id,
+                seq: e.seq,
+            })
+            .collect(),
+    }
+}
+
+/// proto DeltaOp → wire DeltaWire
+fn proto_to_wire_delta(d: &crate::powerfs::DeltaOp) -> DeltaWire {
+    use crate::powerfs::delta_op::Op;
+    let op = match &d.op {
+        Some(op) => op,
+        None => {
+            return DeltaWire {
+                op_type: DeltaOpType::Add,
+                vclock: VectorClockWire::default(),
+                entry: None,
+                entry_id: None,
+                old_entry_id: None,
+                setattr: None,
+            }
+        }
+    };
+    match op {
+        Op::Add(e) => DeltaWire {
+            op_type: DeltaOpType::Add,
+            // 补全 vclock：用 entry 的 (client_id, seq) 构建，
+            // 客户端 apply 后 vclock 推进，避免 puller 反复收到相同 delta。
+            vclock: VectorClockWire {
+                entries: if e.client_id != 0 {
+                    vec![powerfs_coherence::VectorClockEntryWire {
+                        client_id: e.client_id,
+                        seq: e.seq,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+            entry: Some(DirEntryWire {
+                name: e.name.clone(),
+                client_id: e.client_id,
+                seq: e.seq,
+                inode: e.inode,
+                generation: 0,
+                file_type: 0,
+                mode: e.mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+                nlink: 1,
+                rdev: 0,
+                parent_ino: e.parent_ino,
+                chunks: vec![],
+                symlink_target: None,
+            }),
+            entry_id: None,
+            old_entry_id: None,
+            setattr: None,
+        },
+        Op::Remove(id) => DeltaWire {
+            op_type: DeltaOpType::Remove,
+            vclock: VectorClockWire::default(),
+            entry: None,
+            entry_id: Some(EntryIdWire {
+                name: id.name.clone(),
+                client_id: 0,
+                seq: 0,
+                parent_ino: id.parent_ino,
+            }),
+            old_entry_id: None,
+            setattr: None,
+        },
+        Op::Rename(r) => DeltaWire {
+            op_type: DeltaOpType::Rename,
+            vclock: VectorClockWire::default(),
+            entry: Some(DirEntryWire {
+                name: r.new_name.clone(),
+                client_id: 0,
+                seq: 0,
+                inode: 0,
+                generation: 0,
+                file_type: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+                nlink: 1,
+                rdev: 0,
+                parent_ino: r.new_parent_ino,
+                chunks: vec![],
+                symlink_target: None,
+            }),
+            entry_id: None,
+            old_entry_id: Some(EntryIdWire {
+                name: r.old_name.clone(),
+                client_id: 0,
+                seq: 0,
+                parent_ino: r.old_parent_ino,
+            }),
+            setattr: None,
+        },
+        Op::SetAttr(s) => DeltaWire {
+            op_type: DeltaOpType::SetAttr,
+            vclock: VectorClockWire::default(),
+            entry: None,
+            entry_id: None,
+            old_entry_id: None,
+            setattr: Some(SetAttrWire {
+                inode: s.inode,
+                mode: None,
+                uid: None,
+                gid: None,
+                size: if s.size > 0 { Some(s.size) } else { None },
+                mtime: if s.mtime > 0 { Some(s.mtime) } else { None },
+                nlink: None,
+                chunks: s
+                    .chunks
+                    .iter()
+                    .map(|c| ChunkWire {
+                        offset: c.offset,
+                        size: c.size,
+                        mtime: c.mtime,
+                        fid: c.fid.clone(),
+                        cookie: c.cookie,
+                        crc32: c.crc32,
+                    })
+                    .collect(),
+            }),
+        },
+    }
+}
+
+/// wire DeltaWire → proto DeltaOp
+fn wire_to_proto_delta(w: &DeltaWire) -> Option<crate::powerfs::DeltaOp> {
+    use crate::powerfs::{
+        delta_op::Op, DirEntryOrset, EntryId as ProtoEntryId, RenameOp, SetAttrOp,
+    };
+    let op = match w.op_type {
+        DeltaOpType::Add => {
+            let e = w.entry.as_ref()?;
+            Op::Add(DirEntryOrset {
+                parent_ino: e.parent_ino,
+                name: e.name.clone(),
+                inode: e.inode,
+                mode: e.mode,
+                seq: e.seq,
+                client_id: e.client_id,
+            })
+        }
+        DeltaOpType::Remove => {
+            let id = w.entry_id.as_ref()?;
+            Op::Remove(ProtoEntryId {
+                parent_ino: id.parent_ino,
+                name: id.name.clone(),
+            })
+        }
+        DeltaOpType::Rename => {
+            let old = w.old_entry_id.as_ref()?;
+            let new = w.entry.as_ref()?;
+            Op::Rename(RenameOp {
+                old_parent_ino: old.parent_ino,
+                old_name: old.name.clone(),
+                new_parent_ino: new.parent_ino,
+                new_name: new.name.clone(),
+            })
+        }
+        DeltaOpType::SetAttr => {
+            let s = w.setattr.as_ref()?;
+            Op::SetAttr(SetAttrOp {
+                inode: s.inode,
+                size: s.size.unwrap_or(0),
+                mtime: s.mtime.unwrap_or(0),
+                chunks: s
+                    .chunks
+                    .iter()
+                    .map(|c| crate::powerfs::FileChunk {
+                        offset: c.offset,
+                        size: c.size,
+                        mtime: c.mtime,
+                        fid: c.fid.clone(),
+                        cookie: c.cookie,
+                        crc32: c.crc32,
+                    })
+                    .collect(),
+                extended: std::collections::HashMap::new(),
+            })
+        }
+    };
+    Some(crate::powerfs::DeltaOp { op: Some(op) })
 }
 
 #[async_trait::async_trait]
@@ -885,6 +1476,12 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            MsgType::PushDelta => self.handle_push_delta(msg).await,
+            MsgType::PullDelta => self.handle_pull_delta(msg).await,
+            MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
+            MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
+            MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
+            MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
@@ -939,6 +1536,12 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            MsgType::PushDelta => self.handle_push_delta(msg).await,
+            MsgType::PullDelta => self.handle_pull_delta(msg).await,
+            MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
+            MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
+            MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
+            MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);

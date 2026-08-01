@@ -10,6 +10,7 @@ use crate::circuit_breaker::CircuitBreakerPool;
 use crate::client_error::{ClientError, ClientResult};
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
+use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
 use powerfs_net::{ClientConfig, PowerFsNetClient};
 
@@ -244,6 +245,9 @@ pub struct MetaShardClient {
     notify: Arc<tokio::sync::Notify>,
     /// 默认 Filer 地址（当 shard_id 不在路由表中时回退使用，例如 inode 作为 shard_id 时）
     default_filer_addr: Arc<Mutex<String>>,
+    /// Sharded RPC Pool — 并发派发元数据请求，消除全局 response_waiters 锁。
+    /// 在 init() 中创建（需要 shard_router 已填充）。
+    rpc_pool: Arc<Mutex<Option<Arc<ShardedRpcPool>>>>,
 }
 
 impl MetaShardClient {
@@ -269,6 +273,7 @@ impl MetaShardClient {
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
             default_filer_addr: Arc::new(Mutex::new(String::new())),
+            rpc_pool: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -351,60 +356,51 @@ impl MetaShardClient {
     }
 
     /// 提交元数据请求并等待响应
+    ///
+    /// 通过 ShardedRpcPool 并发派发（per-worker MPSC 队列 + tokio::spawn），
+    /// 消除全局 response_waiters 锁。结果通过 oneshot 直接返回。
     pub async fn submit_metadata_request_and_wait(
         &self,
         context: RequestContext,
         shard_id: u64,
         timeout: Duration,
     ) -> ClientResult<RequestResult> {
-        let request_id = context.request_id.clone();
-        let (tx, rx) = oneshot::channel();
+        let req = PendingRequest {
+            context,
+            shard_id,
+            enqueued_at: Instant::now(),
+        };
 
-        self.register_waiter(request_id.clone(), tx);
-        self.submit_metadata_request(context, shard_id)
-            .map_err(ClientError::Internal)?;
-
-        // 尝试直接处理队列中的请求（如果队列前面没有其他请求）
-        // 注意：这只是优化，真正的处理由后台处理器或显式 process_* 完成
-        // 这里我们只需要等待结果
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                // 超时，清理等待者
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
-        }
+        // 快速路径：ShardedRpcPool（延迟初始化，首次调用时创建）
+        let pool = self.ensure_rpc_pool();
+        pool.submit(req, timeout).await
     }
 
     /// 提交控制请求并等待响应
+    ///
+    /// 同样通过 ShardedRpcPool 派发（控制请求与元数据请求共用 pool，
+    /// 控制请求低频，无需独立优先级队列）。
     pub async fn submit_control_request_and_wait(
         &self,
         context: RequestContext,
         shard_id: u64,
         timeout: Duration,
     ) -> ClientResult<RequestResult> {
-        let request_id = context.request_id.clone();
-        let (tx, rx) = oneshot::channel();
+        let req = PendingRequest {
+            context,
+            shard_id,
+            enqueued_at: Instant::now(),
+        };
 
-        self.register_waiter(request_id.clone(), tx);
-        self.submit_control_request(context, shard_id)
-            .map_err(ClientError::Internal)?;
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
-        }
+        // 快速路径：ShardedRpcPool
+        let pool = self.ensure_rpc_pool();
+        pool.submit(req, timeout).await
     }
 
-    /// 启动后台处理循环（事件驱动，无轮询延迟）
+    /// 启动后台处理循环
+    ///
+    /// 串行处理循环已被 ShardedRpcPool 取代（submit_*_and_wait 直接走 pool）。
+    /// 此方法仅启动连接健康检查任务（periodic ping + reconnect）。
     pub fn start_background_processor(&self) {
         let mut running = self.background_running.lock().unwrap();
         if *running {
@@ -412,67 +408,9 @@ impl MetaShardClient {
         }
         *running = true;
 
-        let data_queue = self.data_queue.clone();
-        let control_queue = self.control_queue.clone();
-        let data_channel = self.data_channel.clone();
-        let control_channel = self.control_channel.clone();
-        let shard_router = self.shard_router.clone();
-        let breakers = self.breakers.clone();
-        let topology_manager = self.topology_manager.clone();
-        let filer_connections = self.filer_connections.clone();
-        let listeners = self.listeners.clone();
-        let background_running = self.background_running.clone();
-        let state = self.state.clone();
-        let response_waiters = self.response_waiters.clone();
-        let notify = self.notify.clone();
-        let default_filer_addr = self.default_filer_addr.clone();
-
-        tokio::spawn(async move {
-            log::info!("MetaShardClient: Background processor started");
-
-            loop {
-                // 检查是否应该停止
-                if !*background_running.lock().unwrap() {
-                    break;
-                }
-
-                // 检查状态
-                let current_state = *state.lock().unwrap();
-                if current_state == MetaShardClientState::Closed
-                    || current_state == MetaShardClientState::Suspended
-                {
-                    // 暂停状态下等待通知（Leader变更恢复时会notify）
-                    notify.notified().await;
-                    continue;
-                }
-
-                // 尝试处理队列中的请求
-                let processed = process_available_requests(
-                    &data_queue,
-                    &control_queue,
-                    &data_channel,
-                    &control_channel,
-                    &breakers,
-                    &filer_connections,
-                    &default_filer_addr,
-                    &shard_router,
-                    &topology_manager,
-                    &listeners,
-                    &response_waiters,
-                )
-                .await;
-
-                if processed {
-                    // 处理了请求，检查队列中是否还有更多
-                    continue;
-                }
-
-                // 队列为空，等待事件通知（入队时触发）
-                notify.notified().await;
-            }
-
-            log::info!("MetaShardClient: Background processor stopped");
-        });
+        log::info!(
+            "MetaShardClient: Background processor started (health-check only, dispatch via ShardedRpcPool)"
+        );
 
         // ---- Connection health task: periodic ping + graceful reconnect ----
         // Without this, a connection whose far end silently dropped (NAT /
@@ -559,8 +497,30 @@ impl MetaShardClient {
             self.setup_default_routes();
         }
 
+        // ShardedRpcPool 延迟到首次 submit_*_and_wait 时创建（需要 tokio 运行时上下文）
         *self.state.lock().unwrap() = MetaShardClientState::Ready;
-        log::info!("MetaShardClient: Initialized");
+        log::info!(
+            "MetaShardClient: Initialized (shard_count={})",
+            self.shard_router.len()
+        );
+    }
+
+    /// 确保 ShardedRpcPool 已创建（延迟初始化，在 async 上下文中调用）
+    fn ensure_rpc_pool(&self) -> Arc<ShardedRpcPool> {
+        let mut guard = self.rpc_pool.lock().unwrap();
+        if guard.is_none() {
+            let shard_count = self.shard_router.len().max(1);
+            let worker_count = calc_worker_count(shard_count);
+            let pool = ShardedRpcPool::new(
+                worker_count,
+                self.filer_connections.clone(),
+                self.default_filer_addr.clone(),
+                self.breakers.clone(),
+                self.shard_router.clone(),
+            );
+            *guard = Some(Arc::new(pool));
+        }
+        guard.as_ref().unwrap().clone()
     }
 
     /// 设置默认分片路由 - 将 filer leader 地址设为所有分片的默认目标
@@ -940,6 +900,189 @@ impl MetaShardClient {
         (data_len, control_len)
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 2: CRDT delta sync 方法（fuse→filer 走 net 层）
+    // -----------------------------------------------------------------------
+
+    /// 通用 coherence 请求发送：处理 leader 解析、连接、redirect 重试。
+    ///
+    /// 成功返回 STATUS_OK 响应的 body 字节；失败返回错误字符串。
+    /// redirect 重试最多 5 次（与 process_request_internal 一致）。
+    async fn send_coherence_msg(
+        &self,
+        msg_type: powerfs_net::MsgType,
+        shard_id: u64,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+
+            // 1) 获取当前分片 leader 地址（回退到 default_filer_addr）
+            let leader_addr = self
+                .shard_router
+                .get(&shard_id)
+                .map(|s| s.leader_addr.clone())
+                .unwrap_or_else(|| self.default_filer_addr());
+
+            if leader_addr.is_empty() {
+                return Err(format!("no leader for shard {}", shard_id));
+            }
+
+            // 2) 获取或创建连接
+            let filer_client = self
+                .get_or_create_filer_client(&leader_addr)
+                .await
+                .map_err(|e| format!("connect filer {}: {:?}", leader_addr, e))?;
+
+            // 3) circuit breaker 检查
+            if !self.breakers.check(&leader_addr) {
+                return Err(format!("circuit open for {}", leader_addr));
+            }
+
+            // 4) 发送请求
+            let send_result = filer_client.send_request(msg_type, &body, &[]).await;
+
+            match send_result {
+                Ok(resp) => {
+                    let status = resp.header.status;
+                    log::debug!(
+                        "send_coherence_msg: {:?} shard={} attempt={} leader={} status={} body_len={}",
+                        msg_type,
+                        shard_id,
+                        attempt,
+                        leader_addr,
+                        status,
+                        resp.body.len()
+                    );
+
+                    if status == powerfs_net::STATUS_OK {
+                        self.breakers.record_success(&leader_addr);
+                        return Ok(resp.body);
+                    }
+
+                    // redirect：解析新 leader 地址，更新路由，重试
+                    if status == powerfs_net::STATUS_ERR_REDIRECT && attempt < MAX_ATTEMPTS {
+                        let new_leader = {
+                            use powerfs_net::serialize::TlvDecoder;
+                            let mut dec = TlvDecoder::new(&resp.body);
+                            match dec.next_string(powerfs_net::FieldId::Owner) {
+                                Ok(addr) if !addr.is_empty() => Some(addr),
+                                _ => None,
+                            }
+                        };
+
+                        if let Some(new_addr) = new_leader {
+                            log::info!(
+                                "send_coherence_msg: shard={} redirect {} -> {} (attempt {}/{})",
+                                shard_id,
+                                leader_addr,
+                                new_addr,
+                                attempt,
+                                MAX_ATTEMPTS
+                            );
+                            self.shard_router
+                                .insert(shard_id, ShardInfo::new(shard_id, new_addr));
+                            let delay_ms = 50u64 << (attempt - 1).min(3);
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                    }
+
+                    // 其他错误：尝试从 body 解析错误信息
+                    self.breakers.record_failure(&leader_addr);
+                    let err_msg = serde_json::from_slice::<serde_json::Value>(&resp.body)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                        .unwrap_or_else(|| format!("server status {}", status));
+                    return Err(err_msg);
+                }
+                Err(e) => {
+                    self.breakers.record_failure(&leader_addr);
+                    return Err(format!("net error: {:?}", e));
+                }
+            }
+        }
+    }
+
+    /// push_delta：将本地变更 delta 推送到 filer（leader only）。
+    pub async fn push_delta(
+        &self,
+        req: &powerfs_coherence::PushDeltaRequest,
+    ) -> Result<powerfs_coherence::PushDeltaResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::PushDelta, req.shard_id, body)
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
+    /// pull_delta：从 filer 拉取其他客户端的 delta（leader only）。
+    pub async fn pull_delta(
+        &self,
+        req: &powerfs_coherence::PullDeltaRequest,
+    ) -> Result<powerfs_coherence::PullDeltaResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::PullDelta, req.shard_id, body)
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
+    /// alloc_inode_batch：向 filer 申请 inode 预留段（leader only）。
+    pub async fn alloc_inode_batch(
+        &self,
+        req: &powerfs_coherence::AllocInodeBatchRequest,
+    ) -> Result<powerfs_coherence::AllocInodeBatchResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::AllocInodeBatch, req.shard_id, body)
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
+    /// update_inode_size_chunks：close 时强一致 sync 账本到 filer（leader only）。
+    pub async fn update_inode_size_chunks(
+        &self,
+        req: &powerfs_coherence::UpdateInodeSizeChunksRequest,
+    ) -> Result<powerfs_coherence::UpdateInodeSizeChunksResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(
+                powerfs_net::MsgType::UpdateInodeSizeChunks,
+                req.shard_id,
+                body,
+            )
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
+    /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
+    pub async fn open_count_inc(
+        &self,
+        req: &powerfs_coherence::OpenCountRequest,
+    ) -> Result<powerfs_coherence::OpenCountResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::OpenCountInc, req.shard_id, body)
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
+    /// Phase 3.5.3: open_count 递减——fuse release/close 时通知 filer（leader only）。
+    pub async fn open_count_dec(
+        &self,
+        req: &powerfs_coherence::OpenCountRequest,
+    ) -> Result<powerfs_coherence::OpenCountResponse, String> {
+        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::OpenCountDec, req.shard_id, body)
+            .await?;
+        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+    }
+
     /// 关闭客户端
     pub fn close(&self) {
         self.stop_background_processor();
@@ -948,10 +1091,47 @@ impl MetaShardClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DeltaSyncChannel trait 实现：供 CrdtReplicaCoherence 注入使用
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl powerfs_coherence::DeltaSyncChannel for MetaShardClient {
+    async fn push_delta(
+        &self,
+        req: &powerfs_coherence::PushDeltaRequest,
+    ) -> Result<powerfs_coherence::PushDeltaResponse, String> {
+        MetaShardClient::push_delta(self, req).await
+    }
+
+    async fn pull_delta(
+        &self,
+        req: &powerfs_coherence::PullDeltaRequest,
+    ) -> Result<powerfs_coherence::PullDeltaResponse, String> {
+        MetaShardClient::pull_delta(self, req).await
+    }
+
+    async fn alloc_inode_batch(
+        &self,
+        req: &powerfs_coherence::AllocInodeBatchRequest,
+    ) -> Result<powerfs_coherence::AllocInodeBatchResponse, String> {
+        MetaShardClient::alloc_inode_batch(self, req).await
+    }
+
+    async fn update_inode_size_chunks(
+        &self,
+        req: &powerfs_coherence::UpdateInodeSizeChunksRequest,
+    ) -> Result<powerfs_coherence::UpdateInodeSizeChunksResponse, String> {
+        MetaShardClient::update_inode_size_chunks(self, req).await
+    }
+}
+
 // ---- 自由函数版本（供后台处理器使用） ----
 
 /// 处理队列中所有可用的请求，返回是否处理了至少一个
 #[allow(clippy::too_many_arguments)]
+/// 旧版串行请求处理（已被 ShardedRpcPool 取代，保留作为参考）
+#[allow(dead_code)]
 async fn process_available_requests(
     data_queue: &Arc<RequestQueue>,
     control_queue: &Arc<RequestQueue>,
@@ -961,7 +1141,7 @@ async fn process_available_requests(
     filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
-    topology_manager: &Arc<ClusterTopologyManager>,
+    _topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
 ) -> bool {
@@ -977,10 +1157,7 @@ async fn process_available_requests(
                 filer_connections,
                 default_filer_addr,
                 breakers,
-                data_channel,
-                control_channel,
                 shard_router,
-                topology_manager,
             )
             .await;
 
@@ -1012,10 +1189,7 @@ async fn process_available_requests(
                 filer_connections,
                 default_filer_addr,
                 breakers,
-                data_channel,
-                control_channel,
                 shard_router,
-                topology_manager,
             )
             .await;
 
@@ -1038,17 +1212,15 @@ async fn process_available_requests(
     false
 }
 
-/// 内部请求处理逻辑（供后台处理器使用）
-#[allow(clippy::too_many_arguments)]
-async fn process_request_internal(
+/// 内部请求处理逻辑（供 ShardedRpcPool 和后台处理器使用）
+///
+/// 包含 redirect 重试逻辑（最多 5 次，指数退避）。
+pub(crate) async fn process_request_internal(
     req: PendingRequest,
     filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     default_filer_addr: &Arc<Mutex<String>>,
     breakers: &Arc<CircuitBreakerPool>,
-    _data_channel: &Arc<TransportChannel>,
-    _control_channel: &Arc<TransportChannel>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
-    _topology_manager: &Arc<ClusterTopologyManager>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let kind = req.context.kind;
@@ -1151,6 +1323,15 @@ async fn process_request_internal(
                             shard_id
                         );
                     }
+                }
+
+                // STATUS_ERR_NOT_FOUND is a valid response for lookup/getattr
+                // operations.  Return an empty RequestResult so callers can
+                // interpret it as `Ok(None)` instead of a hard error.
+                const STATUS_ERR_NOT_FOUND: u16 = 1;
+                if status == STATUS_ERR_NOT_FOUND {
+                    breakers.record_success(&leader_addr);
+                    return Ok(RequestResult::empty(request_id));
                 }
 
                 // 其他错误或超过重试次数

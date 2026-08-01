@@ -81,6 +81,13 @@ pub struct FilerConfig {
     /// CRDT 后台维护任务执行间隔（秒），默认 60 秒
     #[serde(default)]
     pub crdt_maintenance_interval_secs: Option<u64>,
+    /// Phase 3.5: GC 后台任务执行间隔（秒），默认 300 秒
+    #[serde(default)]
+    pub gc_interval_secs: Option<u64>,
+    /// Phase 3.5: GC grace period（秒），tombstone 标记后等待多久才可被物理删除，默认 86400 秒（24 小时）
+    /// 所有 filer 节点必须配置相同的值，避免元数据不一致
+    #[serde(default)]
+    pub gc_grace_period_secs: Option<u64>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

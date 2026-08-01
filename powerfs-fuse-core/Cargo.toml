@@ -10,6 +10,7 @@ powerfs-master = { path = "../powerfs-master" }
 powerfs-master-net = { path = "../powerfs-master-net" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
+powerfs-coherence = { path = "../powerfs-coherence" }
 libc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }

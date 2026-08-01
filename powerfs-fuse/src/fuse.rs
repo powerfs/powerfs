@@ -19,6 +19,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(1);
+/// Phase 4.3: 已打开文件（open_inodes 中）的 size/chunks 权威缓存 TTL。
+/// 文件打开期间 fuse 持有数据 lease（read/write 时获取），其他客户端无法修改数据，
+/// 因此 size/chunks 在 open→release 期间可信，用 lease_duration 作为 TTL。
+const TTL_OPEN: Duration = Duration::from_secs(30);
 const PREFETCH_CHUNKS: u64 = 2;
 const FUSE_APPEND: u32 = 0x400;
 
@@ -105,8 +109,8 @@ impl FuseApp {
             volume_addrs: self.volume_addrs.clone(),
             filer_addr: self.filer_addr.clone(),
             filer_port: self.filer_net_port,
-            request_timeout: Duration::from_secs(30),
-            client_identity: powerfs_fuse_core::ClientIdentity::default(),
+            request_timeout: Duration::from_secs(10),
+            client_identity: powerfs_fuse_core::ClientIdentity::stable_for(&self.mount_point),
             mount_point: self.mount_point.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
@@ -127,10 +131,24 @@ impl FuseApp {
 
         let cache = Arc::new(MetadataCache::new());
 
+        // Phase 3: 构建 CrdtReplicaCoherence（目录条目 CRDT 副本 + 异步 delta sync）
+        let invalidator = Arc::new(crate::cache::MetadataCacheInvalidatorAdapter::new(
+            cache.clone(),
+        ));
+        let delta_channel: Arc<dyn powerfs_coherence::DeltaSyncChannel> =
+            sync_client.facade().meta_shard_client().clone();
+        let coherence = Arc::new(powerfs_coherence::crdt_client::CrdtReplicaCoherence::new(
+            delta_channel,
+            invalidator,
+            sync_client.facade().client_id_u64(),
+            powerfs_coherence::crdt_client::CrdtConfig::default(),
+        ));
+
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
             chunk_cache: Arc::new(ChunkCache::with_defaults()),
+            coherence: coherence.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
@@ -141,7 +159,13 @@ impl FuseApp {
             write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
+            open_inodes: Arc::new(RwLock::new(HashSet::new())),
         };
+
+        // Phase 3: 启动 change_cache_flusher + 后台 puller
+        let flusher_handle = fs.coherence.clone().start_flusher();
+        let puller_handle = fs.coherence.clone().start_puller();
+        let _ = (flusher_handle, puller_handle); // 持有 JoinHandle 生命周期
 
         let fs_arc = Arc::new(fs);
         let bg_fs = fs_arc.clone();
@@ -168,21 +192,35 @@ impl FuseApp {
 
         let server = Arc::new(Server::new(fs_arc));
 
-        let mut fuse_server = FuseServer {
-            server: server.clone(),
-            ch: session.new_channel().map_err(|e| {
-                PowerFsError::Internal(format!("failed to create fuse channel: {}", e))
-            })?,
-        };
+        // 阶段1: 多 FUSE worker 线程并发处理请求，消除 block_on 串行瓶颈。
+        // 每个 worker 持有独立 FuseChannel（dup fd），共享同一个 Server<PowerFsFs>。
+        // FUSE FileSystem trait 是同步的，worker 线程通过 runtime.block_on() 桥接异步；
+        // 多 worker 并发调用 block_on 时，tokio runtime 自然并发调度各自 future。
+        //
+        // worker 数取 max(num_cpus, 4)：FUSE 操作是 I/O 密集型（阻塞在网络往返），
+        // 即使单 CPU 容器也需要足够并发度让多个请求同时在途。
+        let num_workers = num_cpus::get().max(4);
+        info!("Starting {} FUSE worker threads", num_workers);
 
-        let handle = std::thread::Builder::new()
-            .name("fuse_server".to_string())
-            .spawn(move || {
-                info!("FUSE service thread started");
-                let _ = fuse_server.svc_loop();
-                warn!("FUSE service thread exited");
-            })
-            .map_err(|e| PowerFsError::Internal(format!("failed to spawn fuse thread: {}", e)))?;
+        let mut worker_handles = Vec::with_capacity(num_workers);
+        for i in 0..num_workers {
+            let server = server.clone();
+            let ch = session.new_channel().map_err(|e| {
+                PowerFsError::Internal(format!("failed to create fuse channel {}: {}", i, e))
+            })?;
+            let mut fuse_server = FuseServer { server, ch };
+            let handle = std::thread::Builder::new()
+                .name(format!("fuse_worker_{}", i))
+                .spawn(move || {
+                    info!("FUSE worker thread {} started", i);
+                    let _ = fuse_server.svc_loop();
+                    warn!("FUSE worker thread {} exited", i);
+                })
+                .map_err(|e| {
+                    PowerFsError::Internal(format!("failed to spawn fuse worker {}: {}", i, e))
+                })?;
+            worker_handles.push(handle);
+        }
 
         tokio::signal::ctrl_c()
             .await
@@ -191,7 +229,9 @@ impl FuseApp {
         info!("Received Ctrl+C, unmounting...");
         session.wake().ok();
         session.umount().ok();
-        let _ = handle.join();
+        for handle in worker_handles {
+            let _ = handle.join();
+        }
 
         info!("FUSE session ended");
         Ok(())
@@ -242,6 +282,8 @@ struct PowerFsFs {
     client: Arc<SyncFuseClientFacade>,
     cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
+    /// Phase 3: CRDT 副本一致性（目录条目本地 apply + 异步 delta sync）
+    coherence: Arc<powerfs_coherence::crdt_client::CrdtReplicaCoherence>,
     collection: String,
     replication: String,
     locks: Arc<RwLock<FileLocks>>,
@@ -250,6 +292,10 @@ struct PowerFsFs {
     write_locks: WriteLocks,
     stripe_size: u64,
     lease_duration_ms: u64,
+    /// Phase 4.3/4.4: 当前已打开的 inode 集合。
+    /// open() 时加入，release() 时移除。getattr() 对其中的 inode 使用长 TTL
+    /// （size/chunks 在 open→release 期间权威，因数据 lease 排他）。
+    open_inodes: Arc<RwLock<HashSet<u64>>>,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -287,6 +333,7 @@ impl<'a> LeaseGuard<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn token(&self) -> &str {
         &self.token
     }
@@ -300,9 +347,11 @@ impl<'a> LeaseGuard<'a> {
             "LeaseGuard: releasing lease for inode={}, token={}",
             self.inode, self.token
         );
-        if let Err(e) = self
-            .client
-            .release_lease(self.volume_id, self.inode, &self.client_id)
+        // 传入 LeaseGuard 持有的 token，避免 release_lease_remote 从 leases 表
+        // 查到错误/过期 token 的 bug
+        if let Err(e) =
+            self.client
+                .release_lease(self.volume_id, self.inode, &self.client_id, &self.token)
         {
             warn!(
                 "LeaseGuard: lease release failed for inode={}: {}",
@@ -319,6 +368,37 @@ impl<'a> Drop for LeaseGuard<'a> {
 }
 
 impl PowerFsFs {
+    /// Phase 3.3: local_remove_entry 带 pull_delta 回退 + gRPC fallback。
+    ///
+    /// fuse 重启后 dir_cache 可能为空，`local_remove_entry` 会失败 "no local replica"。
+    /// 此时先 `pull_delta` 构建本地副本再重试；仍失败则 fallback 到 gRPC `delete_entry`，
+    /// 确保 filer 上的元数据一定能被删除（避免 fuse-1 已删但 fuse-2 仍可见的不一致）。
+    fn remove_entry_with_fallback(&self, parent: u64, name: &str, is_dir: bool) {
+        if let Err(e) = self.coherence.local_remove_entry(parent, name) {
+            if e.contains("no local replica") || e.contains("not found") {
+                debug!(
+                    "remove_entry: no local replica for dir {}, pulling delta before retry",
+                    parent
+                );
+                let coherence = self.coherence.clone();
+                self.client
+                    .block_on(async move { coherence.do_pull_and_apply_deltas(parent).await });
+            }
+            if let Err(e2) = self.coherence.local_remove_entry(parent, name) {
+                warn!(
+                    "remove_entry: local_remove_entry retry failed for dir {} name {}: {}, fallback to gRPC",
+                    parent, name, e2
+                );
+                if let Err(e3) =
+                    self.client
+                        .delete_entry(parent, name, is_dir, "powerfs-fuse-client")
+                {
+                    warn!("remove_entry: gRPC delete_entry fallback failed: {}", e3);
+                }
+            }
+        }
+    }
+
     fn get_write_lock(&self, inode: u64, chunk_idx: u64) -> Arc<std::sync::Mutex<()>> {
         let key = (inode, chunk_idx);
         let mut locks = self.write_locks.lock().unwrap();
@@ -393,8 +473,6 @@ impl PowerFsFs {
 
         let chunk_size = self.chunk_cache.chunk_size();
 
-        let mut chunks = Vec::new();
-
         for (_, chunk_idx) in &dirty {
             let chunk_offset = chunk_idx * chunk_size;
             let chunk_data = self.chunk_cache.get(inode, chunk_offset);
@@ -416,60 +494,11 @@ impl PowerFsFs {
                         error!("write_blob failed: {}", e);
                         std::io::Error::from_raw_os_error(libc::EIO)
                     })?;
-
-                chunks.push(powerfs_master::proto::powerfs::FileChunk {
-                    offset: chunk_offset,
-                    size: data_len as u64,
-                    mtime: chunk_data.mtime,
-                    fid: fid.to_string(),
-                    cookie: 0,
-                    crc32: chunk_data.crc32,
-                });
             }
         }
 
-        // Dirty entries already drained by drain_dirty_for_inode above
-
-        let path = self.cache.inode_to_path(inode).unwrap_or_default();
-        if !path.is_empty() && !chunks.is_empty() {
-            let filer_entry = powerfs_master::proto::powerfs::Entry {
-                name: entry.name.clone(),
-                directory: self.cache.inode_to_path(entry.parent).unwrap_or_default(),
-                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                    ino: entry.inode,
-                    mode: entry.mode | 0o100000,
-                    nlink: entry.nlink,
-                    uid: entry.uid,
-                    gid: entry.gid,
-                    rdev: 0,
-                    size: entry.size,
-                    blksize: 4096,
-                    blocks: entry.size.div_ceil(512),
-                    atime: entry.atime as u64,
-                    mtime: entry.mtime as u64,
-                    ctime: entry.ctime as u64,
-                    crtime: entry.ctime as u64,
-                    perm: 0,
-                }),
-                chunks,
-                hard_link_id: entry.hard_link_id.clone(),
-                hard_link_counter: entry.hard_link_counter,
-                extended: HashMap::new(),
-                content_size: entry.content_size,
-                disk_size: entry.disk_size,
-                ttl: String::new(),
-                symlink_target: String::new(),
-                owner: String::new(),
-                generation: entry.generation,
-            };
-
-            // Update entry inline (not in background thread) to avoid
-            // sharing the TCP stream across multiple Tokio runtimes
-            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
-                warn!("Failed to update entry on master: {}", e);
-            }
-        }
-
+        // Phase 3.4: size/chunks 元数据同步移至 release()（close 时强一致 sync），
+        // flush_dirty_chunks 只负责将数据持久化到 volume server。
         Ok(())
     }
 
@@ -485,6 +514,118 @@ impl PowerFsFs {
         }
 
         Ok(())
+    }
+
+    /// Phase 3.4: close 时强一致 sync size/chunks 到 filer（Raft）。
+    ///
+    /// 流程：构建 UpdateInodeSizeChunksRequest → 带 retry+timeout 调用 filer → 成功后 force_sync 目录 delta。
+    /// 失败处理：重试到超时上限 → 返回 EIO + 标记 fsck（日志）。
+    /// lease 在 sync 成功前不释放（崩溃则 lease 超时回收 + fsck 修复孤儿 chunks）。
+    fn sync_size_chunks_on_close(&self, inode: u64) -> std::io::Result<()> {
+        let entry = match self.cache.get_inode(inode) {
+            Some(e) => e,
+            None => {
+                // 目录或未缓存条目无需 sync size/chunks
+                warn!(
+                    "sync_size_chunks_on_close: inode {} cache miss (None), skipping sync",
+                    inode
+                );
+                return Ok(());
+            }
+        };
+
+        if entry.is_dir {
+            debug!(
+                "sync_size_chunks_on_close: inode {} is dir, skipping sync",
+                inode
+            );
+            return Ok(());
+        }
+
+        debug!(
+            "sync_size_chunks_on_close: inode={}, content_size={}, chunks={}, fid={:?}",
+            inode,
+            entry.content_size,
+            entry.chunks.len(),
+            entry.fid.as_ref().map(|f| f.to_string())
+        );
+
+        let parent = entry.parent;
+        let chunks_wire: Vec<powerfs_coherence::ChunkWire> = entry
+            .chunks
+            .iter()
+            .map(|c| powerfs_coherence::ChunkWire {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                fid: c.fid.clone(),
+                cookie: c.cookie,
+                crc32: c.crc32,
+            })
+            .collect();
+
+        let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
+            shard_id: parent, // dir_ino 作为 shard_id
+            inode,
+            size: entry.content_size,
+            chunks: chunks_wire,
+            client_id: self.client.client_id(),
+        };
+
+        // retry + timeout：总超时 10s，重试间隔 500ms 递增
+        let max_retries = 5u32;
+        let mut last_err = String::new();
+        for attempt in 1..=max_retries {
+            let coherence = self.coherence.clone();
+            let req = req.clone();
+            let result = self
+                .client
+                .block_on(async move { coherence.sync_size_chunks(&req).await });
+            match result {
+                Ok(resp) if resp.success => {
+                    debug!(
+                        "sync_size_chunks_on_close: inode {} synced (attempt {})",
+                        inode, attempt
+                    );
+                    // 同步 push 父目录的 CRDT delta（确保目录条目可见）
+                    let coherence = self.coherence.clone();
+                    if let Err(e) = self
+                        .client
+                        .block_on(async move { coherence.force_sync(parent).await })
+                    {
+                        warn!(
+                            "sync_size_chunks_on_close: force_sync dir {} failed: {} (size/chunks already synced)",
+                            parent, e
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(resp) => {
+                    last_err = resp.error;
+                    warn!(
+                        "sync_size_chunks_on_close: inode {} attempt {} failed: {}",
+                        inode, attempt, last_err
+                    );
+                }
+                Err(e) => {
+                    last_err = e;
+                    warn!(
+                        "sync_size_chunks_on_close: inode {} attempt {} error: {}",
+                        inode, attempt, last_err
+                    );
+                }
+            }
+            if attempt < max_retries {
+                std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64)));
+            }
+        }
+
+        // sync 失败：标记 fsck + 返回 EIO
+        error!(
+            "sync_size_chunks_on_close: inode {} FAILED after {} attempts: {} — marked for fsck (orphan chunks possible)",
+            inode, max_retries, last_err
+        );
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn create_stat(&self, entry: &CachedEntry) -> libc::stat64 {
@@ -642,6 +783,66 @@ impl PowerFsFs {
         }
         Some(current)
     }
+
+    /// Phase 4.2: 从 filer 获取 inode 的 attr 并填入 MetadataCache。
+    /// DirORSet 只存 (inode, name, type)，attr 需从 filer 获取。
+    fn lookup_attr_from_filer(
+        &self,
+        parent: u64,
+        name: &str,
+        inode: u64,
+    ) -> std::io::Result<Entry> {
+        match self.client.get_entry_by_parent(parent, name) {
+            Ok(Some(entry)) => {
+                let cached = self.entry_to_cached(parent, &entry);
+                self.cache.insert(cached.clone());
+                Ok(self.create_fuse_entry(&cached))
+            }
+            Ok(None) => {
+                // DirORSet 有条目但 filer 查不到（delta 已 push 但 filer 未处理完？）
+                // 返回一个基于 DirORSet 信息的最小 entry
+                debug!(
+                    "lookup_attr_from_filer: filer miss for inode {} (dir entry exists), using minimal entry",
+                    inode
+                );
+                let now = chrono::Utc::now().timestamp();
+                let cached = CachedEntry {
+                    inode,
+                    parent,
+                    name: name.to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    symlink_target: None,
+                    nlink: 1,
+                    fid: None,
+                    size: 0,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    xattrs: HashMap::new(),
+                    chunks: Vec::new(),
+                    hard_link_id: String::new(),
+                    hard_link_counter: 0,
+                    content_size: 0,
+                    disk_size: 0,
+                    generation: 0,
+                    cached_at: Instant::now(),
+                };
+                self.cache.insert(cached.clone());
+                Ok(self.create_fuse_entry(&cached))
+            }
+            Err(e) => {
+                warn!(
+                    "lookup_attr_from_filer: filer query failed for inode {}: {}",
+                    inode, e
+                );
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+        }
+    }
 }
 
 impl FileSystem for PowerFsFs {
@@ -660,26 +861,47 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("lookup: parent={}, name={}", parent, name_str);
 
+        // 1. MetadataCache 命中（含完整 attr）— 快速路径
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
             return Ok(self.create_fuse_entry(&entry));
         }
 
-        // 使用 parent_ino 直接查询，避免路径解析错误
+        // Phase 4.2: 读本地 DirORSet（权威目录条目源）
+        // 2. DirORSet 命中 → 获取 inode → 查 filer 获取 attr（MetadataCache miss 时）
+        if let Some(inode) = self.coherence.lookup(parent, name_str) {
+            debug!(
+                "lookup: DirORSet hit for '{}/{}' → inode {}",
+                parent, name_str, inode
+            );
+            return self.lookup_attr_from_filer(parent, name_str, inode);
+        }
+
+        // 3. DirORSet miss → 同步 pull_delta 后再查 DirORSet
+        debug!(
+            "lookup: DirORSet miss for '{}/{}', pulling delta",
+            parent, name_str
+        );
+        let coherence = self.coherence.clone();
+        self.client
+            .block_on(async move { coherence.do_pull_and_apply_deltas(parent).await });
+        if let Some(inode) = self.coherence.lookup(parent, name_str) {
+            debug!(
+                "lookup: DirORSet hit after pull for '{}/{}' → inode {}",
+                parent, name_str, inode
+            );
+            return self.lookup_attr_from_filer(parent, name_str, inode);
+        }
+
+        // 4. Fallback: 直接查 filer（兼容旧路径 + 兜底）
         match self.client.get_entry_by_parent(parent, name_str) {
             Ok(Some(entry)) => {
-                info!(
-                    "lookup found entry: parent={}, name={}, chunks={}, content_size={}",
+                debug!(
+                    "lookup found entry via filer fallback: parent={}, name={}, chunks={}",
                     parent,
                     name_str,
-                    entry.chunks.len(),
-                    entry.content_size
+                    entry.chunks.len()
                 );
                 let cached = self.entry_to_cached(parent, &entry);
-                info!(
-                    "cached entry: fid={:?}, chunks={}",
-                    cached.fid.is_some(),
-                    cached.chunks.len()
-                );
                 self.cache.insert(cached.clone());
                 Ok(self.create_fuse_entry(&cached))
             }
@@ -699,9 +921,17 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<(libc::stat64, Duration)> {
         debug!("getattr: inode={}", inode);
 
+        // Phase 4.3: 已打开文件的 size/chunks 在 open→release 期间权威
+        // （数据 lease 排他，其他客户端无法修改），使用长 TTL 避免频繁 filer 查询。
+        let is_open = self.open_inodes.read().unwrap().contains(&inode);
+        let ttl = if is_open { TTL_OPEN } else { TTL };
+
         if let Some(entry) = self.cache.get_inode(inode) {
-            debug!("getattr: cache hit for inode={}", inode);
-            return Ok((self.create_stat(&entry), TTL));
+            debug!(
+                "getattr: cache hit for inode={}, is_open={}, ttl={:?}",
+                inode, is_open, ttl
+            );
+            return Ok((self.create_stat(&entry), ttl));
         }
 
         // Cache miss: 查询 Filer 获取真实属性
@@ -736,7 +966,7 @@ impl FileSystem for PowerFsFs {
                     "getattr: fetched inode={} from filer, name={}, parent={}",
                     inode, cached.name, parent
                 );
-                Ok((self.create_stat(&cached), TTL))
+                Ok((self.create_stat(&cached), ttl))
             }
             Ok(None) => {
                 warn!("getattr: inode={} not found in filer", inode);
@@ -812,53 +1042,20 @@ impl FileSystem for PowerFsFs {
             },
         );
 
-        // Persist the updated entry to Filer
+        // Persist metadata changes via CRDT (mode/uid/gid/mtime) — async delta sync.
+        // size 变更由 close 时 sync_size_chunks_on_close 强一致同步，此处不处理。
         if let Some(updated) = self.cache.get_inode(inode) {
-            let filer_entry = FilerEntry {
-                name: updated.name.clone(),
-                directory: String::new(), // not used in update flow
-                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                    ino: updated.inode,
-                    mode: updated.mode,
-                    nlink: 1,
-                    uid: updated.uid,
-                    gid: updated.gid,
-                    rdev: 0,
-                    size: updated.size,
-                    blksize: 4096,
-                    blocks: updated.size.div_ceil(512),
-                    atime: updated.atime as u64,
-                    mtime: updated.mtime as u64,
-                    ctime: updated.ctime as u64,
-                    crtime: chrono::Utc::now().timestamp() as u64,
-                    perm: 0,
-                }),
-                chunks: updated
-                    .chunks
-                    .iter()
-                    .map(|c| powerfs_master::proto::powerfs::FileChunk {
-                        offset: c.offset,
-                        size: c.size,
-                        mtime: c.mtime,
-                        fid: c.fid.clone(),
-                        cookie: c.cookie,
-                        crc32: c.crc32,
-                    })
-                    .collect(),
-                hard_link_id: updated.hard_link_id.clone(),
-                hard_link_counter: updated.hard_link_counter,
-                extended: HashMap::new(),
-                content_size: updated.content_size,
-                disk_size: updated.disk_size,
-                ttl: String::new(),
-                symlink_target: updated.symlink_target.clone().unwrap_or_default(),
-                owner: String::new(),
-                generation: updated.generation,
-            };
-
-            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
+            let parent_ino = updated.parent;
+            if let Err(e) = self.coherence.local_setattr_entry(
+                parent_ino,
+                inode,
+                mode,
+                uid,
+                gid,
+                mtime.map(|t| t as u64),
+            ) {
                 warn!(
-                    "setattr: failed to persist to filer for inode={}: {}",
+                    "setattr: failed to buffer CRDT delta for inode={}: {}",
                     inode, e
                 );
                 // Continue anyway - local cache is already updated
@@ -890,53 +1087,25 @@ impl FileSystem for PowerFsFs {
 
         let now = chrono::Utc::now().timestamp();
 
-        let parent_path = if let Some(path) = self.cache.inode_to_path(parent) {
-            path
-        } else {
-            match self.client.get_entry_by_inode(parent) {
-                Ok(Some((_, path))) => path,
-                _ => {
-                    error!("Failed to get parent path for inode {}", parent);
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                }
-            }
-        };
-
-        let filer_entry = FilerEntry {
-            name: name_str.to_string(),
-            directory: parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: 0,
-                mode: mode | 0o040000,
-                nlink: 2,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                rdev: 0,
-                size: 0,
-                blksize: 4096,
-                blocks: 0,
-                atime: now as u64,
-                mtime: now as u64,
-                ctime: now as u64,
-                crtime: now as u64,
-                perm: 0,
-            }),
-            chunks: Vec::new(),
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            extended: HashMap::new(),
-            content_size: 0,
-            disk_size: 0,
-            ttl: String::new(),
-            symlink_target: String::new(),
-            owner: String::new(),
-            generation: 0,
-        };
-
-        let inode = self.client.create_entry(&filer_entry, "").map_err(|e| {
-            error!("Failed to create directory entry on master: {}", e);
-            std::io::Error::from_raw_os_error(libc::EIO)
-        })?;
+        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync（不再同步调 filer create_entry）
+        let coherence = self.coherence.clone();
+        let inode = self
+            .client
+            .block_on(async move { coherence.alloc_inode().await })
+            .map_err(|e| {
+                error!("mkdir: alloc_inode failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+        // 保留 S_IFDIR 类型位（0o040000）—— filer 端 apply_delta_to_store 通过
+        // mode & S_IFMT 判定 FileType，清除会导致目录被识别为普通文件。
+        let dir_mode = mode | 0o040000;
+        let _dir_entry = self
+            .coherence
+            .local_create_entry(parent, name_str, inode, true, dir_mode, ctx.uid, ctx.gid)
+            .map_err(|e| {
+                error!("mkdir: local_create_entry failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
         let entry = CachedEntry {
             inode,
@@ -948,7 +1117,7 @@ impl FileSystem for PowerFsFs {
             nlink: 2,
             fid: None,
             size: 0,
-            mode: mode & 0o7777,
+            mode: dir_mode,
             uid: ctx.uid,
             gid: ctx.gid,
             atime: now,
@@ -964,6 +1133,10 @@ impl FileSystem for PowerFsFs {
             cached_at: Instant::now(),
         };
         self.cache.insert(entry.clone());
+        debug!(
+            "mkdir: local apply done, inode={}, async delta buffered for dir {}",
+            inode, parent
+        );
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -984,17 +1157,10 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
-        // Non-blocking delete: spawn a background thread to delete the entry
-        let client = self.client.clone();
-        let name_owned = name_str.to_string();
-        std::thread::spawn(
-            move || match client.delete_entry(parent, &name_owned, true, "") {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to delete directory entry on master: {}", e);
-                }
-            },
-        );
+        // Phase 3.3: 本地 tombstone + 异步 delta sync（不再同步调 filer delete_entry）
+        // filer 收到 Remove delta 后通过 apply_delta_to_store 物理删除 CF_DIR_ENTRIES + CF_INODES
+        // 使用带 pull_delta 回退 + gRPC fallback 的辅助方法，确保 filer 元数据一定能删除
+        self.remove_entry_with_fallback(parent, name_str, true);
 
         self.cache.remove(entry.inode);
         Ok(())
@@ -1024,6 +1190,7 @@ impl FileSystem for PowerFsFs {
 
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
+            // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
                 match self.client.get_volume_addr(fid.volume_id.0) {
@@ -1038,17 +1205,10 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            // Non-blocking delete: spawn a background thread to delete the entry
-            let client = self.client.clone();
-            let name_owned = name_str.to_string();
-            std::thread::spawn(
-                move || match client.delete_entry(parent, &name_owned, false, "") {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Failed to delete file entry on master: {}", e);
-                    }
-                },
-            );
+            // Phase 3.3: 本地 tombstone + 异步 delta sync（不再同步调 filer delete_entry）
+            // filer 收到 Remove delta 后通过 apply_delta_to_store 物理删除 CF_DIR_ENTRIES + CF_INODES
+            // 使用带 pull_delta 回退 + gRPC fallback 的辅助方法，确保 filer 元数据一定能删除
+            self.remove_entry_with_fallback(parent, name_str, false);
 
             self.cache.remove(entry.inode);
         } else {
@@ -1095,60 +1255,24 @@ impl FileSystem for PowerFsFs {
 
         let fid_str = fid.to_string();
 
-        let parent_path = if let Some(path) = self.cache.inode_to_path(parent) {
-            path
-        } else {
-            match self.client.get_entry_by_inode(parent) {
-                Ok(Some((_, path))) => path,
-                _ => {
-                    error!("Failed to get parent path for inode {}", parent);
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                }
-            }
-        };
-
-        let filer_entry = FilerEntry {
-            name: name_str.to_string(),
-            directory: parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: 0,
-                mode: args.mode | 0o100000,
-                nlink: 1,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                rdev: 0,
-                size: 0,
-                blksize: 4096,
-                blocks: 0,
-                atime: now as u64,
-                mtime: now as u64,
-                ctime: now as u64,
-                crtime: now as u64,
-                perm: 0,
-            }),
-            chunks: vec![powerfs_master::proto::powerfs::FileChunk {
-                offset: 0,
-                size: 0,
-                mtime: now as u64,
-                fid: fid_str.clone(),
-                cookie: fid.cookie as u32,
-                crc32: 0,
-            }],
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            extended: HashMap::new(),
-            content_size: 0,
-            disk_size: 0,
-            ttl: String::new(),
-            symlink_target: String::new(),
-            owner: String::new(),
-            generation: 0,
-        };
-
-        let inode = self.client.create_entry(&filer_entry, "").map_err(|e| {
-            error!("Failed to create file entry on master: {}", e);
-            std::io::Error::from_raw_os_error(libc::EIO)
-        })?;
+        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync（不再同步调 filer create_entry）
+        let coherence = self.coherence.clone();
+        let inode = self
+            .client
+            .block_on(async move { coherence.alloc_inode().await })
+            .map_err(|e| {
+                error!("create: alloc_inode failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+        // 保留 S_IFREG 类型位（0o100000）—— 与 mkdir 同理，filer 端通过 mode & S_IFMT 判定 FileType。
+        let file_mode = args.mode | 0o100000;
+        let _dir_entry = self
+            .coherence
+            .local_create_entry(parent, name_str, inode, false, file_mode, ctx.uid, ctx.gid)
+            .map_err(|e| {
+                error!("create: local_create_entry failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
         let entry = CachedEntry {
             inode,
@@ -1160,7 +1284,7 @@ impl FileSystem for PowerFsFs {
             nlink: 1,
             fid: Some(fid),
             size: 0,
-            mode: args.mode & 0o7777,
+            mode: file_mode,
             uid: ctx.uid,
             gid: ctx.gid,
             atime: now,
@@ -1183,6 +1307,14 @@ impl FileSystem for PowerFsFs {
             cached_at: Instant::now(),
         };
         self.cache.insert(entry.clone());
+        debug!(
+            "create: local apply done, inode={}, async delta buffered for dir {}",
+            inode, parent
+        );
+
+        // create also opens the file: pin inode + track as open
+        self.open_inodes.write().unwrap().insert(inode);
+        self.cache.pin_inode(inode);
 
         Ok((
             self.create_fuse_entry(&entry),
@@ -1210,24 +1342,87 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
         }
 
-        if let Some(entry) = self.cache.get_inode(inode) {
-            debug!(
-                "open: found entry in cache, is_dir={}, mode={:o}",
-                entry.is_dir, entry.mode
-            );
+        // Phase 4.4: open 时从 filer 刷新 size/chunks（权威账本），填充 MetadataCache。
+        // 这确保 open 后 getattr/read/write 拿到的是最新 size/chunks，省一次 getattr。
+        let parent = if let Some(entry) = self.cache.get_inode(inode) {
             if entry.is_dir {
                 debug!("open: entry is directory, returning EISDIR");
                 return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
             }
-            Ok((
-                Some(inode),
-                fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
-                None,
-            ))
+            // Cache hit: best-effort 从 filer 刷新 size/chunks
+            let parent = entry.parent;
+            if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
+                let fresh = self.entry_to_cached(parent, &filer_entry);
+                self.cache.insert(fresh);
+                debug!("open: refreshed size/chunks from filer for inode={}", inode);
+            }
+            parent
         } else {
-            debug!("open: entry not found in cache, returning ENOENT");
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            // Cache miss: 从 filer 获取完整条目（类似 getattr 流程）
+            debug!("open: cache miss for inode={}, querying filer", inode);
+            match self.client.get_entry_by_inode(inode) {
+                Ok(Some((filer_entry, path))) => {
+                    let p = if path.is_empty() || path == "/" {
+                        ROOT_INODE
+                    } else {
+                        let parent_path = match path.rfind('/') {
+                            Some(0) => "/".to_string(),
+                            Some(pos) => path[..pos].to_string(),
+                            None => "/".to_string(),
+                        };
+                        self.resolve_path_inode(&parent_path).unwrap_or(ROOT_INODE)
+                    };
+                    if filer_entry
+                        .attributes
+                        .as_ref()
+                        .map(|a| a.mode & 0o170000 == 0o040000)
+                        .unwrap_or(false)
+                    {
+                        debug!("open: filer entry is directory, returning EISDIR");
+                        return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+                    }
+                    let cached = self.entry_to_cached(p, &filer_entry);
+                    self.cache.insert(cached);
+                    debug!("open: fetched inode={} from filer during open", inode);
+                    p
+                }
+                Ok(None) => {
+                    debug!("open: inode={} not found in filer", inode);
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                Err(e) => {
+                    warn!("open: failed to query filer for inode={}: {}", inode, e);
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+            }
+        };
+
+        // Phase 4.3/4.4: 标记 inode 为已打开（getattr 使用长 TTL）
+        self.open_inodes.write().unwrap().insert(inode);
+        // Pin inode in MetadataCache to prevent TTL expiry during slow writes
+        self.cache.pin_inode(inode);
+
+        // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
+        let meta_shard_client = self.client.facade().meta_shard_client().clone();
+        let req = powerfs_coherence::OpenCountRequest {
+            shard_id: parent,
+            inode,
+        };
+        if let Err(e) = self
+            .client
+            .block_on(async move { meta_shard_client.open_count_inc(&req).await })
+        {
+            debug!(
+                "open: open_count_inc for inode {} failed (best-effort): {}",
+                inode, e
+            );
         }
+
+        Ok((
+            Some(inode),
+            fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
+            None,
+        ))
     }
 
     fn read(
@@ -1522,13 +1717,14 @@ impl FileSystem for PowerFsFs {
         // Read data into buffer BEFORE acquiring any lock — I/O must not hold locks
         let mut buf = vec![0u8; size as usize];
         let read_len = r.read(&mut buf).unwrap_or(0);
+        debug!("write: inode={}, read_len={}", inode, read_len);
         if read_len == 0 {
+            warn!("write: inode={} read_len=0, returning Ok(0)", inode);
             return Ok(0);
         }
         buf.truncate(read_len);
 
         let is_append = (flags & FUSE_APPEND) != 0;
-        let client_id = self.client.client_id();
 
         // Lock for metadata operations (append offset, FID assignment, size update)
         let meta_lock = self.get_write_lock(inode, u64::MAX);
@@ -1538,6 +1734,14 @@ impl FileSystem for PowerFsFs {
             .cache
             .get_inode(inode)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        debug!(
+            "write: inode={}, entry.fid={:?}, entry.is_dir={}, entry.size={}, entry.content_size={}",
+            inode,
+            entry.fid.as_ref().map(|f| f.to_string()),
+            entry.is_dir,
+            entry.size,
+            entry.content_size
+        );
 
         if is_append {
             let latest_entry = self
@@ -1547,10 +1751,13 @@ impl FileSystem for PowerFsFs {
             offset = latest_entry.size;
         }
 
+        // Phase 3.3+: lease 由 provider_adapter::ensure_lease 内部管理（带缓存复用），
+        // 不再在 write 路径显式 acquire/release lease，避免每个 4K write 触发 3 次
+        // block_on 同步网络往返。首次 write 时 ensure_lease 获取 lease 并缓存，
+        // 后续 write 复用缓存中的有效 lease。lease 在 release(close) 时释放。
         let chunk_size = self.chunk_cache.chunk_size();
-        let mut lease_guard: Option<LeaseGuard> = None;
 
-        if let Some(ref fid) = entry.fid {
+        if let Some(ref _fid) = entry.fid {
             let end_offset = offset + read_len as u64;
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let end_chunk = if end_offset == 0 {
@@ -1558,48 +1765,6 @@ impl FileSystem for PowerFsFs {
             } else {
                 self.chunk_cache.get_chunk_index(end_offset - 1)
             };
-
-            // Calculate stripe range for lease acquisition
-            let stripe_start = offset / self.stripe_size;
-            let stripe_end = if end_offset > 0 {
-                (end_offset - 1) / self.stripe_size + 1
-            } else {
-                1
-            };
-            let stripe_count = stripe_end - stripe_start;
-
-            // Acquire Volume Lease before writing
-            debug!(
-                "write: acquiring lease for inode={}, stripe_start={}, stripe_count={}, volume_id={}",
-                inode, stripe_start, stripe_count, fid.volume_id.0
-            );
-
-            match self.client.acquire_lease(
-                fid.volume_id.0,
-                inode,
-                stripe_start,
-                stripe_count,
-                &client_id,
-                true, // exclusive write lease
-                self.lease_duration_ms,
-            ) {
-                Ok(token) => {
-                    lease_guard = Some(LeaseGuard::new(
-                        token,
-                        fid.volume_id.0,
-                        inode,
-                        client_id.clone(),
-                        &self.client,
-                    ));
-                    debug!("write: lease acquired successfully");
-                }
-                Err(e) => {
-                    warn!(
-                        "write: lease acquisition failed for inode={}: {}, proceeding with caution",
-                        inode, e
-                    );
-                }
-            }
 
             // Drop metadata lock before per-chunk writes
             drop(_meta_guard);
@@ -1656,10 +1821,10 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            // Synchronously flush dirty chunks to Volume Server while lease is held.
-            // The LeaseGuard ensures the lease is released even if flush fails.
-            let lease_ref = lease_guard.as_ref().map(|g| g.token());
-            self.flush_dirty_chunks(inode, lease_ref).ok();
+            // Synchronously flush dirty chunks to Volume Server.
+            // lease_token=None: provider_adapter::ensure_lease 内部复用缓存 lease
+            // 或自动获取，无需 write 路径显式管理。
+            self.flush_dirty_chunks(inode, None).ok();
         } else {
             // First write: assign FID under metadata lock
             let (fid, _location, _stripe_fids, _stripe_locations) = self
@@ -1674,91 +1839,32 @@ impl FileSystem for PowerFsFs {
             let new_size = offset + read_len as u64;
             self.cache.update_size(inode, new_size);
 
+            // 构建 chunk 信息并更新 cache（确保 close 时 sync 正确的 chunks 到 filer）
+            let chunk_info = powerfs_orset::CachedFileChunk {
+                offset: 0,
+                size: new_size,
+                mtime: entry.mtime as u64,
+                fid: fid.to_string(),
+                cookie: fid.cookie as u32,
+                crc32: 0,
+            };
+            self.cache.update_chunks(inode, vec![chunk_info]);
+
             let mtime = entry.mtime as u64;
             self.chunk_cache.put(inode, 0, buf, mtime, 0);
 
             self.mark_dirty(inode, 0);
 
-            // Acquire lease for first write too
-            let stripe_start = 0;
-            let stripe_count = 1;
-            match self.client.acquire_lease(
-                fid.volume_id.0,
-                inode,
-                stripe_start,
-                stripe_count,
-                &client_id,
-                true,
-                self.lease_duration_ms,
-            ) {
-                Ok(token) => {
-                    lease_guard = Some(LeaseGuard::new(
-                        token,
-                        fid.volume_id.0,
-                        inode,
-                        client_id.clone(),
-                        &self.client,
-                    ));
-                    debug!("write: first write lease acquired successfully");
-                }
-                Err(e) => {
-                    warn!(
-                        "write: first write lease acquisition failed for inode={}: {}",
-                        inode, e
-                    );
-                }
-            }
+            // NOTE: 旧代码在此处同步调用 self.client.update_entry() 向 master 注册文件条目，
+            // 这会阻塞写入路径 10s+（gRPC 同步往返）。在新设计中：
+            //   - 目录条目由 CRDT local_create_entry（create 时已完成）异步 delta sync
+            //   - size/chunks 由 release() 时 sync_size_chunks_on_close 强一致同步到 filer
+            // 因此 update_entry 调用是冗余的，移除以消除写入延迟根因。
 
-            let parent_path = self.cache.inode_to_path(entry.parent).unwrap_or_default();
-            let filer_entry = powerfs_master::proto::powerfs::Entry {
-                name: entry.name.clone(),
-                directory: parent_path,
-                attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                    ino: entry.inode,
-                    mode: entry.mode | 0o100000,
-                    nlink: entry.nlink,
-                    uid: entry.uid,
-                    gid: entry.gid,
-                    rdev: 0,
-                    size: new_size,
-                    blksize: 4096,
-                    blocks: new_size.div_ceil(512) as u64,
-                    atime: entry.atime as u64,
-                    mtime: entry.mtime as u64,
-                    ctime: entry.ctime as u64,
-                    crtime: entry.ctime as u64,
-                    perm: 0,
-                }),
-                chunks: vec![powerfs_master::proto::powerfs::FileChunk {
-                    offset: 0,
-                    size: new_size,
-                    mtime,
-                    fid: fid.to_string(),
-                    cookie: 0,
-                    crc32: 0,
-                }],
-                hard_link_id: entry.hard_link_id.clone(),
-                hard_link_counter: entry.hard_link_counter,
-                extended: HashMap::new(),
-                content_size: new_size,
-                disk_size: new_size,
-                ttl: String::new(),
-                symlink_target: String::new(),
-                owner: String::new(),
-                generation: entry.generation,
-            };
-
-            // Update entry inline to avoid sharing TCP stream across runtimes
-            if let Err(e) = self.client.update_entry(&filer_entry, "", 0, false) {
-                warn!("Failed to update entry on master: {}", e);
-            }
-
-            // Flush dirty chunks with lease for first write too
-            let lease_ref = lease_guard.as_ref().map(|g| g.token());
-            self.flush_dirty_chunks(inode, lease_ref).ok();
+            // Flush dirty chunks; lease 由 ensure_lease 内部管理（首次自动获取并缓存）
+            self.flush_dirty_chunks(inode, None).ok();
         }
 
-        // Lease is automatically released by LeaseGuard on drop
         Ok(read_len)
     }
 
@@ -1772,7 +1878,75 @@ impl FileSystem for PowerFsFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
-        let _ = self.flush_dirty_chunks(inode, None);
+        // Phase 3.4: close 流程 = flush 数据 → sync size/chunks（强一致）→ 递减 open_count → 释放 lease
+        // 1. Flush dirty data chunks to volume server
+        if let Err(e) = self.flush_dirty_chunks(inode, None) {
+            warn!(
+                "release: flush_dirty_chunks for inode {} failed: {}",
+                inode, e
+            );
+        }
+
+        // 2. Sync size/chunks to filer (Raft strong consistency) + force_sync directory delta
+        //    sync 失败返回 EIO，调用方感知 close 未完成
+        let sync_result = self.sync_size_chunks_on_close(inode);
+        if let Err(e) = &sync_result {
+            error!(
+                "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
+                inode, e
+            );
+        }
+
+        // 3. Phase 3.5.3: 递减 open_count（best-effort，无论 sync 成功与否都执行）
+        //    在返回前完成，确保 GC 不会在文件仍被打开时删除
+        if let Some(entry) = self.cache.get_inode(inode) {
+            let meta_shard_client = self.client.facade().meta_shard_client().clone();
+            let req = powerfs_coherence::OpenCountRequest {
+                shard_id: entry.parent,
+                inode,
+            };
+            if let Err(e) = self
+                .client
+                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
+            {
+                debug!(
+                    "release: open_count_dec for inode {} failed (best-effort): {}",
+                    inode, e
+                );
+            }
+        }
+
+        // Phase 4.3/4.4: 移除 open_inodes 追踪（getattr 恢复短 TTL）
+        self.open_inodes.write().unwrap().remove(&inode);
+        // Unpin inode from MetadataCache (restore normal TTL expiry)
+        self.cache.unpin_inode(inode);
+
+        // 4. 释放 Volume lease（best-effort，close 时释放 write 路径缓存的 lease）
+        //    write 路径不再每次 acquire/release，lease 由 ensure_lease 缓存复用，
+        //    此处统一释放，避免 lease 在 volume server 端堆积。
+        if let Some(entry) = self.cache.get_inode(inode) {
+            if let Some(ref fid) = entry.fid {
+                let client_id = self.client.client_id();
+                // 从 leases 表取 token 传入，避免 release_lease_remote 内部查表
+                let token = self
+                    .client
+                    .get_valid_lease_token(fid.volume_id.0, inode)
+                    .unwrap_or_default();
+                if let Err(e) =
+                    self.client
+                        .release_lease(fid.volume_id.0, inode, &client_id, &token)
+                {
+                    debug!(
+                        "release: release_lease for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            }
+        }
+
+        sync_result?;
+
+        debug!("release: inode {} closed, size/chunks synced", inode);
         Ok(())
     }
 
@@ -1830,13 +2004,47 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        // Use local cache for directory listing
-        // In PowerFS CRDT model, client writes update local cache, and delta sync
-        // propagates changes to other clients' caches.
+        // Phase 4.1: 读本地 DirORSet 副本（权威目录条目源）
+        // 1. 先读 MetadataCache（可能已有完整 attr）
+        // 2. miss 时读 DirORSet（只有 inode/name/type，但零开销）
+        // 3. DirORSet 也空时，同步 pull_delta 再读 DirORSet
+        // 4. 仍空时 fallback 到 filer list_entries（兼容旧路径）
         let mut children = self.cache.list_children(inode);
+
         if children.is_empty() {
-            // Try to get entries from the server, but don't block for too long
-            // Use a short timeout to avoid blocking FUSE operations
+            // Phase 4.1: 读本地 DirORSet
+            let dir_entries = self.coherence.list_entries(inode);
+            if !dir_entries.is_empty() {
+                debug!(
+                    "readdir: DirORSet hit for dir {}, {} entries",
+                    inode,
+                    dir_entries.len()
+                );
+                children = dir_entries;
+            }
+        }
+
+        if children.is_empty() {
+            // Phase 4.1: DirORSet 也空，同步 pull_delta 后再读
+            debug!(
+                "readdir: DirORSet empty for dir {}, pulling delta from filer",
+                inode
+            );
+            let coherence = self.coherence.clone();
+            self.client
+                .block_on(async move { coherence.do_pull_and_apply_deltas(inode).await });
+            let dir_entries = self.coherence.list_entries(inode);
+            if !dir_entries.is_empty() {
+                debug!(
+                    "readdir: DirORSet populated after pull, {} entries",
+                    dir_entries.len()
+                );
+                children = dir_entries;
+            }
+        }
+
+        if children.is_empty() {
+            // Fallback: 直接查 filer（兼容旧路径 + 兜底）
             if let Ok(entries) = self.client.list_entries(inode, 1000, "") {
                 for child_entry in entries {
                     let cached = self.entry_to_cached(inode, &child_entry);
@@ -1897,6 +2105,23 @@ impl FileSystem for PowerFsFs {
             .lookup_in_cache(olddir, old_str)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
+        // 记录 rename 前是否已有同名目标（用于 CRDT 删除旧目标）
+        let has_existing_target = self
+            .lookup_in_cache(newdir, new_str)
+            .filter(|t| t.inode != entry.inode)
+            .is_some();
+
+        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync
+        // 顺序：先删旧目标 → 再 rename/create（保证 DirORSet 状态正确）
+        if has_existing_target {
+            if let Err(e) = self.coherence.local_remove_entry(newdir, new_str) {
+                debug!(
+                    "rename: local_remove_entry for overwritten target in dir {} skipped: {}",
+                    newdir, e
+                );
+            }
+        }
+
         self.cache
             .rename(olddir, old_str, newdir, new_str)
             .map_err(|e| {
@@ -1904,68 +2129,35 @@ impl FileSystem for PowerFsFs {
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        let new_parent_path = self
-            .cache
-            .inode_to_path(newdir)
-            .unwrap_or_else(|| "/".to_string());
-
-        let filer_entry = FilerEntry {
-            name: new_str.to_string(),
-            directory: new_parent_path,
-            attributes: Some(powerfs_master::proto::powerfs::FuseAttributes {
-                ino: entry.inode,
-                mode: if entry.is_dir {
-                    entry.mode | 0o040000
-                } else {
-                    entry.mode | 0o100000
-                },
-                nlink: entry.nlink,
-                uid: entry.uid,
-                gid: entry.gid,
-                rdev: 0,
-                size: entry.size,
-                blksize: 4096,
-                blocks: entry.size.div_ceil(512),
-                atime: entry.atime as u64,
-                mtime: entry.mtime as u64,
-                ctime: chrono::Utc::now().timestamp() as u64,
-                crtime: entry.atime as u64,
-                perm: 0,
-            }),
-            chunks: entry
-                .chunks
-                .iter()
-                .map(|chunk| powerfs_master::proto::powerfs::FileChunk {
-                    offset: chunk.offset,
-                    size: chunk.size,
-                    mtime: chunk.mtime,
-                    fid: chunk.fid.clone(),
-                    cookie: chunk.cookie,
-                    crc32: chunk.crc32,
-                })
-                .collect(),
-            hard_link_id: entry.hard_link_id.clone(),
-            hard_link_counter: entry.hard_link_counter,
-            extended: HashMap::new(),
-            content_size: entry.content_size,
-            disk_size: entry.disk_size,
-            ttl: String::new(),
-            symlink_target: entry.symlink_target.clone().unwrap_or_default(),
-            owner: String::new(),
-            generation: entry.generation,
-        };
-
-        match self.client.delete_entry(olddir, old_str, entry.is_dir, "") {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to delete old entry on master during rename: {}", e);
+        // 跨目录 rename = local_remove_entry(olddir) + local_create_entry(newdir)
+        // 同目录 rename = local_rename_entry(olddir, old, new)
+        if olddir == newdir {
+            if let Err(e) = self.coherence.local_rename_entry(olddir, old_str, new_str) {
+                warn!(
+                    "rename: local_rename_entry failed for dir {}: {} (cache already updated)",
+                    olddir, e
+                );
             }
-        }
-
-        match self.client.create_entry(&filer_entry, "") {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to create new entry on master during rename: {}", e);
+        } else {
+            if let Err(e) = self.coherence.local_remove_entry(olddir, old_str) {
+                warn!(
+                    "rename: local_remove_entry from old dir {} failed: {} (cache already updated)",
+                    olddir, e
+                );
+            }
+            if let Err(e) = self.coherence.local_create_entry(
+                newdir,
+                new_str,
+                entry.inode,
+                entry.is_dir,
+                entry.mode,
+                entry.uid,
+                entry.gid,
+            ) {
+                warn!(
+                    "rename: local_create_entry to new dir {} failed: {} (cache already updated)",
+                    newdir, e
+                );
             }
         }
 

@@ -13,13 +13,15 @@ service MasterService {
     
     // Collection management
     rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+    rpc UpdateCollection(UpdateCollectionRequest) returns (UpdateCollectionResponse);
     rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
     rpc GetCollection(GetCollectionRequest) returns (GetCollectionResponse);
     rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
-    
+    rpc GetCollectionStats(GetCollectionStatsRequest) returns (GetCollectionStatsResponse);
+
     // Statistics
     rpc GetStatistics(StatisticsRequest) returns (StatisticsResponse);
-    
+
     // Volume management
     rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
     
@@ -280,27 +282,125 @@ message VolumeGrowResponse {
     string error = 3;
 }
 
-// Collection management messages
+// ===== Collection management messages (P0 full attribute model) =====
+
+// Lifecycle status of a collection.
+enum CollectionStatus {
+    COLLECTION_STATUS_UNSPECIFIED = 0;
+    COLLECTION_STATUS_ACTIVE = 1;
+    COLLECTION_STATUS_READONLY = 2;
+    COLLECTION_STATUS_ARCHIVED = 3;
+    COLLECTION_STATUS_DELETED = 4;
+}
+
+// Redundancy mode: replication or erasure coding (EC).
+message ReplicationMode {
+    uint32 copies = 1;
+}
+
+message ErasureCodingMode {
+    uint32 data_shards = 1;
+    uint32 parity_shards = 2;
+    string algorithm = 3;
+}
+
+message Redundancy {
+    oneof mode {
+        ReplicationMode replication = 1;
+        ErasureCodingMode erasure_coding = 2;
+    }
+}
+
+// Storage policy bundling redundancy and write quorum.
+message StoragePolicy {
+    string name = 1;
+    Redundancy redundancy = 2;
+    uint32 min_write_nodes = 3;
+}
+
+// Volume allocation strategy.
+message AutoAllocation {
+    uint32 count = 1;
+    uint64 volume_size = 2;
+}
+
+message ManualAllocation {
+    repeated uint64 volume_ids = 1;
+}
+
+message HybridAllocation {
+    repeated uint64 fixed_volume_ids = 1;
+    uint32 auto_count = 2;
+}
+
+message VolumeAllocation {
+    oneof mode {
+        AutoAllocation auto = 1;
+        ManualAllocation manual = 2;
+        HybridAllocation hybrid = 3;
+    }
+}
+
+// Collection extended attributes (P0).
 message CollectionInfo {
     string name = 1;
-    string replication = 2;
-    string ttl = 3;
+    CollectionStatus status = 2;
+    StoragePolicy storage_policy = 3;
     string disk_type = 4;
-    uint64 max_volume_count = 5;
-    uint64 volume_count = 6;
-    uint64 created_at = 7;
-    uint64 modified_at = 8;
+    uint64 capacity_quota_bytes = 5;
+    uint32 volume_count = 6;
+    uint32 ttl_seconds = 7;
+    int64 created_at = 8;
+    int64 updated_at = 9;
+    string description = 10;
+    VolumeAllocation volume_allocation = 11;
+    repeated uint64 excluded_volume_ids = 12;
+}
+
+// Runtime stats for a collection.
+message CollectionStatsInfo {
+    uint64 used_bytes = 1;
+    uint64 file_count = 2;
+    uint32 volume_count = 3;
+    uint32 writable_volume_count = 4;
+    uint64 read_ops = 5;
+    uint64 write_ops = 6;
+    uint64 read_bytes = 7;
+    uint64 write_bytes = 8;
 }
 
 message CreateCollectionRequest {
     string name = 1;
-    string replication = 2;
-    string ttl = 3;
+    CollectionStatus status = 2;
+    StoragePolicy storage_policy = 3;
     string disk_type = 4;
-    uint64 max_volume_count = 5;
+    uint64 capacity_quota_bytes = 5;
+    uint32 volume_count = 6;
+    uint32 ttl_seconds = 7;
+    string description = 8;
+    VolumeAllocation volume_allocation = 9;
+    repeated uint64 excluded_volume_ids = 10;
 }
 
 message CreateCollectionResponse {
+    bool success = 1;
+    string error = 2;
+    CollectionInfo collection = 3;
+}
+
+message UpdateCollectionRequest {
+    string name = 1;
+    CollectionStatus status = 2;
+    StoragePolicy storage_policy = 3;
+    string disk_type = 4;
+    uint64 capacity_quota_bytes = 5;
+    uint32 ttl_seconds = 6;
+    string description = 7;
+    VolumeAllocation volume_allocation = 8;
+    repeated uint64 excluded_volume_ids = 9;
+}
+
+message UpdateCollectionResponse {
     bool success = 1;
     string error = 2;
     CollectionInfo collection = 3;
@@ -330,6 +430,16 @@ message ListCollectionsRequest {}
 message ListCollectionsResponse {
     repeated CollectionInfo collections = 1;
     string error = 2;
+}
+
+message GetCollectionStatsRequest {
+    string name = 1;
+}
+
+message GetCollectionStatsResponse {
+    bool success = 1;
+    string error = 2;
+    CollectionStatsInfo stats = 3;
 }
 
 // Volume management messages

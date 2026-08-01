@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -958,12 +958,51 @@ export async function setBalancerConfig(config: SchedulerConfig): Promise<void> 
 
 // ===== Collection management =====
 
+export interface RedundancyParams {
+  mode: 'replication' | 'erasure_coding'
+  copies?: number
+  data_shards?: number
+  parity_shards?: number
+  algorithm?: string
+}
+
+export interface StoragePolicyParams {
+  name?: string
+  redundancy: RedundancyParams
+  min_write_nodes?: number
+}
+
+export interface VolumeAllocationParams {
+  mode: 'auto' | 'manual' | 'hybrid'
+  count?: number
+  volume_size?: number
+  volume_ids?: number[]
+  fixed_volume_ids?: number[]
+  auto_count?: number
+}
+
 export interface CreateCollectionParams {
   name: string
-  replication?: string
-  ttl?: string
+  status?: number
+  storage_policy?: StoragePolicyParams
   disk_type?: string
-  max_volume_count?: number
+  capacity_quota_bytes?: number
+  volume_count?: number
+  ttl_seconds?: number
+  description?: string
+  volume_allocation?: VolumeAllocationParams
+  excluded_volume_ids?: number[]
+}
+
+export interface UpdateCollectionParams {
+  status?: number
+  storage_policy?: StoragePolicyParams
+  disk_type?: string
+  capacity_quota_bytes?: number
+  ttl_seconds?: number
+  description?: string
+  volume_allocation?: VolumeAllocationParams
+  excluded_volume_ids?: number[]
 }
 
 export async function getCollections(): Promise<CollectionInfo[]> {
@@ -981,6 +1020,16 @@ export async function createCollection(params: CreateCollectionParams): Promise<
   return response.data.data
 }
 
+export async function updateCollection(name: string, params: UpdateCollectionParams): Promise<CollectionInfo> {
+  const response = await api.put(`/collections/${name}`, params)
+  return response.data.data
+}
+
 export async function deleteCollection(name: string): Promise<void> {
   await api.delete(`/collections/${name}`)
+}
+
+export async function getCollectionStats(name: string): Promise<CollectionStats> {
+  const response = await api.get(`/collections/${name}/stats`)
+  return response.data.data
 }
