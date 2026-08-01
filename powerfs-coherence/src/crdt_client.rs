@@ -249,8 +249,12 @@ impl ChangeCache {
 /// CRDT 副本一致性配置
 #[derive(Clone, Debug)]
 pub struct CrdtConfig {
-    /// 后台 puller 间隔
+    /// 后台 puller 基础间隔
     pub pull_interval: Duration,
+    /// 后台 puller 最大间隔（退避上限）
+    pub pull_max_interval: Duration,
+    /// 连续空响应多少次后开始退避
+    pub pull_backoff_threshold: u32,
     /// 最大缓存目录数
     pub max_cached_dirs: usize,
     /// inode 预留段大小
@@ -269,6 +273,8 @@ impl Default for CrdtConfig {
     fn default() -> Self {
         Self {
             pull_interval: Duration::from_millis(1000),
+            pull_max_interval: Duration::from_secs(30),
+            pull_backoff_threshold: 3,
             max_cached_dirs: 1024,
             inode_batch_size: 1024,
             sync_interval: Duration::from_millis(100),
@@ -700,7 +706,10 @@ impl CrdtReplicaCoherence {
     }
 
     /// pull + merge delta 到本地副本 + 联动失效
-    pub async fn do_pull_and_apply_deltas(&self, dir_ino: u64) {
+    ///
+    /// 返回 `true` 表示拉取到并应用了新 delta；`false` 表示无新 delta 或出错。
+    /// Phase 1.8: start_puller 用此返回值驱动自适应退避。
+    pub async fn do_pull_and_apply_deltas(&self, dir_ino: u64) -> bool {
         let vclock = self
             .dir_cache
             .get(dir_ino)
@@ -721,12 +730,12 @@ impl CrdtReplicaCoherence {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("pull_delta failed for dir {}: {}", dir_ino, e);
-                return;
+                return false;
             }
         };
 
         if resp.deltas.is_empty() {
-            return;
+            return false;
         }
 
         // merge deltas 到本地副本
@@ -755,20 +764,55 @@ impl CrdtReplicaCoherence {
             self.invalidator.invalidate_inode(ino);
         }
         self.invalidator.invalidate_dir(dir_ino);
+        true
     }
 
     /// 启动后台 puller task（定时 pull 所有已缓存目录的 delta）
+    ///
+    /// Phase 1.8: 自适应退避。连续 `pull_backoff_threshold` 次空响应后，
+    /// 间隔翻倍（上限 `pull_max_interval`）。拉取到新 delta 时立即重置为基础间隔。
+    /// 这样在空闲时减少不必要的 PullDelta 请求，在有写入活动时保持低延迟同步。
     pub fn start_puller(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
-        let interval = this.config.pull_interval;
+        let base_interval = this.config.pull_interval;
+        let max_interval = this.config.pull_max_interval;
+        let backoff_threshold = this.config.pull_backoff_threshold;
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_empty: u32 = 0;
+            let mut current_interval = base_interval;
             loop {
-                ticker.tick().await;
+                tokio::time::sleep(current_interval).await;
                 let dirs = this.dir_cache.cached_dirs();
+                let mut any_delta = false;
                 for dir_ino in dirs {
-                    this.do_pull_and_apply_deltas(dir_ino).await;
+                    if this.do_pull_and_apply_deltas(dir_ino).await {
+                        any_delta = true;
+                    }
+                }
+                if any_delta {
+                    if consecutive_empty > backoff_threshold {
+                        log::debug!(
+                            "puller: deltas found, resetting interval {:?} → {:?}",
+                            current_interval,
+                            base_interval
+                        );
+                    }
+                    consecutive_empty = 0;
+                    current_interval = base_interval;
+                } else {
+                    consecutive_empty = consecutive_empty.saturating_add(1);
+                    if consecutive_empty > backoff_threshold {
+                        let new_interval = (current_interval * 2).min(max_interval);
+                        if new_interval != current_interval {
+                            log::debug!(
+                                "puller backoff: consecutive_empty={}, {:?} → {:?}",
+                                consecutive_empty,
+                                current_interval,
+                                new_interval
+                            );
+                            current_interval = new_interval;
+                        }
+                    }
                 }
             }
         })
