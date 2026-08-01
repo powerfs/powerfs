@@ -457,21 +457,41 @@ impl PowerFsFs {
             return Ok(());
         }
 
-        let entry = self
-            .cache
-            .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        // Phase 1.7: 查找 entry/fid/addr 失败时，重新标记 dirty 以便后续重试，
+        // 避免 drain 后丢数据。write 合并依赖此重试机制保证持久性。
+        let entry = match self.cache.get_inode(inode) {
+            Some(e) => e,
+            None => {
+                for (_, idx) in &dirty {
+                    self.mark_dirty(inode, *idx);
+                }
+                return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+            }
+        };
 
-        let fid = entry
-            .fid
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+        let fid = match entry.fid {
+            Some(ref f) => f.clone(),
+            None => {
+                for (_, idx) in &dirty {
+                    self.mark_dirty(inode, *idx);
+                }
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        };
 
-        let addr = self.client.get_volume_addr(fid.volume_id.0).map_err(|e| {
-            error!("get_volume_addr failed: {}", e);
-            std::io::Error::from_raw_os_error(libc::EIO)
-        })?;
+        let addr = match self.client.get_volume_addr(fid.volume_id.0) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("get_volume_addr failed: {}", e);
+                for (_, idx) in &dirty {
+                    self.mark_dirty(inode, *idx);
+                }
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        };
 
         let chunk_size = self.chunk_cache.chunk_size();
+        let mut had_error = false;
 
         for (_, chunk_idx) in &dirty {
             let chunk_offset = chunk_idx * chunk_size;
@@ -479,22 +499,30 @@ impl PowerFsFs {
 
             if let Some(chunk_data) = chunk_data {
                 let data_len = chunk_data.data.len();
-                self.client
-                    .write_blob_with_lease(
-                        &addr,
-                        fid.volume_id.0,
-                        fid.file_key,
-                        inode,
-                        chunk_offset as i64,
-                        data_len as i32,
-                        chunk_data.data,
-                        lease_token,
-                    )
-                    .map_err(|e| {
-                        error!("write_blob failed: {}", e);
-                        std::io::Error::from_raw_os_error(libc::EIO)
-                    })?;
+                if let Err(e) = self.client.write_blob_with_lease(
+                    &addr,
+                    fid.volume_id.0,
+                    fid.file_key,
+                    inode,
+                    chunk_offset as i64,
+                    data_len as i32,
+                    chunk_data.data,
+                    lease_token,
+                ) {
+                    // Phase 1.7: 单个 chunk flush 失败，重新标记 dirty 以便重试，
+                    // 继续处理其他 chunk（best-effort），最终返回错误。
+                    self.mark_dirty(inode, *chunk_idx);
+                    error!(
+                        "write_blob failed for inode {} chunk {}: {}",
+                        inode, chunk_idx, e
+                    );
+                    had_error = true;
+                }
             }
+        }
+
+        if had_error {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
         // Phase 3.4: size/chunks 元数据同步移至 release()（close 时强一致 sync），
@@ -510,7 +538,15 @@ impl PowerFsFs {
         }
 
         for inode in inodes {
-            let _ = self.flush_dirty_chunks(inode, None);
+            if let Err(e) = self.flush_dirty_chunks(inode, None) {
+                // Phase 1.7: 后台 flusher 错误需记录，避免静默丢数据。
+                // flush 失败的 chunk 仍保留在 dirty_shards（drain 已消费则重新 mark），
+                // 下次 flush 周期会重试。release/fsync 仍会同步 flush 作为最后保障。
+                warn!(
+                    "flush_all_dirty_chunks: flush inode {} failed (will retry next cycle): {}",
+                    inode, e
+                );
+            }
         }
 
         Ok(())
@@ -1821,10 +1857,11 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
-            // Synchronously flush dirty chunks to Volume Server.
-            // lease_token=None: provider_adapter::ensure_lease 内部复用缓存 lease
-            // 或自动获取，无需 write 路径显式管理。
-            self.flush_dirty_chunks(inode, None).ok();
+            // Phase 1.7: write合并/delayed flush — 不在 write 路径同步 flush。
+            // 多次 4K write 自然合并到同一 chunk_cache 条目（chunk_size=1MB），
+            // 由后台 flusher（100ms 间隔）异步 flush 到 Volume Server，
+            // release(close)/fsync 时同步 flush 保证持久性。
+            // 收益：64K 文件 16 次 4K write 从 16 次网络往返降到 1-2 次。
         } else {
             // First write: assign FID under metadata lock
             let (fid, _location, _stripe_fids, _stripe_locations) = self
@@ -1861,8 +1898,8 @@ impl FileSystem for PowerFsFs {
             //   - size/chunks 由 release() 时 sync_size_chunks_on_close 强一致同步到 filer
             // 因此 update_entry 调用是冗余的，移除以消除写入延迟根因。
 
-            // Flush dirty chunks; lease 由 ensure_lease 内部管理（首次自动获取并缓存）
-            self.flush_dirty_chunks(inode, None).ok();
+            // Phase 1.7: write合并/delayed flush — 首次 write 也不同步 flush，
+            // FID 已分配，chunk 已缓存，由后台 flusher 异步持久化。
         }
 
         Ok(read_len)

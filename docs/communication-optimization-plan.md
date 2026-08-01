@@ -966,4 +966,102 @@ fuse.rs 改用 `ClientIdentity::stable_for(&self.mount_point)` 替代 `ClientIde
 
 残留 P1 问题（cp -prf 权限/mtime 异常）需单独排查 setattr CRDT sync。
 
+---
+
+### 12.12 阶段1.7：write合并/delayed flush（消除 write 路径同步网络往返）（2026-08-01）
+
+#### 问题现象
+
+阶段1.5（block_on spawn+channel）+ send_write_needle_direct 后，4K write 从 10.2s 降到 0.2s，但 64K 文件（16 × 4K write）仍需 11.6s。
+
+根因：**write 回调每次都同步调用 `flush_dirty_chunks`**，每次 flush 触发一次 `write_blob_with_lease` 网络往返（ensure_lease 缓存复用 + send_write_needle_direct）。16 次 4K write = 16 次同步网络往返，无合并。
+
+#### 根因定位
+
+```
+write(4K) 路径（修复前）:
+  1. 读数据到 buf
+  2. chunk_cache.modify（合并到 1MB chunk）  ← 本地操作
+  3. mark_dirty(inode, chunk_idx)
+  4. flush_dirty_chunks(inode, None)          ← 同步网络往返！
+     → drain_dirty_for_inode
+     → write_blob_with_lease
+       → ensure_lease（首次获取，后续复用缓存）
+       → send_write_needle_direct            ← 等待 volume server 响应
+  5. 返回 Ok(read_len)
+
+64K 文件 = 16 次 write = 16 次同步往返 ≈ 11.6s（每次 ~0.7s）
+```
+
+chunk_cache 的 chunk_size=1MB，16 次 4K write 全部落在 chunk 0，**数据本可在本地合并为 1 个 64K chunk**，但同步 flush 导致每次 write 都发送网络请求。
+
+#### 修复方案：write-back 缓存
+
+**核心思想**：write 只写本地 chunk_cache + mark_dirty，不同步 flush。由后台 flusher（100ms 间隔）异步持久化，release(close)/fsync 同步 flush 保证持久性。
+
+```
+write(4K) 路径（修复后）:
+  1. 读数据到 buf
+  2. chunk_cache.modify（合并到 1MB chunk）  ← 本地操作
+  3. mark_dirty(inode, chunk_idx)
+  4. 返回 Ok(read_len)                        ← 无网络往返！
+
+后台 flusher（100ms）:
+  → flush_all_dirty_chunks
+    → flush_dirty_chunks(inode)
+      → drain_dirty + write_blob_with_lease   ← 异步，不阻塞 write
+
+release(close):
+  → flush_dirty_chunks(inode)                 ← 同步，保证持久性
+  → sync_size_chunks_on_close                 ← 强一致同步到 filer
+
+fsync:
+  → flush_dirty_chunks(inode)                 ← 同步，保证持久性
+```
+
+**收益**：64K 文件 16 次 4K write 从 16 次同步往返降到 0 次同步往返（write 仅本地操作），后台 flusher 1 次异步往返 + release 1 次同步往返。
+
+#### 改动详情
+
+| 文件 | 改动 | 说明 |
+|---|---|---|
+| [fuse.rs write()](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) | 移除 2 处 `flush_dirty_chunks(inode, None).ok()` | 已有 FID 路径 + 首次 write 路径 |
+| [fuse.rs flush_dirty_chunks()](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) | flush 失败时重新 mark_dirty | 避免 drain 后丢数据，支持重试 |
+| [fuse.rs flush_all_dirty_chunks()](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) | 添加错误日志 | 后台 flusher 静默丢数据 → warn 日志 |
+
+#### flush_dirty_chunks 失败重试机制
+
+修复前：`drain_dirty_for_inode` 先清除 dirty 标记，若后续 write_blob 失败，dirty 标记已丢失，数据无法重试。
+
+修复后：
+1. entry/fid/addr 查找失败 → 重新 mark_dirty 所有 dirty chunks，返回错误
+2. 单个 chunk write 失败 → 重新 mark_dirty 该 chunk，继续处理其他 chunk（best-effort）
+3. 任一 chunk 失败 → 返回 EIO，但已成功的 chunk 不重复 flush
+
+后台 flusher 下个周期（100ms）会重新 flush 被标记 dirty 的失败 chunk。
+
+#### 正确性分析
+
+| 场景 | 保证 | 机制 |
+|---|---|---|
+| 同客户端 read-after-write | ✅ 强一致 | read 先查 chunk_cache |
+| fsync 持久性 | ✅ 强持久 | fsync 同步 flush |
+| close 持久性 | ✅ 强持久 | release 同步 flush + sync size/chunks |
+| 崩溃数据丢失窗口 | ⚠️ ≤100ms | 后台 flusher 100ms 间隔（write-back cache 标准行为） |
+| 跨客户端写冲突 | ✅ lease 排他 | ensure_lease 获取独占 lease |
+| O_APPEND 并发 | ✅ | write 用 per-chunk lock，cache.update_size 同步更新 |
+| 内存压力 | ✅ 有界 | chunk_size=1MB，dirty chunks 100ms 内 flush |
+
+#### 与修复建议优先级的对应
+
+修复建议（优先级排序）：
+1. ~~lease 复用~~ ✅ 已实现（ensure_lease 缓存，§8.2）
+2. ~~release token bug~~ ✅ 已修复（LeaseGuard 用持有 token）
+3. **write合并/delayed flush** ✅ 本节实现
+4. data_queue 并发处理（阶段1.6）🟡 待推进
+5. PullDelta 退避 🟡 待推进
+
+核心改动（lease 复用 + write 延迟 flush）将 64K write 从 48 次往返（原始）降到 1-2 次。
+
+
 
