@@ -660,7 +660,7 @@ impl CrdtReplicaCoherence {
                 let batches = this.change_cache.drain_all();
                 if batches.is_empty() {
                     // 每 50 tick（约 5 秒）输出一次心跳日志，确认 flusher 在运行
-                    if tick_count % 50 == 0 {
+                    if tick_count.is_multiple_of(50) {
                         log::debug!(
                             "change_cache_flusher: tick {} (idle, no pending deltas)",
                             tick_count

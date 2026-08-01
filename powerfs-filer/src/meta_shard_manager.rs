@@ -1647,7 +1647,7 @@ impl MetaShardManager {
             .unwrap_or(0);
 
         for delta in deltas {
-            let seq = extract_seq_from_delta(delta).unwrap_or_else(|| {
+            let seq = extract_seq_from_delta(delta).unwrap_or({
                 // Remove/Rename delta 没有 seq 字段，用 client_vclock 中的 seq
                 // 确保 delta_log.get_since 能正确返回这些 delta（seq > client_vclock[client_id]）
                 if client_vc_seq > 0 {
