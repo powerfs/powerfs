@@ -354,27 +354,24 @@ impl VolumeClient {
     }
 
     /// 提交数据请求并等待响应
+    ///
+    /// Phase 1.6: oneshot tx 直接嵌入 PendingRequest，无需 register_waiter。
+    /// 超时时 rx 自动 drop，processor 的 tx.send 返回 Err 但无副作用。
     pub async fn submit_data_request_and_wait(
         &self,
         context: RequestContext,
         volume_id: u64,
         timeout: Duration,
     ) -> ClientResult<RequestResult> {
-        let request_id = context.request_id.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.register_waiter(request_id.clone(), tx);
-        self.submit_data_request(context, volume_id)
+        self.submit_data_request(context, volume_id, Some(tx))
             .map_err(ClientError::Internal)?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
+            Err(_) => Err(ClientError::Timeout(timeout)),
         }
     }
 
@@ -385,21 +382,15 @@ impl VolumeClient {
         volume_id: u64,
         timeout: Duration,
     ) -> ClientResult<RequestResult> {
-        let request_id = context.request_id.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.register_waiter(request_id.clone(), tx);
-        self.submit_lease_request(context, volume_id)
+        self.submit_lease_request(context, volume_id, Some(tx))
             .map_err(ClientError::Internal)?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
+            Err(_) => Err(ClientError::Timeout(timeout)),
         }
     }
 
@@ -410,21 +401,15 @@ impl VolumeClient {
         volume_id: u64,
         timeout: Duration,
     ) -> ClientResult<RequestResult> {
-        let request_id = context.request_id.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.register_waiter(request_id.clone(), tx);
-        self.submit_management_request(context, volume_id)
+        self.submit_management_request(context, volume_id, Some(tx))
             .map_err(ClientError::Internal)?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
+            Err(_) => Err(ClientError::Timeout(timeout)),
         }
     }
 
@@ -633,10 +618,14 @@ impl VolumeClient {
     }
 
     /// 提交数据请求 (读/写共享队列)
+    ///
+    /// Phase 1.6: `response_tx` 直接嵌入 PendingRequest，消除 response_waiters 中间层。
+    /// 传 `Some(tx)` 时 processor 直接通过 oneshot 投递结果；传 `None` 为 fire-and-forget。
     pub fn submit_data_request(
         &self,
         context: RequestContext,
         volume_id: u64,
+        response_tx: Option<oneshot::Sender<ClientResult<RequestResult>>>,
     ) -> Result<(), String> {
         if self.state() != VolumeClientState::Ready && self.state() != VolumeClientState::Processing
         {
@@ -663,6 +652,7 @@ impl VolumeClient {
             context,
             shard_id: volume_id,
             enqueued_at: Instant::now(),
+            response_tx,
         };
 
         self.data_queue.enqueue(req)?;
@@ -677,6 +667,7 @@ impl VolumeClient {
         &self,
         context: RequestContext,
         volume_id: u64,
+        response_tx: Option<oneshot::Sender<ClientResult<RequestResult>>>,
     ) -> Result<(), String> {
         if self.state() == VolumeClientState::Closed {
             return Err("Client is closed".to_string());
@@ -686,6 +677,7 @@ impl VolumeClient {
             context,
             shard_id: volume_id,
             enqueued_at: Instant::now(),
+            response_tx,
         };
 
         self.lease_queue.enqueue(req)?;
@@ -698,6 +690,7 @@ impl VolumeClient {
         &self,
         context: RequestContext,
         volume_id: u64,
+        response_tx: Option<oneshot::Sender<ClientResult<RequestResult>>>,
     ) -> Result<(), String> {
         if self.state() == VolumeClientState::Closed {
             return Err("Client is closed".to_string());
@@ -707,6 +700,7 @@ impl VolumeClient {
             context,
             shard_id: volume_id,
             enqueued_at: Instant::now(),
+            response_tx,
         };
 
         self.mgmt_queue.enqueue(req)?;
@@ -1727,6 +1721,24 @@ fn resolve_waiter_for(
     }
 }
 
+/// Phase 1.6: 直接通过 response_tx 投递结果，回退到 response_waiters。
+///
+/// 当 PendingRequest 携带 response_tx（来自 submit_*_request_and_wait）时，
+/// 直接通过 oneshot 投递，跳过 HashMap 查找和锁竞争。
+/// 当 response_tx 为 None（fire-and-forget）时，回退到 resolve_waiter_for。
+fn deliver_result(
+    response_tx: &mut Option<oneshot::Sender<ClientResult<RequestResult>>>,
+    request_id: &RequestId,
+    result: ClientResult<RequestResult>,
+    response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+) {
+    if let Some(tx) = response_tx.take() {
+        let _ = tx.send(result);
+    } else {
+        resolve_waiter_for(request_id, result, response_waiters);
+    }
+}
+
 /// 生成 volume 连接的唯一 client_id。
 ///
 /// 组合维度：
@@ -2085,7 +2097,7 @@ async fn process_mgmt_requests(
 /// 数据请求处理（自由函数版本）
 #[allow(clippy::too_many_arguments)]
 async fn process_data_request_internal(
-    req: PendingRequest,
+    mut req: PendingRequest,
     volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
@@ -2094,6 +2106,7 @@ async fn process_data_request_internal(
     leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
+    let mut response_tx = req.response_tx.take();
     let request_id = req.context.request_id.clone();
     let kind = req.context.kind;
     let msg_type = req.context.msg_type;
@@ -2113,7 +2126,12 @@ async fn process_data_request_internal(
                 "process_data_request_internal: volume not found for shard_id={}",
                 req.shard_id
             );
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2122,7 +2140,12 @@ async fn process_data_request_internal(
     // Per-server circuit breaker check
     if !breakers.check(&volume_addr) {
         let result = Err(ClientError::CircuitOpen);
-        resolve_waiter_for(&request_id, result.clone(), response_waiters);
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            result.clone(),
+            response_waiters,
+        );
         return result;
     }
 
@@ -2139,7 +2162,12 @@ async fn process_data_request_internal(
                 "process_data_request_internal: failed to get volume client: {}",
                 e
             );
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2273,13 +2301,18 @@ async fn process_data_request_internal(
         _ => Err(ClientError::UnsupportedRequest(format!("{:?}", kind))),
     };
 
-    resolve_waiter_for(&request_id, result.clone(), response_waiters);
+    deliver_result(
+        &mut response_tx,
+        &request_id,
+        result.clone(),
+        response_waiters,
+    );
     result
 }
 
 /// Lease 请求处理（自由函数版本）
 async fn process_lease_request_internal(
-    req: PendingRequest,
+    mut req: PendingRequest,
     volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
@@ -2287,6 +2320,7 @@ async fn process_lease_request_internal(
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
+    let mut response_tx = req.response_tx.take();
     let request_id = req.context.request_id.clone();
     let body = req.context.payload.clone();
 
@@ -2295,7 +2329,12 @@ async fn process_lease_request_internal(
         .map(|v| v.clone())
         .ok_or_else(|| {
             let err = ClientError::VolumeNotFound(req.shard_id);
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2304,7 +2343,12 @@ async fn process_lease_request_internal(
     // Per-server circuit breaker check
     if !breakers.check(&volume_addr) {
         let result = Err(ClientError::CircuitOpen);
-        resolve_waiter_for(&request_id, result.clone(), response_waiters);
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            result.clone(),
+            response_waiters,
+        );
         return result;
     }
 
@@ -2312,7 +2356,12 @@ async fn process_lease_request_internal(
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2343,13 +2392,18 @@ async fn process_lease_request_internal(
         }
     };
 
-    resolve_waiter_for(&request_id, final_result.clone(), response_waiters);
+    deliver_result(
+        &mut response_tx,
+        &request_id,
+        final_result.clone(),
+        response_waiters,
+    );
     final_result
 }
 
 /// 管理请求处理（自由函数版本）
 async fn process_mgmt_request_internal(
-    req: PendingRequest,
+    mut req: PendingRequest,
     volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
@@ -2357,6 +2411,7 @@ async fn process_mgmt_request_internal(
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
+    let mut response_tx = req.response_tx.take();
     let request_id = req.context.request_id.clone();
     let body = req.context.payload.clone();
 
@@ -2365,7 +2420,12 @@ async fn process_mgmt_request_internal(
         .map(|v| v.clone())
         .ok_or_else(|| {
             let err = ClientError::VolumeNotFound(req.shard_id);
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2374,7 +2434,12 @@ async fn process_mgmt_request_internal(
     // Per-server circuit breaker check
     if !breakers.check(&volume_addr) {
         let result = Err(ClientError::CircuitOpen);
-        resolve_waiter_for(&request_id, result.clone(), response_waiters);
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            result.clone(),
+            response_waiters,
+        );
         return result;
     }
 
@@ -2382,7 +2447,12 @@ async fn process_mgmt_request_internal(
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-            resolve_waiter_for(&request_id, Err(err.clone()), response_waiters);
+            deliver_result(
+                &mut response_tx,
+                &request_id,
+                Err(err.clone()),
+                response_waiters,
+            );
             err
         })?;
 
@@ -2413,7 +2483,12 @@ async fn process_mgmt_request_internal(
         }
     };
 
-    resolve_waiter_for(&request_id, final_result.clone(), response_waiters);
+    deliver_result(
+        &mut response_tx,
+        &request_id,
+        final_result.clone(),
+        response_waiters,
+    );
     final_result
 }
 
@@ -2512,20 +2587,15 @@ impl VolumeClient {
         .with_request_id(request_id.clone());
 
         let (tx, rx) = oneshot::channel();
-        self.register_waiter(request_id.clone(), tx);
 
-        self.submit_management_request(context, volume_id)
+        self.submit_management_request(context, volume_id, Some(tx))
             .map_err(ClientError::Internal)?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(response))) => self.decode_statfs_response(&response),
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(ClientError::Cancelled),
-            Err(_) => {
-                let mut waiters = self.response_waiters.lock().unwrap();
-                waiters.remove(&request_id);
-                Err(ClientError::Timeout(timeout))
-            }
+            Err(_) => Err(ClientError::Timeout(timeout)),
         }
     }
 
@@ -2604,7 +2674,7 @@ mod tests {
         let (client, _, _rt) = create_test_volume_client();
         let ctx = create_test_context(RequestKind::Read);
 
-        assert!(client.submit_data_request(ctx, 1).is_ok());
+        assert!(client.submit_data_request(ctx, 1, None).is_ok());
 
         let (data_len, _, _) = client.queue_stats();
         assert_eq!(data_len, 1);
@@ -2618,7 +2688,7 @@ mod tests {
         // 写请求在没有缓存 Lease 时仍可入队（客户端预检查降级为警告，
         // 真正的校验由 Volume 服务端 validate_token_with_grace_period 严格执行）。
         // 这避免了与 ProviderAdapter::ensure_lease 的时序竞争导致误拦截合法写请求。
-        let result = client.submit_data_request(ctx, 1);
+        let result = client.submit_data_request(ctx, 1, None);
         assert!(
             result.is_ok(),
             "write without cached lease should proceed to server-side validation"
@@ -2639,7 +2709,7 @@ mod tests {
         assert!(client.has_valid_lease_for_volume(1));
 
         let ctx = create_test_context(RequestKind::Write);
-        assert!(client.submit_data_request(ctx, 1).is_ok());
+        assert!(client.submit_data_request(ctx, 1, None).is_ok());
     }
 
     #[test]
@@ -2673,7 +2743,7 @@ mod tests {
         // 提交多个请求
         for _ in 0..3 {
             let ctx = create_test_context(RequestKind::Read);
-            client.submit_data_request(ctx, 1).unwrap();
+            client.submit_data_request(ctx, 1, None).unwrap();
         }
 
         let (data_len, _, _) = client.queue_stats();
@@ -2693,15 +2763,15 @@ mod tests {
 
         // 数据请求
         let ctx1 = create_test_context(RequestKind::Read);
-        client.submit_data_request(ctx1, 1).unwrap();
+        client.submit_data_request(ctx1, 1, None).unwrap();
 
         // Lease 请求
         let ctx2 = create_test_context(RequestKind::Lease);
-        client.submit_lease_request(ctx2, 1).unwrap();
+        client.submit_lease_request(ctx2, 1, None).unwrap();
 
         // 管理请求
         let ctx3 = create_test_context(RequestKind::Management);
-        client.submit_management_request(ctx3, 1).unwrap();
+        client.submit_management_request(ctx3, 1, None).unwrap();
 
         let (data_len, lease_len, mgmt_len) = client.queue_stats();
         assert_eq!(data_len, 1);
@@ -2740,7 +2810,7 @@ mod tests {
 
         let ctx = create_test_context(RequestKind::Read);
         // This will check the breaker for "unknown" (no routing yet)
-        let result = client.submit_data_request(ctx, 1);
+        let result = client.submit_data_request(ctx, 1, None);
         // May or may not be open depending on whether routing resolved the address
         // The key test is that per-server breakers work correctly
         assert!(result.is_err() || result.is_ok()); // Either is acceptable
@@ -2752,7 +2822,7 @@ mod tests {
         client.close();
 
         let ctx = create_test_context(RequestKind::Read);
-        let result = client.submit_data_request(ctx, 1);
+        let result = client.submit_data_request(ctx, 1, None);
         assert!(result.is_err());
     }
 }

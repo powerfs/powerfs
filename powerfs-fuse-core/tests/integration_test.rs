@@ -164,7 +164,7 @@ async fn test_volume_request_submission_without_network() {
     .with_request_id(request_id);
 
     // 提交请求
-    let result = client.submit_data_request(context, 1);
+    let result = client.submit_data_request(context, 1, None);
     assert!(result.is_ok());
 
     // 验证请求已入队

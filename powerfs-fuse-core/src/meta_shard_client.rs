@@ -69,11 +69,26 @@ pub trait RequestCompletionListener: Send + Sync {
 }
 
 /// 待处理请求
-#[derive(Debug)]
+///
+/// Phase 1.6: `response_tx` 直接嵌入请求中，消除 `response_waiters` 中间层。
+/// processor 完成后直接通过 `response_tx` 投递结果，无需 HashMap 查找。
 pub struct PendingRequest {
     pub context: RequestContext,
     pub shard_id: u64,
     pub enqueued_at: Instant,
+    /// Phase 1.6: 直接 response 通道，None 表示 fire-and-forget 请求。
+    pub response_tx: Option<oneshot::Sender<ClientResult<RequestResult>>>,
+}
+
+impl std::fmt::Debug for PendingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRequest")
+            .field("context", &self.context)
+            .field("shard_id", &self.shard_id)
+            .field("enqueued_at", &self.enqueued_at)
+            .field("response_tx", &self.response_tx.is_some())
+            .finish()
+    }
 }
 
 /// 传输通道配置
@@ -369,6 +384,7 @@ impl MetaShardClient {
             context,
             shard_id,
             enqueued_at: Instant::now(),
+            response_tx: None,
         };
 
         // 快速路径：ShardedRpcPool（延迟初始化，首次调用时创建）
@@ -390,6 +406,7 @@ impl MetaShardClient {
             context,
             shard_id,
             enqueued_at: Instant::now(),
+            response_tx: None,
         };
 
         // 快速路径：ShardedRpcPool
@@ -614,6 +631,7 @@ impl MetaShardClient {
             context,
             shard_id,
             enqueued_at: Instant::now(),
+            response_tx: None,
         };
 
         self.data_queue.enqueue(req)?;
@@ -638,6 +656,7 @@ impl MetaShardClient {
             context,
             shard_id,
             enqueued_at: Instant::now(),
+            response_tx: None,
         };
 
         self.control_queue.enqueue(req)?;

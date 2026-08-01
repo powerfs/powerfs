@@ -1057,11 +1057,114 @@ fsync:
 修复建议（优先级排序）：
 1. ~~lease 复用~~ ✅ 已实现（ensure_lease 缓存，§8.2）
 2. ~~release token bug~~ ✅ 已修复（LeaseGuard 用持有 token）
-3. **write合并/delayed flush** ✅ 本节实现
-4. data_queue 并发处理（阶段1.6）🟡 待推进
+3. ~~write合并/delayed flush~~ ✅ §12.12 实现
+4. ~~data_queue 并发处理（阶段1.6）~~ ✅ §12.13 实现
 5. PullDelta 退避 🟡 待推进
 
 核心改动（lease 复用 + write 延迟 flush）将 64K write 从 48 次往返（原始）降到 1-2 次。
+
+---
+
+### 12.13 阶段1.6：消除 response_waiters 中间层，恢复 data_queue 管控（2026-08-01）
+
+#### 问题现象
+
+阶段1.7（write合并）后 write 路径不再同步 flush，但 `read_blob`、`write_blob`（备选）、`batch_write_blob` 仍走 `submit_data_request_and_wait` → data_queue → process_data_request_internal → `resolve_waiter_for` → response_waiters → oneshot 路径。
+
+response 路由有 2 层间接：
+1. `submit_data_request_and_wait` 注册 oneshot tx 到 `response_waiters` HashMap
+2. `process_data_request_internal` 通过 `resolve_waiter_for` 查 HashMap 取 tx 发送结果
+
+中间层问题：
+- HashMap lock 竞争（`Mutex::lock`）
+- spawn 任务的 poll 延迟导致 response 卡在 `response_waiters` 中
+- `send_write_needle_direct` 绕过 data_queue 失去并发管控
+
+#### 修复方案：response_tx 直接嵌入 PendingRequest
+
+**核心思想**：oneshot tx 直接嵌入 PendingRequest，processor 完成后直接通过 tx 投递结果，无需 HashMap 查找。
+
+```
+修复前:
+  submit_data_request_and_wait:
+    1. oneshot channel (tx, rx)
+    2. register_waiter(request_id, tx)     ← 注册到 HashMap
+    3. submit_data_request(context, vid)   ← 入队，无 tx
+    4. await rx
+
+  process_data_request_internal:
+    5. ... 处理请求 ...
+    6. resolve_waiter_for(request_id, result, response_waiters)
+       → HashMap.lock()
+       → HashMap.remove(request_id)
+       → tx.send(result)                   ← 查找 + 锁竞争
+
+修复后:
+  submit_data_request_and_wait:
+    1. oneshot channel (tx, rx)
+    2. submit_data_request(context, vid, Some(tx))  ← tx 嵌入 PendingRequest
+    3. await rx                              ← 无 register_waiter
+
+  process_data_request_internal:
+    4. let response_tx = req.response_tx.take()
+    5. ... 处理请求 ...
+    6. deliver_result(&mut response_tx, ...)
+       → tx.send(result)                    ← 直接投递，无 HashMap 查找
+```
+
+#### 改动详情
+
+| 文件 | 改动 | 说明 |
+|---|---|---|
+| [meta_shard_client.rs PendingRequest](file:///home/portion/powerfs/powerfs-fuse-core/src/meta_shard_client.rs) | 添加 `response_tx: Option<oneshot::Sender<...>>` 字段 | 手动实现 Debug（Sender 无 Debug） |
+| [volume_client.rs submit_*_request](file:///home/portion/powerfs/powerfs-fuse-core/src/volume_client.rs) | 添加 `response_tx` 参数 | 3 个函数：data/lease/mgmt |
+| [volume_client.rs submit_*_request_and_wait](file:///home/portion/powerfs/powerfs-fuse-core/src/volume_client.rs) | 嵌入 `Some(tx)`，移除 `register_waiter` | 4 处（含 statfs） |
+| [volume_client.rs process_*_request_internal](file:///home/portion/powerfs/powerfs-fuse-core/src/volume_client.rs) | 提取 `response_tx`，用 `deliver_result` 替代 `resolve_waiter_for` | 3 个函数，14 处调用 |
+| [volume_client.rs deliver_result](file:///home/portion/powerfs/powerfs-fuse-core/src/volume_client.rs) | 新增辅助函数 | 优先用 tx 直接投递，回退到 response_waiters |
+
+#### deliver_result 回退机制
+
+```rust
+fn deliver_result(
+    response_tx: &mut Option<oneshot::Sender<ClientResult<RequestResult>>>,
+    request_id: &RequestId,
+    result: ClientResult<RequestResult>,
+    response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
+) {
+    if let Some(tx) = response_tx.take() {
+        let _ = tx.send(result);           // 快速路径：直接投递
+    } else {
+        resolve_waiter_for(request_id, result, response_waiters);  // 回退
+    }
+}
+```
+
+- `Some(tx)`：来自 `submit_*_request_and_wait`，直接投递（快速路径）
+- `None`：fire-and-forget 请求，回退到 `response_waiters`（向后兼容）
+
+#### 超时处理简化
+
+修复前：超时时需 `response_waiters.lock()` + `remove(&request_id)` 清理。
+修复后：超时时 `rx` 自动 drop，processor 的 `tx.send()` 返回 `Err` 但无副作用。无需显式清理。
+
+#### 影响范围
+
+- **read_blob**（读路径）：response 延迟降低，无 HashMap 锁竞争
+- **write_blob/batch_write_blob**（备选写路径）：同上
+- **lease 请求**：response 延迟降低
+- **mgmt 请求**（statfs 等）：response 延迟降低
+- **send_write_needle_direct**：保留（write 主路径），后续可迁移回 data_queue
+
+#### 正确性
+
+| 场景 | 保证 | 机制 |
+|---|---|---|
+| 正常响应 | ✅ | tx 直接投递 |
+| 超时 | ✅ | rx drop，tx.send 返回 Err |
+| fire-and-forget | ✅ | response_tx=None，回退到 response_waiters |
+| 并发请求 | ✅ | 每个请求独立 oneshot，无共享状态 |
+| 向后兼容 | ✅ | deliver_result 回退到 resolve_waiter_for |
+
 
 
 
