@@ -356,6 +356,19 @@ impl CrdtReplicaCoherence {
             .map(|e| e.inode)
     }
 
+    /// Lookup with file type — returns (inode, is_dir) from the local DirORSet.
+    /// Used by lookup_attr_from_filer to correctly set is_dir when the filer
+    /// doesn't yet have the entry (delta not synced).
+    pub fn lookup_with_type(&self, dir_ino: u64, name: &str) -> Option<(u64, bool)> {
+        let arc = self.dir_cache.get(dir_ino)?;
+        let orset = arc.read().unwrap();
+        orset
+            .entries
+            .values()
+            .find(|e| e.id.name == name)
+            .map(|e| (e.inode, e.file_type.is_dir()))
+    }
+
     /// 列出目录所有条目（readdir 路径用）
     pub fn list_entries(&self, dir_ino: u64) -> Vec<(u64, String, bool)> {
         let arc = match self.dir_cache.get(dir_ino) {

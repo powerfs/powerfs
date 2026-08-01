@@ -857,6 +857,7 @@ impl PowerFsFs {
         parent: u64,
         name: &str,
         inode: u64,
+        is_dir: bool,
     ) -> std::io::Result<Entry> {
         match self.client.get_entry_by_parent(parent, name) {
             Ok(Some(entry)) => {
@@ -866,23 +867,25 @@ impl PowerFsFs {
             }
             Ok(None) => {
                 // DirORSet 有条目但 filer 查不到（delta 已 push 但 filer 未处理完？）
-                // 返回一个基于 DirORSet 信息的最小 entry
+                // 返回一个基于 DirORSet 信息的最小 entry，使用 DirORSet 的 is_dir
+                // 而非硬编码 false（否则目录会被误报为文件，破坏 find/cp 递归）
                 debug!(
-                    "lookup_attr_from_filer: filer miss for inode {} (dir entry exists), using minimal entry",
-                    inode
+                    "lookup_attr_from_filer: filer miss for inode {} (dir entry exists, is_dir={}), using minimal entry",
+                    inode, is_dir
                 );
                 let now = chrono::Utc::now().timestamp();
+                let mode = if is_dir { 0o40755 } else { 0o100644 };
                 let cached = CachedEntry {
                     inode,
                     parent,
                     name: name.to_string(),
-                    is_dir: false,
+                    is_dir,
                     is_symlink: false,
                     symlink_target: None,
-                    nlink: 1,
+                    nlink: if is_dir { 2 } else { 1 },
                     fid: None,
                     size: 0,
-                    mode: 0o644,
+                    mode,
                     uid: 0,
                     gid: 0,
                     atime: now,
@@ -934,12 +937,12 @@ impl FileSystem for PowerFsFs {
 
         // Phase 4.2: 读本地 DirORSet（权威目录条目源）
         // 2. DirORSet 命中 → 获取 inode → 查 filer 获取 attr（MetadataCache miss 时）
-        if let Some(inode) = self.coherence.lookup(parent, name_str) {
+        if let Some((inode, is_dir)) = self.coherence.lookup_with_type(parent, name_str) {
             debug!(
-                "lookup: DirORSet hit for '{}/{}' → inode {}",
-                parent, name_str, inode
+                "lookup: DirORSet hit for '{}/{}' → inode {} is_dir={}",
+                parent, name_str, inode, is_dir
             );
-            return self.lookup_attr_from_filer(parent, name_str, inode);
+            return self.lookup_attr_from_filer(parent, name_str, inode, is_dir);
         }
 
         // 3. DirORSet miss → 同步 pull_delta 后再查 DirORSet
@@ -950,12 +953,12 @@ impl FileSystem for PowerFsFs {
         let coherence = self.coherence.clone();
         self.client
             .block_on(async move { coherence.do_pull_and_apply_deltas(parent).await });
-        if let Some(inode) = self.coherence.lookup(parent, name_str) {
+        if let Some((inode, is_dir)) = self.coherence.lookup_with_type(parent, name_str) {
             debug!(
-                "lookup: DirORSet hit after pull for '{}/{}' → inode {}",
-                parent, name_str, inode
+                "lookup: DirORSet hit after pull for '{}/{}' → inode {} is_dir={}",
+                parent, name_str, inode, is_dir
             );
-            return self.lookup_attr_from_filer(parent, name_str, inode);
+            return self.lookup_attr_from_filer(parent, name_str, inode, is_dir);
         }
 
         // 4. Fallback: 直接查 filer（兼容旧路径 + 兜底）

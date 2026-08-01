@@ -489,6 +489,13 @@ impl MetadataCache {
         };
 
         let path_map = self.path_map.read().unwrap();
+        // Acquire inode_cache read lock once for is_dir lookups.
+        // Use direct cache access (not get_inode) to bypass TTL — entries
+        // physically present in inode_cache have correct is_dir regardless
+        // of TTL expiry. Using get_inode here causes directories to be
+        // misreported as files when their cache entries expire (TTL=2s),
+        // breaking find/cp -prf recursion after large directory copies.
+        let inode_cache = self.inode_cache.read().unwrap();
         let mut children = Vec::new();
 
         let prefix = if parent_path == "/" {
@@ -504,8 +511,8 @@ impl MetadataCache {
                 // Check if it's a direct child (no additional slashes beyond the prefix)
                 let relative = &path[prefix.len()..];
                 if !relative.is_empty() && !relative.contains('/') {
-                    // Get is_dir from inode_cache, but use the name from the path
-                    let is_dir = self.get_inode(*ino).map(|e| e.is_dir).unwrap_or(false);
+                    // Get is_dir from inode_cache directly (no TTL check, no LRU touch)
+                    let is_dir = inode_cache.peek(ino).map(|e| e.is_dir).unwrap_or(false);
                     children.push((*ino, relative.to_string(), is_dir));
                 }
             }
@@ -514,24 +521,27 @@ impl MetadataCache {
 
         // Also check inode_cache for any entries that might not be in path_map
         // Use a set of (inode, name) pairs to avoid duplicates, but allow hard links with different names
-        let cache = self.inode_cache.read().unwrap();
         let mut seen_pairs = std::collections::HashSet::new();
-        for (_, entry) in cache.iter() {
+        for (_, entry) in inode_cache.iter() {
             if entry.parent == parent_inode && entry.inode != parent_inode {
                 let pair = (entry.inode, entry.name.clone());
                 if seen_pairs.insert(pair) {
-                    // Check if this entry is already in children
-                    let already_exists = children
-                        .iter()
-                        .any(|(ino, name, _)| *ino == entry.inode && *name == entry.name);
-                    if !already_exists {
+                    // Check if this entry is already in children.
+                    // If it is but has wrong is_dir (from path_map scan with
+                    // expired get_inode), update it with the correct value.
+                    let existing = children
+                        .iter_mut()
+                        .find(|(ino, name, _)| *ino == entry.inode && *name == entry.name);
+                    if let Some(existing) = existing {
+                        existing.2 = entry.is_dir;
+                    } else {
                         children.push((entry.inode, entry.name.clone(), entry.is_dir));
                     }
                 }
             }
         }
 
-        drop(cache);
+        drop(inode_cache);
 
         // Debug logging
         log::debug!(
