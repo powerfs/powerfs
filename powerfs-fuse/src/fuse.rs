@@ -157,6 +157,7 @@ impl FuseApp {
                 .collect(),
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            flush_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             open_inodes: Arc::new(RwLock::new(HashSet::new())),
@@ -277,6 +278,8 @@ impl FuseServer {
 }
 
 type FileLocks = HashMap<u64, Vec<FileLock>>;
+type FlushLockMap = HashMap<u64, Arc<std::sync::Mutex<()>>>;
+type FlushLocks = Arc<std::sync::Mutex<FlushLockMap>>;
 
 struct PowerFsFs {
     client: Arc<SyncFuseClientFacade>,
@@ -290,6 +293,10 @@ struct PowerFsFs {
     dirty_shards: DirtyShards,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
     write_locks: WriteLocks,
+    /// Per-inode flush lock: serializes flush_dirty_chunks and release's lease
+    /// release to prevent the TOCTOU race where release removes a lease token
+    /// from the server while the background flusher is still using it.
+    flush_locks: FlushLocks,
     stripe_size: u64,
     lease_duration_ms: u64,
     /// Phase 4.3/4.4: 当前已打开的 inode 集合。
@@ -408,6 +415,16 @@ impl PowerFsFs {
             .clone()
     }
 
+    /// 获取 per-inode flush lock，用于序列化 flush_dirty_chunks 和 release 的
+    /// lease 释放，防止后台 flusher 与 release 回调并发操作同一 inode 的 lease。
+    fn get_flush_lock(&self, inode: u64) -> Arc<std::sync::Mutex<()>> {
+        let mut locks = self.flush_locks.lock().unwrap();
+        locks
+            .entry(inode)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn dirty_shard_idx(key: &(u64, u64)) -> usize {
         let hash = key.0.wrapping_add(key.1);
         (hash as usize) % NUM_DIRTY_SHARDS
@@ -450,7 +467,20 @@ impl PowerFsFs {
         inodes
     }
 
+    /// Flush dirty chunks for an inode. Acquires per-inode flush lock to
+    /// serialize with release callback's lease release.
     fn flush_dirty_chunks(&self, inode: u64, lease_token: Option<&str>) -> std::io::Result<()> {
+        let flush_lock = self.get_flush_lock(inode);
+        let _guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_dirty_chunks_impl(inode, lease_token)
+    }
+
+    /// Internal flush implementation — caller MUST hold the per-inode flush lock.
+    fn flush_dirty_chunks_impl(
+        &self,
+        inode: u64,
+        lease_token: Option<&str>,
+    ) -> std::io::Result<()> {
         let dirty = self.drain_dirty_for_inode(inode);
 
         if dirty.is_empty() {
@@ -1916,8 +1946,14 @@ impl FileSystem for PowerFsFs {
         _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
         // Phase 3.4: close 流程 = flush 数据 → sync size/chunks（强一致）→ 递减 open_count → 释放 lease
-        // 1. Flush dirty data chunks to volume server
-        if let Err(e) = self.flush_dirty_chunks(inode, None) {
+        //
+        // 持有 per-inode flush lock 贯穿整个序列，防止后台 flusher 在 release
+        // 释放 lease 后仍用旧 token 写入（TOCTOU 竞争导致 "Lease token not found"）。
+        let flush_lock = self.get_flush_lock(inode);
+        let _flush_guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 1. Flush dirty data chunks to volume server (lock held — call impl directly)
+        if let Err(e) = self.flush_dirty_chunks_impl(inode, None) {
             warn!(
                 "release: flush_dirty_chunks for inode {} failed: {}",
                 inode, e
@@ -1961,6 +1997,7 @@ impl FileSystem for PowerFsFs {
         // 4. 释放 Volume lease（best-effort，close 时释放 write 路径缓存的 lease）
         //    write 路径不再每次 acquire/release，lease 由 ensure_lease 缓存复用，
         //    此处统一释放，避免 lease 在 volume server 端堆积。
+        //    仍在 flush lock 内 —— 后台 flusher 此刻被阻塞，不会用旧 token 写入。
         if let Some(entry) = self.cache.get_inode(inode) {
             if let Some(ref fid) = entry.fid {
                 let client_id = self.client.client_id();
