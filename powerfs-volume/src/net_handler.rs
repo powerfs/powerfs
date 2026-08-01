@@ -252,6 +252,14 @@ impl VolumeNetHandler {
                 if let Some(volume) = storage_manager.get_volume(&vid) {
                     match volume.delete_needle(&nid) {
                         Ok(_) => Ok(true),
+                        Err(powerfs_common::error::PowerFsError::NeedleNotFound(_)) => {
+                            // Idempotent delete: needle already gone = desired state.
+                            // Returning success prevents the circuit breaker from
+                            // tripping on expected conditions (e.g., file created and
+                            // deleted quickly before data flush, or retry double-delete).
+                            debug!("delete_needle: needle not found (idempotent): {}", nid.0);
+                            Ok(true)
+                        }
                         Err(e) => {
                             warn!("delete_needle failed: {}", e);
                             Ok(false)

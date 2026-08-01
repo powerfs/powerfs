@@ -504,6 +504,16 @@ impl VolumeService for VolumeServer {
                     Ok(_) => Ok(Response::new(crate::proto::DeleteNeedleResponse {
                         success: true,
                     })),
+                    Err(powerfs_common::error::PowerFsError::NeedleNotFound(_)) => {
+                        // Idempotent delete: needle already gone = desired state.
+                        debug!(
+                            "delete_needle: needle not found (idempotent): {}",
+                            needle_id.0
+                        );
+                        Ok(Response::new(crate::proto::DeleteNeedleResponse {
+                            success: true,
+                        }))
+                    }
                     Err(e) => {
                         warn!("delete_needle failed: {}", e);
                         Err(Status::internal(format!("{}", e)))
