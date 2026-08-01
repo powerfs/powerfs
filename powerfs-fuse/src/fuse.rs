@@ -1222,7 +1222,15 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        if !self.cache.list_children(entry.inode).is_empty() {
+        // 用 DirORSet（权威源）检查目录是否为空，避免 path_map 残留条目
+        // 导致空目录被误判为非空（ENOTEMPTY）。
+        let dir_children = self.coherence.list_entries(entry.inode);
+        if dir_children.is_empty() {
+            // DirORSet 为空时再查 MetadataCache 兜底（冷启动场景）
+            if !self.cache.list_children(entry.inode).is_empty() {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            }
+        } else {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
         }
 
@@ -2081,28 +2089,19 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        // Phase 4.1: 读本地 DirORSet 副本（权威目录条目源）
-        // 1. 先读 MetadataCache（可能已有完整 attr）
-        // 2. miss 时读 DirORSet（只有 inode/name/type，但零开销）
-        // 3. DirORSet 也空时，同步 pull_delta 再读 DirORSet
-        // 4. 仍空时 fallback 到 filer list_entries（兼容旧路径）
-        let mut children = self.cache.list_children(inode);
+        // DirORSet 是权威目录条目源（CRDT 维护，正确处理远程删除）。
+        // MetadataCache.list_children 扫描 path_map，可能包含已被远程删除但
+        // 未清理的残留条目（filer fallback 路径只写 MetadataCache 不写 DirORSet，
+        // 导致后续 Remove delta 在 DirORSet 中找不到匹配，invalidate 不触发）。
+        // 因此 readdir 必须以 DirORSet 为主，list_children 仅作最终 fallback。
+        //
+        // 1. 读本地 DirORSet
+        // 2. DirORSet 空 → 同步 pull_delta 后再读
+        // 3. 仍空 → fallback 到 filer list_entries（冷启动场景）
+        // 4. 仍空 → list_children（兜底，兼容旧缓存）
+        let mut children = self.coherence.list_entries(inode);
 
         if children.is_empty() {
-            // Phase 4.1: 读本地 DirORSet
-            let dir_entries = self.coherence.list_entries(inode);
-            if !dir_entries.is_empty() {
-                debug!(
-                    "readdir: DirORSet hit for dir {}, {} entries",
-                    inode,
-                    dir_entries.len()
-                );
-                children = dir_entries;
-            }
-        }
-
-        if children.is_empty() {
-            // Phase 4.1: DirORSet 也空，同步 pull_delta 后再读
             debug!(
                 "readdir: DirORSet empty for dir {}, pulling delta from filer",
                 inode
@@ -2121,7 +2120,11 @@ impl FileSystem for PowerFsFs {
         }
 
         if children.is_empty() {
-            // Fallback: 直接查 filer（兼容旧路径 + 兜底）
+            // Fallback: 直接查 filer（冷启动 + DirORSet 无副本时）
+            debug!(
+                "readdir: DirORSet still empty for dir {}, falling back to filer list_entries",
+                inode
+            );
             if let Ok(entries) = self.client.list_entries(inode, 1000, "") {
                 for child_entry in entries {
                     let cached = self.entry_to_cached(inode, &child_entry);
@@ -2173,8 +2176,15 @@ impl FileSystem for PowerFsFs {
         }
 
         if let Some(target) = self.lookup_in_cache(newdir, new_str) {
-            if target.is_dir && !self.cache.list_children(target.inode).is_empty() {
-                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            if target.is_dir {
+                // 用 DirORSet 检查目录是否为空（权威源，避免 path_map 残留）
+                let dir_children = self.coherence.list_entries(target.inode);
+                if !dir_children.is_empty()
+                    || (dir_children.is_empty()
+                        && !self.cache.list_children(target.inode).is_empty())
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
             }
         }
 
