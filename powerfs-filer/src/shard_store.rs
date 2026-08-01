@@ -87,6 +87,7 @@ pub struct ShardStore {
     directory_entries: RwLock<HashMap<u64, HashMap<String, u64>>>,
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
+    next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
 }
 
 impl ShardStore {
@@ -143,9 +144,11 @@ impl ShardStore {
                 read_qps: 0,
             }),
             root_inodes: RwLock::new(HashMap::new()),
+            next_inode: std::sync::Mutex::new(inode_range.0),
         };
 
         store.load_data()?;
+        store.init_next_inode();
         Ok(store)
     }
 
@@ -1149,6 +1152,250 @@ impl ShardStore {
             cache.insert(info.inode, info);
         }
 
+        Ok(())
+    }
+
+    /// 原子地创建 inode 并添加目录条目（WriteBatch 保证 CF_INODES + CF_DIR_ENTRIES 一致）。
+    /// 用于 push_delta 的 Add 操作，避免 create_inode + add_dir_entry 两步非原子导致的不一致。
+    pub fn create_inode_atomic(
+        &self,
+        info: InodeInfo,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let inode_key = info.inode.to_be_bytes();
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        let dir_key = format!("{}:{}", parent_inode, name);
+        let dir_value = info.inode.to_be_bytes();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(cf_inodes, inode_key, &data);
+        batch.put_cf(cf_dir_entries, dir_key.as_bytes(), &dir_value);
+
+        let write_opts = rocksdb::WriteOptions::default();
+        self.db
+            .write_opt(batch, &write_opts)
+            .map_err(|e| format!("batch create inode: {}", e))?;
+
+        let is_file = matches!(info.file_type, FileType::File);
+        let is_dir = matches!(info.file_type, FileType::Directory);
+        let inode_val = info.inode;
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.insert(inode_val, info);
+        }
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            dir_entries.entry(parent_inode).or_default();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.insert(name.to_string(), inode_val);
+            }
+        }
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            if is_file {
+                stats.file_count += 1;
+            }
+            if is_dir {
+                stats.dir_count += 1;
+            }
+        }
+        self.save_stats();
+
+        Ok(())
+    }
+
+    /// 原子地删除 inode 并移除目录条目（WriteBatch 保证 CF_INODES + CF_DIR_ENTRIES 一致）。
+    /// 用于 push_delta 的 Remove 操作，避免 remove_dir_entry + delete_inode 两步非原子。
+    pub fn remove_inode_atomic(
+        &self,
+        inode: u64,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let dir_key = format!("{}:{}", parent_inode, name);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(cf_inodes, inode.to_be_bytes());
+        batch.delete_cf(cf_dir_entries, dir_key.as_bytes());
+
+        let write_opts = rocksdb::WriteOptions::default();
+        self.db
+            .write_opt(batch, &write_opts)
+            .map_err(|e| format!("batch remove inode: {}", e))?;
+
+        let removed = {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.remove(&inode).map(|info| {
+                let is_file = matches!(info.file_type, FileType::File);
+                let is_dir = matches!(info.file_type, FileType::Directory);
+                (is_file, is_dir)
+            })
+        };
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                dir.remove(name);
+            }
+        }
+        if let Some((is_file, is_dir)) = removed {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count = stats.inode_count.saturating_sub(1);
+            if is_file {
+                stats.file_count = stats.file_count.saturating_sub(1);
+            }
+            if is_dir {
+                stats.dir_count = stats.dir_count.saturating_sub(1);
+            }
+            self.save_stats();
+        }
+
+        Ok(())
+    }
+
+    /// 原子地重命名目录条目（WriteBatch delete old + put new）。
+    /// inode 本身不变，仅迁移 dir_entry。用于 push_delta 的 Rename 操作。
+    pub fn rename_dir_entry_atomic(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let old_key = format!("{}:{}", old_parent, old_name);
+        let new_key = format!("{}:{}", new_parent, new_name);
+        let new_value = inode.to_be_bytes();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(cf_dir_entries, old_key.as_bytes());
+        batch.put_cf(cf_dir_entries, new_key.as_bytes(), new_value);
+
+        let write_opts = rocksdb::WriteOptions::default();
+        self.db
+            .write_opt(batch, &write_opts)
+            .map_err(|e| format!("batch rename dir entry: {}", e))?;
+
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            if let Some(dir) = dir_entries.get_mut(&old_parent) {
+                dir.remove(old_name);
+            }
+            dir_entries.entry(new_parent).or_default();
+            if let Some(dir) = dir_entries.get_mut(&new_parent) {
+                dir.insert(new_name.to_string(), inode);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 初始化 next_inode：从 CF_METADATA 读，若无用 inode_range.start（§4 1.4）
+    fn init_next_inode(&self) {
+        let start = match self.db.cf_handle(CF_METADATA) {
+            Some(cf) => match self.db.get_cf(cf, b"next_inode") {
+                Ok(Some(v)) if v.len() == 8 => {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&v);
+                    u64::from_be_bytes(arr)
+                }
+                _ => self.inode_range.0,
+            },
+            None => self.inode_range.0,
+        };
+        *self.next_inode.lock().unwrap() = start;
+        info!(
+            "Shard {}: init_next_inode = {} (range={:?})",
+            self.shard_id.0, start, self.inode_range
+        );
+    }
+
+    /// 批量分配 inode 区间 [start, end)（leader 单点 + CF_METADATA sync 持久化，§4 1.4）。
+    /// 返回 (start, end)，fuse 在区间内本地分配，写路径零等待。
+    pub fn alloc_inode_batch(&self, count: u32) -> Result<(u64, u64), String> {
+        if count == 0 {
+            return Err("alloc_inode_batch: count must > 0".to_string());
+        }
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| "CF_METADATA not found".to_string())?;
+        let mut guard = self.next_inode.lock().unwrap();
+        let start = *guard;
+        let end = start
+            .checked_add(count as u64)
+            .ok_or_else(|| "inode range overflow".to_string())?;
+        if end > self.inode_range.1 {
+            return Err(format!(
+                "inode range exhausted: start={} end={} max={}",
+                start, end, self.inode_range.1
+            ));
+        }
+        // sync 持久化 next_inode=end，防 leader 崩溃丢分配
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf, b"next_inode", end.to_be_bytes(), &write_opts)
+            .map_err(|e| format!("persist next_inode: {}", e))?;
+        *guard = end;
+        info!(
+            "Shard {}: alloc_inode_batch count={} -> [{}, {})",
+            self.shard_id.0, count, start, end
+        );
+        Ok((start, end))
+    }
+
+    /// 原子更新 inode 的 size + chunks（强一致，sync 写，§4 1.5 / §5.1 lease 协调）。
+    /// close 时 sync 账本调用，保证数据账本全局强一致。
+    pub fn update_inode_size_chunks_atomic(
+        &self,
+        inode: u64,
+        size: u64,
+        chunks: Vec<StoredFileChunk>,
+    ) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+        let mut info = self
+            .get_inode(inode)
+            .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
+        info.size = size;
+        info.blocks = size.div_ceil(512);
+        info.chunks = chunks;
+        info.mtime = Self::current_time();
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        // sync 写保证 close sync 账本强持久化
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf_inodes, inode.to_be_bytes(), &data, &write_opts)
+            .map_err(|e| format!("put inode size/chunks: {}", e))?;
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
         Ok(())
     }
 

@@ -27,6 +27,12 @@ service FilerMetaService {
     
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+
+    // Inode 批量授权（fuse 本地分配，Phase 3 写解耦用，§4 1.4）
+    rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
+
+    // size/chunks 强一致更新（close 时 sync 账本，§5.1 lease 协调，§4 1.5）
+    rpc UpdateInodeSizeChunks(UpdateInodeSizeChunksRequest) returns (UpdateInodeSizeChunksResponse);
 }
 
 // POSIX 元数据服务 (扁平路径，FUSE 使用)
@@ -55,6 +61,12 @@ service PosixMetaService {
     
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+
+    // Inode 批量授权
+    rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
+
+    // size/chunks 强一致更新
+    rpc UpdateInodeSizeChunks(UpdateInodeSizeChunksRequest) returns (UpdateInodeSizeChunksResponse);
 }
 
 message GetEntryRequest {
@@ -340,6 +352,34 @@ message RaftMessageRequest {
 }
 
 message RaftMessageResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Inode 批量授权（§4 1.4）
+message AllocInodeBatchRequest {
+    uint64 shard_id = 1;
+    uint32 count = 2;
+    string client_id = 3;
+}
+
+message AllocInodeBatchResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 start_inode = 3;
+    uint64 end_inode = 4;
+}
+
+// size/chunks 强一致更新（§4 1.5，§5.1 lease 协调）
+message UpdateInodeSizeChunksRequest {
+    uint64 shard_id = 1;
+    uint64 inode = 2;
+    uint64 size = 3;
+    repeated FileChunk chunks = 4;
+    string client_id = 5;
+}
+
+message UpdateInodeSizeChunksResponse {
     bool success = 1;
     string error = 2;
 }

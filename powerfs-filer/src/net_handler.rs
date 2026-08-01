@@ -482,6 +482,11 @@ impl FilerNetHandler {
                         .await;
                 }
 
+                // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(parent_ino, now);
+                self.notify_inode_change(ino, now);
+
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
@@ -543,6 +548,11 @@ impl FilerNetHandler {
                     .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid))
                     .await;
 
+                // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(parent_ino, now);
+                self.notify_inode_change(info.inode, now);
+
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, info.inode);
                 enc.add_u32(FieldId::Mode, (mode | 0o040000) as u32);
@@ -586,7 +596,13 @@ impl FilerNetHandler {
                     .delete_file_by_inode(info.inode, shard_id)
                     .await
                 {
-                    Ok(_) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+                    Ok(_) => {
+                        // B5: notify 目录条目变更（parent readdir 缓存 + 被删 inode 失效）
+                        let now = crate::shard_store::ShardStore::current_time();
+                        self.notify_inode_change(parent_ino, now);
+                        self.notify_inode_change(info.inode, now);
+                        Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+                    }
                     Err(e) => {
                         warn!("FILER_NET_UNLINK failed: {}", e);
                         Ok(Self::build_response(
@@ -625,7 +641,12 @@ impl FilerNetHandler {
             .delete_directory(parent_ino, &name)
             .await
         {
-            Ok(_) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Ok(_) => {
+                // B5: notify 目录条目变更
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(parent_ino, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
             Err(e) => {
                 warn!("FILER_NET_RMDIR failed: {}", e);
                 Ok(Self::build_response(
@@ -655,7 +676,13 @@ impl FilerNetHandler {
             .rename(old_parent_ino, &old_name, new_parent_ino, &new_name)
             .await
         {
-            Ok(_) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Ok(_) => {
+                // B5: notify 两个目录条目变更
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(old_parent_ino, now);
+                self.notify_inode_change(new_parent_ino, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
             Err(e) => {
                 warn!("FILER_NET_RENAME failed: {}", e);
                 Ok(Self::build_response(

@@ -268,8 +268,10 @@ pub struct Entry {
     #[prost(uint32, tag = "6")]
     pub hard_link_counter: u32,
     #[prost(map = "string, bytes", tag = "7")]
-    pub extended:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
+    pub extended: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::vec::Vec<u8>,
+    >,
     #[prost(uint64, tag = "8")]
     pub content_size: u64,
     #[prost(uint64, tag = "9")]
@@ -426,8 +428,10 @@ pub struct SetAttrOp {
     #[prost(message, repeated, tag = "4")]
     pub chunks: ::prost::alloc::vec::Vec<FileChunk>,
     #[prost(map = "string, bytes", tag = "5")]
-    pub extended:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
+    pub extended: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::vec::Vec<u8>,
+    >,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -490,11 +494,57 @@ pub struct RaftMessageResponse {
     #[prost(string, tag = "2")]
     pub error: ::prost::alloc::string::String,
 }
+/// Inode 批量授权（§4 1.4）
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllocInodeBatchRequest {
+    #[prost(uint64, tag = "1")]
+    pub shard_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub count: u32,
+    #[prost(string, tag = "3")]
+    pub client_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllocInodeBatchResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub start_inode: u64,
+    #[prost(uint64, tag = "4")]
+    pub end_inode: u64,
+}
+/// size/chunks 强一致更新（§4 1.5，§5.1 lease 协调）
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateInodeSizeChunksRequest {
+    #[prost(uint64, tag = "1")]
+    pub shard_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub inode: u64,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(message, repeated, tag = "4")]
+    pub chunks: ::prost::alloc::vec::Vec<FileChunk>,
+    #[prost(string, tag = "5")]
+    pub client_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateInodeSizeChunksResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod filer_meta_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     /// S3 桶兼容服务 (用于 S3 API)
     #[derive(Debug, Clone)]
     pub struct FilerMetaServiceClient<T> {
@@ -539,8 +589,9 @@ pub mod filer_meta_service_client {
                     <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::BoxBody>>>::Error:
-                Into<StdError> + Send + Sync,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + Send + Sync,
         {
             FilerMetaServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -578,15 +629,23 @@ pub mod filer_meta_service_client {
         pub async fn get_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::GetEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/GetEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/GetEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "GetEntry"));
@@ -595,38 +654,48 @@ pub mod filer_meta_service_client {
         pub async fn get_entry_by_inode(
             &mut self,
             request: impl tonic::IntoRequest<super::GetEntryByInodeRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryByInodeResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryByInodeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/GetEntryByInode");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/GetEntryByInode",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.FilerMetaService",
-                "GetEntryByInode",
-            ));
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.FilerMetaService", "GetEntryByInode"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn create_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/CreateEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/CreateEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "CreateEntry"));
@@ -635,17 +704,23 @@ pub mod filer_meta_service_client {
         pub async fn update_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::UpdateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::UpdateEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/UpdateEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/UpdateEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "UpdateEntry"));
@@ -654,17 +729,23 @@ pub mod filer_meta_service_client {
         pub async fn delete_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/DeleteEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/DeleteEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "DeleteEntry"));
@@ -673,17 +754,23 @@ pub mod filer_meta_service_client {
         pub async fn rename_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::RenameEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::RenameEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RenameEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/RenameEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/RenameEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "RenameEntry"));
@@ -692,17 +779,23 @@ pub mod filer_meta_service_client {
         pub async fn list_entries(
             &mut self,
             request: impl tonic::IntoRequest<super::ListEntriesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListEntriesResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ListEntriesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/ListEntries");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/ListEntries",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "ListEntries"));
@@ -711,38 +804,51 @@ pub mod filer_meta_service_client {
         pub async fn lookup_directory_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::LookupDirectoryEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::LookupDirectoryEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LookupDirectoryEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/powerfs.FilerMetaService/LookupDirectoryEntry",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.FilerMetaService",
-                "LookupDirectoryEntry",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("powerfs.FilerMetaService", "LookupDirectoryEntry"),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Delta sync API
         pub async fn push_delta(
             &mut self,
             request: impl tonic::IntoRequest<super::PushDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PushDeltaResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::PushDeltaResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/PushDelta");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/PushDelta",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "PushDelta"));
@@ -751,15 +857,23 @@ pub mod filer_meta_service_client {
         pub async fn pull_delta(
             &mut self,
             request: impl tonic::IntoRequest<super::PullDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PullDeltaResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::PullDeltaResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/PullDelta");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/PullDelta",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "PullDelta"));
@@ -770,15 +884,19 @@ pub mod filer_meta_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseRequest>,
         ) -> std::result::Result<tonic::Response<super::LeaseResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/AcquireLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/AcquireLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "AcquireLease"));
@@ -787,17 +905,23 @@ pub mod filer_meta_service_client {
         pub async fn release_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseReleaseRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseReleaseResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseReleaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/ReleaseLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/ReleaseLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "ReleaseLease"));
@@ -806,16 +930,23 @@ pub mod filer_meta_service_client {
         pub async fn renew_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseRenewRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseRenewResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseRenewResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/RenewLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/RenewLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "RenewLease"));
@@ -825,38 +956,48 @@ pub mod filer_meta_service_client {
         pub async fn send_raft_message(
             &mut self,
             request: impl tonic::IntoRequest<super::RaftMessageRequest>,
-        ) -> std::result::Result<tonic::Response<super::RaftMessageResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/SendRaftMessage");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/SendRaftMessage",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.FilerMetaService",
-                "SendRaftMessage",
-            ));
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.FilerMetaService", "SendRaftMessage"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_shard_stats(
             &mut self,
             request: impl tonic::IntoRequest<super::GetShardStatsRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetShardStatsResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardStatsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/GetShardStats");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/GetShardStats",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "GetShardStats"));
@@ -865,19 +1006,80 @@ pub mod filer_meta_service_client {
         pub async fn list_shards(
             &mut self,
             request: impl tonic::IntoRequest<super::ListShardsRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListShardsResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ListShardsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.FilerMetaService/ListShards");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/ListShards",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.FilerMetaService", "ListShards"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Inode 批量授权（fuse 本地分配，Phase 3 写解耦用，§4 1.4）
+        pub async fn alloc_inode_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AllocInodeBatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocInodeBatchResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/AllocInodeBatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.FilerMetaService", "AllocInodeBatch"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// size/chunks 强一致更新（close 时 sync 账本，§5.1 lease 协调，§4 1.5）
+        pub async fn update_inode_size_chunks(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateInodeSizeChunksRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateInodeSizeChunksResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.FilerMetaService/UpdateInodeSizeChunks",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("powerfs.FilerMetaService", "UpdateInodeSizeChunks"),
+                );
             self.inner.unary(req, path, codec).await
         }
     }
@@ -885,8 +1087,8 @@ pub mod filer_meta_service_client {
 /// Generated client implementations.
 pub mod posix_meta_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     /// POSIX 元数据服务 (扁平路径，FUSE 使用)
     #[derive(Debug, Clone)]
     pub struct PosixMetaServiceClient<T> {
@@ -931,8 +1133,9 @@ pub mod posix_meta_service_client {
                     <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::BoxBody>>>::Error:
-                Into<StdError> + Send + Sync,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::BoxBody>,
+            >>::Error: Into<StdError> + Send + Sync,
         {
             PosixMetaServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -970,15 +1173,23 @@ pub mod posix_meta_service_client {
         pub async fn get_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::GetEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/GetEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/GetEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "GetEntry"));
@@ -987,38 +1198,48 @@ pub mod posix_meta_service_client {
         pub async fn get_entry_by_inode(
             &mut self,
             request: impl tonic::IntoRequest<super::GetEntryByInodeRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryByInodeResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryByInodeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/GetEntryByInode");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/GetEntryByInode",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.PosixMetaService",
-                "GetEntryByInode",
-            ));
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.PosixMetaService", "GetEntryByInode"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn create_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/CreateEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/CreateEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "CreateEntry"));
@@ -1027,38 +1248,48 @@ pub mod posix_meta_service_client {
         pub async fn create_directory(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateDirectoryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateDirectoryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateDirectoryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/CreateDirectory");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/CreateDirectory",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.PosixMetaService",
-                "CreateDirectory",
-            ));
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.PosixMetaService", "CreateDirectory"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn update_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::UpdateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::UpdateEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/UpdateEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/UpdateEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "UpdateEntry"));
@@ -1067,17 +1298,23 @@ pub mod posix_meta_service_client {
         pub async fn delete_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::DeleteEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/DeleteEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/DeleteEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "DeleteEntry"));
@@ -1086,17 +1323,23 @@ pub mod posix_meta_service_client {
         pub async fn rename_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::RenameEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::RenameEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RenameEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/RenameEntry");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/RenameEntry",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "RenameEntry"));
@@ -1105,17 +1348,23 @@ pub mod posix_meta_service_client {
         pub async fn list_entries(
             &mut self,
             request: impl tonic::IntoRequest<super::ListEntriesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListEntriesResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ListEntriesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/ListEntries");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/ListEntries",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "ListEntries"));
@@ -1124,38 +1373,51 @@ pub mod posix_meta_service_client {
         pub async fn lookup_directory_entry(
             &mut self,
             request: impl tonic::IntoRequest<super::LookupDirectoryEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::LookupDirectoryEntryResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LookupDirectoryEntryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/powerfs.PosixMetaService/LookupDirectoryEntry",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.PosixMetaService",
-                "LookupDirectoryEntry",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("powerfs.PosixMetaService", "LookupDirectoryEntry"),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Delta sync API
         pub async fn push_delta(
             &mut self,
             request: impl tonic::IntoRequest<super::PushDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PushDeltaResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::PushDeltaResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/PushDelta");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/PushDelta",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "PushDelta"));
@@ -1164,15 +1426,23 @@ pub mod posix_meta_service_client {
         pub async fn pull_delta(
             &mut self,
             request: impl tonic::IntoRequest<super::PullDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PullDeltaResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::PullDeltaResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/PullDelta");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/PullDelta",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "PullDelta"));
@@ -1183,15 +1453,19 @@ pub mod posix_meta_service_client {
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseRequest>,
         ) -> std::result::Result<tonic::Response<super::LeaseResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/AcquireLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/AcquireLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "AcquireLease"));
@@ -1200,17 +1474,23 @@ pub mod posix_meta_service_client {
         pub async fn release_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseReleaseRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseReleaseResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseReleaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/ReleaseLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/ReleaseLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "ReleaseLease"));
@@ -1219,16 +1499,23 @@ pub mod posix_meta_service_client {
         pub async fn renew_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::LeaseRenewRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseRenewResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseRenewResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/RenewLease");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/RenewLease",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "RenewLease"));
@@ -1238,38 +1525,48 @@ pub mod posix_meta_service_client {
         pub async fn send_raft_message(
             &mut self,
             request: impl tonic::IntoRequest<super::RaftMessageRequest>,
-        ) -> std::result::Result<tonic::Response<super::RaftMessageResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/SendRaftMessage");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/SendRaftMessage",
+            );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "powerfs.PosixMetaService",
-                "SendRaftMessage",
-            ));
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.PosixMetaService", "SendRaftMessage"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_shard_stats(
             &mut self,
             request: impl tonic::IntoRequest<super::GetShardStatsRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetShardStatsResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardStatsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/GetShardStats");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/GetShardStats",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "GetShardStats"));
@@ -1278,19 +1575,80 @@ pub mod posix_meta_service_client {
         pub async fn list_shards(
             &mut self,
             request: impl tonic::IntoRequest<super::ListShardsRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListShardsResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Unknown,
-                    format!("Service was not ready: {}", e.into()),
-                )
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ListShardsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/powerfs.PosixMetaService/ListShards");
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/ListShards",
+            );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("powerfs.PosixMetaService", "ListShards"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Inode 批量授权
+        pub async fn alloc_inode_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AllocInodeBatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocInodeBatchResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/AllocInodeBatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("powerfs.PosixMetaService", "AllocInodeBatch"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// size/chunks 强一致更新
+        pub async fn update_inode_size_chunks(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateInodeSizeChunksRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateInodeSizeChunksResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/powerfs.PosixMetaService/UpdateInodeSizeChunks",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("powerfs.PosixMetaService", "UpdateInodeSizeChunks"),
+                );
             self.inner.unary(req, path, codec).await
         }
     }
@@ -1305,44 +1663,74 @@ pub mod filer_meta_service_server {
         async fn get_entry(
             &self,
             request: tonic::Request<super::GetEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryResponse>,
+            tonic::Status,
+        >;
         async fn get_entry_by_inode(
             &self,
             request: tonic::Request<super::GetEntryByInodeRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryByInodeResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryByInodeResponse>,
+            tonic::Status,
+        >;
         async fn create_entry(
             &self,
             request: tonic::Request<super::CreateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateEntryResponse>,
+            tonic::Status,
+        >;
         async fn update_entry(
             &self,
             request: tonic::Request<super::UpdateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::UpdateEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateEntryResponse>,
+            tonic::Status,
+        >;
         async fn delete_entry(
             &self,
             request: tonic::Request<super::DeleteEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteEntryResponse>,
+            tonic::Status,
+        >;
         async fn rename_entry(
             &self,
             request: tonic::Request<super::RenameEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::RenameEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RenameEntryResponse>,
+            tonic::Status,
+        >;
         async fn list_entries(
             &self,
             request: tonic::Request<super::ListEntriesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListEntriesResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ListEntriesResponse>,
+            tonic::Status,
+        >;
         async fn lookup_directory_entry(
             &self,
             request: tonic::Request<super::LookupDirectoryEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::LookupDirectoryEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LookupDirectoryEntryResponse>,
+            tonic::Status,
+        >;
         /// Delta sync API
         async fn push_delta(
             &self,
             request: tonic::Request<super::PushDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PushDeltaResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::PushDeltaResponse>,
+            tonic::Status,
+        >;
         async fn pull_delta(
             &self,
             request: tonic::Request<super::PullDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PullDeltaResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::PullDeltaResponse>,
+            tonic::Status,
+        >;
         /// Lease management
         async fn acquire_lease(
             &self,
@@ -1351,24 +1739,55 @@ pub mod filer_meta_service_server {
         async fn release_lease(
             &self,
             request: tonic::Request<super::LeaseReleaseRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseReleaseResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseReleaseResponse>,
+            tonic::Status,
+        >;
         async fn renew_lease(
             &self,
             request: tonic::Request<super::LeaseRenewRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseRenewResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseRenewResponse>,
+            tonic::Status,
+        >;
         /// Raft message exchange for multi-Filer communication
         async fn send_raft_message(
             &self,
             request: tonic::Request<super::RaftMessageRequest>,
-        ) -> std::result::Result<tonic::Response<super::RaftMessageResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
+            tonic::Status,
+        >;
         async fn get_shard_stats(
             &self,
             request: tonic::Request<super::GetShardStatsRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetShardStatsResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardStatsResponse>,
+            tonic::Status,
+        >;
         async fn list_shards(
             &self,
             request: tonic::Request<super::ListShardsRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListShardsResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ListShardsResponse>,
+            tonic::Status,
+        >;
+        /// Inode 批量授权（fuse 本地分配，Phase 3 写解耦用，§4 1.4）
+        async fn alloc_inode_batch(
+            &self,
+            request: tonic::Request<super::AllocInodeBatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocInodeBatchResponse>,
+            tonic::Status,
+        >;
+        /// size/chunks 强一致更新（close 时 sync 账本，§5.1 lease 协调，§4 1.5）
+        async fn update_inode_size_chunks(
+            &self,
+            request: tonic::Request<super::UpdateInodeSizeChunksRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateInodeSizeChunksResponse>,
+            tonic::Status,
+        >;
     }
     /// S3 桶兼容服务 (用于 S3 API)
     #[derive(Debug)]
@@ -1394,7 +1813,10 @@ pub mod filer_meta_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -1450,9 +1872,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/GetEntry" => {
                     #[allow(non_camel_case_types)]
                     struct GetEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::GetEntryRequest> for GetEntrySvc<T> {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::GetEntryRequest>
+                    for GetEntrySvc<T> {
                         type Response = super::GetEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetEntryRequest>,
@@ -1490,19 +1918,23 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/GetEntryByInode" => {
                     #[allow(non_camel_case_types)]
                     struct GetEntryByInodeSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService>
-                        tonic::server::UnaryService<super::GetEntryByInodeRequest>
-                        for GetEntryByInodeSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::GetEntryByInodeRequest>
+                    for GetEntryByInodeSvc<T> {
                         type Response = super::GetEntryByInodeResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetEntryByInodeRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::get_entry_by_inode(&inner, request).await
+                                <T as FilerMetaService>::get_entry_by_inode(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1533,11 +1965,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/CreateEntry" => {
                     #[allow(non_camel_case_types)]
                     struct CreateEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::CreateEntryRequest>
-                        for CreateEntrySvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::CreateEntryRequest>
+                    for CreateEntrySvc<T> {
                         type Response = super::CreateEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::CreateEntryRequest>,
@@ -1575,11 +2011,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/UpdateEntry" => {
                     #[allow(non_camel_case_types)]
                     struct UpdateEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::UpdateEntryRequest>
-                        for UpdateEntrySvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::UpdateEntryRequest>
+                    for UpdateEntrySvc<T> {
                         type Response = super::UpdateEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::UpdateEntryRequest>,
@@ -1617,11 +2057,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/DeleteEntry" => {
                     #[allow(non_camel_case_types)]
                     struct DeleteEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::DeleteEntryRequest>
-                        for DeleteEntrySvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::DeleteEntryRequest>
+                    for DeleteEntrySvc<T> {
                         type Response = super::DeleteEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::DeleteEntryRequest>,
@@ -1659,11 +2103,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/RenameEntry" => {
                     #[allow(non_camel_case_types)]
                     struct RenameEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::RenameEntryRequest>
-                        for RenameEntrySvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::RenameEntryRequest>
+                    for RenameEntrySvc<T> {
                         type Response = super::RenameEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RenameEntryRequest>,
@@ -1701,11 +2149,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/ListEntries" => {
                     #[allow(non_camel_case_types)]
                     struct ListEntriesSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::ListEntriesRequest>
-                        for ListEntriesSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::ListEntriesRequest>
+                    for ListEntriesSvc<T> {
                         type Response = super::ListEntriesResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ListEntriesRequest>,
@@ -1743,19 +2195,25 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/LookupDirectoryEntry" => {
                     #[allow(non_camel_case_types)]
                     struct LookupDirectoryEntrySvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService>
-                        tonic::server::UnaryService<super::LookupDirectoryEntryRequest>
-                        for LookupDirectoryEntrySvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::LookupDirectoryEntryRequest>
+                    for LookupDirectoryEntrySvc<T> {
                         type Response = super::LookupDirectoryEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LookupDirectoryEntryRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::lookup_directory_entry(&inner, request)
+                                <T as FilerMetaService>::lookup_directory_entry(
+                                        &inner,
+                                        request,
+                                    )
                                     .await
                             };
                             Box::pin(fut)
@@ -1787,9 +2245,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/PushDelta" => {
                     #[allow(non_camel_case_types)]
                     struct PushDeltaSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::PushDeltaRequest> for PushDeltaSvc<T> {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::PushDeltaRequest>
+                    for PushDeltaSvc<T> {
                         type Response = super::PushDeltaResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::PushDeltaRequest>,
@@ -1827,9 +2291,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/PullDelta" => {
                     #[allow(non_camel_case_types)]
                     struct PullDeltaSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::PullDeltaRequest> for PullDeltaSvc<T> {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::PullDeltaRequest>
+                    for PullDeltaSvc<T> {
                         type Response = super::PullDeltaResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::PullDeltaRequest>,
@@ -1867,16 +2337,23 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/AcquireLease" => {
                     #[allow(non_camel_case_types)]
                     struct AcquireLeaseSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::LeaseRequest> for AcquireLeaseSvc<T> {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::LeaseRequest>
+                    for AcquireLeaseSvc<T> {
                         type Response = super::LeaseResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::acquire_lease(&inner, request).await
+                                <T as FilerMetaService>::acquire_lease(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1907,19 +2384,23 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/ReleaseLease" => {
                     #[allow(non_camel_case_types)]
                     struct ReleaseLeaseSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService>
-                        tonic::server::UnaryService<super::LeaseReleaseRequest>
-                        for ReleaseLeaseSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::LeaseReleaseRequest>
+                    for ReleaseLeaseSvc<T> {
                         type Response = super::LeaseReleaseResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseReleaseRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::release_lease(&inner, request).await
+                                <T as FilerMetaService>::release_lease(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1950,11 +2431,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/RenewLease" => {
                     #[allow(non_camel_case_types)]
                     struct RenewLeaseSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::LeaseRenewRequest>
-                        for RenewLeaseSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::LeaseRenewRequest>
+                    for RenewLeaseSvc<T> {
                         type Response = super::LeaseRenewResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseRenewRequest>,
@@ -1992,18 +2477,23 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/SendRaftMessage" => {
                     #[allow(non_camel_case_types)]
                     struct SendRaftMessageSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::RaftMessageRequest>
-                        for SendRaftMessageSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::RaftMessageRequest>
+                    for SendRaftMessageSvc<T> {
                         type Response = super::RaftMessageResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RaftMessageRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::send_raft_message(&inner, request).await
+                                <T as FilerMetaService>::send_raft_message(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2034,19 +2524,23 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/GetShardStats" => {
                     #[allow(non_camel_case_types)]
                     struct GetShardStatsSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService>
-                        tonic::server::UnaryService<super::GetShardStatsRequest>
-                        for GetShardStatsSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::GetShardStatsRequest>
+                    for GetShardStatsSvc<T> {
                         type Response = super::GetShardStatsResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetShardStatsRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as FilerMetaService>::get_shard_stats(&inner, request).await
+                                <T as FilerMetaService>::get_shard_stats(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2077,11 +2571,15 @@ pub mod filer_meta_service_server {
                 "/powerfs.FilerMetaService/ListShards" => {
                     #[allow(non_camel_case_types)]
                     struct ListShardsSvc<T: FilerMetaService>(pub Arc<T>);
-                    impl<T: FilerMetaService> tonic::server::UnaryService<super::ListShardsRequest>
-                        for ListShardsSvc<T>
-                    {
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::ListShardsRequest>
+                    for ListShardsSvc<T> {
                         type Response = super::ListShardsResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ListShardsRequest>,
@@ -2116,14 +2614,115 @@ pub mod filer_meta_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => Box::pin(async move {
-                    Ok(http::Response::builder()
-                        .status(200)
-                        .header("grpc-status", "12")
-                        .header("content-type", "application/grpc")
-                        .body(empty_body())
-                        .unwrap())
-                }),
+                "/powerfs.FilerMetaService/AllocInodeBatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct AllocInodeBatchSvc<T: FilerMetaService>(pub Arc<T>);
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::AllocInodeBatchRequest>
+                    for AllocInodeBatchSvc<T> {
+                        type Response = super::AllocInodeBatchResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AllocInodeBatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as FilerMetaService>::alloc_inode_batch(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = AllocInodeBatchSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.FilerMetaService/UpdateInodeSizeChunks" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateInodeSizeChunksSvc<T: FilerMetaService>(pub Arc<T>);
+                    impl<
+                        T: FilerMetaService,
+                    > tonic::server::UnaryService<super::UpdateInodeSizeChunksRequest>
+                    for UpdateInodeSizeChunksSvc<T> {
+                        type Response = super::UpdateInodeSizeChunksResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateInodeSizeChunksRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as FilerMetaService>::update_inode_size_chunks(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = UpdateInodeSizeChunksSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        Ok(
+                            http::Response::builder()
+                                .status(200)
+                                .header("grpc-status", "12")
+                                .header("content-type", "application/grpc")
+                                .body(empty_body())
+                                .unwrap(),
+                        )
+                    })
+                }
             }
         }
     }
@@ -2163,48 +2762,81 @@ pub mod posix_meta_service_server {
         async fn get_entry(
             &self,
             request: tonic::Request<super::GetEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryResponse>,
+            tonic::Status,
+        >;
         async fn get_entry_by_inode(
             &self,
             request: tonic::Request<super::GetEntryByInodeRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetEntryByInodeResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetEntryByInodeResponse>,
+            tonic::Status,
+        >;
         async fn create_entry(
             &self,
             request: tonic::Request<super::CreateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateEntryResponse>,
+            tonic::Status,
+        >;
         async fn create_directory(
             &self,
             request: tonic::Request<super::CreateDirectoryRequest>,
-        ) -> std::result::Result<tonic::Response<super::CreateDirectoryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::CreateDirectoryResponse>,
+            tonic::Status,
+        >;
         async fn update_entry(
             &self,
             request: tonic::Request<super::UpdateEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::UpdateEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateEntryResponse>,
+            tonic::Status,
+        >;
         async fn delete_entry(
             &self,
             request: tonic::Request<super::DeleteEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::DeleteEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteEntryResponse>,
+            tonic::Status,
+        >;
         async fn rename_entry(
             &self,
             request: tonic::Request<super::RenameEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::RenameEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RenameEntryResponse>,
+            tonic::Status,
+        >;
         async fn list_entries(
             &self,
             request: tonic::Request<super::ListEntriesRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListEntriesResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ListEntriesResponse>,
+            tonic::Status,
+        >;
         async fn lookup_directory_entry(
             &self,
             request: tonic::Request<super::LookupDirectoryEntryRequest>,
-        ) -> std::result::Result<tonic::Response<super::LookupDirectoryEntryResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LookupDirectoryEntryResponse>,
+            tonic::Status,
+        >;
         /// Delta sync API
         async fn push_delta(
             &self,
             request: tonic::Request<super::PushDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PushDeltaResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::PushDeltaResponse>,
+            tonic::Status,
+        >;
         async fn pull_delta(
             &self,
             request: tonic::Request<super::PullDeltaRequest>,
-        ) -> std::result::Result<tonic::Response<super::PullDeltaResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::PullDeltaResponse>,
+            tonic::Status,
+        >;
         /// Lease management
         async fn acquire_lease(
             &self,
@@ -2213,24 +2845,55 @@ pub mod posix_meta_service_server {
         async fn release_lease(
             &self,
             request: tonic::Request<super::LeaseReleaseRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseReleaseResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseReleaseResponse>,
+            tonic::Status,
+        >;
         async fn renew_lease(
             &self,
             request: tonic::Request<super::LeaseRenewRequest>,
-        ) -> std::result::Result<tonic::Response<super::LeaseRenewResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::LeaseRenewResponse>,
+            tonic::Status,
+        >;
         /// Raft message exchange
         async fn send_raft_message(
             &self,
             request: tonic::Request<super::RaftMessageRequest>,
-        ) -> std::result::Result<tonic::Response<super::RaftMessageResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RaftMessageResponse>,
+            tonic::Status,
+        >;
         async fn get_shard_stats(
             &self,
             request: tonic::Request<super::GetShardStatsRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetShardStatsResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::GetShardStatsResponse>,
+            tonic::Status,
+        >;
         async fn list_shards(
             &self,
             request: tonic::Request<super::ListShardsRequest>,
-        ) -> std::result::Result<tonic::Response<super::ListShardsResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::ListShardsResponse>,
+            tonic::Status,
+        >;
+        /// Inode 批量授权
+        async fn alloc_inode_batch(
+            &self,
+            request: tonic::Request<super::AllocInodeBatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AllocInodeBatchResponse>,
+            tonic::Status,
+        >;
+        /// size/chunks 强一致更新
+        async fn update_inode_size_chunks(
+            &self,
+            request: tonic::Request<super::UpdateInodeSizeChunksRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateInodeSizeChunksResponse>,
+            tonic::Status,
+        >;
     }
     /// POSIX 元数据服务 (扁平路径，FUSE 使用)
     #[derive(Debug)]
@@ -2256,7 +2919,10 @@ pub mod posix_meta_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -2312,9 +2978,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/GetEntry" => {
                     #[allow(non_camel_case_types)]
                     struct GetEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::GetEntryRequest> for GetEntrySvc<T> {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::GetEntryRequest>
+                    for GetEntrySvc<T> {
                         type Response = super::GetEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetEntryRequest>,
@@ -2352,19 +3024,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/GetEntryByInode" => {
                     #[allow(non_camel_case_types)]
                     struct GetEntryByInodeSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService>
-                        tonic::server::UnaryService<super::GetEntryByInodeRequest>
-                        for GetEntryByInodeSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::GetEntryByInodeRequest>
+                    for GetEntryByInodeSvc<T> {
                         type Response = super::GetEntryByInodeResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetEntryByInodeRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::get_entry_by_inode(&inner, request).await
+                                <T as PosixMetaService>::get_entry_by_inode(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2395,11 +3071,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/CreateEntry" => {
                     #[allow(non_camel_case_types)]
                     struct CreateEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::CreateEntryRequest>
-                        for CreateEntrySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::CreateEntryRequest>
+                    for CreateEntrySvc<T> {
                         type Response = super::CreateEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::CreateEntryRequest>,
@@ -2437,19 +3117,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/CreateDirectory" => {
                     #[allow(non_camel_case_types)]
                     struct CreateDirectorySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService>
-                        tonic::server::UnaryService<super::CreateDirectoryRequest>
-                        for CreateDirectorySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::CreateDirectoryRequest>
+                    for CreateDirectorySvc<T> {
                         type Response = super::CreateDirectoryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::CreateDirectoryRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::create_directory(&inner, request).await
+                                <T as PosixMetaService>::create_directory(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2480,11 +3164,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/UpdateEntry" => {
                     #[allow(non_camel_case_types)]
                     struct UpdateEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::UpdateEntryRequest>
-                        for UpdateEntrySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::UpdateEntryRequest>
+                    for UpdateEntrySvc<T> {
                         type Response = super::UpdateEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::UpdateEntryRequest>,
@@ -2522,11 +3210,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/DeleteEntry" => {
                     #[allow(non_camel_case_types)]
                     struct DeleteEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::DeleteEntryRequest>
-                        for DeleteEntrySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::DeleteEntryRequest>
+                    for DeleteEntrySvc<T> {
                         type Response = super::DeleteEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::DeleteEntryRequest>,
@@ -2564,11 +3256,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/RenameEntry" => {
                     #[allow(non_camel_case_types)]
                     struct RenameEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::RenameEntryRequest>
-                        for RenameEntrySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::RenameEntryRequest>
+                    for RenameEntrySvc<T> {
                         type Response = super::RenameEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RenameEntryRequest>,
@@ -2606,11 +3302,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/ListEntries" => {
                     #[allow(non_camel_case_types)]
                     struct ListEntriesSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::ListEntriesRequest>
-                        for ListEntriesSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::ListEntriesRequest>
+                    for ListEntriesSvc<T> {
                         type Response = super::ListEntriesResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ListEntriesRequest>,
@@ -2648,19 +3348,25 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/LookupDirectoryEntry" => {
                     #[allow(non_camel_case_types)]
                     struct LookupDirectoryEntrySvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService>
-                        tonic::server::UnaryService<super::LookupDirectoryEntryRequest>
-                        for LookupDirectoryEntrySvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::LookupDirectoryEntryRequest>
+                    for LookupDirectoryEntrySvc<T> {
                         type Response = super::LookupDirectoryEntryResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LookupDirectoryEntryRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::lookup_directory_entry(&inner, request)
+                                <T as PosixMetaService>::lookup_directory_entry(
+                                        &inner,
+                                        request,
+                                    )
                                     .await
                             };
                             Box::pin(fut)
@@ -2692,9 +3398,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/PushDelta" => {
                     #[allow(non_camel_case_types)]
                     struct PushDeltaSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::PushDeltaRequest> for PushDeltaSvc<T> {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::PushDeltaRequest>
+                    for PushDeltaSvc<T> {
                         type Response = super::PushDeltaResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::PushDeltaRequest>,
@@ -2732,9 +3444,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/PullDelta" => {
                     #[allow(non_camel_case_types)]
                     struct PullDeltaSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::PullDeltaRequest> for PullDeltaSvc<T> {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::PullDeltaRequest>
+                    for PullDeltaSvc<T> {
                         type Response = super::PullDeltaResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::PullDeltaRequest>,
@@ -2772,16 +3490,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/AcquireLease" => {
                     #[allow(non_camel_case_types)]
                     struct AcquireLeaseSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::LeaseRequest> for AcquireLeaseSvc<T> {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::LeaseRequest>
+                    for AcquireLeaseSvc<T> {
                         type Response = super::LeaseResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::acquire_lease(&inner, request).await
+                                <T as PosixMetaService>::acquire_lease(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2812,19 +3537,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/ReleaseLease" => {
                     #[allow(non_camel_case_types)]
                     struct ReleaseLeaseSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService>
-                        tonic::server::UnaryService<super::LeaseReleaseRequest>
-                        for ReleaseLeaseSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::LeaseReleaseRequest>
+                    for ReleaseLeaseSvc<T> {
                         type Response = super::LeaseReleaseResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseReleaseRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::release_lease(&inner, request).await
+                                <T as PosixMetaService>::release_lease(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2855,11 +3584,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/RenewLease" => {
                     #[allow(non_camel_case_types)]
                     struct RenewLeaseSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::LeaseRenewRequest>
-                        for RenewLeaseSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::LeaseRenewRequest>
+                    for RenewLeaseSvc<T> {
                         type Response = super::LeaseRenewResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::LeaseRenewRequest>,
@@ -2897,18 +3630,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/SendRaftMessage" => {
                     #[allow(non_camel_case_types)]
                     struct SendRaftMessageSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::RaftMessageRequest>
-                        for SendRaftMessageSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::RaftMessageRequest>
+                    for SendRaftMessageSvc<T> {
                         type Response = super::RaftMessageResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RaftMessageRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::send_raft_message(&inner, request).await
+                                <T as PosixMetaService>::send_raft_message(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2939,19 +3677,23 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/GetShardStats" => {
                     #[allow(non_camel_case_types)]
                     struct GetShardStatsSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService>
-                        tonic::server::UnaryService<super::GetShardStatsRequest>
-                        for GetShardStatsSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::GetShardStatsRequest>
+                    for GetShardStatsSvc<T> {
                         type Response = super::GetShardStatsResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetShardStatsRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as PosixMetaService>::get_shard_stats(&inner, request).await
+                                <T as PosixMetaService>::get_shard_stats(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -2982,11 +3724,15 @@ pub mod posix_meta_service_server {
                 "/powerfs.PosixMetaService/ListShards" => {
                     #[allow(non_camel_case_types)]
                     struct ListShardsSvc<T: PosixMetaService>(pub Arc<T>);
-                    impl<T: PosixMetaService> tonic::server::UnaryService<super::ListShardsRequest>
-                        for ListShardsSvc<T>
-                    {
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::ListShardsRequest>
+                    for ListShardsSvc<T> {
                         type Response = super::ListShardsResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ListShardsRequest>,
@@ -3021,14 +3767,115 @@ pub mod posix_meta_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => Box::pin(async move {
-                    Ok(http::Response::builder()
-                        .status(200)
-                        .header("grpc-status", "12")
-                        .header("content-type", "application/grpc")
-                        .body(empty_body())
-                        .unwrap())
-                }),
+                "/powerfs.PosixMetaService/AllocInodeBatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct AllocInodeBatchSvc<T: PosixMetaService>(pub Arc<T>);
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::AllocInodeBatchRequest>
+                    for AllocInodeBatchSvc<T> {
+                        type Response = super::AllocInodeBatchResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AllocInodeBatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PosixMetaService>::alloc_inode_batch(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = AllocInodeBatchSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/powerfs.PosixMetaService/UpdateInodeSizeChunks" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateInodeSizeChunksSvc<T: PosixMetaService>(pub Arc<T>);
+                    impl<
+                        T: PosixMetaService,
+                    > tonic::server::UnaryService<super::UpdateInodeSizeChunksRequest>
+                    for UpdateInodeSizeChunksSvc<T> {
+                        type Response = super::UpdateInodeSizeChunksResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateInodeSizeChunksRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PosixMetaService>::update_inode_size_chunks(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = UpdateInodeSizeChunksSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        Ok(
+                            http::Response::builder()
+                                .status(200)
+                                .header("grpc-status", "12")
+                                .header("content-type", "application/grpc")
+                                .body(empty_body())
+                                .unwrap(),
+                        )
+                    })
+                }
             }
         }
     }

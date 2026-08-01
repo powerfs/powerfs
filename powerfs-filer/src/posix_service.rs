@@ -9,15 +9,17 @@ use crate::shard_strategy::ShardStrategy;
 
 use super::powerfs::posix_meta_service_server::PosixMetaService;
 use super::powerfs::{
-    CreateDirectoryRequest, CreateDirectoryResponse, CreateEntryRequest, CreateEntryResponse,
-    DeleteEntryRequest, DeleteEntryResponse, Entry as ProtoEntry, FileChunk as ProtoFileChunk,
-    FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
-    GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse, LeaseReleaseRequest,
-    LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse,
-    ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
-    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
-    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
-    RenameEntryRequest, RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
+    AllocInodeBatchRequest, AllocInodeBatchResponse, CreateDirectoryRequest,
+    CreateDirectoryResponse, CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest,
+    DeleteEntryResponse, Entry as ProtoEntry, FileChunk as ProtoFileChunk, FuseAttributes,
+    GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse,
+    GetShardStatsRequest, GetShardStatsResponse, LeaseReleaseRequest, LeaseReleaseResponse,
+    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest,
+    ListEntriesResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
+    LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
+    PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RenameEntryRequest,
+    RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
+    UpdateInodeSizeChunksResponse,
 };
 
 const S_IFDIR: u32 = 0o170000;
@@ -637,6 +639,113 @@ impl PosixMetaService for PosixMetaServiceImpl {
                 error: e,
                 deltas: vec![],
                 server_vclock: None,
+            })),
+        }
+    }
+
+    async fn alloc_inode_batch(
+        &self,
+        request: Request<AllocInodeBatchRequest>,
+    ) -> Result<Response<AllocInodeBatchResponse>, Status> {
+        let req = request.into_inner();
+        let shard_id = ShardId(req.shard_id);
+
+        match self
+            .meta_shard_manager
+            .get_shard_leader_status(shard_id)
+            .await
+        {
+            Some((true, _)) => {}
+            Some((false, leader_addr)) => {
+                return Ok(Response::new(AllocInodeBatchResponse {
+                    success: false,
+                    error: format!("not leader; redirect to {}", leader_addr),
+                    start_inode: 0,
+                    end_inode: 0,
+                }));
+            }
+            None => {
+                return Ok(Response::new(AllocInodeBatchResponse {
+                    success: false,
+                    error: format!("shard {} leader status unknown", shard_id.0),
+                    start_inode: 0,
+                    end_inode: 0,
+                }));
+            }
+        }
+
+        match self
+            .meta_shard_manager
+            .alloc_inode_batch(shard_id, req.count)
+            .await
+        {
+            Ok((start, end)) => Ok(Response::new(AllocInodeBatchResponse {
+                success: true,
+                error: "".to_string(),
+                start_inode: start,
+                end_inode: end,
+            })),
+            Err(e) => Ok(Response::new(AllocInodeBatchResponse {
+                success: false,
+                error: e,
+                start_inode: 0,
+                end_inode: 0,
+            })),
+        }
+    }
+
+    async fn update_inode_size_chunks(
+        &self,
+        request: Request<UpdateInodeSizeChunksRequest>,
+    ) -> Result<Response<UpdateInodeSizeChunksResponse>, Status> {
+        let req = request.into_inner();
+        let shard_id = ShardId(req.shard_id);
+
+        match self
+            .meta_shard_manager
+            .get_shard_leader_status(shard_id)
+            .await
+        {
+            Some((true, _)) => {}
+            Some((false, leader_addr)) => {
+                return Ok(Response::new(UpdateInodeSizeChunksResponse {
+                    success: false,
+                    error: format!("not leader; redirect to {}", leader_addr),
+                }));
+            }
+            None => {
+                return Ok(Response::new(UpdateInodeSizeChunksResponse {
+                    success: false,
+                    error: format!("shard {} leader status unknown", shard_id.0),
+                }));
+            }
+        }
+
+        let chunks: Vec<crate::shard_store::StoredFileChunk> = req
+            .chunks
+            .into_iter()
+            .map(|c| crate::shard_store::StoredFileChunk {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                fid: c.fid,
+                cookie: c.cookie,
+                crc32: c.crc32,
+            })
+            .collect();
+
+        match self
+            .meta_shard_manager
+            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks)
+            .await
+        {
+            Ok(_) => Ok(Response::new(UpdateInodeSizeChunksResponse {
+                success: true,
+                error: "".to_string(),
+            })),
+            Err(e) => Ok(Response::new(UpdateInodeSizeChunksResponse {
+                success: false,
+                error: e,
             })),
         }
     }

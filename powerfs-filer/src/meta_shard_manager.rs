@@ -1563,6 +1563,37 @@ impl MetaShardManager {
             .await
     }
 
+    /// 批量分配 inode 区间（leader 单点 + CF_METADATA 持久化，§4 1.4）。
+    /// fuse 在区间内本地分配，写路径零等待。
+    pub async fn alloc_inode_batch(
+        &self,
+        shard_id: ShardId,
+        count: u32,
+    ) -> Result<(u64, u64), String> {
+        let stores = self.shard_stores.read().unwrap();
+        let store = stores
+            .get(&shard_id)
+            .cloned()
+            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+        store.alloc_inode_batch(count)
+    }
+
+    /// 强一致更新 inode 的 size + chunks（close sync 账本，§4 1.5 / §5.1 lease 协调）。
+    pub async fn update_inode_size_chunks_atomic(
+        &self,
+        shard_id: ShardId,
+        inode: u64,
+        size: u64,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+    ) -> Result<(), String> {
+        let stores = self.shard_stores.read().unwrap();
+        let store = stores
+            .get(&shard_id)
+            .cloned()
+            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+        store.update_inode_size_chunks_atomic(inode, size, chunks)
+    }
+
     pub async fn get_filer_status(&self) -> FilerStatus {
         let details = self.list_shards_detail().await;
         let leader_count = details.iter().filter(|d| d.is_leader).count() as u64;
@@ -1863,12 +1894,7 @@ impl MetaShardManager {
                     nlink: 1,
                     version: 0,
                 };
-                store.create_inode(inode_info)?;
-                store.add_dir_entry(
-                    entry_orset.parent_ino,
-                    &entry_orset.name,
-                    entry_orset.inode,
-                )?;
+                store.create_inode_atomic(inode_info, entry_orset.parent_ino, &entry_orset.name)?;
                 debug!(
                     "Applied Add delta: {}/{} inode={}",
                     entry_orset.parent_ino, entry_orset.name, entry_orset.inode
@@ -1877,8 +1903,7 @@ impl MetaShardManager {
             Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
                 if let Some(inode_info) = store.lookup(entry_id.parent_ino, &entry_id.name) {
                     let inode = inode_info.inode;
-                    store.remove_dir_entry(entry_id.parent_ino, &entry_id.name)?;
-                    store.delete_inode(inode)?;
+                    store.remove_inode_atomic(inode, entry_id.parent_ino, &entry_id.name)?;
                     debug!(
                         "Applied Remove delta: {}/{} inode={}",
                         entry_id.parent_ino, entry_id.name, inode
@@ -1890,8 +1915,13 @@ impl MetaShardManager {
                     store.lookup(rename_op.old_parent_ino, &rename_op.old_name)
                 {
                     let inode = inode_info.inode;
-                    store.remove_dir_entry(rename_op.old_parent_ino, &rename_op.old_name)?;
-                    store.add_dir_entry(rename_op.new_parent_ino, &rename_op.new_name, inode)?;
+                    store.rename_dir_entry_atomic(
+                        rename_op.old_parent_ino,
+                        &rename_op.old_name,
+                        rename_op.new_parent_ino,
+                        &rename_op.new_name,
+                        inode,
+                    )?;
                     debug!(
                         "Applied Rename delta: {}/{} -> {}/{}",
                         rename_op.old_parent_ino,
