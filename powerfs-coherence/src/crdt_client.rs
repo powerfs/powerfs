@@ -499,36 +499,42 @@ impl CrdtReplicaCoherence {
 
     /// 本地删除条目（Phase 3.3 写路径用）。
     ///
-    /// 按 name 查找本地副本中的 EntryId → orset.remove → 缓冲 delta。
-    /// 返回被删除条目的 inode（供调用方清理 MetadataCache / 删数据）。
+    /// 按 name 查找本地副本中所有同名 EntryId → 逐个 orset.remove → 缓冲 delta。
+    /// 文件系统语义要求删除一个名字时清除所有同名条目（OR-Set 可能有多个同名
+    /// EntryId，例如跨客户端重复 Add 或删除后重建）。仅删除一个会导致
+    /// list_entries 仍返回该名字，rmdir 报 ENOTEMPTY、cp 报 EEXIST。
+    /// 返回被删除条目的 inode（同名条目共享同一 inode）。
     pub fn local_remove_entry(&self, dir_ino: u64, name: &str) -> Result<u64, String> {
         let arc = self
             .dir_cache
             .get(dir_ino)
             .ok_or_else(|| format!("no local replica for dir {}", dir_ino))?;
-        let (inode, delta) = {
+        let (inode, deltas) = {
             let orset_read = arc.read().unwrap();
-            let entry = orset_read
-                .get_by_name(name)
-                .into_iter()
-                .next()
-                .ok_or_else(|| format!("entry '{}' not found in dir {}", name, dir_ino))?;
-            let id = entry.id.clone();
-            let inode = entry.inode;
+            let entries = orset_read.get_by_name(name);
+            if entries.is_empty() {
+                return Err(format!("entry '{}' not found in dir {}", name, dir_ino));
+            }
+            let ids: Vec<_> = entries.iter().map(|e| e.id.clone()).collect();
+            let inode = entries[0].inode;
             drop(orset_read);
 
             let mut orset = arc.write().unwrap();
-            orset.remove(&id); // 递增 vclock + 追加 delta 到 delta_log
-            let delta = orset
-                .delta_log
-                .pop()
-                .ok_or_else(|| "delta_log empty after remove".to_string())?;
-            (inode, delta)
+            let mut deltas = Vec::with_capacity(ids.len());
+            for id in &ids {
+                orset.remove(id); // 递增 vclock + 追加 delta 到 delta_log
+                if let Some(d) = orset.delta_log.pop() {
+                    deltas.push(d);
+                }
+            }
+            (inode, deltas)
         };
-        self.change_cache.push(dir_ino, delta).map_err(|e| {
-            log::warn!("ChangeCache backpressure for dir {}: {}", dir_ino, e);
-            e
-        })?;
+        for delta in deltas {
+            self.change_cache.push(dir_ino, delta).map_err(|e| {
+                log::warn!("ChangeCache backpressure for dir {}: {}", dir_ino, e);
+                e
+            })?;
+        }
         log::info!(
             "local_remove_entry: dir {} name '{}' inode {} delta buffered (change_cache total={})",
             dir_ino,
@@ -1020,24 +1026,31 @@ fn apply_remote_delta(orset: &mut DirORSet, delta: &DeltaOp) -> Option<u64> {
             }
         }
         DeltaOp::Remove { id, vclock } => {
-            // 幂等：entries.remove 仅在 key 存在时返回 Some，重复 Remove 返回 None。
-            // 注意：filer 返回的 Remove delta 中 EntryIdWire 的 client_id/seq 可能为 0
-            // （proto EntryId 不携带这些字段），精确匹配可能失败。
-            // 此时按 name 模糊匹配，确保跨客户端删除能正确同步。
-            let ino = orset.entries.remove(id).map(|e| e.inode);
-            let ino = if let Some(ino) = ino {
-                Some(ino)
-            } else {
-                let key_to_remove = orset.entries.keys().find(|k| k.name == id.name).cloned();
-                if let Some(k) = key_to_remove {
-                    orset.entries.remove(&k).map(|e| e.inode)
-                } else {
-                    None
+            // 文件系统语义：删除一个名字时清除所有同名 EntryId（OR-Set 可能有
+            // 多个同名 EntryId）。仅删除一个会导致 list_entries 仍返回该名字，
+            // rmdir 报 ENOTEMPTY、cp 报 EEXIST。
+            // 先尝试精确匹配删除，再按 name 删除所有剩余同名条目。
+            let mut removed_inodes: Vec<u64> = Vec::new();
+            if let Some(e) = orset.entries.remove(id) {
+                removed_inodes.push(e.inode);
+            }
+            // 按 name 删除所有剩余同名条目
+            let keys_to_remove: Vec<_> = orset
+                .entries
+                .keys()
+                .filter(|k| k.name == id.name)
+                .cloned()
+                .collect();
+            for k in keys_to_remove {
+                orset.tombstones.insert(k.clone());
+                if let Some(e) = orset.entries.remove(&k) {
+                    removed_inodes.push(e.inode);
                 }
-            };
+            }
             orset.tombstones.insert(id.clone());
             orset.vclock.merge(vclock);
-            ino
+            // 返回第一个被删除的 inode（用于联动失效 MetadataCache）
+            removed_inodes.into_iter().next()
         }
         DeltaOp::Rename {
             old_id,
