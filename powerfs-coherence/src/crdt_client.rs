@@ -369,16 +369,23 @@ impl CrdtReplicaCoherence {
             .map(|e| (e.inode, e.file_type.is_dir()))
     }
 
-    /// 列出目录所有条目（readdir 路径用）
+    /// 列出目录所有条目（readdir 路径用）。
+    ///
+    /// DirORSet 是 OR-Set，同一 name 可能有多个 EntryId（不同 client_id/seq），
+    /// 例如跨客户端重复 Add 或删除后重建。文件系统语义要求每个 name 只出现一次，
+    /// 因此按 name 去重，保留第一个匹配条目。
     pub fn list_entries(&self, dir_ino: u64) -> Vec<(u64, String, bool)> {
         let arc = match self.dir_cache.get(dir_ino) {
             Some(a) => a,
             None => return vec![],
         };
         let orset = arc.read().unwrap();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(orset.entries.len());
         orset
             .entries
             .values()
+            .filter(|e| seen.insert(e.id.name.clone()))
             .map(|e| (e.inode, e.id.name.clone(), e.file_type.is_dir()))
             .collect()
     }
