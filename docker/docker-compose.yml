@@ -380,6 +380,7 @@ services:
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: fuse-1
+    hostname: fuse-1
     cpus: '1.0'
     mem_limit: 512m
     init: true
@@ -417,6 +418,7 @@ services:
       dockerfile: docker/Dockerfile
     image: powerfs:latest
     container_name: fuse-2
+    hostname: fuse-2
     cpus: '1.0'
     mem_limit: 512m
     init: true
