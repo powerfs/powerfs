@@ -718,8 +718,8 @@ pub fn encode_rename_req(
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::ParentIno, old_parent_ino);
     enc.add_string(FieldId::Name, old_name)?;
-    enc.add_u64(FieldId::Ino, new_parent_ino); // reuse Ino for new parent
-    enc.add_string(FieldId::SymlinkTarget, new_name)?; // reuse SymlinkTarget for new name
+    enc.add_u64(FieldId::NewParentIno, new_parent_ino);
+    enc.add_string(FieldId::NewName, new_name)?;
     Ok(enc.into_bytes())
 }
 
@@ -735,8 +735,8 @@ pub fn decode_rename_req(body: &[u8]) -> Result<(u64, String, u64, String), NetE
         match field {
             FieldId::ParentIno => old_parent_ino = dec.read_u64(length)?,
             FieldId::Name => old_name = dec.read_string(length)?.to_string(),
-            FieldId::Ino => new_parent_ino = dec.read_u64(length)?,
-            FieldId::SymlinkTarget => new_name = dec.read_string(length)?.to_string(),
+            FieldId::NewParentIno => new_parent_ino = dec.read_u64(length)?,
+            FieldId::NewName => new_name = dec.read_string(length)?.to_string(),
             _ => dec.skip(length)?,
         }
     }
@@ -1067,6 +1067,148 @@ pub fn decode_readdir_resp(body: &[u8]) -> Result<Vec<DirEntry>, NetError> {
     }
 
     Ok(entries)
+}
+
+// ============================================================================
+// Mkdir / Unlink / Rmdir request encode/decode
+// ============================================================================
+
+/// Encode a mkdir request
+/// Filer expects: ParentIno(u64) / Name(string) / Mode(u64) / Uid(u64) / Gid(u64)
+pub fn encode_mkdir_req(
+    parent_ino: u64,
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Mode, mode as u64);
+    enc.add_u64(FieldId::Uid, uid as u64);
+    enc.add_u64(FieldId::Gid, gid as u64);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a mkdir request (server side)
+pub fn decode_mkdir_req(body: &[u8]) -> Result<(u64, String, u32, u32, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let mode = dec.next_u64(FieldId::Mode)? as u32;
+    let uid = dec.next_u64(FieldId::Uid)? as u32;
+    let gid = dec.next_u64(FieldId::Gid)? as u32;
+    Ok((parent_ino, name, mode, uid, gid))
+}
+
+/// Encode an unlink request
+/// Filer expects: ParentIno(u64) / Name(string)
+pub fn encode_unlink_req(parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode an unlink request (server side)
+pub fn decode_unlink_req(body: &[u8]) -> Result<(u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    Ok((parent_ino, name))
+}
+
+/// Encode an rmdir request
+/// Filer expects: ParentIno(u64) / Name(string)
+pub fn encode_rmdir_req(parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode an rmdir request (server side)
+pub fn decode_rmdir_req(body: &[u8]) -> Result<(u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    Ok((parent_ino, name))
+}
+
+// ============================================================================
+// Common attr response decode (shared by lookup/getattr/mkdir/create/symlink/link/rename)
+// ============================================================================
+
+/// Common attr response fields
+#[derive(Debug, Clone, Default)]
+pub struct AttrResponse {
+    pub ino: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub nlink: u32,
+    pub mtime: u64,
+    pub atime: u64,
+    pub ctime: u64,
+    pub name: String,
+    pub rdev: u64,
+}
+
+/// Decode a common attr response (lookup/getattr return TLV)
+/// Field order: Ino / Mode / Uid / Gid / Size / Nlink / Mtime / Atime / Ctime / Name / ...
+/// Some fields may be missing (mkdir response only has Ino/Mode/Name); they stay at default.
+pub fn decode_attr_resp(body: &[u8]) -> Result<AttrResponse, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut resp = AttrResponse::default();
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Ino => resp.ino = dec.read_u64(length)?,
+            FieldId::Mode => resp.mode = dec.read_u32(length)?,
+            FieldId::Uid => resp.uid = dec.read_u32(length)?,
+            FieldId::Gid => resp.gid = dec.read_u32(length)?,
+            FieldId::Size => resp.size = dec.read_u64(length)?,
+            FieldId::Nlink => resp.nlink = dec.read_u32(length)?,
+            FieldId::Mtime => resp.mtime = dec.read_u64(length)?,
+            FieldId::Atime => resp.atime = dec.read_u64(length)?,
+            FieldId::Ctime => resp.ctime = dec.read_u64(length)?,
+            FieldId::Name => resp.name = dec.read_string(length)?.to_string(),
+            FieldId::Rdev => resp.rdev = dec.read_u64(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok(resp)
+}
+
+/// Encode a statfs request (empty body, shard_id in routing)
+pub fn encode_statfs_req() -> Result<Vec<u8>, NetError> {
+    Ok(Vec::new())
+}
+
+/// Decode a statfs response
+pub fn decode_statfs_resp(body: &[u8]) -> Result<(u64, u64, u64, u64, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut total = 0u64;
+    let mut free = 0u64;
+    let mut total_inodes = 0u64;
+    let mut free_inodes = 0u64;
+    let mut block_size = 4096u32;
+
+    while let Some((field, length)) = dec.next_field() {
+        match field {
+            FieldId::Size => total = dec.read_u64(length)?,
+            FieldId::Free => free = dec.read_u64(length)?,
+            FieldId::Nlink => total_inodes = dec.read_u64(length)?,
+            FieldId::FreeInodes => free_inodes = dec.read_u64(length)?,
+            FieldId::BlockSize => block_size = dec.read_u32(length)?,
+            _ => dec.skip(length)?,
+        }
+    }
+
+    Ok((total, free, total_inodes, free_inodes, block_size))
 }
 
 #[cfg(test)]

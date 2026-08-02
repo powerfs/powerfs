@@ -1145,6 +1145,317 @@ impl powerfs_coherence::DeltaSyncChannel for MetaShardClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MetadataClient trait implementation: strong-consistency metadata operations
+// ---------------------------------------------------------------------------
+
+use crate::metadata_client::{
+    MetadataAttr, MetadataClient, MetadataDirEntry, MetadataStatfs, SetattrParams,
+};
+use powerfs_common::error::{PowerFsError, Result as FsResult};
+use powerfs_net::serialize;
+use powerfs_net::MsgType;
+use std::future::Future;
+use std::pin::Pin;
+
+fn map_err<E: std::fmt::Display>(e: E) -> PowerFsError {
+    PowerFsError::Internal(e.to_string())
+}
+
+fn file_type_from_mode(mode: u32) -> u8 {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::DT_DIR,
+        libc::S_IFLNK => libc::DT_LNK,
+        libc::S_IFIFO => libc::DT_FIFO,
+        libc::S_IFCHR => libc::DT_CHR,
+        libc::S_IFBLK => libc::DT_BLK,
+        libc::S_IFSOCK => libc::DT_SOCK,
+        _ => libc::DT_REG,
+    }
+}
+
+fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
+    MetadataAttr {
+        inode: resp.ino,
+        mode: resp.mode,
+        uid: resp.uid,
+        gid: resp.gid,
+        size: resp.size,
+        mtime: resp.mtime,
+        atime: resp.atime,
+        ctime: resp.ctime,
+        nlink: resp.nlink,
+        rdev: resp.rdev,
+        file_type: file_type_from_mode(resp.mode),
+        symlink_target: None,
+    }
+}
+
+impl MetadataClient for MetaShardClient {
+    fn lookup(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let body = serialize::encode_lookup_req(parent_ino, &name).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Lookup, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn mkdir(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let body =
+                serialize::encode_mkdir_req(parent_ino, &name, mode, uid, gid).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Mkdir, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn create(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let body =
+                serialize::encode_create_req(parent_ino, &name, mode, uid, gid).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Create, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn unlink(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<()>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let body = serialize::encode_unlink_req(parent_ino, &name).map_err(map_err)?;
+            self.send_coherence_msg(MsgType::Unlink, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            Ok(())
+        })
+    }
+
+    fn rmdir(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<()>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let body = serialize::encode_rmdir_req(parent_ino, &name).map_err(map_err)?;
+            self.send_coherence_msg(MsgType::Rmdir, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            Ok(())
+        })
+    }
+
+    fn rename(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        new_parent_ino: u64,
+        new_name: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let name = name.to_string();
+        let new_name = new_name.to_string();
+        Box::pin(async move {
+            let body = serialize::encode_rename_req(parent_ino, &name, new_parent_ino, &new_name)
+                .map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Rename, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn symlink(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let name = name.to_string();
+        let target = target.to_string();
+        Box::pin(async move {
+            let body =
+                serialize::encode_symlink_req(parent_ino, &name, &target).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Symlink, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn readlink(
+        &self,
+        ino: u64,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<String>> + Send + '_>> {
+        Box::pin(async move {
+            let body = serialize::encode_readlink_req(ino).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Readlink, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let target = serialize::decode_readlink_resp(&resp).map_err(map_err)?;
+            Ok(target)
+        })
+    }
+
+    fn link(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &str,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let new_name = new_name.to_string();
+        Box::pin(async move {
+            let body =
+                serialize::encode_link_req(ino, new_parent_ino, &new_name).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::Link, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn readdir(
+        &self,
+        ino: u64,
+        offset: u64,
+        count: u32,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<Vec<MetadataDirEntry>>> + Send + '_>> {
+        Box::pin(async move {
+            let body = serialize::encode_readdir_req(ino, offset, count).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::ReadDir, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let entries = serialize::decode_readdir_resp(&resp).map_err(map_err)?;
+            let result = entries
+                .into_iter()
+                .map(|e| MetadataDirEntry {
+                    inode: e.ino,
+                    name: e.name,
+                    file_type: file_type_from_mode(e.mode),
+                    offset: e.offset,
+                })
+                .collect();
+            Ok(result)
+        })
+    }
+
+    fn getattr(
+        &self,
+        ino: u64,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        Box::pin(async move {
+            let body = serialize::encode_getattr_req(ino).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::GetAttr, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn setattr(
+        &self,
+        ino: u64,
+        params: &SetattrParams,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
+        let params = params.clone();
+        Box::pin(async move {
+            let body = serialize::encode_setattr_req(
+                ino,
+                params.mode,
+                params.uid,
+                params.gid,
+                params.size,
+            )
+            .map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::SetAttr, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+            Ok(attr_from_resp(attr_resp))
+        })
+    }
+
+    fn statfs(
+        &self,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<MetadataStatfs>> + Send + '_>> {
+        Box::pin(async move {
+            let body = serialize::encode_statfs_req().map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::StatFs, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let (total, free, total_inodes, free_inodes, block_size) =
+                serialize::decode_statfs_resp(&resp).map_err(map_err)?;
+            Ok(MetadataStatfs {
+                total_bytes: total,
+                free_bytes: free,
+                total_inodes,
+                free_inodes,
+                block_size,
+            })
+        })
+    }
+}
+
 // ---- 自由函数版本（供后台处理器使用） ----
 
 /// 处理队列中所有可用的请求，返回是否处理了至少一个

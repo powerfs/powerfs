@@ -523,6 +523,11 @@ pub enum FieldId {
     Backend = 0x18,
     Version = 0x19,
 
+    // Statfs fields
+    Free = 0x1A,
+    FreeInodes = 0x1B,
+    BlockSize = 0x1C,
+
     // List fields
     Limit = 0x20,
     LastName = 0x21,
@@ -605,6 +610,9 @@ impl FieldId {
             0x17 => Some(Self::Owner),
             0x18 => Some(Self::Backend),
             0x19 => Some(Self::Version),
+            0x1A => Some(Self::Free),
+            0x1B => Some(Self::FreeInodes),
+            0x1C => Some(Self::BlockSize),
             0x20 => Some(Self::Limit),
             0x21 => Some(Self::LastName),
             0x22 => Some(Self::HasMore),

@@ -4,6 +4,7 @@ pub mod client_identity;
 pub mod error;
 pub mod fuse_client_facade;
 pub mod meta_shard_client;
+pub mod metadata_client;
 pub mod orset;
 pub mod provider_adapter;
 pub mod request_id;

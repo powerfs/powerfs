@@ -27,6 +27,7 @@ pub mod request_context;
 pub mod serialize;
 pub mod server;
 pub mod server_connection;
+pub mod transport;
 
 pub use admin_server::{AdminServer, AdminServerConfig};
 
