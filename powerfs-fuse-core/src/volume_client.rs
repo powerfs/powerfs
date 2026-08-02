@@ -896,6 +896,127 @@ impl VolumeClient {
         }
     }
 
+    /// 异步批量获取 Lease: 一次 RPC 获取多个 stripe range 的 lease。
+    ///
+    /// P2-1: 服务端在单个锁范围内完成所有冲突检查 + 授权（all-or-nothing）。
+    /// 适用于大文件跨多个非连续 stripe 的写入场景，避免逐个 acquire 导致的
+    /// 部分获取死锁和多次 RPC 往返。
+    ///
+    /// `stripe_specs` 为 (stripe_start, stripe_count) 列表。
+    /// 返回 (token, epoch) 列表，顺序与输入一致。
+    pub async fn acquire_lease_batch(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_specs: &[(u64, u64)],
+        client_id: &str,
+        exclusive: bool,
+        duration_ms: u64,
+    ) -> ClientResult<Vec<(String, u64)>> {
+        if stripe_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let volume = self
+            .volume_router
+            .get(&volume_id)
+            .map(|v| v.clone())
+            .ok_or(ClientError::VolumeNotFound(volume_id))?;
+
+        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+
+        // Encode specs blob: each spec is 16 bytes (stripe_start + stripe_count, both u64 LE)
+        let mut specs_blob = Vec::with_capacity(stripe_specs.len() * 16);
+        for (start, count) in stripe_specs {
+            specs_blob.extend_from_slice(&start.to_le_bytes());
+            specs_blob.extend_from_slice(&count.to_le_bytes());
+        }
+
+        let mut enc = powerfs_net::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_string(FieldId::ClientId, client_id)?;
+        enc.add_u64(FieldId::Mode, if exclusive { 1 } else { 0 });
+        enc.add_u64(FieldId::LeaseDuration, duration_ms);
+        enc.add_bytes(FieldId::LeaseBatchSpecs, &specs_blob)?;
+
+        let result = vol_client
+            .send_request(
+                powerfs_net::MsgType::AcquireLeaseBatch,
+                &enc.into_bytes(),
+                &[],
+            )
+            .await;
+
+        match result {
+            Ok(resp) if resp.is_ok() => {
+                let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp.body);
+                let count = dec.next_u32(FieldId::Count).unwrap_or(0) as usize;
+                let blob = dec.next_bytes(FieldId::LeaseBatchSpecs).unwrap_or_default();
+
+                let mut tokens = Vec::with_capacity(count);
+                let mut offset = 0;
+                for _ in 0..count {
+                    if offset + 4 > blob.len() {
+                        break;
+                    }
+                    let token_len =
+                        u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if offset + token_len + 8 > blob.len() {
+                        break;
+                    }
+                    let token =
+                        String::from_utf8_lossy(&blob[offset..offset + token_len]).to_string();
+                    offset += token_len;
+                    let epoch = u64::from_le_bytes(blob[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    tokens.push((token, epoch));
+                }
+
+                if tokens.len() != count {
+                    return Err(ClientError::Internal(format!(
+                        "AcquireLeaseBatch response decode mismatch: expected {} tokens, got {}",
+                        count,
+                        tokens.len()
+                    )));
+                }
+
+                // Cache the first token for the (volume_id, inode) pair so
+                // that ensure_lease / get_valid_lease_token can find it.
+                // Subsequent tokens are returned to the caller for direct use.
+                if let Some((first_token, _)) = tokens.first() {
+                    self.update_lease(
+                        volume_id,
+                        inode,
+                        first_token.clone(),
+                        Duration::from_millis(duration_ms),
+                    );
+                }
+
+                log::debug!(
+                    "acquire_lease_batch: volume={}, inode={}, acquired {} leases",
+                    volume_id,
+                    inode,
+                    tokens.len()
+                );
+                Ok(tokens)
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "acquire_lease_batch: server error for volume={}, inode={}, status={}",
+                    volume_id,
+                    inode,
+                    resp.header.status
+                );
+                Err(ClientError::Server(format!(
+                    "AcquireLeaseBatch failed: status={}",
+                    resp.header.status
+                )))
+            }
+            Err(e) => Err(ClientError::from_net_error(e)),
+        }
+    }
+
     /// 异步释放 Lease: 直接构建 TLV 请求发送到 Volume Server
     ///
     /// token 由调用方传入（LeaseGuard 持有的 token 或 leases 表中查到的 token），

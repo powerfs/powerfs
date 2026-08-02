@@ -228,6 +228,51 @@ impl RangeLeaseManager {
         Ok(entry_to_range_lease(&entry, stripe_size))
     }
 
+    /// Atomically acquire leases for multiple stripe ranges.
+    ///
+    /// All-or-nothing: if any stripe range conflicts with an existing lease
+    /// held by a different client, the entire batch fails and no leases are
+    /// granted. This prevents partial acquisition deadlocks when multiple
+    /// non-contiguous stripes need leases simultaneously.
+    ///
+    /// `stripe_specs` is a list of (stripe_start, stripe_count) tuples.
+    /// Returns one `RangeLease` per spec, in the same order.
+    pub fn acquire_batch(
+        &self,
+        inode: u64,
+        stripe_specs: &[(u64, u64)],
+        client_id: &str,
+        duration_ms: u64,
+        exclusive: bool,
+        stripe_size: u64,
+    ) -> Result<Vec<RangeLease>, String> {
+        let stripe_size = if stripe_size > 0 {
+            stripe_size
+        } else {
+            self.default_stripe_size
+        };
+        let mode = if exclusive {
+            LeaseMode::Exclusive
+        } else {
+            LeaseMode::Shared
+        };
+
+        let keys: Vec<StripeKey> = stripe_specs
+            .iter()
+            .map(|(start, count)| StripeKey::new(inode, *start, *count))
+            .collect();
+
+        let entries = self
+            .store
+            .acquire_batch(&keys, client_id, mode, Duration::from_millis(duration_ms))
+            .map_err(|e| e.to_string())?;
+
+        Ok(entries
+            .iter()
+            .map(|e| entry_to_range_lease(e, stripe_size))
+            .collect())
+    }
+
     pub fn renew(&self, token: &str, holder: &str, duration_ms: u64) -> Result<(), String> {
         self.store
             .renew(token, holder, Duration::from_millis(duration_ms))

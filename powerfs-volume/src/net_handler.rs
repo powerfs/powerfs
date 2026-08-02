@@ -568,6 +568,91 @@ impl VolumeNetHandler {
         }
     }
 
+    fn handle_acquire_lease_batch(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let exclusive = dec.next_u64(FieldId::Mode).unwrap_or(0) != 0;
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+        let specs_blob = dec.next_bytes(FieldId::LeaseBatchSpecs).unwrap_or_default();
+
+        // Decode specs: each spec is 16 bytes (stripe_start: u64 LE + stripe_count: u64 LE)
+        if specs_blob.len() % 16 != 0 {
+            warn!(
+                "NET_ACQUIRE_LEASE_BATCH: malformed specs blob len={} (not multiple of 16)",
+                specs_blob.len()
+            );
+            let mut enc = TlvEncoder::new();
+            enc.add_string(FieldId::Owner, "malformed specs blob")?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        let mut stripe_specs: Vec<(u64, u64)> = Vec::with_capacity(specs_blob.len() / 16);
+        for chunk in specs_blob.chunks_exact(16) {
+            let start = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let count = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            stripe_specs.push((start, count));
+        }
+
+        info!(
+            "NET_ACQUIRE_LEASE_BATCH: inode={}, specs={}, client={}, exclusive={}",
+            inode,
+            stripe_specs.len(),
+            client_id,
+            exclusive
+        );
+
+        match self.volume_server.range_lease_mgr.acquire_batch(
+            inode,
+            &stripe_specs,
+            &client_id,
+            duration_ms,
+            exclusive,
+            64 * 1024 * 1024,
+        ) {
+            Ok(leases) => {
+                // Encode response: Count + flat blob of (token_len: u32 LE + token_bytes + epoch: u64 LE)
+                let mut enc = TlvEncoder::new();
+                enc.add_u32(FieldId::Count, leases.len() as u32);
+
+                let mut blob = Vec::new();
+                for lease in &leases {
+                    let token_bytes = lease.token.as_bytes();
+                    blob.extend_from_slice(&(token_bytes.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(token_bytes);
+                    blob.extend_from_slice(&lease.epoch.to_le_bytes());
+                }
+                enc.add_bytes(FieldId::LeaseBatchSpecs, &blob)?;
+
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                warn!("NET_ACQUIRE_LEASE_BATCH failed: {}", e);
+                let mut enc = TlvEncoder::new();
+                enc.add_string(FieldId::Owner, &e)?;
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     fn handle_release_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
@@ -716,6 +801,7 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::AcquireLeaseBatch => self.handle_acquire_lease_batch(msg),
             MsgType::ReleaseLease => self.handle_release_lease(msg),
             MsgType::RenewLease => self.handle_renew_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
@@ -802,6 +888,7 @@ impl ServerRequestHandler for VolumeNetHandler {
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::AcquireLease => self.handle_acquire_lease(msg),
+            MsgType::AcquireLeaseBatch => self.handle_acquire_lease_batch(msg),
             MsgType::ReleaseLease => self.handle_release_lease(msg),
             MsgType::RenewLease => self.handle_renew_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),

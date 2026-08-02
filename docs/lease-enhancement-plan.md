@@ -166,7 +166,7 @@ impl Drop for LeaseGuard {
 | 阶段 2 | P1-1 持久化 + P1-2 fence token 持久化 | 高 | ✅ 完成 (commit 0dc0942b) |
 | 阶段 2b | P1-3 remaining() 集成到写路径 | 中 | ✅ 完成 |
 | 阶段 3a | P2-2 监控指标 | 低 | ✅ 完成 |
-| 阶段 3b | P2-1 批量操作 | 低 | ⏳ 待实施 |
+| 阶段 3b | P2-1 批量操作 | 低 | ✅ 完成 |
 
 ### 已完成项详情
 
@@ -220,6 +220,20 @@ impl Drop for LeaseGuard {
   - `GET /admin/lease-stats`：JSON 快照
 - 2 个新单元测试覆盖计数器正确性（acquire/conflict/renew/release +
   expired/disconnected）
+
+#### P2-1: 批量 Stripe 操作
+- `LeaseStore::acquire_batch` trait 方法（默认实现为循环 acquire + rollback）
+- `MemoryLeaseStore::acquire_batch` 原子实现：单个锁范围内完成所有冲突检查 +
+  授权（all-or-nothing），含内部冲突检测（batch 内 key 间重叠）
+- `RangeLeaseManager::acquire_batch` 封装：接受 `&[(stripe_start, stripe_count)]`
+  列表，返回 `Vec<RangeLease>`
+- TLV 协议 `AcquireLeaseBatch` (0x0084) + `LeaseBatchSpecs` FieldId (0x83)
+  - 请求：flat blob 编码 specs（每 spec 16 bytes: start + count u64 LE）
+  - 响应：Count + flat blob 编码 tokens（token_len + token_bytes + epoch）
+- `VolumeClient::acquire_lease_batch` 客户端方法：一次 RPC 获取多 stripe lease
+- Volume Server `handle_acquire_lease_batch` net handler
+- 5 个新单元测试：success / conflict all-or-nothing / internal conflict /
+  empty / different groups
 
 ## 约束
 

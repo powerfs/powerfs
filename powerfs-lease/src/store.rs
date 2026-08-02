@@ -96,6 +96,38 @@ pub trait LeaseStore<K: LeaseKey>: Send + Sync {
         duration: Duration,
     ) -> Result<LeaseEntry<K>, LeaseError>;
 
+    /// Atomically acquire leases for multiple keys.
+    ///
+    /// All-or-nothing: if any key conflicts with an existing lease held by
+    /// a different holder, the entire batch fails and no leases are granted.
+    /// This prevents partial acquisition where a client obtains some leases
+    /// but not others, which can lead to deadlocks or inconsistent state.
+    ///
+    /// Default implementation loops over `acquire` (non-atomic); stores that
+    /// support atomic batch acquire should override this.
+    fn acquire_batch(
+        &self,
+        keys: &[K],
+        holder: &str,
+        mode: LeaseMode,
+        duration: Duration,
+    ) -> Result<Vec<LeaseEntry<K>>, LeaseError> {
+        let mut entries = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.acquire(key.clone(), holder, mode, duration) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    // Rollback: release already-acquired leases
+                    for entry in &entries {
+                        let _ = self.release(&entry.token, holder);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     fn renew(&self, token: &str, holder: &str, duration: Duration) -> Result<(), LeaseError>;
 
     fn release(&self, token: &str, holder: &str) -> Result<(), LeaseError>;
@@ -371,6 +403,128 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
 
         self.acquire_total.fetch_add(1, Ordering::Relaxed);
         Ok(entry)
+    }
+
+    /// Atomic batch acquire: all keys are checked for conflicts in a single
+    /// lock scope. If any key conflicts, NONE are acquired (all-or-nothing).
+    ///
+    /// Also checks for internal conflicts between batch keys themselves
+    /// (e.g., two keys in the batch that overlap with each other in
+    /// exclusive mode).
+    fn acquire_batch(
+        &self,
+        keys: &[K],
+        holder: &str,
+        mode: LeaseMode,
+        duration: Duration,
+    ) -> Result<Vec<LeaseEntry<K>>, LeaseError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Instant::now();
+        let expire_at = now + duration;
+
+        let mut leases = self.leases.write().unwrap();
+        let mut group_index = self.group_index.write().unwrap();
+        let mut holder_index = self.holder_index.write().unwrap();
+
+        // Phase 1: Check each key against existing leases AND against other
+        // keys in this batch (internal conflict check).
+        //
+        // Track pending entries separately so we can abort without side
+        // effects if any conflict is found.
+        let mut pending: Vec<LeaseEntry<K>> = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let group_id = key.group_id();
+
+            // Check against existing leases in the same group
+            if let Some(existing_tokens) = group_index.get(&group_id) {
+                for token in existing_tokens.iter() {
+                    if let Some(existing) = leases.get(token) {
+                        if existing.is_expired() {
+                            continue;
+                        }
+                        if existing.holder == holder {
+                            continue;
+                        }
+                        if (existing.mode.is_exclusive() || mode.is_exclusive())
+                            && existing.key.conflicts(key)
+                        {
+                            self.acquire_total.fetch_add(1, Ordering::Relaxed);
+                            self.acquire_conflict_total.fetch_add(1, Ordering::Relaxed);
+                            return Err(LeaseError::Conflict(format!(
+                                "batch: key group {} conflicts with existing lease held by {}",
+                                group_id, existing.holder
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // Check against already-pending keys in this batch (internal
+            // conflict). Two exclusive keys that overlap cannot both be
+            // granted.
+            if mode.is_exclusive() {
+                for p in &pending {
+                    if p.key.group_id() == group_id && p.key.conflicts(key) {
+                        self.acquire_total.fetch_add(1, Ordering::Relaxed);
+                        self.acquire_conflict_total.fetch_add(1, Ordering::Relaxed);
+                        return Err(LeaseError::Conflict(format!(
+                            "batch: internal conflict between keys in group {}",
+                            group_id
+                        )));
+                    }
+                }
+            }
+
+            let (token, epoch) = self.generate_token();
+            let entry = LeaseEntry {
+                key: key.clone(),
+                holder: holder.to_string(),
+                token: token.clone(),
+                mode,
+                acquired_at: now,
+                expire_at,
+                epoch,
+            };
+            pending.push(entry);
+        }
+
+        // Phase 2: All checks passed — commit all pending entries.
+        let mut result = Vec::with_capacity(pending.len());
+        let mut new_holder = false;
+        for entry in pending {
+            let token = entry.token.clone();
+            let group_id = entry.key.group_id();
+
+            leases.insert(token.clone(), entry.clone());
+            group_index.entry(group_id).or_default().push(token.clone());
+
+            let holder_entry = holder_index.entry(holder.to_string()).or_default();
+            if holder_entry.is_empty() {
+                new_holder = true;
+            }
+            holder_entry.insert(token.clone());
+
+            // Persist (best-effort)
+            if let Some(p) = &self.persistence {
+                let data = encode_entry(&entry);
+                if let Err(e) = p.save(&token, &data) {
+                    log::warn!("lease persistence save failed on acquire_batch: {}", e);
+                }
+            }
+
+            result.push(entry);
+        }
+
+        if new_holder {
+            self.holder_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.acquire_total
+            .fetch_add(result.len() as u64, Ordering::Relaxed);
+        Ok(result)
     }
 
     fn renew(&self, token: &str, holder: &str, duration: Duration) -> Result<(), LeaseError> {
@@ -1079,5 +1233,187 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.stats().disconnected_total, 1);
         assert_eq!(store.stats().active_count, 0);
+    }
+
+    #[test]
+    fn test_acquire_batch_success() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+
+        // Acquire 3 non-overlapping stripes in one batch
+        let keys = vec![
+            TestKey {
+                id: 1,
+                start: 0,
+                count: 4,
+            },
+            TestKey {
+                id: 1,
+                start: 4,
+                count: 4,
+            },
+            TestKey {
+                id: 1,
+                start: 8,
+                count: 4,
+            },
+        ];
+
+        let entries = store
+            .acquire_batch(
+                &keys,
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert!(store.stats().active_count >= 3);
+        assert!(store.stats().acquire_total >= 3);
+
+        // All tokens should be distinct
+        assert_ne!(entries[0].token, entries[1].token);
+        assert_ne!(entries[1].token, entries[2].token);
+    }
+
+    #[test]
+    fn test_acquire_batch_conflict_all_or_nothing() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+
+        // Client A acquires stripe [0, 4)
+        store
+            .acquire(
+                TestKey {
+                    id: 1,
+                    start: 0,
+                    count: 4,
+                },
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+
+        // Client B tries batch: [8, 12) + [2, 6) — second conflicts with A
+        let keys = vec![
+            TestKey {
+                id: 1,
+                start: 8,
+                count: 4,
+            },
+            TestKey {
+                id: 1,
+                start: 2,
+                count: 4,
+            }, // overlaps with [0, 4)
+        ];
+
+        let result = store.acquire_batch(
+            &keys,
+            "client-b",
+            LeaseMode::Exclusive,
+            Duration::from_secs(30),
+        );
+        assert!(result.is_err());
+
+        // All-or-nothing: the non-conflicting key [8, 12) must NOT be acquired
+        assert_eq!(store.active_count(), 1); // only client-a's lease
+        assert!(store.stats().acquire_conflict_total >= 1);
+
+        // Client B can now acquire [8, 12) alone (no conflict)
+        store
+            .acquire(
+                TestKey {
+                    id: 1,
+                    start: 8,
+                    count: 4,
+                },
+                "client-b",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(store.active_count(), 2);
+    }
+
+    #[test]
+    fn test_acquire_batch_internal_conflict() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+
+        // Batch with two overlapping exclusive keys — internal conflict
+        let keys = vec![
+            TestKey {
+                id: 1,
+                start: 0,
+                count: 4,
+            },
+            TestKey {
+                id: 1,
+                start: 2,
+                count: 4,
+            }, // overlaps with [0, 4)
+        ];
+
+        let result = store.acquire_batch(
+            &keys,
+            "client-a",
+            LeaseMode::Exclusive,
+            Duration::from_secs(30),
+        );
+        assert!(result.is_err());
+        assert_eq!(store.active_count(), 0); // nothing acquired
+
+        // Shared mode: overlapping shared keys are OK (no conflict)
+        let result = store.acquire_batch(
+            &keys,
+            "client-a",
+            LeaseMode::Shared,
+            Duration::from_secs(30),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_acquire_batch_empty() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+        let entries = store
+            .acquire_batch(
+                &[],
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_acquire_batch_different_groups() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+
+        // Keys in different groups (different inode) never conflict
+        let keys = vec![
+            TestKey {
+                id: 1,
+                start: 0,
+                count: 4,
+            },
+            TestKey {
+                id: 2,
+                start: 0,
+                count: 4,
+            }, // same range, different group
+        ];
+
+        let entries = store
+            .acquire_batch(
+                &keys,
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 2);
     }
 }

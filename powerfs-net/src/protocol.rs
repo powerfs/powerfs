@@ -396,6 +396,7 @@ pub enum MsgType {
     ReleaseLease = 0x0081,
     RenewLease = 0x0082,
     LeaseStatus = 0x0083,
+    AcquireLeaseBatch = 0x0084,
 }
 
 impl MsgType {
@@ -448,6 +449,7 @@ impl MsgType {
             0x0080 => Some(Self::AcquireLease),
             0x0081 => Some(Self::ReleaseLease),
             0x0082 => Some(Self::RenewLease),
+            0x0084 => Some(Self::AcquireLeaseBatch),
             0x0083 => Some(Self::LeaseStatus),
             _ => None,
         }
@@ -567,6 +569,8 @@ pub enum FieldId {
     LeaseToken = 0x80,
     LeaseRangeOffset = 0x81,
     LeaseRangeLength = 0x82,
+    /// Batch lease specs: flat byte array of (stripe_start: u64 LE, stripe_count: u64 LE) pairs.
+    LeaseBatchSpecs = 0x83,
 
     // AssignVolume fields
     Collection = 0x90,
