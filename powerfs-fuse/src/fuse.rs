@@ -1849,13 +1849,43 @@ impl FileSystem for PowerFsFs {
                 });
 
                 if !modified {
-                    // Chunk not in cache. If the file already has data at this
-                    // chunk offset (content_size > chunk_start_offset), we MUST
-                    // read the existing chunk from the volume server before
-                    // applying the partial write. Otherwise the flushed chunk
-                    // would contain zeros in the prefix, corrupting data
-                    // written by other clients (cross-client append bug).
-                    let mut new_data: Vec<u8> = if content_size_before_write > chunk_start_offset {
+                    // Chunk not in cache. Determine if read-before-write is
+                    // needed by checking whether existing data exists outside
+                    // the write region within this chunk.
+                    //
+                    // Read-before-write is required only when there is existing
+                    // data BEFORE or AFTER the write region that must be
+                    // preserved. If the write covers all existing data (or
+                    // there is no existing data), the read can be skipped
+                    // entirely — a significant optimization for sequential
+                    // writes (full chunk overwrites) and appends.
+                    let existing_end_in_chunk =
+                        content_size_before_write.saturating_sub(chunk_start_offset);
+                    let write_end_in_chunk = (in_chunk_start + bytes_to_write) as u64;
+
+                    // No data before our write: write starts at chunk start, or
+                    // existing data doesn't reach our write position.
+                    let no_data_before =
+                        in_chunk_start == 0 || existing_end_in_chunk <= in_chunk_start as u64;
+                    // No data after our write: write fills to chunk end, or
+                    // existing data doesn't extend beyond our write end.
+                    let no_data_after = write_end_in_chunk >= chunk_size
+                        || existing_end_in_chunk <= write_end_in_chunk;
+
+                    let mut new_data: Vec<u8> = if no_data_before && no_data_after {
+                        // Optimization: no existing data to preserve — skip
+                        // read-before-write entirely. This covers:
+                        // - Full chunk overwrite (e.g., 1M sequential write)
+                        // - Append beyond existing file size
+                        // - Write to a new/empty chunk
+                        debug!(
+                            "write: skip read-before-write inode={} chunk_offset={} (no existing data to preserve)",
+                            inode, chunk_start_offset
+                        );
+                        vec![0u8; in_chunk_start + bytes_to_write]
+                    } else if content_size_before_write > chunk_start_offset {
+                        // Partial write within existing data — must read
+                        // existing chunk to preserve prefix/suffix.
                         let existing_len = std::cmp::min(
                             chunk_size,
                             content_size_before_write - chunk_start_offset,
