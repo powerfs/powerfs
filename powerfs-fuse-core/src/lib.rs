@@ -21,7 +21,7 @@ pub use circuit_breaker::{
 pub use client_error::{ClientError, ClientResult};
 pub use client_identity::ClientIdentity;
 pub use fuse_client_facade::{FuseClientFacade, FuseClientFacadeConfig, SyncFuseClientFacade};
-pub use lease::{LeaseManager, LeaseMode, LeaseToken, VolumeLeaseManager};
+pub use lease::{LeaseGuard, LeaseManager, LeaseMode, LeaseState, LeaseToken, VolumeLeaseManager};
 pub use meta_shard_client::{
     ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,
     RequestQueue, RequestResult, TransportChannel,
@@ -35,5 +35,6 @@ pub use topology::{
     MasterClientState, ShardInfo, TopologyUpdateListener, VolumeInfo,
 };
 pub use volume_client::{
-    LeaseInfo, LeaseState, SchedulerStats, VolumeClient, VolumeClientConfig, VolumeClientState,
+    LeaseInfo, LeaseState as VolumeLeaseState, SchedulerStats, VolumeClient, VolumeClientConfig,
+    VolumeClientState,
 };

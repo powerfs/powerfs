@@ -18,6 +18,7 @@ redis-event = ["powerfs-common/redis-event"]
 chrono = { workspace = true }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
+powerfs-lease = { path = "../powerfs-lease" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-net = { path = "../powerfs-net" }
 tokio = { workspace = true, features = ["time"] }

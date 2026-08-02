@@ -2,6 +2,7 @@
 members = [
     "powerfs-net",
     "powerfs-master-net",
+    "powerfs-lease",
     "powerfs-core",
     "powerfs-master",
     "powerfs-volume",

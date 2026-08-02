@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
+powerfs-lease = { path = "../powerfs-lease" }
 powerfs-master = { path = "../powerfs-master" }
 powerfs-master-net = { path = "../powerfs-master-net" }
 powerfs-net = { path = "../powerfs-net" }

@@ -1,0 +1,17 @@
+[package]
+name = "powerfs-lease"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Lease management primitives for PowerFS (server-side store, client-side manager, RAII guard)"
+license.workspace = true
+
+[dependencies]
+uuid = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lib]
+name = "powerfs_lease"
+path = "src/lib.rs"
