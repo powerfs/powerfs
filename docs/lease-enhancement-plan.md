@@ -165,7 +165,8 @@ impl Drop for LeaseGuard {
 | 阶段 1 | P0-1 独立 crate 抽离 + P0-2 LeaseGuard RAII | 高 | ✅ 完成 (commit ed9eb20a) |
 | 阶段 2 | P1-1 持久化 + P1-2 fence token 持久化 | 高 | ✅ 完成 (commit 0dc0942b) |
 | 阶段 2b | P1-3 remaining() 集成到写路径 | 中 | ⏳ API 已就绪，待集成 |
-| 阶段 3 | P2-1 批量操作 + P2-2 监控指标 | 低 | ⏳ 待实施 |
+| 阶段 3a | P2-2 监控指标 | 低 | ✅ 完成 |
+| 阶段 3b | P2-1 批量操作 | 低 | ⏳ 待实施 |
 
 ### 已完成项详情
 
@@ -196,6 +197,19 @@ impl Drop for LeaseGuard {
 - epoch counter 通过 `save_epoch` / `load_epoch` 持久化
 - `load_from_persistence` 恢复时设置 epoch = max(current, stored) + 1
 - 防止 ABA：重启后 epoch 不归零
+
+#### P2-2: 监控指标
+- `LeaseStats` 结构记录 active_count / active_holders / acquire_total /
+  acquire_conflict_total / renew_total / release_total / expired_total /
+  disconnected_total
+- `MemoryLeaseStore` 内置原子计数器，acquire/release/renew/cleanup_expired/
+  disconnect_holder 全路径更新
+- `MemoryLeaseStore::stats()` / `RangeLeaseManager::stats()` 返回快照
+- Volume Server 新增 HTTP 端点（绑定 `http_port`）：
+  - `GET /metrics`：Prometheus 格式（8 个 gauge 指标）
+  - `GET /admin/lease-stats`：JSON 快照
+- 2 个新单元测试覆盖计数器正确性（acquire/conflict/renew/release +
+  expired/disconnected）
 
 ## 约束
 

@@ -203,6 +203,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &data_dir,
     );
 
+    // Start HTTP metrics & admin endpoints on http_port.
+    // Exposes /metrics (Prometheus) and /admin/lease-stats (JSON) for the
+    // lease subsystem. Failure to start is non-fatal: log and continue.
+    {
+        let metrics_addr_str = format!("{}:{}", ip, http_port);
+        if let Ok(metrics_addr) = metrics_addr_str.parse() {
+            if let Err(e) = powerfs_volume::metrics::start_metrics_server(
+                metrics_addr,
+                volume_server.range_lease_mgr.clone(),
+            )
+            .await
+            {
+                warn!("Failed to start volume metrics server: {}", e);
+            }
+        } else {
+            warn!(
+                "Failed to parse metrics bind address {}; metrics endpoint disabled",
+                metrics_addr_str
+            );
+        }
+    }
+
     // Start powerfs-net binary protocol server for Volume
     if net_port > 0 {
         let net_bind_addr = format!("{}:{}", ip, net_port);

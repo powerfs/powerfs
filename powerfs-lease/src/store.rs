@@ -15,6 +15,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Lease store statistics (snapshot at query time).
+#[derive(Debug, Clone, Default)]
+pub struct LeaseStats {
+    /// Currently active (non-expired) leases.
+    pub active_count: usize,
+    /// Currently active unique holders.
+    pub active_holders: u64,
+    /// Total acquire calls (success + conflict).
+    pub acquire_total: u64,
+    /// Acquire calls that resulted in conflict.
+    pub acquire_conflict_total: u64,
+    /// Total successful renew calls.
+    pub renew_total: u64,
+    /// Total successful release calls.
+    pub release_total: u64,
+    /// Total leases removed by cleanup_expired.
+    pub expired_total: u64,
+    /// Total leases removed by disconnect_holder.
+    pub disconnected_total: u64,
+}
+
 /// Trait for resource keys managed by the lease store.
 ///
 /// Implementors define:
@@ -124,6 +145,13 @@ pub struct MemoryLeaseStore<K: LeaseKey> {
     /// Optional persistence backend. When present, acquire/renew/release
     /// operations are also persisted for crash recovery.
     persistence: Option<Arc<dyn LeasePersistence>>,
+    // --- Monitoring counters ---
+    acquire_total: AtomicU64,
+    acquire_conflict_total: AtomicU64,
+    renew_total: AtomicU64,
+    release_total: AtomicU64,
+    expired_total: AtomicU64,
+    disconnected_total: AtomicU64,
 }
 
 impl<K: LeaseKey> MemoryLeaseStore<K> {
@@ -137,6 +165,30 @@ impl<K: LeaseKey> MemoryLeaseStore<K> {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             cleanup_grace: Duration::from_millis(5000),
             persistence: None,
+            acquire_total: AtomicU64::new(0),
+            acquire_conflict_total: AtomicU64::new(0),
+            renew_total: AtomicU64::new(0),
+            release_total: AtomicU64::new(0),
+            expired_total: AtomicU64::new(0),
+            disconnected_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Get current lease statistics (snapshot).
+    ///
+    /// Active counts (`active_count`, `active_holders`) are computed live;
+    /// counters (`*_total`) are monotonically increasing cumulative totals
+    /// since store creation.
+    pub fn stats(&self) -> LeaseStats {
+        LeaseStats {
+            active_count: self.active_count(),
+            active_holders: self.active_holders_count(),
+            acquire_total: self.acquire_total.load(Ordering::Relaxed),
+            acquire_conflict_total: self.acquire_conflict_total.load(Ordering::Relaxed),
+            renew_total: self.renew_total.load(Ordering::Relaxed),
+            release_total: self.release_total.load(Ordering::Relaxed),
+            expired_total: self.expired_total.load(Ordering::Relaxed),
+            disconnected_total: self.disconnected_total.load(Ordering::Relaxed),
         }
     }
 
@@ -271,6 +323,8 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
                     if (existing.mode.is_exclusive() || mode.is_exclusive())
                         && existing.key.conflicts(&key)
                     {
+                        self.acquire_total.fetch_add(1, Ordering::Relaxed);
+                        self.acquire_conflict_total.fetch_add(1, Ordering::Relaxed);
                         return Err(LeaseError::Conflict(format!(
                             "key group {} conflicts with existing lease held by {}",
                             group_id, existing.holder
@@ -315,6 +369,7 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             }
         }
 
+        self.acquire_total.fetch_add(1, Ordering::Relaxed);
         Ok(entry)
     }
 
@@ -339,6 +394,7 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
                     }
                 }
 
+                self.renew_total.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             None => Err(LeaseError::NotFound),
@@ -384,6 +440,7 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             }
         }
 
+        self.release_total.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -504,6 +561,10 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             }
         }
 
+        if removed > 0 {
+            self.disconnected_total
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
         removed
     }
 
@@ -549,6 +610,10 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
                     let _ = p.delete(&token);
                 }
             }
+        }
+        if removed > 0 {
+            self.expired_total
+                .fetch_add(removed as u64, Ordering::Relaxed);
         }
         removed
     }
@@ -902,5 +967,117 @@ mod tests {
         assert_eq!(store.get_entries_by_group(1).len(), 2);
         assert_eq!(store.get_entries_by_group(2).len(), 1);
         assert_eq!(store.get_entries_by_group(3).len(), 0);
+    }
+
+    #[test]
+    fn test_stats_counters() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+        let key_a = TestKey {
+            id: 1,
+            start: 0,
+            count: 4,
+        };
+        let key_b = TestKey {
+            id: 1,
+            start: 2,
+            count: 4,
+        };
+
+        // Initial stats: all zero
+        let s0 = store.stats();
+        assert_eq!(s0.active_count, 0);
+        assert_eq!(s0.active_holders, 0);
+        assert_eq!(s0.acquire_total, 0);
+        assert_eq!(s0.acquire_conflict_total, 0);
+        assert_eq!(s0.renew_total, 0);
+        assert_eq!(s0.release_total, 0);
+        assert_eq!(s0.expired_total, 0);
+        assert_eq!(s0.disconnected_total, 0);
+
+        // acquire (success)
+        let entry = store
+            .acquire(
+                key_a,
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+
+        // acquire (conflict)
+        let conflict = store.acquire(
+            key_b,
+            "client-b",
+            LeaseMode::Exclusive,
+            Duration::from_secs(30),
+        );
+        assert!(conflict.is_err());
+
+        let s1 = store.stats();
+        assert_eq!(s1.active_count, 1);
+        assert_eq!(s1.active_holders, 1);
+        assert_eq!(s1.acquire_total, 2); // success + conflict
+        assert_eq!(s1.acquire_conflict_total, 1);
+        assert_eq!(s1.renew_total, 0);
+        assert_eq!(s1.release_total, 0);
+
+        // renew
+        store
+            .renew(&entry.token, "client-a", Duration::from_secs(30))
+            .unwrap();
+        let s2 = store.stats();
+        assert_eq!(s2.renew_total, 1);
+
+        // release
+        store.release(&entry.token, "client-a").unwrap();
+        let s3 = store.stats();
+        assert_eq!(s3.release_total, 1);
+        assert_eq!(s3.active_count, 0);
+        assert_eq!(s3.active_holders, 0);
+    }
+
+    #[test]
+    fn test_stats_expired_and_disconnected() {
+        let store = MemoryLeaseStore::<TestKey>::new().with_cleanup_grace(Duration::from_millis(0));
+        let key1 = TestKey {
+            id: 1,
+            start: 0,
+            count: 4,
+        };
+        let key2 = TestKey {
+            id: 2,
+            start: 0,
+            count: 4,
+        };
+
+        // Two leases, different groups, same holder
+        store
+            .acquire(
+                key1,
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        store
+            .acquire(
+                key2,
+                "client-a",
+                LeaseMode::Exclusive,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+
+        // Wait for first to expire
+        std::thread::sleep(Duration::from_millis(10));
+        let removed = store.cleanup_expired();
+        assert!(removed >= 1);
+        assert!(store.stats().expired_total >= 1);
+
+        // disconnect_holder removes the remaining active lease
+        let removed = store.disconnect_holder("client-a");
+        assert_eq!(removed, 1);
+        assert_eq!(store.stats().disconnected_total, 1);
+        assert_eq!(store.stats().active_count, 0);
     }
 }

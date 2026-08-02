@@ -48,5 +48,5 @@ pub use error::LeaseError;
 pub use guard::LeaseGuard;
 pub use manager::{LeaseManager, LeaseState};
 pub use persistence::{decode_entry, encode_entry, LeasePersistence};
-pub use store::{LeaseEntry, LeaseKey, LeaseStore, MemoryLeaseStore};
+pub use store::{LeaseEntry, LeaseKey, LeaseStats, LeaseStore, MemoryLeaseStore};
 pub use token::{LeaseMode, LeaseToken};

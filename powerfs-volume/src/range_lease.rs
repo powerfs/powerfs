@@ -7,7 +7,9 @@
 //!
 //! This is a thin wrapper — all core logic lives in `powerfs-lease`.
 
-use powerfs_lease::{LeaseEntry, LeaseError, LeaseKey, LeaseMode, LeaseStore, MemoryLeaseStore};
+use powerfs_lease::{
+    LeaseEntry, LeaseError, LeaseKey, LeaseMode, LeaseStats, LeaseStore, MemoryLeaseStore,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -309,6 +311,14 @@ impl RangeLeaseManager {
 
     pub fn get_active_holders_count(&self) -> u64 {
         self.store.active_holders_count()
+    }
+
+    /// Snapshot of lease store statistics for monitoring.
+    ///
+    /// Returns active counts plus cumulative counters (acquire/conflict/
+    /// renew/release/expired/disconnected) since store creation.
+    pub fn stats(&self) -> LeaseStats {
+        self.store.stats()
     }
 
     /// Get all non-expired leases held by a specific client.
