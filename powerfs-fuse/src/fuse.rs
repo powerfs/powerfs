@@ -550,7 +550,7 @@ impl PowerFsFs {
                     *chunk_idx,
                     powerfs_fuse_core::WriteBlobRequest {
                         volume_id: fid.volume_id.0,
-                        file_key: fid.file_key,
+                        file_key: fid.file_key.saturating_add(*chunk_idx),
                         inode,
                         offset: chunk_offset as i64,
                         size: data_len as i32,
@@ -1253,10 +1253,21 @@ impl FileSystem for PowerFsFs {
             // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
             if let Some(fid) = &entry.fid {
                 let volume_id = fid.volume_id.0;
+                let chunk_size = self.chunk_cache.chunk_size();
+                // Each chunk has a unique needle_id = fid.file_key + chunk_idx.
+                // Iterate all chunks to delete every needle.
+                let chunk_count = if chunk_size > 0 {
+                    entry.content_size.div_ceil(chunk_size)
+                } else {
+                    1
+                };
                 match self.client.get_volume_addr(fid.volume_id.0) {
                     Ok(addr) => {
-                        if let Err(e) = self.client.delete_data(&addr, volume_id, fid.file_key) {
-                            warn!("Failed to delete remote data: {}", e);
+                        for chunk_idx in 0..chunk_count {
+                            let needle_key = fid.file_key.saturating_add(chunk_idx);
+                            if let Err(e) = self.client.delete_data(&addr, volume_id, needle_key) {
+                                warn!("Failed to delete chunk {}: {}", chunk_idx, e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -1727,12 +1738,14 @@ impl FileSystem for PowerFsFs {
                 // Build batch read requests
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
-                    .map(|(_, offset, size)| powerfs_fuse_core::ReadBlobRequest {
-                        volume_id: fid.volume_id.0,
-                        file_key: fid.file_key,
-                        offset: *offset as i64,
-                        size: *size,
-                    })
+                    .map(
+                        |(chunk_idx, offset, size)| powerfs_fuse_core::ReadBlobRequest {
+                            volume_id: fid.volume_id.0,
+                            file_key: fid.file_key.saturating_add(*chunk_idx),
+                            offset: *offset as i64,
+                            size: *size,
+                        },
+                    )
                     .collect();
 
                 let results = self.client.read_blob_batch(requests);
@@ -1782,7 +1795,7 @@ impl FileSystem for PowerFsFs {
                         match self.client.read_blob(
                             &addr,
                             fid.volume_id.0,
-                            fid.file_key,
+                            fid.file_key.saturating_add(chunk_idx),
                             chunk_offset as i64,
                             read_size,
                         ) {
@@ -2017,7 +2030,7 @@ impl FileSystem for PowerFsFs {
                             match self.client.read_blob(
                                 addr,
                                 volume_id,
-                                file_key,
+                                file_key.saturating_add(chunk_idx),
                                 chunk_start_offset as i64,
                                 existing_len as i32,
                             ) {

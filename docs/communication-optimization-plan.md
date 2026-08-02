@@ -1511,6 +1511,49 @@ const TTL_OPEN: Duration = Duration::ZERO;          // 打开文件仍禁用（l
 - ✅ **是 volume state != Available**（volume Full，max_volume_size=10GB 过小）
 - **修复**：增大 max_volume_size 或清理旧数据创建新 volume
 
+### 13.7 Volume 空间回收修复（方案 A，2026-08-02）
+
+**根因**：delete_needle 不减少 used_bytes，compact_cleanup 从未被调用，volume Full 后永不恢复。
+
+**修复内容**：
+
+| 修复项 | 改动位置 | 说明 |
+|--------|---------|------|
+| A-1: delete 减少 used_bytes | [volume_metadata.rs:408-418](file:///home/portion/powerfs/powerfs-core/src/volume_metadata.rs#L408-L418) | 按 needle 大小（HEADER+data+FOOTER）减少 used_bytes，增加 free_bytes |
+| A-2: delete 后恢复 Available | [volume.rs:410-423](file:///home/portion/powerfs/powerfs-core/src/volume.rs#L410-L423) | Full 状态下 free_bytes > 0 时恢复 Available |
+| A-3: rebuild 排除 deleted | [volume_metadata.rs:263-298](file:///home/portion/powerfs/powerfs-core/src/volume_metadata.rs#L263-L298) | 重启重建时 used_bytes 只算活跃 needle |
+| restore 对称修复 | [volume_metadata.rs:478-487](file:///home/portion/powerfs/powerfs-core/src/volume_metadata.rs#L478-L487) | 恢复 needle 时增加 used_bytes |
+
+**验证结果**：volume-1 重启后 rebuild：
+- volume 13616388064009670238: `used=10737034876`(~10GB) → **`rebuilt used=22169163`**(~22MB)
+- `free=10715249077`(~10GB)，volume 恢复 Available
+- status=10 错误消失
+
+### 13.8 file_key 静默数据丢失修复（2026-08-02）
+
+**严重 bug**：所有 chunk 用同一个 `fid.file_key` 作为 needle_id，导致 needle 互相覆盖（静默数据丢失）。
+
+**根因**：[fuse.rs flush_dirty_chunks_impl](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L553) `file_key: fid.file_key` — fid.file_key 是文件级标识，但 volume server 用 file_key 作为 needle_id（[volume.rs:306](file:///home/portion/powerfs/powerfs-core/src/volume.rs#L306) `NeedleId(file_key)`）。所有 chunk 写入同一个 needle，后写覆盖先写。
+
+**影响**：
+- 256M 文件（256 个 chunk）只有最后一个 chunk 的数据保留
+- read 时只能读到最后一个 chunk（前 255M 数据丢失）
+- fio 不验证数据，所以性能测试未发现
+
+**修复**：每个 chunk 用唯一 file_key = `fid.file_key + chunk_idx`
+
+| 路径 | 改动位置 | 修复 |
+|------|---------|------|
+| flush（write） | [fuse.rs:553](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L553) | `file_key: fid.file_key.saturating_add(*chunk_idx)` |
+| read batch | [fuse.rs:1732](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1732) | `file_key: fid.file_key.saturating_add(*chunk_idx)` |
+| read-before-write | [fuse.rs:2020](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L2020) | `file_key.saturating_add(chunk_idx)` |
+| read_blob after flush | [fuse.rs:1785](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1785) | `fid.file_key.saturating_add(chunk_idx)` |
+| delete | [fuse.rs:1251-1278](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1251-L1278) | 遍历所有 chunk 逐个删除（file_key + chunk_idx） |
+
+**验证结果**：
+- volume-1 日志：64 个不同 file_key（100-163），每个 chunk 唯一 ✅
+- 数据正确性：md5 write = md5 read，**DATA INTEGRITY PASS** ✅
+
 **当前性能基线（P0+P1 修复后）**：
 
 | 测试 | 块大小 | 带宽 | IOPS |

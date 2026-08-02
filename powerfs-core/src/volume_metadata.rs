@@ -254,17 +254,22 @@ impl VolumeMetadata {
         Ok(result)
     }
 
-    /// 启动时重建 allocation 统计：扫描 needles CF + deleted CF，计算物理空间使用
+    /// 启动时重建 allocation 统计：扫描 needles CF + deleted CF
     /// 返回 (used_bytes, append_offset, active_count, deleted_count)
+    ///
+    /// used_bytes: 活跃 needle 总大小（逻辑空间使用，删除后已回收）
+    /// append_offset: 物理文件末尾（包括 deleted needle 的 hole，append-only）
+    /// free_bytes = volume_size - used_bytes（逻辑可用空间）
     pub fn rebuild_allocation_stats(&self) -> Result<(u64, u64, u64, u64)> {
         use powerfs_common::constants::{
             NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET,
         };
 
         let mut max_end: u64 = VOLUME_DATA_OFFSET;
+        let mut used_bytes: u64 = 0;
         let mut active_count: u64 = 0;
 
-        // 扫描 needles CF（活跃 needle）
+        // 扫描 needles CF（活跃 needle）—— 算入 used_bytes
         for (_, info) in self.iter() {
             let needle_size =
                 (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
@@ -272,10 +277,12 @@ impl VolumeMetadata {
             if end > max_end {
                 max_end = end;
             }
+            used_bytes = used_bytes.saturating_add(needle_size);
             active_count += 1;
         }
 
-        // 扫描 deleted CF（已删除但未 compact 的 needle，仍占用物理空间）
+        // 扫描 deleted CF（已删除 needle）—— 不算入 used_bytes（逻辑空间已回收），
+        // 但仍影响 append_offset（物理文件末尾，hole 不可复用，需 compact 回收）
         let deleted_items = self.list_deleted()?;
         let deleted_count = deleted_items.len() as u64;
         for (_, info) in &deleted_items {
@@ -286,8 +293,6 @@ impl VolumeMetadata {
                 max_end = end;
             }
         }
-
-        let used_bytes = max_end.saturating_sub(VOLUME_DATA_OFFSET);
 
         Ok((used_bytes, max_end, active_count, deleted_count))
     }
@@ -382,8 +387,10 @@ impl VolumeMetadata {
     pub fn delete_needle_atomic(
         &self,
         needle_id: &NeedleId,
-        _volume_size: u64,
+        volume_size: u64,
     ) -> Result<Option<NeedleInfo>> {
+        use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE};
+
         let existing = self.get_needle(needle_id)?;
 
         if let Some(mut info) = existing.clone() {
@@ -403,8 +410,13 @@ impl VolumeMetadata {
             })?;
             batch.put_cf(self.cf_deleted(), key, deleted_data);
 
-            // 更新分配状态（used 不立即减少，等 compact 后才回收）
+            // 更新分配状态：立即回收逻辑空间（used_bytes 减少）
+            // 物理空间回收由 compact 机制处理（hole 不可复用，但逻辑上空间已释放）
             let mut stats = self.get_allocation()?;
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+            stats.used_bytes = stats.used_bytes.saturating_sub(needle_size);
+            stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
             stats.active_count = stats.active_count.saturating_sub(1);
             stats.deleted_count += 1;
             stats.last_modified_at = now_ts;
@@ -419,8 +431,13 @@ impl VolumeMetadata {
             })?;
 
             debug!(
-                "Atomic delete: needle={}, active={}, deleted={}",
-                needle_id.0, stats.active_count, stats.deleted_count
+                "Atomic delete: needle={}, freed={} bytes, used={}, free={}, active={}, deleted={}",
+                needle_id.0,
+                needle_size,
+                stats.used_bytes,
+                stats.free_bytes,
+                stats.active_count,
+                stats.deleted_count
             );
         }
 
@@ -431,8 +448,10 @@ impl VolumeMetadata {
     pub fn restore_needle_atomic(
         &self,
         needle_id: &NeedleId,
-        _volume_size: u64,
+        volume_size: u64,
     ) -> Result<Option<NeedleInfo>> {
+        use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE};
+
         let key = needle_id.0.to_be_bytes();
 
         // 从 deleted CF 读取
@@ -459,8 +478,12 @@ impl VolumeMetadata {
             // 从 deleted CF 移除
             batch.delete_cf(self.cf_deleted(), key);
 
-            // 更新分配状态
+            // 更新分配状态：恢复 needle 时增加 used_bytes（与 delete 对称）
             let mut stats = self.get_allocation()?;
+            let needle_size =
+                (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+            stats.used_bytes = stats.used_bytes.saturating_add(needle_size);
+            stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
             stats.active_count += 1;
             stats.deleted_count = stats.deleted_count.saturating_sub(1);
             stats.last_modified_at = now_ts;
@@ -475,8 +498,9 @@ impl VolumeMetadata {
             })?;
 
             debug!(
-                "Atomic restore: needle={}, active={}, deleted={}",
-                needle_id.0, stats.active_count, stats.deleted_count
+                "Atomic restore: needle={}, restored={} bytes, used={}, free={}, active={}, deleted={}",
+                needle_id.0, needle_size, stats.used_bytes, stats.free_bytes,
+                stats.active_count, stats.deleted_count
             );
 
             Ok(Some(info))

@@ -407,6 +407,28 @@ impl Volume {
             let mut info_guard = self.info.write().unwrap();
             info_guard.modified_at = Utc::now();
 
+            // A-2: 删除后检查是否可以恢复 Available 状态
+            // volume 因 free_bytes 不足被标记为 Full，删除 needle 释放逻辑空间后，
+            // 如果 free_bytes > 0 则恢复 Available，允许后续写入。
+            if info_guard.state == VolumeState::Full {
+                if let Ok(alloc_stats) = self.index.get_allocation() {
+                    if alloc_stats.free_bytes > 0 {
+                        info_guard.state = VolumeState::Available;
+                        log::info!(
+                            "Volume {} recovered to Available after delete: used={}, free={}",
+                            info_guard.id,
+                            alloc_stats.used_bytes,
+                            alloc_stats.free_bytes
+                        );
+                    }
+                }
+            }
+
+            // 同步 info 中的 used 字段
+            if let Ok(alloc_stats) = self.index.get_allocation() {
+                info_guard.used = alloc_stats.used_bytes;
+            }
+
             Ok(())
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))
