@@ -769,32 +769,35 @@ pub fn decode_delete_req(body: &[u8]) -> Result<(u64, bool), NetError> {
     Ok((ino, is_dir))
 }
 
-/// Encode a readdir request
-pub fn encode_readdir_req(ino: u64, offset: u64, count: u32) -> Result<Vec<u8>, NetError> {
+/// Encode a readdir request.
+/// Filer expects: ParentIno(u64) / Limit(u64) / LastName(string, empty for first page)
+/// The `offset` parameter (FUSE entry offset) is handled client-side by the FUSE
+/// layer; the Filer uses cursor-based pagination via LastName.
+pub fn encode_readdir_req(ino: u64, _offset: u64, count: u32) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, ino);
-    enc.add_u64(FieldId::Offset, offset);
-    enc.add_u32(FieldId::Count, count);
+    enc.add_u64(FieldId::ParentIno, ino);
+    enc.add_u64(FieldId::Limit, count as u64);
+    enc.add_string(FieldId::LastName, "")?;
     Ok(enc.into_bytes())
 }
 
 /// Decode a readdir request
-pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u64, u32), NetError> {
+pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u64, String), NetError> {
     let mut dec = TlvDecoder::new(body);
-    let mut ino = 0u64;
-    let mut offset = 0u64;
-    let mut count = 0u32;
+    let mut parent_ino = 0u64;
+    let mut limit = 1000u64;
+    let mut last_name = String::new();
 
     while let Some((field, length)) = dec.next_field() {
         match field {
-            FieldId::Ino => ino = dec.read_u64(length)?,
-            FieldId::Offset => offset = dec.read_u64(length)?,
-            FieldId::Count => count = dec.read_u32(length)?,
+            FieldId::ParentIno => parent_ino = dec.read_u64(length)?,
+            FieldId::Limit => limit = dec.read_u64(length)?,
+            FieldId::LastName => last_name = dec.read_string(length)?.to_string(),
             _ => dec.skip(length)?,
         }
     }
 
-    Ok((ino, offset, count))
+    Ok((parent_ino, limit, last_name))
 }
 
 /// Encode a data request (read/write)

@@ -770,7 +770,7 @@ impl FilerNetHandler {
         let has_more = (limited.len() as u64) < limit && !entries.is_empty();
 
         let mut enc = TlvEncoder::new();
-        enc.add_u64(FieldId::Count, limited.len() as u64);
+        enc.add_u32(FieldId::Count, limited.len() as u32);
         enc.add_u64(FieldId::HasMore, if has_more { 1 } else { 0 });
 
         for entry in &limited {
