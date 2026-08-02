@@ -383,6 +383,17 @@ impl MetadataCache {
         drop(cache);
     }
 
+    /// Force-update content_size and size for an inode, bypassing the
+    /// defensive guard in insert(). Used by open() when the Filer's value
+    /// is authoritative (no local chunk data — cache was invalidated).
+    pub fn set_content_size(&self, inode: u64, size: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.content_size = size;
+            entry.size = size;
+        }
+    }
+
     /// Remove an entry by inode
     pub fn remove(&self, inode: u64) {
         let entry = {
@@ -1504,7 +1515,23 @@ impl ChunkCache {
         let shard = shard_idx(&key);
         let mut cache = self.shards[shard].write().unwrap();
         if let Some(chunk) = cache.get_mut(&key) {
+            let old_len = chunk.data.len() as u64;
             f(chunk);
+            let new_len = chunk.data.len() as u64;
+            if new_len != old_len {
+                // Update current_bytes to reflect the size change caused by
+                // the closure (e.g., resize). Without this, put/evict/remove
+                // would later subtract the actual data.len() which differs
+                // from what was originally added, causing current_bytes
+                // underflow (wrapping to near u64::MAX) and breaking eviction.
+                if new_len > old_len {
+                    self.current_bytes
+                        .fetch_add(new_len - old_len, Ordering::SeqCst);
+                } else {
+                    self.current_bytes
+                        .fetch_sub(old_len - new_len, Ordering::SeqCst);
+                }
+            }
             true
         } else {
             false
@@ -1662,6 +1689,25 @@ impl ChunkCache {
             let cache = shard.read().unwrap();
             for ((ino, _), chunk) in cache.iter() {
                 if *ino == inode && chunk.dirty {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if the inode has ANY chunks (dirty or clean) in the cache.
+    /// Used by open()'s unsynced-write guard to distinguish between:
+    /// - Local data that was flushed but not yet committed to the Filer
+    ///   (has_chunks=true, has_dirty=false → guard applies)
+    /// - Stale cache after an Invalidate notification invalidated both
+    ///   metadata and chunk caches (has_chunks=false → guard must NOT
+    ///   apply, the Filer's value is authoritative)
+    pub fn has_chunks(&self, inode: u64) -> bool {
+        for shard in self.shards.iter() {
+            let cache = shard.read().unwrap();
+            for (ino, _) in cache.keys() {
+                if *ino == inode {
                     return true;
                 }
             }

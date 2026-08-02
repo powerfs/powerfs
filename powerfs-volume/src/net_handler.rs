@@ -580,7 +580,7 @@ impl VolumeNetHandler {
         let specs_blob = dec.next_bytes(FieldId::LeaseBatchSpecs).unwrap_or_default();
 
         // Decode specs: each spec is 16 bytes (stripe_start: u64 LE + stripe_count: u64 LE)
-        if specs_blob.len() % 16 != 0 {
+        if !specs_blob.len().is_multiple_of(16) {
             warn!(
                 "NET_ACQUIRE_LEASE_BATCH: malformed specs blob len={} (not multiple of 16)",
                 specs_blob.len()

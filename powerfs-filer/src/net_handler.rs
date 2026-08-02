@@ -1196,8 +1196,62 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::SetAttr => self.handle_setattr(msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
             MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
-            MsgType::Create => self.handle_create(msg).await,
-            MsgType::Mkdir => self.handle_mkdir(msg).await,
+            MsgType::Create => {
+                let response = self.handle_create(msg).await?;
+                // Subscribe the creating client to the parent directory and
+                // the new inode so it receives subsequent Invalidate
+                // notifications (e.g., another client truncating the file).
+                // The pre-create Lookups returned ENOENT so no subscription
+                // was established; without this the creator never receives
+                // cross-client change notifications for the new file.
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (create)",
+                                client_id, parent_ino
+                            );
+                        }
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                                info!(
+                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (create)",
+                                    client_id, entry_ino
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
+            MsgType::Mkdir => {
+                let response = self.handle_mkdir(msg).await?;
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                        }
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
             MsgType::Unlink => self.handle_unlink(msg).await,
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::Rename => self.handle_rename(msg).await,
@@ -1306,8 +1360,61 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::SetAttr => self.handle_setattr(msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
             MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
-            MsgType::Create => self.handle_create(msg).await,
-            MsgType::Mkdir => self.handle_mkdir(msg).await,
+            MsgType::Create => {
+                let response = self.handle_create(msg).await?;
+                // Subscribe the creating client to the parent directory and
+                // the new inode so it receives subsequent Invalidate
+                // notifications (e.g., another client truncating the file).
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let client_id = ctx.client.client_id;
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (create)",
+                                client_id, parent_ino
+                            );
+                        }
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                                info!(
+                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (create)",
+                                    client_id, entry_ino
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
+            MsgType::Mkdir => {
+                let response = self.handle_mkdir(msg).await?;
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let client_id = ctx.client.client_id;
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                        }
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
             MsgType::Unlink => self.handle_unlink(msg).await,
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::Rename => self.handle_rename(msg).await,

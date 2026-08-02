@@ -21,11 +21,18 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TTL: Duration = Duration::from_secs(1);
-/// Phase 4.3: 已打开文件（open_inodes 中）的 size/chunks 权威缓存 TTL。
-/// 文件打开期间 fuse 持有数据 lease（read/write 时获取），其他客户端无法修改数据，
-/// 因此 size/chunks 在 open→release 期间可信，用 lease_duration 作为 TTL。
-const TTL_OPEN: Duration = Duration::from_secs(30);
+/// TTL for kernel attribute cache. Set to ZERO to disable kernel caching
+/// because the FUSE daemon cannot invalidate the kernel cache when an
+/// Invalidate notification is received from the Filer. With a non-zero TTL,
+/// `stat` would return stale attributes after another client modifies the
+/// file. The FUSE daemon's userspace MetadataCache (kept fresh by
+/// Invalidate notifications) is the authoritative cache.
+const TTL: Duration = Duration::ZERO;
+/// TTL for getattr responses on open files. Same rationale as TTL: the
+/// kernel cache cannot be invalidated, so ZERO ensures every stat queries
+/// the FUSE daemon. Open files' metadata is authoritative in the userspace
+/// cache (lease-held).
+const TTL_OPEN: Duration = Duration::ZERO;
 const PREFETCH_CHUNKS: u64 = 2;
 const FUSE_APPEND: u32 = 0x400;
 
@@ -880,16 +887,37 @@ impl FileSystem for PowerFsFs {
         let is_open = self.open_inodes.read().unwrap().contains(&inode);
         let ttl = if is_open { TTL_OPEN } else { TTL };
 
-        if let Some(entry) = self.cache.get_inode(inode) {
-            debug!(
-                "getattr: cache hit for inode={}, is_open={}, ttl={:?}",
-                inode, is_open, ttl
-            );
-            return Ok((self.create_stat(&entry), ttl));
+        // For open files (pinned, lease-held), the userspace cache is
+        // authoritative — no other client can modify the data while we
+        // hold the lease. Return the cached entry directly.
+        if is_open {
+            if let Some(entry) = self.cache.get_inode(inode) {
+                debug!(
+                    "getattr: cache hit for inode={}, is_open=true (lease-held)",
+                    inode
+                );
+                return Ok((self.create_stat(&entry), ttl));
+            }
         }
 
-        // Cache miss: 查询 Filer 获取真实属性
-        debug!("getattr: cache miss for inode={}, querying filer", inode);
+        // Directories are never pinned (open returns EISDIR), so the
+        // Invalidate mechanism works reliably for them — the cache with
+        // its TTL fallback is sufficient.
+        if let Some(entry) = self.cache.get_inode(inode) {
+            if entry.is_dir {
+                debug!("getattr: cache hit for dir inode={}", inode);
+                return Ok((self.create_stat(&entry), ttl));
+            }
+        }
+
+        // For non-open files, fetch fresh metadata from the Filer on every
+        // getattr. TTL=0 promises the kernel fresh data, so returning a
+        // stale cached entry would break cross-client visibility (e.g.,
+        // another client's truncate must be visible immediately). The
+        // Invalidate mechanism is async and can be delayed or skipped
+        // (e.g., when the file is briefly opened by a concurrent read),
+        // so we cannot rely on it alone for correctness.
+        debug!("getattr: fetching fresh metadata for inode={} from filer (non-open file)", inode);
         let result = self.client.get_entry_by_inode(inode);
         debug!(
             "getattr: get_entry_by_inode result for inode={}: is_ok={}, is_none={}",
@@ -1365,7 +1393,8 @@ impl FileSystem for PowerFsFs {
                 let filer_stale_empty = fresh.chunks.is_empty() && !entry.chunks.is_empty();
 
                 // Unsynced-write guard: if the local content_size is LARGER
-                // than the Filer's, we have writes that the background flusher
+                // than the Filer's, AND the chunk_cache still has local data
+                // for this inode, we have writes that the background flusher
                 // has pushed to the Volume Server but sync_size_chunks_on_close
                 // hasn't yet committed to the Filer. The local cache is
                 // authoritative (we hold the write lease; no other client can
@@ -1373,8 +1402,15 @@ impl FileSystem for PowerFsFs {
                 // size would cause reads to truncate, and clearing the chunk
                 // cache would discard the just-flushed data — both break
                 // cross-client appends. Skip the refresh entirely in this case.
+                //
+                // CRITICAL: The has_chunks check prevents a false positive
+                // when the cache was invalidated by an Invalidate notification
+                // (another client truncated the file). After invalidation,
+                // has_chunks returns false, so the Filer's smaller size is
+                // correctly applied.
                 let local_ahead = entry.content_size > fresh.content_size;
-                if local_ahead {
+                let has_local_data = self.chunk_cache.has_chunks(inode);
+                if local_ahead && has_local_data {
                     debug!(
                         "open: skipping filer refresh for inode={} (local content_size={} > filer={}, unsynced writes)",
                         inode, entry.content_size, fresh.content_size
@@ -1382,7 +1418,15 @@ impl FileSystem for PowerFsFs {
                 } else {
                     let chunks_changed =
                         !filer_stale_empty && !chunks_match(&entry.chunks, &fresh.chunks);
+                    let filer_content_size = fresh.content_size;
                     self.cache.insert(fresh);
+                    // If no local chunk data exists (cache was invalidated by
+                    // an Invalidate notification), force the Filer's
+                    // content_size. insert()'s defensive guard may have
+                    // preserved a stale larger value from before invalidation.
+                    if !has_local_data {
+                        self.cache.set_content_size(inode, filer_content_size);
+                    }
                     if chunks_changed {
                         self.chunk_cache.remove_inode_chunks(inode);
                         debug!(

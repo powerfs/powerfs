@@ -1,6 +1,9 @@
 ./powerfs-fuse/Cargo.toml
 .trae/
 kernel/
+dynalock/
+cubefs/
+juicefs/
 output/
 ubuntu-linux-git/
 autoconf-2.71
