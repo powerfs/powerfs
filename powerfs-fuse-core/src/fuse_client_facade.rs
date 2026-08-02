@@ -484,10 +484,26 @@ impl FuseClientFacade {
         self.volume_client.get_valid_lease_token(volume_id, inode)
     }
 
+    /// 获取指定 inode 的 lease 剩余时间（委托给 VolumeClient）。
+    pub fn get_lease_remaining(&self, volume_id: u64, inode: u64) -> Option<Duration> {
+        self.volume_client.get_lease_remaining(volume_id, inode)
+    }
+
     /// 更新 lease 缓存（委托给 VolumeClient）
     pub fn update_lease(&self, volume_id: u64, inode: u64, token: String, duration: Duration) {
         self.volume_client
             .update_lease(volume_id, inode, token, duration);
+    }
+
+    /// 异步续租 Lease（委托给 VolumeClient）。
+    ///
+    /// 在 lease 即将过期但仍在有效期内时调用，延长 lease 的过期时间，
+    /// 避免写操作中途 lease 过期导致服务端校验失败。
+    pub async fn renew_lease(&self, volume_id: u64, inode: u64, token: &str) -> Result<(), String> {
+        self.volume_client
+            .renew_lease(volume_id, inode, token)
+            .await
+            .map_err(|e| format!("RenewLease failed: {}", e))
     }
 
     // ======= 元数据请求方法（委托给 MetaShardClient）=======

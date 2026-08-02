@@ -164,7 +164,7 @@ impl Drop for LeaseGuard {
 |------|------|--------|------|
 | 阶段 1 | P0-1 独立 crate 抽离 + P0-2 LeaseGuard RAII | 高 | ✅ 完成 (commit ed9eb20a) |
 | 阶段 2 | P1-1 持久化 + P1-2 fence token 持久化 | 高 | ✅ 完成 (commit 0dc0942b) |
-| 阶段 2b | P1-3 remaining() 集成到写路径 | 中 | ⏳ API 已就绪，待集成 |
+| 阶段 2b | P1-3 remaining() 集成到写路径 | 中 | ✅ 完成 |
 | 阶段 3a | P2-2 监控指标 | 低 | ✅ 完成 |
 | 阶段 3b | P2-1 批量操作 | 低 | ⏳ 待实施 |
 
@@ -197,6 +197,16 @@ impl Drop for LeaseGuard {
 - epoch counter 通过 `save_epoch` / `load_epoch` 持久化
 - `load_from_persistence` 恢复时设置 epoch = max(current, stored) + 1
 - 防止 ABA：重启后 epoch 不归零
+
+#### P1-3: remaining() 集成到写路径
+- `LeaseInfo::remaining()` 返回剩余 Duration（saturating）
+- `VolumeClient::get_lease_remaining(volume_id, inode) -> Option<Duration>`
+- `FuseClientFacade::get_lease_remaining()` / `renew_lease()` 委托方法
+- `ensure_lease` 写路径集成：剩余 < RENEW_THRESHOLD (10s) 时主动续租
+  - 续租失败非致命：降级返回现有有效 token，依赖服务端 grace period
+  - 日志记录续租决策与失败原因
+- 2 个新单元测试：`test_lease_remaining_and_get_lease_remaining`（VolumeClient 集成）、
+  `test_lease_info_remaining_directly`（LeaseInfo 独立测试，无 VolumeClient 依赖）
 
 #### P2-2: 监控指标
 - `LeaseStats` 结构记录 active_count / active_holders / acquire_total /

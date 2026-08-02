@@ -159,6 +159,11 @@ impl LeaseInfo {
         Instant::now() >= self.expire_at
     }
 
+    /// Remaining duration before this lease expires (saturates to zero).
+    pub fn remaining(&self) -> std::time::Duration {
+        self.expire_at.saturating_duration_since(Instant::now())
+    }
+
     pub fn renew(&mut self, duration: std::time::Duration) {
         let now = Instant::now();
         self.acquired_at = now;
@@ -615,6 +620,17 @@ impl VolumeClient {
             .get(&(volume_id, inode))
             .filter(|l| l.is_valid())
             .map(|l| l.token.clone())
+    }
+
+    /// 获取指定 inode 的 lease 剩余时间（如果存在且有效）
+    ///
+    /// 用于写路径在长操作前检查 lease 是否即将过期，剩余不足时主动续租，
+    /// 避免 lease 在写操作中途过期导致服务端校验失败。
+    pub fn get_lease_remaining(&self, volume_id: u64, inode: u64) -> Option<std::time::Duration> {
+        self.leases
+            .get(&(volume_id, inode))
+            .filter(|l| l.is_valid())
+            .map(|l| l.remaining())
     }
 
     /// 提交数据请求 (读/写共享队列)
@@ -2742,6 +2758,56 @@ mod tests {
         client.release_lease(1, 100);
         assert_eq!(client.get_lease_state(1, 100), LeaseState::Released);
         assert!(!client.has_valid_lease(1, 100));
+    }
+
+    #[test]
+    fn test_lease_remaining_and_get_lease_remaining() {
+        let (client, _, _rt) = create_test_volume_client();
+
+        // No lease cached → None
+        assert!(client.get_lease_remaining(1, 100).is_none());
+
+        // Acquire lease with 30s duration
+        client.update_lease(
+            1,
+            100,
+            "token-remaining".to_string(),
+            std::time::Duration::from_secs(30),
+        );
+
+        // remaining should be ~30s (allow slight timing slack)
+        let remaining = client
+            .get_lease_remaining(1, 100)
+            .expect("lease should be valid");
+        assert!(remaining <= std::time::Duration::from_secs(30));
+        assert!(remaining > std::time::Duration::from_secs(28));
+
+        // After release, get_lease_remaining returns None (is_valid false)
+        client.release_lease(1, 100);
+        assert!(client.get_lease_remaining(1, 100).is_none());
+    }
+
+    #[test]
+    fn test_lease_info_remaining_directly() {
+        // Test LeaseInfo::remaining() without a VolumeClient to avoid
+        // background lease renewer task interference.
+        let info = LeaseInfo::new("tok-direct".to_string(), std::time::Duration::from_secs(60));
+        let remaining = info.remaining();
+        assert!(remaining <= std::time::Duration::from_secs(60));
+        assert!(remaining > std::time::Duration::from_secs(58));
+        assert!(!info.is_expired());
+
+        // Expired lease
+        let mut expired = LeaseInfo::new(
+            "tok-expired".to_string(),
+            std::time::Duration::from_millis(1),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(expired.is_expired());
+        assert_eq!(expired.remaining(), std::time::Duration::ZERO);
+        expired.renew(std::time::Duration::from_secs(30));
+        assert!(!expired.is_expired());
+        assert!(expired.remaining() > std::time::Duration::from_secs(28));
     }
 
     #[test]

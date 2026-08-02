@@ -14,6 +14,16 @@ use powerfs_net::FieldId;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// P1-3: Lease proactive renew threshold.
+///
+/// When a cached lease's remaining time drops below this threshold,
+/// `ensure_lease` proactively renews it before returning the token to the
+/// caller. This prevents lease expiry mid-write for long operations.
+///
+/// Set to 10s: with a 60s default lease duration, this gives the renew
+/// RPC ample time to complete while leaving 50s of "fresh" validity.
+const RENEW_THRESHOLD: Duration = Duration::from_secs(10);
+
 /// Helper: hex dump first N bytes for debugging
 fn hex_dump(bytes: &[u8]) -> String {
     let n = bytes.len().min(128);
@@ -1062,6 +1072,9 @@ impl FacadeStorageProvider {
     /// 获取/续期指定 (volume, inode) 的有效 lease 并返回 token。
     /// 优先读缓存；若缓存未命中或已过期，向 Volume 发起 RangeLease 请求并更新缓存。
     /// inode 用于 Volume Server 端的 lease 校验（lease 按 inode 注册）。
+    ///
+    /// P1-3: 当缓存 lease 有效但剩余时间低于 RENEW_THRESHOLD 时，主动续租，
+    /// 避免 lease 在长写操作中途过期导致服务端 validate_token 失败。
     async fn ensure_lease(
         &self,
         volume_id: u64,
@@ -1072,6 +1085,30 @@ impl FacadeStorageProvider {
         // Fast path: use cached valid lease token via facade
         // Cache key is (volume_id, inode) to match server-side lease registration
         if let Some(tok) = self.facade.get_valid_lease_token(vid, inode) {
+            // P1-3: proactively renew if remaining time is below threshold.
+            // This prevents lease expiry mid-write for long operations.
+            if let Some(remaining) = self.facade.get_lease_remaining(vid, inode) {
+                if remaining < RENEW_THRESHOLD {
+                    log::debug!(
+                        "ensure_lease: proactive renew for volume={} inode={} remaining_ms={} < threshold_ms={}",
+                        vid,
+                        inode,
+                        remaining.as_millis(),
+                        RENEW_THRESHOLD.as_millis()
+                    );
+                    // Best-effort renew: if it fails, fall back to the
+                    // existing valid token (server-side grace period covers
+                    // brief overruns). A failed renew is not fatal.
+                    if let Err(e) = self.facade.renew_lease(vid, inode, &tok).await {
+                        log::warn!(
+                            "ensure_lease: proactive renew failed for volume={} inode={} err={} (falling back to existing token)",
+                            vid,
+                            inode,
+                            e
+                        );
+                    }
+                }
+            }
             return Ok(tok);
         }
 
