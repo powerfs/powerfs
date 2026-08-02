@@ -1714,6 +1714,21 @@ impl FileSystem for PowerFsFs {
                 }
             }
 
+            // Fix: update chunks[].size to reflect actual data layout.
+            // Previously this branch only called update_size (content_size) but
+            // never updated chunks[].size, leaving it stuck at 0 from create().
+            // This caused sync_size_chunks_on_close to send chunks[].size=0 to
+            // the Filer, breaking cross-client reads.
+            if let Some(ref fid) = entry.fid {
+                self.cache.update_chunk_sizes_after_write(
+                    inode,
+                    offset,
+                    read_len as u64,
+                    chunk_size,
+                    fid,
+                );
+            }
+
             // Phase 1.7: write合并/delayed flush — 不在 write 路径同步 flush。
             // 多次 4K write 自然合并到同一 chunk_cache 条目（chunk_size=1MB），
             // 由后台 flusher（100ms 间隔）异步 flush 到 Volume Server，

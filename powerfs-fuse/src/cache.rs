@@ -444,6 +444,61 @@ impl MetadataCache {
         }
     }
 
+    /// Update chunk sizes after a write to reflect the actual data layout.
+    ///
+    /// This fixes a critical bug where the `if Some(fid)` write branch only called
+    /// `update_size` (updating `content_size`) but never updated `chunks[].size`,
+    /// leaving `chunks[0].size` stuck at 0 from `create()`. When `sync_size_chunks_on_close`
+    /// synced this stale chunks list to the Filer, subsequent reads from other clients
+    /// got `chunks[0].size=0`, causing read failures or incorrect fallback size estimation.
+    ///
+    /// For each chunk touched by the write range `[offset, offset+length)`, this method
+    /// updates the chunk's `size` to cover the valid data end. If a chunk entry doesn't
+    /// exist at the expected offset, it is created using the provided FID.
+    pub fn update_chunk_sizes_after_write(
+        &self,
+        inode: u64,
+        offset: u64,
+        length: u64,
+        chunk_size: u64,
+        fid: &Fid,
+    ) {
+        if length == 0 {
+            return;
+        }
+        let write_end = offset + length;
+        let start_chunk_idx = offset / chunk_size;
+        let end_chunk_idx = (write_end - 1) / chunk_size;
+
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            let fid_str = fid.to_string();
+            let cookie = fid.cookie as u32;
+            let mtime = entry.mtime.max(0) as u64;
+
+            for chunk_idx in start_chunk_idx..=end_chunk_idx {
+                let chunk_offset = chunk_idx * chunk_size;
+                let chunk_data_end = write_end.min(chunk_offset + chunk_size);
+                let chunk_data_size = chunk_data_end - chunk_offset;
+
+                if let Some(chunk) = entry.chunks.iter_mut().find(|c| c.offset == chunk_offset) {
+                    // Extend the chunk size to cover the new write
+                    chunk.size = chunk.size.max(chunk_data_size);
+                } else {
+                    // Create a new chunk entry for this offset
+                    entry.chunks.push(CachedFileChunk {
+                        offset: chunk_offset,
+                        size: chunk_data_size,
+                        mtime,
+                        fid: fid_str.clone(),
+                        cookie,
+                        crc32: 0,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn update_attr(&self, inode: u64, params: UpdateAttrParams) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
