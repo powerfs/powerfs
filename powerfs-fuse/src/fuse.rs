@@ -843,10 +843,20 @@ impl FileSystem for PowerFsFs {
 
     fn init(
         &self,
-        _capable: fuse_backend_rs::api::filesystem::FsOptions,
+        capable: fuse_backend_rs::api::filesystem::FsOptions,
     ) -> std::io::Result<fuse_backend_rs::api::filesystem::FsOptions> {
-        // Disable WRITEBACK_CACHE for immediate metadata sync across clients
-        Ok(fuse_backend_rs::api::filesystem::FsOptions::empty())
+        // Enable BIG_WRITES + MAX_PAGES so the kernel negotiates max_write=1MB
+        // instead of the default 4KB. Without these flags, 1M writes are split
+        // into 256 x 4K FUSE round-trips (52μs each = 13.3ms/MB ≈ 70 MiB/s).
+        // WRITEBACK_CACHE remains disabled for immediate metadata sync across clients.
+        let mut opts = fuse_backend_rs::api::filesystem::FsOptions::empty();
+        if capable.contains(fuse_backend_rs::api::filesystem::FsOptions::BIG_WRITES) {
+            opts |= fuse_backend_rs::api::filesystem::FsOptions::BIG_WRITES;
+        }
+        if capable.contains(fuse_backend_rs::api::filesystem::FsOptions::MAX_PAGES) {
+            opts |= fuse_backend_rs::api::filesystem::FsOptions::MAX_PAGES;
+        }
+        Ok(opts)
     }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {

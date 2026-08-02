@@ -1305,9 +1305,9 @@ for (_, chunk_idx) in &dirty {
 | Phase 1 (Raft, Step 7) | 53.2 MiB/s | 122 MiB/s | 56.9 MiB/s | 18.0 MiB/s | Filer 强一致，无客户端缓存 |
 | Phase 2 (修复前) | 18.7 MiB/s | 92.2 MiB/s | 9.3 MiB/s | 8.2 MiB/s | lease + callback + read-before-write |
 | Phase 2 (当前) | 53.4 MiB/s | 252 MiB/s | 23.8 MiB/s | 6.5 MiB/s | read-before-write 优化 + getattr 修复 |
-| **P0 修复后（预期）** | **~10 GiB/s** | ~10 GiB/s | — | — | BIG_WRITES + MAX_PAGES |
+| **P0 修复后（实测）** | **1642 MiB/s** | **1292 MiB/s** | 39.0 MiB/s | 7.8 MiB/s | BIG_WRITES + MAX_PAGES |
 
-**结论**：从 GB/s 降到 ~70 MiB/s 的主因是 `init` 返回 `FsOptions::empty()` 导致 `max_write=4KB`。这是一个 1 行代码的配置遗漏，修复后预期恢复 GB/s 级别。
+**结论**：P0 修复（`init` 启用 `BIG_WRITES` + `MAX_PAGES`）实测提升 30.7 倍顺序写、5.1 倍顺序读，恢复 GB/s 级别。随机读写提升较小（4K 不受 max_write 限制），后续优化需聚焦 P1（并行 flush/read + 减少 block_on）。
 
 
 
