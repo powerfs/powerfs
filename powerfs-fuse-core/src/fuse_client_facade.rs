@@ -242,7 +242,7 @@ pub struct FuseClientFacade {
     topology_manager: Arc<ClusterTopologyManager>,
     /// Master 客户端
     master_client: Arc<MasterClient>,
-    /// MetaShard 客户端（Arc 包装：供 CrdtReplicaCoherence 作为 DeltaSyncChannel 注入）
+    /// MetaShard 客户端（Arc 包装：实现 DeltaSyncChannel trait）
     meta_shard_client: Arc<MetaShardClient>,
     /// Volume 客户端
     volume_client: Arc<VolumeClient>,
@@ -446,7 +446,7 @@ impl FuseClientFacade {
         self.config.client_identity.client_id.to_string()
     }
 
-    /// 获取客户端 u64 ID（用于 EntryId / VectorClock / CrdtReplicaCoherence）
+    /// 获取客户端 u64 ID（用于 lease 标识与元数据同步）
     pub fn client_id_u64(&self) -> u64 {
         self.config.client_identity.client_id
     }

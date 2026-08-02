@@ -1026,30 +1026,6 @@ impl MetaShardClient {
         }
     }
 
-    /// push_delta：将本地变更 delta 推送到 filer（leader only）。
-    pub async fn push_delta(
-        &self,
-        req: &powerfs_coherence::PushDeltaRequest,
-    ) -> Result<powerfs_coherence::PushDeltaResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
-        let resp_body = self
-            .send_coherence_msg(powerfs_net::MsgType::PushDelta, req.shard_id, body)
-            .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
-    }
-
-    /// pull_delta：从 filer 拉取其他客户端的 delta（leader only）。
-    pub async fn pull_delta(
-        &self,
-        req: &powerfs_coherence::PullDeltaRequest,
-    ) -> Result<powerfs_coherence::PullDeltaResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
-        let resp_body = self
-            .send_coherence_msg(powerfs_net::MsgType::PullDelta, req.shard_id, body)
-            .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
-    }
-
     /// alloc_inode_batch：向 filer 申请 inode 预留段（leader only）。
     pub async fn alloc_inode_batch(
         &self,
@@ -1111,25 +1087,11 @@ impl MetaShardClient {
 }
 
 // ---------------------------------------------------------------------------
-// DeltaSyncChannel trait 实现：供 CrdtReplicaCoherence 注入使用
+// DeltaSyncChannel trait 实现：强一致路径下封装 meta_shard_client 的 RPC 调用
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
 impl powerfs_coherence::DeltaSyncChannel for MetaShardClient {
-    async fn push_delta(
-        &self,
-        req: &powerfs_coherence::PushDeltaRequest,
-    ) -> Result<powerfs_coherence::PushDeltaResponse, String> {
-        MetaShardClient::push_delta(self, req).await
-    }
-
-    async fn pull_delta(
-        &self,
-        req: &powerfs_coherence::PullDeltaRequest,
-    ) -> Result<powerfs_coherence::PullDeltaResponse, String> {
-        MetaShardClient::pull_delta(self, req).await
-    }
-
     async fn alloc_inode_batch(
         &self,
         req: &powerfs_coherence::AllocInodeBatchRequest,
@@ -1142,6 +1104,20 @@ impl powerfs_coherence::DeltaSyncChannel for MetaShardClient {
         req: &powerfs_coherence::UpdateInodeSizeChunksRequest,
     ) -> Result<powerfs_coherence::UpdateInodeSizeChunksResponse, String> {
         MetaShardClient::update_inode_size_chunks(self, req).await
+    }
+
+    async fn open_count_inc(
+        &self,
+        req: &powerfs_coherence::OpenCountRequest,
+    ) -> Result<powerfs_coherence::OpenCountResponse, String> {
+        MetaShardClient::open_count_inc(self, req).await
+    }
+
+    async fn open_count_dec(
+        &self,
+        req: &powerfs_coherence::OpenCountRequest,
+    ) -> Result<powerfs_coherence::OpenCountResponse, String> {
+        MetaShardClient::open_count_dec(self, req).await
     }
 }
 

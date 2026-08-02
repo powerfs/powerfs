@@ -786,3 +786,50 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 - 1c. rename TLV 改用 NewParentIno/NewName + 删除死代码 build_write_tlv（范围缩小）
 - 1d. Transport trait（不变）
 - 1e. 删除废弃 MetadataProvider trait（不变）
+
+### 2026-08-02 Step 1 完成记录
+
+**Commit**: `de0832e5` refactor(metadata): add MetadataClient trait and Transport abstraction for strong consistency
+
+**完成内容**：
+- 1a. ✅ 定义 MetadataClient trait（13 个方法：lookup/mkdir/create/unlink/rmdir/rename/symlink/readlink/link/readdir/getattr/setattr/statfs）
+- 1b. ✅ MetaShardClient 实现 MetadataClient trait（TLV 编码 + send_coherence_msg + TLV 解码）
+- 1c. ✅ rename TLV 改用 NewParentIno/NewName（Filer 侧已使用，客户端侧同步）
+- 1d. ✅ Transport/TransportPool/BatchTransport trait（powerfs-net/src/transport.rs）
+- 1e. ⏭️ 废弃 MetadataProvider trait 延后到 Step 3 删除 CRDT 时一起处理
+
+**额外修复**：
+- 补充 serialize.rs 缺少的 encode/decode 函数（mkdir/unlink/rmdir/attr_resp/statfs）
+- 新增 FieldId::Free/FreeInodes/BlockSize 用于 statfs
+- decode_attr_resp 使用循环遍历方式（而非顺序 unwrap_or），正确处理缺失字段
+
+**验证**：
+- cargo check --workspace: 全部 13 个 package 编译通过
+- cargo clippy: 0 警告（修复 8 个 unnecessary_cast）
+- cargo fmt: 通过
+- cargo test: 12 passed, 1 failed（test_request_kind_priority 为 pre-existing 失败，与本次改动无关）
+
+### 2026-08-02 Step 2 完成记录
+
+**Commit**: `f5e886cc` refactor(fuse): replace CRDT coherence calls with MetadataClient RPC
+
+**完成内容**：
+- 2a. ✅ 9 个 FUSE 回调改写（lookup/mkdir/rmdir/unlink/create/setattr/readdir/rename/entry_exists）
+- 2b. ⏭️ Raft 读语义：Filer 侧已实现 check_leader（Leader Lease Read），客户端侧无需额外处理
+- 2c. ⏭️ 跨客户端可见性：open 时强制 getattr 已有逻辑（保留现有 getattr 缓存 + TTL_OPEN 机制）
+
+**调整记录**：
+- getattr 未改为 MetadataClient.getattr：因为现有 get_entry_by_inode 返回完整 FilerEntry（含 chunks/fid/path），而 MetadataAttr 缺少这些字段。getattr 是读操作，走现有 Filer RPC 不影响强一致性（Filer check_leader 已保证 Leader Lease Read）。
+- symlink/link/readlink 未改为 MetadataClient：这些操作使用 powerfs-net 协议直接调 Filer handler（非 coherence 调用），已是强一致路径。EEXIST 检查通过 entry_exists 间接走 metadata_client.lookup。
+- 删除的死代码：remove_entry_with_fallback、lookup_attr_from_filer、coherence.force_sync in sync_size_chunks_on_close
+
+**保留的 coherence 调用**（非 CRDT，强一致数据路径）：
+- sync_size_chunks / update_inode_size_chunks（close 时同步 size/chunks）
+- open_count_inc / open_count_dec（GC 追踪）
+- coherence 字段 + start_flusher/start_puller（Step 3 清理）
+
+**验证**：
+- cargo check: 编译通过
+- cargo clippy: 0 警告
+- cargo fmt: 通过
+- 代码量：-408 行 / +235 行（净减 173 行，9 个回调从多源 CRDT 逻辑简化为单路径 RPC）

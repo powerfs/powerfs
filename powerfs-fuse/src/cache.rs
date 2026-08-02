@@ -894,30 +894,6 @@ impl Default for MetadataCache {
     }
 }
 
-/// MetadataCache 的 MetadataCacheInvalidator trait 适配器。
-///
-/// 供 CrdtReplicaCoherence 注入：delta merge 后联动失效 MetadataCache。
-/// size/chunks 不被失效（强一致，仅 lease 刷新）。
-pub struct MetadataCacheInvalidatorAdapter {
-    cache: std::sync::Arc<MetadataCache>,
-}
-
-impl MetadataCacheInvalidatorAdapter {
-    pub fn new(cache: std::sync::Arc<MetadataCache>) -> Self {
-        Self { cache }
-    }
-}
-
-impl powerfs_coherence::MetadataCacheInvalidator for MetadataCacheInvalidatorAdapter {
-    fn invalidate_inode(&self, inode: u64) {
-        self.cache.invalidate_inode(inode);
-    }
-
-    fn invalidate_dir(&self, parent_inode: u64) {
-        self.cache.invalidate_dir(parent_inode);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

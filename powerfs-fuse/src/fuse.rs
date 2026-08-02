@@ -134,24 +134,10 @@ impl FuseApp {
 
         let cache = Arc::new(MetadataCache::new());
 
-        // Phase 3: 构建 CrdtReplicaCoherence（目录条目 CRDT 副本 + 异步 delta sync）
-        let invalidator = Arc::new(crate::cache::MetadataCacheInvalidatorAdapter::new(
-            cache.clone(),
-        ));
-        let delta_channel: Arc<dyn powerfs_coherence::DeltaSyncChannel> =
-            sync_client.facade().meta_shard_client().clone();
-        let coherence = Arc::new(powerfs_coherence::crdt_client::CrdtReplicaCoherence::new(
-            delta_channel,
-            invalidator,
-            sync_client.facade().client_id_u64(),
-            powerfs_coherence::crdt_client::CrdtConfig::default(),
-        ));
-
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
             chunk_cache: Arc::new(ChunkCache::with_defaults()),
-            coherence: coherence.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
@@ -165,11 +151,6 @@ impl FuseApp {
             lease_duration_ms: 30000,      // 30 seconds lease
             open_inodes: Arc::new(RwLock::new(HashSet::new())),
         };
-
-        // Phase 3: 启动 change_cache_flusher + 后台 puller
-        let flusher_handle = fs.coherence.clone().start_flusher();
-        let puller_handle = fs.coherence.clone().start_puller();
-        let _ = (flusher_handle, puller_handle); // 持有 JoinHandle 生命周期
 
         let fs_arc = Arc::new(fs);
         let bg_fs = fs_arc.clone();
@@ -288,8 +269,6 @@ struct PowerFsFs {
     client: Arc<SyncFuseClientFacade>,
     cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
-    /// Phase 3: CRDT 副本一致性（目录条目本地 apply + 异步 delta sync）
-    coherence: Arc<powerfs_coherence::crdt_client::CrdtReplicaCoherence>,
     collection: String,
     replication: String,
     locks: Arc<RwLock<FileLocks>>,
@@ -649,11 +628,11 @@ impl PowerFsFs {
         let max_retries = 5u32;
         let mut last_err = String::new();
         for attempt in 1..=max_retries {
-            let coherence = self.coherence.clone();
+            let meta_client = self.client.facade().meta_shard_client().clone();
             let req = req.clone();
             let result = self
                 .client
-                .block_on(async move { coherence.sync_size_chunks(&req).await });
+                .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
             match result {
                 Ok(resp) if resp.success => {
                     debug!(
