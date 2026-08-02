@@ -20,7 +20,10 @@ pub use circuit_breaker::{
 };
 pub use client_error::{ClientError, ClientResult};
 pub use client_identity::ClientIdentity;
-pub use fuse_client_facade::{FuseClientFacade, FuseClientFacadeConfig, SyncFuseClientFacade};
+pub use fuse_client_facade::{
+    FuseClientFacade, FuseClientFacadeConfig, ReadBlobRequest, SyncFuseClientFacade,
+    WriteBlobRequest,
+};
 pub use lease::{LeaseGuard, LeaseManager, LeaseMode, LeaseState, LeaseToken, VolumeLeaseManager};
 pub use meta_shard_client::{
     ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,

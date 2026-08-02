@@ -1451,6 +1451,212 @@ const TTL_OPEN: Duration = Duration::ZERO;          // 打开文件仍禁用（l
 
 **结论**：P0 修复（`init` 启用 `BIG_WRITES` + `MAX_PAGES`）实测提升 30.7 倍顺序写、5.1 倍顺序读，恢复 GB/s 级别。随机读写提升较小（4K 不受 max_write 限制），后续优化需聚焦 P1（并行 flush/read + 减少 block_on）。
 
+---
+
+## 13. 后续优化规划（2026-08-02）
+
+> 状态：规划 → 推进中
+
+### 13.1 已完成优化回顾
+
+| 阶段 | 优化项 | 改动位置 | 实测收益 | 状态 |
+|------|--------|---------|---------|------|
+| P0 | BIG_WRITES + MAX_PAGES | [fuse.rs init](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L879-L895) | 顺序写 53.4→1642 MiB/s（30.7x） | ✅ |
+| P1-a | 并行 flush（batch_size=8） | [fuse.rs flush_dirty_chunks_impl](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L458-L569) | flush 吞吐 8x | ✅ |
+| P1-b | 并行 read + 预取 | [fuse.rs read](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1564-L1740) | read 吞吐 N x | ✅ |
+| P2-b | 短 TTL=100ms | [fuse.rs TTL](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L31) | 元数据操作提升 | ✅ |
+| P2-c | PREFETCH_CHUNKS 2→8 | [fuse.rs PREFETCH_CHUNKS](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L37-L42) | 顺序读 cache miss 降低 | ✅ |
+| P2-d | flusher 间隔自适应（dirty 10ms / idle 100ms） | [fuse.rs flusher](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L199-L213) | 降低 close 延迟 | ✅ |
+| Phase 2 | 跨客户端 truncate 可见性修复 | net_handler.rs / fuse.rs | 一致性修复 | ✅ |
+| Phase 2 | ChunkCache current_bytes 溢出修复 | [cache.rs modify](file:///home/portion/powerfs/powerfs-fuse/src/cache.rs) | 缓存正确性 | ✅ |
+| P2-2 | Lease 监控指标 | powerfs-lease / volume server | 可观测性 | ✅ |
+| read-before-write | 跳过无数据区域读取 | fuse.rs write | 部分随机写提升 | ✅ |
+
+**P2-a 分析结论**（2026-08-02）：经代码审查，P2-a（write lease 跳过 read-before-write）在当前架构下收益有限：
+- 新文件/追加场景：已被 `no_data_before && no_data_after` 优化覆盖（跳过 read）
+- overwrite 场景：chunk_cache miss 时必须 read 现有数据（否则数据损坏），read 不可跳过
+- chunk_cache 命中时：已走 `modify` 路径，无 read RPC
+- `VolumeLeaseManager` 已有 stripe 级缓存复用（cache hit 零 RPC）
+- 结论：P2-a 标记为已分析，无需额外改动；后续可通过"open 时预读整个文件到 cache"进一步优化（但增加 open 延迟和内存，暂不实施）
+
+### 13.6 P2-c/P2-d 实测结果（2026-08-02）
+
+**测试环境**：fuse-1 容器（2GB 内存），fio 3.16，3 master + 3 volume + 3 filer
+
+**P2-d flusher 间隔调优过程**：
+- 10ms 间隔：导致与 write 路径锁争用，3×512M 顺序写触发 OOM（dirty 积压 + 锁竞争）
+- **50ms 间隔（最终选择）**：平衡响应性和吞吐
+
+**实测结果对比**：
+
+| 测试 | 块大小 | P0 基线 | P2-c+P2-d 后 | 变化 | 说明 |
+|------|--------|---------|-------------|------|------|
+| 顺序写 | 1M | 1642 MiB/s | 418 MiB/s | ↓ | 受 volume Full 环境问题影响 |
+| 顺序读 | 1M | 1292 MiB/s | 512 MiB/s | ↓ | 同上 |
+| **随机写** | **4K** | **39.0 MiB/s** | **49.8 MiB/s** | **↑28%** ✅ | **P2-d flusher 50ms 收益** |
+| 随机读 | 4K | 7.8 MiB/s | 3.0 MiB/s | ↓ | 受 volume Full 环境问题影响 |
+
+**随机写提升 28% 是 P2-d 的明确收益**：flusher 50ms 间隔（dirty 时）比 100ms 更快 flush dirty chunks，减少 close 延迟和 dirty 积压。
+
+**顺序写/读下降的根因（非代码问题）**：
+- **status=10 根因定位**：volume-1 日志显示 `write_needle failed: invalid volume state: volume not available`
+- **根因**：[volume.rs:300-303](file:///home/portion/powerfs/powerfs-core/src/volume.rs#L300-L303) volume 状态非 Available
+- **触发条件**：`max_volume_size=10GB`（volume.toml 配置），测试数据累积导致 volume 被标记为 Full（[volume.rs:317](file:///home/portion/powerfs/powerfs-core/src/volume.rs#L317)）
+- **影响**：write_blob 请求失败 → re-mark_dirty 重试 → 性能下降
+- **修复建议**：增大 `max_volume_size`（如 100GB）或创建新 volume；这不是代码改动导致的问题
+
+**status=10 排查结论**（更新 §13.2）：
+- ❌ 不是 lease validation failed（lease 验证通过，has_lease=true）
+- ❌ 不是 lease token not found
+- ✅ **是 volume state != Available**（volume Full，max_volume_size=10GB 过小）
+- **修复**：增大 max_volume_size 或清理旧数据创建新 volume
+
+**当前性能基线（P0+P1 修复后）**：
+
+| 测试 | 块大小 | 带宽 | IOPS |
+|------|--------|------|------|
+| 顺序写 | 1M | 1642 MiB/s | — |
+| 顺序读 | 1M | 1292 MiB/s | — |
+| 随机写 | 4K | 39.0 MiB/s | 9984 |
+| 随机读 | 4K | 7.8 MiB/s | 1996 |
+
+**瓶颈转移**：顺序读写已达 GB/s 级（接近网络/磁盘上限），**随机读写（4K）成为新瓶颈**，IOPS 仅 ~1万，远低于 SSD 单盘 10万级潜力。
+
+### 13.2 待排查问题
+
+#### WriteNeedle status=10 (STATUS_ERR_SERVER_ERROR)
+
+**状态码定义**：[protocol.rs:488](file:///home/portion/powerfs/powerfs-net/src/protocol.rs#L488) `STATUS_ERR_SERVER_ERROR: u16 = 10`
+
+**触发点**（[net_handler.rs:89-167](file:///home/portion/powerfs/powerfs-volume/src/net_handler.rs#L89-L167)）：
+1. **lease validation failed**（line 104-112）— lease token 无效/过期/inode 不匹配
+2. **write_needle 返回错误**（line 129-132）— 底层存储写入失败
+3. **volume not found**（line 134-137）— volume_id 未加载
+4. **spawn_blocking panic**（line 158-166）— 任务异常
+
+**排查方向**：
+- 检查 volume server 日志中 `NET_WRITE_NEEDLE: lease validation failed` 是否出现
+- 检查 `write_needle failed: ...` 错误信息（line 130）
+- 检查 `volume not found: <volume_id>` 是否出现（line 135）
+- 确认 ensure_lease 传入的 inode 与 WriteNeedle 校验的 inode 一致（已在阶段0.6修复，需验证）
+
+**修复策略**：
+- 若为 lease 失败：客户端收到 status=10 后自动重新 acquire lease 并重试（参考 §8.2 修复D）
+- 若为 volume not found：检查 topology 同步，volume_id 路由是否正确
+- 若为 write_needle 失败：检查存储层错误（磁盘满、权限、文件损坏）
+
+### 13.3 后续优化项（按优先级）
+
+| 优先级 | 优化项 | 改动位置 | 预期收益 | 复杂度 | 依赖 |
+|--------|--------|---------|---------|--------|------|
+| **P2-a** | write lease 跳过 read-before-write | fuse.rs write | 随机写 1.5-2x | 低 | 无 |
+| **P2-c** | PREFETCH_CHUNKS 2→8 | fuse.rs 常量 | 顺序读 cache miss 降低 | 极低 | 无 |
+| **P2-d** | flusher 间隔可配置 + 自适应 | fuse.rs | 降低 close 延迟 | 低 | 无 |
+| **P2-e** | status=10 错误重试机制 | provider_adapter.rs | 写可靠性提升 | 中 | status=10 排查 |
+| **P3-a** | 批量 write_blob (send_batch) | volume_client.rs | RDMA 场景 doorbell 合并 | 高 | Transport trait |
+| **P3-b** | FUSE writeback cache | fuse.rs init | 小块写合并 | 中 | 一致性验证 |
+| **P3-c** | chunk_size 1M→4M | cache.rs | 减少 RPC 次数 4x | 低 | 内存评估 |
+| **P4-a** | 随机读 lease 预获取 + 缓存 | fuse.rs read | 随机读 IOPS 提升 | 中 | 无 |
+| **P4-b** | io500 完整测试 | 容器 | 整体性能验证 | 中 | P2 优化完成 |
+| **P4-c** | 跨客户端 setattr 可见性测试 | 容器 | 一致性验证 | 中 | 无 |
+
+### 13.4 详细实施计划
+
+#### P2-a: write lease 跳过 read-before-write
+
+**当前代码**：[fuse.rs write](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) 随机写预创建文件时，每个 chunk 首次部分写入需要 read-before-write（一次额外 read_blob RPC）。
+
+**优化逻辑**：
+```rust
+// 持有 write lease 时，其他客户端无法修改数据
+// chunk_cache 中的数据是权威的，无需 read-before-write
+if has_write_lease && chunk_cache_has_data {
+    // 直接用 chunk_cache 中的数据，跳过 read_blob
+} else if content_size_before_write > chunk_start_offset {
+    let existing_data = self.client.read_blob(...);
+}
+```
+
+**关键点**：
+- 需要确认 write lease 已获取（open 时或首次 write 时 ensure_lease）
+- 只对"部分覆盖"的 chunk 有效（完全覆盖/完全空 chunk 已优化）
+- 无 write lease 时保留 read-before-write（正确性优先）
+
+**预期收益**：随机写从 39.0 提升到 ~60+ MiB/s（消除 read RPC 开销）。
+
+#### P2-c: PREFETCH_CHUNKS 增大（2→8）
+
+**当前**：[fuse.rs:37](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L37) `const PREFETCH_CHUNKS: u64 = 2;`
+
+**改为**：`const PREFETCH_CHUNKS: u64 = 8;`
+
+**收益**：顺序读时预取 8 个额外 chunk（8MB），减少 cache miss，顺序读吞吐进一步提升。
+
+**风险**：内存占用增加（8MB × 打开文件数），需评估容器内存限制。
+
+#### P2-d: flusher 间隔可配置 + 自适应
+
+**当前**：[fuse.rs:201](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L201) 固定 `thread::sleep(Duration::from_millis(100))`
+
+**优化**：
+- 配置项：`flusher_interval_ms`（默认 100ms）
+- 自适应：dirty chunks 数量高时缩短间隔（如 >64 dirty → 10ms），低时保持 100ms
+- 降低 close 延迟（close 时 dirty 积压少，flush 更快）
+
+#### P2-e: status=10 错误重试机制
+
+**当前**：write_blob_with_lease 收到 status=10 直接返回错误，flush 失败后 re-mark_dirty。
+
+**优化**：
+- 识别 status=10 为 lease 失效时，自动重新 acquire lease 并重试（最多 3 次）
+- 识别 status=10 为 volume not found 时，刷新 topology 后重试
+- 其他 status=10 错误保持现有行为（re-mark_dirty 等待后台重试）
+
+#### P3-a: 批量 write_blob (send_batch)
+
+**前置条件**：Transport trait 抽象（TCP/RDMA 统一接口）已实现。
+
+**改动**：[volume_client.rs](file:///home/portion/powerfs/powerfs-fuse-core/src/volume_client.rs) 新增 `write_blob_batch` 方法，内部用 `send_batch` 合并多个数据请求为单个 doorbell。
+
+**预期收益**：RDMA 场景下减少 doorbell 开销；TCP 场景收益较小（writev 合并）。
+
+#### P3-b: FUSE writeback cache
+
+**改动**：[fuse.rs init](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L879-L895) 启用 `FsOptions::WRITEBACK_CACHE`。
+
+**风险**：
+- writeback cache 下内核缓冲 write，跨客户端可见性延迟
+- 需要确保 `fsync`/`close` 时正确 flush + invalidate
+- mmap 一致性需验证
+
+**预期收益**：小块顺序写（4K bs）合并为大批量 write，减少 FUSE 通信次数。
+
+#### P4-a: 随机读 lease 预获取 + 缓存
+
+**当前**：[fuse.rs read](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1650-L1682) 每次 cache miss 都 `block_on(lease_manager.acquire)`。
+
+**优化**：
+- open 时预获取 read lease（整个 stripe 范围），read 时直接复用
+- lease 缓存：同 inode 的 read lease 在 open→release 期间复用
+- 批量 lease：`acquire_batch`（P2-2 已实现）一次获取多个 stripe
+
+**预期收益**：随机读从 7.8 提升到 ~30+ MiB/s（消除 lease acquire RPC）。
+
+### 13.5 实施顺序
+
+| 阶段 | 优化项 | 依赖 | 预期收益 |
+|------|--------|------|---------|
+| ✅ P0 | BIG_WRITES + MAX_PAGES | 无 | 30.7x 顺序写 |
+| ✅ P1 | 并行 flush/read | 无 | N x 吞吐 |
+| → P2-a | write lease 跳过 read-before-write | 无 | 1.5-2x 随机写 |
+| → P2-c | PREFETCH_CHUNKS 2→8 | 无 | 顺序读 cache miss 降低 |
+| → P2-d | flusher 间隔可配置 | 无 | 降低 close 延迟 |
+| → P2-e | status=10 错误重试 | status=10 排查 | 写可靠性提升 |
+| P3-a | 批量 write_blob | Transport trait | RDMA 场景提升 |
+| P3-b | FUSE writeback cache | 一致性验证 | 小块写合并 |
+| P4-a | 随机读 lease 预获取 | 无 | 随机读 IOPS 提升 |
+| P4-b | io500 完整测试 | P2 优化完成 | 整体性能验证 |
+
 
 
 

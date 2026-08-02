@@ -820,6 +820,26 @@ pub struct SyncFuseClientFacade {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
+/// Parameters for a single chunk write in a batch flush.
+#[derive(Clone)]
+pub struct WriteBlobRequest {
+    pub volume_id: u64,
+    pub file_key: u64,
+    pub inode: u64,
+    pub offset: i64,
+    pub size: i32,
+    pub data: Vec<u8>,
+}
+
+/// Parameters for a single chunk read in a batch fetch.
+#[derive(Clone)]
+pub struct ReadBlobRequest {
+    pub volume_id: u64,
+    pub file_key: u64,
+    pub offset: i64,
+    pub size: i32,
+}
+
 impl SyncFuseClientFacade {
     pub fn new(facade: Arc<FuseClientFacade>, runtime: Arc<tokio::runtime::Runtime>) -> Self {
         Self { facade, runtime }
@@ -1265,6 +1285,69 @@ impl SyncFuseClientFacade {
                 Ok(data) => Ok(data),
                 Err(e) => Err(pfe_to_string(e)),
             }
+        })
+    }
+
+    /// Batch write multiple chunks in parallel using tokio::join_all.
+    /// Each chunk is sent concurrently (up to the runtime's thread pool),
+    /// reducing total flush time from N×latency to ~1×latency.
+    pub fn write_blob_batch_with_lease(
+        &self,
+        requests: Vec<WriteBlobRequest>,
+        lease_token: Option<&str>,
+    ) -> Vec<Result<(), String>> {
+        let facade = self.facade.clone();
+        let lease_owned = lease_token.map(|s| s.to_string());
+        self.runtime.block_on(async move {
+            let futures: Vec<_> = requests
+                .into_iter()
+                .map(|req| {
+                    let facade = facade.clone();
+                    let lease_ref = lease_owned.as_deref();
+                    async move {
+                        let provider =
+                            crate::provider_adapter::FacadeStorageProvider::new(facade);
+                        provider
+                            .write_blob_with_lease(
+                                req.volume_id,
+                                req.file_key,
+                                req.inode,
+                                req.offset,
+                                req.size,
+                                &req.data,
+                                lease_ref,
+                            )
+                            .await
+                            .map_err(pfe_to_string)
+                    }
+                })
+                .collect();
+            futures::future::join_all(futures).await
+        })
+    }
+
+    /// Batch read multiple chunks in parallel using tokio::join_all.
+    pub fn read_blob_batch(
+        &self,
+        requests: Vec<ReadBlobRequest>,
+    ) -> Vec<Result<Vec<u8>, String>> {
+        let facade = self.facade.clone();
+        self.runtime.block_on(async move {
+            let futures: Vec<_> = requests
+                .into_iter()
+                .map(|req| {
+                    let facade = facade.clone();
+                    async move {
+                        let provider =
+                            crate::provider_adapter::FacadeStorageProvider::new(facade);
+                        provider
+                            .read_blob(req.volume_id, req.file_key, req.offset, req.size)
+                            .await
+                            .map_err(pfe_to_string)
+                    }
+                })
+                .collect();
+            futures::future::join_all(futures).await
         })
     }
 
