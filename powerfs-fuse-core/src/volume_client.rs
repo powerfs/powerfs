@@ -791,10 +791,18 @@ impl VolumeClient {
         duration: std::time::Duration,
     ) {
         let key = (volume_id, inode);
+        // Always overwrite token + duration: ensure_lease may acquire a NEW
+        // token (e.g. after local expiry) and the cached entry must reflect
+        // the latest server-side token. Previously this only called renew()
+        // on the existing entry, leaving the stale token in place — release
+        // then sent the old token, the server replied "Lease not found", and
+        // the orphaned server-side lease blocked all future acquires
+        // ("Stripe lease conflict").
         let mut lease = self
             .leases
             .entry(key)
             .or_insert_with(|| LeaseInfo::new(token.clone(), duration));
+        lease.token = token;
         lease.renew(duration);
     }
 

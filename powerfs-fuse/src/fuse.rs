@@ -105,6 +105,11 @@ impl FuseApp {
                 .to_string()
         };
 
+        let client_identity = powerfs_fuse_core::ClientIdentity::stable_for(&self.mount_point);
+        info!(
+            "Phase 2: FUSE client_identity client_id={} uuid={} (hostname+mount_point={})",
+            client_identity.client_id, client_identity.client_uuid, self.mount_point
+        );
         let facade_config = powerfs_fuse_core::FuseClientFacadeConfig {
             master_addr: master_addr.clone(),
             master_port: self.master_net_port,
@@ -113,7 +118,7 @@ impl FuseApp {
             filer_addr: self.filer_addr.clone(),
             filer_port: self.filer_net_port,
             request_timeout: Duration::from_secs(10),
-            client_identity: powerfs_fuse_core::ClientIdentity::stable_for(&self.mount_point),
+            client_identity,
             mount_point: self.mount_point.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
@@ -133,6 +138,24 @@ impl FuseApp {
         ));
 
         let cache = Arc::new(MetadataCache::new());
+        // Create the chunk (data) cache up front so it can be shared with the
+        // InvalidateHandler: a metadata Invalidate means the file's size/chunks
+        // changed, so the client must drop cached file data as well to avoid
+        // serving stale reads after another client modifies the file.
+        let chunk_cache = Arc::new(ChunkCache::with_defaults());
+
+        // Phase 2: Wire up InvalidateHandler so the FUSE client receives
+        // server-pushed Invalidate notifications from the Filer and evicts
+        // stale metadata cache entries when another client modifies the
+        // same directory.
+        let invalidate_handler = Arc::new(crate::invalidate_handler::InvalidateHandler::new(
+            cache.clone(),
+            chunk_cache.clone(),
+        ));
+        sync_client
+            .facade()
+            .meta_shard_client()
+            .set_notification_handler(invalidate_handler);
 
         let lease_manager = Arc::new(VolumeLeaseManager::new(
             sync_client.facade().clone(),
@@ -142,7 +165,7 @@ impl FuseApp {
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
-            chunk_cache: Arc::new(ChunkCache::with_defaults()),
+            chunk_cache,
             collection: self.collection.clone(),
             replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
@@ -303,6 +326,20 @@ type WriteLockMap = HashMap<(u64, u64), Arc<std::sync::Mutex<()>>>;
 type WriteLocks = Arc<std::sync::Mutex<WriteLockMap>>;
 type DirtyShardSet = HashSet<(u64, u64)>;
 type DirtyShards = Vec<Arc<RwLock<DirtyShardSet>>>;
+
+/// Compare two chunks lists for equality. Used by open() to decide whether
+/// to clear the chunk cache: if the Filer's chunks match the cached chunks,
+/// the cached file data is still valid and should be preserved (critical for
+/// append writes). Comparison is by fid, offset, and size — the fields that
+/// determine what data to read from the Volume.
+fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.fid == y.fid && x.offset == y.offset && x.size == y.size
+    })
+}
 
 /// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
 ///
@@ -948,13 +985,18 @@ impl FileSystem for PowerFsFs {
         };
 
         // Step 2: 通过 MetadataClient.setattr RPC 走 Filer Raft leader（强一致）
-        // 同步 mode/uid/gid/atime/mtime 到 filer。size 变更由 close 时
-        // sync_size_chunks_on_close 强一致同步（含 chunks），此处不传 size。
+        // 同步 mode/uid/gid/atime/mtime/size 到 filer。
+        //
+        // size 必须在此处同步（不能仅依赖 close 时的 sync_size_chunks_on_close），
+        // 否则 truncate 后其他客户端通过 Filer 读取时 attrs.size 仍为旧值，
+        // 导致 read 路径使用过期的 file_size 读取超出实际内容的数据。
+        // 例：echo "short" > file（file 原有 28 字节）→ setattr(SIZE=0) → write(6)
+        // 若不传 size，Filer 的 attrs.size=28，其他客户端读到 28 字节（6 新 + 22 旧）。
         let params = SetattrParams {
             mode,
             uid,
             gid,
-            size: None,
+            size,
             atime,
             mtime,
         };
@@ -978,6 +1020,31 @@ impl FileSystem for PowerFsFs {
                 mtime: mtime.map(|t| t as i64),
             },
         );
+
+        // Truncate 处理：清除旧数据缓存，防止 read/flush 返回 truncate 前的残留数据。
+        //
+        // 关键场景：echo "short" > file（file 原有 28 字节）
+        // 1. setattr(SIZE=0) — truncate
+        // 2. write("short\n", 6 bytes)
+        // 3. release → sync_size_chunks_on_close(content_size=6)
+        //
+        // 若不清除 ChunkCache，步骤 2 仅覆盖前 6 字节，残留 22 字节旧数据。
+        // flush 到 volume server 后，其他客户端读取时 attrs.size 可能仍为旧值（28），
+        // 导致读取 28 字节（6 新 + 22 旧），而非正确的 6 字节。
+        if let Some(new_size) = size {
+            // 清除 ChunkCache：truncate 丢弃所有缓存数据，下次 read/write 从头开始
+            self.chunk_cache.remove_inode_chunks(inode);
+            // truncate 到 0 时清除 chunks 列表（无数据块）
+            if new_size == 0 {
+                self.cache.update_chunks(inode, Vec::new());
+            }
+            // 更新 content_size 与 size 一致（update_attr 只更新 size，不更新 content_size）
+            self.cache.update_size(inode, new_size);
+            debug!(
+                "setattr: truncated inode={} to size={}, cleared chunk cache",
+                inode, new_size
+            );
+        }
 
         if let Some(updated) = self.cache.get_inode(inode) {
             Ok((self.create_stat(&updated), TTL))
@@ -1242,17 +1309,93 @@ impl FileSystem for PowerFsFs {
 
         // Phase 4.4: open 时从 filer 刷新 size/chunks（权威账本），填充 MetadataCache。
         // 这确保 open 后 getattr/read/write 拿到的是最新 size/chunks，省一次 getattr。
+        //
+        // CRITICAL: Pin the inode BEFORE any RPC to prevent a self-invalidation
+        // race. The Filer pushes an Invalidate when metadata changes (including
+        // sync_size_chunks_on_close from a prior release). If the Invalidate
+        // arrives between the refresh RPC and the pin, the InvalidateHandler
+        // evicts the just-inserted entry, causing ENOENT on the subsequent
+        // setattr/write. Pinning early makes InvalidateHandler skip the
+        // notification (open files hold a data lease, so the cache is
+        // authoritative).
         let parent = if let Some(entry) = self.cache.get_inode(inode) {
             if entry.is_dir {
                 debug!("open: entry is directory, returning EISDIR");
                 return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
             }
+            // Pin before RPC: Invalidate arriving during refresh is skipped.
+            self.open_inodes.write().unwrap().insert(inode);
+            self.cache.pin_inode(inode);
             // Cache hit: best-effort 从 filer 刷新 size/chunks
             let parent = entry.parent;
-            if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
+            // CRITICAL: Skip the Filer refresh when there are dirty (unflushed)
+            // chunks. A concurrent open by another FUSE worker (e.g., shell
+            // pipeline like `echo > f && cat f` opens f twice in quick
+            // succession) would refresh from the Filer which still has the
+            // pre-write content_size=0 (sync_size_chunks_on_close hasn't run
+            // yet). The insert() would then overwrite content_size back to 0,
+            // causing release's sync to send size=0 to the Filer — breaking
+            // cross-client reads. When dirty chunks exist, the local cache is
+            // authoritative (we hold the write lease; no other client can
+            // modify the data).
+            if self.chunk_cache.has_dirty_chunks(inode) {
+                // Local cache has unsynced data (write happened but
+                // sync_size_chunks_on_close hasn't completed yet, e.g.,
+                // async FUSE RELEASE). The local cache is authoritative:
+                // skip the Filer refresh to preserve content_size and
+                // chunk data for append writes.
+                debug!(
+                    "open: skipping filer refresh for inode={} (has dirty/unsynced chunks)",
+                    inode
+                );
+            } else if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
                 let fresh = self.entry_to_cached(parent, &filer_entry);
-                self.cache.insert(fresh);
-                debug!("open: refreshed size/chunks from filer for inode={}", inode);
+                // Data has been synced: the Filer is authoritative. Update
+                // metadata and clear the chunk cache if the chunks list
+                // changed (another client may have modified the file).
+                //
+                // Stale Filer guard: if the Filer returns empty chunks but
+                // the local cache has non-empty chunks, the Filer's Raft
+                // commit may not have applied yet (sync_size_chunks_on_close
+                // returned after the leader accepted but before the state
+                // machine applied). In this case, treat the chunks as
+                // unchanged to preserve the local chunk cache for appends.
+                // When the Filer has non-empty chunks with a different FID,
+                // another client wrote new data → clear the cache.
+                let filer_stale_empty = fresh.chunks.is_empty() && !entry.chunks.is_empty();
+
+                // Unsynced-write guard: if the local content_size is LARGER
+                // than the Filer's, we have writes that the background flusher
+                // has pushed to the Volume Server but sync_size_chunks_on_close
+                // hasn't yet committed to the Filer. The local cache is
+                // authoritative (we hold the write lease; no other client can
+                // modify the data). Inserting the Filer's stale (smaller)
+                // size would cause reads to truncate, and clearing the chunk
+                // cache would discard the just-flushed data — both break
+                // cross-client appends. Skip the refresh entirely in this case.
+                let local_ahead = entry.content_size > fresh.content_size;
+                if local_ahead {
+                    debug!(
+                        "open: skipping filer refresh for inode={} (local content_size={} > filer={}, unsynced writes)",
+                        inode, entry.content_size, fresh.content_size
+                    );
+                } else {
+                    let chunks_changed = !filer_stale_empty
+                        && !chunks_match(&entry.chunks, &fresh.chunks);
+                    self.cache.insert(fresh);
+                    if chunks_changed {
+                        self.chunk_cache.remove_inode_chunks(inode);
+                        debug!(
+                            "open: refreshed metadata for inode={} (chunks changed, cache cleared)",
+                            inode
+                        );
+                    } else {
+                        debug!(
+                            "open: refreshed metadata for inode={} (filer_stale_empty={}, chunks preserved)",
+                            inode, filer_stale_empty
+                        );
+                    }
+                }
             }
             parent
         } else {
@@ -1279,8 +1422,16 @@ impl FileSystem for PowerFsFs {
                         debug!("open: filer entry is directory, returning EISDIR");
                         return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
                     }
+                    // Pin before insert: same self-invalidation race protection.
+                    self.open_inodes.write().unwrap().insert(inode);
+                    self.cache.pin_inode(inode);
                     let cached = self.entry_to_cached(p, &filer_entry);
                     self.cache.insert(cached);
+                    // Clear ChunkCache: same cross-client visibility guarantee,
+                    // but only if no dirty chunks (see cache-hit branch above).
+                    if !self.chunk_cache.has_dirty_chunks(inode) {
+                        self.chunk_cache.remove_inode_chunks(inode);
+                    }
                     debug!("open: fetched inode={} from filer during open", inode);
                     p
                 }
@@ -1294,11 +1445,6 @@ impl FileSystem for PowerFsFs {
                 }
             }
         };
-
-        // Phase 4.3/4.4: 标记 inode 为已打开（getattr 使用长 TTL）
-        self.open_inodes.write().unwrap().insert(inode);
-        // Pin inode in MetadataCache to prevent TTL expiry during slow writes
-        self.cache.pin_inode(inode);
 
         // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
@@ -1650,7 +1796,7 @@ impl FileSystem for PowerFsFs {
         // 后续 write 复用缓存中的有效 lease。lease 在 release(close) 时释放。
         let chunk_size = self.chunk_cache.chunk_size();
 
-        if let Some(ref _fid) = entry.fid {
+        if let Some(ref fid) = entry.fid {
             let end_offset = offset + read_len as u64;
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let end_chunk = if end_offset == 0 {
@@ -1658,6 +1804,17 @@ impl FileSystem for PowerFsFs {
             } else {
                 self.chunk_cache.get_chunk_index(end_offset - 1)
             };
+
+            // Capture info needed for read-before-write before dropping the lock.
+            // `entry.content_size` is the authoritative file size before this write;
+            // any chunk whose `chunk_start_offset < content_size` already has data
+            // on the volume server and must be read back before partial modification
+            // (otherwise we'd flush a chunk with zero-padded holes, corrupting
+            // cross-client appends).
+            let content_size_before_write = entry.content_size;
+            let volume_id = fid.volume_id.0;
+            let file_key = fid.file_key;
+            let volume_addr = self.client.get_volume_addr(volume_id).ok();
 
             // Drop metadata lock before per-chunk writes
             drop(_meta_guard);
@@ -1692,7 +1849,51 @@ impl FileSystem for PowerFsFs {
                 });
 
                 if !modified {
-                    let mut new_data = vec![0u8; in_chunk_start + bytes_to_write];
+                    // Chunk not in cache. If the file already has data at this
+                    // chunk offset (content_size > chunk_start_offset), we MUST
+                    // read the existing chunk from the volume server before
+                    // applying the partial write. Otherwise the flushed chunk
+                    // would contain zeros in the prefix, corrupting data
+                    // written by other clients (cross-client append bug).
+                    let mut new_data: Vec<u8> = if content_size_before_write > chunk_start_offset {
+                        let existing_len = std::cmp::min(
+                            chunk_size,
+                            content_size_before_write - chunk_start_offset,
+                        ) as usize;
+                        let mut base = if let Some(ref addr) = volume_addr {
+                            match self.client.read_blob(
+                                addr,
+                                volume_id,
+                                file_key,
+                                chunk_start_offset as i64,
+                                existing_len as i32,
+                            ) {
+                                Ok(data) => {
+                                    debug!(
+                                        "write: read-before-write inode={} chunk_offset={} read_len={}",
+                                        inode, chunk_start_offset, data.len()
+                                    );
+                                    data
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "write: read-before-write failed inode={} chunk_offset={}: {} — using zeros",
+                                        inode, chunk_start_offset, e
+                                    );
+                                    vec![0u8; existing_len]
+                                }
+                            }
+                        } else {
+                            vec![0u8; existing_len]
+                        };
+                        let needed_len = in_chunk_start + bytes_to_write;
+                        if base.len() < needed_len {
+                            base.resize(needed_len, 0);
+                        }
+                        base
+                    } else {
+                        vec![0u8; in_chunk_start + bytes_to_write]
+                    };
                     new_data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
                         &buf[data_offset as usize..data_offset as usize + bytes_to_write],
                     );
@@ -1795,21 +1996,51 @@ impl FileSystem for PowerFsFs {
         let _flush_guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // 1. Flush dirty data chunks to volume server (lock held — call impl directly)
-        if let Err(e) = self.flush_dirty_chunks_impl(inode, None) {
+        //
+        // CRITICAL: capture the flush result. If flush fails, the data is NOT
+        // on the volume server — we must NOT sync metadata (which would create
+        // dangling chunk references) and must NOT clear dirty (which would
+        // prevent retry). The background flusher will retry the write.
+        let flush_result = self.flush_dirty_chunks_impl(inode, None);
+        if let Err(e) = &flush_result {
             warn!(
-                "release: flush_dirty_chunks for inode {} failed: {}",
+                "release: flush_dirty_chunks for inode {} failed: {} — data remains dirty for retry",
                 inode, e
             );
         }
 
         // 2. Sync size/chunks to filer (Raft strong consistency)
-        //    sync 失败返回 EIO，调用方感知 close 未完成
-        let sync_result = self.sync_size_chunks_on_close(inode);
-        if let Err(e) = &sync_result {
+        //    Only sync if flush succeeded: if flush failed, the chunks are not
+        //    on the volume server. Syncing metadata would make other clients
+        //    read non-existent chunks, causing cross-client data corruption.
+        //    The dirty flag is preserved so the background flusher retries.
+        let sync_result = if flush_result.is_ok() {
+            let r = self.sync_size_chunks_on_close(inode);
+            if let Err(e) = &r {
+                error!(
+                    "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
+                    inode, e
+                );
+            }
+            r
+        } else {
             error!(
-                "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
-                inode, e
+                "release: skipping sync for inode {} because flush failed — \
+                 metadata not updated, dirty flag preserved for retry",
+                inode
             );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "flush failed, sync skipped",
+            ))
+        };
+
+        // 3. Clear dirty only if both flush AND sync succeeded.
+        //    If either failed, keep dirty flag so:
+        //    - Background flusher retries the write
+        //    - open() skips Filer refresh (local cache is authoritative)
+        if sync_result.is_ok() {
+            self.chunk_cache.clear_dirty(inode);
         }
 
         // 3. Phase 3.5.3: 递减 open_count（best-effort，无论 sync 成功与否都执行）
@@ -1836,14 +2067,16 @@ impl FileSystem for PowerFsFs {
         // Unpin inode from MetadataCache (restore normal TTL expiry)
         self.cache.unpin_inode(inode);
 
-        // 4. 释放 Volume lease（best-effort，close 时释放 write 路径缓存的 lease）
-        //    write 路径不再每次 acquire/release，lease 由 ensure_lease 缓存复用，
-        //    此处统一释放，避免 lease 在 volume server 端堆积。
+        // 4. 释放 Volume lease（best-effort，close 时释放 write + read lease）
+        //    write lease: 由 ensure_lease 缓存，通过 VolumeClient 释放
+        //    read lease: 由 LeaseManager 缓存，必须在 server 上释放（不能仅
+        //    清本地缓存），否则残留的读 lease 会阻止其他客户端获取写 lease
+        //    （stripe lease conflict）。
         //    仍在 flush lock 内 —— 后台 flusher 此刻被阻塞，不会用旧 token 写入。
         if let Some(entry) = self.cache.get_inode(inode) {
             if let Some(ref fid) = entry.fid {
                 let client_id = self.client.client_id();
-                // 从 leases 表取 token 传入，避免 release_lease_remote 内部查表
+                // 4a. 释放 write lease（从 VolumeClient leases 表取 token）
                 let token = self
                     .client
                     .get_valid_lease_token(fid.volume_id.0, inode)
@@ -1853,13 +2086,25 @@ impl FileSystem for PowerFsFs {
                         .release_lease(fid.volume_id.0, inode, &client_id, &token)
                 {
                     debug!(
-                        "release: release_lease for inode {} failed (best-effort): {}",
+                        "release: write lease release for inode {} failed (best-effort): {}",
                         inode, e
                     );
                 }
-                // Step 6: 失效 LeaseManager 读 lease 缓存，避免 close 后复用
-                // 已释放的 token（下一次 open 重新 acquire）。
-                self.lease_manager.invalidate(fid.volume_id.0, inode);
+                // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
+                let read_tokens = self
+                    .lease_manager
+                    .release_all_for_inode(fid.volume_id.0, inode);
+                for (tok, cid) in read_tokens {
+                    if let Err(e) =
+                        self.client
+                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
+                    {
+                        debug!(
+                            "release: read lease release for inode {} failed (best-effort): {}",
+                            inode, e
+                        );
+                    }
+                }
             }
         }
 

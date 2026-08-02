@@ -175,15 +175,16 @@ impl InodeNotifier {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::Ino, inode);
         enc.add_u64(FieldId::Version, version);
+        let body = enc.into_bytes();
 
         let header = FrameHeader::new(
             MsgType::Invalidate.as_u16(),
             FrameFlags::new(FrameFlags::NOTIFY),
             0, // seq is not used for NOTIFY
-            0,
+            body.len() as u32, // CRITICAL: must match actual body length
         );
 
-        NetMessage::new(header).with_body(enc.into_bytes())
+        NetMessage::new(header).with_body(body)
     }
 
     /// Get the number of subscribers for an inode

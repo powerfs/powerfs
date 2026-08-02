@@ -314,14 +314,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     });
 
     if net_port > 0 {
-        let net_handler = Arc::new(FilerNetHandler::new(
+        // Phase 2: Create ServerConnectionManager and InodeNotifier first,
+        // so the FilerNetHandler can push Invalidate notifications to clients
+        // when directory metadata changes.
+        let net_manager = Arc::new(ServerConnectionManager::new());
+        let inode_notifier = Arc::new(powerfs_filer::inode_notifier::InodeNotifier::new(
+            net_manager.clone(),
+        ));
+
+        let net_handler = Arc::new(FilerNetHandler::with_notifier(
             meta_shard_manager.clone(),
             shard_strategy.clone(),
             net_port,
+            inode_notifier,
         ));
 
         // Wrap with ManagedNetHandler for session management + middleware
-        let net_manager = Arc::new(ServerConnectionManager::new());
         let managed_handler = Arc::new(ManagedNetHandler::from_arc(
             net_manager.clone(),
             net_handler,

@@ -213,25 +213,45 @@ impl MasterNetHandler {
 
         let original_id: u64 = volume_id_str.parse().unwrap_or(0);
 
-        // Look up by original ID (as used by Volume Server)
-        if let Some(info) = self.master.get_volume_info_by_original_id(original_id) {
+        // Look up volume info. Modern volume servers use UUID-based IDs
+        // (e.g. 6941703278889880408) which are stored verbatim in
+        // `self.volumes`, so try an exact match first. The legacy
+        // `get_volume_info_by_original_id` (composite_id % 1000) path is
+        // kept as a fallback for old deployments that still use the
+        // node_seq * 1000 + original_id encoding.
+        let info = self
+            .master
+            .get_volume_info(&powerfs_common::types::VolumeId(original_id))
+            .or_else(|| self.master.get_volume_info_by_original_id(original_id));
+
+        if let Some(info) = info {
             info!(
-                "NET_LOOKUP_VOLUME: found volume info for original_id={}, composite_id={}, node_id={}",
+                "NET_LOOKUP_VOLUME: found volume info for id={}, volume_id={}, node_id={}",
                 original_id, info.id.0, info.node_id.0
             );
 
-            if let Some(node) = self.master.get_node(&info.node_id) {
+            // Prefer the volume route address (ip:net_port) since FUSE
+            // clients connect via powerfs-net, not HTTP. Fall back to the
+            // node's HTTP url only if no route is registered.
+            let route_addr = self
+                .master
+                .get_volume_route(info.id.0)
+                .map(|r| r.addr)
+                .or_else(|| {
+                    self.master
+                        .get_node(&info.node_id)
+                        .map(|n| n.url())
+                });
+
+            if let Some(addr) = route_addr {
                 info!(
-                    "NET_LOOKUP_VOLUME: node address={}, http_port={}, grpc_port={}, url={}",
-                    node.address,
-                    node.http_port,
-                    node.grpc_port,
-                    node.url()
+                    "NET_LOOKUP_VOLUME: returning route addr={} for volume_id={}",
+                    addr, info.id.0
                 );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Limit, 1); // count
-                enc.add_string(FieldId::Owner, &node.url())?;
-                enc.add_string(FieldId::Backend, &node.data_center_id.to_string())?;
+                enc.add_string(FieldId::Owner, &addr)?;
+                enc.add_string(FieldId::Backend, &info.node_id.0.to_string())?;
 
                 return Ok(Self::build_response(
                     msg,

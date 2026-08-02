@@ -155,6 +155,37 @@ impl VolumeLeaseManager {
         let mut cache = self.cache.write().unwrap();
         cache.retain(|k, _| !(k.volume_id == volume_id && k.inode == inode));
     }
+
+    /// 释放指定 `(volume_id, inode)` 的全部读 lease：先从缓存取出所有 token，
+    /// 清除缓存，然后在 volume server 上逐个释放。
+    ///
+    /// 这是对 `invalidate()` 的补充：`invalidate()` 只清本地缓存不通知 server，
+    /// 导致 server 端读 lease 残留，阻止其他客户端获取写 lease（stripe lease
+    /// conflict）。本方法在 close 时调用，确保读 lease 在 server 上也被释放。
+    pub fn release_all_for_inode(
+        &self,
+        volume_id: u64,
+        inode: u64,
+    ) -> Vec<(String, String)> {
+        // 1. 取出所有匹配的 (token, client_id) 并清除缓存
+        let tokens: Vec<(String, String)> = {
+            let mut cache = self.cache.write().unwrap();
+            let keys_to_remove: Vec<LeaseKey> = cache
+                .keys()
+                .filter(|k| k.volume_id == volume_id && k.inode == inode)
+                .cloned()
+                .collect();
+            let mut result = Vec::new();
+            for key in keys_to_remove {
+                if let Some(entry) = cache.remove(&key) {
+                    result.push((entry.token.clone(), (*self.client_id).clone()));
+                }
+            }
+            result
+        };
+        // 2. 返回 (token, client_id) 列表，由调用方异步释放
+        tokens
+    }
 }
 
 impl LeaseManager for VolumeLeaseManager {

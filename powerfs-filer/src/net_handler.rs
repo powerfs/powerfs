@@ -63,14 +63,17 @@ impl FilerNetHandler {
     fn notify_inode_change(&self, inode: u64, version: u64) {
         if let Some(ref notifier) = self.inode_notifier {
             let notifier = notifier.clone();
+            let sub_count = notifier.subscriber_count(inode);
+            info!(
+                "FILER_NET_NOTIFY: inode={}, version={}, subscribers={}",
+                inode, version, sub_count
+            );
             tokio::spawn(async move {
                 let count = notifier.notify(inode, version).await;
-                if count > 0 {
-                    debug!(
-                        "FILER_NET: notified {} clients about inode {} change (v={})",
-                        count, inode, version
-                    );
-                }
+                info!(
+                    "FILER_NET_NOTIFY: notified {} clients about inode {} change (v={})",
+                    count, inode, version
+                );
             });
         }
     }
@@ -983,6 +986,16 @@ impl FilerNetHandler {
             .await
         {
             Ok(_) => {
+                // Phase 2: notify subscribers that this inode's content
+                // (size/chunks) changed so they can evict stale cache
+                // entries. Without this, a second client that previously
+                // looked up the file would keep serving the old content
+                // until the 30s TTL expires.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.notify_inode_change(req.inode, now);
                 let resp = powerfs_coherence::UpdateInodeSizeChunksResponse {
                     success: true,
                     error: String::new(),
@@ -1108,7 +1121,69 @@ impl PowerFsNetHandler for FilerNetHandler {
         );
 
         match msg_type {
-            MsgType::Lookup => self.handle_lookup(msg).await,
+            MsgType::Lookup => {
+                let response = self.handle_lookup(msg).await?;
+                // Phase 2: auto-subscribe client to parent directory for
+                // callback invalidation. On any change to this directory,
+                // the Filer will push an Invalidate notification so the
+                // client can evict its cached entry.
+                //
+                // Also subscribe to the returned entry inode (when it is a
+                // regular file) so that content mutations (setattr /
+                // write_chunks) on that file trigger an Invalidate to this
+                // client. Without this, a second client that only looked up
+                // the file would never receive content-change notifications.
+                if response.header.status == STATUS_OK {
+                    info!(
+                        "FILER_NET_LOOKUP_DEBUG: status=OK, has_notifier={}",
+                        self.inode_notifier.is_some()
+                    );
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let mut dec = TlvDecoder::new(&msg.body);
+                        let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (lookup)",
+                                client_id, parent_ino
+                            );
+                        }
+                        // Subscribe to the returned entry inode as well so
+                        // file content changes are pushed to this client.
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                                info!(
+                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (lookup)",
+                                    client_id, entry_ino
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
+            MsgType::ReadDir => {
+                let response = self.handle_readdir(msg).await?;
+                // Phase 2: auto-subscribe client to the listed directory.
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            debug!(
+                                "FILER_NET: subscribed client {} to dir inode {} (readdir)",
+                                client_id, parent_ino
+                            );
+                        }
+                    }
+                }
+                Ok(response)
+            }
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
@@ -1118,7 +1193,6 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Unlink => self.handle_unlink(msg).await,
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::Rename => self.handle_rename(msg).await,
-            MsgType::ReadDir => self.handle_readdir(msg).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
@@ -1166,7 +1240,60 @@ impl ServerRequestHandler for FilerNetHandler {
         );
 
         match msg_type {
-            MsgType::Lookup => self.handle_lookup(msg).await,
+            MsgType::Lookup => {
+                let response = self.handle_lookup(msg).await?;
+                // Phase 2: subscribe client to parent dir + entry inode for
+                // callback invalidation. This must live in the
+                // ServerRequestHandler::handle path (not PowerFsNetHandler)
+                // because ManagedNetHandler dispatches via
+                // process_with_pipeline which calls ServerRequestHandler.
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let client_id = ctx.client.client_id;
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (lookup)",
+                                client_id, parent_ino
+                            );
+                        }
+                        if let Ok(entry_ino) =
+                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
+                        {
+                            if entry_ino != 0 && entry_ino != parent_ino {
+                                notifier.subscribe(entry_ino, client_id);
+                                info!(
+                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (lookup)",
+                                    client_id, entry_ino
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(response)
+            }
+            MsgType::ReadDir => {
+                let response = self.handle_readdir(msg).await?;
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let client_id = ctx.client.client_id;
+                        let parent_ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::ParentIno)
+                            .unwrap_or(0);
+                        if parent_ino != 0 {
+                            notifier.subscribe(parent_ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (readdir)",
+                                client_id, parent_ino
+                            );
+                        }
+                    }
+                }
+                Ok(response)
+            }
             MsgType::GetAttr => self.handle_getattr(msg).await,
             MsgType::SetAttr => self.handle_setattr(msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
@@ -1176,7 +1303,6 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Unlink => self.handle_unlink(msg).await,
             MsgType::Rmdir => self.handle_rmdir(msg).await,
             MsgType::Rename => self.handle_rename(msg).await,
-            MsgType::ReadDir => self.handle_readdir(msg).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,

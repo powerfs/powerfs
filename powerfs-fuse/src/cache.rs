@@ -3,7 +3,7 @@ use lru::LruCache;
 use powerfs_common::types::Fid;
 use powerfs_master::proto::FileChunk;
 use powerfs_orset::CachedFileChunk;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -70,7 +70,11 @@ struct DirCacheEntry {
 /// Default TTL for metadata cache entries (seconds). Entries older than this are
 /// treated as stale and will be fetched from the server on next access.
 /// This provides a safety net when Invalidation notifications are lost.
-const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(2);
+///
+/// Phase 2: Extended from 2s to 30s now that callback invalidation is wired
+/// up. The Filer pushes Invalidate notifications when directory metadata
+/// changes, so the TTL is only a fallback for lost notifications.
+const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(30);
 
 /// Metadata cache for FUSE filesystem
 pub struct MetadataCache {
@@ -89,8 +93,10 @@ pub struct MetadataCache {
     /// Latest known generation per path (from notifications)
     path_generations: RwLock<HashMap<String, u64>>,
     /// Pinned inodes (open files): skip TTL expiry to prevent cache miss
-    /// during slow writes that exceed metadata_ttl.
-    pinned_inodes: RwLock<HashSet<u64>>,
+    /// during slow writes that exceed metadata_ttl. Uses reference counting
+    /// so concurrent open/release on the same inode (different FUSE workers)
+    /// don't prematurely unpin.
+    pinned_inodes: RwLock<HashMap<u64, u32>>,
 }
 
 impl MetadataCache {
@@ -99,6 +105,13 @@ impl MetadataCache {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_ttl(capacity, DEFAULT_METADATA_TTL)
+    }
+
+    /// Create a MetadataCache with a custom metadata TTL.
+    /// Used by tests to avoid long sleep times.
+    #[allow(dead_code)]
+    pub fn with_capacity_and_ttl(capacity: usize, metadata_ttl: Duration) -> Self {
         let cache = MetadataCache {
             inode_cache: RwLock::new(LruCache::new(
                 NonZero::new(capacity).unwrap_or(NonZero::new(10000).unwrap()),
@@ -107,9 +120,9 @@ impl MetadataCache {
             dir_cache: RwLock::new(HashMap::new()),
             next_inode: AtomicU64::new(2),
             dir_cache_ttl: Duration::from_secs(5),
-            metadata_ttl: DEFAULT_METADATA_TTL,
+            metadata_ttl,
             path_generations: RwLock::new(HashMap::new()),
-            pinned_inodes: RwLock::new(HashSet::new()),
+            pinned_inodes: RwLock::new(HashMap::new()),
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
@@ -156,7 +169,7 @@ impl MetadataCache {
         let entry = cache.get(&inode).cloned()?;
         // Pinned inodes (open files) skip TTL expiry to prevent cache miss
         // during slow writes that exceed metadata_ttl.
-        let is_pinned = self.pinned_inodes.read().unwrap().contains(&inode);
+        let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
         if !is_pinned && entry.cached_at.elapsed() > self.metadata_ttl {
             // Entry too old, treat as stale
             debug!(
@@ -172,15 +185,36 @@ impl MetadataCache {
     }
 
     /// Pin an inode to skip TTL expiry (called on open).
-    /// Pinned inodes stay in cache as long as the file is open,
-    /// preventing cache miss during slow writes.
+    /// Uses reference counting: each open increments the count, each release
+    /// decrements. The inode is only unpinned when the count reaches 0.
+    /// This prevents concurrent open/release (different FUSE workers) from
+    /// prematurely unpinning an inode that is still open by another handle.
     pub fn pin_inode(&self, inode: u64) {
-        self.pinned_inodes.write().unwrap().insert(inode);
+        let mut pinned = self.pinned_inodes.write().unwrap();
+        *pinned.entry(inode).or_insert(0) += 1;
     }
 
     /// Unpin an inode (called on release/close).
+    /// Decrements the reference count; only removes when count reaches 0.
     pub fn unpin_inode(&self, inode: u64) {
-        self.pinned_inodes.write().unwrap().remove(&inode);
+        let mut pinned = self.pinned_inodes.write().unwrap();
+        if let Some(count) = pinned.get_mut(&inode) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                pinned.remove(&inode);
+            }
+        }
+    }
+
+    /// Check if an inode is pinned (open). Pinned inodes hold a data lease,
+    /// so their cached metadata/data is authoritative and should not be
+    /// invalidated by server-pushed Invalidate notifications. This prevents
+    /// a self-invalidation race where a client's own setattr triggers an
+    /// Invalidate that evicts the entry it just updated (causing ENOENT).
+    pub fn is_pinned(&self, inode: u64) -> bool {
+        self.pinned_inodes.read().unwrap().contains_key(&inode)
     }
 
     /// Get path by walking up parent chain
@@ -303,9 +337,29 @@ impl MetadataCache {
                 if !entry.chunks.is_empty() {
                     existing.chunks = entry.chunks.clone();
                 }
-                // Update size/content_size from the new entry
-                existing.size = entry.size;
-                existing.content_size = entry.content_size;
+                // Update size/content_size from the new entry.
+                //
+                // Defensive guard: when the inode is pinned (open), preserve
+                // the larger content_size to avoid overwriting unflushed writes
+                // with stale Filer data. A concurrent open() by another FUSE
+                // worker can call insert() with a Filer response that predates
+                // the current write session (sync_size_chunks_on_close hasn't
+                // run yet). Without this guard, the stale content_size=0 would
+                // overwrite the locally-written content_size, causing release's
+                // sync to send size=0 to the Filer — breaking cross-client reads.
+                //
+                // Truncate (which legitimately shrinks size) goes through
+                // setattr(), not insert(), so this guard is safe.
+                let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
+                if is_pinned && existing.content_size > entry.content_size {
+                    debug!(
+                        "insert: preserving larger content_size for pinned inode={} (existing={}, filer={})",
+                        inode, existing.content_size, entry.content_size
+                    );
+                } else {
+                    existing.size = entry.size;
+                    existing.content_size = entry.content_size;
+                }
                 existing.mode = entry.mode;
                 existing.uid = entry.uid;
                 existing.gid = entry.gid;
@@ -1278,7 +1332,8 @@ mod tests {
 
     #[test]
     fn test_metadata_ttl_expiry() {
-        let cache = MetadataCache::new();
+        // Use a short TTL (1s) to keep the test fast
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_secs(1));
         let inode = cache.allocate_inode();
         let now = chrono::Utc::now().timestamp();
         cache.insert(CachedEntry {
@@ -1310,8 +1365,8 @@ mod tests {
         // Fresh entry should be returned
         assert!(cache.get_inode(inode).is_some());
 
-        // Wait for TTL (2s) to expire
-        std::thread::sleep(Duration::from_secs(3));
+        // Wait for TTL (1s) to expire
+        std::thread::sleep(Duration::from_secs(2));
 
         // Now the entry should be treated as stale -> None
         assert!(
@@ -1322,7 +1377,8 @@ mod tests {
 
     #[test]
     fn test_metadata_ttl_refresh_on_update() {
-        let cache = MetadataCache::new();
+        // Use a short TTL (2s) to keep the test fast
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_secs(2));
         let inode = cache.allocate_inode();
         let now = chrono::Utc::now().timestamp();
         cache.insert(CachedEntry {
@@ -1358,7 +1414,7 @@ mod tests {
         cache.update_size(inode, 4096);
 
         // Wait for original TTL to have elapsed, but refreshed entry should still be fresh
-        std::thread::sleep(Duration::from_millis(1600));
+        std::thread::sleep(Duration::from_millis(1700));
 
         assert!(
             cache.get_inode(inode).is_some(),
@@ -1596,6 +1652,21 @@ impl ChunkCache {
 
     pub fn remove_inode_chunks(&self, inode: u64) {
         self.remove(inode);
+    }
+
+    /// Check if the inode has any dirty (unflushed) chunks.
+    /// Used by open() to decide whether it's safe to clear the ChunkCache:
+    /// if dirty chunks exist, clearing would lose unflushed data.
+    pub fn has_dirty_chunks(&self, inode: u64) -> bool {
+        for shard in self.shards.iter() {
+            let cache = shard.read().unwrap();
+            for ((ino, _), chunk) in cache.iter() {
+                if *ino == inode && chunk.dirty {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 清除指定 inode 的所有脏标记（flush 完成后调用）

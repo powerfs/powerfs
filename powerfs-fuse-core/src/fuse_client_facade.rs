@@ -274,7 +274,11 @@ impl FuseClientFacade {
 
         // 创建 MetaShard 客户端
         let meta_config = MetaShardClientConfig::default();
-        let meta_shard_client = MetaShardClient::new(meta_config, topology_manager.clone());
+        let meta_shard_client = MetaShardClient::new(
+            meta_config,
+            topology_manager.clone(),
+            config.client_identity.client_id,
+        );
 
         // 创建 Volume 客户端
         // CRITICAL: sync volume_config.client_id with client_identity.client_id so
@@ -356,7 +360,11 @@ impl FuseClientFacade {
 
         // 创建 MetaShard 客户端（会自动创建自己的网络连接池）
         let meta_config = MetaShardClientConfig::default();
-        let meta_shard_client = MetaShardClient::new(meta_config, topology_manager.clone());
+        let meta_shard_client = MetaShardClient::new(
+            meta_config,
+            topology_manager.clone(),
+            config.client_identity.client_id,
+        );
         meta_shard_client
             .set_default_filer_addr(format!("{}:{}", config.filer_addr, config.filer_port));
         meta_shard_client.init();

@@ -12,7 +12,19 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
-use powerfs_net::{ClientConfig, PowerFsNetClient};
+use powerfs_net::client::NotificationHandler;
+use powerfs_net::{ClientConfig, NetMessage, PowerFsNetClient};
+
+/// Wrapper to convert `Arc<dyn NotificationHandler>` into
+/// `Box<dyn NotificationHandler>` so it can be re-installed on every
+/// new `PowerFsNetClient` after a reconnect.
+struct ArcNotificationHandler(Arc<dyn NotificationHandler + Send + Sync>);
+
+impl NotificationHandler for ArcNotificationHandler {
+    fn handle_notification(&self, msg: &NetMessage) {
+        self.0.handle_notification(msg);
+    }
+}
 
 /// 根据 RequestKind 获取默认 MsgType
 pub(crate) fn default_msg_type_for_kind(kind: RequestKind) -> powerfs_net::MsgType {
@@ -263,12 +275,23 @@ pub struct MetaShardClient {
     /// Sharded RPC Pool — 并发派发元数据请求，消除全局 response_waiters 锁。
     /// 在 init() 中创建（需要 shard_router 已填充）。
     rpc_pool: Arc<Mutex<Option<Arc<ShardedRpcPool>>>>,
+    /// Phase 2: Notification handler for server-pushed Invalidate messages.
+    /// Applied to every new Filer connection so the client can receive
+    /// cache invalidation callbacks.
+    notification_handler:
+        Arc<std::sync::RwLock<Option<Arc<dyn NotificationHandler + Send + Sync>>>>,
+    /// Phase 2: Unique client ID used in Filer handshake so the Filer can
+    /// route Invalidate notifications to the correct client. Without this,
+    /// all FUSE clients share client_id=0 and notifications go to the last
+    /// connected client instead of the subscriber.
+    client_id: u64,
 }
 
 impl MetaShardClient {
     pub fn new(
         config: MetaShardClientConfig,
         topology_manager: Arc<ClusterTopologyManager>,
+        client_id: u64,
     ) -> Self {
         Self {
             breakers: Arc::new(CircuitBreakerPool::new(
@@ -289,6 +312,20 @@ impl MetaShardClient {
             notify: Arc::new(tokio::sync::Notify::new()),
             default_filer_addr: Arc::new(Mutex::new(String::new())),
             rpc_pool: Arc::new(Mutex::new(None)),
+            notification_handler: Arc::new(std::sync::RwLock::new(None)),
+            client_id,
+        }
+    }
+
+    /// Phase 2: Install a notification handler to receive server-pushed
+    /// `Invalidate` messages from the Filer.  The handler is applied to
+    /// every new Filer connection so the client can evict stale metadata
+    /// cache entries when another client modifies the same directory.
+    pub fn set_notification_handler(&self, handler: Arc<dyn NotificationHandler + Send + Sync>) {
+        *self.notification_handler.write().unwrap() = Some(handler.clone());
+        // Apply to all existing connections
+        for entry in self.filer_connections.iter() {
+            entry.set_notification_handler(Box::new(ArcNotificationHandler(handler.clone())));
         }
     }
 
@@ -306,7 +343,7 @@ impl MetaShardClient {
         let client_config = ClientConfig {
             addr: host,
             port,
-            client_id: 0,
+            client_id: self.client_id,
             client_type: powerfs_net::ClientType::Fuse,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
@@ -316,11 +353,21 @@ impl MetaShardClient {
             max_inflight_requests: 256,
         };
 
+        log::info!(
+            "MetaShardClient: creating Filer connection to {} with client_id={}",
+            addr, self.client_id
+        );
         let client = Arc::new(PowerFsNetClient::new(client_config));
         client
             .connect()
             .await
             .map_err(ClientError::from_net_error)?;
+
+        // Phase 2: Apply notification handler to new Filer connection so
+        // the client receives server-pushed Invalidate messages.
+        if let Some(h) = self.notification_handler.read().unwrap().clone() {
+            client.set_notification_handler(Box::new(ArcNotificationHandler(h)));
+        }
 
         // 保存到连接池
         self.filer_connections
@@ -534,6 +581,8 @@ impl MetaShardClient {
                 self.default_filer_addr.clone(),
                 self.breakers.clone(),
                 self.shard_router.clone(),
+                self.client_id,
+                self.notification_handler.clone(),
             );
             *guard = Some(Arc::new(pool));
         }
@@ -1450,6 +1499,8 @@ async fn process_available_requests(
     _topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
+    client_id: u64,
+    notification_handler: &SharedNotificationHandler,
 ) -> bool {
     // 优先处理控制请求
     if control_channel.can_accept() {
@@ -1464,6 +1515,8 @@ async fn process_available_requests(
                 default_filer_addr,
                 breakers,
                 shard_router,
+                client_id,
+                notification_handler,
             )
             .await;
 
@@ -1496,6 +1549,8 @@ async fn process_available_requests(
                 default_filer_addr,
                 breakers,
                 shard_router,
+                client_id,
+                notification_handler,
             )
             .await;
 
@@ -1527,6 +1582,8 @@ pub(crate) async fn process_request_internal(
     default_filer_addr: &Arc<Mutex<String>>,
     breakers: &Arc<CircuitBreakerPool>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
+    client_id: u64,
+    notification_handler: &SharedNotificationHandler,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let kind = req.context.kind;
@@ -1565,7 +1622,9 @@ pub(crate) async fn process_request_internal(
         }
 
         // 2) 获取或创建到该 leader 的连接
-        let filer_client = get_or_create_filer_client(filer_connections, &leader_addr).await?;
+        let filer_client =
+            get_or_create_filer_client(filer_connections, &leader_addr, client_id, notification_handler)
+                .await?;
 
         // 3) Per-server circuit breaker check
         if !breakers.check(&leader_addr) {
@@ -1652,10 +1711,23 @@ pub(crate) async fn process_request_internal(
     }
 }
 
+/// Type alias for the notification handler shared state.
+pub(crate) type SharedNotificationHandler =
+    Arc<std::sync::RwLock<Option<Arc<dyn NotificationHandler + Send + Sync>>>>;
+
 /// 获取或创建到指定地址的 filer 连接（自由函数版本，供后台处理器使用）
+///
+/// Phase 2 fix: accepts `client_id` and `notification_handler` so that
+/// connections created by ShardedRpcPool workers use the correct client
+/// identity in the Filer handshake and receive server-pushed Invalidate
+/// notifications. Previously this function hardcoded `client_id: 0` and
+/// never installed the notification handler, causing all FUSE clients to
+/// share the same session and miss cache invalidation callbacks.
 async fn get_or_create_filer_client(
     connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
     addr: &str,
+    client_id: u64,
+    notification_handler: &SharedNotificationHandler,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
     // 先检查是否已有连接 (DashMap lock-free read)
     if let Some(entry) = connections.get(addr) {
@@ -1671,7 +1743,7 @@ async fn get_or_create_filer_client(
     let client_config = ClientConfig {
         addr: host,
         port,
-        client_id: 0,
+        client_id,
         client_type: powerfs_net::ClientType::Fuse,
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
@@ -1681,11 +1753,21 @@ async fn get_or_create_filer_client(
         max_inflight_requests: 256,
     };
 
+    log::info!(
+        "MetaShardClient(standalone): creating Filer connection to {} with client_id={}",
+        addr, client_id
+    );
     let client = Arc::new(PowerFsNetClient::new(client_config));
     client
         .connect()
         .await
         .map_err(ClientError::from_net_error)?;
+
+    // Phase 2: Apply notification handler so the client receives
+    // server-pushed Invalidate messages for cache invalidation.
+    if let Some(h) = notification_handler.read().unwrap().clone() {
+        client.set_notification_handler(Box::new(ArcNotificationHandler(h)));
+    }
 
     // 保存到连接池
     connections.insert(addr.to_string(), client.clone());
@@ -1725,7 +1807,7 @@ mod tests {
         topology_manager.update_topology(topology);
 
         let config = MetaShardClientConfig::default();
-        let client = MetaShardClient::new(config, topology_manager.clone());
+        let client = MetaShardClient::new(config, topology_manager.clone(), 1);
         client.init();
 
         (client, topology_manager)

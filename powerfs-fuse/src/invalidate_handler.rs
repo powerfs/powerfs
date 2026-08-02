@@ -9,21 +9,28 @@ use log::{debug, warn};
 use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::{FieldId, MsgType, NetMessage, NotificationHandler};
 
-use crate::cache::MetadataCache;
+use crate::cache::{ChunkCache, MetadataCache};
 
 /// Handler for server-pushed Invalidate notifications
 ///
 /// On receiving an Invalidate message, checks the cached inode's version
 /// and invalidates it if the server's version is newer.
+///
+/// Both the metadata cache and the chunk (data) cache are invalidated to
+/// avoid serving stale data after another client modifies the file. The
+/// Filer pushes a single Invalidate when an inode's metadata (including
+/// size/chunks) changes, so the client must drop both caches together.
 pub struct InvalidateHandler {
     /// Reference to the FUSE client's metadata cache
     cache: Arc<MetadataCache>,
+    /// Reference to the FUSE client's chunk (data) cache
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl InvalidateHandler {
-    /// Create a new InvalidateHandler with the given metadata cache
-    pub fn new(cache: Arc<MetadataCache>) -> Self {
-        Self { cache }
+    /// Create a new InvalidateHandler with the given metadata and chunk caches
+    pub fn new(cache: Arc<MetadataCache>, chunk_cache: Arc<ChunkCache>) -> Self {
+        Self { cache, chunk_cache }
     }
 }
 
@@ -56,13 +63,34 @@ impl NotificationHandler for InvalidateHandler {
                     inode, version
                 );
 
+                // Skip invalidation for pinned (open) inodes. An open file
+                // holds a data lease, so the client's cached metadata/data is
+                // authoritative. This also prevents a self-invalidation race:
+                // when this client's own setattr triggers an Invalidate, the
+                // notification would evict the cache entry the client just
+                // updated (update_attr doesn't bump generation), causing
+                // ENOENT on the subsequent get_inode. Pinned inodes are
+                // refreshed from the Filer on open and synced on close, so
+                // skipping invalidation here is safe.
+                if self.cache.is_pinned(inode) {
+                    debug!(
+                        "InvalidateHandler: skipping invalidation for pinned inode={} (open, lease-held, server_v={})",
+                        inode, version
+                    );
+                    return;
+                }
+
                 // Check if our cached version is stale
                 if self.cache.is_inode_stale(inode, version) {
                     debug!(
                         "InvalidateHandler: invalidating stale cache for inode={} (server_v={} > cached_v)",
                         inode, version
                     );
+                    // Drop both metadata and data caches together: an Invalidate
+                    // means the inode's size/chunks changed, so cached file data
+                    // may no longer correspond to the current chunks list.
                     self.cache.invalidate_inode(inode);
+                    self.chunk_cache.remove_inode_chunks(inode);
                 } else {
                     debug!(
                         "InvalidateHandler: skipping invalidation for inode={} (already fresh, server_v={})",
@@ -83,7 +111,7 @@ impl NotificationHandler for InvalidateHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CachedEntry;
+    use crate::cache::{CachedEntry, ChunkCache};
     use powerfs_net::serialize::TlvEncoder;
     use powerfs_net::{FrameFlags, FrameHeader};
     use std::collections::HashMap;
@@ -131,6 +159,10 @@ mod tests {
         }
     }
 
+    fn make_chunk_cache() -> Arc<ChunkCache> {
+        Arc::new(ChunkCache::with_defaults())
+    }
+
     #[test]
     fn test_invalidate_stale_cache() {
         let cache = Arc::new(MetadataCache::new());
@@ -140,7 +172,7 @@ mod tests {
         assert!(cache.get_inode(inode).is_some());
 
         // Server sends version=5 (newer than cached 1)
-        let handler = InvalidateHandler::new(cache.clone());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -156,7 +188,7 @@ mod tests {
         cache.insert(make_test_entry(inode, "fresh.txt", 10));
 
         // Server sends version=5 (older than cached 10)
-        let handler = InvalidateHandler::new(cache.clone());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -167,7 +199,7 @@ mod tests {
     #[test]
     fn test_invalidate_inode_not_in_cache() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
 
         let msg = make_invalidate_msg(99999, 1);
         handler.handle_notification(&msg);
@@ -178,7 +210,7 @@ mod tests {
     #[test]
     fn test_invalidate_zero_inode_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
 
         let msg = make_invalidate_msg(0, 1);
         handler.handle_notification(&msg);
@@ -187,7 +219,7 @@ mod tests {
     #[test]
     fn test_non_invalidate_message_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
 
         let header = FrameHeader::new(
             MsgType::Ping.as_u16(),
@@ -198,5 +230,34 @@ mod tests {
         let msg = NetMessage::new(header);
 
         handler.handle_notification(&msg);
+    }
+
+    #[test]
+    fn test_invalidate_skip_pinned_inode() {
+        // An open (pinned) inode must not be invalidated, even if the server
+        // version is newer. This prevents a self-invalidation race where the
+        // client's own setattr triggers an Invalidate that evicts the entry
+        // it just updated (update_attr doesn't bump generation).
+        let cache = Arc::new(MetadataCache::new());
+        let inode = cache.allocate_inode();
+
+        cache.insert(make_test_entry(inode, "open.txt", 1));
+        cache.pin_inode(inode);
+        assert!(cache.is_pinned(inode));
+
+        // Server sends version=5 (newer than cached 1) — simulates the
+        // Invalidate triggered by this client's own setattr.
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let msg = make_invalidate_msg(inode, 5);
+        handler.handle_notification(&msg);
+
+        // Pinned inode should still be in cache
+        assert!(cache.get_inode(inode).is_some());
+
+        // After unpin, a subsequent Invalidate should work
+        cache.unpin_inode(inode);
+        let msg2 = make_invalidate_msg(inode, 5);
+        handler.handle_notification(&msg2);
+        assert!(cache.get_inode(inode).is_none());
     }
 }
