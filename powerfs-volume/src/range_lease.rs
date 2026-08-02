@@ -7,7 +7,7 @@
 //!
 //! This is a thin wrapper — all core logic lives in `powerfs-lease`.
 
-use powerfs_lease::{LeaseEntry, LeaseKey, LeaseMode, LeaseStore, MemoryLeaseStore};
+use powerfs_lease::{LeaseEntry, LeaseError, LeaseKey, LeaseMode, LeaseStore, MemoryLeaseStore};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,6 +47,25 @@ impl LeaseKey for StripeKey {
         let self_end = self.stripe_start + self.stripe_count;
         let other_end = other.stripe_start + other.stripe_count;
         self.stripe_start < other_end && other.stripe_start < self_end
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24);
+        buf.extend_from_slice(&self.inode.to_le_bytes());
+        buf.extend_from_slice(&self.stripe_start.to_le_bytes());
+        buf.extend_from_slice(&self.stripe_count.to_le_bytes());
+        buf
+    }
+
+    fn decode(data: &[u8]) -> Result<Self, LeaseError> {
+        if data.len() < 24 {
+            return Err(LeaseError::Internal("StripeKey too short".into()));
+        }
+        Ok(Self {
+            inode: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+            stripe_start: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+            stripe_count: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+        })
     }
 }
 
@@ -127,6 +146,32 @@ impl RangeLeaseManager {
             ),
             default_stripe_size,
         }
+    }
+
+    /// Construct with a persistence backend for crash recovery.
+    /// After construction, call `load_from_persistence()` on startup to
+    /// recover lease state.
+    pub fn new_with_persistence<P: powerfs_lease::LeasePersistence + 'static>(
+        default_stripe_size: u64,
+        backend: P,
+    ) -> Self {
+        Self {
+            store: Arc::new(MemoryLeaseStore::new().with_persistence(backend)),
+            default_stripe_size,
+        }
+    }
+
+    /// Load non-expired leases from persistence backend on startup.
+    /// Returns the number of entries restored.
+    pub fn load_from_persistence(&self) -> Result<usize, String> {
+        self.store
+            .load_from_persistence()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Persist the current epoch counter (best-effort, call periodically).
+    pub fn persist_epoch(&self) -> Result<(), String> {
+        self.store.persist_epoch().map_err(|e| e.to_string())
     }
 
     pub fn with_defaults() -> Self {

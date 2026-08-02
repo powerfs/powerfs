@@ -56,11 +56,44 @@ impl VolumeServer {
                     "volume",
                 ))
             }
-            _ => {
+            #[cfg(feature = "redis-event")]
+            Err(_) => {
                 warn!("REDIS_URL not set, using null event provider");
                 Arc::new(NullEventProvider)
             }
+            #[cfg(not(feature = "redis-event"))]
+            _ => {
+                warn!("redis-event feature disabled, using null event provider");
+                Arc::new(NullEventProvider)
+            }
         };
+
+        // Lease persistence: use RocksDB at {data_dir}/lease_db if the directory
+        // is writable; otherwise fall back to in-memory only.
+        let lease_db_path = format!("{}/lease_db", data_dir);
+        let range_lease_mgr =
+            match crate::lease_persistence::RocksDBLeasePersistence::open(&lease_db_path) {
+                Ok(persistence) => {
+                    let mgr =
+                        RangeLeaseManager::new_with_persistence(DEFAULT_STRIPE_SIZE, persistence);
+                    match mgr.load_from_persistence() {
+                        Ok(count) => {
+                            info!("Loaded {} leases from persistence", count);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load leases from persistence: {}", e);
+                        }
+                    }
+                    Arc::new(mgr)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to open lease persistence at {}: {}, using in-memory only",
+                        lease_db_path, e
+                    );
+                    Arc::new(RangeLeaseManager::new(DEFAULT_STRIPE_SIZE))
+                }
+            };
 
         VolumeServer {
             storage_manager,
@@ -70,7 +103,7 @@ impl VolumeServer {
             grpc_port,
             http_port,
             data_dir: data_dir.to_string(),
-            range_lease_mgr: Arc::new(RangeLeaseManager::new(DEFAULT_STRIPE_SIZE)),
+            range_lease_mgr,
             io_stats: Arc::new(IoStatsCollector::new()),
         }
     }

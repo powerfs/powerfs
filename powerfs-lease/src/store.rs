@@ -7,6 +7,7 @@
 //! - `holder_index`: holder → tokens (for fast disconnect cleanup)
 
 use crate::error::LeaseError;
+use crate::persistence::{decode_entry, encode_entry, LeasePersistence};
 use crate::token::LeaseMode;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 ///   same group.
 /// - `conflicts`: whether two keys in the same group conflict (e.g., overlapping
 ///   stripe ranges).
+/// - `encode`/`decode`: binary serialization for optional persistence.
 pub trait LeaseKey: Clone + Eq + Hash + Send + Sync + 'static {
     /// Coarse group identifier for indexing (e.g., inode number).
     fn group_id(&self) -> u64;
@@ -29,6 +31,12 @@ pub trait LeaseKey: Clone + Eq + Hash + Send + Sync + 'static {
     /// Whether this key conflicts with another key.
     /// Only called for keys in the same group.
     fn conflicts(&self, other: &Self) -> bool;
+
+    /// Encode to bytes for persistence.
+    fn encode(&self) -> Vec<u8>;
+
+    /// Decode from bytes (for persistence load on startup).
+    fn decode(data: &[u8]) -> Result<Self, crate::LeaseError>;
 }
 
 /// A granted lease entry.
@@ -113,6 +121,9 @@ pub struct MemoryLeaseStore<K: LeaseKey> {
     /// Grace period for cleanup_expired: leases expired within this window
     /// are NOT removed, so validate_token_with_grace can still find them.
     cleanup_grace: Duration,
+    /// Optional persistence backend. When present, acquire/renew/release
+    /// operations are also persisted for crash recovery.
+    persistence: Option<Arc<dyn LeasePersistence>>,
 }
 
 impl<K: LeaseKey> MemoryLeaseStore<K> {
@@ -125,6 +136,7 @@ impl<K: LeaseKey> MemoryLeaseStore<K> {
             epoch_counter: Arc::new(AtomicU64::new(0)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             cleanup_grace: Duration::from_millis(5000),
+            persistence: None,
         }
     }
 
@@ -133,10 +145,93 @@ impl<K: LeaseKey> MemoryLeaseStore<K> {
         self
     }
 
+    /// Enable persistence backend. After this, acquire/renew/release will
+    /// also persist to the backend, and `load_from_persistence` can be used
+    /// on startup to recover lease state.
+    pub fn with_persistence<P: LeasePersistence + 'static>(mut self, backend: P) -> Self {
+        self.persistence = Some(Arc::new(backend));
+        self
+    }
+
+    /// Load non-expired leases from the persistence backend.
+    /// Called on Volume Server startup to recover lease state after crash.
+    ///
+    /// Also restores the epoch counter to prevent fence token ABA.
+    pub fn load_from_persistence(&self) -> Result<usize, LeaseError> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| LeaseError::Internal("no persistence backend configured".into()))?;
+
+        // Restore epoch counter
+        if let Ok(stored_epoch) = persistence.load_epoch() {
+            // Set epoch_counter to max(current, stored) + 1 to avoid reuse
+            let current = self.epoch_counter.load(Ordering::Relaxed);
+            if stored_epoch > current {
+                self.epoch_counter
+                    .store(stored_epoch + 1, Ordering::Relaxed);
+            }
+        }
+
+        // Load all lease entries
+        let entries = persistence.load_all()?;
+        let mut restored = 0usize;
+
+        for (token, data) in entries {
+            match decode_entry::<K>(&data) {
+                Ok(Some(entry)) => {
+                    let group_id = entry.key.group_id();
+                    let mut leases = self.leases.write().unwrap();
+                    let mut group_index = self.group_index.write().unwrap();
+                    let mut holder_index = self.holder_index.write().unwrap();
+
+                    // Update epoch counter if loaded entry has higher epoch
+                    if entry.epoch >= self.epoch_counter.load(Ordering::Relaxed) {
+                        self.epoch_counter.store(entry.epoch + 1, Ordering::Relaxed);
+                    }
+
+                    let holder_name = entry.holder.clone();
+                    let tok = entry.token.clone();
+
+                    leases.insert(token.clone(), entry);
+                    group_index.entry(group_id).or_default().push(token.clone());
+
+                    let holder_set = holder_index.entry(holder_name).or_default();
+                    let is_new = holder_set.is_empty();
+                    holder_set.insert(tok);
+                    if is_new {
+                        self.holder_count.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    restored += 1;
+                }
+                Ok(None) => {
+                    // Expired — delete from persistence
+                    let _ = persistence.delete(&token);
+                }
+                Err(e) => {
+                    log::warn!("Failed to decode lease entry on load: {}", e);
+                }
+            }
+        }
+
+        log::info!("Loaded {} lease entries from persistence", restored);
+        Ok(restored)
+    }
+
     fn generate_token(&self) -> (String, u64) {
         let epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
         let id = uuid::Uuid::new_v4();
         (format!("lease-{}-{}", epoch, id), epoch)
+    }
+
+    /// Persist epoch counter to backend (best-effort, called periodically).
+    pub fn persist_epoch(&self) -> Result<(), LeaseError> {
+        if let Some(p) = &self.persistence {
+            let epoch = self.epoch_counter.load(Ordering::Relaxed);
+            p.save_epoch(epoch)?;
+        }
+        Ok(())
     }
 }
 
@@ -212,6 +307,14 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             self.holder_count.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Persist to backend (best-effort)
+        if let Some(p) = &self.persistence {
+            let data = encode_entry(&entry);
+            if let Err(e) = p.save(&token, &data) {
+                log::warn!("lease persistence save failed on acquire: {}", e);
+            }
+        }
+
         Ok(entry)
     }
 
@@ -227,6 +330,15 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
                 }
                 entry.expire_at = Instant::now() + duration;
                 entry.epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
+
+                // Persist updated entry (best-effort)
+                if let Some(p) = &self.persistence {
+                    let data = encode_entry(entry);
+                    if let Err(e) = p.save(token, &data) {
+                        log::warn!("lease persistence save failed on renew: {}", e);
+                    }
+                }
+
                 Ok(())
             }
             None => Err(LeaseError::NotFound),
@@ -262,6 +374,13 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             if tokens.is_empty() {
                 holder_index.remove(holder);
                 self.holder_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        // Persist deletion (best-effort)
+        if let Some(p) = &self.persistence {
+            if let Err(e) = p.delete(token) {
+                log::warn!("lease persistence delete failed on release: {}", e);
             }
         }
 
@@ -355,12 +474,14 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             .unwrap_or_default();
 
         let mut removed = 0usize;
-        for token in tokens_to_remove {
-            if let Some(entry) = leases.remove(&token) {
+        let mut removed_tokens: Vec<String> = Vec::new();
+        for token in &tokens_to_remove {
+            if let Some(entry) = leases.remove(token) {
                 removed += 1;
+                removed_tokens.push(token.clone());
                 let group_id = entry.key.group_id();
                 if let Some(tokens) = group_index.get_mut(&group_id) {
-                    tokens.retain(|t| t != &token);
+                    tokens.retain(|t| t != token);
                     if tokens.is_empty() {
                         group_index.remove(&group_id);
                     }
@@ -373,6 +494,13 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
             if tokens.is_empty() {
                 holder_index.remove(holder);
                 self.holder_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        // Persist deletions (best-effort)
+        if let Some(p) = &self.persistence {
+            for token in &removed_tokens {
+                let _ = p.delete(token);
             }
         }
 
@@ -414,6 +542,11 @@ impl<K: LeaseKey> LeaseStore<K> for MemoryLeaseStore<K> {
                         holder_index.remove(&entry.holder);
                         self.holder_count.fetch_sub(1, Ordering::Relaxed);
                     }
+                }
+
+                // Persist deletion (best-effort)
+                if let Some(p) = &self.persistence {
+                    let _ = p.delete(&token);
                 }
             }
         }
@@ -464,6 +597,23 @@ mod tests {
             let self_end = self.start + self.count;
             let other_end = other.start + other.count;
             self.start < other_end && other.start < self_end
+        }
+        fn encode(&self) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(24);
+            buf.extend_from_slice(&self.id.to_le_bytes());
+            buf.extend_from_slice(&self.start.to_le_bytes());
+            buf.extend_from_slice(&self.count.to_le_bytes());
+            buf
+        }
+        fn decode(data: &[u8]) -> Result<Self, LeaseError> {
+            if data.len() < 24 {
+                return Err(LeaseError::Internal("key too short".into()));
+            }
+            Ok(Self {
+                id: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+                start: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+                count: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+            })
         }
     }
 
