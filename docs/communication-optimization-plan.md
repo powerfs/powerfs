@@ -1289,13 +1289,155 @@ for (_, chunk_idx) in &dirty {
 
 ### 实施建议
 
-1. **立即修复 P0**（BIG_WRITES + MAX_PAGES）：1 行代码改动，预期 128 倍写带宽提升。这是当前所有块大小都被限制在 ~70 MiB/s 的根本原因。
+1. ~~**立即修复 P0**（BIG_WRITES + MAX_PAGES）~~：✅ 已完成（commit `7c2320d4`），顺序写 53.4→1642 MiB/s（30.7x）。
 
-2. **P0 修复后重新跑 fio 基线**：确认写带宽是否达到 GB/s 级别。如果顺序写仍低于 500 MiB/s，说明 P1（串行 flush）成为新瓶颈。
+2. ~~**P0 修复后重新跑 fio 基线**~~：✅ 已完成，顺序写/读恢复 GB/s 级别，随机读写仍低（39.0/7.8 MiB/s）。
 
-3. **P1 并行 flush/read**：在 P0 修复验证后实施。将串行 `for` 循环改为 `tokio::join_all` 并行发送。
+3. **P1 并行 flush/read**：当前最高优先级。将串行 `for` 循环改为 `tokio::join_all` 并行发送。
 
 4. **P2 优化按需实施**：read-before-write 跳过对随机写有 2x 提升；短 TTL 对元数据密集场景有提升。
+
+### P1-P3 详细实施计划
+
+#### P1-a: 并行 flush（写路径优化）
+
+**当前代码**：[fuse.rs:504-530](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L504-L530) `flush_dirty_chunks`
+```rust
+// 串行：每个 chunk 一次 block_on + RPC
+for (_, chunk_idx) in &dirty {
+    self.client.write_blob_with_lease(...)  // ~2ms per chunk
+}
+// 256 chunks × 2ms = 512ms total
+```
+
+**改为**：
+```rust
+// 并行：收集所有 dirty chunks，分批并行 flush
+let chunks: Vec<_> = dirty.into_iter().map(|(_, idx)| { ... }).collect();
+let batch_size = 8; // 限制并发度，避免压垮 Volume Server
+for batch in chunks.chunks(batch_size) {
+    let futures: Vec<_> = batch.iter().map(|c| async { write_blob(c) }).collect();
+    futures::future::join_all(futures).await;
+}
+// 256 chunks / 8 并发 × 2ms = 64ms total (8x 提升)
+```
+
+**关键点**：
+- 并发度限制为 8（避免 Volume Server 过载和网络拥塞）
+- 保留 flush_lock（per-inode），防止后台 flusher 和 release 争用
+- 错误处理：单个 chunk flush 失败时 re-mark_dirty，不影响其他 chunk
+- lease_token 传递：batch 内共享同一个 lease（同一 inode 同一 stripe）
+
+**预期收益**：flush 吞吐 8 倍提升，release 延迟从 512ms 降到 64ms。
+
+#### P1-b: 并行 read + 增大预取（读路径优化）
+
+**当前代码**：[fuse.rs:1650-1735](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1650-L1735) read 方法
+```rust
+// 串行：每个 cache miss chunk 一次 block_on(read_blob)
+for chunk in missing_chunks {
+    self.client.read_blob(...)  // ~2ms per chunk
+}
+// 顺序读 256MB: 256 × 2ms = 512ms → 500 MiB/s 理论上限
+```
+
+**改为**：
+```rust
+// 并行：缺失的 chunks 一次性并行读取
+let futures: Vec<_> = missing_chunks.iter().map(|c| async { read_blob(c) }).collect();
+let results = futures::future::join_all(futures).await;
+// 8 chunks × 2ms = 2ms (batch 内并行)
+```
+
+**同时增大预取窗口**：
+- `PREFETCH_CHUNKS: u64 = 2` → `8`
+- 顺序读时预取 8 个额外 chunk，减少 cache miss
+
+**关键点**：
+- 并发度限制为 8（与 flush 一致）
+- lease 获取改为批量（`acquire_lease_batch` 已在 P2-2 实现）
+- 预取数据异步写入 chunk_cache，不阻塞当前 read
+
+**预期收益**：顺序读从 1292 提升到 ~5000+ MiB/s，随机读从 7.8 提升到 ~30+ MiB/s。
+
+#### P2-a: write lease 跳过 read-before-write
+
+**当前代码**：[fuse.rs:1933-1973](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1933-L1973)
+```rust
+// 随机写预创建文件时，每个 chunk 首次写入需要 read-before-write
+if content_size_before_write > chunk_start_offset {
+    let existing_data = self.client.read_blob(...);  // 额外 RPC
+}
+```
+
+**改为**：
+```rust
+// 持有 write lease 时，其他客户端无法修改数据
+// chunk_cache 中的数据是权威的，无需 read-before-write
+if has_write_lease && chunk_cache_has_data {
+    // 直接用 chunk_cache 中的数据，跳过 read_blob
+} else if content_size_before_write > chunk_start_offset {
+    let existing_data = self.client.read_blob(...);
+}
+```
+
+**关键点**：
+- 需要确认 write lease 已获取（open 时或首次 write 时）
+- 只对"部分覆盖"的 chunk 有效（完全覆盖/完全空 chunk 已优化）
+- 无 write lease 时保留 read-before-write（正确性优先）
+
+**预期收益**：随机写从 39.0 提升到 ~60+ MiB/s（消除 read RPC 开销）。
+
+#### P2-b: 短 TTL 替代 TTL=0
+
+**当前代码**：[fuse.rs:30-35](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L30-L35)
+```rust
+const TTL: Duration = Duration::ZERO;      // 禁用内核缓存
+const TTL_OPEN: Duration = Duration::ZERO;  // 打开文件也禁用
+```
+
+**改为**：
+```rust
+const TTL: Duration = Duration::from_millis(100);  // 100ms 内核缓存
+const TTL_OPEN: Duration = Duration::ZERO;          // 打开文件仍禁用（lease 权威）
+```
+
+**关键点**：
+- 100ms TTL 足以减少重复 getattr 的 FUSE 通信开销
+- 跨客户端修改通过 Invalidate 通知失效（已有机制）
+- 打开文件 TTL=0（lease 期间权威，不依赖内核缓存）
+
+**预期收益**：`ls -l`、`find`、`stat` 等元数据密集操作 2-5 倍提升。
+
+#### P3-a: 批量 write_blob (send_batch)
+
+**目标**：将多个 chunk 的写入合并为一个 RDMA doorbell 请求。
+
+**前置条件**：Transport trait 抽象（TCP/RDMA 统一接口）已实现。
+
+**改动**：`volume_client.rs` 新增 `write_blob_batch` 方法，内部用 `send_batch` 合并多个数据请求。
+
+**预期收益**：RDMA 场景下减少 doorbell 开销，TCP 场景收益较小。
+
+#### P3-b: 启用 FUSE writeback cache
+
+**改动**：`fuse.rs init` 中启用 `FsOptions::WRITEBACK_CACHE`。
+
+**风险**：writeback cache 下内核缓冲 write，跨客户端可见性延迟。需要确保 `fsync`/`close` 时正确 flush + invalidate。
+
+**预期收益**：小块顺序写（4K bs）合并为大批量 write，减少 FUSE 通信次数。
+
+### 实施顺序
+
+| 阶段 | 优化项 | 依赖 | 预期收益 |
+|------|--------|------|---------|
+| ✅ P0 | BIG_WRITES + MAX_PAGES | 无 | 30.7x 顺序写 |
+| → P1-a | 并行 flush | 无 | 8x flush 吞吐 |
+| → P1-b | 并行 read + 预取 | 无 | 4x read 吞吐 |
+| P2-a | write lease 跳过 read-before-write | P1 验证后 | 1.5x 随机写 |
+| P2-b | 短 TTL | 无 | 2-5x 元数据操作 |
+| P3-a | 批量 write_blob | Transport trait | RDMA 场景提升 |
+| P3-b | FUSE writeback cache | 一致性验证 | 小块写合并 |
 
 ### 历史对比
 
