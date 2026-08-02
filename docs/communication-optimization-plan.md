@@ -1165,6 +1165,150 @@ fn deliver_result(
 | 并发请求 | ✅ | 每个请求独立 oneshot，无共享状态 |
 | 向后兼容 | ✅ | deliver_result 回退到 resolve_waiter_for |
 
+---
+
+## FUSE I/O 性能瓶颈分析与优化方案（2026-08-02）
+
+### 当前性能基线
+
+测试环境：fuse-1 容器（2GB 内存），fio 3.16
+
+| 测试 | 块大小 | 带宽 | 平均延迟 | IOPS |
+|------|--------|------|---------|------|
+| 顺序写 (direct=1, libaio) | 1M | 53.4 MiB/s | — | — |
+| 顺序读 (direct=1, libaio) | 1M | 252 MiB/s | — | — |
+| 随机写 (direct=1, libaio) | 4K | 23.8 MiB/s | — | 6093 |
+| 随机读 (direct=1, libaio) | 4K | 6.5 MiB/s | — | 1664 |
+| 顺序写 (psync) | 4K | 70.2 MiB/s | 52μs | 17971 |
+| 顺序写 (psync) | 1M | 73.6 MiB/s | 12.84ms | 73 |
+| 顺序写 (psync) | 4M | 68.8 MiB/s | 55ms | 16.6 |
+
+**关键观察**：4K/1M/4M 的写带宽几乎相同（~70 MiB/s），延迟与块大小成正比（4K→52μs, 1M→12.84ms, 4M→55ms），说明瓶颈在 FUSE 通信次数而非数据量。
+
+### 瓶颈分析
+
+#### P0: FUSE max_write=4KB（128 倍性能损失）⭐ 最大瓶颈
+
+**根因**：[fuse.rs:844-850](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L844-L850) 的 `init` 方法返回 `FsOptions::empty()`，未设置 `BIG_WRITES` 和 `MAX_PAGES` 标志。
+
+fuse-backend-rs 0.14.0 的 INIT 协商逻辑（`sync_io.rs:768-779`）：
+```
+默认: max_write = MIN_READ_BUFFER - BUFFER_HEADER_SIZE  (≈4KB)
+BIG_WRITES:  max_write = MAX_REQ_PAGES × pagesize
+MAX_PAGES:   max_write = 1MB (MAX_REQ_PAGES × pagesize)
+```
+
+**影响**：1M write 被内核拆分成 256 个 4K write，每个 4K write 有 52μs 的 FUSE 内核↔用户态通信开销。
+
+- 4K bs: 1 次 write × 52μs = 52μs → 70.2 MiB/s
+- 1M bs: 256 次 write × 52μs = 13.3ms → 73.6 MiB/s
+- 4M bs: 1024 次 write × 52μs = 53ms → 68.8 MiB/s
+
+**修复**：
+```rust
+fn init(&self, capable: FsOptions) -> std::io::Result<FsOptions> {
+    let mut opts = FsOptions::empty();
+    if capable.contains(FsOptions::BIG_WRITES) {
+        opts |= FsOptions::BIG_WRITES;
+    }
+    if capable.contains(FsOptions::MAX_PAGES) {
+        opts |= FsOptions::MAX_PAGES;
+    }
+    Ok(opts)
+}
+```
+
+**预期收益**：1M write 从 13.3ms 降到 ~100μs → 带宽从 ~70 MiB/s 提升到 ~10 GiB/s（128 倍）。
+
+#### P1: flush 串行 + block_on
+
+**根因**：[fuse.rs:504-530](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L504-L530) `flush_dirty_chunks` 串行处理每个 dirty chunk：
+```rust
+for (_, chunk_idx) in &dirty {
+    self.client.write_blob_with_lease(...)  // runtime.block_on() + RPC
+}
+```
+
+每个 chunk 一次 `runtime.block_on()` 同步阻塞 + 一次 Volume Server RPC 往返。256 个 chunk × ~2ms = 512ms。
+
+**影响**：
+- release/close 时同步 flush 延迟高
+- 后台 flusher 吞吐量受限于串行 RPC 速度
+- write 速度 > flush 速度时 dirty chunks 积压
+
+**修复**：并行 flush —— 将 dirty chunks 分批，用 `tokio::join_all` 或 `futures::join_all` 并行发送多个 `write_blob_with_lease`。
+
+#### P1: read 串行 + block_on
+
+**根因**：[fuse.rs:1650-1735](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1650-L1735) read 路径对每个 cache miss 的 chunk 串行 `block_on(read_blob)`，无并行预取。每次 cache miss 还要 `block_on(lease_manager.acquire)`。
+
+**影响**：随机读 6.5 MiB/s（每次 4K read 都可能 cache miss → block_on + RPC）。
+
+**修复**：
+1. 并行 read：预取多个 chunk 时用 `tokio::join_all` 并行发送
+2. 异步 lease：lease 获取改为非阻塞（或预获取）
+3. 增大预取窗口（PREFETCH_CHUNKS=2 → 8）
+
+#### P2: TTL=0 导致额外 getattr
+
+**根因**：[fuse.rs:30-35](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L30-L35) `TTL=0` 禁用内核属性缓存。非打开文件的 getattr 每次查 Filer（RPC）。
+
+**影响**：`ls -l`、`find`、`stat` 等元数据密集操作性能差。
+
+**修复**：对单客户端场景使用短 TTL（如 1s），跨客户端修改通过 Invalidate 失效。或区分场景：fio/io500 用 TTL=0，日常用短 TTL。
+
+#### P2: read-before-write 开销
+
+**根因**：[fuse.rs:1933-1973](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1933-L1973) 随机写预创建文件时，每个 chunk 的首次写入需要 read-before-write（一次额外的 `read_blob` RPC）。
+
+**影响**：随机写 23.8 MiB/s（每个 chunk 首次写有 2 次 RPC：read + write）。
+
+**修复**：持有 write lease 时跳过 read-before-write（其他客户端无法修改数据，chunk_cache 中的数据权威）。
+
+#### P3: release 同步 flush + sync
+
+**根因**：[fuse.rs:2068-2110](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L2068-L2110) release 时同步串行 flush 所有 dirty chunks + `sync_size_chunks_on_close` Filer RPC。
+
+**影响**：close 延迟高（512ms+ for 256 chunks）。
+
+**修复**：并行 flush + 异步 sync（或 sync 放到后台，release 立即返回）。
+
+### 优化方案汇总
+
+| 优先级 | 优化项 | 改动位置 | 预期收益 | 复杂度 |
+|--------|--------|---------|---------|--------|
+| **P0** | 设置 BIG_WRITES + MAX_PAGES | fuse.rs init | **128x 写带宽** | 极低（1 行） |
+| **P1** | 并行 flush | fuse.rs flush_dirty_chunks | N 倍 flush 吞吐 | 中 |
+| **P1** | 并行 read + 预取 | fuse.rs read | N 倍 read 吞吐 | 中 |
+| P2 | write lease 跳过 read-before-write | fuse.rs write | 随机写 2x | 低 |
+| P2 | 短 TTL 替代 TTL=0 | fuse.rs TTL 常量 | 元数据操作提升 | 低 |
+| P2 | 增大 chunk_size (1M→4M) | cache.rs | 减少 RPC 次数 4x | 低 |
+| P3 | 批量 write_blob (send_batch) | volume_client.rs | 减少 RPC 开销 | 高 |
+| P3 | 启用 FUSE writeback cache | fuse.rs init | 批量 write 合并 | 中（需处理一致性） |
+| P3 | flusher 间隔 100ms→10ms | fuse.rs | 降低 flush 延迟 | 极低 |
+
+### 实施建议
+
+1. **立即修复 P0**（BIG_WRITES + MAX_PAGES）：1 行代码改动，预期 128 倍写带宽提升。这是当前所有块大小都被限制在 ~70 MiB/s 的根本原因。
+
+2. **P0 修复后重新跑 fio 基线**：确认写带宽是否达到 GB/s 级别。如果顺序写仍低于 500 MiB/s，说明 P1（串行 flush）成为新瓶颈。
+
+3. **P1 并行 flush/read**：在 P0 修复验证后实施。将串行 `for` 循环改为 `tokio::join_all` 并行发送。
+
+4. **P2 优化按需实施**：read-before-write 跳过对随机写有 2x 提升；短 TTL 对元数据密集场景有提升。
+
+### 历史对比
+
+| 阶段 | 顺序写 | 顺序读 | 随机写 | 随机读 | 关键变化 |
+|------|--------|--------|--------|--------|---------|
+| Phase 1 (CRDT 时代) | GB/s 级 | GB/s 级 | — | — | 无 lease，无 Filer 强一致 |
+| Phase 1 (Raft, Step 7) | 53.2 MiB/s | 122 MiB/s | 56.9 MiB/s | 18.0 MiB/s | Filer 强一致，无客户端缓存 |
+| Phase 2 (修复前) | 18.7 MiB/s | 92.2 MiB/s | 9.3 MiB/s | 8.2 MiB/s | lease + callback + read-before-write |
+| Phase 2 (当前) | 53.4 MiB/s | 252 MiB/s | 23.8 MiB/s | 6.5 MiB/s | read-before-write 优化 + getattr 修复 |
+| **P0 修复后（预期）** | **~10 GiB/s** | ~10 GiB/s | — | — | BIG_WRITES + MAX_PAGES |
+
+**结论**：从 GB/s 降到 ~70 MiB/s 的主因是 `init` 返回 `FsOptions::empty()` 导致 `max_write=4KB`。这是一个 1 行代码的配置遗漏，修复后预期恢复 GB/s 级别。
+
 
 
 
