@@ -8,6 +8,9 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
 use powerfs_common::types::Fid;
+use powerfs_fuse_core::metadata_client::{
+    MetadataAttr, MetadataClient, MetadataDirEntry, SetattrParams,
+};
 use powerfs_fuse_core::SyncFuseClientFacade;
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
@@ -374,38 +377,42 @@ impl<'a> Drop for LeaseGuard<'a> {
     }
 }
 
-impl PowerFsFs {
-    /// Phase 3.3: local_remove_entry 带 pull_delta 回退 + gRPC fallback。
-    ///
-    /// fuse 重启后 dir_cache 可能为空，`local_remove_entry` 会失败 "no local replica"。
-    /// 此时先 `pull_delta` 构建本地副本再重试；仍失败则 fallback 到 gRPC `delete_entry`，
-    /// 确保 filer 上的元数据一定能被删除（避免 fuse-1 已删但 fuse-2 仍可见的不一致）。
-    fn remove_entry_with_fallback(&self, parent: u64, name: &str, is_dir: bool) {
-        if let Err(e) = self.coherence.local_remove_entry(parent, name) {
-            if e.contains("no local replica") || e.contains("not found") {
-                debug!(
-                    "remove_entry: no local replica for dir {}, pulling delta before retry",
-                    parent
-                );
-                let coherence = self.coherence.clone();
-                self.client
-                    .block_on(async move { coherence.do_pull_and_apply_deltas(parent).await });
-            }
-            if let Err(e2) = self.coherence.local_remove_entry(parent, name) {
-                warn!(
-                    "remove_entry: local_remove_entry retry failed for dir {} name {}: {}, fallback to gRPC",
-                    parent, name, e2
-                );
-                if let Err(e3) =
-                    self.client
-                        .delete_entry(parent, name, is_dir, "powerfs-fuse-client")
-                {
-                    warn!("remove_entry: gRPC delete_entry fallback failed: {}", e3);
-                }
-            }
-        }
+/// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
+///
+/// 强一致方案下，所有元数据操作走 Filer Raft leader，返回 MetadataAttr。
+/// 此函数将其转换为 FUSE 缓存所需的 CachedEntry 结构。
+/// parent/name 由调用方传入（MetadataAttr 不包含路径信息）。
+fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedEntry {
+    let is_dir = attr.file_type == libc::DT_DIR;
+    let is_symlink = attr.file_type == libc::DT_LNK;
+    CachedEntry {
+        inode: attr.inode,
+        parent,
+        name: name.to_string(),
+        is_dir,
+        is_symlink,
+        symlink_target: attr.symlink_target.clone(),
+        nlink: attr.nlink,
+        fid: None,
+        size: attr.size,
+        mode: attr.mode,
+        uid: attr.uid,
+        gid: attr.gid,
+        atime: attr.atime as i64,
+        mtime: attr.mtime as i64,
+        ctime: attr.ctime as i64,
+        xattrs: HashMap::new(),
+        chunks: Vec::new(),
+        hard_link_id: String::new(),
+        hard_link_counter: 0,
+        content_size: attr.size,
+        disk_size: 0,
+        generation: 0,
+        cached_at: Instant::now(),
     }
+}
 
+impl PowerFsFs {
     fn get_write_lock(&self, inode: u64, chunk_idx: u64) -> Arc<std::sync::Mutex<()>> {
         let key = (inode, chunk_idx);
         let mut locks = self.write_locks.lock().unwrap();
@@ -584,7 +591,7 @@ impl PowerFsFs {
 
     /// Phase 3.4: close 时强一致 sync size/chunks 到 filer（Raft）。
     ///
-    /// 流程：构建 UpdateInodeSizeChunksRequest → 带 retry+timeout 调用 filer → 成功后 force_sync 目录 delta。
+    /// 流程：构建 UpdateInodeSizeChunksRequest → 带 retry+timeout 调用 filer → 成功后返回。
     /// 失败处理：重试到超时上限 → 返回 EIO + 标记 fsck（日志）。
     /// lease 在 sync 成功前不释放（崩溃则 lease 超时回收 + fsck 修复孤儿 chunks）。
     fn sync_size_chunks_on_close(&self, inode: u64) -> std::io::Result<()> {
@@ -653,17 +660,8 @@ impl PowerFsFs {
                         "sync_size_chunks_on_close: inode {} synced (attempt {})",
                         inode, attempt
                     );
-                    // 同步 push 父目录的 CRDT delta（确保目录条目可见）
-                    let coherence = self.coherence.clone();
-                    if let Err(e) = self
-                        .client
-                        .block_on(async move { coherence.force_sync(parent).await })
-                    {
-                        warn!(
-                            "sync_size_chunks_on_close: force_sync dir {} failed: {} (size/chunks already synced)",
-                            parent, e
-                        );
-                    }
+                    // Step 2: 强一致方案下，目录条目由 MetadataClient RPC（mkdir/create 等）
+                    // 走 Raft 提交，无需再 force_sync CRDT delta。
                     return Ok(());
                 }
                 Ok(resp) => {
@@ -733,18 +731,19 @@ impl PowerFsFs {
 
     /// 检查目录条目是否存在（用于 create/mkdir/symlink/link/rename 的 EEXIST 检查）。
     ///
-    /// 以 DirORSet 为权威源：如果 DirORSet 有副本且条目不存在，返回 false
-    /// （即使 MetadataCache 有残留条目也不算存在）。DirORSet 无副本时回退到
-    /// MetadataCache（冷启动场景）。
+    /// Step 2: 强一致方案下，先查 MetadataCache（快速路径），cache miss 时查 Filer
+    /// （通过 MetadataClient.lookup RPC 走 Leader Lease Read）。
     fn entry_exists(&self, parent: u64, name: &str) -> bool {
-        if self.coherence.lookup_with_type(parent, name).is_some() {
+        // 先查缓存（快速路径）
+        if self.lookup_in_cache(parent, name).is_some() {
             return true;
         }
-        // DirORSet 无副本时回退到 MetadataCache
-        if self.coherence.dir_cache().get(parent).is_none() {
-            return self.lookup_in_cache(parent, name).is_some();
-        }
-        false
+        // 查 Filer（shard_id = parent_ino）
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name.to_string();
+        self.client
+            .block_on(async move { meta_client.lookup(parent, &name_owned, parent).await })
+            .is_ok()
     }
 
     fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
@@ -865,69 +864,6 @@ impl PowerFsFs {
         }
         Some(current)
     }
-
-    /// Phase 4.2: 从 filer 获取 inode 的 attr 并填入 MetadataCache。
-    /// DirORSet 只存 (inode, name, type)，attr 需从 filer 获取。
-    fn lookup_attr_from_filer(
-        &self,
-        parent: u64,
-        name: &str,
-        inode: u64,
-        is_dir: bool,
-    ) -> std::io::Result<Entry> {
-        match self.client.get_entry_by_parent(parent, name) {
-            Ok(Some(entry)) => {
-                let cached = self.entry_to_cached(parent, &entry);
-                self.cache.insert(cached.clone());
-                Ok(self.create_fuse_entry(&cached))
-            }
-            Ok(None) => {
-                // DirORSet 有条目但 filer 查不到（delta 已 push 但 filer 未处理完？）
-                // 返回一个基于 DirORSet 信息的最小 entry，使用 DirORSet 的 is_dir
-                // 而非硬编码 false（否则目录会被误报为文件，破坏 find/cp 递归）
-                debug!(
-                    "lookup_attr_from_filer: filer miss for inode {} (dir entry exists, is_dir={}), using minimal entry",
-                    inode, is_dir
-                );
-                let now = chrono::Utc::now().timestamp();
-                let mode = if is_dir { 0o40755 } else { 0o100644 };
-                let cached = CachedEntry {
-                    inode,
-                    parent,
-                    name: name.to_string(),
-                    is_dir,
-                    is_symlink: false,
-                    symlink_target: None,
-                    nlink: if is_dir { 2 } else { 1 },
-                    fid: None,
-                    size: 0,
-                    mode,
-                    uid: 0,
-                    gid: 0,
-                    atime: now,
-                    mtime: now,
-                    ctime: now,
-                    xattrs: HashMap::new(),
-                    chunks: Vec::new(),
-                    hard_link_id: String::new(),
-                    hard_link_counter: 0,
-                    content_size: 0,
-                    disk_size: 0,
-                    generation: 0,
-                    cached_at: Instant::now(),
-                };
-                self.cache.insert(cached.clone());
-                Ok(self.create_fuse_entry(&cached))
-            }
-            Err(e) => {
-                warn!(
-                    "lookup_attr_from_filer: filer query failed for inode {}: {}",
-                    inode, e
-                );
-                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
-            }
-        }
-    }
 }
 
 impl FileSystem for PowerFsFs {
@@ -951,51 +887,20 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
-        // Phase 4.2: 读本地 DirORSet（权威目录条目源）
-        // 2. DirORSet 命中 → 获取 inode → 查 filer 获取 attr（MetadataCache miss 时）
-        if let Some((inode, is_dir)) = self.coherence.lookup_with_type(parent, name_str) {
-            debug!(
-                "lookup: DirORSet hit for '{}/{}' → inode {} is_dir={}",
-                parent, name_str, inode, is_dir
-            );
-            return self.lookup_attr_from_filer(parent, name_str, inode, is_dir);
-        }
+        // 2. Step 2: Filer RPC（强一致 Leader Lease Read，shard_id = parent_ino）
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name_str.to_string();
+        let attr = self
+            .client
+            .block_on(async move { meta_client.lookup(parent, &name_owned, parent).await })
+            .map_err(|e| {
+                debug!("lookup RPC failed for '{}/{}': {}", parent, name_str, e);
+                std::io::Error::from_raw_os_error(libc::ENOENT)
+            })?;
 
-        // 3. DirORSet miss → 同步 pull_delta 后再查 DirORSet
-        debug!(
-            "lookup: DirORSet miss for '{}/{}', pulling delta",
-            parent, name_str
-        );
-        let coherence = self.coherence.clone();
-        self.client
-            .block_on(async move { coherence.do_pull_and_apply_deltas(parent).await });
-        if let Some((inode, is_dir)) = self.coherence.lookup_with_type(parent, name_str) {
-            debug!(
-                "lookup: DirORSet hit after pull for '{}/{}' → inode {} is_dir={}",
-                parent, name_str, inode, is_dir
-            );
-            return self.lookup_attr_from_filer(parent, name_str, inode, is_dir);
-        }
-
-        // 4. Fallback: 直接查 filer（兼容旧路径 + 兜底）
-        match self.client.get_entry_by_parent(parent, name_str) {
-            Ok(Some(entry)) => {
-                debug!(
-                    "lookup found entry via filer fallback: parent={}, name={}, chunks={}",
-                    parent,
-                    name_str,
-                    entry.chunks.len()
-                );
-                let cached = self.entry_to_cached(parent, &entry);
-                self.cache.insert(cached.clone());
-                Ok(self.create_fuse_entry(&cached))
-            }
-            Ok(None) => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
-            Err(e) => {
-                warn!("lookup entry failed: {}", e);
-                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
-            }
-        }
+        let entry = attr_to_cached_entry(&attr, parent, name_str);
+        self.cache.insert(entry.clone());
+        Ok(self.create_fuse_entry(&entry))
     }
 
     fn getattr(
@@ -1101,20 +1006,40 @@ impl FileSystem for PowerFsFs {
 
         let now = chrono::Utc::now().timestamp();
         let atime = if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::ATIME_NOW) {
-            Some(now)
+            Some(now as u64)
         } else if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::ATIME) {
-            Some(attr.st_atime)
+            Some(attr.st_atime as u64)
         } else {
             None
         };
         let mtime = if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::MTIME_NOW) {
-            Some(now)
+            Some(now as u64)
         } else if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::MTIME) {
-            Some(attr.st_mtime)
+            Some(attr.st_mtime as u64)
         } else {
             None
         };
 
+        // Step 2: 通过 MetadataClient.setattr RPC 走 Filer Raft leader（强一致）
+        // 同步 mode/uid/gid/atime/mtime 到 filer。size 变更由 close 时
+        // sync_size_chunks_on_close 强一致同步（含 chunks），此处不传 size。
+        let params = SetattrParams {
+            mode,
+            uid,
+            gid,
+            size: None,
+            atime,
+            mtime,
+        };
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        self.client
+            .block_on(async move { meta_client.setattr(inode, &params, inode).await })
+            .map_err(|e| {
+                error!("setattr RPC failed for inode {}: {}", inode, e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        // RPC 成功后更新本地缓存（含 size，供 FUSE 立即返回最新 stat）
         self.cache.update_attr(
             inode,
             crate::cache::UpdateAttrParams {
@@ -1122,30 +1047,12 @@ impl FileSystem for PowerFsFs {
                 size,
                 uid,
                 gid,
-                atime,
-                mtime,
+                atime: atime.map(|t| t as i64),
+                mtime: mtime.map(|t| t as i64),
             },
         );
 
-        // Persist metadata changes via CRDT (mode/uid/gid/mtime) — async delta sync.
-        // size 变更由 close 时 sync_size_chunks_on_close 强一致同步，此处不处理。
         if let Some(updated) = self.cache.get_inode(inode) {
-            let parent_ino = updated.parent;
-            if let Err(e) = self.coherence.local_setattr_entry(
-                parent_ino,
-                inode,
-                mode,
-                uid,
-                gid,
-                mtime.map(|t| t as u64),
-            ) {
-                warn!(
-                    "setattr: failed to buffer CRDT delta for inode={}: {}",
-                    inode, e
-                );
-                // Continue anyway - local cache is already updated
-            }
-
             Ok((self.create_stat(&updated), TTL))
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -1170,58 +1077,28 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        let now = chrono::Utc::now().timestamp();
-
-        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync（不再同步调 filer create_entry）
-        let coherence = self.coherence.clone();
-        let inode = self
-            .client
-            .block_on(async move { coherence.alloc_inode().await })
-            .map_err(|e| {
-                error!("mkdir: alloc_inode failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
-            })?;
-        // 保留 S_IFDIR 类型位（0o040000）—— filer 端 apply_delta_to_store 通过
-        // mode & S_IFMT 判定 FileType，清除会导致目录被识别为普通文件。
+        // Step 2: 通过 MetadataClient.mkdir RPC 走 Filer Raft leader（强一致）
+        // 保留 S_IFDIR 类型位（0o040000）—— filer 端通过 mode & S_IFMT 判定 FileType。
         let dir_mode = mode | 0o040000;
-        let _dir_entry = self
-            .coherence
-            .local_create_entry(parent, name_str, inode, true, dir_mode, ctx.uid, ctx.gid)
+        let uid = ctx.uid;
+        let gid = ctx.gid;
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name_str.to_string();
+        let attr = self
+            .client
+            .block_on(async move {
+                meta_client
+                    .mkdir(parent, &name_owned, dir_mode, uid, gid, parent)
+                    .await
+            })
             .map_err(|e| {
-                error!("mkdir: local_create_entry failed: {}", e);
+                error!("mkdir RPC failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        let entry = CachedEntry {
-            inode,
-            parent,
-            name: name_str.to_string(),
-            is_dir: true,
-            is_symlink: false,
-            symlink_target: None,
-            nlink: 2,
-            fid: None,
-            size: 0,
-            mode: dir_mode,
-            uid: ctx.uid,
-            gid: ctx.gid,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            xattrs: HashMap::new(),
-            chunks: Vec::new(),
-            hard_link_id: String::new(),
-            hard_link_counter: 0,
-            content_size: 0,
-            disk_size: 0,
-            generation: 0,
-            cached_at: Instant::now(),
-        };
+        let entry = attr_to_cached_entry(&attr, parent, name_str);
         self.cache.insert(entry.clone());
-        debug!(
-            "mkdir: local apply done, inode={}, async delta buffered for dir {}",
-            inode, parent
-        );
+        debug!("mkdir: RPC done, inode={}, dir={}", attr.inode, parent);
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -1230,32 +1107,26 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("rmdir: parent={}, name={}", parent, name_str);
 
-        let entry = self
-            .lookup_in_cache(parent, name_str)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        // Step 2: 通过 MetadataClient.rmdir RPC 走 Filer Raft leader（强一致）
+        // Filer 的 handle_rmdir 会做空目录检查（ENOTEMPTY），客户端不需要重复检查。
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name_str.to_string();
+        self.client
+            .block_on(async move { meta_client.rmdir(parent, &name_owned, parent).await })
+            .map_err(|e| {
+                let errno = if e.to_string().contains("not empty") {
+                    libc::ENOTEMPTY
+                } else {
+                    error!("rmdir RPC failed: {}", e);
+                    libc::EIO
+                };
+                std::io::Error::from_raw_os_error(errno)
+            })?;
 
-        if !entry.is_dir {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        // Remove from cache
+        if let Some(entry) = self.lookup_in_cache(parent, name_str) {
+            self.cache.remove(entry.inode);
         }
-
-        // 用 DirORSet（权威源）检查目录是否为空，避免 path_map 残留条目
-        // 导致空目录被误判为非空（ENOTEMPTY）。
-        let dir_children = self.coherence.list_entries(entry.inode);
-        if dir_children.is_empty() {
-            // DirORSet 为空时再查 MetadataCache 兜底（冷启动场景）
-            if !self.cache.list_children(entry.inode).is_empty() {
-                return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
-            }
-        } else {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
-        }
-
-        // Phase 3.3: 本地 tombstone + 异步 delta sync（不再同步调 filer delete_entry）
-        // filer 收到 Remove delta 后通过 apply_delta_to_store 物理删除 CF_DIR_ENTRIES + CF_INODES
-        // 使用带 pull_delta 回退 + gRPC fallback 的辅助方法，确保 filer 元数据一定能删除
-        self.remove_entry_with_fallback(parent, name_str, true);
-
-        self.cache.remove(entry.inode);
         Ok(())
     }
 
@@ -1281,6 +1152,17 @@ impl FileSystem for PowerFsFs {
             None
         };
 
+        // Step 2: 通过 MetadataClient.unlink RPC 走 Filer Raft leader（强一致）
+        // Filer 端原子地移除目录条目并递减 nlink。
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name_str.to_string();
+        self.client
+            .block_on(async move { meta_client.unlink(parent, &name_owned, parent).await })
+            .map_err(|e| {
+                error!("unlink RPC failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
             // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
@@ -1297,11 +1179,6 @@ impl FileSystem for PowerFsFs {
                     }
                 }
             }
-
-            // Phase 3.3: 本地 tombstone + 异步 delta sync（不再同步调 filer delete_entry）
-            // filer 收到 Remove delta 后通过 apply_delta_to_store 物理删除 CF_DIR_ENTRIES + CF_INODES
-            // 使用带 pull_delta 回退 + gRPC fallback 的辅助方法，确保 filer 元数据一定能删除
-            self.remove_entry_with_fallback(parent, name_str, false);
 
             self.cache.remove(entry.inode);
         } else {
@@ -1348,25 +1225,29 @@ impl FileSystem for PowerFsFs {
 
         let fid_str = fid.to_string();
 
-        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync（不再同步调 filer create_entry）
-        let coherence = self.coherence.clone();
-        let inode = self
-            .client
-            .block_on(async move { coherence.alloc_inode().await })
-            .map_err(|e| {
-                error!("create: alloc_inode failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
-            })?;
+        // Step 2: 通过 MetadataClient.create RPC 走 Filer Raft leader（强一致）
+        // Filer 端分配 inode 并创建目录条目，返回 MetadataAttr（含 inode）。
         // 保留 S_IFREG 类型位（0o100000）—— 与 mkdir 同理，filer 端通过 mode & S_IFMT 判定 FileType。
         let file_mode = args.mode | 0o100000;
-        let _dir_entry = self
-            .coherence
-            .local_create_entry(parent, name_str, inode, false, file_mode, ctx.uid, ctx.gid)
+        let uid = ctx.uid;
+        let gid = ctx.gid;
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_owned = name_str.to_string();
+        let attr = self
+            .client
+            .block_on(async move {
+                meta_client
+                    .create(parent, &name_owned, file_mode, uid, gid, parent)
+                    .await
+            })
             .map_err(|e| {
-                error!("create: local_create_entry failed: {}", e);
+                error!("create RPC failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
+        let inode = attr.inode;
 
+        // 构造 CachedEntry：fid/chunks 来自客户端 assign_fid，attr 来自 Filer RPC。
+        // size/chunks 在 close 时由 sync_size_chunks_on_close 强一致同步到 filer。
         let entry = CachedEntry {
             inode,
             parent,
@@ -1400,10 +1281,7 @@ impl FileSystem for PowerFsFs {
             cached_at: Instant::now(),
         };
         self.cache.insert(entry.clone());
-        debug!(
-            "create: local apply done, inode={}, async delta buffered for dir {}",
-            inode, parent
-        );
+        debug!("create: RPC done, inode={}, dir={}", inode, parent);
 
         // create also opens the file: pin inode + track as open
         self.open_inodes.write().unwrap().insert(inode);
@@ -1951,7 +1829,7 @@ impl FileSystem for PowerFsFs {
 
             // NOTE: 旧代码在此处同步调用 self.client.update_entry() 向 master 注册文件条目，
             // 这会阻塞写入路径 10s+（gRPC 同步往返）。在新设计中：
-            //   - 目录条目由 CRDT local_create_entry（create 时已完成）异步 delta sync
+            //   - 目录条目由 MetadataClient.create RPC（create 时已完成）走 Raft 强一致提交
             //   - size/chunks 由 release() 时 sync_size_chunks_on_close 强一致同步到 filer
             // 因此 update_entry 调用是冗余的，移除以消除写入延迟根因。
 
@@ -1987,7 +1865,7 @@ impl FileSystem for PowerFsFs {
             );
         }
 
-        // 2. Sync size/chunks to filer (Raft strong consistency) + force_sync directory delta
+        // 2. Sync size/chunks to filer (Raft strong consistency)
         //    sync 失败返回 EIO，调用方感知 close 未完成
         let sync_result = self.sync_size_chunks_on_close(inode);
         if let Err(e) = &sync_result {
@@ -2062,14 +1940,36 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<()> {
         debug!("readdir: inode={}, offset={}", inode, offset);
 
-        let entry = self
-            .cache
-            .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        // 尝试从缓存获取目录条目（用于 is_dir 检查和 ".." 的 parent inode）
+        let cached_entry = self.cache.get_inode(inode);
 
-        if !entry.is_dir {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        // 缓存 miss 时通过 MetadataClient.getattr 验证是目录并获取属性
+        match &cached_entry {
+            Some(entry) if !entry.is_dir => {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            None => {
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let attr = self
+                    .client
+                    .block_on(async move { meta_client.getattr(inode, inode).await })
+                    .map_err(|e| {
+                        debug!("readdir: getattr RPC failed for inode {}: {}", inode, e);
+                        std::io::Error::from_raw_os_error(libc::ENOENT)
+                    })?;
+                if !attr.is_dir() {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+                }
+            }
+            _ => {}
         }
+
+        // 解析 parent inode（用于 ".." 条目）
+        let parent_ino = if inode == ROOT_INODE {
+            ROOT_INODE
+        } else {
+            cached_entry.as_ref().map(|e| e.parent).unwrap_or(inode)
+        };
 
         let mut idx = 0u64;
 
@@ -2086,79 +1986,46 @@ impl FileSystem for PowerFsFs {
         }
         idx += 1;
 
-        if offset <= idx {
-            let parent = if inode == ROOT_INODE {
-                ROOT_INODE
-            } else {
-                entry.parent
-            };
-            if add_entry(DirEntry {
-                ino: parent,
+        if offset <= idx
+            && add_entry(DirEntry {
+                ino: parent_ino,
                 offset: idx + 1,
                 type_: 0o040000,
                 name: "..".as_bytes(),
             })
             .is_err()
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         idx += 1;
 
-        // DirORSet 是权威目录条目源（CRDT 维护，正确处理远程删除）。
-        // MetadataCache.list_children 扫描 path_map，可能包含已被远程删除但
-        // 未清理的残留条目（filer fallback 路径只写 MetadataCache 不写 DirORSet，
-        // 导致后续 Remove delta 在 DirORSet 中找不到匹配，invalidate 不触发）。
-        // 因此 readdir 必须以 DirORSet 为主，list_children 仅作最终 fallback。
-        //
-        // 1. 读本地 DirORSet
-        // 2. DirORSet 空 → 同步 pull_delta 后再读
-        // 3. 仍空 → fallback 到 filer list_entries（冷启动场景）
-        // 4. 仍空 → list_children（兜底，兼容旧缓存）
-        let mut children = self.coherence.list_entries(inode);
+        // Step 2: 通过 MetadataClient.readdir RPC 走 Filer Raft leader（强一致 Leader Lease Read）
+        // shard_id = inode（对 inode 操作）
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let dir_entries: Vec<MetadataDirEntry> = self
+            .client
+            .block_on(async move { meta_client.readdir(inode, offset, 1000, inode).await })
+            .map_err(|e| {
+                error!("readdir RPC failed for inode {}: {}", inode, e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
 
-        if children.is_empty() {
-            debug!(
-                "readdir: DirORSet empty for dir {}, pulling delta from filer",
-                inode
-            );
-            let coherence = self.coherence.clone();
-            self.client
-                .block_on(async move { coherence.do_pull_and_apply_deltas(inode).await });
-            let dir_entries = self.coherence.list_entries(inode);
-            if !dir_entries.is_empty() {
-                debug!(
-                    "readdir: DirORSet populated after pull, {} entries",
-                    dir_entries.len()
-                );
-                children = dir_entries;
-            }
-        }
+        debug!(
+            "readdir: RPC returned {} entries for dir {}",
+            dir_entries.len(),
+            inode
+        );
 
-        if children.is_empty() {
-            // Fallback: 直接查 filer（冷启动 + DirORSet 无副本时）
-            debug!(
-                "readdir: DirORSet still empty for dir {}, falling back to filer list_entries",
-                inode
-            );
-            if let Ok(entries) = self.client.list_entries(inode, 1000, "") {
-                for child_entry in entries {
-                    let cached = self.entry_to_cached(inode, &child_entry);
-                    self.cache.insert(cached);
-                }
-                children = self.cache.list_children(inode);
-            }
-        }
-
-        for (child_ino, child_name, is_dir) in children {
+        for child in dir_entries {
             idx += 1;
             if offset < idx {
-                let type_ = if is_dir { 0o040000 } else { 0o100000 };
+                // DT_DIR=4, DT_REG=8, DT_LNK=10 等；FUSE DirEntry.type_ 用 d_type 值
+                let type_ = child.file_type as u32;
                 if add_entry(DirEntry {
-                    ino: child_ino,
+                    ino: child.inode,
                     offset: idx,
                     type_,
-                    name: child_name.as_bytes(),
+                    name: child.name.as_bytes(),
                 })
                 .is_err()
                 {
@@ -2191,77 +2058,37 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        if let Some(target) = self.lookup_in_cache(newdir, new_str) {
-            if target.is_dir {
-                // 用 DirORSet 检查目录是否为空（权威源，避免 path_map 残留）
-                let dir_children = self.coherence.list_entries(target.inode);
-                if !dir_children.is_empty()
-                    || (dir_children.is_empty()
-                        && !self.cache.list_children(target.inode).is_empty())
-                {
-                    return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
-                }
-            }
-        }
-
-        let entry = self
-            .lookup_in_cache(olddir, old_str)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-
-        // 记录 rename 前是否已有同名目标（用于 CRDT 删除旧目标）
-        let has_existing_target = self
-            .lookup_in_cache(newdir, new_str)
-            .filter(|t| t.inode != entry.inode)
-            .is_some();
-
-        // Phase 3.3: 本地 apply DirORSet + 异步 delta sync
-        // 顺序：先删旧目标 → 再 rename/create（保证 DirORSet 状态正确）
-        if has_existing_target {
-            if let Err(e) = self.coherence.local_remove_entry(newdir, new_str) {
-                debug!(
-                    "rename: local_remove_entry for overwritten target in dir {} skipped: {}",
-                    newdir, e
-                );
-            }
-        }
-
-        self.cache
-            .rename(olddir, old_str, newdir, new_str)
+        // Step 2: 通过 MetadataClient.rename RPC 走 Filer Raft leader（强一致，原子提交）
+        // Filer 端原子处理：删除旧目标（如有）+ 移动/重命名条目。
+        // 空目录检查由 Filer 在 Raft 提交时完成，返回 ENOTEMPTY 错误。
+        // shard_id = olddir（源目录的 shard）
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let old_owned = old_str.to_string();
+        let new_owned = new_str.to_string();
+        let _attr = self
+            .client
+            .block_on(async move {
+                meta_client
+                    .rename(olddir, &old_owned, newdir, &new_owned, olddir)
+                    .await
+            })
             .map_err(|e| {
-                error!("rename failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = if e.to_string().contains("not empty") {
+                    libc::ENOTEMPTY
+                } else {
+                    error!("rename RPC failed: {}", e);
+                    libc::EIO
+                };
+                std::io::Error::from_raw_os_error(errno)
             })?;
 
-        // 跨目录 rename = local_remove_entry(olddir) + local_create_entry(newdir)
-        // 同目录 rename = local_rename_entry(olddir, old, new)
-        if olddir == newdir {
-            if let Err(e) = self.coherence.local_rename_entry(olddir, old_str, new_str) {
-                warn!(
-                    "rename: local_rename_entry failed for dir {}: {} (cache already updated)",
-                    olddir, e
-                );
-            }
-        } else {
-            if let Err(e) = self.coherence.local_remove_entry(olddir, old_str) {
-                warn!(
-                    "rename: local_remove_entry from old dir {} failed: {} (cache already updated)",
-                    olddir, e
-                );
-            }
-            if let Err(e) = self.coherence.local_create_entry(
-                newdir,
-                new_str,
-                entry.inode,
-                entry.is_dir,
-                entry.mode,
-                entry.uid,
-                entry.gid,
-            ) {
-                warn!(
-                    "rename: local_create_entry to new dir {} failed: {} (cache already updated)",
-                    newdir, e
-                );
-            }
+        // RPC 成功后更新本地缓存（path_map + inode_cache）
+        // cache.rename 失败仅影响本地缓存一致性，不影响 Filer 已提交的状态
+        if let Err(e) = self.cache.rename(olddir, old_str, newdir, new_str) {
+            warn!(
+                "rename: cache.rename failed (filer already committed): {}",
+                e
+            );
         }
 
         Ok(())
