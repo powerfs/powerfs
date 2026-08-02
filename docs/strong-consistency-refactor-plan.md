@@ -935,3 +935,88 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 - 容器内存限制 512MiB，测试参数已适配（随机读写 size=1M 避免OOM）
 
 结论：阶段1（Filer 强一致 + 无客户端元数据缓存）fio 性能基线达标，可作为阶段2 推进决策的依据。
+
+---
+
+## 八、阶段2 实施记录（客户端 lease 缓存 + callback invalidation）
+
+### Step B1: Master 侧 CRDT 元数据清理
+
+**Commit**: `8caf9165` refactor(master): remove dead CRDT filesystem metadata code
+
+删除 Master 侧的 DirectoryTree / MetadataManager（约 7000 行死代码），保留 Volume 管理 Raft 功能。所有文件系统元数据由 Filer Raft 统一管理。
+
+### Step B2: Callback Invalidation 链路实现
+
+实现了从 Filer 订阅到客户端缓存失效的完整链路：
+
+1. **Filer 订阅**：Filer 在 Lookup/ReadDir 时自动订阅目录和文件 inode 的通知
+2. **Invalidate 推送**：Filer 在元数据变更（setattr / update_inode_size_chunks）时推送 Invalidate 通知
+3. **客户端失效**：InvalidateHandler 接收通知，清理 MetadataCache + ChunkCache
+4. **Pinned inode 保护**：已打开文件（pinned）跳过失效，保证写入过程中缓存不被清除
+5. **引用计数 pinning**：pinned_inodes 从 HashSet 改为 HashMap<u64, u32>，处理并发 open/release
+
+**关键修复**：
+- InodeNotifier body_len 计算错误导致协议流损坏
+- ShardedRpcPool client_id 传播，确保每个客户端使用独立标识
+- Master LookupVolume 支持 UUID-based ID 精确查找
+
+### Step B3: 跨客户端 Append 可见性修复
+
+**Commit**: `4f0e5348` fix(fuse): implement cross-client append visibility and callback invalidation
+
+#### Bug 1: Read-before-write
+**问题**：fuse-2 append 到 fuse-1 创建的文件时，chunk_cache 为空，write 代码创建 `[zeros + new_data]` 的 chunk，flush 覆盖了 volume 上 fuse-1 的原始数据。
+
+**修复**：在 write 路径中，当 chunk 不在缓存中但文件已有数据（`content_size_before_write > chunk_start_offset`）时，先从 Volume Server 读取现有 chunk 数据，再应用部分写入。
+
+#### Bug 2: Open unsynced-write guard
+**问题**：后台 flusher 将数据写入 Volume 并清除 dirty 标志后，open() 从 Filer 刷新（Filer 仍是旧 size），发现 chunks 不匹配，清空 chunk_cache，导致数据丢失。
+
+**修复**：在 open() 中添加 `local_ahead` 检查 — 当本地 content_size > Filer 的 content_size 时，跳过刷新（本地缓存有未同步的写入，是权威的）。
+
+#### Bug 3: VolumeClient::update_lease token 不更新
+**问题**：`update_lease` 在条目已存在时只更新 duration，不更新 token。ensure_lease 获取新 token 后，缓存中仍是旧 token。release 用旧 token 发送到服务器，服务器回复 "Lease not found"，孤立的 lease 阻止所有后续获取（"Stripe lease conflict"）。
+
+**修复**：`update_lease` 始终覆盖 token + duration。
+
+#### Bug 4: Read lease 未在服务器释放
+**问题**：release() 仅清除本地 lease 缓存，未在服务器释放 read lease，残留的 read lease 阻止其他客户端获取 write lease。
+
+**修复**：添加 `release_all_for_inode` 方法，在服务器端释放所有 read lease。
+
+### Step B4: 跨客户端测试验证
+
+#### 测试环境
+- 3 Master + 3 Filer (Raft) + 3 Volume + 2 FUSE 客户端
+- 容器环境，fuse-1 和 fuse-2 同时挂载同一 PowerFS
+
+#### 测试结果
+
+| 测试场景 | 结果 | 说明 |
+|---------|------|------|
+| 跨客户端 append（fuse-1 创建 → fuse-2 追加 → fuse-1 读取） | ✅ | 两客户端均看到完整数据 |
+| 交替写入（A1→B2→A3→B4，4 轮交替） | ✅ | 两客户端均看到全部 4 行 |
+| 64KB 大文件跨客户端 append | ✅ | fuse-2 追加 64KB 后，fuse-1 看到 128KB，md5 一致 |
+| 跨客户端 truncate 可见性 | ⚠️ | setattr 同步到 Filer 但 Invalidate 未触发，待修复 |
+
+#### fio 性能基线（Phase 2）
+
+| 测试 | 带宽 | Phase 1 基线 | 变化 |
+|------|------|-------------|------|
+| 顺序写 (1M bs) | 18.7 MiB/s | 53.2 MiB/s | ↓ (read-before-write + callback 开销) |
+| 顺序读 (1M bs) | 92.2 MiB/s | 122 MiB/s | ↓ (callback invalidation 开销) |
+| 随机写 (4K bs) | 9.3 MiB/s | 56.9 MiB/s | ↓ (lease 管理开销) |
+| 随机读 (4K bs) | 8.2 MiB/s | 18.0 MiB/s | ↓ (lease + callback 开销) |
+
+**性能分析**：
+- 顺序写下降主要因 read-before-write：首次写入每个 chunk 需额外一次 Volume 读
+- 随机写下降因 lease 管理开销和 read-before-write
+- 顺序读/随机读下降因 callback invalidation 的额外网络通信
+- 所有测试功能正确，无数据损坏
+
+### 待办事项
+
+1. **跨客户端 truncate 可见性**：setattr 同步到 Filer 但 Invalidate 通知未触发，需检查 Filer 的 setattr handler 是否调用 notify_inode_change
+2. **性能优化**：read-before-write 可通过预取或 write lease 期间跳过读取来优化
+3. **io500 测试**：待 truncate 修复后运行完整 io500 测试
