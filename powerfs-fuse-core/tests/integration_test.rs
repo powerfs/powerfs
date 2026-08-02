@@ -65,7 +65,7 @@ fn test_facade_config_custom_values() {
 fn test_meta_shard_client_initialization() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager);
+    let mut client = MetaShardClient::new(config, topology_manager, 0);
 
     // 验证初始状态
     assert_eq!(client.state(), MetaShardClientState::Init);
@@ -99,7 +99,7 @@ async fn test_volume_client_initialization() {
 async fn test_request_submission_without_network() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager.clone());
+    let mut client = MetaShardClient::new(config, topology_manager.clone(), 0);
     client.init();
 
     // 创建请求上下文
@@ -294,7 +294,7 @@ async fn test_client_cleanup() {
     let meta_config = MetaShardClientConfig::default();
     let volume_config = VolumeClientConfig::default();
 
-    let mut meta_client = MetaShardClient::new(meta_config, topology_manager.clone());
+    let mut meta_client = MetaShardClient::new(meta_config, topology_manager.clone(), 0);
     let mut volume_client = VolumeClient::new(volume_config, topology_manager);
 
     meta_client.init();
@@ -315,9 +315,10 @@ async fn test_client_cleanup() {
 #[test]
 fn test_request_kind_priority() {
     // 优先级数字越小表示优先级越高
+    // 当前优先级: Lease=0 < Metadata=1 < Read=2 < Write=3 < Management=4 < Control=5
     assert!(RequestKind::Lease.priority() < RequestKind::Metadata.priority());
-    assert!(RequestKind::Management.priority() < RequestKind::Read.priority());
-    assert!(RequestKind::Control.priority() < RequestKind::Write.priority());
+    assert!(RequestKind::Read.priority() < RequestKind::Management.priority());
+    assert!(RequestKind::Write.priority() < RequestKind::Control.priority());
 }
 
 /// 测试 MetaShardClient 队列操作
@@ -325,7 +326,7 @@ fn test_request_kind_priority() {
 fn test_meta_shard_client_queue_operations() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager);
+    let mut client = MetaShardClient::new(config, topology_manager, 0);
     client.init();
 
     // 创建多个请求

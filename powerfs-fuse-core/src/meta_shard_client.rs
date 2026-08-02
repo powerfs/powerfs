@@ -355,7 +355,8 @@ impl MetaShardClient {
 
         log::info!(
             "MetaShardClient: creating Filer connection to {} with client_id={}",
-            addr, self.client_id
+            addr,
+            self.client_id
         );
         let client = Arc::new(PowerFsNetClient::new(client_config));
         client
@@ -1622,9 +1623,13 @@ pub(crate) async fn process_request_internal(
         }
 
         // 2) 获取或创建到该 leader 的连接
-        let filer_client =
-            get_or_create_filer_client(filer_connections, &leader_addr, client_id, notification_handler)
-                .await?;
+        let filer_client = get_or_create_filer_client(
+            filer_connections,
+            &leader_addr,
+            client_id,
+            notification_handler,
+        )
+        .await?;
 
         // 3) Per-server circuit breaker check
         if !breakers.check(&leader_addr) {
@@ -1755,7 +1760,8 @@ async fn get_or_create_filer_client(
 
     log::info!(
         "MetaShardClient(standalone): creating Filer connection to {} with client_id={}",
-        addr, client_id
+        addr,
+        client_id
     );
     let client = Arc::new(PowerFsNetClient::new(client_config));
     client

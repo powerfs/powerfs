@@ -336,9 +336,9 @@ fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        x.fid == y.fid && x.offset == y.offset && x.size == y.size
-    })
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.fid == y.fid && x.offset == y.offset && x.size == y.size)
 }
 
 /// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
@@ -1380,8 +1380,8 @@ impl FileSystem for PowerFsFs {
                         inode, entry.content_size, fresh.content_size
                     );
                 } else {
-                    let chunks_changed = !filer_stale_empty
-                        && !chunks_match(&entry.chunks, &fresh.chunks);
+                    let chunks_changed =
+                        !filer_stale_empty && !chunks_match(&entry.chunks, &fresh.chunks);
                     self.cache.insert(fresh);
                     if chunks_changed {
                         self.chunk_cache.remove_inode_chunks(inode);
@@ -2029,10 +2029,7 @@ impl FileSystem for PowerFsFs {
                  metadata not updated, dirty flag preserved for retry",
                 inode
             );
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "flush failed, sync skipped",
-            ))
+            Err(std::io::Error::other("flush failed, sync skipped"))
         };
 
         // 3. Clear dirty only if both flush AND sync succeeded.
@@ -2095,9 +2092,9 @@ impl FileSystem for PowerFsFs {
                     .lease_manager
                     .release_all_for_inode(fid.volume_id.0, inode);
                 for (tok, cid) in read_tokens {
-                    if let Err(e) =
-                        self.client
-                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
+                    if let Err(e) = self
+                        .client
+                        .release_lease(fid.volume_id.0, inode, &cid, &tok)
                     {
                         debug!(
                             "release: read lease release for inode {} failed (best-effort): {}",

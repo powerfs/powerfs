@@ -180,7 +180,7 @@ impl InodeNotifier {
         let header = FrameHeader::new(
             MsgType::Invalidate.as_u16(),
             FrameFlags::new(FrameFlags::NOTIFY),
-            0, // seq is not used for NOTIFY
+            0,                 // seq is not used for NOTIFY
             body.len() as u32, // CRITICAL: must match actual body length
         );
 

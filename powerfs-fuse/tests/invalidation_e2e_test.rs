@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use powerfs_fuse::cache::{CachedEntry, MetadataCache};
+use powerfs_fuse::cache::{CachedEntry, ChunkCache, MetadataCache};
 use powerfs_fuse::invalidate_handler::InvalidateHandler;
 use powerfs_net::protocol::{ClientType, FrameFlags, FrameHeader, MsgType, NetMessage};
 use powerfs_net::serialize::TlvEncoder;
@@ -84,7 +84,8 @@ async fn test_invalidation_e2e_single_client_cache_cleared() {
     // Setup: Server + Client
     let mgr = Arc::new(ServerConnectionManager::new());
     let cache = Arc::new(MetadataCache::new());
-    let handler = InvalidateHandler::new(cache.clone());
+    let chunk_cache = Arc::new(ChunkCache::with_defaults());
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 1001;
     let addr: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
@@ -114,7 +115,8 @@ async fn test_invalidation_e2e_single_client_cache_cleared() {
 async fn test_invalidation_e2e_older_version_ignored() {
     let mgr = Arc::new(ServerConnectionManager::new());
     let cache = Arc::new(MetadataCache::new());
-    let handler = InvalidateHandler::new(cache.clone());
+    let chunk_cache = Arc::new(ChunkCache::with_defaults());
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 1002;
     let addr: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
@@ -143,8 +145,10 @@ async fn test_invalidation_e2e_multiple_clients_isolation() {
 
     let cache_a = Arc::new(MetadataCache::new());
     let cache_b = Arc::new(MetadataCache::new());
-    let handler_a = InvalidateHandler::new(cache_a.clone());
-    let handler_b = InvalidateHandler::new(cache_b.clone());
+    let chunk_cache_a = Arc::new(ChunkCache::with_defaults());
+    let chunk_cache_b = Arc::new(ChunkCache::with_defaults());
+    let handler_a = InvalidateHandler::new(cache_a.clone(), chunk_cache_a);
+    let handler_b = InvalidateHandler::new(cache_b.clone(), chunk_cache_b);
 
     // Register two clients
     let client_a: u64 = 2001;
@@ -201,8 +205,10 @@ async fn test_invalidation_e2e_broadcast_all_clients() {
 
     let cache_a = Arc::new(MetadataCache::new());
     let cache_b = Arc::new(MetadataCache::new());
-    let handler_a = InvalidateHandler::new(cache_a.clone());
-    let handler_b = InvalidateHandler::new(cache_b.clone());
+    let chunk_cache_a = Arc::new(ChunkCache::with_defaults());
+    let chunk_cache_b = Arc::new(ChunkCache::with_defaults());
+    let handler_a = InvalidateHandler::new(cache_a.clone(), chunk_cache_a);
+    let handler_b = InvalidateHandler::new(cache_b.clone(), chunk_cache_b);
 
     let client_a: u64 = 3001;
     let client_b: u64 = 3002;
@@ -246,7 +252,8 @@ async fn test_invalidation_e2e_broadcast_all_clients() {
 async fn test_invalidation_e2e_zero_inode_ignored() {
     let mgr = Arc::new(ServerConnectionManager::new());
     let cache = Arc::new(MetadataCache::new());
-    let handler = InvalidateHandler::new(cache.clone());
+    let chunk_cache = Arc::new(ChunkCache::with_defaults());
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 4001;
     mgr.register_session(
@@ -268,7 +275,8 @@ async fn test_invalidation_e2e_zero_inode_ignored() {
 async fn test_invalidation_e2e_multiple_inodes() {
     let mgr = Arc::new(ServerConnectionManager::new());
     let cache = Arc::new(MetadataCache::new());
-    let handler = InvalidateHandler::new(cache.clone());
+    let chunk_cache = Arc::new(ChunkCache::with_defaults());
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 5001;
     mgr.register_session(
@@ -308,7 +316,8 @@ async fn test_invalidation_e2e_multiple_inodes() {
 async fn test_invalidation_e2e_idempotent_same_version() {
     let mgr = Arc::new(ServerConnectionManager::new());
     let cache = Arc::new(MetadataCache::new());
-    let handler = InvalidateHandler::new(cache.clone());
+    let chunk_cache = Arc::new(ChunkCache::with_defaults());
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 6001;
     mgr.register_session(

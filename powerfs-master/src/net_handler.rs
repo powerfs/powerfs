@@ -237,11 +237,7 @@ impl MasterNetHandler {
                 .master
                 .get_volume_route(info.id.0)
                 .map(|r| r.addr)
-                .or_else(|| {
-                    self.master
-                        .get_node(&info.node_id)
-                        .map(|n| n.url())
-                });
+                .or_else(|| self.master.get_node(&info.node_id).map(|n| n.url()));
 
             if let Some(addr) = route_addr {
                 info!(
