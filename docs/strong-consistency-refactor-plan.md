@@ -858,3 +858,30 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 - cargo clippy: 0 警告
 - cargo fmt: 通过
 - 代码量：-4336 行 / +1092 行（净减 3244 行 CRDT 代码）
+
+### 2026-08-02 Step 4-5 调整
+
+- **Step 4 跳过**：path_map/dir_cache 保留为兼容代码，主路径已走 MetadataClient RPC，后续清理
+- **Step 5 延后**：gRPC push_delta/pull_delta 是 proto 生成代码，需 proto 升级时清理。当前是 dead code 不影响功能
+
+### 2026-08-02 Step 6 完成记录
+
+**Commit**: `db23c7a2` feat(lease): add LeaseManager trait with read lease cache reuse
+
+**完成内容**：
+- 6a. ✅ 定义 LeaseManager trait（LeaseMode/LeaseToken/LeaseState + acquire/release/state）
+- 6b. ✅ 实现 VolumeLeaseManager（包装 FuseClientFacade + Arc<RwLock<HashMap>> 缓存）
+- 6c. ✅ read 路径改用 LeaseManager.acquire(Shared)（缓存命中零 RPC，修复 per-read RPC 缺陷）
+- 6d. ✅ release() 添加 lease_manager.invalidate() 清理缓存
+- 6e. ✅ 删除 per-read LeaseGuard（~60 行），lease 改为 open→release 期间复用
+
+**调整记录**：
+- trait 返回 `Pin<Box<Future + Send + 'static>>`（block_on 要求，非 '_）
+- VolumeLeaseManager 包装 Arc<FuseClientFacade>（非 VolumeClient）
+- lease 在 open→release 期间复用（非 per-read），与 write 路径 ensure_lease 模式一致
+- write 路径未改（ensure_lease 已有缓存复用），后续统一到 LeaseManager
+
+**验证**：
+- cargo check/clippy/fmt: 通过
+- cargo test: 71 + 26 = 97 单元测试通过
+- 代码量：+328 行 / -81 行
