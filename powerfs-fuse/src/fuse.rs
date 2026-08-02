@@ -731,6 +731,22 @@ impl PowerFsFs {
         self.cache.lookup_in_cache(parent, name)
     }
 
+    /// 检查目录条目是否存在（用于 create/mkdir/symlink/link/rename 的 EEXIST 检查）。
+    ///
+    /// 以 DirORSet 为权威源：如果 DirORSet 有副本且条目不存在，返回 false
+    /// （即使 MetadataCache 有残留条目也不算存在）。DirORSet 无副本时回退到
+    /// MetadataCache（冷启动场景）。
+    fn entry_exists(&self, parent: u64, name: &str) -> bool {
+        if self.coherence.lookup_with_type(parent, name).is_some() {
+            return true;
+        }
+        // DirORSet 无副本时回退到 MetadataCache
+        if self.coherence.dir_cache().get(parent).is_none() {
+            return self.lookup_in_cache(parent, name).is_some();
+        }
+        false
+    }
+
     fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
         let attrs = entry.attributes.as_ref();
         let chunks = entry
@@ -1150,7 +1166,7 @@ impl FileSystem for PowerFsFs {
             parent, name_str, mode
         );
 
-        if self.lookup_in_cache(parent, name_str).is_some() {
+        if self.entry_exists(parent, name_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -1316,7 +1332,7 @@ impl FileSystem for PowerFsFs {
             parent, name_str, args.mode
         );
 
-        if self.lookup_in_cache(parent, name_str).is_some() {
+        if self.entry_exists(parent, name_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -2171,7 +2187,7 @@ impl FileSystem for PowerFsFs {
         );
 
         let no_replace = (flags & 1) != 0;
-        if no_replace && self.lookup_in_cache(newdir, new_str).is_some() {
+        if no_replace && self.entry_exists(newdir, new_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -2265,7 +2281,7 @@ impl FileSystem for PowerFsFs {
             parent, name_str, link_str
         );
 
-        if self.lookup_in_cache(parent, name_str).is_some() {
+        if self.entry_exists(parent, name_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -2343,7 +2359,7 @@ impl FileSystem for PowerFsFs {
             inode, newparent, name_str
         );
 
-        if self.lookup_in_cache(newparent, name_str).is_some() {
+        if self.entry_exists(newparent, name_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
