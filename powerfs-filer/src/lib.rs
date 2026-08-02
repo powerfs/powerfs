@@ -8,7 +8,9 @@ pub mod meta_shard_manager;
 pub mod metadata_store;
 pub mod net_handler;
 pub mod posix_service;
-pub mod powerfs;
+pub mod powerfs {
+    tonic::include_proto!("powerfs");
+}
 pub mod provider_impl;
 pub mod raft_group_manager;
 pub mod s3_handler;

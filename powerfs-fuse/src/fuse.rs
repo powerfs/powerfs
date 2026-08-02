@@ -917,7 +917,10 @@ impl FileSystem for PowerFsFs {
         // Invalidate mechanism is async and can be delayed or skipped
         // (e.g., when the file is briefly opened by a concurrent read),
         // so we cannot rely on it alone for correctness.
-        debug!("getattr: fetching fresh metadata for inode={} from filer (non-open file)", inode);
+        debug!(
+            "getattr: fetching fresh metadata for inode={} from filer (non-open file)",
+            inode
+        );
         let result = self.client.get_entry_by_inode(inode);
         debug!(
             "getattr: get_entry_by_inode result for inode={}: is_ok={}, is_none={}",
