@@ -275,13 +275,51 @@ impl MetadataCache {
                 // Rename: replace with the new entry's metadata
                 *existing = entry;
             } else {
-                // Hard link: keep the original hard_link_id, refresh counter
+                // Same name/parent: update metadata fields from the new entry.
+                //
+                // Previously this branch only updated cached_at, which caused a
+                // critical bug: when `open` refreshed fid/chunks from the Filer
+                // (via get_entry_by_inode → entry_to_cached → insert), the
+                // existing cache entry (from a prior lookup that set fid=None,
+                // chunks=[]) was NOT updated. The read path then saw fid=None
+                // and returned EIO, and sync_size_chunks_on_close synced
+                // chunks=[] to the Filer, corrupting cross-client reads.
+                //
+                // Fix: update all metadata fields (fid, chunks, size, mode,
+                // uid/gid, timestamps) from the new entry, preserving only
+                // hard_link_id/counter semantics.
                 if !entry.hard_link_id.is_empty() && existing.hard_link_id.is_empty() {
                     existing.hard_link_id = entry.hard_link_id.clone();
                 }
                 if entry.hard_link_counter > 0 {
                     existing.hard_link_counter = entry.hard_link_counter;
                 }
+                // Update fid: prefer the new entry's fid if present, otherwise
+                // keep the existing one (don't overwrite a valid fid with None)
+                if entry.fid.is_some() {
+                    existing.fid = entry.fid.clone();
+                }
+                // Update chunks: prefer the new entry's chunks if non-empty
+                if !entry.chunks.is_empty() {
+                    existing.chunks = entry.chunks.clone();
+                }
+                // Update size/content_size from the new entry
+                existing.size = entry.size;
+                existing.content_size = entry.content_size;
+                existing.mode = entry.mode;
+                existing.uid = entry.uid;
+                existing.gid = entry.gid;
+                existing.atime = entry.atime;
+                existing.mtime = entry.mtime;
+                existing.ctime = entry.ctime;
+                existing.nlink = entry.nlink;
+                existing.is_dir = entry.is_dir;
+                existing.is_symlink = entry.is_symlink;
+                if entry.is_symlink {
+                    existing.symlink_target = entry.symlink_target.clone();
+                }
+                existing.disk_size = entry.disk_size;
+                existing.generation = entry.generation;
                 // Always update cached_at to prevent TTL expiration issues
                 existing.cached_at = Instant::now();
             }
