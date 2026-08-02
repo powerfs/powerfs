@@ -998,25 +998,55 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 | 跨客户端 append（fuse-1 创建 → fuse-2 追加 → fuse-1 读取） | ✅ | 两客户端均看到完整数据 |
 | 交替写入（A1→B2→A3→B4，4 轮交替） | ✅ | 两客户端均看到全部 4 行 |
 | 64KB 大文件跨客户端 append | ✅ | fuse-2 追加 64KB 后，fuse-1 看到 128KB，md5 一致 |
-| 跨客户端 truncate 可见性 | ⚠️ | setattr 同步到 Filer 但 Invalidate 未触发，待修复 |
+| 跨客户端 truncate-down 可见性（200→50） | ✅ | fuse-2 truncate 后 fuse-1 stat 立即看到 size=50 |
+| 跨客户端 truncate-up 可见性（50→300） | ✅ | fuse-2 扩展后 fuse-1 stat 立即看到 size=300 |
 
-#### fio 性能基线（Phase 2）
+#### fio 性能基线（Phase 2 — 修复后）
 
-| 测试 | 带宽 | Phase 1 基线 | 变化 |
-|------|------|-------------|------|
-| 顺序写 (1M bs) | 18.7 MiB/s | 53.2 MiB/s | ↓ (read-before-write + callback 开销) |
-| 顺序读 (1M bs) | 92.2 MiB/s | 122 MiB/s | ↓ (callback invalidation 开销) |
-| 随机写 (4K bs) | 9.3 MiB/s | 56.9 MiB/s | ↓ (lease 管理开销) |
-| 随机读 (4K bs) | 8.2 MiB/s | 18.0 MiB/s | ↓ (lease + callback 开销) |
+测试环境：fuse-1 容器（2GB 内存），fio 3.16，`--direct=1 --ioengine=libaio --iodepth=4`，文件 256M
+
+| 测试 | 带宽 | Phase 1 基线 | Phase 2 修复前 | 本次 |
+|------|------|-------------|---------------|------|
+| 顺序写 (1M bs) | 53.4 MiB/s | 53.2 MiB/s | 18.7 MiB/s | ✅ 恢复 Phase 1 水平（read-before-write 优化） |
+| 顺序读 (1M bs) | 252 MiB/s | 122 MiB/s | 92.2 MiB/s | ✅ 较 Phase 1 提升 2x |
+| 随机写 (4K bs) | 23.8 MiB/s | 56.9 MiB/s | 9.3 MiB/s | ↑ 较修复前提升，仍低于 Phase 1（read-before-write 正确性代价） |
+| 随机读 (4K bs) | 6.5 MiB/s | 18.0 MiB/s | 8.2 MiB/s | ↓ 待优化（ChunkCache 驱逐修复后字节统计更准确） |
 
 **性能分析**：
-- 顺序写下降主要因 read-before-write：首次写入每个 chunk 需额外一次 Volume 读
-- 随机写下降因 lease 管理开销和 read-before-write
-- 顺序读/随机读下降因 callback invalidation 的额外网络通信
+- 顺序写恢复：read-before-write 优化跳过无数据 chunk 的读取（commit `12938003`）
+- 顺序读大幅提升：getattr 对目录使用缓存 + TTL=0 减少内核陈旧回写
+- 随机写低于 Phase 1：fio 预创建文件后随机写命中已有数据，read-before-write 无法跳过（正确性必需）
+- 随机读待优化：ChunkCache current_bytes 修复后驱逐更准确，可能减少有效缓存命中
 - 所有测试功能正确，无数据损坏
+
+### Step B5: 跨客户端 truncate 可见性修复（commit `242310f4`）
+
+#### 根因分析
+
+跨客户端 truncate 不可见的根因有四层：
+
+1. **Filer `handle_setattr` 未通知**（已在 `b93210ff` 修复）：setattr 成功后未调用 `notify_inode_change`，其他客户端无法感知 truncate。
+2. **Create/Mkdir 未建立订阅**：创建者客户端在 pre-create Lookup 时返回 ENOENT，未建立 inode 订阅，导致后续 Invalidate 通知无法送达创建者。
+3. **open 的 unsynced-write guard 误判**：当本地缓存因 Invalidate 过时（content_size > filer），错误地认为是未同步写入并跳过刷新。缺少 `has_local_data` 检查。
+4. **getattr 返回陈旧缓存**：MetadataCache 30s TTL 内返回陈旧 size，而 Invalidate 异步到达时可能被读操作 pin 跳过。FUSE 对内核承诺 TTL=0 却返回陈旧数据。
+
+#### 修复内容
+
+1. **getattr 对非打开文件从 Filer 获取最新元数据**：TTL=0 承诺内核新鲜数据，非打开文件不走缓存（open 文件 lease 权威、目录 Invalidate 可靠仍用缓存）。
+2. **open 添加 has_local_data guard**：只有 chunk_cache 有本地数据时才应用 unsynced-write 保护；无本地数据时调用 `set_content_size` 强制更新。
+3. **ChunkCache.modify 跟踪数据长度变化**：更新 `current_bytes`，避免 resize/truncate 操作导致下溢和驱逐异常。
+4. **Filer Create/Mkdir 建立创建者订阅**：为创建者订阅父目录和新 inode，确保后续变更通知可达。
+5. **内核属性缓存 TTL=0**：FUSE daemon 无法失效内核缓存，设为 0 确保每次 stat 查询 FUSE daemon。
+
+#### 验证结果
+
+- truncate-down（200→50）：fuse-1 stat 立即看到 size=50，md5 一致 ✅
+- truncate-up（50→300）：fuse-1 stat 立即看到 size=300 ✅
+- fio 顺序写恢复到 53.4 MiB/s（Phase 1 水平）✅
 
 ### 待办事项
 
-1. **跨客户端 truncate 可见性**：setattr 同步到 Filer 但 Invalidate 通知未触发，需检查 Filer 的 setattr handler 是否调用 notify_inode_change
-2. **性能优化**：read-before-write 可通过预取或 write lease 期间跳过读取来优化
-3. **io500 测试**：待 truncate 修复后运行完整 io500 测试
+1. ~~跨客户端 truncate 可见性~~ ✅ 已修复（commit `b93210ff` + `242310f4`）
+2. **随机读写性能优化**：read-before-write 对预创建文件的随机写无法跳过；ChunkCache 驱逐修复后随机读下降，需分析缓存命中率
+3. **io500 测试**：truncate 修复已完成，可运行完整 io500 测试
+4. **跨客户端 setattr 其他字段可见性**：mode/uid/gid/mtime 等字段的跨客户端可见性需补充测试
