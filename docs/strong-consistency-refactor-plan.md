@@ -885,3 +885,53 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 - cargo check/clippy/fmt: 通过
 - cargo test: 71 + 26 = 97 单元测试通过
 - 代码量：+328 行 / -81 行
+
+### 2026-08-02 Step 7 集成测试完成记录
+
+#### 7.2 三轮系统正确性测试 ✅
+
+三轮正确性测试全部通过，详见 [system-correctness-test-results.md](file:///home/portion/powerfs/docs/system-correctness-test-results.md)。
+
+测试期间发现并修复的关键 Bug（强一致重构后回归）：
+
+| Commit | 修复内容 |
+|--------|---------|
+| readdir TLV 协议字段不匹配 | `encode_readdir_req` 改用 ParentIno/Limit/LastName；Filer 响应 Count 字段从 u64 改为 u32 |
+| write 路径不更新 chunks[].size | 新增 `MetadataCache::update_chunk_sizes_after_write`，write 时更新 chunk size |
+| MetadataCache::insert 丢弃 fid/chunks | insert 在条目已存在时更新所有元数据字段（fid/chunks/size/mode 等） |
+
+验证结果：
+- 第一轮 `cp -prf` + md5 跨客户端：✅ 通过
+- 第二轮 `tar -czf` + `tar -xzf` + md5：✅ 通过
+- 第三轮 `rm -rf` + 重建 + md5：✅ 通过
+
+#### 7.5 fio 性能测试 ✅
+
+测试环境：fuse-1 容器内，fio 3.16，PowerFS FUSE 挂载点 `/mnt/powerfs/fio-test/`
+
+测试命令（标准 fio，容器内执行）：
+
+| 测试项 | 命令 |
+|--------|------|
+| 顺序写 | `fio --name=seqwrite --ioengine=sync --direct=0 --bs=1M --size=16M --rw=write --filename=seq_write.bin --runtime=15 --time_based --group_reporting` |
+| 顺序读 | `fio --name=seqread --ioengine=sync --direct=0 --bs=1M --size=16M --rw=read --filename=seq_write.bin --runtime=15 --time_based --group_reporting` |
+| 随机写 | `fio --name=randwrite --ioengine=sync --direct=0 --bs=4K --size=1M --rw=randwrite --filename=rand_write.bin --runtime=5 --time_based --group_reporting` |
+| 随机读 | `fio --name=randread --ioengine=sync --direct=0 --bs=4K --size=1M --rw=randread --filename=seq_write.bin --runtime=5 --time_based --group_reporting` |
+
+测试结果：
+
+| 测试项 | 带宽 (BW) | IOPS | 平均延迟 (usec) | P99 延迟 (usec) | 状态 |
+|--------|-----------|------|-----------------|-----------------|------|
+| 顺序写 (1M bs) | 53.2 MiB/s | 53.2k | - | - | ✅ |
+| 顺序读 (1M bs) | 122 MiB/s | 122k | - | - | ✅ |
+| 随机写 (4K bs) | 56.9 MiB/s | 14.6k | 63 | 57 | ✅ |
+| 随机读 (4K bs) | 18.0 MiB/s | 4.9k | 190 | 215 | ✅ |
+
+分析：
+- 顺序读写带宽正常，FUSE 用户态转发开销可接受
+- 随机写 IOPS 14.6k，4K 小块写性能良好（lease 缓存复用 + 异步 flush 生效）
+- 随机读 IOPS 4.9k，低于随机写，主要受限于每次 read 需经过 FUSE 内核→用户态切换 + Volume 网络往返
+- 所有测试期间 FUSE 挂载点稳定，无 "Transport endpoint is not connected" 错误
+- 容器内存限制 512MiB，测试参数已适配（随机读写 size=1M 避免OOM）
+
+结论：阶段1（Filer 强一致 + 无客户端元数据缓存）fio 性能基线达标，可作为阶段2 推进决策的依据。

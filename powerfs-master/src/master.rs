@@ -66,8 +66,6 @@ pub struct MasterNode {
     net_manager: Arc<RwLock<Option<Arc<ServerConnectionManager>>>>,
     pub kv_cache: Arc<KVCacheEngine>,
     pub kv_persist: Arc<KVPersistStore>,
-    pub directory_tree: Arc<crate::directory_tree::DirectoryTree>,
-    pub metadata_manager: Arc<crate::metadata_manager::MetadataManager>,
     pub volume_client_pool: Arc<VolumeClientPool>,
     event_provider: Arc<dyn EventProvider>,
     filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
@@ -332,24 +330,7 @@ impl MasterNode {
 
         Self::restore_kv_sessions(&kv_cache, &kv_persist);
 
-        let dir_tree_path = std::path::Path::new(raft_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let dir_tree = Arc::new(
-            crate::directory_tree::DirectoryTree::new(&dir_tree_path.join("directory_tree"))
-                .map_err(|e| {
-                    PowerFsError::Internal(format!("Failed to create directory tree: {}", e))
-                })?,
-        );
-        dir_tree
-            .init_root()
-            .map_err(|e| PowerFsError::Internal(format!("Failed to init root: {}", e)))?;
-
         let volume_client_pool = Arc::new(VolumeClientPool::new());
-
-        let metadata_manager = Arc::new(crate::metadata_manager::MetadataManager::new(
-            dir_tree.db.clone(),
-        ));
 
         let event_provider: Arc<dyn EventProvider> = match std::env::var("REDIS_URL") {
             #[cfg(feature = "redis-event")]
@@ -396,8 +377,6 @@ impl MasterNode {
             net_manager: Arc::new(RwLock::new(None)),
             kv_cache,
             kv_persist,
-            directory_tree: dir_tree,
-            metadata_manager,
             volume_client_pool,
             event_provider,
             filer_nodes: RwLock::new(HashMap::new()),
@@ -2159,36 +2138,6 @@ impl MasterNode {
         self.client_manager.read().unwrap().get_fuse_clients()
     }
 
-    pub fn get_conflicts(
-        &self,
-        dir_ino: u64,
-        unresolved_only: bool,
-    ) -> Vec<powerfs_orset::ConflictRecord> {
-        self.directory_tree.get_conflicts(dir_ino, unresolved_only)
-    }
-
-    pub fn resolve_conflict(
-        &self,
-        dir_ino: u64,
-        conflict_id: &str,
-        resolution: powerfs_orset::ConflictResolution,
-    ) {
-        self.directory_tree
-            .resolve_conflict(dir_ino, conflict_id, resolution)
-    }
-
-    pub fn set_merge_policy(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) {
-        self.directory_tree.set_merge_policy(dir_ino, policy)
-    }
-
-    pub fn auto_resolve_conflicts(&self, dir_ino: u64, policy: powerfs_orset::MergePolicy) -> u64 {
-        self.directory_tree.auto_resolve_conflicts(dir_ino, policy)
-    }
-
-    pub fn resolve_path_to_inode(&self, path: &str) -> Option<u64> {
-        self.directory_tree.resolve_path_to_inode(path)
-    }
-
     pub async fn lookup_volume(
         &self,
         volume_ids: &[String],
@@ -2671,8 +2620,6 @@ impl Clone for MasterNode {
             net_manager: self.net_manager.clone(),
             kv_cache: self.kv_cache.clone(),
             kv_persist: self.kv_persist.clone(),
-            directory_tree: self.directory_tree.clone(),
-            metadata_manager: self.metadata_manager.clone(),
             volume_client_pool: self.volume_client_pool.clone(),
             event_provider: self.event_provider.clone(),
             filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),

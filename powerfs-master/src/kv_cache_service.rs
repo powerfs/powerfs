@@ -90,9 +90,6 @@ impl KvCacheService for KvCacheServiceImpl {
                 };
                 let _ = self.master.kv_persist.save_session(&req.session_id, &meta);
 
-                let kv_dir = format!("/kv/{}", req.session_id);
-                let _ = self.master.directory_tree.create_directory(&kv_dir);
-
                 Ok(Response::new(CreateSessionResponse {
                     success: true,
                     error: String::new(),
@@ -236,50 +233,6 @@ impl KvCacheService for KvCacheServiceImpl {
                 {
                     Ok(_) => {
                         let _ = self.master.kv_persist.save_block_fid(block_id, &fid_str);
-
-                        let layer_dir = format!("/kv/{}/layer_{}", req.session_id, req.layer_id);
-                        let _ = self.master.directory_tree.create_directory(&layer_dir);
-
-                        let block_file = format!("block_{}.data", block_id);
-                        let file_entry = crate::proto::Entry {
-                            name: block_file,
-                            directory: layer_dir,
-                            attributes: Some(crate::proto::FuseAttributes {
-                                ino: 0,
-                                mode: 0o100644,
-                                nlink: 1,
-                                uid: 0,
-                                gid: 0,
-                                rdev: 0,
-                                size: req.data.len() as u64,
-                                blksize: 4096,
-                                blocks: req.data.len().div_ceil(4096) as u64,
-                                atime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                                mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                                ctime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                                crtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                                    as u64,
-                                perm: 0o644,
-                            }),
-                            chunks: vec![crate::proto::FileChunk {
-                                offset: 0,
-                                size: req.data.len() as u64,
-                                mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                                fid: fid_str.clone(),
-                                cookie: 0,
-                                crc32: 0,
-                            }],
-                            hard_link_id: "".to_string(),
-                            hard_link_counter: 0,
-                            extended: std::collections::HashMap::new(),
-                            content_size: req.data.len() as u64,
-                            disk_size: req.data.len() as u64,
-                            ttl: "".to_string(),
-                            symlink_target: "".to_string(),
-                            owner: String::new(),
-                            generation: 0,
-                        };
-                        let _ = self.master.directory_tree.create_entry(file_entry, "");
 
                         let mut locations = Vec::new();
                         for node in nodes {

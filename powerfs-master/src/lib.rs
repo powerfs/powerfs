@@ -1,9 +1,7 @@
 pub mod collection;
-pub mod directory_tree;
 pub mod kv_cache_service;
 pub mod lock_manager;
 pub mod master;
-pub mod metadata_manager;
 pub mod metrics;
 pub mod net_handler;
 pub mod proto;

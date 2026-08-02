@@ -1,4 +1,3 @@
-use crate::directory_tree::DirectoryTree;
 use crate::proto::{
     CreateEntryRequest, DeleteEntryRequest, Entry, GetEntryRequest, ListEntriesRequest,
 };
@@ -21,76 +20,35 @@ pub trait DirectoryTreeApi: Sync + Send + 'static {
 }
 
 pub enum DirectoryTreeClient {
-    Direct(Arc<DirectoryTree>),
     Remote(Arc<RemoteDirectoryTree>),
 }
 
 impl DirectoryTreeApi for DirectoryTreeClient {
     fn get_entry(&self, path: &str) -> BoxFuture<'_, Option<Entry>> {
         let path = path.to_string();
-        match self {
-            DirectoryTreeClient::Direct(dt) => {
-                let dt = dt.clone();
-                Box::pin(async move { dt.get_entry(&path) })
-            }
-            DirectoryTreeClient::Remote(rdt) => {
-                let rdt = rdt.clone();
-                Box::pin(async move { rdt.get_entry(&path).await })
-            }
-        }
+        let DirectoryTreeClient::Remote(rdt) = self;
+        let rdt = rdt.clone();
+        Box::pin(async move { rdt.get_entry(&path).await })
     }
 
     fn create_entry(&self, entry: Entry) -> BoxFuture<'_, Result<u64>> {
-        match self {
-            DirectoryTreeClient::Direct(dt) => {
-                let dt = dt.clone();
-                Box::pin(async move {
-                    dt.create_entry(entry, "").map_err(|e| {
-                        PowerFsError::Internal(format!("Failed to create entry: {}", e))
-                    })
-                })
-            }
-            DirectoryTreeClient::Remote(rdt) => {
-                let rdt = rdt.clone();
-                Box::pin(async move { rdt.create_entry(entry).await })
-            }
-        }
+        let DirectoryTreeClient::Remote(rdt) = self;
+        let rdt = rdt.clone();
+        Box::pin(async move { rdt.create_entry(entry).await })
     }
 
     fn create_directory(&self, path: &str) -> BoxFuture<'_, Result<u64>> {
         let path = path.to_string();
-        match self {
-            DirectoryTreeClient::Direct(dt) => {
-                let dt = dt.clone();
-                Box::pin(async move {
-                    dt.create_directory(&path).map_err(|e| {
-                        PowerFsError::Internal(format!("Failed to create directory: {}", e))
-                    })
-                })
-            }
-            DirectoryTreeClient::Remote(rdt) => {
-                let rdt = rdt.clone();
-                Box::pin(async move { rdt.create_directory(&path).await })
-            }
-        }
+        let DirectoryTreeClient::Remote(rdt) = self;
+        let rdt = rdt.clone();
+        Box::pin(async move { rdt.create_directory(&path).await })
     }
 
     fn delete_entry(&self, path: &str) -> BoxFuture<'_, Result<bool>> {
         let path = path.to_string();
-        match self {
-            DirectoryTreeClient::Direct(dt) => {
-                let dt = dt.clone();
-                Box::pin(async move {
-                    dt.delete_entry_by_path(&path, "").map_err(|e| {
-                        PowerFsError::Internal(format!("Failed to delete entry: {}", e))
-                    })
-                })
-            }
-            DirectoryTreeClient::Remote(rdt) => {
-                let rdt = rdt.clone();
-                Box::pin(async move { rdt.delete_entry(&path).await })
-            }
-        }
+        let DirectoryTreeClient::Remote(rdt) = self;
+        let rdt = rdt.clone();
+        Box::pin(async move { rdt.delete_entry(&path).await })
     }
 
     fn list_entries(
@@ -101,22 +59,9 @@ impl DirectoryTreeApi for DirectoryTreeClient {
     ) -> BoxFuture<'_, Vec<Entry>> {
         let directory = directory.to_string();
         let last_name = last_name.to_string();
-        match self {
-            DirectoryTreeClient::Direct(dt) => {
-                let dt = dt.clone();
-                Box::pin(async move {
-                    let parent_ino = dt
-                        .get_entry(&directory)
-                        .and_then(|e| e.attributes.map(|a| a.ino))
-                        .unwrap_or(1);
-                    dt.list_entries(parent_ino, limit, &last_name)
-                })
-            }
-            DirectoryTreeClient::Remote(rdt) => {
-                let rdt = rdt.clone();
-                Box::pin(async move { rdt.list_entries(&directory, limit, &last_name).await })
-            }
-        }
+        let DirectoryTreeClient::Remote(rdt) = self;
+        let rdt = rdt.clone();
+        Box::pin(async move { rdt.list_entries(&directory, limit, &last_name).await })
     }
 }
 

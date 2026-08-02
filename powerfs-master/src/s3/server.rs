@@ -1431,8 +1431,7 @@ pub mod handlers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::directory_tree::DirectoryTree;
-    use crate::s3::directory_tree_api::DirectoryTreeClient;
+    use crate::s3::directory_tree_api::{DirectoryTreeClient, RemoteDirectoryTree};
     use axum::body::{Body, HttpBody};
     use axum::http::{Method, Request, StatusCode};
     use tempfile::tempdir;
@@ -1440,8 +1439,8 @@ mod tests {
 
     async fn create_test_state() -> Arc<S3State> {
         let dir = tempdir().unwrap();
-        let dt: Arc<dyn DirectoryTreeApi> = Arc::new(DirectoryTreeClient::Direct(Arc::new(
-            DirectoryTree::new(dir.path()).unwrap(),
+        let dt: Arc<dyn DirectoryTreeApi> = Arc::new(DirectoryTreeClient::Remote(Arc::new(
+            RemoteDirectoryTree::new(vec!["127.0.0.1:50051".to_string()]).unwrap(),
         )));
         let master = Arc::new(
             crate::master::MasterNode::new(

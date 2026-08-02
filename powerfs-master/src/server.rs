@@ -4,7 +4,7 @@ use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::powerfs::*;
 use super::proto::*;
 use futures::Stream;
-use log::{debug, info, warn};
+use log::{info, warn};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
@@ -13,7 +13,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_stream::StreamExt;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use uuid::Uuid;
 
@@ -1076,413 +1075,74 @@ impl MasterService for MasterGrpcServer {
 
     async fn get_conflicts(
         &self,
-        request: Request<GetConflictsRequest>,
+        _request: Request<GetConflictsRequest>,
     ) -> Result<Response<GetConflictsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(GetConflictsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        conflicts: Vec::new(),
-                        total_count: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let conflicts = self.master.get_conflicts(dir_ino, req.unresolved_only);
-        let mut proto_conflicts = Vec::new();
-        for conflict in conflicts {
-            let mut branches = Vec::new();
-            for branch in &conflict.branches {
-                branches.push(powerfs::DirEntryOrset {
-                    id: Some(powerfs::EntryId {
-                        name: branch.id.name.clone(),
-                        client_id: branch.id.client_id,
-                        seq: branch.id.seq,
-                    }),
-                    inode: branch.inode,
-                    parent_ino: branch.parent_ino,
-                    mode: branch.mode,
-                    size: branch.size,
-                    mtime: branch.mtime,
-                    atime: branch.atime,
-                    ctime: branch.ctime,
-                    nlink: branch.nlink,
-                    symlink_target: branch.symlink_target.clone().unwrap_or_default(),
-                    file_type: match branch.file_type {
-                        powerfs_orset::FileType::RegularFile => 0,
-                        powerfs_orset::FileType::Directory => 1,
-                        powerfs_orset::FileType::Symlink => 2,
-                        powerfs_orset::FileType::Fifo => 3,
-                        powerfs_orset::FileType::CharDevice => 4,
-                        powerfs_orset::FileType::BlockDevice => 5,
-                        powerfs_orset::FileType::Socket => 6,
-                    },
-                    uid: branch.uid,
-                    gid: branch.gid,
-                    rdev: branch.rdev,
-                });
-            }
-            proto_conflicts.push(powerfs::ConflictRecord {
-                id: conflict.id.clone(),
-                conflict_type: match conflict.conflict_type {
-                    powerfs_orset::ConflictType::CreateCreate => 0,
-                    powerfs_orset::ConflictType::WriteWrite => 1,
-                    powerfs_orset::ConflictType::WriteUnlink => 2,
-                    powerfs_orset::ConflictType::DeleteCreate => 3,
-                    powerfs_orset::ConflictType::RenameConflict => 4,
-                    powerfs_orset::ConflictType::RenameDelete => 5,
-                    powerfs_orset::ConflictType::CreateDelete => 6,
-                },
-                dir_ino,
-                dir_path: req.dir_path.clone(),
-                base_name: conflict
-                    .branches
-                    .first()
-                    .map(|b| b.id.name.clone())
-                    .unwrap_or_default(),
-                branches,
-                create_time: conflict.create_time,
-                resolved: conflict.resolved,
-                resolved_time: conflict.resolved_time.unwrap_or(0),
-                resolution: match conflict.resolution {
-                    Some(powerfs_orset::ConflictResolution::KeepFirst) => 0,
-                    Some(powerfs_orset::ConflictResolution::KeepLast) => 1,
-                    Some(powerfs_orset::ConflictResolution::KeepAll) => 2,
-                    Some(powerfs_orset::ConflictResolution::Merge) => 3,
-                    None => 0,
-                },
-            });
-        }
-        let total_count = proto_conflicts.len() as u64;
-        Ok(Response::new(GetConflictsResponse {
-            success: true,
-            error: String::new(),
-            conflicts: proto_conflicts,
-            total_count,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn resolve_conflict(
         &self,
-        request: Request<ResolveConflictRequest>,
+        _request: Request<ResolveConflictRequest>,
     ) -> Result<Response<ResolveConflictResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(ResolveConflictResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let resolution = match req.resolution {
-            0 => powerfs_orset::ConflictResolution::KeepFirst,
-            1 => powerfs_orset::ConflictResolution::KeepLast,
-            2 => powerfs_orset::ConflictResolution::KeepAll,
-            3 => powerfs_orset::ConflictResolution::Merge,
-            _ => {
-                return Ok(Response::new(ResolveConflictResponse {
-                    success: false,
-                    error: "invalid resolution".to_string(),
-                }));
-            }
-        };
-        self.master
-            .resolve_conflict(dir_ino, &req.conflict_id, resolution);
-        Ok(Response::new(ResolveConflictResponse {
-            success: true,
-            error: String::new(),
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn set_merge_policy(
         &self,
-        request: Request<SetMergePolicyRequest>,
+        _request: Request<SetMergePolicyRequest>,
     ) -> Result<Response<SetMergePolicyResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(SetMergePolicyResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let policy = match req.policy {
-            0 => powerfs_orset::MergePolicy::LwwTime,
-            1 => powerfs_orset::MergePolicy::ContentHash,
-            2 => powerfs_orset::MergePolicy::WeightBased,
-            3 => powerfs_orset::MergePolicy::KeepAll,
-            4 => powerfs_orset::MergePolicy::WritePriority,
-            5 => powerfs_orset::MergePolicy::DeletePriority,
-            6 => powerfs_orset::MergePolicy::Aggressive,
-            7 => powerfs_orset::MergePolicy::Conservative,
-            8 => powerfs_orset::MergePolicy::Manual,
-            _ => {
-                return Ok(Response::new(SetMergePolicyResponse {
-                    success: false,
-                    error: "invalid merge policy".to_string(),
-                }));
-            }
-        };
-        self.master.set_merge_policy(dir_ino, policy);
-        Ok(Response::new(SetMergePolicyResponse {
-            success: true,
-            error: String::new(),
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn auto_resolve_conflicts(
         &self,
-        request: Request<AutoResolveConflictsRequest>,
+        _request: Request<AutoResolveConflictsRequest>,
     ) -> Result<Response<AutoResolveConflictsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(AutoResolveConflictsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        resolved_count: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let policy = match req.policy {
-            0 => powerfs_orset::MergePolicy::LwwTime,
-            1 => powerfs_orset::MergePolicy::ContentHash,
-            2 => powerfs_orset::MergePolicy::WeightBased,
-            3 => powerfs_orset::MergePolicy::KeepAll,
-            4 => powerfs_orset::MergePolicy::WritePriority,
-            5 => powerfs_orset::MergePolicy::DeletePriority,
-            6 => powerfs_orset::MergePolicy::Aggressive,
-            7 => powerfs_orset::MergePolicy::Conservative,
-            8 => powerfs_orset::MergePolicy::Manual,
-            _ => {
-                return Ok(Response::new(AutoResolveConflictsResponse {
-                    success: false,
-                    error: "invalid merge policy".to_string(),
-                    resolved_count: 0,
-                }));
-            }
-        };
-        let resolved_count = self.master.auto_resolve_conflicts(dir_ino, policy);
-        Ok(Response::new(AutoResolveConflictsResponse {
-            success: true,
-            error: String::new(),
-            resolved_count,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn batch_detect_conflicts(
         &self,
-        request: Request<BatchDetectConflictsRequest>,
+        _request: Request<BatchDetectConflictsRequest>,
     ) -> Result<Response<BatchDetectConflictsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(BatchDetectConflictsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        total_count: 0,
-                        create_create_count: 0,
-                        write_write_count: 0,
-                        write_unlink_count: 0,
-                        delete_create_count: 0,
-                        rename_conflict_count: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let stats = self
-            .master
-            .directory_tree
-            .get_conflict_stats(dir_ino, req.recursive);
-        Ok(Response::new(BatchDetectConflictsResponse {
-            success: true,
-            error: String::new(),
-            total_count: stats.total_count,
-            create_create_count: stats.create_create_count,
-            write_write_count: stats.write_write_count,
-            write_unlink_count: stats.write_unlink_count,
-            delete_create_count: stats.delete_create_count,
-            rename_conflict_count: stats.rename_conflict_count,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn batch_resolve_conflicts(
         &self,
-        request: Request<BatchResolveConflictsRequest>,
+        _request: Request<BatchResolveConflictsRequest>,
     ) -> Result<Response<BatchResolveConflictsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(BatchResolveConflictsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        resolved_count: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let policy = match req.policy {
-            0 => powerfs_orset::MergePolicy::LwwTime,
-            1 => powerfs_orset::MergePolicy::ContentHash,
-            2 => powerfs_orset::MergePolicy::WeightBased,
-            3 => powerfs_orset::MergePolicy::KeepAll,
-            4 => powerfs_orset::MergePolicy::WritePriority,
-            5 => powerfs_orset::MergePolicy::DeletePriority,
-            6 => powerfs_orset::MergePolicy::Aggressive,
-            7 => powerfs_orset::MergePolicy::Conservative,
-            8 => powerfs_orset::MergePolicy::Manual,
-            _ => {
-                return Ok(Response::new(BatchResolveConflictsResponse {
-                    success: false,
-                    error: "invalid merge policy".to_string(),
-                    resolved_count: 0,
-                }));
-            }
-        };
-
-        let resolved_count = self.master.directory_tree.batch_resolve_conflicts(
-            dir_ino,
-            policy,
-            req.recursive,
-            req.conflict_type,
-        );
-
-        Ok(Response::new(BatchResolveConflictsResponse {
-            success: true,
-            error: String::new(),
-            resolved_count,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn get_conflict_stats(
         &self,
-        request: Request<GetConflictStatsRequest>,
+        _request: Request<GetConflictStatsRequest>,
     ) -> Result<Response<GetConflictStatsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(GetConflictStatsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        total_count: 0,
-                        resolved_count: 0,
-                        unresolved_count: 0,
-                        create_create_count: 0,
-                        create_create_resolved: 0,
-                        write_write_count: 0,
-                        write_write_resolved: 0,
-                        write_unlink_count: 0,
-                        write_unlink_resolved: 0,
-                        delete_create_count: 0,
-                        delete_create_resolved: 0,
-                        rename_conflict_count: 0,
-                        rename_conflict_resolved: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let stats = self
-            .master
-            .directory_tree
-            .get_conflict_stats_full(dir_ino, req.recursive);
-        Ok(Response::new(GetConflictStatsResponse {
-            success: true,
-            error: String::new(),
-            total_count: stats.total_count,
-            resolved_count: stats.resolved_count,
-            unresolved_count: stats.unresolved_count,
-            create_create_count: stats.create_create_count,
-            create_create_resolved: stats.create_create_resolved,
-            write_write_count: stats.write_write_count,
-            write_write_resolved: stats.write_write_resolved,
-            write_unlink_count: stats.write_unlink_count,
-            write_unlink_resolved: stats.write_unlink_resolved,
-            delete_create_count: stats.delete_create_count,
-            delete_create_resolved: stats.delete_create_resolved,
-            rename_conflict_count: stats.rename_conflict_count,
-            rename_conflict_resolved: stats.rename_conflict_resolved,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn batch_ignore_conflicts(
         &self,
-        request: Request<BatchIgnoreConflictsRequest>,
+        _request: Request<BatchIgnoreConflictsRequest>,
     ) -> Result<Response<BatchIgnoreConflictsResponse>, Status> {
-        let req = request.into_inner();
-
-        let dir_ino = if !req.dir_path.is_empty() {
-            match self.master.resolve_path_to_inode(&req.dir_path) {
-                Some(ino) => ino,
-                None => {
-                    return Ok(Response::new(BatchIgnoreConflictsResponse {
-                        success: false,
-                        error: format!("Path not found: {}", req.dir_path),
-                        ignored_count: 0,
-                    }));
-                }
-            }
-        } else {
-            req.dir_ino
-        };
-
-        let ignored_count = self
-            .master
-            .directory_tree
-            .batch_ignore_conflicts(dir_ino, req.conflict_type);
-        Ok(Response::new(BatchIgnoreConflictsResponse {
-            success: true,
-            error: String::new(),
-            ignored_count,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn delete_volume(
@@ -1685,743 +1345,172 @@ impl MasterService for MasterGrpcServer {
 
     async fn lookup_directory_entry(
         &self,
-        request: Request<LookupDirectoryEntryRequest>,
+        _request: Request<LookupDirectoryEntryRequest>,
     ) -> Result<Response<LookupDirectoryEntryResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let name = req.name.clone();
-
-        let entry = tokio::task::spawn_blocking(move || dir_tree.lookup(req.parent_ino, &name))
-            .await
-            .unwrap();
-
-        if let Some(entry) = entry {
-            Ok(Response::new(LookupDirectoryEntryResponse {
-                found: true,
-                entry: Some(entry),
-                error: String::new(),
-            }))
-        } else {
-            Ok(Response::new(LookupDirectoryEntryResponse {
-                found: false,
-                entry: None,
-                error: String::new(),
-            }))
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn get_entry(
         &self,
-        request: Request<GetEntryRequest>,
+        _request: Request<GetEntryRequest>,
     ) -> Result<Response<GetEntryResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let path = req.path.clone();
-
-        let entry = tokio::task::spawn_blocking(move || dir_tree.get_entry(&path))
-            .await
-            .unwrap();
-
-        if let Some(entry) = entry {
-            Ok(Response::new(GetEntryResponse {
-                found: true,
-                entry: Some(entry),
-                error: String::new(),
-            }))
-        } else {
-            Ok(Response::new(GetEntryResponse {
-                found: false,
-                entry: None,
-                error: String::new(),
-            }))
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn get_entry_by_inode(
         &self,
-        request: Request<GetEntryByInodeRequest>,
+        _request: Request<GetEntryByInodeRequest>,
     ) -> Result<Response<GetEntryByInodeResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let inode = req.inode;
-
-        let result = tokio::task::spawn_blocking(move || dir_tree.get_entry_by_inode(inode))
-            .await
-            .unwrap();
-
-        if let Some((entry, path)) = result {
-            let mode_val = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
-            let file_type = mode_val & 0o170000;
-            info!(
-                "get_entry_by_inode response: inode={}, name={}, path={}, mode={:o}, file_type={:o}, is_symlink={}, symlink_target='{}'",
-                inode, entry.name, path, mode_val, file_type, file_type == 0o120000, entry.symlink_target
-            );
-            Ok(Response::new(GetEntryByInodeResponse {
-                found: true,
-                entry: Some(entry),
-                path,
-                error: String::new(),
-            }))
-        } else {
-            Ok(Response::new(GetEntryByInodeResponse {
-                found: false,
-                entry: None,
-                path: String::new(),
-                error: String::new(),
-            }))
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn create_entry(
         &self,
-        request: Request<CreateEntryRequest>,
+        _request: Request<CreateEntryRequest>,
     ) -> Result<Response<CreateEntryResponse>, Status> {
-        if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            return Err(Status::failed_precondition(format!(
-                "not leader; current leader is {}",
-                leader
-            )));
-        }
-
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let metadata_manager = self.master.metadata_manager.clone();
-        let client_id = req.client_id.clone();
-        let client_id_clone = client_id.clone();
-        let entry = req.entry.unwrap_or_default();
-        let entry_clone = entry.clone();
-        info!(
-            "create_entry request: name={}, directory={}, client_id={}, mode={:o}, symlink_target='{}'",
-            entry.name.as_str(),
-            entry.directory.as_str(),
-            client_id,
-            entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
-            entry.symlink_target
-        );
-
-        let inode =
-            tokio::task::spawn_blocking(move || dir_tree.create_entry(entry, &client_id_clone))
-                .await
-                .unwrap();
-
-        if let Ok(inode) = inode {
-            let parent_ino = self
-                .master
-                .resolve_path_to_inode(&entry_clone.directory)
-                .unwrap_or(0);
-            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-            info!(
-                "Sending Create event: name={}, parent_ino={}, inode={}, client_id_num={}",
-                entry_clone.name, parent_ino, inode, client_id_num
-            );
-            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Create {
-                client_id: client_id.clone(),
-                client_id_num,
-                entry: entry_clone,
-                parent_ino,
-                inode,
-            });
-        }
-
-        match inode {
-            Ok(inode) if inode > 0 => Ok(Response::new(CreateEntryResponse {
-                success: true,
-                error: String::new(),
-                inode,
-            })),
-            Ok(_) => Ok(Response::new(CreateEntryResponse {
-                success: false,
-                error: "parent directory not found".to_string(),
-                inode: 0,
-            })),
-            Err(e) => Ok(Response::new(CreateEntryResponse {
-                success: false,
-                error: e.to_string(),
-                inode: 0,
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn update_entry(
         &self,
-        request: Request<UpdateEntryRequest>,
+        _request: Request<UpdateEntryRequest>,
     ) -> Result<Response<UpdateEntryResponse>, Status> {
-        if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            return Err(Status::failed_precondition(format!(
-                "not leader; current leader is {}",
-                leader
-            )));
-        }
-
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let metadata_manager = self.master.metadata_manager.clone();
-        let client_id = req.client_id.clone();
-        let client_id_clone = client_id.clone();
-        let entry = req.entry.unwrap_or_default();
-        let entry_clone = entry.clone();
-        let entry_ref = &entry;
-        let expected_size = req.expected_size;
-        let is_truncate = req.is_truncate;
-        info!(
-            "update_entry request: name={}, directory={}, client_id={}, content_size={}, size={}, mode={:o}, symlink_target='{}', expected_size={}, is_truncate={}",
-            entry_ref.name.as_str(),
-            entry_ref.directory.as_str(),
-            client_id,
-            entry_ref.content_size,
-            entry_ref.attributes.as_ref().map(|a| a.size).unwrap_or(0),
-            entry_ref.attributes.as_ref().map(|a| a.mode).unwrap_or(0),
-            entry_ref.symlink_target,
-            expected_size,
-            is_truncate
-        );
-
-        let result = tokio::task::spawn_blocking(move || {
-            dir_tree.update_entry(entry, &client_id_clone, expected_size, is_truncate)
-        })
-        .await
-        .unwrap();
-
-        let actual_size = if let Ok(s) = &result { *s } else { 0 };
-
-        if result.is_ok() && actual_size > 0 {
-            let inode = entry_clone.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
-            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Update {
-                client_id: client_id.clone(),
-                client_id_num,
-                entry: entry_clone,
-                inode,
-            });
-        }
-
-        match result {
-            Ok(actual_size) => Ok(Response::new(UpdateEntryResponse {
-                success: true,
-                error: String::new(),
-                actual_size,
-            })),
-            Err(e) => Ok(Response::new(UpdateEntryResponse {
-                success: false,
-                error: e.to_string(),
-                actual_size: 0,
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn delete_entry(
         &self,
-        request: Request<DeleteEntryRequest>,
+        _request: Request<DeleteEntryRequest>,
     ) -> Result<Response<DeleteEntryResponse>, Status> {
-        if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            return Err(Status::failed_precondition(format!(
-                "not leader; current leader is {}",
-                leader
-            )));
-        }
-
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let metadata_manager = self.master.metadata_manager.clone();
-        let ino = req.ino;
-        let client_id = req.client_id.clone();
-        let client_id_clone = client_id.clone();
-
-        let result =
-            tokio::task::spawn_blocking(move || dir_tree.delete_entry(ino, &client_id_clone))
-                .await
-                .unwrap();
-
-        if result.is_ok() {
-            let name = "unknown".to_string();
-            let path = "unknown".to_string();
-            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-            metadata_manager.send_event(crate::metadata_manager::MetadataEvent::Delete {
-                client_id: client_id.clone(),
-                client_id_num,
-                path,
-                inode: ino,
-                name,
-            });
-        }
-
-        match result {
-            Ok(_) => Ok(Response::new(DeleteEntryResponse {
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(DeleteEntryResponse {
-                success: false,
-                error: e.to_string(),
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn rename_entry(
         &self,
-        request: Request<powerfs::RenameEntryRequest>,
+        _request: Request<powerfs::RenameEntryRequest>,
     ) -> Result<Response<powerfs::RenameEntryResponse>, Status> {
-        let req = request.into_inner();
-        info!(
-            "rename_entry request: old_parent_ino={}, old_name={}, new_parent_ino={}, new_name={}, client_id={}",
-            req.old_parent_ino, req.old_name, req.new_parent_ino, req.new_name, req.client_id
-        );
-        let dir_tree = self.master.directory_tree.clone();
-        let old_parent_ino = req.old_parent_ino;
-        let old_name = req.old_name.clone();
-        let new_parent_ino = req.new_parent_ino;
-        let new_name = req.new_name.clone();
-        let client_id = req.client_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            dir_tree.rename_entry(
-                old_parent_ino,
-                &old_name,
-                new_parent_ino,
-                &new_name,
-                &client_id,
-            )
-        })
-        .await
-        .unwrap();
-
-        match result {
-            Ok(success) => {
-                info!("rename_entry result: success={}", success);
-                Ok(Response::new(powerfs::RenameEntryResponse {
-                    success,
-                    error: String::new(),
-                }))
-            }
-            Err(e) => {
-                info!("rename_entry error: {}", e);
-                Ok(Response::new(powerfs::RenameEntryResponse {
-                    success: false,
-                    error: e.to_string(),
-                }))
-            }
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn list_entries(
         &self,
-        request: Request<ListEntriesRequest>,
+        _request: Request<ListEntriesRequest>,
     ) -> Result<Response<ListEntriesResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let parent_ino = req.parent_ino;
-        let limit = req.limit;
-        let last_name = req.last_name.clone();
-
-        let entries = tokio::task::spawn_blocking(move || {
-            dir_tree.list_entries(parent_ino, limit, &last_name)
-        })
-        .await
-        .unwrap();
-
-        Ok(Response::new(ListEntriesResponse {
-            entries,
-            has_more: false,
-            error: String::new(),
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn stream_mutate_entry(
         &self,
-        request: Request<Streaming<MutateEntryRequest>>,
+        _request: Request<Streaming<MutateEntryRequest>>,
     ) -> Result<Response<Self::StreamMutateEntryStream>, Status> {
-        let mut stream = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let metadata_manager = self.master.metadata_manager.clone();
-
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        tokio::spawn(async move {
-            while let Some(req) = stream.message().await.unwrap_or(None) {
-                let dir_tree_clone = dir_tree.clone();
-                let metadata_manager_clone = metadata_manager.clone();
-                let result = match req.mutation {
-                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Create(
-                        create_req,
-                    )) => {
-                        let client_id = create_req.client_id.clone();
-                        let client_id_clone = client_id.clone();
-                        let entry = create_req.entry.unwrap_or_default();
-                        let entry_clone = entry.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.create_entry(entry, &client_id_clone)
-                        })
-                        .await
-                        .unwrap();
-
-                        if let Ok(inode) = result {
-                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-                            let parent_ino = 1;
-                            info!("Sending Create event via StreamMutateEntry: name={}, inode={}, client_id_num={}", entry_clone.name, inode, client_id_num);
-                            metadata_manager_clone.send_event(
-                                crate::metadata_manager::MetadataEvent::Create {
-                                    client_id,
-                                    client_id_num,
-                                    entry: entry_clone,
-                                    parent_ino,
-                                    inode,
-                                },
-                            );
-                        }
-
-                        result.map(|_| ()).map_err(|e| e.to_string())
-                    }
-                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Update(
-                        update_req,
-                    )) => {
-                        let client_id = update_req.client_id.clone();
-                        let client_id_clone = client_id.clone();
-                        let entry = update_req.entry.unwrap_or_default();
-                        let entry_clone = entry.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.update_entry(entry, &client_id_clone, 0, false)
-                        })
-                        .await
-                        .unwrap();
-
-                        if result.is_ok() {
-                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-                            let inode = entry_clone.attributes.as_ref().map(|a| a.ino).unwrap_or(0);
-                            metadata_manager_clone.send_event(
-                                crate::metadata_manager::MetadataEvent::Update {
-                                    client_id,
-                                    client_id_num,
-                                    entry: entry_clone,
-                                    inode,
-                                },
-                            );
-                        }
-
-                        result.map(|_| ()).map_err(|e| e.to_string())
-                    }
-                    Some(crate::proto::powerfs::mutate_entry_request::Mutation::Delete(
-                        delete_req,
-                    )) => {
-                        let client_id = delete_req.client_id.clone();
-                        let client_id_clone = client_id.clone();
-                        let ino = delete_req.ino;
-                        let result = tokio::task::spawn_blocking(move || {
-                            dir_tree_clone.delete_entry(ino, &client_id_clone)
-                        })
-                        .await
-                        .unwrap();
-
-                        if result.is_ok() {
-                            let client_id_num: u64 = client_id.parse().unwrap_or(0);
-                            metadata_manager_clone.send_event(
-                                crate::metadata_manager::MetadataEvent::Delete {
-                                    client_id,
-                                    client_id_num,
-                                    path: "unknown".to_string(),
-                                    inode: ino,
-                                    name: "unknown".to_string(),
-                                },
-                            );
-                        }
-
-                        result.map(|_| ()).map_err(|e| e.to_string())
-                    }
-                    None => Ok(()),
-                };
-
-                let _ = tx
-                    .send(MutateEntryResponse {
-                        success: result.is_ok(),
-                        error: result.err().unwrap_or_default(),
-                    })
-                    .await;
-            }
-        });
-
-        #[allow(clippy::result_large_err)]
-        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
-        Ok(Response::new(Box::pin(output_stream)))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn subscribe_metadata(
         &self,
-        request: Request<SubscribeMetadataRequest>,
+        _request: Request<SubscribeMetadataRequest>,
     ) -> Result<Response<Self::SubscribeMetadataStream>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-
-        let path_prefix = if req.path_prefix.is_empty() {
-            "/".to_string()
-        } else {
-            req.path_prefix
-        };
-
-        dir_tree.add_subscriber(&path_prefix);
-
-        let mut rx = dir_tree.subscribe();
-
-        let output_stream = async_stream::stream! {
-            while let Ok(notification) = rx.recv().await {
-                if notification.path.starts_with(&path_prefix) || path_prefix == "/" {
-                    yield Ok(notification);
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(output_stream)))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn acquire_lease(
         &self,
-        request: Request<powerfs::LeaseRequest>,
+        _request: Request<powerfs::LeaseRequest>,
     ) -> Result<Response<powerfs::LeaseResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let path = req.path.clone();
-        let client_id = req.client_id.clone();
-        let duration_ms = req.duration_ms;
-
-        let (lease_id, epoch) = tokio::task::spawn_blocking(move || {
-            let lease_id = dir_tree.acquire_lease(&path, &client_id, duration_ms);
-            let epoch = dir_tree.get_epoch();
-            (lease_id, epoch)
-        })
-        .await
-        .unwrap();
-
-        Ok(Response::new(powerfs::LeaseResponse {
-            success: true,
-            error: String::new(),
-            lease_id,
-            duration_ms,
-            epoch,
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn release_lease(
         &self,
-        request: Request<powerfs::LeaseReleaseRequest>,
+        _request: Request<powerfs::LeaseReleaseRequest>,
     ) -> Result<Response<powerfs::LeaseReleaseResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let lease_id = req.lease_id.clone();
-
-        let success = tokio::task::spawn_blocking(move || dir_tree.release_lease(&lease_id))
-            .await
-            .unwrap();
-
-        Ok(Response::new(powerfs::LeaseReleaseResponse {
-            success,
-            error: if success {
-                String::new()
-            } else {
-                "Lease not found".to_string()
-            },
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn renew_lease(
         &self,
-        request: Request<powerfs::LeaseRenewRequest>,
+        _request: Request<powerfs::LeaseRenewRequest>,
     ) -> Result<Response<powerfs::LeaseRenewResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let lease_id = req.lease_id.clone();
-        let duration_ms = req.duration_ms;
-
-        let result =
-            tokio::task::spawn_blocking(move || dir_tree.renew_lease(&lease_id, duration_ms))
-                .await
-                .unwrap();
-
-        match result {
-            Some(epoch) => Ok(Response::new(powerfs::LeaseRenewResponse {
-                success: true,
-                error: String::new(),
-                epoch,
-            })),
-            None => Ok(Response::new(powerfs::LeaseRenewResponse {
-                success: false,
-                error: "Lease not found".to_string(),
-                epoch: 0,
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn register_job_client(
         &self,
-        request: Request<powerfs::JobRegistrationRequest>,
+        _request: Request<powerfs::JobRegistrationRequest>,
     ) -> Result<Response<powerfs::JobRegistrationResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let job_id = req.job_id.clone();
-        let job_name = req.job_name.clone();
-        let client_id = req.client_id.clone();
-
-        let success = tokio::task::spawn_blocking(move || {
-            dir_tree.register_job_client(&job_id, &job_name, &client_id)
-        })
-        .await
-        .unwrap();
-
-        Ok(Response::new(powerfs::JobRegistrationResponse {
-            success,
-            error: if success {
-                String::new()
-            } else {
-                "Failed to register job client".to_string()
-            },
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn deregister_job_client(
         &self,
-        request: Request<powerfs::JobDeregistrationRequest>,
+        _request: Request<powerfs::JobDeregistrationRequest>,
     ) -> Result<Response<powerfs::JobDeregistrationResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let job_id = req.job_id.clone();
-        let client_id = req.client_id.clone();
-
-        let success = tokio::task::spawn_blocking(move || {
-            dir_tree.deregister_job_client(&job_id, &client_id)
-        })
-        .await
-        .unwrap();
-
-        Ok(Response::new(powerfs::JobDeregistrationResponse {
-            success,
-            error: if success {
-                String::new()
-            } else {
-                "Job not found".to_string()
-            },
-        }))
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn complete_job(
         &self,
-        request: Request<powerfs::JobCompletionRequest>,
+        _request: Request<powerfs::JobCompletionRequest>,
     ) -> Result<Response<powerfs::JobCompletionResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let job_id = req.job_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || dir_tree.complete_job(&job_id))
-            .await
-            .unwrap();
-
-        match result {
-            Some(invalidated_entries) => Ok(Response::new(powerfs::JobCompletionResponse {
-                success: true,
-                error: String::new(),
-                invalidated_entries,
-            })),
-            None => Err(Status::not_found("Job not found")),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn get_job_info(
         &self,
-        request: Request<powerfs::JobInfoRequest>,
+        _request: Request<powerfs::JobInfoRequest>,
     ) -> Result<Response<powerfs::JobInfoResponse>, Status> {
-        let req = request.into_inner();
-        let dir_tree = self.master.directory_tree.clone();
-        let job_id = req.job_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || dir_tree.get_job_info(&job_id))
-            .await
-            .unwrap();
-
-        match result {
-            Some(job) => {
-                let job_ctx = powerfs::JobContext {
-                    job_id: job.job_id,
-                    job_name: job.job_name,
-                    client_ids: job.client_ids.into_iter().collect(),
-                    start_time: job.start_time,
-                    end_time: job.end_time,
-                    is_active: job.is_active,
-                };
-                Ok(Response::new(powerfs::JobInfoResponse {
-                    found: true,
-                    job: Some(job_ctx),
-                    error: String::new(),
-                }))
-            }
-            None => Ok(Response::new(powerfs::JobInfoResponse {
-                found: false,
-                job: None,
-                error: "Job not found".to_string(),
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn push_delta(
         &self,
-        request: Request<PushDeltaRequest>,
+        _request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
-        let req = request.into_inner();
-        let client_id = req.client_id;
-        let deltas = req.deltas;
-        let _client_vclock = req.client_vclock;
-
-        debug!(
-            "push_delta: client_id={}, delta_count={}",
-            client_id,
-            deltas.len()
-        );
-
-        let dir_tree = self.master.directory_tree.clone();
-        let result = tokio::task::spawn_blocking(move || dir_tree.push_delta(&client_id, &deltas))
-            .await
-            .unwrap();
-
-        match result {
-            Ok(server_vclock) => Ok(Response::new(PushDeltaResponse {
-                success: true,
-                error: String::new(),
-                server_vclock: Some(server_vclock),
-            })),
-            Err(e) => Ok(Response::new(PushDeltaResponse {
-                success: false,
-                error: e.to_string(),
-                server_vclock: None,
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 
     async fn pull_delta(
         &self,
-        request: Request<PullDeltaRequest>,
+        _request: Request<PullDeltaRequest>,
     ) -> Result<Response<PullDeltaResponse>, Status> {
-        let req = request.into_inner();
-        let client_id = req.client_id;
-        let _client_vclock = req.client_vclock;
-
-        debug!("pull_delta: client_id={}", client_id);
-
-        let dir_tree = self.master.directory_tree.clone();
-        let result = tokio::task::spawn_blocking(move || dir_tree.pull_delta(&client_id))
-            .await
-            .unwrap();
-
-        match result {
-            Ok((deltas, server_vclock)) => Ok(Response::new(PullDeltaResponse {
-                success: true,
-                error: String::new(),
-                deltas,
-                server_vclock: Some(server_vclock),
-            })),
-            Err(e) => Ok(Response::new(PullDeltaResponse {
-                success: false,
-                error: e.to_string(),
-                deltas: Vec::new(),
-                server_vclock: None,
-            })),
-        }
+        Err(Status::unimplemented(
+            "filesystem metadata operations moved to Filer Raft",
+        ))
     }
 }
