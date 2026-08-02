@@ -362,7 +362,15 @@ impl FilerNetHandler {
             .setattr(ino, shard_id, size, mode, uid, gid)
             .await
         {
-            Ok(_) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Ok(_) => {
+                // Notify other clients that this inode's metadata (and
+                // possibly size) changed. Without this, truncate operations
+                // via SetAttr are invisible to other clients' cached metadata
+                // until TTL expiry, causing stale reads.
+                let now = chrono::Utc::now().timestamp() as u64;
+                self.notify_inode_change(ino, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
             Err(e) => {
                 warn!("FILER_NET_SETATTR failed: {}", e);
                 Ok(Self::build_response(
