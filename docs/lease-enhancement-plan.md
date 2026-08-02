@@ -160,11 +160,42 @@ impl Drop for LeaseGuard {
 
 ## 实施计划
 
-| 阶段 | 内容 | 优先级 |
-|------|------|--------|
-| 阶段 1 | P0-1 独立 crate 抽离 + P0-2 LeaseGuard RAII | 高 |
-| 阶段 2 | P1-1 持久化 + P1-2 fence token 持久化 + P1-3 remaining() | 中 |
-| 阶段 3 | P2-1 批量操作 + P2-2 监控指标 | 低 |
+| 阶段 | 内容 | 优先级 | 状态 |
+|------|------|--------|------|
+| 阶段 1 | P0-1 独立 crate 抽离 + P0-2 LeaseGuard RAII | 高 | ✅ 完成 (commit ed9eb20a) |
+| 阶段 2 | P1-1 持久化 + P1-2 fence token 持久化 | 高 | ✅ 完成 (commit 0dc0942b) |
+| 阶段 2b | P1-3 remaining() 集成到写路径 | 中 | ⏳ API 已就绪，待集成 |
+| 阶段 3 | P2-1 批量操作 + P2-2 监控指标 | 低 | ⏳ 待实施 |
+
+### 已完成项详情
+
+#### P0-1: 独立 crate 抽离 (commit ed9eb20a)
+- 新建 `powerfs-lease` crate（无 PowerFS 业务依赖）
+- `LeaseKey` trait + `MemoryLeaseStore<K>` 泛化自 RangeLeaseManager
+- `LeaseManager` trait（客户端异步接口 + 缓存）
+- `LeaseGuard` RAII（Drop 自动释放）
+- 14 单元测试 + 1 doctest
+
+#### P0-2: LeaseGuard RAII (commit ed9eb20a)
+- `LeaseGuard::drop()` fire-and-forget tokio::spawn 释放
+- `release()` 显式释放 + `mark_released()` 跳过 Drop
+- `remaining()` / `is_expired()` 查询方法
+- 4 个 guard 测试
+
+#### P1-1: Lease 持久化 (commit 0dc0942b)
+- `LeasePersistence` trait（byte-based，无泛型）
+- `encode_entry` / `decode_entry` 序列化（Instant ↔ Unix millis）
+- `MemoryLeaseStore` 可选持久化后端
+- acquire/renew/release/disconnect_holder/cleanup_expired 全路径持久化
+- `load_from_persistence()` 启动恢复
+- `RocksDBLeasePersistence` 实现（leases + meta 两个 CF）
+- VolumeServer::new 自动接入持久化
+- 3 个 RocksDB 测试（basic CRUD、reopen、full roundtrip）
+
+#### P1-2: Fence Token 持久化 (commit 0dc0942b)
+- epoch counter 通过 `save_epoch` / `load_epoch` 持久化
+- `load_from_persistence` 恢复时设置 epoch = max(current, stored) + 1
+- 防止 ABA：重启后 epoch 不归零
 
 ## 约束
 
