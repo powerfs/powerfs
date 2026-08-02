@@ -101,10 +101,12 @@ impl fmt::Display for EntryId {
 pub struct CachedFileChunk {
     pub offset: u64,
     pub size: u64,
-    pub mtime: u64,
-    pub fid: String,
-    pub cookie: u32,
+    /// Chunk-level storage key (needle_id on volume server).
+    pub needle_id: u64,
+    /// Volume this chunk resides on (per-chunk to support stripe mode).
+    pub volume_id: u64,
     pub crc32: u32,
+    pub mtime: u64,
 }
 
 /// 目录条目（OR-Set 中的一个元素）
@@ -1920,8 +1922,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 1000,
-            fid: "fid1".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -1930,8 +1932,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 2000,
-            fid: "fid2".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -1964,8 +1966,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 1000,
-            fid: "fid1".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -1974,8 +1976,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 2000,
-            fid: "fid2".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 67890,
         }];
 
@@ -2007,8 +2009,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 1000,
-            fid: "fid1".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -2017,8 +2019,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 2000,
-            fid: "fid2".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -2050,8 +2052,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 1000,
-            fid: "fid1".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -2060,8 +2062,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 2000,
-            fid: "fid2".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -2093,8 +2095,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 1000,
-            fid: "fid1".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 
@@ -2103,8 +2105,8 @@ mod tests {
             offset: 0,
             size: 10,
             mtime: 2000,
-            fid: "fid2".to_string(),
-            cookie: 0,
+            needle_id: 1,
+            volume_id: 1,
             crc32: 12345,
         }];
 

@@ -1,6 +1,6 @@
 use powerfs_volume::proto::{
-    powerfs::volume_service_client::VolumeServiceClient, CreateVolumeRequest, DeleteNeedleRequest,
-    ReadNeedleRequest, WriteNeedleRequest,
+    powerfs::volume_service_client::VolumeServiceClient, CompactVolumeRequest, CreateVolumeRequest,
+    DeleteNeedleRequest, ReadNeedleRequest, WriteNeedleRequest,
 };
 use tonic::transport::Channel;
 
@@ -125,6 +125,21 @@ impl VolumeServerClient {
             Ok(())
         } else {
             Err("delete failed".into())
+        }
+    }
+
+    pub async fn compact_volume(
+        &mut self,
+        volume_id: u64,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        let mut service = self.service().await?;
+        let request = CompactVolumeRequest { volume_id };
+        let response = service.compact_volume(tonic::Request::new(request)).await?;
+        let result = response.into_inner();
+        if result.success {
+            Ok((result.reclaimed_bytes, result.moved_needles))
+        } else {
+            Err(format!("compact failed: {}", result.error).into())
         }
     }
 }

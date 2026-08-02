@@ -63,9 +63,9 @@ impl VolumeNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
         // inode for lease validation (lease is registered by inode, not file_key)
-        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
+        let inode = dec.next_u64(FieldId::Inode).unwrap_or(file_key);
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
         let holder_client_id = dec
@@ -123,7 +123,7 @@ impl VolumeNetHandler {
                     match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
                         Ok(info) => {
                             let mut enc = TlvEncoder::new();
-                            enc.add_u64(FieldId::Name, info.id.0);
+                            enc.add_u64(FieldId::FileKey, info.id.0);
                             Ok(Some(enc.into_bytes()))
                         }
                         Err(e) => {
@@ -173,7 +173,7 @@ impl VolumeNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
 
         info!(
             "NET_READ_NEEDLE: volume_id={}, file_key={}",
@@ -236,7 +236,7 @@ impl VolumeNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
 
         info!(
             "NET_DELETE_NEEDLE: volume_id={}, file_key={}",
@@ -308,8 +308,8 @@ impl VolumeNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
-        let inode = dec.next_u64(FieldId::FileKey).unwrap_or(file_key);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Inode).unwrap_or(file_key);
         let entries = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
         let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
@@ -413,7 +413,7 @@ impl VolumeNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let file_key = dec.next_u64(FieldId::Name).unwrap_or(0);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
         let offset = dec.next_u64(FieldId::Offset).unwrap_or(0) as i64;
         let size = dec.next_u64(FieldId::Size).unwrap_or(0);
 

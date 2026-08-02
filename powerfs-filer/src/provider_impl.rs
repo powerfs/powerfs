@@ -23,12 +23,20 @@ fn inode_info_to_entry(info: &crate::shard_store::InodeInfo) -> Entry {
     });
 
     let chunks = if let Some(fid) = &info.fid {
+        // Parse file_key from fid string "volume_id,cookie,file_key" as needle_id
+        // (S3 single-chunk: needle_id == file_key).
+        let needle_id: u64 = fid
+            .split(',')
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let volume_id: u64 = info.volume_id.unwrap_or(0);
         vec![FileChunk {
             offset: 0,
             size: info.size,
             mtime: info.mtime,
-            fid: fid.clone(),
-            cookie: 0,
+            needle_id,
+            volume_id,
             crc32: 0,
         }]
     } else {

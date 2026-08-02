@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use log::error;
 
 use crate::client_identity::ClientIdentity;
@@ -48,10 +49,10 @@ pub(crate) fn proto_entry_to_traits(entry: &ProtoEntry) -> powerfs_common::trait
         .map(|c| powerfs_common::traits::FileChunk {
             offset: c.offset,
             size: c.size,
-            mtime: c.mtime,
-            fid: c.fid.clone(),
-            cookie: c.cookie,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
             crc32: c.crc32,
+            mtime: c.mtime,
         })
         .collect();
 
@@ -97,10 +98,10 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
         .map(|c| ProtoFileChunk {
             offset: c.offset,
             size: c.size,
-            mtime: c.mtime,
-            fid: c.fid.clone(),
-            cookie: c.cookie,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
             crc32: c.crc32,
+            mtime: c.mtime,
         })
         .collect();
 
@@ -828,7 +829,7 @@ pub struct WriteBlobRequest {
     pub inode: u64,
     pub offset: i64,
     pub size: i32,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// Parameters for a single chunk read in a batch fetch.
@@ -1305,8 +1306,7 @@ impl SyncFuseClientFacade {
                     let facade = facade.clone();
                     let lease_ref = lease_owned.as_deref();
                     async move {
-                        let provider =
-                            crate::provider_adapter::FacadeStorageProvider::new(facade);
+                        let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
                         provider
                             .write_blob_with_lease(
                                 req.volume_id,
@@ -1327,10 +1327,7 @@ impl SyncFuseClientFacade {
     }
 
     /// Batch read multiple chunks in parallel using tokio::join_all.
-    pub fn read_blob_batch(
-        &self,
-        requests: Vec<ReadBlobRequest>,
-    ) -> Vec<Result<Vec<u8>, String>> {
+    pub fn read_blob_batch(&self, requests: Vec<ReadBlobRequest>) -> Vec<Result<Vec<u8>, String>> {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
             let futures: Vec<_> = requests
@@ -1338,8 +1335,7 @@ impl SyncFuseClientFacade {
                 .map(|req| {
                     let facade = facade.clone();
                     async move {
-                        let provider =
-                            crate::provider_adapter::FacadeStorageProvider::new(facade);
+                        let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
                         provider
                             .read_blob(req.volume_id, req.file_key, req.offset, req.size)
                             .await

@@ -13,6 +13,7 @@ use powerfs_common::{
         VolumeState,
     },
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 fn backend_err(e: StorageBackendError) -> PowerFsError {
@@ -35,6 +36,8 @@ pub struct Volume {
     /// triggers never fire and there is no external scheduler ticker
     /// calling us periodically.
     op_counter: std::sync::atomic::AtomicU32,
+    /// Compact 正在进行时设为 true，阻止并发 write
+    compacting: AtomicBool,
 }
 
 /// Internal helper used by Drop and by unit tests that want a deterministic
@@ -162,6 +165,7 @@ impl Volume {
             backend_volume_id,
             coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
             op_counter: std::sync::atomic::AtomicU32::new(0),
+            compacting: AtomicBool::new(false),
         })
     }
 
@@ -521,6 +525,29 @@ impl Volume {
     }
 
     pub fn compact(&self) -> Result<(u64, u64)> {
+        // 防止并发 compact
+        if self
+            .compacting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(PowerFsError::Internal(
+                "Volume is already compacting".to_string(),
+            ));
+        }
+
+        // 确保 compact 在退出时重置标志（即使出错）
+        let result = self.compact_inner();
+        self.compacting.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn compact_inner(&self) -> Result<(u64, u64)> {
+        // 开始前先 flush coalescer，避免 dirty 数据与 compact 冲突
+        self.coalescer.flush_all(|id, vec, is_new| {
+            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
+        });
+
         let mut active_needles: Vec<NeedleInfo> = Vec::new();
 
         for (_id, info) in self.index.iter() {
@@ -532,7 +559,6 @@ impl Volume {
         active_needles.sort_by_key(|info| info.offset);
 
         let mut new_offset = VOLUME_DATA_OFFSET;
-        let mut reclaimed: u64 = 0;
         let mut updated_count: u64 = 0;
 
         for info in &active_needles {
@@ -563,15 +589,18 @@ impl Volume {
             updated_count += 1;
         }
 
-        let old_used = self.used();
-        let new_used = new_offset.saturating_sub(VOLUME_DATA_OFFSET);
-        if new_used < old_used {
-            reclaimed = old_used - new_used;
-        }
+        // Reclaimed space = old physical end (including holes from deleted
+        // needles) - new physical end (compact written, holes removed).
+        // Using append_offset (physical) instead of used (logical) ensures
+        // compact correctly reports the physical hole space reclaimed.
+        let old_stats = self.index.get_allocation()?;
+        let old_append_offset = old_stats.append_offset;
+        let new_physical_end = new_offset;
+        let reclaimed = old_append_offset.saturating_sub(new_physical_end);
 
         // 通过 RocksDB compact_cleanup 原子更新 allocation CF
         let volume_size = self.size();
-        let new_stats = self.index.compact_cleanup(reclaimed, volume_size)?;
+        let new_stats = self.index.compact_cleanup(new_offset, volume_size)?;
 
         {
             let mut info_guard = self.info.write().unwrap();
@@ -584,6 +613,29 @@ impl Volume {
             .map_err(backend_err)?;
 
         Ok((reclaimed, updated_count))
+    }
+
+    /// 当前 volume 是否正在 compact
+    pub fn is_compacting(&self) -> bool {
+        self.compacting.load(Ordering::SeqCst)
+    }
+
+    /// 检查是否应该触发 compact（deleted 比例超过阈值）
+    pub fn should_compact(&self) -> bool {
+        let stats = match self.index.get_allocation() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if stats.active_count == 0 {
+            return false;
+        }
+        // 当 deleted_count 占总 needle 比例超过 30% 时触发
+        let total = stats.active_count + stats.deleted_count;
+        if total == 0 {
+            return false;
+        }
+        let deleted_ratio = stats.deleted_count as f64 / total as f64;
+        deleted_ratio > 0.3
     }
 
     fn append_needle_version(
@@ -666,6 +718,11 @@ impl Volume {
         data: Bytes,
         _cookie: u32,
     ) -> Result<()> {
+        if self.compacting.load(Ordering::SeqCst) {
+            return Err(PowerFsError::Internal(
+                "Volume is compacting, retry later".to_string(),
+            ));
+        }
         let needle_id = NeedleId(file_key);
         let data_offset = offset as usize;
         let data_size = std::cmp::min(size as usize, data.len());

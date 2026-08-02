@@ -176,6 +176,52 @@ impl VolumeServer {
             }
         });
 
+        // Auto-compact 检查 task：每 5 分钟扫描所有 volume，对 deleted 比例超过 30%
+        // 的 volume 自动触发 compact，回收物理空间。
+        {
+            let storage_manager = self.storage_manager.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300));
+                interval.tick().await; // 跳过第一次（启动时立即触发）
+                loop {
+                    interval.tick().await;
+                    let volumes = storage_manager.list_volumes();
+                    for vinfo in volumes {
+                        let vid = vinfo.id;
+                        let volume = match storage_manager.get_volume(&vid) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        if !volume.should_compact() {
+                            continue;
+                        }
+                        info!("Auto-compact triggered for volume {}", vid.0);
+                        let volume_clone = volume.clone();
+                        let vid_clone = vid;
+                        let join =
+                            tokio::task::spawn_blocking(move || volume_clone.compact()).await;
+                        match join {
+                            Ok(Ok((reclaimed, moved))) => {
+                                info!(
+                                    "Auto-compact volume {}: reclaimed={} bytes, moved={} needles",
+                                    vid_clone.0, reclaimed, moved
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Auto-compact volume {} failed: {}", vid_clone.0, e);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Auto-compact volume {} task join failed: {}",
+                                    vid_clone.0, e
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Server::builder()
             .http2_keepalive_timeout(Some(Duration::from_secs(30)))
             .http2_keepalive_interval(Some(Duration::from_secs(10)))
@@ -1309,6 +1355,58 @@ impl VolumeService for VolumeServer {
                     success: false,
                     error: e,
                     epoch: 0,
+                }))
+            }
+        }
+    }
+
+    async fn compact_volume(
+        &self,
+        request: Request<crate::proto::CompactVolumeRequest>,
+    ) -> std::result::Result<Response<crate::proto::CompactVolumeResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        info!("compact_volume: volume_id={}", volume_id.0);
+
+        let storage_manager = self.storage_manager.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            let volume = storage_manager
+                .get_volume(&volume_id)
+                .ok_or_else(|| PowerFsError::VolumeNotFound(volume_id))?;
+            volume.compact()
+        })
+        .await
+        {
+            Ok(Ok((reclaimed, moved))) => {
+                info!(
+                    "Manual compact volume {}: reclaimed={} bytes, moved={} needles",
+                    volume_id.0, reclaimed, moved
+                );
+                Ok(Response::new(crate::proto::CompactVolumeResponse {
+                    success: true,
+                    reclaimed_bytes: reclaimed,
+                    moved_needles: moved,
+                    error: String::new(),
+                }))
+            }
+            Ok(Err(e)) => {
+                warn!("Manual compact volume {} failed: {}", volume_id.0, e);
+                Ok(Response::new(crate::proto::CompactVolumeResponse {
+                    success: false,
+                    reclaimed_bytes: 0,
+                    moved_needles: 0,
+                    error: e.to_string(),
+                }))
+            }
+            Err(e) => {
+                error!("compact_volume task join failed: {}", e);
+                Ok(Response::new(crate::proto::CompactVolumeResponse {
+                    success: false,
+                    reclaimed_bytes: 0,
+                    moved_needles: 0,
+                    error: format!("task join failed: {}", e),
                 }))
             }
         }

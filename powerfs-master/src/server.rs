@@ -546,7 +546,7 @@ impl MasterService for MasterGrpcServer {
                     for &vid in &volume_ids {
                         let vid_vol = VolumeId(vid);
                         let cookie = rand::random::<u32>() as u64;
-                        let file_key = self.master.allocate_file_key(&vid_vol).unwrap_or(1);
+                        let file_key = self.master.allocate_file_key(&vid_vol).await.unwrap_or(1);
                         let fid = powerfs_common::types::Fid {
                             volume_id: vid_vol,
                             cookie,

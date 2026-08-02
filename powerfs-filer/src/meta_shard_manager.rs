@@ -1755,8 +1755,8 @@ impl MetaShardManager {
                                                 offset: c.offset,
                                                 size: c.size,
                                                 mtime: c.mtime,
-                                                fid: c.fid.clone(),
-                                                cookie: c.cookie,
+                                                needle_id: c.needle_id,
+                                                volume_id: c.volume_id,
                                                 crc32: c.crc32,
                                             })
                                             .collect();
@@ -2021,8 +2021,8 @@ impl MetaShardManager {
                                 offset: c.offset,
                                 size: c.size,
                                 mtime: c.mtime,
-                                fid: c.fid.clone(),
-                                cookie: c.cookie,
+                                needle_id: c.needle_id,
+                                volume_id: c.volume_id,
                                 crc32: c.crc32,
                             })
                             .collect();
@@ -2360,8 +2360,8 @@ impl MetaShardManager {
 
     /// Phase 3.5.2: 异步回收 volume server 上的数据块。
     ///
-    /// 对每个 chunk，解析 fid（格式 "volume_id,cookie,file_key"），
-    /// 通过 VolumeRouter 查询 volume server 地址，调用 delete_needle 回收数据。
+    /// 对每个 chunk，使用 chunk.volume_id 和 chunk.needle_id 通过 VolumeRouter
+    /// 查询 volume server 地址，调用 delete_needle 回收数据。
     /// 回收失败时记录警告，不阻塞后续 chunk 回收（best-effort）。
     pub async fn reclaim_data_chunks(
         &self,
@@ -2371,35 +2371,8 @@ impl MetaShardManager {
     ) {
         for (inode, chunks) in chunks_to_reclaim {
             for chunk in chunks {
-                // 解析 fid: "volume_id,cookie,file_key"
-                let parts: Vec<&str> = chunk.fid.split(',').collect();
-                if parts.len() < 3 {
-                    warn!(
-                        "GC reclaim: invalid fid format '{}' for inode {}, skipping",
-                        chunk.fid, inode
-                    );
-                    continue;
-                }
-                let volume_id: u64 = match parts[0].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!(
-                            "GC reclaim: invalid volume_id in fid '{}' for inode {}, skipping",
-                            chunk.fid, inode
-                        );
-                        continue;
-                    }
-                };
-                let file_key: u64 = match parts[2].parse() {
-                    Ok(k) => k,
-                    Err(_) => {
-                        warn!(
-                            "GC reclaim: invalid file_key in fid '{}' for inode {}, skipping",
-                            chunk.fid, inode
-                        );
-                        continue;
-                    }
-                };
+                let volume_id = chunk.volume_id;
+                let needle_id = chunk.needle_id;
 
                 // 查询 volume server 地址
                 let server_addr = match volume_router.get_server_addr(volume_id).await {
@@ -2415,21 +2388,21 @@ impl MetaShardManager {
 
                 // 回收数据块
                 match volume_client_pool
-                    .delete_needle(&server_addr, volume_id, file_key)
+                    .delete_needle(&server_addr, volume_id, needle_id)
                     .await
                 {
                     Ok(()) => {
                         debug!(
-                            "GC reclaim: deleted needle volume_id={}, file_key={} for inode {}",
-                            volume_id, file_key, inode
+                            "GC reclaim: deleted needle volume_id={}, needle_id={} for inode {}",
+                            volume_id, needle_id, inode
                         );
                         // Phase 5: WAL — 回收成功，从 pending_reclaims 移除
-                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                        self.remove_pending_reclaim_all_stores(volume_id, needle_id);
                     }
                     Err(e) => {
                         warn!(
-                            "GC reclaim: delete_needle failed for inode {} (volume_id={}, file_key={}): {} — will retry next GC cycle",
-                            inode, volume_id, file_key, e
+                            "GC reclaim: delete_needle failed for inode {} (volume_id={}, needle_id={}): {} — will retry next GC cycle",
+                            inode, volume_id, needle_id, e
                         );
                         // Phase 5: WAL — 回收失败，保留在 pending_reclaims，下次 GC 重试
                     }
@@ -2438,12 +2411,12 @@ impl MetaShardManager {
         }
     }
 
-    /// Phase 5: 从所有 shard stores 中移除指定 fid 的 pending_reclaim。
+    /// Phase 5: 从所有 shard stores 中移除指定 chunk 的 pending_reclaim。
     /// RocksDB delete 对不存在的 key 是 no-op，所以遍历所有 store 是安全的。
-    fn remove_pending_reclaim_all_stores(&self, fid: &str) {
+    fn remove_pending_reclaim_all_stores(&self, volume_id: u64, needle_id: u64) {
         let stores = self.shard_stores.read().unwrap();
         for store in stores.values() {
-            store.remove_pending_reclaim(fid);
+            store.remove_pending_reclaim(volume_id, needle_id);
         }
     }
 
@@ -2480,37 +2453,8 @@ impl MetaShardManager {
         for (shard_id, pending) in &all_pending {
             for (inode, chunk) in pending {
                 retried += 1;
-                let parts: Vec<&str> = chunk.fid.split(',').collect();
-                if parts.len() < 3 {
-                    warn!(
-                        "GC retry: invalid fid '{}' for inode {}, removing from pending",
-                        chunk.fid, inode
-                    );
-                    self.remove_pending_reclaim_all_stores(&chunk.fid);
-                    continue;
-                }
-                let volume_id: u64 = match parts[0].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!(
-                            "GC retry: invalid volume_id in fid '{}', removing",
-                            chunk.fid
-                        );
-                        self.remove_pending_reclaim_all_stores(&chunk.fid);
-                        continue;
-                    }
-                };
-                let file_key: u64 = match parts[2].parse() {
-                    Ok(k) => k,
-                    Err(_) => {
-                        warn!(
-                            "GC retry: invalid file_key in fid '{}', removing",
-                            chunk.fid
-                        );
-                        self.remove_pending_reclaim_all_stores(&chunk.fid);
-                        continue;
-                    }
-                };
+                let volume_id = chunk.volume_id;
+                let needle_id = chunk.needle_id;
 
                 let server_addr = match volume_router.get_server_addr(volume_id).await {
                     Some(addr) => addr,
@@ -2525,22 +2469,22 @@ impl MetaShardManager {
                 };
 
                 match volume_client_pool
-                    .delete_needle(&server_addr, volume_id, file_key)
+                    .delete_needle(&server_addr, volume_id, needle_id)
                     .await
                 {
                     Ok(()) => {
                         succeeded += 1;
-                        self.remove_pending_reclaim_all_stores(&chunk.fid);
+                        self.remove_pending_reclaim_all_stores(volume_id, needle_id);
                         debug!(
-                            "GC retry: deleted needle volume_id={}, file_key={} for inode {}",
-                            volume_id, file_key, inode
+                            "GC retry: deleted needle volume_id={}, needle_id={} for inode {}",
+                            volume_id, needle_id, inode
                         );
                     }
                     Err(e) => {
                         failed += 1;
                         warn!(
-                            "GC retry: delete_needle failed for inode {} (volume_id={}, file_key={}): {}",
-                            inode, volume_id, file_key, e
+                            "GC retry: delete_needle failed for inode {} (volume_id={}, needle_id={}): {}",
+                            inode, volume_id, needle_id, e
                         );
                     }
                 }

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use log::{debug, warn};
 use lru::LruCache;
 use powerfs_common::types::Fid;
@@ -10,15 +11,15 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const ROOT_INODE: u64 = 1;
-pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB - TLV protocol supports up to 4GB value length
+pub const DEFAULT_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2MB - balance performance and memory
 
 pub fn chunk_from_proto(chunk: FileChunk) -> CachedFileChunk {
     CachedFileChunk {
         offset: chunk.offset,
         size: chunk.size,
         mtime: chunk.mtime,
-        fid: chunk.fid,
-        cookie: chunk.cookie,
+        needle_id: chunk.needle_id,
+        volume_id: chunk.volume_id,
         crc32: chunk.crc32,
     }
 }
@@ -575,8 +576,6 @@ impl MetadataCache {
 
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
-            let fid_str = fid.to_string();
-            let cookie = fid.cookie as u32;
             let mtime = entry.mtime.max(0) as u64;
 
             for chunk_idx in start_chunk_idx..=end_chunk_idx {
@@ -593,8 +592,8 @@ impl MetadataCache {
                         offset: chunk_offset,
                         size: chunk_data_size,
                         mtime,
-                        fid: fid_str.clone(),
-                        cookie,
+                        needle_id: fid.file_key.saturating_add(chunk_idx),
+                        volume_id: fid.volume_id.0,
                         crc32: 0,
                     });
                 }
@@ -1436,7 +1435,7 @@ mod tests {
 
 #[derive(Debug, Clone)]
 pub struct ChunkData {
-    pub data: Vec<u8>,
+    pub data: Bytes, // Bytes enables O(1) clone (reference count) in flush path
     pub offset: u64,
     pub size: u64,
     pub mtime: u64,
@@ -1482,8 +1481,8 @@ impl ChunkCache {
     }
 
     pub fn with_defaults() -> Self {
-        // 默认 4GB 缓存上限
-        ChunkCache::with_max_bytes(DEFAULT_CHUNK_SIZE, 4 * 1024 * 1024 * 1024)
+        // 512MB 缓存上限（2GB 容器内存下安全）
+        ChunkCache::with_max_bytes(DEFAULT_CHUNK_SIZE, 512 * 1024 * 1024)
     }
 
     pub fn chunk_size(&self) -> u64 {
@@ -1538,7 +1537,7 @@ impl ChunkCache {
         }
     }
 
-    pub fn put(&self, inode: u64, offset: u64, data: Vec<u8>, mtime: u64, crc32: u32) {
+    pub fn put(&self, inode: u64, offset: u64, data: Bytes, mtime: u64, crc32: u32) {
         let chunk_index = self.get_chunk_index(offset);
         let key = (inode, chunk_index);
         let shard = shard_idx(&key);
@@ -1809,7 +1808,7 @@ mod chunk_cache_tests {
 
         assert!(cache.get(inode, 0).is_none());
 
-        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1234567890, 0);
         let chunk = cache.get(inode, 0).unwrap();
         assert_eq!(chunk.data.len(), 1024);
         assert_eq!(chunk.offset, 0);
@@ -1821,8 +1820,8 @@ mod chunk_cache_tests {
         let cache = ChunkCache::new(1024, 10);
         let inode = 100;
 
-        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
-        cache.put(inode, 1024, vec![1u8; 1024], 1234567891, 1);
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1234567890, 0);
+        cache.put(inode, 1024, vec![1u8; 1024].into(), 1234567891, 1);
 
         assert!(cache.get(inode, 0).is_some());
         assert!(cache.get(inode, 1024).is_some());
@@ -1838,7 +1837,7 @@ mod chunk_cache_tests {
         let cache = ChunkCache::new(1024, 10);
         let inode = 100;
 
-        cache.put(inode, 0, vec![0u8; 1024], 1234567890, 0);
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1234567890, 0);
 
         let missing = cache.prefetch(inode, 0, 3072);
         assert_eq!(missing.len(), 2);
@@ -1869,15 +1868,15 @@ mod chunk_cache_tests {
         let inode = 100;
 
         // 放入 2 个 chunk（刚好填满）
-        cache.put(inode, 0, vec![0u8; 1024], 1000, 0); // mtime=1000
-        cache.put(inode, 1024, vec![1u8; 1024], 2000, 1); // mtime=2000
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1000, 0); // mtime=1000
+        cache.put(inode, 1024, vec![1u8; 1024].into(), 2000, 1); // mtime=2000
         assert_eq!(cache.current_bytes(), 2048);
 
         // 清除脏标记（模拟 flush 完成后的状态）
         cache.clear_dirty(inode);
 
         // 放入第 3 个 chunk 触发 LRU 淘汰
-        cache.put(inode, 2048, vec![2u8; 1024], 3000, 2); // mtime=3000
+        cache.put(inode, 2048, vec![2u8; 1024].into(), 3000, 2); // mtime=3000
 
         // 最旧的（mtime=1000）应被淘汰，剩下较新的两个
         assert!(
@@ -1897,10 +1896,10 @@ mod chunk_cache_tests {
         let inode = 100;
 
         // 放入 4 个 chunk（offset 0, 1024, 2048, 3072）
-        cache.put(inode, 0, vec![0u8; 1024], 1000, 0);
-        cache.put(inode, 1024, vec![1u8; 1024], 1000, 1);
-        cache.put(inode, 2048, vec![2u8; 1024], 1000, 2);
-        cache.put(inode, 3072, vec![3u8; 1024], 1000, 3);
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1000, 0);
+        cache.put(inode, 1024, vec![1u8; 1024].into(), 1000, 1);
+        cache.put(inode, 2048, vec![2u8; 1024].into(), 1000, 2);
+        cache.put(inode, 3072, vec![3u8; 1024].into(), 1000, 3);
 
         // truncate 到 2048：移除 offset >= 2048 的 chunk
         cache.remove_after(inode, 2048);
@@ -1927,14 +1926,14 @@ mod chunk_cache_tests {
 
         assert_eq!(cache.current_bytes(), 0);
 
-        cache.put(inode, 0, vec![0u8; 512], 1000, 0);
+        cache.put(inode, 0, vec![0u8; 512].into(), 1000, 0);
         assert_eq!(cache.current_bytes(), 512);
 
-        cache.put(inode, 1024, vec![1u8; 256], 1000, 1);
+        cache.put(inode, 1024, vec![1u8; 256].into(), 1000, 1);
         assert_eq!(cache.current_bytes(), 768);
 
         // 替换已有 chunk（512 → 1024）
-        cache.put(inode, 0, vec![2u8; 1024], 1000, 0);
+        cache.put(inode, 0, vec![2u8; 1024].into(), 1000, 0);
         assert_eq!(cache.current_bytes(), 1280); // 1024 + 256
 
         cache.remove(inode);

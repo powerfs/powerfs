@@ -684,15 +684,26 @@ fn test_compact_reclaims_space_after_deletes() {
     let used_before = volume.used();
     volume.delete_needle(&NeedleId(2)).unwrap();
     let used_after_delete = volume.used();
-    assert_eq!(used_after_delete, used_before);
+    // delete_needle immediately reclaims logical space (used_bytes decreases).
+    // Physical space (holes) is reclaimed later by compact().
+    assert!(
+        used_after_delete < used_before,
+        "delete should reduce used_bytes: before={}, after={}",
+        used_before,
+        used_after_delete
+    );
 
     let (reclaimed, moved) = volume.compact().unwrap();
-    assert!(reclaimed > 0);
-    assert!(moved > 0);
+    assert!(reclaimed > 0, "compact should reclaim physical hole space");
+    assert!(moved > 0, "compact should move needles to fill holes");
 
     let used_after_compact = volume.used();
-    assert!(used_after_compact < used_before);
-    assert_eq!(used_after_compact, used_before - reclaimed);
+    // compact reclaims physical holes, not logical space (already reclaimed by delete).
+    // used_after_compact should equal used_after_delete (active needles only).
+    assert_eq!(
+        used_after_compact, used_after_delete,
+        "compact should not change logical used_bytes"
+    );
 
     let data1 = volume.read_needle(&NeedleId(1)).unwrap();
     assert_eq!(data1, Bytes::from("needle one"));
@@ -719,7 +730,12 @@ fn test_compact_after_append_only_growth() {
     assert!(moved > 0);
 
     let used_after = volume.used();
-    assert!(used_after < used_before);
+    // compact reclaims physical holes (from append-only version overwrites),
+    // not logical space. used_bytes should remain unchanged.
+    assert_eq!(
+        used_after, used_before,
+        "compact should not change logical used_bytes"
+    );
 
     let data = volume.read_needle(&NeedleId(1)).unwrap();
     assert_eq!(data.len(), 2048);

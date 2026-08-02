@@ -382,7 +382,7 @@ services:
     container_name: fuse-1
     hostname: fuse-1
     cpus: '1.0'
-    mem_limit: 512m
+    mem_limit: 2g
     init: true
     networks:
       powerfs-network:
@@ -420,7 +420,7 @@ services:
     container_name: fuse-2
     hostname: fuse-2
     cpus: '1.0'
-    mem_limit: 512m
+    mem_limit: 2g
     init: true
     networks:
       powerfs-network:

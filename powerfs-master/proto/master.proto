@@ -786,8 +786,8 @@ message FileChunk {
     uint64 offset = 1;
     uint64 size = 2;
     uint64 mtime = 3;
-    string fid = 4;
-    uint32 cookie = 5;
+    uint64 needle_id = 4;  // chunk-level storage key on volume server
+    uint64 volume_id = 5;  // volume this chunk resides on (per-chunk for stripe)
     uint32 crc32 = 6;
 }
 

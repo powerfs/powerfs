@@ -37,10 +37,12 @@ pub trait DeltaSyncChannel: Send + Sync {
 pub struct ChunkWire {
     pub offset: u64,
     pub size: u64,
-    pub mtime: u64,
-    pub fid: String,
-    pub cookie: u32,
+    /// Chunk-level storage key (needle_id on volume server).
+    pub needle_id: u64,
+    /// Volume this chunk resides on (per-chunk to support stripe mode).
+    pub volume_id: u64,
     pub crc32: u32,
+    pub mtime: u64,
 }
 
 /// alloc_inode_batch 请求体

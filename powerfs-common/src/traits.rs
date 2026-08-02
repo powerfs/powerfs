@@ -86,10 +86,13 @@ pub struct EntryAttributes {
 pub struct FileChunk {
     pub offset: u64,
     pub size: u64,
-    pub mtime: u64,
-    pub fid: String,
-    pub cookie: u32,
+    /// Chunk-level storage key (needle_id on volume server).
+    /// file_key is file-level; each chunk gets needle_id = file_key + chunk_idx.
+    pub needle_id: u64,
+    /// Volume this chunk resides on (per-chunk to support stripe mode).
+    pub volume_id: u64,
     pub crc32: u32,
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

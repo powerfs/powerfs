@@ -662,8 +662,8 @@ impl FilerMetaService for FilerMetaServiceImpl {
                 offset: c.offset,
                 size: c.size,
                 mtime: c.mtime,
-                fid: c.fid,
-                cookie: c.cookie,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
                 crc32: c.crc32,
             })
             .collect();
@@ -853,8 +853,8 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
                 offset: c.offset,
                 size: c.size,
                 mtime: c.mtime,
-                fid: c.fid.clone(),
-                cookie: c.cookie,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
                 crc32: c.crc32,
             })
             .collect(),

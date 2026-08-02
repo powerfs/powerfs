@@ -8,8 +8,8 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    CollectionArgs, ConflictsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, MountArgs,
-    ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    CollectionArgs, CompactArgs, ConflictsArgs, FsckArgs, GrowArgs, HeartbeatArgs, KvArgs,
+    LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
 };
 
 /// PowerFS CLI tool for testing and administration
@@ -72,6 +72,9 @@ enum Commands {
     /// Collection management (list/info/create/delete/stats)
     Collection(CollectionArgs),
 
+    /// Compact a volume on a volume server (reclaim space from deleted needles)
+    Compact(CompactArgs),
+
     /// Mount PowerFS as a FUSE filesystem
     Mount(MountArgs),
 
@@ -80,6 +83,9 @@ enum Commands {
 
     /// Conflict management (list/resolve/set-policy/auto-resolve)
     Conflicts(ConflictsArgs),
+
+    /// Filesystem consistency check (orphaned needles, ghost references, metadata anomalies)
+    Fsck(FsckArgs),
 }
 
 #[tokio::main]
@@ -115,12 +121,14 @@ async fn main() {
         Commands::ClusterStatus(args) => commands::cluster_status(client, args).await,
         Commands::ClusterTransfer(args) => commands::cluster_transfer(client, args).await,
         Commands::Collection(args) => commands::collection(client, args).await,
+        Commands::Compact(args) => commands::compact(args).await,
         Commands::Mount(args) => commands::mount(args),
         Commands::Kv(args) => {
             let kv_client = kv_client::KvCacheClient::new(&cli.master);
             commands::kv(kv_client, args).await
         }
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
+        Commands::Fsck(args) => commands::fsck(client, args).await,
     };
 
     if let Err(e) = result {

@@ -187,8 +187,8 @@ impl FilerNetHandler {
                     offset: c.offset,
                     size: c.size,
                     mtime: c.mtime,
-                    fid: c.fid.clone(),
-                    cookie: c.cookie,
+                    needle_id: c.needle_id,
+                    volume_id: c.volume_id,
                     crc32: c.crc32,
                 })
                 .collect();
@@ -204,7 +204,7 @@ impl FilerNetHandler {
             enc.add_u64(FieldId::VolumeId, volume_id);
         }
         if let Some(chunk) = info.chunks.first() {
-            enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
+            enc.add_u64(FieldId::Cookie, 0);
             enc.add_u64(FieldId::FileKey, chunk.offset);
             enc.add_u64(FieldId::Size, chunk.size);
         }
@@ -982,8 +982,8 @@ impl FilerNetHandler {
                 offset: c.offset,
                 size: c.size,
                 mtime: c.mtime,
-                fid: c.fid.clone(),
-                cookie: c.cookie,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
                 crc32: c.crc32,
             })
             .collect();

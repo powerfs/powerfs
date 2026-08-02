@@ -577,13 +577,16 @@ pub enum FieldId {
     Replication = 0x91,
     VolumeId = 0x92,
     Cookie = 0x93,
+    /// Chunk-level storage key (needle_id on volume server).
+    /// Used in Write/Read/Delete/BatchWrite TLV to identify the physical needle.
     FileKey = 0x94,
     Fid = 0x95,
     /// 完整 chunks 列表（JSON 序列化的 Vec<ChunkWire>）。
-    /// 用于 GetAttr/Lookup/ReadDir 返回多 chunk 文件的完整数据布局，
-    /// 解决旧协议只能返回首 chunk 的问题。fuse 端优先解析此字段，
-    /// 缺失时回退到 Fid/Cookie/FileKey/Size 单 chunk 字段以保持兼容。
+    /// 用于 GetAttr/Lookup/ReadDir 返回多 chunk 文件的完整数据布局。
     Chunks = 0x96,
+    /// Inode for lease validation (lease is registered per-inode, not per-needle).
+    /// Used in Write/BatchWrite TLV alongside FileKey.
+    Inode = 0x97,
 }
 
 impl FieldId {
@@ -650,6 +653,7 @@ impl FieldId {
             0x94 => Some(Self::FileKey),
             0x95 => Some(Self::Fid),
             0x96 => Some(Self::Chunks),
+            0x97 => Some(Self::Inode),
             _ => None,
         }
     }

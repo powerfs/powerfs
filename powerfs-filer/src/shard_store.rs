@@ -62,10 +62,12 @@ pub struct InodeInfo {
 pub struct StoredFileChunk {
     pub offset: u64,
     pub size: u64,
-    pub mtime: u64,
-    pub fid: String,
-    pub cookie: u32,
+    /// Chunk-level storage key (needle_id on volume server).
+    pub needle_id: u64,
+    /// Volume this chunk resides on (per-chunk to support stripe mode).
+    pub volume_id: u64,
     pub crc32: u32,
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -915,12 +917,19 @@ impl ShardStore {
             if let Some(info) = inodes.get_mut(&inode) {
                 info.fid = Some(fid.clone());
                 info.volume_id = Some(volume_id);
+                // Extract file_key from fid string "volume_id,cookie,file_key"
+                // to use as the chunk-level needle_id.
+                let needle_id: u64 = fid
+                    .split(',')
+                    .nth(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
                 info.chunks.push(StoredFileChunk {
                     offset,
                     size,
                     mtime: chrono::Utc::now().timestamp() as u64,
-                    fid: fid.clone(),
-                    cookie,
+                    needle_id,
+                    volume_id,
                     crc32: 0,
                 });
 
@@ -1400,21 +1409,22 @@ impl ShardStore {
     // ========================================================================
 
     /// Phase 5: 持久化待回收 chunk（WAL 模式：先持久化再删元数据）。
-    /// key = fid, value = (inode, StoredFileChunk) JSON。
+    /// key = "volume_id,needle_id", value = (inode, StoredFileChunk) JSON。
     pub fn add_pending_reclaim(&self, inode: u64, chunk: &StoredFileChunk) {
         if let Some(cf) = self.db.cf_handle(CF_PENDING_RECLAIMS) {
             let entry = serde_json::json!({"inode": inode, "chunk": chunk});
             if let Ok(data) = serde_json::to_vec(&entry) {
-                let key = chunk.fid.as_bytes();
-                let _ = self.db.put_cf(cf, key, &data);
+                let key = format!("{},{}", chunk.volume_id, chunk.needle_id);
+                let _ = self.db.put_cf(cf, key.as_bytes(), &data);
             }
         }
     }
 
     /// Phase 5: 删除待回收 chunk（delete_needle 成功后调用）。
-    pub fn remove_pending_reclaim(&self, fid: &str) {
+    pub fn remove_pending_reclaim(&self, volume_id: u64, needle_id: u64) {
         if let Some(cf) = self.db.cf_handle(CF_PENDING_RECLAIMS) {
-            let _ = self.db.delete_cf(cf, fid.as_bytes());
+            let key = format!("{},{}", volume_id, needle_id);
+            let _ = self.db.delete_cf(cf, key.as_bytes());
         }
     }
 
@@ -2025,8 +2035,8 @@ mod tests {
             offset: 0,
             size: 1024,
             mtime: 100,
-            fid: "1,100,200".to_string(),
-            cookie: 100,
+            needle_id: 200,
+            volume_id: 1,
             crc32: 0xDEADBEEF,
         };
 
@@ -2038,10 +2048,11 @@ mod tests {
         let pending = store.list_pending_reclaims();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 5000);
-        assert_eq!(pending[0].1.fid, "1,100,200");
+        assert_eq!(pending[0].1.needle_id, 200);
+        assert_eq!(pending[0].1.volume_id, 1);
 
         // 删除 pending reclaim
-        store.remove_pending_reclaim("1,100,200");
+        store.remove_pending_reclaim(1, 200);
         assert!(store.list_pending_reclaims().is_empty());
     }
 }

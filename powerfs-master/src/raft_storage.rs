@@ -88,6 +88,14 @@ pub enum RaftCommand {
     DeleteVolume {
         volume_id: u64,
     },
+    /// Persist `next_file_key` advance for a volume.
+    /// Proposed in batches (every FILE_KEY_BATCH_SIZE allocations) to survive
+    /// master restarts without reusing file_keys (which would cause silent
+    /// data overwrites on the volume server).
+    AdvanceFileKey {
+        volume_id: u64,
+        new_next_key: u64,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)

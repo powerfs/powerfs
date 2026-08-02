@@ -2363,15 +2363,15 @@ async fn process_data_request_internal(
             }
         }
         RequestKind::Write => {
-            // Decode TLV body to extract file_key (inode) for per-inode lease check.
-            // TLV layout from build_write_tlv: VolumeId -> Name(file_key) -> Offset -> Size -> Data
-            // Use next_field() sequentially to locate the Name (file_key) field robustly.
+            // Decode TLV body to extract file_key (needle_id) for per-inode lease check.
+            // TLV layout from build_write_tlv: VolumeId -> FileKey(file_key) -> Offset -> Size -> Data
+            // Use next_field() sequentially to locate the FileKey (file_key) field robustly.
             let file_key: u64 = {
                 let mut dec = TlvDecoder::new(&body);
                 let mut found: Option<u64> = None;
-                // Walk TLV fields until we find the Name field
+                // Walk TLV fields until we find the FileKey field
                 while let Some((fid, length)) = dec.next_field() {
-                    if fid == FieldId::Name {
+                    if fid == FieldId::FileKey {
                         match dec.read_u64(length) {
                             Ok(v) => {
                                 found = Some(v);

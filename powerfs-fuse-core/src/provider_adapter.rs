@@ -81,12 +81,22 @@ fn build_create_tlv_with_chunks(
     let _ = enc.add_u64(FieldId::Uid, uid);
     let _ = enc.add_u64(FieldId::Gid, gid);
 
-    // Encode chunk/fid info for persistence on Filer
-    for chunk in chunks {
-        let _ = enc.add_string(FieldId::Fid, &chunk.fid);
-        let _ = enc.add_u64(FieldId::Cookie, chunk.cookie as u64);
-        let _ = enc.add_u64(FieldId::FileKey, chunk.offset); // reuse FileKey field
-        let _ = enc.add_u64(FieldId::Size, chunk.size);
+    // Encode chunk info for persistence on Filer (JSON-serialized ChunkWire list)
+    let wire_list: Vec<ChunkWire> = chunks
+        .iter()
+        .map(|c| ChunkWire {
+            offset: c.offset,
+            size: c.size,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
+            crc32: c.crc32,
+            mtime: c.mtime,
+        })
+        .collect();
+    if !wire_list.is_empty() {
+        if let Ok(json_bytes) = serde_json::to_vec(&wire_list) {
+            let _ = enc.add_bytes(FieldId::Chunks, &json_bytes);
+        }
     }
 
     enc.into_bytes()
@@ -196,15 +206,9 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         name
     );
 
-    // Parse chunk/fid info
-    // 优先解析 FieldId::Chunks 完整列表（新协议，多 chunk 支持）；
-    // 缺失时回退到 Fid/Cookie/FileKey/Size 单 chunk 字段（旧协议兼容）。
+    // Parse chunk info from FieldId::Chunks (JSON-serialized ChunkWire list).
+    // If Chunks field is absent, return an empty chunks list.
     let chunks_bytes = dec.next_bytes(FieldId::Chunks).ok();
-    let fid = dec.next_string(FieldId::Fid).ok();
-    let _volume_id = dec.next_u64(FieldId::VolumeId).ok();
-    let cookie = dec.next_u64(FieldId::Cookie).ok();
-    let file_key = dec.next_u64(FieldId::FileKey).ok();
-    let chunk_size = dec.next_u64(FieldId::Size).ok();
 
     let mut chunks: Vec<powerfs_common::traits::FileChunk> = Vec::new();
     if let Some(json_bytes) = chunks_bytes {
@@ -213,25 +217,12 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
                 chunks.push(powerfs_common::traits::FileChunk {
                     offset: w.offset,
                     size: w.size,
-                    mtime: w.mtime,
-                    fid: w.fid,
-                    cookie: w.cookie,
+                    needle_id: w.needle_id,
+                    volume_id: w.volume_id,
                     crc32: w.crc32,
+                    mtime: w.mtime,
                 });
             }
-        }
-    }
-    // 回退：旧协议仅有首 chunk 字段
-    if chunks.is_empty() {
-        if let (Some(fid_str), Some(c)) = (fid, cookie) {
-            chunks.push(powerfs_common::traits::FileChunk {
-                offset: file_key.unwrap_or(0),
-                size: chunk_size.unwrap_or(0),
-                mtime,
-                fid: fid_str,
-                cookie: c as u32,
-                crc32: 0,
-            });
         }
     }
 
@@ -363,7 +354,7 @@ fn build_write_tlv(
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
-    enc.add_u64(FieldId::Name, file_key);
+    enc.add_u64(FieldId::FileKey, file_key);
     let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
         if !token.is_empty() {
@@ -389,8 +380,8 @@ fn build_write_tlv_with_inode(
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
-    enc.add_u64(FieldId::Name, file_key);
-    enc.add_u64(FieldId::FileKey, inode); // inode for lease validation
+    enc.add_u64(FieldId::FileKey, file_key);
+    enc.add_u64(FieldId::Inode, inode); // inode for lease validation
     let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
         if !token.is_empty() {
@@ -409,7 +400,7 @@ fn build_write_tlv_with_inode(
 fn build_read_tlv(volume_id: u64, file_key: u64, offset: i64, size: i32) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
-    enc.add_u64(FieldId::Name, file_key);
+    enc.add_u64(FieldId::FileKey, file_key);
     enc.add_u64(FieldId::Offset, offset as u64);
     enc.add_u64(FieldId::Size, size as u64);
     enc.into_bytes()
@@ -426,7 +417,7 @@ fn build_batch_write_tlv(
 ) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
-    enc.add_u64(FieldId::Name, file_key);
+    enc.add_u64(FieldId::FileKey, file_key);
     enc.add_u64(FieldId::Entries, entries_count as u64);
     let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
@@ -446,7 +437,7 @@ fn build_batch_write_tlv(
 fn build_delete_tlv(volume_id: u64, file_key: u64) -> Vec<u8> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, volume_id);
-    enc.add_u64(FieldId::Name, file_key);
+    enc.add_u64(FieldId::FileKey, file_key);
     enc.into_bytes()
 }
 

@@ -510,7 +510,15 @@ impl VolumeMetadata {
     }
 
     /// Compact 后清理 deleted CF 并更新分配状态，返回更新后的 AllocationStats
-    pub fn compact_cleanup(&self, freed_bytes: u64, volume_size: u64) -> Result<AllocationStats> {
+    ///
+    /// `new_append_offset` 是 compact 重写后的物理文件末尾（holes 已消除）。
+    /// 注意：`used_bytes` 不在此处减少——delete_needle 时已回收逻辑空间，
+    /// compact 只回收物理 hole（通过 truncate + 更新 append_offset）。
+    pub fn compact_cleanup(
+        &self,
+        new_append_offset: u64,
+        volume_size: u64,
+    ) -> Result<AllocationStats> {
         let mut batch = WriteBatch::default();
 
         // 清空 deleted CF
@@ -520,9 +528,9 @@ impl VolumeMetadata {
             batch.delete_cf(self.cf_deleted(), key);
         }
 
-        // 更新分配状态
+        // 更新分配状态：append_offset 收缩到新的物理末尾（holes 已消除）
         let mut stats = self.get_allocation()?;
-        stats.used_bytes = stats.used_bytes.saturating_sub(freed_bytes);
+        stats.append_offset = new_append_offset;
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
         stats.deleted_count = 0;
         stats.last_modified_at = Utc::now().timestamp();
@@ -536,8 +544,8 @@ impl VolumeMetadata {
         })?;
 
         info!(
-            "Compact cleanup: freed={} bytes, {} deleted needles removed, used={}, free={}",
-            freed_bytes,
+            "Compact cleanup: new_append_offset={}, {} deleted needles removed, used={}, free={}",
+            new_append_offset,
             deleted_items.len(),
             stats.used_bytes,
             stats.free_bytes

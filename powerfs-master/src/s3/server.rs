@@ -30,7 +30,8 @@ pub struct PartInfo {
     pub part_number: i32,
     pub etag: String,
     pub size: u64,
-    pub fid: String,
+    pub needle_id: u64,
+    pub volume_id: u64,
 }
 
 pub struct MultipartSession {
@@ -586,8 +587,8 @@ pub mod handlers {
             offset: 0,
             size,
             mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-            fid: format!("{},{},{}", fid.volume_id.0, fid.cookie, fid.file_key),
-            cookie: fid.cookie as u32,
+            needle_id: fid.file_key,
+            volume_id: fid.volume_id.0,
             crc32: 0,
         }];
 
@@ -681,24 +682,8 @@ pub mod handlers {
         }
 
         let chunk = &entry.chunks[0];
-        let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
-        if fid_parts.len() < 3 {
-            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid FID format");
-        }
-
-        let volume_id: u64 = match fid_parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => {
-                return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid volume ID")
-            }
-        };
-
-        let file_key: u64 = match fid_parts[2].parse() {
-            Ok(f) => f,
-            Err(_) => {
-                return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid file key")
-            }
-        };
+        let volume_id: u64 = chunk.volume_id;
+        let file_key: u64 = chunk.needle_id;
 
         // 使用缓存获取volume位置
         let node_address = match state.cache.volume_location_cache.get(volume_id).await {
@@ -829,22 +814,15 @@ pub mod handlers {
         };
 
         for chunk in &entry.chunks {
-            let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
-            if fid_parts.len() >= 3 {
-                if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
-                {
-                    if let Some(volume_info) =
-                        state.master.get_volume_info(&VolumeId(volume_id)).await
-                    {
-                        if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
-                            let node_address = format!("{}:{}", node.address, node.grpc_port);
-                            let _ = state
-                                .volume_client_pool
-                                .delete_needle(&node_address, volume_id, file_key)
-                                .await;
-                        }
-                    }
+            let volume_id = chunk.volume_id;
+            let file_key = chunk.needle_id;
+            if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                    let node_address = format!("{}:{}", node.address, node.grpc_port);
+                    let _ = state
+                        .volume_client_pool
+                        .delete_needle(&node_address, volume_id, file_key)
+                        .await;
                 }
             }
         }
@@ -988,13 +966,12 @@ pub mod handlers {
         hasher.update(data);
         let etag = hex::encode(hasher.finalize());
 
-        let fid = format!("{},0,{}", session.volume_id, file_key);
-
         session.parts.push(PartInfo {
             part_number,
             etag: etag.clone(),
             size,
-            fid,
+            needle_id: file_key,
+            volume_id: session.volume_id,
         });
 
         let mut response = (StatusCode::OK, "").into_response();
@@ -1096,8 +1073,8 @@ pub mod handlers {
                 offset,
                 size: part.size,
                 mtime: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
-                fid: part.fid.clone(),
-                cookie: 0,
+                needle_id: part.needle_id,
+                volume_id: part.volume_id,
                 crc32: 0,
             });
             offset += part.size;
@@ -1189,22 +1166,15 @@ pub mod handlers {
         }
 
         for part in &session.parts {
-            let fid_parts: Vec<&str> = part.fid.split(',').collect();
-            if fid_parts.len() >= 3 {
-                if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
-                {
-                    if let Some(volume_info) =
-                        state.master.get_volume_info(&VolumeId(volume_id)).await
-                    {
-                        if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
-                            let node_address = format!("{}:{}", node.address, node.grpc_port);
-                            let _ = state
-                                .volume_client_pool
-                                .delete_needle(&node_address, volume_id, file_key)
-                                .await;
-                        }
-                    }
+            let volume_id = part.volume_id;
+            let file_key = part.needle_id;
+            if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                    let node_address = format!("{}:{}", node.address, node.grpc_port);
+                    let _ = state
+                        .volume_client_pool
+                        .delete_needle(&node_address, volume_id, file_key)
+                        .await;
                 }
             }
         }
@@ -1247,22 +1217,15 @@ pub mod handlers {
         };
 
         for part in &session.parts {
-            let fid_parts: Vec<&str> = part.fid.split(',').collect();
-            if fid_parts.len() >= 3 {
-                if let (Ok(volume_id), Ok(file_key)) =
-                    (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
-                {
-                    if let Some(volume_info) =
-                        state.master.get_volume_info(&VolumeId(volume_id)).await
-                    {
-                        if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
-                            let node_address = format!("{}:{}", node.address, node.grpc_port);
-                            let _ = state
-                                .volume_client_pool
-                                .delete_needle(&node_address, volume_id, file_key)
-                                .await;
-                        }
-                    }
+            let volume_id = part.volume_id;
+            let file_key = part.needle_id;
+            if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+                if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                    let node_address = format!("{}:{}", node.address, node.grpc_port);
+                    let _ = state
+                        .volume_client_pool
+                        .delete_needle(&node_address, volume_id, file_key)
+                        .await;
                 }
             }
         }
@@ -1314,27 +1277,21 @@ pub mod handlers {
         }
 
         let chunk = &entry.chunks[0];
-        let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
-        if fid_parts.len() >= 3 {
-            if let (Ok(volume_id), Ok(file_key)) =
-                (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
-            {
-                if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
+        let volume_id = chunk.volume_id;
+        let file_key = chunk.needle_id;
+        if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+            if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                let node_address = format!("{}:{}", node.address, node.grpc_port);
+                if let Err(e) = state
+                    .volume_client_pool
+                    .restore_needle(&node_address, volume_id, file_key)
+                    .await
                 {
-                    if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
-                        let node_address = format!("{}:{}", node.address, node.grpc_port);
-                        if let Err(e) = state
-                            .volume_client_pool
-                            .restore_needle(&node_address, volume_id, file_key)
-                            .await
-                        {
-                            eprintln!("Failed to restore needle: {}", e);
-                            return build_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to restore object",
-                            );
-                        }
-                    }
+                    eprintln!("Failed to restore needle: {}", e);
+                    return build_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to restore object",
+                    );
                 }
             }
         }
@@ -1379,43 +1336,36 @@ pub mod handlers {
         }
 
         let chunk = &entry.chunks[0];
-        let fid_parts: Vec<&str> = chunk.fid.split(',').collect();
-        if fid_parts.len() >= 3 {
-            if let (Ok(volume_id), Ok(file_key)) =
-                (fid_parts[0].parse::<u64>(), fid_parts[2].parse::<u64>())
-            {
-                if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await
+        let volume_id = chunk.volume_id;
+        let file_key = chunk.needle_id;
+        if let Some(volume_info) = state.master.get_volume_info(&VolumeId(volume_id)).await {
+            if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
+                let node_address = format!("{}:{}", node.address, node.grpc_port);
+                match state
+                    .volume_client_pool
+                    .worm_lock(&node_address, volume_id, file_key, retention_days)
+                    .await
                 {
-                    if let Some(node) = state.master.get_node_info(&volume_info.node_id).await {
-                        let node_address = format!("{}:{}", node.address, node.grpc_port);
-                        match state
-                            .volume_client_pool
-                            .worm_lock(&node_address, volume_id, file_key, retention_days)
-                            .await
-                        {
-                            Ok(retention_until) => {
-                                let json = serde_json::json!({
-                                    "message": "WORM lock applied successfully",
-                                    "key": key,
-                                    "retention_days": retention_days,
-                                    "retention_until": retention_until,
-                                });
-                                let mut response =
-                                    (StatusCode::OK, serde_json::to_string(&json).unwrap())
-                                        .into_response();
-                                response
-                                    .headers_mut()
-                                    .insert("Content-Type", "application/json".parse().unwrap());
-                                return response;
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to apply WORM lock: {}", e);
-                                return build_error_response(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Failed to apply WORM lock",
-                                );
-                            }
-                        }
+                    Ok(retention_until) => {
+                        let json = serde_json::json!({
+                            "message": "WORM lock applied successfully",
+                            "key": key,
+                            "retention_days": retention_days,
+                            "retention_until": retention_until,
+                        });
+                        let mut response =
+                            (StatusCode::OK, serde_json::to_string(&json).unwrap()).into_response();
+                        response
+                            .headers_mut()
+                            .insert("Content-Type", "application/json".parse().unwrap());
+                        return response;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to apply WORM lock: {}", e);
+                        return build_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to apply WORM lock",
+                        );
                     }
                 }
             }

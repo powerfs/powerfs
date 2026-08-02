@@ -27,6 +27,9 @@ service VolumeService {
 
     // Lease-validated write for data consistency
     rpc WriteNeedleBlobLease(WriteNeedleBlobLeaseRequest) returns (WriteNeedleBlobLeaseResponse);
+
+    // Trigger volume compaction (reclaim space from deleted needles)
+    rpc CompactVolume(CompactVolumeRequest) returns (CompactVolumeResponse);
 }
 
 message CreateVolumeRequest {
@@ -285,4 +288,19 @@ message WriteNeedleBlobLeaseRequest {
 message WriteNeedleBlobLeaseResponse {
     bool success = 1;
     string error = 2;
+}
+
+// ============================================================
+// Volume Compaction
+// ============================================================
+
+message CompactVolumeRequest {
+    uint64 volume_id = 1;
+}
+
+message CompactVolumeResponse {
+    bool success = 1;
+    uint64 reclaimed_bytes = 2;
+    uint64 moved_needles = 3;
+    string error = 4;
 }

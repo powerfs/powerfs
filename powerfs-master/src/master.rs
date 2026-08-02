@@ -31,6 +31,11 @@ pub use crate::volume_assigner::{
     AssignContext, RoundRobinAssigner, SmartVolumeAssigner, VolumeAssigner,
 };
 
+/// Batch size for persisting next_file_key via Raft.
+/// Every FILE_KEY_BATCH_SIZE allocations, master proposes AdvanceFileKey
+/// to survive restarts without reusing file_keys.
+const FILE_KEY_BATCH_SIZE: u64 = 1000;
+
 pub struct MasterNode {
     id: NodeId,
     address: SocketAddr,
@@ -796,9 +801,44 @@ impl MasterNode {
             RaftCommand::DeleteVolume { volume_id } => {
                 self.apply_delete_volume(volume_id).await?;
             }
+            RaftCommand::AdvanceFileKey {
+                volume_id,
+                new_next_key,
+            } => {
+                let mut volumes = self.volumes.write().unwrap();
+                if let Some(vol_info) = volumes.get_mut(&VolumeId(volume_id)) {
+                    // Only advance, never regress (avoid stale proposals overwriting newer state)
+                    if new_next_key > vol_info.next_file_key {
+                        vol_info.next_file_key = new_next_key;
+                        debug!(
+                            "Advanced next_file_key for volume {} to {} via Raft",
+                            volume_id, new_next_key
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// After allocating a file_key, check if we need to persist the advance
+    /// via Raft. Called after the write lock on `self.volumes` is released.
+    /// Best-effort: failures are logged but don't block the allocation.
+    async fn maybe_advance_file_key(&self, volume_id: u64, allocated_key: u64) {
+        if allocated_key > 0 && allocated_key.is_multiple_of(FILE_KEY_BATCH_SIZE) {
+            let new_next_key = allocated_key + 1;
+            let cmd = crate::raft_storage::RaftCommand::AdvanceFileKey {
+                volume_id,
+                new_next_key,
+            };
+            if let Err(e) = self.propose_command(cmd).await {
+                warn!(
+                    "Failed to propose AdvanceFileKey for volume {}: {} (next_file_key may not persist across restart)",
+                    volume_id, e
+                );
+            }
+        }
     }
 
     fn apply_add_node(&self, params: AddNodeParams) -> Result<()> {
@@ -1588,6 +1628,8 @@ impl MasterNode {
                     1
                 }
             };
+            // Persist next_file_key advance in batches via Raft
+            self.maybe_advance_file_key(existing_vid.0, file_key).await;
 
             let volume_id = existing_vid;
             let cookie = rand::random::<u32>() as u64;
@@ -1717,15 +1759,22 @@ impl MasterNode {
     }
 
     /// 在指定 volume 上分配一个新的 file_key（自增）
-    pub fn allocate_file_key(&self, volume_id: &VolumeId) -> Option<u64> {
-        let mut volumes = self.volumes.write().unwrap();
-        if let Some(vol_info) = volumes.get_mut(volume_id) {
-            let key = vol_info.next_file_key;
-            vol_info.next_file_key += 1;
-            Some(key)
-        } else {
-            None
+    pub async fn allocate_file_key(&self, volume_id: &VolumeId) -> Option<u64> {
+        let allocated_key = {
+            let mut volumes = self.volumes.write().unwrap();
+            if let Some(vol_info) = volumes.get_mut(volume_id) {
+                let key = vol_info.next_file_key;
+                vol_info.next_file_key += 1;
+                Some(key)
+            } else {
+                None
+            }
+        };
+        if let Some(key) = allocated_key {
+            // Persist next_file_key advance in batches via Raft
+            self.maybe_advance_file_key(volume_id.0, key).await;
         }
+        allocated_key
     }
 
     pub async fn create_new_volume(
@@ -1824,6 +1873,8 @@ impl MasterNode {
                 1
             }
         };
+        // Persist next_file_key advance in batches via Raft
+        self.maybe_advance_file_key(volume_id.0, file_key).await;
 
         let cookie = rand::random::<u32>() as u64;
 
@@ -1949,6 +2000,8 @@ impl MasterNode {
                 1
             }
         };
+        // Persist next_file_key advance in batches via Raft
+        self.maybe_advance_file_key(volume_id.0, file_key).await;
 
         let cookie = rand::random::<u32>() as u64;
         let fid = Fid {

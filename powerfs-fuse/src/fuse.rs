@@ -1,4 +1,5 @@
 use crate::cache::{CachedEntry, ChunkCache, MetadataCache, ROOT_INODE};
+use bytes::BytesMut;
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -7,7 +8,7 @@ use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use log::{debug, error, info, warn};
 use powerfs_common::error::{PowerFsError, Result};
-use powerfs_common::types::Fid;
+use powerfs_common::types::{Fid, VolumeId};
 use powerfs_fuse_core::metadata_client::{
     MetadataAttr, MetadataClient, MetadataDirEntry, SetattrParams,
 };
@@ -35,11 +36,12 @@ const TTL: Duration = Duration::from_millis(100);
 /// cache (lease-held).
 const TTL_OPEN: Duration = Duration::ZERO;
 /// Number of additional chunks to prefetch ahead during sequential reads.
-/// With chunk_size=1MB, PREFETCH_CHUNKS=8 prefetches 8MB ahead, reducing
-/// cache misses for sequential workloads. Memory cost: 8MB × concurrent
-/// open files (e.g. 10 files = 80MB, acceptable under 2GB container limit).
-/// Previously 2, which caused frequent cache misses on large sequential reads.
-const PREFETCH_CHUNKS: u64 = 8;
+/// With chunk_size=4MB, PREFETCH_CHUNKS=4 prefetches 16MB ahead, reducing
+/// cache misses for sequential workloads. Memory cost: 16MB × concurrent
+/// open files (e.g. 10 files = 160MB, acceptable under 2GB container limit).
+/// Previously 8 (with 1MB chunks = 8MB); reduced to 4 after chunk_size
+/// increased to 4MB to keep prefetch memory bounded.
+const PREFETCH_CHUNKS: u64 = 4;
 const FUSE_APPEND: u32 = 0x400;
 
 /// FUSE application that manages the mount lifecycle
@@ -203,14 +205,14 @@ impl FuseApp {
             // When idle, use a longer interval (100ms) to save CPU wakeups.
             // Note: too-aggressive (10ms) caused lock contention with write
             // path and OOM under sustained 512M+ sequential writes (dirty
-            // accumulation vs flush rate). 50ms balances responsiveness and
-            // throughput.
+            // accumulation vs flush rate). 20ms balances responsiveness and
+            // throughput (2GB container has enough memory to handle higher flush rate).
             if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = bg_fs.flush_all_dirty_chunks();
                 bg_fs
                     .has_dirty
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             } else {
                 thread::sleep(Duration::from_millis(100));
             }
@@ -359,9 +361,12 @@ fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.fid == y.fid && x.offset == y.offset && x.size == y.size)
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.needle_id == y.needle_id
+            && x.volume_id == y.volume_id
+            && x.offset == y.offset
+            && x.size == y.size
+    })
 }
 
 /// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
@@ -536,7 +541,7 @@ impl PowerFsFs {
         // Previously this was a serial for-loop, each chunk doing a
         // block_on + RPC (~2ms). 256 chunks × 2ms = 512ms. Now all chunks
         // are sent concurrently via join_all, reducing to ~1 RPC latency.
-        let batch_size = 8; // limit concurrency to avoid Volume Server overload
+        let batch_size = 32; // high concurrency for better throughput (2GB container)
         let mut had_error = false;
 
         // Collect chunk data for all dirty chunks
@@ -652,8 +657,8 @@ impl PowerFsFs {
                 offset: c.offset,
                 size: c.size,
                 mtime: c.mtime,
-                fid: c.fid.clone(),
-                cookie: c.cookie,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
                 crc32: c.crc32,
             })
             .collect();
@@ -776,17 +781,19 @@ impl PowerFsFs {
                 offset: chunk.offset,
                 size: chunk.size,
                 mtime: chunk.mtime,
-                fid: chunk.fid.clone(),
-                cookie: chunk.cookie,
+                needle_id: chunk.needle_id,
+                volume_id: chunk.volume_id,
                 crc32: chunk.crc32,
             })
             .collect();
 
-        let fid = entry.chunks.first().and_then(|chunk| {
-            info!("Parsing fid from chunk: {}", chunk.fid);
-            let result = Fid::from_string(&chunk.fid);
-            info!("Fid parse result: {:?}", result);
-            result.ok()
+        // Reconstruct file-level Fid from chunks[0]: needle_id = file_key,
+        // volume_id = volume_id. cookie is no longer stored per-chunk (set to 0;
+        // not used for data operations since chunks carry needle_id directly).
+        let fid = entry.chunks.first().map(|chunk| Fid {
+            volume_id: VolumeId(chunk.volume_id),
+            cookie: 0,
+            file_key: chunk.needle_id,
         });
         info!(
             "entry_to_cached: name={}, fid={:?}, chunks={}",
@@ -1251,27 +1258,22 @@ impl FileSystem for PowerFsFs {
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
             // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
-            if let Some(fid) = &entry.fid {
-                let volume_id = fid.volume_id.0;
-                let chunk_size = self.chunk_cache.chunk_size();
-                // Each chunk has a unique needle_id = fid.file_key + chunk_idx.
-                // Iterate all chunks to delete every needle.
-                let chunk_count = if chunk_size > 0 {
-                    entry.content_size.div_ceil(chunk_size)
-                } else {
-                    1
-                };
-                match self.client.get_volume_addr(fid.volume_id.0) {
+            // Iterate entry.chunks and delete each by its needle_id and volume_id.
+            for chunk in &entry.chunks {
+                match self.client.get_volume_addr(chunk.volume_id) {
                     Ok(addr) => {
-                        for chunk_idx in 0..chunk_count {
-                            let needle_key = fid.file_key.saturating_add(chunk_idx);
-                            if let Err(e) = self.client.delete_data(&addr, volume_id, needle_key) {
-                                warn!("Failed to delete chunk {}: {}", chunk_idx, e);
-                            }
+                        if let Err(e) =
+                            self.client
+                                .delete_data(&addr, chunk.volume_id, chunk.needle_id)
+                        {
+                            warn!("Failed to delete chunk at offset {}: {}", chunk.offset, e);
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to get volume addr for deletion: {}", e);
+                        warn!(
+                            "Failed to get volume addr for volume {}: {}",
+                            chunk.volume_id, e
+                        );
                     }
                 }
             }
@@ -1319,7 +1321,8 @@ impl FileSystem for PowerFsFs {
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        let fid_str = fid.to_string();
+        let needle_id = fid.file_key;
+        let volume_id = fid.volume_id.0;
 
         // Step 2: 通过 MetadataClient.create RPC 走 Filer Raft leader（强一致）
         // Filer 端分配 inode 并创建目录条目，返回 MetadataAttr（含 inode）。
@@ -1365,8 +1368,8 @@ impl FileSystem for PowerFsFs {
                 offset: 0,
                 size: 0,
                 mtime: now as u64,
-                fid: fid_str,
-                cookie: 0,
+                needle_id,
+                volume_id,
                 crc32: 0,
             }],
             hard_link_id: String::new(),
@@ -1735,17 +1738,30 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
+                // Build chunk_map for O(1) needle_id lookup
+                let chunk_map: HashMap<u64, (u64, u64)> = entry
+                    .chunks
+                    .iter()
+                    .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                    .collect();
+
                 // Build batch read requests
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
-                    .map(
-                        |(chunk_idx, offset, size)| powerfs_fuse_core::ReadBlobRequest {
-                            volume_id: fid.volume_id.0,
-                            file_key: fid.file_key.saturating_add(*chunk_idx),
+                    .map(|(chunk_idx, offset, size)| {
+                        // Look up needle_id and volume_id from chunk_map (O(1)).
+                        // Fall back to fid-based computation for sparse holes not in chunks.
+                        let (needle_id, vol_id) = chunk_map
+                            .get(offset)
+                            .copied()
+                            .unwrap_or((fid.file_key.saturating_add(*chunk_idx), fid.volume_id.0));
+                        powerfs_fuse_core::ReadBlobRequest {
+                            volume_id: vol_id,
+                            file_key: needle_id,
                             offset: *offset as i64,
                             size: *size,
-                        },
-                    )
+                        }
+                    })
                     .collect();
 
                 let results = self.client.read_blob_batch(requests);
@@ -1767,8 +1783,13 @@ impl FileSystem for PowerFsFs {
                                 chunk_offset,
                                 data.len()
                             );
-                            self.chunk_cache
-                                .put(inode, *chunk_offset, data.clone(), mtime, 0);
+                            self.chunk_cache.put(
+                                inode,
+                                *chunk_offset,
+                                data.clone().into(),
+                                mtime,
+                                0,
+                            );
                         }
                         Err(e) if e.contains("needle not found") => {
                             // Defer dirty-check + retry to second pass
@@ -1792,15 +1813,22 @@ impl FileSystem for PowerFsFs {
                     if is_dirty {
                         debug!("read_blob: chunk {} is dirty, flushing first", chunk_idx);
                         let _ = self.flush_dirty_chunks(inode, None);
+                        let (needle_id, vol_id) = entry
+                            .chunks
+                            .iter()
+                            .find(|c| c.offset == chunk_offset)
+                            .map(|c| (c.needle_id, c.volume_id))
+                            .unwrap_or((fid.file_key.saturating_add(chunk_idx), fid.volume_id.0));
                         match self.client.read_blob(
                             &addr,
-                            fid.volume_id.0,
-                            fid.file_key.saturating_add(chunk_idx),
+                            vol_id,
+                            needle_id,
                             chunk_offset as i64,
                             read_size,
                         ) {
                             Ok(data) => {
-                                self.chunk_cache.put(inode, chunk_offset, data, mtime, 0);
+                                self.chunk_cache
+                                    .put(inode, chunk_offset, data.into(), mtime, 0);
                             }
                             Err(e2) => {
                                 error!("read_blob failed after flush: {}", e2);
@@ -1815,7 +1843,7 @@ impl FileSystem for PowerFsFs {
                         self.chunk_cache.put(
                             inode,
                             chunk_offset,
-                            vec![0; read_size as usize],
+                            vec![0; read_size as usize].into(),
                             mtime,
                             0,
                         );
@@ -1890,8 +1918,9 @@ impl FileSystem for PowerFsFs {
         debug!("write: inode={}, size={}, offset={}", inode, size, offset);
 
         // Read data into buffer BEFORE acquiring any lock — I/O must not hold locks
-        let mut buf = vec![0u8; size as usize];
-        let read_len = r.read(&mut buf).unwrap_or(0);
+        let mut buf = BytesMut::with_capacity(size as usize);
+        buf.resize(size as usize, 0);
+        let read_len = r.read(&mut buf[..]).unwrap_or(0);
         debug!("write: inode={}, read_len={}", inode, read_len);
         if read_len == 0 {
             warn!("write: inode={} read_len=0, returning Ok(0)", inode);
@@ -1950,7 +1979,13 @@ impl FileSystem for PowerFsFs {
             let content_size_before_write = entry.content_size;
             let volume_id = fid.volume_id.0;
             let file_key = fid.file_key;
-            let volume_addr = self.client.get_volume_addr(volume_id).ok();
+
+            // Build chunk_map for O(1) needle_id lookup (read-before-write + read path)
+            let chunk_map: HashMap<u64, (u64, u64)> = entry
+                .chunks
+                .iter()
+                .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                .collect();
 
             // Drop metadata lock before per-chunk writes
             drop(_meta_guard);
@@ -1975,12 +2010,15 @@ impl FileSystem for PowerFsFs {
                 let mtime = entry.mtime as u64;
                 let modified = self.chunk_cache.modify(inode, chunk_start_offset, |chunk| {
                     let needed_len = in_chunk_start + bytes_to_write;
-                    if chunk.data.len() < needed_len {
-                        chunk.data.resize(needed_len, 0);
+                    let mut mut_data = BytesMut::with_capacity(needed_len);
+                    mut_data.extend_from_slice(&chunk.data);
+                    if mut_data.len() < needed_len {
+                        mut_data.resize(needed_len, 0);
                     }
-                    chunk.data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                    mut_data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
                         &buf[data_offset as usize..data_offset as usize + bytes_to_write],
                     );
+                    chunk.data = mut_data.freeze();
                     chunk.mtime = mtime;
                 });
 
@@ -2026,11 +2064,17 @@ impl FileSystem for PowerFsFs {
                             chunk_size,
                             content_size_before_write - chunk_start_offset,
                         ) as usize;
-                        let mut base = if let Some(ref addr) = volume_addr {
+                        // Look up needle_id from chunk_map (O(1)), fallback to fid-based
+                        let (rbw_needle_id, rbw_vol_id) = chunk_map
+                            .get(&chunk_start_offset)
+                            .copied()
+                            .unwrap_or((file_key.saturating_add(chunk_idx), volume_id));
+                        let rbw_addr = self.client.get_volume_addr(rbw_vol_id).ok();
+                        let mut base = if let Some(ref addr) = rbw_addr {
                             match self.client.read_blob(
                                 addr,
-                                volume_id,
-                                file_key.saturating_add(chunk_idx),
+                                rbw_vol_id,
+                                rbw_needle_id,
                                 chunk_start_offset as i64,
                                 existing_len as i32,
                             ) {
@@ -2064,7 +2108,7 @@ impl FileSystem for PowerFsFs {
                         &buf[data_offset as usize..data_offset as usize + bytes_to_write],
                     );
                     self.chunk_cache
-                        .put(inode, chunk_start_offset, new_data, mtime, 0);
+                        .put(inode, chunk_start_offset, new_data.into(), mtime, 0);
                 }
 
                 self.mark_dirty(inode, chunk_idx);
@@ -2120,14 +2164,14 @@ impl FileSystem for PowerFsFs {
                 offset: 0,
                 size: new_size,
                 mtime: entry.mtime as u64,
-                fid: fid.to_string(),
-                cookie: fid.cookie as u32,
+                needle_id: fid.file_key,
+                volume_id: fid.volume_id.0,
                 crc32: 0,
             };
             self.cache.update_chunks(inode, vec![chunk_info]);
 
             let mtime = entry.mtime as u64;
-            self.chunk_cache.put(inode, 0, buf, mtime, 0);
+            self.chunk_cache.put(inode, 0, buf.freeze(), mtime, 0);
 
             self.mark_dirty(inode, 0);
 
