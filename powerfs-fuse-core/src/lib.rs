@@ -3,6 +3,7 @@ pub mod client_error;
 pub mod client_identity;
 pub mod error;
 pub mod fuse_client_facade;
+pub mod lease;
 pub mod meta_shard_client;
 pub mod metadata_client;
 pub mod orset;
@@ -20,6 +21,7 @@ pub use circuit_breaker::{
 pub use client_error::{ClientError, ClientResult};
 pub use client_identity::ClientIdentity;
 pub use fuse_client_facade::{FuseClientFacade, FuseClientFacadeConfig, SyncFuseClientFacade};
+pub use lease::{LeaseManager, LeaseMode, LeaseToken, VolumeLeaseManager};
 pub use meta_shard_client::{
     ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,
     RequestQueue, RequestResult, TransportChannel,

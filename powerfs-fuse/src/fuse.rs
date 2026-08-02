@@ -11,7 +11,7 @@ use powerfs_common::types::Fid;
 use powerfs_fuse_core::metadata_client::{
     MetadataAttr, MetadataClient, MetadataDirEntry, SetattrParams,
 };
-use powerfs_fuse_core::SyncFuseClientFacade;
+use powerfs_fuse_core::{LeaseManager, LeaseMode, SyncFuseClientFacade, VolumeLeaseManager};
 use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
@@ -134,6 +134,11 @@ impl FuseApp {
 
         let cache = Arc::new(MetadataCache::new());
 
+        let lease_manager = Arc::new(VolumeLeaseManager::new(
+            sync_client.facade().clone(),
+            sync_client.client_id(),
+        ));
+
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
@@ -149,6 +154,7 @@ impl FuseApp {
             flush_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
+            lease_manager,
             open_inodes: Arc::new(RwLock::new(HashSet::new())),
         };
 
@@ -281,6 +287,10 @@ struct PowerFsFs {
     flush_locks: FlushLocks,
     stripe_size: u64,
     lease_duration_ms: u64,
+    /// Step 6: 统一 lease 入口 + 读路径缓存复用。
+    /// read 路径通过此 manager 获取共享 lease，命中缓存时零 RPC；
+    /// lease 在 open→release 期间复用，release() 时 invalidate。
+    lease_manager: Arc<VolumeLeaseManager>,
     /// Phase 4.3/4.4: 当前已打开的 inode 集合。
     /// open() 时加入，release() 时移除。getattr() 对其中的 inode 使用长 TTL
     /// （size/chunks 在 open→release 期间权威，因数据 lease 排他）。
@@ -293,68 +303,6 @@ type WriteLockMap = HashMap<(u64, u64), Arc<std::sync::Mutex<()>>>;
 type WriteLocks = Arc<std::sync::Mutex<WriteLockMap>>;
 type DirtyShardSet = HashSet<(u64, u64)>;
 type DirtyShards = Vec<Arc<RwLock<DirtyShardSet>>>;
-
-/// RAII guard that releases a Volume lease on drop, ensuring cleanup on all paths.
-struct LeaseGuard<'a> {
-    token: String,
-    volume_id: u64,
-    inode: u64,
-    client_id: String,
-    client: &'a Arc<SyncFuseClientFacade>,
-    released: bool,
-}
-
-impl<'a> LeaseGuard<'a> {
-    fn new(
-        token: String,
-        volume_id: u64,
-        inode: u64,
-        client_id: String,
-        client: &'a Arc<SyncFuseClientFacade>,
-    ) -> Self {
-        Self {
-            token,
-            volume_id,
-            inode,
-            client_id,
-            client,
-            released: false,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn token(&self) -> &str {
-        &self.token
-    }
-
-    fn do_release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        debug!(
-            "LeaseGuard: releasing lease for inode={}, token={}",
-            self.inode, self.token
-        );
-        // 传入 LeaseGuard 持有的 token，避免 release_lease_remote 从 leases 表
-        // 查到错误/过期 token 的 bug
-        if let Err(e) =
-            self.client
-                .release_lease(self.volume_id, self.inode, &self.client_id, &self.token)
-        {
-            warn!(
-                "LeaseGuard: lease release failed for inode={}: {}",
-                self.inode, e
-            );
-        }
-    }
-}
-
-impl<'a> Drop for LeaseGuard<'a> {
-    fn drop(&mut self) {
-        self.do_release();
-    }
-}
 
 /// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
 ///
@@ -1455,10 +1403,12 @@ impl FileSystem for PowerFsFs {
                 .is_none()
         });
 
-        let client_id = self.client.client_id();
-        let mut _lease_guard: Option<LeaseGuard> = None;
-
-        // Acquire shared read lease if we need remote reads
+        // Acquire shared read lease if we need remote reads.
+        //
+        // Step 6: 通过 LeaseManager 获取共享读 lease，命中缓存时零 RPC。
+        // lease 在 open→release 期间复用（不在每次 read 末尾释放），
+        // 由 release() FUSE handler 统一 invalidate + release。
+        // 这与 write 路径的 ensure_lease 缓存复用模式一致。
         if needs_remote_read {
             let stripe_start = offset / self.stripe_size;
             let stripe_end = if end_offset > 0 {
@@ -1473,24 +1423,16 @@ impl FileSystem for PowerFsFs {
                 inode, stripe_start, stripe_count
             );
 
-            match self.client.acquire_lease(
+            match self.client.block_on(self.lease_manager.acquire(
                 fid.volume_id.0,
                 inode,
+                LeaseMode::Shared,
                 stripe_start,
                 stripe_count,
-                &client_id,
-                false, // shared/read lease
                 self.lease_duration_ms,
-            ) {
-                Ok(token) => {
-                    _lease_guard = Some(LeaseGuard::new(
-                        token,
-                        fid.volume_id.0,
-                        inode,
-                        client_id.clone(),
-                        &self.client,
-                    ));
-                    debug!("read: read lease acquired successfully");
+            )) {
+                Ok(_token) => {
+                    debug!("read: read lease acquired/reused successfully");
                 }
                 Err(e) => {
                     warn!(
@@ -1645,7 +1587,8 @@ impl FileSystem for PowerFsFs {
             Ok(total_written)
         })();
 
-        // Lease is automatically released by LeaseGuard on drop
+        // Step 6: 读 lease 由 LeaseManager 缓存复用（不在 read 末尾释放），
+        // 由 release() FUSE handler 统一 invalidate + release。
         result
     }
 
@@ -1899,6 +1842,9 @@ impl FileSystem for PowerFsFs {
                         inode, e
                     );
                 }
+                // Step 6: 失效 LeaseManager 读 lease 缓存，避免 close 后复用
+                // 已释放的 token（下一次 open 重新 acquire）。
+                self.lease_manager.invalidate(fid.volume_id.0, inode);
             }
         }
 

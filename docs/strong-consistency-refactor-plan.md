@@ -833,3 +833,28 @@ open 时强制 getattr 绕过 inode_cache TTL（3.7.2），从 Filer 获取最�
 - cargo clippy: 0 警告
 - cargo fmt: 通过
 - 代码量：-408 行 / +235 行（净减 173 行，9 个回调从多源 CRDT 逻辑简化为单路径 RPC）
+
+### 2026-08-02 Step 3 完成记录
+
+**Commit**: `d04c5fe1` refactor(coherence): remove CRDT-specific code, preserve generic sync interfaces
+
+**完成内容**：
+- ✅ 删除 crdt_client.rs / crdt_server.rs / mock.rs（CRDT 专属实现）
+- ✅ 删除 lib.rs 中 CRDT 专属 trait/类型（CacheCoherence/CoherenceAuthority/DeltaWire/VectorClockWire 等）
+- ✅ fuse.rs 删除 coherence 字段 + 构建 + start_flusher/start_puller，sync_size_chunks 改为直接调 meta_shard_client
+- ✅ filer net_handler 删除 handle_push_delta/handle_pull_delta + DeltaWire 转换函数
+- ✅ 修复 MetaShardClient DeltaSyncChannel impl（删除 push_delta/pull_delta，补全 open_count_inc/dec）
+- ✅ powerfs-coherence Cargo.toml 清理 8 个无用依赖
+
+**保留**（通用元数据同步接口）：
+- DeltaSyncChannel trait + alloc_inode_batch/update_inode_size_chunks/open_count
+- ChunkWire / AllocInodeBatchRequest/Response / UpdateInodeSizeChunksRequest/Response / OpenCountRequest/Response
+
+**调整记录**：
+- gRPC 服务的 push_delta/pull_delta handler 未删除（使用 proto 类型，需 proto 重新生成，延后到 Step 5）
+
+**验证**：
+- cargo check --workspace: 12 个 crate 编译通过
+- cargo clippy: 0 警告
+- cargo fmt: 通过
+- 代码量：-4336 行 / +1092 行（净减 3244 行 CRDT 代码）
