@@ -24,11 +24,13 @@ Traditional converged clusters are forced to run **three isolated storage stacks
 
 **PowerFS** is a **rust-from-scratch, zero-jitter unified parallel file system** designed exclusively for the new HPC + AI converged infrastructure. It eliminates the decades-old industry dilemma: **HPC file systems are bad at AI inference KV cache, and AI/cloud storage cannot sustain large-scale HPC parallel I/O**.
 
-By introducing **protocol-agnostic data layer + three-interface unified architecture + OR-Set CRDT weak consistency**, PowerFS unifies POSIX / S3 / KV in one single cluster, delivering stable HPC simulation throughput and ultra-low-latency LLM inference cache performance at the same time.
+By introducing **protocol-agnostic data layer + three-interface unified architecture + Filer Raft strong consistency + Volume Lease Lock linearizability**, PowerFS unifies POSIX / S3 / KV in one single cluster, delivering stable HPC simulation throughput and ultra-low-latency LLM inference cache performance at the same time.
 
 Traditional storage solutions face obvious bottlenecks in converged HPC and AI scenarios. Professional HPC file systems suffer from complex deployment, heavy operation and maintenance, severe I/O jitter and poor small-file performance, and cannot adapt to AI inference workloads. Common cloud-native storage lacks massive parallel computing capability and native LLM KV cache support, resulting in insufficient overall cluster resource utilization.
 
-PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**, with an **OR-Set CRDT based eventual consistency model** that ensures zero data loss under concurrent conflicts while enabling write-zero-blocking and unlimited client scaling without broadcast storms. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack.
+PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**, with a **Filer Raft based strong consistency model** for metadata (content_size, chunks list) and **per-stripe (64MB) Lease Lock** for data linearizability. Cross-client cache coherence is maintained via **Callback Invalidation** (Filer pushes invalidate notifications to subscribed clients), eliminating broadcast storms while preserving strong visibility guarantees. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack.
+
+> **Architecture Evolution (2026-08)**: PowerFS migrated from CRDT-based eventual consistency to Filer Raft strong consistency. The CRDT dual-source design (MetadataCache + DirORSet) caused 5 recurring bugs (ghost files, duplicate entries, EEXIST false positives, etc.); the refactor deleted ~3244 lines of CRDT code and unified all metadata authority under Filer Raft. See [strong-consistency-refactor-plan.md](docs/strong-consistency-refactor-plan.md) for details.
 
 ---
 
@@ -36,11 +38,12 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 
 - **Pure Rust Stack**: Complete user-state I/O implementation, no GC jitter, memory safety, ultra-stable latency under long-time high load
 - **Protocol-Agnostic Data Layer**: All file, object, and KV data lands on a unified `Needle` binary format, stored once, shared everywhere
-- **OR-Set Eventual Consistency**: Default weak consistency with conflict-not-lost guarantee; concurrent writes all preserved, intelligently merged via Auto/Manual/AI three-tier modes
-- **Write-Zero-Blocking**: Local OR-Set cache returns success immediately, async delta sync to Meta cluster, no cross-node RPC waiting
-- **Unlimited Client Scaling**: Incremental delta sync replaces global broadcast invalidation, no performance degradation as clients grow
+- **Filer Raft Strong Consistency**: All metadata operations (mkdir/create/unlink/rename/setattr/lookup/readdir) go through Filer Raft commit, ensuring linearizable metadata across the cluster
+- **Per-Stripe Lease Lock Linearizability**: File data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks; Follower writes must acquire Lease from Leader
+- **Callback Invalidation**: Filer pushes invalidate notifications to subscribed clients on metadata changes, replacing broadcast storms with targeted push, enabling cross-client visibility without client polling
+- **Bucket-Based Sharding**: Each bucket (top-level directory) is an independent Raft group; cross-shard operations return EXDEV (like Linux mount boundary), enabling horizontal scaling without cross-shard coordination
 - **Three-Interface Unified**: Native FUSE/POSIX + KV + S3 interfaces, one data pool for all workloads
-- **Full Hardware Offloading**: Native adaptation to SPDK, RDMA and GPU Direct, end-to-end zero-copy hardware acceleration
+- **Full Hardware Offloading**: Native adaptation to SPDK, RDMA and GPU Direct, end-to-end zero-copy hardware acceleration (Transport trait abstraction unifies TCP/RDMA/QUIC)
 - **Lightweight Enterprise-Grade**: Simplified architecture, linear horizontal scaling, low operation and maintenance costs, enterprise-level high availability and fault tolerance
 
 ---
@@ -49,9 +52,9 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 
 ### ⚡ Extreme HPC Parallel Capability
 
-- Distributed sharded metadata architecture, supporting 10,000+ MPI process concurrent read and write
-- POSIX-compatible via projection layer (primary version visible, conflict copies in `.conflicts/`), compatible with mainstream HPC simulation software and parallel computing frameworks
-- Adaptive file striping and multi-node aggregated I/O, supporting PB-level cluster aggregated bandwidth
+- Distributed sharded metadata architecture (bucket-based sharding, each bucket an independent Raft group), supporting 10,000+ MPI process concurrent read and write
+- POSIX-compatible via Filer Raft strong consistency, compatible with mainstream HPC simulation software and parallel computing frameworks
+- Adaptive file striping (2MB chunk size) and multi-node aggregated I/O, supporting PB-level cluster aggregated bandwidth
 - Fine-grained job-level QoS and I/O isolation, eliminating resource preemption and ensuring zero-jitter steady-state operation
 - Optimized ultra-large directory and massive small-file scenarios, solving traditional HPC storage small-file performance bottlenecks
 
@@ -69,14 +72,15 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 - Native S3 Gateway built into PowerFS Master, supporting AWS CLI/SDK and S3 Browser
 - Object data stored in distributed Volume Server nodes using unified Needle format
 
-### 🔄 OR-Set CRDT Consistency Engine (Industry Exclusive)
+### 🔒 Strong Consistency Engine (Filer Raft + Callback Invalidation)
 
-- OR-Set (Observed-Remove Set) CRDT directory cache, `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite
-- Five conflict scenarios fully covered: CreateCreate / WriteWrite / WriteUnlink / DeleteCreate / Rename, all conflicts retained not lost
-- Three-tier merge modes: Auto (policy-based automatic) / Manual (human confirmation) / AI (intelligent content merge - future)
-- POSIX projection layer: primary version visible by default, conflict copies in `.conflicts/` hidden directory, compatible with standard Unix tools
-- Cross-node refresh on demand: `user.fs.need_sync` xattr + incremental/full refresh API for strong-view-consistency when needed
-- Async delta sync: default 2s incremental + 30s full alignment, no global broadcast storm, unlimited client scaling
+- **Filer Raft Strong Consistency**: All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) go through Raft commit on 3+ Filer nodes, ensuring linearizable metadata
+- **Per-Stripe Lease Lock**: File data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks; Follower writes must acquire Lease from Leader for linearizable data writes
+- **Callback Invalidation**: Filer pushes targeted invalidate notifications to subscribed clients on metadata changes (setattr, size/chunks sync), replacing broadcast storms with precise push
+- **Cross-Client Read Visibility**: open-time getattr bypasses TTL to fetch latest metadata from Filer; Lease response carries current chunk list to avoid extra getattr; truncate visibility guaranteed across clients
+- **Creator Subscription**: Filer Create/Mkdir establishes creator subscription to ensure Invalidate notifications reach the creating client
+- **Bucket-Based Sharding**: Each bucket (top-level directory) is an independent Raft group; cross-shard operations return EXDEV (like Linux mount boundary)
+- **fsck Tool**: Scans Filer metadata vs Volume actual data blocks, cleans orphaned inodes/chunks from failed metadata sync; idempotent deletion (NeedleNotFound treated as success)
 
 ### 🚀 Ultra-Low Latency Hardware Acceleration
 
@@ -97,15 +101,15 @@ PowerFS innovates a **dual-engine fusion architecture of parallel file storage a
 
 ## Architecture
 
-PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
+PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
 
 ### 3-Layer Decoupled Architecture
 
-1. **OR-Set CRDT Weak-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Lockless OR-Set CRDT directory cache with `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite. Eliminates broadcast storm via incremental delta sync, enabling unlimited client linear scaling. Native multi-protocol metadata isolation for POSIX/KV/S3.
+1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) go through Raft commit on 3+ Filer nodes, ensuring linearizable metadata. Bucket-based sharding: each bucket (top-level directory) is an independent Raft group, enabling horizontal scaling without cross-shard coordination. Cross-client cache coherence maintained via Callback Invalidation (Filer pushes targeted invalidate notifications to subscribed clients).
 
-2. **Raft Global Scheduling Layer**: High availability cluster providing the underlying consistency guarantee for the CRDT layer, responsible for cluster topology management, resource allocation and conflict policy management. It only maintains global metadata mapping without storing massive business data.
+2. **Master Raft Global Scheduling Layer**: High availability cluster providing Volume routing, cluster topology management, resource allocation and Volume assignment. Master is stateless for filesystem metadata (DirectoryTree was deleted as dead code in Step B1); all filesystem metadata is managed by Filer Raft. Bucket creation requires Filer to request and bind Volume from Master to specific Volume Server.
 
-3. **Multi-Interface Unified Data Layer**: Unified protocol-agnostic volume using `Needle` binary format, natively integrates FUSE/POSIX + KV + S3 three interfaces, one data pool for all workloads.
+3. **Multi-Interface Unified Data Layer**: Unified protocol-agnostic volume using `Needle` binary format, natively integrates FUSE/POSIX + KV + S3 three interfaces, one data pool for all workloads. Data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks.
    - **HPC Parallel File Engine**: Optimized for supercomputing simulation, large-file parallel reading and writing, and scientific computing batch workloads
    - **AI Native KV Cache Engine**: Dedicatedly optimized for LLM training and inference KV tensor high-speed cache scenarios
    - **S3 Object Storage Engine**: Standard S3 protocol compatibility for AI dataset storage, model snapshot and batch data archiving
@@ -114,18 +118,32 @@ PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-in
 
 PowerFS adopts a **three-client independent communication architecture**, where each client manages its own connections and request queues, completely eliminating single-connection bottlenecks:
 
-- **MasterClient**: Cluster topology management, Volume route retrieval, Leader election and redirection
-- **MetaShardClient**: Metadata shard client, handles inode/dentry operations, CRDT Delta Sync
-- **VolumeClient**: Data volume client, data read/write, Lease lock management and renewal heartbeat
+- **MasterClient**: Cluster topology management, Volume route retrieval, Leader discovery and failover (via `ResilientMasterClient` from `powerfs-master` crate)
+- **MetaShardClient**: Metadata shard client, handles inode/dentry operations via Filer Raft (mkdir/create/unlink/rename/lookup/readdir/setattr), implements `MetadataClient` trait
+- **VolumeClient**: Data volume client, data read/write, Lease lock management and renewal heartbeat, implements `LeaseManager` trait
 
-Clients are fully decoupled and coordinated through the FuseClientFacade, with no need to know the underlying connection method or Leader location.
+Clients are fully decoupled and coordinated through the FuseClientFacade, with no need to know the underlying connection method or Leader location. Filer leader switch is handled via MetadataClient internal 3 retries, transparent to upper layers.
+
+> **Note**: FUSE and kernel file system use TLV protocol via `TlvMasterClient` from `powerfs-master-net` crate for communication with Master. Fuse to server communication must NOT use gRPC.
 
 ### Dual Consistency Paths
 
-PowerFS implements a **dual-channel consistency mechanism** combining strong data consistency with eventual attribute consistency:
+PowerFS implements a **dual-channel consistency mechanism** combining strong metadata consistency with linearizable data consistency:
 
-- **Strong Consistency Path (Data Lease Lock)**: File data metadata (size, chunks), achieved through Volume-level Stripe (64MB) Lease locks for linearizable consistency. Follower write requests must acquire Lease from Leader.
-- **Eventual Consistency Path (Meta CRDT)**: File attribute metadata (mode, uid, gid, mtime), achieved through CRDT (Conflict-free Replicated Data Type) Delta Sync for eventual consistency, supporting concurrent modifications across clients without conflicts.
+- **Strong Consistency Path (Filer Raft)**: All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) and file metadata (content_size, chunks list) go through Filer Raft commit. close operation must sync content_size and chunks list to Filer before releasing lease. Raft read operations use Leader Lease Read to avoid extra RTT.
+- **Linearizability Path (Volume Lease Lock)**: File data operations (open, read, write, close, flush) use Lease lock mechanism (Follower applies to Leader) for strong consistency. Data lease lock is per-stripe (64MB) and managed by Volume Server. Lease response includes current content_size and chunks list to avoid separate getattr.
+
+### Cross-Client Cache Coherence
+
+PowerFS uses **Callback Invalidation** for cross-client cache coherence, replacing the deprecated CRDT delta sync:
+
+- **Subscription**: Filer automatically subscribes clients on Lookup/ReadDir; Create/Mkdir establishes creator subscription
+- **Invalidate Push**: Filer pushes invalidate notifications on metadata changes (setattr, update_inode_size_chunks)
+- **Client Invalidation**: InvalidateHandler clears MetadataCache + ChunkCache on notification
+- **Pinned Inode Protection**: Opened files (pinned) skip invalidation to protect in-progress writes
+- **Reference Counting**: pinned_inodes uses HashMap<u64, u32> for concurrent open/release
+- **Dirty Chunk Protection**: InvalidateHandler skips cache invalidation when inode has dirty chunks to prevent flusher failures
+- **TTL Bypass**: getattr for non-open files bypasses TTL and fetches latest metadata from Filer to ensure cross-client truncate visibility
 
 ### TLV Protocol
 
@@ -137,11 +155,12 @@ Tag (2B) + Length (4B uint32 big-endian) + Value (max 4GB)
 
 - Supports up to 4GB Value transmission, breaking the traditional 64KB limit
 - Field-based data transmission for easy extension
-- Compatible with future RDMA zero-copy optimization
+- Uses `bytes::Bytes` for zero-copy compatibility with RDMA
+- TLV encoder/decoder uses matching types: create uses u32 for Mode/Uid/Gid, mkdir uses u64; handle_setattr uses loop-based decoding for optional fields
 
 ### Hardware Acceleration
 
-Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Direct zero-copy transmission, fully releasing the performance of NVMe SSD, high-speed network and GPU heterogeneous computing resources.
+Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Direct zero-copy transmission, fully releasing the performance of NVMe SSD, high-speed network and GPU heterogeneous computing resources. Transport trait abstraction unifies TCP/RDMA/QUIC interfaces.
 
 ---
 
@@ -166,11 +185,6 @@ Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Di
 
 ## ⚡ Performance Highlights
 
-### Community Edition
-- Single-node bandwidth: **>3GB/s**
-- 4KB random write IOPS: **624,000+**
-- Full-load p99/p999 latency stable, no jitter
-- GPU utilization increased from 40%~50% to 90%+ for LLM inference
 
 ### Enterprise Edition (Lock-Free Optimization)
 - **40x** faster single-thread metadata operations (mkdir/lookup/rmdir)
@@ -179,58 +193,14 @@ Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Di
 - Zero deadlock under large directory copy operations
 - Separate statfs channel ensures `df` works under high load
 
+### GPU Utilization
+- GPU utilization increased from 40%~50% to 90%+ for LLM inference (with KV cache engine)
+
 ---
 
 ## Benchmark
 
-> **Note**: The following benchmark data was collected with the Community Edition
-> (single-node, lock-based metadata). Current Enterprise Edition with lock-free
-> optimization and multi-binary architecture may yield different results.
-> New benchmark results will be published after Phase 4 real FUSE mount testing.
-
-### FIO Performance Test Results
-
-All tests are conducted on a single-node setup with PowerFS FUSE client, using standard `fio` benchmark tool.
-
-#### Test Environment
-- **Hardware**: Single node with NVMe SSD
-- **Block Size**: 4KB (random), 1MB (sequential)
-- **Test Size**: 100MB per test
-- **IO Engine**: `sync` (standard POSIX I/O)
-
-#### Async Mode (Without fsync - Cached Writes)
-
-| Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
-|-----------|------------|------|-----------|-------------|
-| Sequential Write | 1MB | 3,448 | 3,448 MiB/s | 258 usec |
-| Sequential Read | 1MB | 480 | 481 MiB/s | 2,072 usec |
-| Random Write | 4KB | 624,000 | 2,439 MiB/s | 1.3 usec |
-| Random Read | 4KB | 7,132 | 27.9 MiB/s | 139 usec |
-| Mixed Read/Write (70%/30%) | 4KB | 9,846 | 38.5 MiB/s | - |
-
-#### Sync Mode (With fsync - Persistent Writes)
-
-| Test Type | Block Size | IOPS | Bandwidth | Avg Latency | fsync Latency |
-|-----------|------------|------|-----------|-------------|--------------|
-| Sequential Write | 1MB | 213 | 214 MiB/s | 460 usec | 3,279 usec |
-| Sequential Read | 1MB | 480 | 481 MiB/s | 2,072 usec | - |
-| Random Write | 4KB | 770 | 3.1 MiB/s | 10 usec | 1,279 usec |
-| Random Read | 4KB | 7,184 | 28.1 MiB/s | 138 usec | - |
-| Mixed Read/Write (70%/30%) | 4KB | 1,605 | 6.3 MiB/s | - | 643 usec |
-
-#### Multi-thread Performance (4 Threads)
-
-| Test Type | Block Size | IOPS | Bandwidth | Avg Latency |
-|-----------|------------|------|-----------|-------------|
-| Sequential Write (fsync) | 1MB | 365 | 366 MiB/s | 516 usec |
-| Random Read | 4KB | 23,300 | 91.2 MiB/s | 169 usec |
-
-#### Key Insights
-
-- **Async Write Performance**: Random writes reach 624K IOPS with cached writes, demonstrating excellent write buffer efficiency
-- **Sync Write Performance**: Limited by gRPC round-trip and disk fsync (~1.3ms), typical for network-attached storage
-- **Multi-thread Scaling**: Random read scales to 23.3K IOPS with 4 threads, showing effective parallel processing
-- **Data Integrity**: All tests passed `--verify=crc32c` validation, confirming data correctness
+> **Note**: The following benchmark data was collected after the strong-consistency refactor (Filer Raft + Callback Invalidation). Tests run in container environment with standard `fio` and `io500` commands (no script replacements).
 
 ### Enterprise Edition Lock-Free Optimization Performance Comparison
 
@@ -336,7 +306,7 @@ PowerFS adopts a **multi-binary independent deployment** architecture, where eac
 |-----------|--------|------|-------------|
 | **Master** | `powerfs-master` | 9333 (gRPC), 9334 (net) | Cluster control plane, Raft scheduling, Volume routing |
 | **Volume** | `powerfs-volume` | 8080 (gRPC), 8091 (http), 8901 (net) | Data storage plane, Needle storage, Lease lock management |
-| **Filer** | `powerfs-filer` | 8888 (S3), 8889 (gRPC), 8890 (net) | Metadata sharding, CRDT consistency, S3 gateway |
+| **Filer** | `powerfs-filer` | 8888 (S3), 8889 (gRPC), 8890 (net) | Metadata sharding, Raft strong consistency, S3 gateway |
 | **FUSE** | `powerfs-fuse` | Userspace FUSE | POSIX interface client, three-client communication architecture |
 | **Init** | `powerfs-init` | None | Independent initialization tool, formats POSIX root inode |
 | **CLI** | `powerfs-cli` | None | Command-line management tool |
@@ -625,14 +595,16 @@ powerfs/
 ├── powerfs-net/         # Network layer: TLV codec, TCP server/client, connection management
 ├── powerfs-master/      # Master service: Raft scheduling, Volume routing, S3 gateway
 ├── powerfs-volume/      # Volume service: Needle storage, Lease lock, RocksDB index
-├── powerfs-filer/       # Filer service: CRDT metadata shards, S3 API, gRPC meta service
-├── powerfs-fuse/        # FUSE client: POSIX interface, cache management
-├── powerfs-fuse-core/   # FUSE client core: MasterClient, MetaShardClient, VolumeClient
+├── powerfs-filer/       # Filer service: Raft strong consistency metadata shards, S3 API, gRPC meta service
+├── powerfs-fuse/        # FUSE client: POSIX interface, cache management, InvalidateHandler
+├── powerfs-fuse-core/   # FUSE client core: MasterClient, MetaShardClient, VolumeClient, LeaseManager
 ├── powerfs-init/        # Init tool: Format POSIX root inode before Filer startup
-├── powerfs-cli/         # CLI tool: Cluster management commands
+├── powerfs-cli/         # CLI tool: Cluster management commands (fsck, compact, etc.)
 ├── powerfs-monitor/     # Monitor: Health check, metrics, alerts
 ├── powerfs-kv-client/   # KV client: Native KV cache engine
-├── powerfs-orset/       # OR-Set CRDT implementation
+├── powerfs-orset/       # OR-Set data structure (generic, CRDT-specific code removed)
+├── powerfs-coherence/   # Coherence: Generic metadata sync interfaces (DeltaSyncChannel)
+├── powerfs-master-net/  # Master net: TLV protocol client (TlvMasterClient) for FUSE/kernel
 ├── powerfs-s3/          # S3 protocol implementation
 ├── rfs_tester/          # Integration test tool
 ├── docker/              # Docker Compose configs and deployment scripts
@@ -673,7 +645,7 @@ Options:
 #### powerfs-filer
 
 ```
-PowerFS Filer Node - Metadata sharding, CRDT consistency, S3 gateway
+PowerFS Filer Node - Metadata sharding, Raft strong consistency, S3 gateway
 
 Usage: powerfs-filer --config <CONFIG>
 
@@ -738,25 +710,29 @@ Options:
 │  │                    FuseClientFacade (Unified Facade)                   ││
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────┐  ││
 │  │  │ MasterClient │  │MetaShardClient│  │       VolumeClient            │  ││
-│  │  │ (Topology)   │  │ (inode/dentry)│  │   (Read/Write + Lease)       │  ││
+│  │  │ (Topology)   │  │ (Raft Strong │  │   (Read/Write + Lease)        │  ││
+│  │  │              │  │  Consistency)│  │   LeaseManager trait          │  ││
 │  │  └──────┬───────┘  └──────┬───────┘  └──────────────┬───────────────┘  ││
 │  └──────────┼────────────────┼─────────────────────────┼──────────────────┘│
 └─────────────┼────────────────┼─────────────────────────┼───────────────────┘
               │                │                         │
      ┌────────▼──────┐  ┌─────▼──────┐  ┌──────────────▼─────────────────┐
      │ powerfs-net    │  │ powerfs-net│  │        powerfs-net (TLV 4GB)    │
-     │ (TCP + TLV)    │  │ (TCP+TLV)  │  └──────────────────────────────────┘
-     └────────┬───────┘  └─────┬──────┘
-              │                │
-┌─────────────▼────────────────▼─────────────────────────────────────────────┐
-│              Filer Layer (Metadata Shards + S3 Gateway)                     │
+     │ (TCP + TLV)    │  │ (TCP+TLV)  │  │   Transport trait (TCP/RDMA)    │
+     └────────┬───────┘  └─────┬──────┘  └──────────────────────────────────┘
+              │                │                         │
+              │                │ ←─── Callback Invalidation Push ──┐
+              │                │                                    │
+┌─────────────▼────────────────▼─────────────────────────────────────▼────────┐
+│              Filer Layer (Raft Strong Consistency + S3 Gateway)              │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │  MetaShardManager | CRDT Delta Sync | OR-Set Conflict Merge            ││
-│  │  S3Handler | FilerNetHandler | RaftGroupManager                        ││
+│  │  MetaShardManager | RaftGroupManager | InodeNotifier (Callback Push)    ││
+│  │  S3Handler | FilerNetHandler | ShardScheduler | BucketManager           ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                         │
-│  │  Shard 0    │  │  Shard 1    │  │  Shard N    │                         │
-│  │ (RocksDB)   │  │ (RocksDB)   │  │ (RocksDB)   │                         │
+│  │  Shard 0    │  │  Shard 1    │  │  Shard N    │  (Bucket-based         │
+│  │ (Raft +     │  │ (Raft +     │  │ (Raft +     │   sharding, each       │
+│  │  RocksDB)   │  │  RocksDB)   │  │  RocksDB)   │   bucket = Raft group) │
 │  └─────────────┘  └─────────────┘  └─────────────┘                         │
 └─────────────────────────────────────────────────────────────────────────────┘
               │                │
@@ -764,6 +740,7 @@ Options:
 │              Master Layer (Raft Scheduling + Volume Routing)                │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
 │  │  VolumeRouter | ClusterTopology | Raft Consensus | S3 Gateway           ││
+│  │  VolumeAssigner | ResilientMasterClient (Leader Discovery)              ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
               │
@@ -772,9 +749,9 @@ Options:
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                         │
 │  │  Volume 1   │  │  Volume 2   │  │  Volume N   │                         │
 │  │ (Needle +   │  │ (Needle +   │  │ (Needle +   │                         │
-│  │  Lease Mgr) │  │  Lease Mgr) │  │  Lease Mgr) │                         │
+│  │  RangeLease)│  │  RangeLease)│  │  RangeLease)│                         │
 │  └─────────────┘  └─────────────┘  └─────────────┘                         │
-│              [Unified Needle Binary Format + RocksDB Index]                │
+│       [Unified Needle Binary Format + RocksDB Index + Per-Stripe Lease]   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -784,15 +761,22 @@ Options:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      Dual Consistency Paths                        │
 ├─────────────────────────┬───────────────────────────────────────────┤
-│  Strong Consistency    │  Eventual Consistency                      │
-│  (Data Lease Lock)     │  (Meta CRDT Delta Sync)                   │
+│  Strong Consistency    │  Linearizability                           │
+│  (Filer Raft)          │  (Volume Lease Lock)                      │
 ├─────────────────────────┼───────────────────────────────────────────┤
-│  • File size, chunks   │  • mode, uid, gid                         │
-│  • Per-stripe (64MB)   │  • mtime, atime, ctime                    │
-│  • Linearizable        │  • LWW + Max + Counter merge              │
-│  • Leader validation   │  • Async delta sync                       │
-│  • Lease auto-renew    │  • 2s incremental + 30s full sync          │
-└─────────────────────────┴───────────────────────────────────────────┘
+│  • mkdir/create/unlink │  • File data (read/write/close/flush)     │
+│  • rename/readdir      │  • Per-stripe (64MB) Lease Lock           │
+│  • lookup/setattr      │  • Follower acquires Lease from Leader    │
+│  • content_size, chunks│  • Lease response carries chunk list      │
+│  • Leader Lease Read   │  • Lease auto-renew + grace period        │
+│  • 3+ nodes Raft       │  • close syncs size/chunks before release │
+├─────────────────────────┴───────────────────────────────────────────┤
+│  Cross-Client Coherence: Callback Invalidation (Filer → Client)    │
+│  • Subscription on Lookup/ReadDir/Create/Mkdir                     │
+│  • Invalidate push on setattr/size_chunks sync                     │
+│  • Pinned inode + dirty chunk protection                           │
+│  • TTL bypass for non-open files getattr                           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Protocol Stack
@@ -824,32 +808,47 @@ Options:
 
 ### Phase 2: Data Consistency (Completed)
 - [x] Lease lock mechanism with auto-renew heartbeat
-- [x] CRDT MetaDelta with LWW/Max/Counter merge strategies
-- [x] Dual consistency paths (strong data + eventual meta)
-- [x] SetAttr split (SetAttrData → Raft, SetAttrMeta → CRDT)
-- [x] Invalidation notification mechanism
-- [x] MetadataCache TTL fallback (2s)
+- [x] Per-stripe (64MB) Lease Lock for data linearizability
+- [x] Dual consistency paths (Filer Raft strong + Volume Lease linearizability)
+- [x] SetAttr split (SetAttrData → Raft, SetAttrMeta → Callback Invalidation)
+- [x] Callback Invalidation mechanism (replacing CRDT delta sync)
+- [x] MetadataCache TTL fallback (2s) + TTL bypass for non-open files
 
 ### Phase 3: Protocol & Storage (Completed)
-- [x] TLV protocol extension (2B+4B+4GB)
+- [x] TLV protocol extension (2B+4B+4GB) with bytes::Bytes zero-copy
 - [x] Volume RocksDB index migration (from sled)
 - [x] L1 crash recovery (WAL auto-recovery)
 - [x] Independent init tool (powerfs-init, mkfs→mount pattern)
 - [x] Raft 3-node deployment configuration
+- [x] Transport trait abstraction (TCP/RDMA/QUIC unified interface)
 
-### Phase 4: Performance & Hardening (In Progress)
-- [ ] Real FUSE mount end-to-end testing
-- [ ] Lease lock mechanism verification under concurrent write
-- [ ] fio performance benchmark (single-node & cluster)
-- [ ] Invalidation cross-client consistency testing
-- [ ] Multi-node Raft failover testing
+### Phase 4: Strong Consistency Refactor (Completed 2026-08)
+- [x] **Filer Raft strong consistency**: All metadata operations go through Raft commit (replaced CRDT)
+- [x] **MetadataClient trait**: Typed metadata API replacing raw TLV submit
+- [x] **LeaseManager trait**: Unified read/write lease management with RAII LeaseHandle
+- [x] **Callback Invalidation**: Filer → Client push for cross-client cache coherence
+- [x] **Bucket-based sharding**: Each bucket = independent Raft group, cross-shard returns EXDEV
+- [x] **Creator subscription**: Filer Create/Mkdir establishes subscription for Invalidate notifications
+- [x] **Cross-client read visibility**: open-time getattr bypasses TTL + lease response carries chunk list
+- [x] **fsck tool**: Scans orphaned inodes/chunks, idempotent deletion (NeedleNotFound = success)
+- [x] **CRDT code deletion**: ~3244 lines removed (crdt_client/crdt_server/mock)
+- [x] Real FUSE mount end-to-end testing (3-round system correctness tests passed)
+- [x] fio performance benchmark (Phase 2 results documented)
+- [x] IO500 moderate config full run (all phases completed, exit 0)
+- [x] Multi-node Raft failover testing
 
-### Phase 5: Enterprise Features (Planned)
+### Phase 5: Performance & Enterprise Features (In Progress)
+- [ ] Random read/write performance optimization (read-before-write overhead reduction)
+- [ ] Batch lookup API (find/ls -R scenario optimization)
+- [ ] readdir with attr (avoid per-entry getattr)
+- [ ] Raft batch commit (multiple writes merged into one log entry)
 - [ ] L2 RocksDB Checkpoint (periodic snapshot)
 - [ ] L3 remote backup (S3 sync)
 - [ ] Volume auto-assignment by Master
 - [ ] Rack-aware topology scheduling
 - [ ] GPU Direct zero-copy integration
+- [ ] RDMA transport implementation (Transport trait RDMA backend)
+- [ ] Client lease cache + callback invalidation (Phase 2 optimization if needed)
 
 ---
 
@@ -981,6 +980,86 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Integration tests MUST run in the container environment. Do not connect to test environment from host via FUSE (network limitations).
 
+### 13. CRDT Dual-Source Design Caused 5 Recurring Bugs
+
+**Symptom**: Ghost files in readdir, duplicate entries in list, EEXIST false positives, ENOTEMPTY on rm -rf, lookup hardcoded is_dir=false.
+
+**Root Cause**: MetadataCache.path_map and DirORSet were both authoritative sources for directory entries, causing consistency complexity. CRDT approach had limited benefits for filesystem metadata.
+
+**Fix**: Migrated to Filer Raft strong consistency. Deleted ~3244 lines of CRDT code (crdt_client/crdt_server/mock). All metadata operations now go through Raft commit.
+
+**Lesson**: CRDT dual-source design is fundamentally flawed for filesystem metadata. Use single authoritative source (Filer Raft) + Callback Invalidation for cross-client coherence.
+
+### 14. read_blob Offset Mismatch (Data Loss for >2MB Files)
+
+**Symptom**: Files larger than 2MB return empty data after first chunk.
+
+**Root Cause**: FUSE client's `read_blob` passed file-internal offset (e.g., 2MB for chunk_idx=1) while volume server's `read_needle_blob` expected needle-internal offset. Each chunk maps 1:1 to needle.
+
+**Fix**: Set offset=0 in all `read_blob` calls (each chunk maps 1:1 to needle).
+
+**Lesson**: Distinguish file-internal offset from needle-internal offset. Each chunk = one needle, so needle offset is always 0.
+
+### 15. Volume Server STATUS_ERR_NOT_FOUND Mismatch
+
+**Symptom**: FUSE returns EIO instead of zero-fill for missing needles (new file extension).
+
+**Root Cause**: Volume server returns STATUS_ERR_NOT_FOUND (status=1) for "needle not found", but volume_client formatted ALL non-OK responses as "Server error: {status}", so FUSE's `e.contains("needle not found")` never matched.
+
+**Fix**: In volume_client.rs Read path, check STATUS_ERR_NOT_FOUND → return "needle not found" error message.
+
+**Lesson**: Error message matching requires precise protocol-level status code handling, not string matching on formatted error messages.
+
+### 16. Needle ID Collision (file_key Design Flaw)
+
+**Symptom**: File B reads File A's data; consecutive files' needle ID ranges overlap.
+
+**Root Cause**: Master allocated file_key with `next_file_key += 1` per file, but multi-chunk files consume `file_key + chunk_idx` (multiple needle IDs). Consecutive files' needle ID ranges overlap.
+
+**Fix**: Allocate file_key in blocks via `FILE_KEY_BLOCK_SIZE = 1_048_576` (1M chunks/file = 2TB max @ 2MB chunks), so `next_file_key += FILE_KEY_BLOCK_SIZE` per file.
+
+**Lesson**: file_key semantics overloaded as both file-level identifier and chunk-level NeedleId causes recurring issues. Block allocation prevents ID range overlap.
+
+### 17. ChunkCache OOM During High-Concurrency Writes
+
+**Symptom**: FUSE container OOM/restart during IO500 IOR tests.
+
+**Root Cause**: ChunkCache evict_if_needed only evicts non-dirty chunks; during high-concurrency writes, all chunks are dirty, causing cache to grow beyond 512MB limit (1.5-2GB).
+
+**Fix**: FUSE write path implements global backpressure lock to prevent ChunkCache memory exceed during high-concurrency writes.
+
+**Lesson**: Cache eviction must account for dirty chunk scenarios; global backpressure needed for write-heavy workloads.
+
+### 18. InvalidateHandler Causing Flusher Failures
+
+**Symptom**: "inode has no fid" EIO errors during writes.
+
+**Root Cause**: InvalidateHandler cleared cache for inodes with dirty chunks, causing flusher to fail when trying to write back dirty data.
+
+**Fix**: InvalidateHandler skips cache invalidation when inode has dirty chunks.
+
+**Lesson**: Cache invalidation must respect dirty state; invalidating dirty inodes causes data loss.
+
+### 19. Cross-Client Append Data Overwrite (Read-Before-Write)
+
+**Symptom**: fuse-2 append to fuse-1 created file overwrites fuse-1's original data.
+
+**Root Cause**: When chunk not in cache but file has data, write code created `[zeros + new_data]` chunk, flush overwrote volume's original data.
+
+**Fix**: In write path, when chunk not in cache but file has data (`content_size_before_write > chunk_start_offset`), first read existing chunk data from Volume Server, then apply partial write.
+
+**Lesson**: Partial writes must read existing data first (read-before-write) when file already has data in target chunk range.
+
+### 20. VolumeClient update_lease Token Not Updated
+
+**Symptom**: "Lease not found" errors blocking all subsequent lease acquisitions.
+
+**Root Cause**: `update_lease` only updated duration when entry existed, not token. ensure_lease got new token but cache kept old token. release sent old token to server.
+
+**Fix**: `update_lease` always overwrites token + duration.
+
+**Lesson**: Lease cache update must refresh all fields, not just duration. Stale tokens cause cascading lease conflicts.
+
 ---
 
 ## Development Guidelines
@@ -997,6 +1076,26 @@ Based on the issues above, the following guidelines MUST be followed:
 8. **Code Quality**: Run `cargo fmt`, `cargo clippy -D warnings`, `cargo test` before every commit.
 9. **Lease Token Threading**: Pass lease tokens explicitly through call chains. Never re-acquire.
 10. **Inode vs FileKey**: Distinguish FUSE inode from Volume NeedleId. Lease uses inode.
+11. **Filer Raft for Metadata**: All filesystem metadata MUST go through Filer Raft. No CRDT or dual-source designs.
+12. **Callback Invalidation for Coherence**: Cross-client cache coherence via Filer push, not client polling or delta sync.
+13. **No Request Forwarding**: No inter-service request forwarding; especially for Raft services, as forwarding amplifies failures.
+14. **TLV Type Matching**: create uses u32 for Mode/Uid/Gid, mkdir uses u64; handle_setattr uses loop-based decoding for optional fields.
+15. **NeedleNotFound = Success**: Treat NeedleNotFound errors as successful idempotent deletions in both TLV (FUSE client) and gRPC handlers.
+16. **Volume max_volume_size = 100GB**: NOT 10GB, to prevent volume full errors and performance degradation.
+17. **FUSE create() must pass fid_info**: Pass fid_info to Filer to store chunk mapping at creation time.
+18. **flush_dirty_chunks_impl**: Must pass chunk_indices (not offsets) to clear_dirty_for_chunks.
+19. **Read-before-write optimization**: Skip reading existing data when writing covers entire chunk or new data regions (no_data_before and no_data_after conditions).
+20. **close sync with retry**: close sync operation (size/chunks to Filer) must have retry with timeout to handle filer unavailability.
+21. **GC checks**: GC MUST check nlink==0, no active lease, and open_count==0 before deleting inode.
+22. **Delta sync only with leader**: Ensure delta sync is only performed with the leader.
+23. **crc32 checks**: Must be performed during read operations.
+24. **gc_grace_period consistency**: Must be consistent across all filer nodes.
+25. **Monitoring required**: Monitor delta sync latency, GC backlog, lease queue length, and inode exhaustion rate.
+26. **ResilientMasterClient**: All gRPC clients connecting to Master use `ResilientMasterClient` from `powerfs-master` crate.
+27. **TlvMasterClient**: FUSE and kernel file system use TLV protocol via `TlvMasterClient` from `powerfs-master-net` crate.
+28. **Transport trait**: Communication layer must support RDMA via Transport trait abstraction (TCP/RDMA/QUIC unified interface).
+29. **Leader Lease Read**: Raft read operations use Leader Lease Read to avoid extra RTT.
+30. **Sharding strategy**: Buckets divided into independent Raft groups; cross-shard operations return EXDEV.
 
 ---
 
