@@ -17,7 +17,8 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use crate::errors::{NetError, NetResult};
@@ -297,11 +298,12 @@ impl PowerFsNetServer {
         info!("Handling connection from {}", peer);
 
         stream.set_nodelay(true)?;
-        let stream = Arc::new(Mutex::new(stream));
 
         // Phase 1: Handshake + auto session registration
-        let (client_id, _client_type) =
-            Self::handle_handshake(stream.clone(), handler.clone(), manager.clone(), peer).await?;
+        // The handshake needs both read and write on the raw stream; it returns
+        // ownership so we can split the stream afterwards.
+        let (stream, client_id, _client_type) =
+            Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await?;
 
         // Register notification channel for this client
         let notification_rx = if let Some(ref mgr) = manager {
@@ -310,9 +312,39 @@ impl PowerFsNetServer {
             None
         };
 
+        // Split the TcpStream into independent read and write halves.
+        //
+        // Previously the stream was wrapped in `Arc<Mutex<TcpStream>>` and shared
+        // between the read loop and per-request handler tasks.  The read loop
+        // held the mutex for up to 100 ms during its `read_exact` timeout (used
+        // to poll for notifications), which blocked every response write for the
+        // same duration — producing the consistent ~100 ms latency observed on
+        // every metadata operation.
+        //
+        // `into_split()` returns `OwnedReadHalf` / `OwnedWriteHalf` that share
+        // no lock, fully decoupling the read path from the write path.
+        let (read_half, write_half) = stream.into_split();
+
+        // Dedicated write task: owns the write half and drains an mpsc channel.
+        // All response frames and notification frames are pushed here, so no
+        // caller ever blocks on a stream lock.
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut wh = write_half;
+            while let Some(frame) = write_rx.recv().await {
+                if let Err(e) = wh.write_all(&frame).await {
+                    warn!("server write_task: write error: {:?}", e);
+                    break;
+                }
+            }
+            info!("server write_task stopped for client {}", client_id);
+        });
+
         // Phase 2: Message loop - blocks until client disconnects or error
         let result = Self::message_loop(
-            stream.clone(),
+            read_half,
+            write_tx,
             handler.clone(),
             manager.clone(),
             client_id,
@@ -329,41 +361,39 @@ impl PowerFsNetServer {
         result
     }
 
-    /// Handle handshake and return (client_id, client_type)
+    /// Handle handshake and return the stream along with (client_id, client_type).
+    /// The stream is returned so the caller can split it into read/write halves.
     async fn handle_handshake(
-        stream: Arc<Mutex<TcpStream>>,
+        mut stream: TcpStream,
         handler: Arc<dyn PowerFsNetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
         peer_addr: SocketAddr,
-    ) -> NetResult<(u64, ClientType)> {
-        let (client_id, client_type) = {
-            let mut s = stream.lock().await;
-            let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
-            s.read_exact(&mut req_buf).await?;
+    ) -> NetResult<(TcpStream, u64, ClientType)> {
+        let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
+        stream.read_exact(&mut req_buf).await?;
 
-            let req = HandshakeRequest::decode(&req_buf)
-                .ok_or_else(|| NetError::Protocol("invalid handshake request".into()))?;
+        let req = HandshakeRequest::decode(&req_buf)
+            .ok_or_else(|| NetError::Protocol("invalid handshake request".into()))?;
 
-            if req.magic != *PROTOCOL_MAGIC {
-                return Err(NetError::Protocol("invalid magic".into()));
-            }
+        if req.magic != *PROTOCOL_MAGIC {
+            return Err(NetError::Protocol("invalid magic".into()));
+        }
 
-            let client_type = ClientType::from_u8(req.client_type)
-                .ok_or_else(|| NetError::Protocol("unknown client type".into()))?;
+        let client_type = ClientType::from_u8(req.client_type)
+            .ok_or_else(|| NetError::Protocol("unknown client type".into()))?;
 
-            info!(
-                "Handshake: client_id={} client_type={:?} addr={}",
-                req.client_id, client_type, peer_addr
-            );
+        info!(
+            "Handshake: client_id={} client_type={:?} addr={}",
+            req.client_id, client_type, peer_addr
+        );
 
-            // Send handshake response
-            let resp = HandshakeResponse::ok(0);
-            let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
-            resp.encode(&mut resp_buf);
-            s.write_all(&resp_buf).await?;
+        // Send handshake response
+        let resp = HandshakeResponse::ok(0);
+        let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
+        resp.encode(&mut resp_buf);
+        stream.write_all(&resp_buf).await?;
 
-            (req.client_id, client_type)
-        };
+        let client_id = req.client_id;
 
         // Register session with manager (if enabled)
         if let Some(ref mgr) = manager {
@@ -374,95 +404,73 @@ impl PowerFsNetServer {
         // Notify handler
         handler.on_connect(client_id, client_type).await;
 
-        Ok((client_id, client_type))
+        Ok((stream, client_id, client_type))
     }
 
     /// Main message loop for a connection
     ///
-    /// Uses tokio::select! to simultaneously handle:
-    /// - Incoming client requests
-    /// - Outgoing notifications from ServerConnectionManager
+    /// The read half is exclusively owned by this loop (no lock).  All writes
+    /// — responses and notifications — go through a dedicated write task via
+    /// an mpsc channel, so the read loop never blocks a response write.
     async fn message_loop(
-        stream: Arc<Mutex<TcpStream>>,
+        mut read_half: tokio::net::tcp::OwnedReadHalf,
+        write_tx: mpsc::UnboundedSender<Vec<u8>>,
         handler: Arc<dyn PowerFsNetHandler>,
         _manager: Option<Arc<ServerConnectionManager>>,
         client_id: u64,
-        mut notification_rx: Option<tokio::sync::mpsc::Receiver<NetMessage>>,
+        notification_rx: Option<mpsc::Receiver<NetMessage>>,
     ) -> NetResult<()> {
         use tokio::io::AsyncReadExt;
 
-        // If we have a notification channel, spawn a task to handle notifications
-        // Otherwise, just handle requests
+        // Spawn a notification forwarder: receives notifications from the
+        // ServerConnectionManager and pushes them onto the write channel.
+        // This replaces the old 100 ms read-timeout polling, eliminating the
+        // stream-lock contention that caused ~100 ms metadata latency.
+        if let Some(mut rx) = notification_rx {
+            let write_tx = write_tx.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    debug!(
+                        "Sending notification to client {}: type={:?}",
+                        client_id,
+                        msg.msg_type()
+                    );
+                    let frame = build_frame(&msg.header, &msg.body, &msg.data);
+                    if write_tx.send(frame).is_err() {
+                        break; // write channel closed — connection dropped
+                    }
+                }
+            });
+        }
+
         loop {
-            // Try to read a header with a small timeout to allow checking notifications
-            let read_result = {
-                let mut s = stream.lock().await;
-                let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+            // Read header — blocking, no timeout, no lock.  The read half is
+            // exclusively owned by this loop, so handler response writes (via
+            // the write task) never contend with reads.
+            let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+            if let Err(e) = read_half.read_exact(&mut hdr_buf).await {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    info!("Client disconnected");
+                    return Ok(());
+                }
+                return Err(NetError::Io(e));
+            }
 
-                // Use a timeout to periodically check for notifications
-                let read_future = s.read_exact(&mut hdr_buf);
-                match tokio::time::timeout(std::time::Duration::from_millis(100), read_future).await
-                {
-                    Ok(result) => result.map(|_| hdr_buf),
-                    Err(_) => {
-                        // Timeout - check for notifications
-                        if let Some(ref mut rx) = notification_rx {
-                            while let Ok(msg) = rx.try_recv() {
-                                // Send notification to client
-                                debug!(
-                                    "Sending notification to client {}: type={:?}",
-                                    client_id,
-                                    msg.msg_type()
-                                );
-                                let mut frame = Vec::with_capacity(
-                                    FrameHeader::SIZE + msg.body.len() + msg.data.len(),
-                                );
-                                let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
-                                msg.header.encode(&mut hdr_buf);
-                                frame.extend_from_slice(&hdr_buf);
-                                frame.extend_from_slice(&msg.body);
-                                frame.extend_from_slice(&msg.data);
-                                s.write_all(&frame).await?;
-                            }
-                        }
-                        continue;
-                    }
+            let header = match FrameHeader::decode(&hdr_buf) {
+                Some(h) => h,
+                None => {
+                    warn!("invalid frame header, skipping");
+                    continue;
                 }
             };
 
-            // Handle read result
-            let header = match read_result {
-                Ok(hdr_buf) => FrameHeader::decode(&hdr_buf)
-                    .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        info!("Client disconnected");
-                        return Ok(());
-                    }
-                    return Err(NetError::Io(e));
-                }
-            };
-
-            // Read data
-            let body = {
-                let data_len = header.data_len as usize;
-                if data_len > 0 {
-                    let mut s = stream.lock().await;
-                    let mut data = Vec::with_capacity(data_len);
-                    let mut remaining = data_len;
-
-                    while remaining > 0 {
-                        let chunk = std::cmp::min(remaining, 4096);
-                        let mut buf = vec![0u8; chunk];
-                        s.read_exact(&mut buf).await?;
-                        data.extend_from_slice(&buf);
-                        remaining -= chunk;
-                    }
-                    data
-                } else {
-                    Vec::new()
-                }
-            };
+            // Read body + data (header.data_len covers both segments)
+            let data_len = header.data_len as usize;
+            let mut body = Vec::with_capacity(data_len);
+            if data_len > 0 {
+                body.resize(data_len, 0u8);
+                read_half.read_exact(&mut body).await?;
+            }
 
             let message = NetMessage::new(header.clone()).with_body(body);
 
@@ -482,13 +490,8 @@ impl PowerFsNetServer {
                     0,
                 )
                 .with_status(STATUS_OK);
-
-                let mut s = stream.lock().await;
-                let mut frame = Vec::with_capacity(FrameHeader::SIZE);
-                let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
-                resp_header.encode(&mut hdr_buf);
-                frame.extend_from_slice(&hdr_buf);
-                s.write_all(&frame).await?;
+                let frame = build_frame(&resp_header, &[], &[]);
+                let _ = write_tx.send(frame);
                 continue;
             }
 
@@ -508,7 +511,7 @@ impl PowerFsNetServer {
             // TransportChannel::max_concurrent (data=32, lease=4, mgmt=4).
             if message.is_request() {
                 let handler = handler.clone();
-                let stream = stream.clone();
+                let write_tx = write_tx.clone();
                 let seq = message.header.seq;
                 let msg_type_u16 = message
                     .msg_type()
@@ -538,24 +541,29 @@ impl PowerFsNetServer {
                         }
                     };
 
-                    // Send response — lock is held only for the duration of
-                    // the write, not during handler processing.
-                    let mut s = stream.lock().await;
-                    let mut frame = Vec::with_capacity(
-                        FrameHeader::SIZE + response.body.len() + response.data.len(),
-                    );
-                    let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
-                    response.header.encode(&mut hdr_buf);
-                    frame.extend_from_slice(&hdr_buf);
-                    frame.extend_from_slice(&response.body);
-                    frame.extend_from_slice(&response.data);
-                    if let Err(e) = s.write_all(&frame).await {
-                        error!("Failed to send response for seq={}: {:?}", seq, e);
+                    // Send response via the write channel — no stream lock.
+                    let frame = build_frame(&response.header, &response.body, &response.data);
+                    if write_tx.send(frame).is_err() {
+                        error!(
+                            "Failed to send response for seq={}: write channel closed",
+                            seq
+                        );
                     }
                 });
             }
         }
     }
+}
+
+/// Build a wire frame from a header, body, and data segment.
+fn build_frame(header: &FrameHeader, body: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(FrameHeader::SIZE + body.len() + data.len());
+    let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+    header.encode(&mut hdr_buf);
+    frame.extend_from_slice(&hdr_buf);
+    frame.extend_from_slice(body);
+    frame.extend_from_slice(data);
+    frame
 }
 
 /// Simple handler for testing
