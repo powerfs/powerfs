@@ -1758,7 +1758,8 @@ impl FileSystem for PowerFsFs {
                         powerfs_fuse_core::ReadBlobRequest {
                             volume_id: vol_id,
                             file_key: needle_id,
-                            offset: *offset as i64,
+                            // offset=0: read from start of needle data (each needle = one chunk)
+                            offset: 0,
                             size: *size,
                         }
                     })
@@ -1823,7 +1824,8 @@ impl FileSystem for PowerFsFs {
                             &addr,
                             vol_id,
                             needle_id,
-                            chunk_offset as i64,
+                            // offset=0: read from start of needle data (each needle = one chunk)
+                            0,
                             read_size,
                         ) {
                             Ok(data) => {
@@ -2075,7 +2077,8 @@ impl FileSystem for PowerFsFs {
                                 addr,
                                 rbw_vol_id,
                                 rbw_needle_id,
-                                chunk_start_offset as i64,
+                                // offset=0: read from start of needle data (each needle = one chunk)
+                                0,
                                 existing_len as i32,
                             ) {
                                 Ok(data) => {
