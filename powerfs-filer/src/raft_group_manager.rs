@@ -139,6 +139,17 @@ pub enum ShardCommand {
         offset: u64,
         size: u64,
     },
+    /// Atomically update inode size + full chunks list via Raft (strong
+    /// consistency). Used by close/sync_size_chunks_on_close to persist
+    /// content_size and chunks. MUST go through Raft so all filer nodes
+    /// replicate the update; otherwise followers serve stale size/chunks
+    /// to subsequent getattr/read, causing cross-client data corruption
+    /// (e.g., IO500 ior-easy-read EOF after first chunk).
+    UpdateInodeSizeChunks {
+        inode: u64,
+        size: u64,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+    },
 }
 
 impl ShardCommand {

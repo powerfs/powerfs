@@ -1602,6 +1602,18 @@ impl MetaShardManager {
     }
 
     /// 强一致更新 inode 的 size + chunks（close sync 账本，§4 1.5 / §5.1 lease 协调）。
+    ///
+    /// MUST go through Raft propose so all filer nodes replicate the update.
+    /// The previous implementation wrote directly to the leader's local
+    /// RocksDB, bypassing Raft — followers never saw the update and served
+    /// stale size/chunks to subsequent getattr/read, causing cross-client
+    /// data corruption (e.g., IO500 ior-easy-read returned EOF after the
+    /// first chunk because a follower's size was stuck at 2MB while the
+    /// leader had the correct 1GB).
+    ///
+    /// After propose we poll the local (leader) store until the apply
+    /// completes, so that notify_inode_change (called by the net handler
+    /// on return) and subsequent reads see the updated data.
     pub async fn update_inode_size_chunks_atomic(
         &self,
         shard_id: ShardId,
@@ -1609,12 +1621,45 @@ impl MetaShardManager {
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
     ) -> Result<(), String> {
-        let stores = self.shard_stores.read().unwrap();
-        let store = stores
-            .get(&shard_id)
-            .cloned()
-            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
-        store.update_inode_size_chunks_atomic(inode, size, chunks)
+        let target_chunk_count = chunks.len();
+        let cmd = ShardCommand::UpdateInodeSizeChunks {
+            inode,
+            size,
+            chunks,
+        };
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the apply to complete on this (leader) node so that
+        // notify_inode_change and subsequent reads see the updated data.
+        // Without this poll, a subscriber re-fetching the entry right
+        // after notify could see the pre-apply (stale) state.
+        let shard_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_id)
+                .cloned()
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+        };
+        let mut retries = 0;
+        while retries < 50 {
+            if let Some(info) = shard_store.get_inode(inode) {
+                if info.size == size && info.chunks.len() == target_chunk_count {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            retries += 1;
+        }
+        log::warn!(
+            "update_inode_size_chunks: timed out waiting for apply (inode={}, size={}, chunks={}), \
+             propose committed; apply will catch up via Raft replication",
+            inode,
+            size,
+            target_chunk_count
+        );
+        Ok(())
     }
 
     pub async fn get_filer_status(&self) -> FilerStatus {

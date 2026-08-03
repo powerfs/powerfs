@@ -519,6 +519,20 @@ impl ShardStore {
             } => {
                 self.set_chunks(inode, fid, volume_id, cookie, offset, size);
             }
+            ShardCommand::UpdateInodeSizeChunks {
+                inode,
+                size,
+                chunks,
+            } => {
+                if let Err(e) = self.update_inode_size_chunks_atomic(inode, size, chunks) {
+                    log::error!(
+                        "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
+                        self.shard_id.0,
+                        inode,
+                        e
+                    );
+                }
+            }
         }
     }
 
