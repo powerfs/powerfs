@@ -1281,11 +1281,13 @@ impl MetadataClient for MetaShardClient {
         uid: u32,
         gid: u32,
         shard_id: u64,
+        fid_info: Option<(u64, u64, u64)>,
     ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
             let body =
-                serialize::encode_create_req(parent_ino, &name, mode, uid, gid).map_err(map_err)?;
+                serialize::encode_create_req(parent_ino, &name, mode, uid, gid, fid_info)
+                    .map_err(map_err)?;
             let resp = self
                 .send_coherence_msg(MsgType::Create, shard_id, body)
                 .await

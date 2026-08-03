@@ -691,7 +691,7 @@ impl PowerFsNetClient {
         uid: u32,
         gid: u32,
     ) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_create_req(parent_ino, name, mode, uid, gid)?;
+        let body = crate::serialize::encode_create_req(parent_ino, name, mode, uid, gid, None)?;
         let resp = self.send_request(MsgType::Create, &body, &[]).await?;
 
         if !resp.is_ok() {

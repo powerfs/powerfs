@@ -1367,17 +1367,23 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.create RPC 走 Filer Raft leader（强一致）
         // Filer 端分配 inode 并创建目录条目，返回 MetadataAttr（含 inode）。
         // 保留 S_IFREG 类型位（0o100000）—— 与 mkdir 同理，filer 端通过 mode & S_IFMT 判定 FileType。
+        //
+        // CRITICAL: Pass fid_info so the Filer stores the chunk mapping at create
+        // time. Without this, the Filer entry has no fid/chunks, and a cache miss
+        // on the client (LRU eviction or Invalidate) leads to open/getattr fetching
+        // a fid=None entry → flush fails with "inode has no fid" (EIO).
         let file_mode = args.mode | 0o100000;
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
         let name_owned = name_str.to_string();
+        let fid_info = Some((volume_id, fid.cookie, fid.file_key)); // (volume_id, cookie, file_key) all u64
         let t_create = std::time::Instant::now();
         let attr = self
             .client
             .block_on(async move {
                 meta_client
-                    .create(parent, &name_owned, file_mode, uid, gid, parent)
+                    .create(parent, &name_owned, file_mode, uid, gid, parent, fid_info)
                     .await
             })
             .map_err(|e| {

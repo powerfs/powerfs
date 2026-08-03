@@ -576,6 +576,7 @@ pub fn encode_create_req(
     mode: u32,
     uid: u32,
     gid: u32,
+    fid_info: Option<(u64, u64, u64)>,
 ) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::ParentIno, parent_ino);
@@ -583,6 +584,17 @@ pub fn encode_create_req(
     enc.add_u32(FieldId::Mode, mode);
     enc.add_u32(FieldId::Uid, uid);
     enc.add_u32(FieldId::Gid, gid);
+    // Attach fid info so the Filer stores the chunk mapping at create time.
+    // Without this, the Filer entry has no fid/chunks, and a cache miss on
+    // the client (LRU eviction or Invalidate) leads to open/getattr fetching
+    // a fid=None entry → flush fails with "inode has no fid" (EIO).
+    if let Some((volume_id, cookie, file_key)) = fid_info {
+        let fid_str = format!("{},{},{}", volume_id, cookie, file_key);
+        enc.add_string(FieldId::Fid, &fid_str)?;
+        enc.add_u64(FieldId::Cookie, cookie);
+        enc.add_u64(FieldId::FileKey, file_key);
+        enc.add_u64(FieldId::Size, 0); // initial chunk size = 0
+    }
     Ok(enc.into_bytes())
 }
 

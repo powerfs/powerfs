@@ -95,6 +95,8 @@ pub trait MetadataClient: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MetadataAttr>> + Send + '_>>;
 
     /// create：创建普通文件
+    /// fid_info: Optional (volume_id, cookie, file_key) to persist chunk mapping
+    /// at create time, preventing "has no fid" errors on cache miss + reopen.
     fn create(
         &self,
         parent_ino: u64,
@@ -103,6 +105,7 @@ pub trait MetadataClient: Send + Sync {
         uid: u32,
         gid: u32,
         shard_id: u64,
+        fid_info: Option<(u64, u64, u64)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MetadataAttr>> + Send + '_>>;
 
     /// unlink：删除文件（仅文件，非目录）

@@ -80,6 +80,24 @@ impl NotificationHandler for InvalidateHandler {
                     return;
                 }
 
+                // Skip invalidation if the inode has dirty (unflushed) chunks.
+                // The dirty data must be preserved, and the flusher needs the
+                // cached metadata (specifically the fid) to write the chunks
+                // to the volume server. Invalidating the metadata here would
+                // cause "inode has no fid" errors in flush_dirty_chunks,
+                // leading to EIO and data loss.
+                //
+                // This race occurs when: create() caches the entry with fid →
+                // Filer pushes Invalidate (before open() pins the inode) →
+                // cache entry evicted → flusher can't write dirty chunks.
+                if self.chunk_cache.has_dirty_chunks(inode) {
+                    debug!(
+                        "InvalidateHandler: skipping invalidation for inode={} (has dirty chunks, preserving metadata for flush, server_v={})",
+                        inode, version
+                    );
+                    return;
+                }
+
                 // Check if our cached version is stale
                 if self.cache.is_inode_stale(inode, version) {
                     debug!(

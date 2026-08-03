@@ -11,7 +11,7 @@ use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
 use powerfs_coherence::ChunkWire;
-use powerfs_net::serialize::{EntryInfo, TlvDecoder, TlvEncoder};
+use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     ClientType, FieldId, FrameFlags, MsgType, NetError, NetMessage, NetResult, PowerFsNetHandler,
     RequestContext, ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
@@ -346,12 +346,24 @@ impl FilerNetHandler {
 
     /// Handle SetAttr request (legacy unified path)
     async fn handle_setattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let mut dec = TlvDecoder::new(&msg.body);
-        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let size = dec.next_u64(FieldId::Size).ok();
-        let mode = dec.next_u64(FieldId::Mode).ok();
-        let uid = dec.next_u64(FieldId::Uid).ok();
-        let gid = dec.next_u64(FieldId::Gid).ok();
+        // Use decode_setattr_req which correctly handles optional fields via
+        // while-loop parsing. Previously used fixed-order next_u64 which
+        // desynced the decoder (encoder uses add_u32 for Mode/Uid/Gid, and
+        // optional fields may be absent).
+        let (ino, mode, uid, gid, size) = match decode_setattr_req(&msg.body) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("FILER_NET_SETATTR: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+        let mode = mode.map(|m| m as u64);
+        let uid = uid.map(|u| u as u64);
+        let gid = gid.map(|g| g as u64);
 
         info!(
             "FILER_NET_SETATTR: ino={}, size={:?}, mode={:?}, uid={:?}, gid={:?}",
@@ -430,15 +442,36 @@ impl FilerNetHandler {
 
     /// Handle SetAttrMeta request (eventual consistency path for mode/uid/gid/timestamps)
     async fn handle_setattr_meta(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        // Use while-loop parsing since fields are optional (encoder skips
+        // None values). Previously used fixed-order next_u64 which desynced
+        // the decoder when optional fields were absent.
         let mut dec = TlvDecoder::new(&msg.body);
-        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let mode = dec.next_u64(FieldId::Mode).ok();
-        let uid = dec.next_u64(FieldId::Uid).ok();
-        let gid = dec.next_u64(FieldId::Gid).ok();
-        let mtime = dec.next_u64(FieldId::Mtime).ok();
-        let atime = dec.next_u64(FieldId::Atime).ok();
-        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
-        let timestamp = dec.next_u64(FieldId::Seq).unwrap_or(0);
+        let mut ino = 0u64;
+        let mut mode: Option<u64> = None;
+        let mut uid: Option<u64> = None;
+        let mut gid: Option<u64> = None;
+        let mut mtime: Option<u64> = None;
+        let mut atime: Option<u64> = None;
+        let mut client_id = String::new();
+        let mut timestamp = 0u64;
+
+        while let Some((field, length)) = dec.next_field() {
+            match field {
+                FieldId::Ino => ino = dec.read_u64(length).unwrap_or(0),
+                FieldId::Mode => mode = Some(dec.read_u64(length).unwrap_or(0)),
+                FieldId::Uid => uid = Some(dec.read_u64(length).unwrap_or(0)),
+                FieldId::Gid => gid = Some(dec.read_u64(length).unwrap_or(0)),
+                FieldId::Mtime => mtime = Some(dec.read_u64(length).unwrap_or(0)),
+                FieldId::Atime => atime = Some(dec.read_u64(length).unwrap_or(0)),
+                FieldId::ClientId => {
+                    client_id = dec.read_string(length).unwrap_or_default().to_string()
+                }
+                FieldId::Seq => timestamp = dec.read_u64(length).unwrap_or(0),
+                _ => {
+                    let _ = dec.skip(length);
+                }
+            }
+        }
 
         info!(
             "FILER_NET_SETATTR_META: ino={}, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, client={}, ts={}",
@@ -483,9 +516,14 @@ impl FilerNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
-        let mode = dec.next_u64(FieldId::Mode).unwrap_or(0o644);
-        let uid = dec.next_u64(FieldId::Uid).unwrap_or(0);
-        let gid = dec.next_u64(FieldId::Gid).unwrap_or(0);
+        // CRITICAL: encoder uses add_u32 for Mode/Uid/Gid, so decoder must use
+        // next_u32. Previously used next_u64, which fails (read_u64 requires
+        // length==8 but gets 4), leaving the cursor un-advanced past the field
+        // data. This desyncs the decoder, making all subsequent fields (Fid,
+        // Cookie, FileKey, Size) unparseable → has_fid always false.
+        let mode = dec.next_u32(FieldId::Mode).unwrap_or(0o644) as u64;
+        let uid = dec.next_u32(FieldId::Uid).unwrap_or(0) as u64;
+        let gid = dec.next_u32(FieldId::Gid).unwrap_or(0) as u64;
 
         // Parse optional chunk/fid info
         let fid = dec.next_string(FieldId::Fid).ok();
@@ -575,6 +613,8 @@ impl FilerNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
+        // encode_mkdir_req uses add_u64 for Mode/Uid/Gid (unlike
+        // encode_create_req which uses add_u32). Decoder must match.
         let mode = dec.next_u64(FieldId::Mode).unwrap_or(0o755);
         let uid = dec.next_u64(FieldId::Uid).unwrap_or(0);
         let gid = dec.next_u64(FieldId::Gid).unwrap_or(0);
