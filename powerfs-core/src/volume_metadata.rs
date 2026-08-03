@@ -352,9 +352,17 @@ impl VolumeMetadata {
         let mut stats = self.get_allocation()?;
 
         // 检查是否是覆盖写入（同一 needle_id 已存在）
-        let is_update = matches!(self.get_needle(&info.id), Ok(Some(_)));
+        let old_needle = self.get_needle(&info.id)?;
+        let is_update = old_needle.is_some();
 
-        stats.used_bytes += data_size;
+        // used_bytes 反映逻辑已用空间（引用的数据量），而非物理文件大小。
+        // 覆盖写入时旧数据已被计数，不应再次增加 used_bytes，否则反复 flush
+        // 同一 chunk 会导致 used_bytes 虚增（每次 flush 加 2MB），使 volume
+        // 在远未达到 max_volume_size 时就被标记为 Full。
+        // append_offset 仍然前进（append-only 模型，物理文件持续增长）。
+        if !is_update {
+            stats.used_bytes += data_size;
+        }
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
         stats.append_offset += data_size;
         stats.next_needle_id = stats.next_needle_id.max(info.id.0 + 1);
@@ -614,6 +622,11 @@ impl VolumeMetadata {
         let mut count = 0;
         let mut stats = AllocationStats::default();
 
+        // 跟踪已见 needle_id → 旧大小，用于覆盖写入时去重 used_bytes。
+        // 物理文件是 append-only，同一 needle_id 可能出现多次（覆盖写入），
+        // 只有最后一次写入是有效的，旧副本不应计入 used_bytes。
+        let mut seen: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
         // Needle header: [NeedleId(8B)][Size(4B)]
         const HEADER_SIZE: usize = 12;
 
@@ -659,12 +672,19 @@ impl VolumeMetadata {
                 ec_shards: Vec::new(),
             };
 
-            // 写入 RocksDB
+            // 写入 RocksDB（后写覆盖先写，只保留最新版本）
             self.put_needle(&info)?;
 
             let total_needle_size = HEADER_SIZE as u64 + data_size as u64 + 8; // +8 for footer
+
+            // 去重 used_bytes：如果之前见过此 needle_id，先减去旧大小
+            if let Some(old_size) = seen.insert(needle_id, total_needle_size) {
+                stats.used_bytes = stats.used_bytes.saturating_sub(old_size);
+                // 覆盖写入：active_count 不变
+            } else {
+                stats.active_count += 1;
+            }
             stats.used_bytes += total_needle_size;
-            stats.active_count += 1;
             stats.next_needle_id = stats.next_needle_id.max(needle_id + 1);
             stats.append_offset = offset + total_needle_size;
 
