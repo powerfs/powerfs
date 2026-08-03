@@ -30,8 +30,6 @@ Traditional storage solutions face obvious bottlenecks in converged HPC and AI s
 
 PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**, with a **Filer Raft based strong consistency model** for metadata (content_size, chunks list) and **per-stripe (64MB) Lease Lock** for data linearizability. Cross-client cache coherence is maintained via **Callback Invalidation** (Filer pushes invalidate notifications to subscribed clients), eliminating broadcast storms while preserving strong visibility guarantees. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack.
 
-> **Architecture Evolution (2026-08)**: PowerFS migrated from CRDT-based eventual consistency to Filer Raft strong consistency. The CRDT dual-source design (MetadataCache + DirORSet) caused 5 recurring bugs (ghost files, duplicate entries, EEXIST false positives, etc.); the refactor deleted ~3244 lines of CRDT code and unified all metadata authority under Filer Raft. See [strong-consistency-refactor-plan.md](docs/strong-consistency-refactor-plan.md) for details.
-
 ---
 
 ## Core Design Philosophy
@@ -135,7 +133,7 @@ PowerFS implements a **dual-channel consistency mechanism** combining strong met
 
 ### Cross-Client Cache Coherence
 
-PowerFS uses **Callback Invalidation** for cross-client cache coherence, replacing the deprecated CRDT delta sync:
+PowerFS uses **Callback Invalidation** for cross-client cache coherence:
 
 - **Subscription**: Filer automatically subscribes clients on Lookup/ReadDir; Create/Mkdir establishes creator subscription
 - **Invalidate Push**: Filer pushes invalidate notifications on metadata changes (setattr, update_inode_size_chunks)
@@ -602,7 +600,7 @@ powerfs/
 ├── powerfs-cli/         # CLI tool: Cluster management commands (fsck, compact, etc.)
 ├── powerfs-monitor/     # Monitor: Health check, metrics, alerts
 ├── powerfs-kv-client/   # KV client: Native KV cache engine
-├── powerfs-orset/       # OR-Set data structure (generic, CRDT-specific code removed)
+├── powerfs-orset/       # Shared data structures (CachedFileChunk, FileType, etc.)
 ├── powerfs-coherence/   # Coherence: Generic metadata sync interfaces (DeltaSyncChannel)
 ├── powerfs-master-net/  # Master net: TLV protocol client (TlvMasterClient) for FUSE/kernel
 ├── powerfs-s3/          # S3 protocol implementation
@@ -811,7 +809,7 @@ Options:
 - [x] Per-stripe (64MB) Lease Lock for data linearizability
 - [x] Dual consistency paths (Filer Raft strong + Volume Lease linearizability)
 - [x] SetAttr split (SetAttrData → Raft, SetAttrMeta → Callback Invalidation)
-- [x] Callback Invalidation mechanism (replacing CRDT delta sync)
+- [x] Callback Invalidation mechanism for cross-client cache coherence
 - [x] MetadataCache TTL fallback (2s) + TTL bypass for non-open files
 
 ### Phase 3: Protocol & Storage (Completed)
@@ -823,7 +821,7 @@ Options:
 - [x] Transport trait abstraction (TCP/RDMA/QUIC unified interface)
 
 ### Phase 4: Strong Consistency Refactor (Completed 2026-08)
-- [x] **Filer Raft strong consistency**: All metadata operations go through Raft commit (replaced CRDT)
+- [x] **Filer Raft strong consistency**: All metadata operations go through Raft commit
 - [x] **MetadataClient trait**: Typed metadata API replacing raw TLV submit
 - [x] **LeaseManager trait**: Unified read/write lease management with RAII LeaseHandle
 - [x] **Callback Invalidation**: Filer → Client push for cross-client cache coherence
@@ -831,7 +829,6 @@ Options:
 - [x] **Creator subscription**: Filer Create/Mkdir establishes subscription for Invalidate notifications
 - [x] **Cross-client read visibility**: open-time getattr bypasses TTL + lease response carries chunk list
 - [x] **fsck tool**: Scans orphaned inodes/chunks, idempotent deletion (NeedleNotFound = success)
-- [x] **CRDT code deletion**: ~3244 lines removed (crdt_client/crdt_server/mock)
 - [x] Real FUSE mount end-to-end testing (3-round system correctness tests passed)
 - [x] fio performance benchmark (Phase 2 results documented)
 - [x] IO500 moderate config full run (all phases completed, exit 0)
@@ -980,17 +977,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Integration tests MUST run in the container environment. Do not connect to test environment from host via FUSE (network limitations).
 
-### 13. CRDT Dual-Source Design Caused 5 Recurring Bugs
-
-**Symptom**: Ghost files in readdir, duplicate entries in list, EEXIST false positives, ENOTEMPTY on rm -rf, lookup hardcoded is_dir=false.
-
-**Root Cause**: MetadataCache.path_map and DirORSet were both authoritative sources for directory entries, causing consistency complexity. CRDT approach had limited benefits for filesystem metadata.
-
-**Fix**: Migrated to Filer Raft strong consistency. Deleted ~3244 lines of CRDT code (crdt_client/crdt_server/mock). All metadata operations now go through Raft commit.
-
-**Lesson**: CRDT dual-source design is fundamentally flawed for filesystem metadata. Use single authoritative source (Filer Raft) + Callback Invalidation for cross-client coherence.
-
-### 14. read_blob Offset Mismatch (Data Loss for >2MB Files)
+### 13. read_blob Offset Mismatch (Data Loss for >2MB Files)
 
 **Symptom**: Files larger than 2MB return empty data after first chunk.
 
@@ -1000,7 +987,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Distinguish file-internal offset from needle-internal offset. Each chunk = one needle, so needle offset is always 0.
 
-### 15. Volume Server STATUS_ERR_NOT_FOUND Mismatch
+### 14. Volume Server STATUS_ERR_NOT_FOUND Mismatch
 
 **Symptom**: FUSE returns EIO instead of zero-fill for missing needles (new file extension).
 
@@ -1010,7 +997,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Error message matching requires precise protocol-level status code handling, not string matching on formatted error messages.
 
-### 16. Needle ID Collision (file_key Design Flaw)
+### 15. Needle ID Collision (file_key Design Flaw)
 
 **Symptom**: File B reads File A's data; consecutive files' needle ID ranges overlap.
 
@@ -1020,7 +1007,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: file_key semantics overloaded as both file-level identifier and chunk-level NeedleId causes recurring issues. Block allocation prevents ID range overlap.
 
-### 17. ChunkCache OOM During High-Concurrency Writes
+### 16. ChunkCache OOM During High-Concurrency Writes
 
 **Symptom**: FUSE container OOM/restart during IO500 IOR tests.
 
@@ -1030,7 +1017,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Cache eviction must account for dirty chunk scenarios; global backpressure needed for write-heavy workloads.
 
-### 18. InvalidateHandler Causing Flusher Failures
+### 17. InvalidateHandler Causing Flusher Failures
 
 **Symptom**: "inode has no fid" EIO errors during writes.
 
@@ -1040,7 +1027,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Cache invalidation must respect dirty state; invalidating dirty inodes causes data loss.
 
-### 19. Cross-Client Append Data Overwrite (Read-Before-Write)
+### 18. Cross-Client Append Data Overwrite (Read-Before-Write)
 
 **Symptom**: fuse-2 append to fuse-1 created file overwrites fuse-1's original data.
 
@@ -1050,7 +1037,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson**: Partial writes must read existing data first (read-before-write) when file already has data in target chunk range.
 
-### 20. VolumeClient update_lease Token Not Updated
+### 19. VolumeClient update_lease Token Not Updated
 
 **Symptom**: "Lease not found" errors blocking all subsequent lease acquisitions.
 
@@ -1076,8 +1063,8 @@ Based on the issues above, the following guidelines MUST be followed:
 8. **Code Quality**: Run `cargo fmt`, `cargo clippy -D warnings`, `cargo test` before every commit.
 9. **Lease Token Threading**: Pass lease tokens explicitly through call chains. Never re-acquire.
 10. **Inode vs FileKey**: Distinguish FUSE inode from Volume NeedleId. Lease uses inode.
-11. **Filer Raft for Metadata**: All filesystem metadata MUST go through Filer Raft. No CRDT or dual-source designs.
-12. **Callback Invalidation for Coherence**: Cross-client cache coherence via Filer push, not client polling or delta sync.
+11. **Filer Raft for Metadata**: All filesystem metadata MUST go through Filer Raft. Single authoritative source, no dual-source designs.
+12. **Callback Invalidation for Coherence**: Cross-client cache coherence via Filer push, not client polling.
 13. **No Request Forwarding**: No inter-service request forwarding; especially for Raft services, as forwarding amplifies failures.
 14. **TLV Type Matching**: create uses u32 for Mode/Uid/Gid, mkdir uses u64; handle_setattr uses loop-based decoding for optional fields.
 15. **NeedleNotFound = Success**: Treat NeedleNotFound errors as successful idempotent deletions in both TLV (FUSE client) and gRPC handlers.
@@ -1087,10 +1074,10 @@ Based on the issues above, the following guidelines MUST be followed:
 19. **Read-before-write optimization**: Skip reading existing data when writing covers entire chunk or new data regions (no_data_before and no_data_after conditions).
 20. **close sync with retry**: close sync operation (size/chunks to Filer) must have retry with timeout to handle filer unavailability.
 21. **GC checks**: GC MUST check nlink==0, no active lease, and open_count==0 before deleting inode.
-22. **Delta sync only with leader**: Ensure delta sync is only performed with the leader.
+22. **Metadata sync only with leader**: Ensure metadata sync (alloc_inode_batch, update_inode_size_chunks, open_count) is only performed with the Filer leader.
 23. **crc32 checks**: Must be performed during read operations.
 24. **gc_grace_period consistency**: Must be consistent across all filer nodes.
-25. **Monitoring required**: Monitor delta sync latency, GC backlog, lease queue length, and inode exhaustion rate.
+25. **Monitoring required**: Monitor metadata sync latency, GC backlog, lease queue length, and inode exhaustion rate.
 26. **ResilientMasterClient**: All gRPC clients connecting to Master use `ResilientMasterClient` from `powerfs-master` crate.
 27. **TlvMasterClient**: FUSE and kernel file system use TLV protocol via `TlvMasterClient` from `powerfs-master-net` crate.
 28. **Transport trait**: Communication layer must support RDMA via Transport trait abstraction (TCP/RDMA/QUIC unified interface).
