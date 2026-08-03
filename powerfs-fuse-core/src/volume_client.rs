@@ -14,7 +14,7 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::serialize::TlvDecoder;
-use powerfs_net::{ClientConfig, FieldId, PowerFsNetClient};
+use powerfs_net::{ClientConfig, FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND};
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
@@ -2345,15 +2345,27 @@ async fn process_data_request_internal(
                     ))
                 }
                 Ok(resp) => {
-                    log::error!(
-                        "process_data_request_internal: received error response: status={}",
-                        resp.header.status
-                    );
-                    breakers.record_failure(&volume_addr);
-                    Err(ClientError::Server(format!(
-                        "Server error: {}",
-                        resp.header.status
-                    )))
+                    // STATUS_ERR_NOT_FOUND (needle not found) is a common case for
+                    // sparse files / holes: the FUSE read path matches on
+                    // "needle not found" to zero-fill missing chunks. Without this
+                    // distinction, sparse-file reads return EIO instead of zeros.
+                    if resp.header.status == STATUS_ERR_NOT_FOUND {
+                        log::debug!(
+                            "process_data_request_internal: needle not found (status={})",
+                            resp.header.status
+                        );
+                        Err(ClientError::Server("needle not found".to_string()))
+                    } else {
+                        log::error!(
+                            "process_data_request_internal: received error response: status={}",
+                            resp.header.status
+                        );
+                        breakers.record_failure(&volume_addr);
+                        Err(ClientError::Server(format!(
+                            "Server error: {}",
+                            resp.header.status
+                        )))
+                    }
                 }
                 Err(e) => {
                     log::error!("process_data_request_internal: request failed: {}", e);
