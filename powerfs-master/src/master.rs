@@ -835,7 +835,7 @@ impl MasterNode {
         let persist_interval = block * FILE_KEY_BATCH_SIZE;
         // Persist on first allocation (key=1: (1-1)%interval==0) and every BATCH allocations after.
         // This ensures the first file_key is persisted, preventing collision on restart.
-        if allocated_key >= 1 && (allocated_key - 1) % persist_interval == 0 {
+        if allocated_key >= 1 && (allocated_key - 1).is_multiple_of(persist_interval) {
             // Persist the NEXT file_key (current + block, since current was just allocated)
             let new_next_key = allocated_key + block;
             let cmd = crate::raft_storage::RaftCommand::AdvanceFileKey {

@@ -1832,12 +1832,9 @@ impl FileSystem for PowerFsFs {
                             .map(|c| (c.needle_id, c.volume_id))
                             .unwrap_or((fid.file_key.saturating_add(chunk_idx), fid.volume_id.0));
                         match self.client.read_blob(
-                            &addr,
-                            vol_id,
-                            needle_id,
+                            &addr, vol_id, needle_id,
                             // offset=0: read from start of needle data (each needle = one chunk)
-                            0,
-                            read_size,
+                            0, read_size,
                         ) {
                             Ok(data) => {
                                 self.chunk_cache
