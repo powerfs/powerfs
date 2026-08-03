@@ -825,9 +825,19 @@ impl MasterNode {
     /// After allocating a file_key, check if we need to persist the advance
     /// via Raft. Called after the write lock on `self.volumes` is released.
     /// Best-effort: failures are logged but don't block the allocation.
+    ///
+    /// With block allocation, allocated_key = 1 + (N-1) * FILE_KEY_BLOCK_SIZE.
+    /// We persist every FILE_KEY_BATCH_SIZE allocations. The check uses:
+    ///   (allocated_key - 1) % (BLOCK_SIZE * BATCH_SIZE) == 0
+    /// which triggers on the 1st, (1+BATCH)th, (1+2*BATCH)th, ... allocations.
     async fn maybe_advance_file_key(&self, volume_id: u64, allocated_key: u64) {
-        if allocated_key > 0 && allocated_key.is_multiple_of(FILE_KEY_BATCH_SIZE) {
-            let new_next_key = allocated_key + 1;
+        let block = powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
+        let persist_interval = block * FILE_KEY_BATCH_SIZE;
+        // Persist on first allocation (key=1: (1-1)%interval==0) and every BATCH allocations after.
+        // This ensures the first file_key is persisted, preventing collision on restart.
+        if allocated_key >= 1 && (allocated_key - 1) % persist_interval == 0 {
+            // Persist the NEXT file_key (current + block, since current was just allocated)
+            let new_next_key = allocated_key + block;
             let cmd = crate::raft_storage::RaftCommand::AdvanceFileKey {
                 volume_id,
                 new_next_key,
@@ -1622,7 +1632,7 @@ impl MasterNode {
                 let mut volumes = self.volumes.write().unwrap();
                 if let Some(vol_info) = volumes.get_mut(&existing_vid) {
                     let key = vol_info.next_file_key;
-                    vol_info.next_file_key += 1;
+                    vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
                     key
                 } else {
                     1
@@ -1758,13 +1768,17 @@ impl MasterNode {
         Ok((volume_ids, start_idx))
     }
 
-    /// 在指定 volume 上分配一个新的 file_key（自增）
+    /// 在指定 volume 上分配一个新的 file_key（块分配，每文件 FILE_KEY_BLOCK_SIZE 个 needle ID）
+    ///
+    /// Each file gets a non-overlapping block: [file_key, file_key + FILE_KEY_BLOCK_SIZE).
+    /// Chunks within the file use needle_id = file_key + chunk_idx, so consecutive
+    /// files never collide (fixes needle ID overlap bug).
     pub async fn allocate_file_key(&self, volume_id: &VolumeId) -> Option<u64> {
         let allocated_key = {
             let mut volumes = self.volumes.write().unwrap();
             if let Some(vol_info) = volumes.get_mut(volume_id) {
                 let key = vol_info.next_file_key;
-                vol_info.next_file_key += 1;
+                vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
                 Some(key)
             } else {
                 None
@@ -1867,7 +1881,7 @@ impl MasterNode {
             let mut volumes = self.volumes.write().unwrap();
             if let Some(vol_info) = volumes.get_mut(&volume_id) {
                 let key = vol_info.next_file_key;
-                vol_info.next_file_key += 1;
+                vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
                 key
             } else {
                 1
@@ -1994,7 +2008,7 @@ impl MasterNode {
             let mut volumes = self.volumes.write().unwrap();
             if let Some(vol_info) = volumes.get_mut(&volume_id) {
                 let key = vol_info.next_file_key;
-                vol_info.next_file_key += 1;
+                vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
                 key
             } else {
                 1

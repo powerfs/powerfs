@@ -579,6 +579,16 @@ impl MetadataCache {
             let mtime = entry.mtime.max(0) as u64;
 
             for chunk_idx in start_chunk_idx..=end_chunk_idx {
+                // Safety: chunk_idx must fit within FILE_KEY_BLOCK_SIZE to avoid
+                // needle ID overflow into the next file's block (2TB max @ 2MB chunks).
+                if chunk_idx >= powerfs_common::constants::FILE_KEY_BLOCK_SIZE {
+                    log::error!(
+                        "chunk_idx {} exceeds FILE_KEY_BLOCK_SIZE {} (file too large, max 2TB)",
+                        chunk_idx,
+                        powerfs_common::constants::FILE_KEY_BLOCK_SIZE
+                    );
+                    break;
+                }
                 let chunk_offset = chunk_idx * chunk_size;
                 let chunk_data_end = write_end.min(chunk_offset + chunk_size);
                 let chunk_data_size = chunk_data_end - chunk_offset;

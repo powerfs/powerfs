@@ -29,5 +29,13 @@ pub const POWERFS_VERSION: &str = "0.1.0";
 pub const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 pub const MAX_BLOCK_SIZE: usize = 1024 * 1024;
 
+/// Number of needle IDs reserved per file_key allocation.
+///
+/// Each file gets a non-overlapping block of needle IDs: [file_key, file_key + FILE_KEY_BLOCK_SIZE).
+/// Chunks within a file use needle_id = file_key + chunk_idx, so consecutive files
+/// never collide. With 2MB chunks, this supports files up to 2TB (1M chunks × 2MB).
+/// u64 capacity: 2^64 / 1M = 1.8×10^13 files per volume (practically unlimited).
+pub const FILE_KEY_BLOCK_SIZE: u64 = 1_048_576; // 1M chunks per file = 2TB max @ 2MB chunks
+
 pub const LRU_CACHE_SIZE: usize = 100_000;
 pub const INDEX_CACHE_SIZE: usize = 10_000;

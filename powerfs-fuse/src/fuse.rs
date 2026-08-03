@@ -548,6 +548,17 @@ impl PowerFsFs {
         let chunks_to_flush: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
             .iter()
             .filter_map(|(_, chunk_idx)| {
+                // Safety: chunk_idx must fit within FILE_KEY_BLOCK_SIZE to avoid
+                // needle ID overflow into the next file's block.
+                if *chunk_idx >= powerfs_common::constants::FILE_KEY_BLOCK_SIZE {
+                    error!(
+                        "chunk_idx {} exceeds FILE_KEY_BLOCK_SIZE {} (file too large)",
+                        chunk_idx,
+                        powerfs_common::constants::FILE_KEY_BLOCK_SIZE
+                    );
+                    had_error = true;
+                    return None;
+                }
                 let chunk_offset = chunk_idx * chunk_size;
                 let chunk_data = self.chunk_cache.get(inode, chunk_offset)?;
                 let data_len = chunk_data.data.len();
