@@ -1736,6 +1736,21 @@ impl ChunkCache {
         }
     }
 
+    /// 清除指定 inode 中特定 chunk 的脏标记。
+    /// 在 flush_dirty_chunks_impl 成功写入 volume server 后调用，
+    /// 使这些 chunk 可被 evict_if_needed 驱逐。
+    /// 只清除传入的 chunk_idx 对应的 chunk，不影响同 inode 的其他 chunk。
+    pub fn clear_dirty_for_chunks(&self, inode: u64, chunk_offsets: &[u64]) {
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            for ((ino, off), chunk) in cache.iter_mut() {
+                if *ino == inode && chunk_offsets.contains(off) {
+                    chunk.dirty = false;
+                }
+            }
+        }
+    }
+
     pub fn dirty_chunks(&self) -> u64 {
         let mut count: u64 = 0;
         for shard in &self.shards {
