@@ -358,6 +358,7 @@ impl MetaShardManager {
     }
 
     pub async fn create_file(&self, parent_inode: u64, name: &str) -> Result<InodeInfo, String> {
+        let t0 = std::time::Instant::now();
         let shard_id = self.shard_strategy.calculate_shard(parent_inode);
 
         let shard_store = {
@@ -376,16 +377,25 @@ impl MetaShardManager {
             inode,
         };
 
+        let t_propose = std::time::Instant::now();
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+        let propose_ms = t_propose.elapsed().as_millis();
 
+        let t_poll = std::time::Instant::now();
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 50 {
             if let Some(info) = shard_store.get_inode(inode) {
+                let poll_ms = t_poll.elapsed().as_millis();
+                let total_ms = t0.elapsed().as_millis();
+                log::info!(
+                    "create_file latency: propose={}ms, poll={}ms (retries={}), total={}ms, inode={}",
+                    propose_ms, poll_ms, retries, total_ms, inode
+                );
                 return Ok(info);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             retries += 1;
         }
 
@@ -457,11 +467,11 @@ impl MetaShardManager {
             .await?;
 
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 50 {
             if let Some(info) = shard_store.get_inode(inode) {
                 return Ok(info);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             retries += 1;
         }
 
@@ -665,6 +675,7 @@ impl MetaShardManager {
         name: &str,
         shard_id: ShardId,
     ) -> Result<u64, String> {
+        let t0 = std::time::Instant::now();
         {
             let stores = self.shard_stores.read().unwrap();
             if stores.get(&shard_id).is_none() {
@@ -680,20 +691,29 @@ impl MetaShardManager {
             inode,
         };
 
+        let t_propose = std::time::Instant::now();
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+        let propose_ms = t_propose.elapsed().as_millis();
 
+        let t_poll = std::time::Instant::now();
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 50 {
             if let Ok(stores) = self.shard_stores.read() {
                 if let Some(shard_store) = stores.get(&shard_id) {
                     if shard_store.get_inode(inode).is_some() {
+                        let poll_ms = t_poll.elapsed().as_millis();
+                        let total_ms = t0.elapsed().as_millis();
+                        log::info!(
+                            "create_file_with_shard latency: propose={}ms, poll={}ms (retries={}), total={}ms, inode={}",
+                            propose_ms, poll_ms, retries, total_ms, inode
+                        );
                         return Ok(inode);
                     }
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             retries += 1;
         }
 
@@ -1073,11 +1093,11 @@ impl MetaShardManager {
             .await?;
 
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 50 {
             if let Some(info) = shard_store.get_inode(inode) {
                 return Ok(info);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             retries += 1;
         }
 
@@ -1423,7 +1443,7 @@ impl MetaShardManager {
             .await?;
 
         let mut retries = 0;
-        while retries < 10 {
+        while retries < 50 {
             let applied = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -1434,7 +1454,7 @@ impl MetaShardManager {
             if applied {
                 return Ok(inode);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             retries += 1;
         }
 

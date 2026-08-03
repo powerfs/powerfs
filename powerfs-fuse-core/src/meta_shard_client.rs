@@ -637,6 +637,20 @@ impl MetaShardClient {
             .insert(shard_id, ShardInfo::new(shard_id, leader_addr));
     }
 
+    /// Calculate shard_id from an inode using the same formula as the filer's ShardStrategy.
+    /// This ensures the FUSE client looks up the correct leader in shard_router,
+    /// avoiding redirects on every request.
+    /// Formula: (inode / inode_per_shard) % shard_count
+    /// inode_per_shard = 1_000_000 (must match filer's ShardStrategy::calculate_inode_per_shard)
+    pub fn calculate_shard_id(&self, inode: u64) -> u64 {
+        let shard_count = self.shard_router.len().max(1) as u64;
+        if shard_count <= 1 {
+            return 0;
+        }
+        let inode_per_shard = 1_000_000u64;
+        (inode / inode_per_shard) % shard_count
+    }
+
     /// 获取当前状态
     pub fn state(&self) -> MetaShardClientState {
         *self.state.lock().unwrap()
@@ -1054,7 +1068,8 @@ impl MetaShardClient {
                             );
                             self.shard_router
                                 .insert(shard_id, ShardInfo::new(shard_id, new_addr));
-                            let delay_ms = 50u64 << (attempt - 1).min(3);
+                            // Minimal backoff for local cluster: 5ms instead of 50ms.
+                            let delay_ms = 5u64 << (attempt - 1).min(3);
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue;
                         }
@@ -1681,8 +1696,8 @@ pub(crate) async fn process_request_internal(
                         // 更新分片路由表
                         shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
 
-                        // 指数退避延迟，避免 Leader 选举期间的请求风暴
-                        let delay_ms = (50u64) << (attempt - 1).min(3); // 50ms, 100ms, 200ms, 400ms
+                        // Minimal backoff for local cluster: 5ms instead of 50ms.
+                        let delay_ms = (5u64) << (attempt - 1).min(3);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
                         // 重试请求

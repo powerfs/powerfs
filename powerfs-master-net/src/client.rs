@@ -50,7 +50,7 @@ impl Default for TlvMasterClientConfig {
             request_timeout: Duration::from_secs(10),
             max_retries: 3,
             max_redirects: 5,
-            retry_backoff: Duration::from_millis(200),
+            retry_backoff: Duration::from_millis(5),
         }
     }
 }

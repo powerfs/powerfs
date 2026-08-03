@@ -775,11 +775,12 @@ impl PowerFsFs {
         if self.lookup_in_cache(parent, name).is_some() {
             return true;
         }
-        // 查 Filer（shard_id = parent_ino）
+        // 查 Filer（shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name.to_string();
         self.client
-            .block_on(async move { meta_client.lookup(parent, &name_owned, parent).await })
+            .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
             .is_ok()
     }
 
@@ -936,12 +937,13 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
-        // 2. Step 2: Filer RPC（强一致 Leader Lease Read，shard_id = parent_ino）
+        // 2. Step 2: Filer RPC（强一致 Leader Lease Read, shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
         let attr = self
             .client
-            .block_on(async move { meta_client.lookup(parent, &name_owned, parent).await })
+            .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
             .map_err(|e| {
                 debug!("lookup RPC failed for '{}/{}': {}", parent, name_str, e);
                 std::io::Error::from_raw_os_error(libc::ENOENT)
@@ -1110,8 +1112,9 @@ impl FileSystem for PowerFsFs {
             mtime,
         };
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(inode);
         self.client
-            .block_on(async move { meta_client.setattr(inode, &params, inode).await })
+            .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
             .map_err(|e| {
                 error!("setattr RPC failed for inode {}: {}", inode, e);
                 std::io::Error::from_raw_os_error(libc::EIO)
@@ -1312,6 +1315,7 @@ impl FileSystem for PowerFsFs {
         fuse_backend_rs::abi::fuse_abi::OpenOptions,
         Option<u32>,
     )> {
+        let t0 = std::time::Instant::now();
         let name_str = name.to_str().unwrap_or("");
         debug!(
             "create: parent={}, name={}, mode={:o}",
@@ -1324,6 +1328,7 @@ impl FileSystem for PowerFsFs {
 
         let now = chrono::Utc::now().timestamp();
 
+        let t_assign = std::time::Instant::now();
         let (fid, _location, _stripe_fids, _stripe_locations) = self
             .client
             .assign_fid(&self.collection, &self.replication)
@@ -1331,6 +1336,7 @@ impl FileSystem for PowerFsFs {
                 error!("assign_fid failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
+        let assign_ms = t_assign.elapsed().as_millis();
 
         let needle_id = fid.file_key;
         let volume_id = fid.volume_id.0;
@@ -1343,6 +1349,7 @@ impl FileSystem for PowerFsFs {
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
         let name_owned = name_str.to_string();
+        let t_create = std::time::Instant::now();
         let attr = self
             .client
             .block_on(async move {
@@ -1354,7 +1361,15 @@ impl FileSystem for PowerFsFs {
                 error!("create RPC failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
+        let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
+        info!(
+            "FUSE create timing: assign_fid={}ms, create_rpc={}ms, total={}ms, inode={}",
+            assign_ms,
+            create_ms,
+            t0.elapsed().as_millis(),
+            inode
+        );
 
         // 构造 CachedEntry：fid/chunks 来自客户端 assign_fid，attr 来自 Filer RPC。
         // size/chunks 在 close 时由 sync_size_chunks_on_close 强一致同步到 filer。

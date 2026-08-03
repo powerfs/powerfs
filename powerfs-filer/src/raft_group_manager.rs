@@ -273,7 +273,7 @@ impl RaftGroup {
     pub async fn run(&mut self) -> Result<(), String> {
         info!("Starting Raft event loop for shard {}", self.shard_id.0);
 
-        let mut tick_interval = interval(Duration::from_millis(200));
+        let mut tick_interval = interval(Duration::from_millis(50));
         let mut tick_count = 0u64;
 
         while *self.running.read().await {
