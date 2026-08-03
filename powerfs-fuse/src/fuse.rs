@@ -190,6 +190,7 @@ impl FuseApp {
             has_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             flush_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            backpressure_lock: Arc::new(std::sync::Mutex::new(())),
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
@@ -333,6 +334,12 @@ struct PowerFsFs {
     /// release to prevent the TOCTOU race where release removes a lease token
     /// from the server while the background flusher is still using it.
     flush_locks: FlushLocks,
+    /// Global backpressure lock: when the chunk cache exceeds a high
+    /// watermark, write threads acquire this lock to serialize cache flushes.
+    /// Without this, multiple FUSE worker threads concurrently writing would
+    /// each trigger an independent flush while the others keep growing the
+    /// cache, defeating the backpressure and causing unbounded memory growth.
+    backpressure_lock: Arc<std::sync::Mutex<()>>,
     stripe_size: u64,
     lease_duration_ms: u64,
     /// Step 6: 统一 lease 入口 + 读路径缓存复用。
@@ -1952,6 +1959,47 @@ impl FileSystem for PowerFsFs {
             return Ok(0);
         }
         buf.truncate(read_len);
+
+        // Backpressure: if cache is near capacity, synchronously flush dirty
+        // chunks to free up space BEFORE adding new data. Without this, heavy
+        // writes (e.g., IO500 IOR) fill the cache with dirty chunks that
+        // cannot be evicted (eviction only removes non-dirty chunks), causing
+        // unbounded memory growth (observed 1.5GB vs 512MB limit) and OOM.
+        //
+        // The global backpressure lock serializes flushes across ALL FUSE
+        // worker threads. Without it, each worker independently triggers a
+        // flush while the others keep growing the cache, defeating the
+        // backpressure. With the lock, when one worker flushes, all others
+        // that detect the same condition block until the flush completes,
+        // effectively pausing all writes during the flush.
+        {
+            const BACKPRESSURE_THRESHOLD_PCT: u64 = 85;
+            let max = self.chunk_cache.max_bytes() as u64;
+            if max > 0 {
+                let threshold = max * BACKPRESSURE_THRESHOLD_PCT / 100;
+                let current = self.chunk_cache.current_bytes();
+                if current > threshold {
+                    // Acquire global lock so only one thread flushes at a time.
+                    // Other write threads block here, preventing concurrent
+                    // cache growth during the flush.
+                    let _bp_guard = self
+                        .backpressure_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    // Re-check after acquiring lock: the previous flush may have
+                    // already reduced the cache below threshold.
+                    let current = self.chunk_cache.current_bytes();
+                    if current > threshold {
+                        debug!(
+                            "write: backpressure flush — cache {} > {} ({}% of max), flushing dirty chunks before write inode={}",
+                            current, threshold, BACKPRESSURE_THRESHOLD_PCT, inode
+                        );
+                        let _ = self.flush_all_dirty_chunks();
+                    }
+                    // Lock released here; other threads can now proceed.
+                }
+            }
+        }
 
         let is_append = (flags & FUSE_APPEND) != 0;
 

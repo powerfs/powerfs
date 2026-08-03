@@ -19,7 +19,7 @@ net_port = 8903               # powerfs-net端口 (与http_port不同!)
 data_dir = "/data"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
 node_id = "volume-server-3"
-max_volume_size = 10737418240
+max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "172.30.0.23"
 
