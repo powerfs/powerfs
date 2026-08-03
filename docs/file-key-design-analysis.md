@@ -1,12 +1,12 @@
 # file_key 设计缺陷分析与修复方案
 
 > 文档创建：2026-08-02
-> 最后更新：2026-08-02
-> 状态：**已实施** — 修复方案 A/B/C 已全部完成，D（fsck）作为后续任务
+> 最后更新：2026-08-03
+> 状态：**已实施** — 修复方案 A/B/C/D 全部完成，问题5（needle ID 冲突）已通过块分配彻底修复
 
 ## 1. 背景与问题概述
 
-file_key 在系统中反复出现 4 次问题（2 次已修复、1 次新发现未修复、1 次潜在隐患），每次修复都只针对单一路径，未触及根本设计缺陷。本文档系统梳理 file_key 的设计初衷、数据表示、问题历史与根本原因，并规划彻底的修复方案。
+file_key 在系统中反复出现 5 次问题，每次修复都只针对单一路径，未触及根本设计缺陷。本文档系统梳理 file_key 的设计初衷、数据表示、问题历史与根本原因，并规划彻底的修复方案。
 
 ---
 
@@ -613,3 +613,93 @@ pub struct FileChunk {
 | fio 顺序读 | ✅ | 107 MiB/s（bs=64k, size=64M） |
 | fio 随机写 | ✅ | 6.5 MiB/s（bs=4k, size=4M） |
 | fio 随机读 | ✅ | 6.0 MiB/s（bs=4k, size=4M） |
+
+---
+
+## 10. Needle ID 冲突修复：块分配方案（2026-08-03）
+
+### 10.1 问题5（新发现，已修复）：needle ID 范围重叠
+
+**发现过程**：在修复 `read_blob` offset 语义后，测试稀疏文件（sparse file）时发现 hole 区域读到非零数据。深入排查发现是 needle ID 冲突。
+
+**根因**：master 的 `allocate_file_key` 使用 `next_file_key += 1`，但多 chunk 文件通过 `needle_id = file_key + chunk_idx` 消费多个 needle ID。连续文件的 needle ID 范围重叠：
+
+```
+File A: file_key=10, 25 chunks → needle IDs 10, 11, 12, ..., 34
+File B: file_key=11,  5 chunks → needle IDs 11, 12, 13, 14, 15  ← 与 A 重叠!
+```
+
+File B 读取 chunk 0 (needle_id=11) 时，实际读到 File A 的 chunk 1 数据（数据泄漏 + 正确性 bug）。
+
+**影响**：
+- 多文件场景下数据交叉污染
+- 稀疏文件 hole 区域读到旧文件残留数据
+- 这是 file_key + chunk_idx 设计的第 **5** 次问题复现
+
+### 10.2 修复方案：file_key 块分配
+
+**核心改动**：master 分配 file_key 时按块分配，每文件预留 `FILE_KEY_BLOCK_SIZE` 个 needle ID。
+
+```rust
+// powerfs-common/src/constants.rs
+pub const FILE_KEY_BLOCK_SIZE: u64 = 1_048_576; // 1M chunks/file = 2TB max @ 2MB chunks
+
+// powerfs-master/src/master.rs (4 处 allocate_file_key 路径)
+vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
+```
+
+**修复效果**：
+```
+修复前 (+= 1):
+  File A: file_key=10, 25 chunks → needle IDs 10,11,...,34
+  File B: file_key=11,  5 chunks → needle IDs 11,12,...,15  ← 重叠!
+
+修复后 (+= 1,048,576):
+  File A: file_key=1,            25 chunks → needle IDs 1,2,...,25
+  File B: file_key=1,048,577,     5 chunks → needle IDs 1048577,...,1048581  ← 无重叠!
+```
+
+**容量分析**：
+- 单文件最大：1,048,576 chunks × 2MB = **2TB**（足够覆盖 IO500 和生产场景）
+- 单 volume 文件数：2^64 / 1,048,576 = **1.8×10^13**（ practically unlimited）
+
+### 10.3 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| powerfs-common/src/constants.rs | 新增 `FILE_KEY_BLOCK_SIZE = 1_048_576` |
+| powerfs-master/src/master.rs | 4 处 `allocate_file_key`: `+= 1` → `+= FILE_KEY_BLOCK_SIZE` |
+| powerfs-master/src/master.rs | `maybe_advance_file_key`: 适配块大小，首次分配也持久化 |
+| powerfs-master/src/server.rs | `file_count = (next_file_key - 1) / FILE_KEY_BLOCK_SIZE` |
+| powerfs-fuse/src/fuse.rs | flush 路径加 `chunk_idx >= BLOCK_SIZE` 安全检查 |
+| powerfs-fuse/src/cache.rs | chunk 创建路径加同样安全检查 |
+
+### 10.4 验证结果（2026-08-03，全新集群）
+
+| 测试项 | 结果 | 说明 |
+|---|---|---|
+| 5 文件 × 10MB 多 chunk | ✅ 5/5 | 文件间无数据交叉污染 |
+| 全空洞稀疏文件 (10MB) | ✅ | 读取全零（needle-not-found → zero-fill） |
+| 带空洞稀疏文件 (hole at chunk 1) | ✅ 3/3 | chunk 0 有数据, chunk 1 零填充, chunk 2 有数据 |
+| 稀疏文件后顺序读写 | ✅ | 20MB 文件 MD5 匹配 |
+| 8 并发文件 | ✅ | 全部 MD5 匹配，无冲突 |
+| 50MB 大文件 (25 chunks) | ✅ | MD5 匹配 |
+| 目录操作 (mkdir/rename/rmdir) | ✅ | 全部通过 |
+| append write | ✅ | 3 行追加正确 |
+| overwrite (truncate + rewrite) | ✅ | 大小保持正确 |
+| fio 顺序写 (64k) | ✅ 86.7 MiB/s | 无回归 |
+| fio 顺序读 (64k) | ✅ 1169 MiB/s | 无回归 |
+| fio 随机读 (4k) | ✅ 99.7 MiB/s | 无回归 |
+| fio 随机写 (4k) | ✅ 4.1 MiB/s | 无回归 |
+
+### 10.5 关联修复：needle-not-found 零填充
+
+块分配修复的同时，还修复了 needle-not-found 的错误处理链路：
+
+- **问题**：volume server 返回 `STATUS_ERR_NOT_FOUND (status=1)`，但 volume_client 统一格式化为 `"Server error: 1"`，FUSE 的 `e.contains("needle not found")` 不匹配 → EIO
+- **修复**：volume_client Read 路径检查 `STATUS_ERR_NOT_FOUND`，返回 `"needle not found"` 错误信息
+- **效果**：稀疏文件 hole 正确零填充，不再 EIO
+
+两个修复协同工作：
+1. 块分配确保 needle ID 不冲突（写入路径）
+2. needle-not-found 零填充确保 hole 正确处理（读取路径）

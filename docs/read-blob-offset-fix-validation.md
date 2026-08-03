@@ -104,3 +104,29 @@ offset: 0,  // needle 内偏移：每个 chunk = 一个 needle，从起始读取
    - offset 修复使多 chunk 读取路径正确工作
 3. **随机写**：性能下降 22% 是正确性修复的必要代价（read-before-write 现在真正执行）
 4. **冷读 830 MiB/s** 证明性能提升是真实的，非缓存假象
+
+## 6. 后续修复（2026-08-03）
+
+offset 修复后发现的两个关联问题也已修复：
+
+### 6.1 needle-not-found 零填充（Commit `9aceb25e`）
+
+- **问题**：volume_client 把 `STATUS_ERR_NOT_FOUND(1)` 格式化为 `"Server error: 1"`，FUSE 的 `e.contains("needle not found")` 不匹配 → EIO
+- **修复**：Read 路径检查 `STATUS_ERR_NOT_FOUND` → 返回 `"needle not found"` → 触发零填充
+
+### 6.2 needle ID 冲突块分配（Commit `7354c610`）
+
+- **问题**：master `next_file_key += 1` 每文件只增 1，但多 chunk 文件消费 `file_key + chunk_idx`（多个 needle ID），导致连续文件 needle ID 重叠
+- **修复**：`next_file_key += FILE_KEY_BLOCK_SIZE (1,048,576)`，每文件预留 1M needle ID（2TB max @ 2MB chunks）
+- **验证**：全新集群 13/13 正确性测试通过，包括稀疏文件零填充、8 并发文件无冲突、50MB 大文件
+
+### 6.3 最终性能数据（块分配后，全新集群）
+
+| 工作负载 | 带宽 | 对比 offset 修复后 |
+|---------|------|-------------------|
+| 顺序写 (64k) | 86.7 MiB/s | -7% (新集群正常波动) |
+| 顺序读 (64k) | 1169 MiB/s | -1% |
+| 随机读 (4k) | 99.7 MiB/s | +1% |
+| 随机写 (4k) | 4.1 MiB/s | +2% |
+
+块分配对性能无显著影响（±2% 噪声范围内）。
