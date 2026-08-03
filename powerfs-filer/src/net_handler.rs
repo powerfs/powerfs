@@ -203,10 +203,15 @@ impl FilerNetHandler {
         if let Some(volume_id) = info.volume_id {
             enc.add_u64(FieldId::VolumeId, volume_id);
         }
+        // Note: Do NOT add FieldId::Size here — the caller already adds the
+        // correct total file size (entry_info.size) before calling us. Adding
+        // chunk.size (first chunk's size, e.g. 2MB) would create a duplicate
+        // Size field, and TLV decoders that pick the last occurrence would
+        // return the chunk size instead of the total file size, breaking
+        // cross-client visibility (e.g. stat shows 2MB for a 20MB file).
         if let Some(chunk) = info.chunks.first() {
             enc.add_u64(FieldId::Cookie, 0);
             enc.add_u64(FieldId::FileKey, chunk.offset);
-            enc.add_u64(FieldId::Size, chunk.size);
         }
         Ok(())
     }
@@ -264,8 +269,8 @@ impl FilerNetHandler {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
                 info!(
-                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}",
-                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name
+                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}, size={}, chunks={}",
+                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name, entry_info.size, info.chunks.len()
                 );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, entry_info.ino);
@@ -321,9 +326,10 @@ impl FilerNetHandler {
                 // open() 时无法刷新账本，跨客户端读文件触发 I/O error。
                 Self::encode_chunks_fields(&mut enc, &info)?;
                 info!(
-                    "FILER_NET_GETATTR: returned info for ino={}, name={}, chunks={}",
+                    "FILER_NET_GETATTR: returned info for ino={}, name={}, size={}, chunks={}",
                     ino,
                     entry_info.name,
+                    entry_info.size,
                     info.chunks.len()
                 );
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
@@ -966,11 +972,20 @@ impl FilerNetHandler {
                 }
             };
 
+        info!(
+            "FILER_NET_UPDATE_SIZE_CHUNKS: req.shard_id={}, inode={}, size={}, chunks={}",
+            req.shard_id, req.inode, req.size, req.chunks.len()
+        );
+
         // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
             .calculate_shard(req.shard_id);
+        info!(
+            "FILER_NET_UPDATE_SIZE_CHUNKS: calculated shard_id={}, is_leader_check",
+            shard_id.0
+        );
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
