@@ -2,6 +2,24 @@
 name = "powerfs-monitor"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+homepage = "https://www.powerfs.org"
+repository = "https://github.com/fudanPPI/powerfs"
+description = "PowerFS Monitor - metrics, alerting, and web dashboard backend"
+
+[package.metadata.deb]
+maintainer = "PowerFS Team <jiangjinhu@fudan.edu.cn>"
+section = "net"
+priority = "optional"
+depends = "powerfs-cli (= 0.1.0)"
+conf-files = ["/etc/powerfs/powerfs.env"]
+assets = [
+    ["target/release/powerfs-monitor", "usr/bin/", "755"],
+    ["../powerfs-packaging/systemd/powerfs-monitor.service", "lib/systemd/system/", "644"],
+    ["../powerfs-packaging/scripts/postinst", "DEBIAN/postinst", "755"],
+    ["../powerfs-packaging/scripts/prerm", "DEBIAN/prerm", "755"],
+    ["../powerfs-packaging/scripts/postrm", "DEBIAN/postrm", "755"],
+]
 
 [[bin]]
 name = "powerfs-monitor"

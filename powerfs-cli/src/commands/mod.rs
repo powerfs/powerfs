@@ -1,5 +1,6 @@
 mod assign;
 mod cluster_add;
+mod config_gen;
 mod cluster_remove;
 mod cluster_status;
 mod cluster_transfer;
@@ -19,6 +20,7 @@ mod write;
 
 pub use assign::{assign, AssignArgs};
 pub use cluster_add::{cluster_add, ClusterAddArgs};
+pub use config_gen::{config_gen, ConfigGenArgs};
 pub use cluster_remove::{cluster_remove, ClusterRemoveArgs};
 pub use cluster_status::{cluster_status, ClusterStatusArgs};
 pub use cluster_transfer::{cluster_transfer, ClusterTransferArgs};

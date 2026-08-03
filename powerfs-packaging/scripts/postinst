@@ -1,0 +1,65 @@
+#!/bin/sh
+# postinst script for powerfs packages
+# Creates the powerfs system user/group and required directories.
+
+set -e
+
+case "$1" in
+    configure)
+        # Create powerfs group if it does not exist
+        if ! getent group powerfs >/dev/null 2>&1; then
+            addgroup --system powerfs
+        fi
+
+        # Create powerfs user if it does not exist
+        if ! getent passwd powerfs >/dev/null 2>&1; then
+            adduser --system \
+                --ingroup powerfs \
+                --home /var/lib/powerfs \
+                --no-create-home \
+                --disabled-login \
+                --gecos "PowerFS service user" \
+                powerfs
+        fi
+
+        # Create runtime directories
+        install -d -o powerfs -g powerfs -m 0755 /var/lib/powerfs
+        install -d -o powerfs -g powerfs -m 0755 /var/log/powerfs
+        install -d -o root -g root -m 0755 /etc/powerfs
+
+        # Add powerfs user to the fuse group if it exists (for /dev/fuse access)
+        if getent group fuse >/dev/null 2>&1; then
+            usermod -aG fuse powerfs 2>/dev/null || true
+        fi
+
+        # Ensure /etc/powerfs/powerfs.env exists (optional, empty by default)
+        if [ ! -f /etc/powerfs/powerfs.env ]; then
+            cat > /etc/powerfs/powerfs.env <<'EOF'
+# PowerFS environment overrides (sourced by systemd units)
+# RUST_LOG=info
+EOF
+            chmod 0644 /etc/powerfs/powerfs.env
+        fi
+
+        # Reload systemd unit files if any new .service files were installed
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+    abort-upgrade|abort-deconfigure|abort-remove)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+# dh_systemd_start / dh_installsystemd compatibility (no-op if not present)
+# Automatically enable units via deb-systemd-helper if available
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    # The actual unit name(s) are passed via the deb-systemd-helper machinery
+    # in official Debian packaging; for manual installs we skip auto-enable.
+    :
+fi
+
+exit 0

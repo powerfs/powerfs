@@ -8,9 +8,16 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    CollectionArgs, CompactArgs, ConflictsArgs, FsckArgs, GrowArgs, HeartbeatArgs, KvArgs,
-    LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, FsckArgs, GrowArgs, HeartbeatArgs,
+    KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
 };
+
+/// `powerfs-cli config` subcommands.
+#[derive(Subcommand, Debug)]
+enum ConfigSubcommand {
+    /// Generate per-node config files from cluster topology
+    Gen(ConfigGenArgs),
+}
 
 /// PowerFS CLI tool for testing and administration
 #[derive(Parser)]
@@ -86,6 +93,12 @@ enum Commands {
 
     /// Filesystem consistency check (orphaned needles, ghost references, metadata anomalies)
     Fsck(FsckArgs),
+
+    /// Configuration file management (generate per-node configs from topology)
+    Config {
+        #[command(subcommand)]
+        command: ConfigSubcommand,
+    },
 }
 
 #[tokio::main]
@@ -100,6 +113,19 @@ async fn main() {
         _ => log::LevelFilter::Trace,
     };
     env_logger::Builder::new().filter_level(log_level).init();
+
+    // `config` subcommands do not require a master connection; handle before creating client.
+    if let Commands::Config { command } = cli.command {
+        match command {
+            ConfigSubcommand::Gen(args) => {
+                if let Err(e) = commands::config_gen(&args) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
 
     info!("Connecting to master at: {}", cli.master);
 
@@ -129,6 +155,7 @@ async fn main() {
         }
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
         Commands::Fsck(args) => commands::fsck(client, args).await,
+        Commands::Config { .. } => unreachable!("handled above"),
     };
 
     if let Err(e) = result {

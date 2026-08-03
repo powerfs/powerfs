@@ -1,0 +1,31 @@
+#!/bin/sh
+# prerm script for powerfs packages
+# Stops the service before removal (does NOT delete data or user).
+
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Each package's prerm is invoked with the unit name(s) it owns.
+        # We attempt to stop any powerfs-* service that matches the package;
+        # deb-systemd-helper / systemctl handles unknown units gracefully.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop powerfs-master.service \
+                           powerfs-volume.service \
+                           powerfs-filer.service \
+                           powerfs-fuse.service \
+                           powerfs-s3.service \
+                           powerfs-monitor.service 2>/dev/null || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        # On upgrade we let the package manager replace files; systemd is
+        # restarted by the postinst of the new package via dh_installsystemd.
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

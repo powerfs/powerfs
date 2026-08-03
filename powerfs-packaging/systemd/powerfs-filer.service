@@ -1,0 +1,29 @@
+[Unit]
+Description=PowerFS Filer Server
+Documentation=https://github.com/fudanPPI/powerfs
+After=network-online.target powerfs-master.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=powerfs
+Group=powerfs
+ExecStart=/usr/bin/powerfs-filer --config /etc/powerfs/filer.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitNPROC=65536
+TasksMax=infinity
+
+WorkingDirectory=/var/lib/powerfs
+EnvironmentFile=-/etc/powerfs/powerfs.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/powerfs /data
+
+[Install]
+WantedBy=multi-user.target

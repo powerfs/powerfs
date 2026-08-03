@@ -1,0 +1,37 @@
+#!/bin/sh
+# postrm script for powerfs packages
+# Removes systemd units and (on purge) removes user/data.
+
+set -e
+
+case "$1" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+    purge)
+        # Remove systemd unit files (already removed by dpkg, just reload)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+
+        # Remove the powerfs user/group only on full purge.
+        # Keep data directories (/var/lib/powerfs, /data) intact by default —
+        # operator must remove them explicitly if desired.
+        if getent passwd powerfs >/dev/null 2>&1; then
+            deluser powerfs 2>/dev/null || true
+        fi
+        if getent group powerfs >/dev/null 2>&1; then
+            delgroup powerfs 2>/dev/null || true
+        fi
+        ;;
+    failed-upgrade|abort-install|disappear|upgrade)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

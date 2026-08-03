@@ -1,0 +1,38 @@
+[Unit]
+Description=PowerFS FUSE Client
+Documentation=https://github.com/fudanPPI/powerfs
+After=network-online.target powerfs-filer.service powerfs-volume.service
+Wants=network-online.target
+Before=remote-fs.target
+
+[Service]
+Type=simple
+User=powerfs
+Group=powerfs
+ExecStartPre=/bin/mkdir -p /mnt/powerfs
+ExecStartPre=/bin/chown powerfs:powerfs /mnt/powerfs
+ExecStart=/usr/bin/powerfs-fuse --config /etc/powerfs/fuse.toml --container
+ExecStopPost=/bin/umount -f /mnt/powerfs || true
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitNPROC=65536
+TasksMax=infinity
+
+WorkingDirectory=/var/lib/powerfs
+EnvironmentFile=-/etc/powerfs/powerfs.env
+
+# FUSE requires CAP_SYS_ADMIN for mount syscall
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+DeviceAllow=/dev/fuse rw
+
+# Hardening (relaxed for FUSE mount)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/powerfs /data /mnt/powerfs
+
+[Install]
+WantedBy=multi-user.target

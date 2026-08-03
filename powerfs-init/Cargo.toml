@@ -4,6 +4,20 @@ version = "0.1.0"
 edition = "2021"
 authors = ["PowerFS Team <jiangjinhu@fudan.edu.cn>"]
 description = "PowerFS Initialization Tool - Format POSIX root and prepare metadata before service startup"
+license = "Apache-2.0"
+homepage = "https://www.powerfs.org"
+repository = "https://github.com/fudanPPI/powerfs"
+
+[package.metadata.deb]
+maintainer = "PowerFS Team <jiangjinhu@fudan.edu.cn>"
+section = "utils"
+priority = "optional"
+depends = "powerfs-cli (= 0.1.0)"
+assets = [
+    ["target/release/powerfs-init", "usr/bin/", "755"],
+    ["../powerfs-packaging/scripts/postinst", "DEBIAN/postinst", "755"],
+    ["../powerfs-packaging/scripts/postrm", "DEBIAN/postrm", "755"],
+]
 
 [[bin]]
 name = "powerfs-init"

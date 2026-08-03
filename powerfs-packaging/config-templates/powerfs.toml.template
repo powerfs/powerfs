@@ -1,0 +1,83 @@
+# PowerFS 配置文件模板
+#
+# 本文件仅作参考模板，不会被任何服务直接加载。
+# 服务启动时通过 --config /etc/powerfs/<role>.toml 加载对应节点的实际配置文件。
+#
+# 推荐使用 powerfs-cli 自动生成 per-node 配置：
+#
+#   powerfs-cli config gen \
+#       --masters 10.0.0.11,10.0.0.12,10.0.0.13 \
+#       --volumes 10.0.0.21,10.0.0.22 \
+#       --filers  10.0.0.31,10.0.0.32,10.0.0.33 \
+#       --redis   10.0.0.11 \
+#       --output  /etc/powerfs
+#
+# 所有端口和地址必须显式设置，无默认值。
+
+[global]
+log_level = "info"
+log_file = "/var/log/powerfs/powerfs.log"
+redis_url = "redis://127.0.0.1:6379"
+
+[master]
+port = 9333                  # HTTP/gRPC 端口 (必填)
+net_port = 9334              # powerfs-net TLV 端口 (必填，必须与 port 不同)
+dir = "/data/master"         # 数据目录 (必填)
+raft_id = 1                  # 当前节点在 Raft 集群中的唯一 ID
+ip = "0.0.0.0"               # 监听地址
+advertise_addr = "10.0.0.11:9333"  # 对外可达地址 (必填，不能为 0.0.0.0)
+peers = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+
+[volume]
+grpc_port = 8080             # gRPC 端口 (必填)
+http_port = 8091             # HTTP 管理端口 (必填，必须与 net_port 不同)
+net_port = 8901              # powerfs-net TLV 端口 (必填)
+data_dir = "/data/volume"
+master_addresses = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+node_id = "volume-server-1"
+max_volume_size = 107374182400   # 100GB
+initial_volume_count = 4
+advertise_addr = "10.0.0.21"     # 对外可达地址 (必填)
+
+[filer]
+port = 8888                  # HTTP 端口 (必填)
+grpc_port = 8889             # gRPC 端口 (必填)
+net_port = 9334              # powerfs-net TLV 端口 (必填)
+master_addresses = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+ip = "0.0.0.0"
+data_dir = "/data/filer"
+shard_count = 2
+raft_id = 1
+raft_peers = ["10.0.0.31:8889", "10.0.0.32:8889", "10.0.0.33:8889"]
+
+[s3]
+port = 9000
+master_address = "10.0.0.11:9333"
+master_endpoints = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+ip = "0.0.0.0"
+dir = "/data/s3"
+access_key = "powerfs"
+secret_key = "powerfs123"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["10.0.0.11", "10.0.0.12", "10.0.0.13"]
+filer_addresses = ["10.0.0.31", "10.0.0.32", "10.0.0.33"]
+volume_addresses = ["10.0.0.21", "10.0.0.22"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9334
+collection = "default"
+replication = "000"
+threads = 8
+verbose = false
+container = false
+log_file = "/var/log/powerfs/fuse.log"
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://127.0.0.1:6379"
+s3_endpoint = "http://10.0.0.31:9000"
+s3_backend_endpoint = "http://10.0.0.31:9000"
+master_endpoint = "http://10.0.0.11:9333"
+master_endpoints = ["http://10.0.0.11:9333", "http://10.0.0.12:9333", "http://10.0.0.13:9333"]

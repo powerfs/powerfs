@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2021"
 authors = ["PowerFS Team <jiangjinhu@fudan.edu.cn>"]
 description = "CLI tool for PowerFS testing and administration"
+license = "Apache-2.0"
+homepage = "https://www.powerfs.org"
+repository = "https://github.com/fudanPPI/powerfs"
+
+[package.metadata.deb]
+maintainer = "PowerFS Team <jiangjinhu@fudan.edu.cn>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+conf-files = ["/etc/powerfs/powerfs.env"]
+assets = [
+    ["target/release/powerfs-cli", "usr/bin/", "755"],
+    ["../powerfs-packaging/config-templates/powerfs.toml.template", "etc/powerfs/powerfs.toml.template", "644"],
+    ["../powerfs-packaging/config-templates/topology.example.toml", "etc/powerfs/topology.example.toml", "644"],
+    ["../powerfs-packaging/config-templates/powerfs.env", "etc/powerfs/powerfs.env", "644"],
+    ["../powerfs-packaging/scripts/postinst", "DEBIAN/postinst", "755"],
+    ["../powerfs-packaging/scripts/postrm", "DEBIAN/postrm", "755"],
+]
 
 [dependencies]
 powerfs-common = { path = "../powerfs-common" }
@@ -22,4 +40,5 @@ env_logger = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 uuid = { workspace = true }

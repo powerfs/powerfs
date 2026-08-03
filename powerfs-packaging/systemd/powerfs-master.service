@@ -1,0 +1,32 @@
+[Unit]
+Description=PowerFS Master Server
+Documentation=https://github.com/fudanPPI/powerfs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=powerfs
+Group=powerfs
+ExecStart=/usr/bin/powerfs-master --config /etc/powerfs/master.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitNPROC=65536
+TasksMax=infinity
+
+# Working directory for relative paths in config
+WorkingDirectory=/var/lib/powerfs
+
+# Environment file (optional, sourced if present)
+EnvironmentFile=-/etc/powerfs/powerfs.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/powerfs /data
+
+[Install]
+WantedBy=multi-user.target
