@@ -1544,6 +1544,12 @@ impl ChunkCache {
         if let Some(chunk) = cache.get_mut(&key) {
             let old_len = chunk.data.len() as u64;
             f(chunk);
+            // Mark chunk as dirty after modification so the flusher knows it
+            // needs to be written to the volume server, and evict_if_needed
+            // won't evict it before the data is persisted. Without this, a
+            // chunk that was previously flushed (dirty=false) and then modified
+            // via modify() could be evicted with unflushed data.
+            chunk.dirty = true;
             let new_len = chunk.data.len() as u64;
             if new_len != old_len {
                 // Update current_bytes to reflect the size change caused by
@@ -1758,11 +1764,11 @@ impl ChunkCache {
     /// 在 flush_dirty_chunks_impl 成功写入 volume server 后调用，
     /// 使这些 chunk 可被 evict_if_needed 驱逐。
     /// 只清除传入的 chunk_idx 对应的 chunk，不影响同 inode 的其他 chunk。
-    pub fn clear_dirty_for_chunks(&self, inode: u64, chunk_offsets: &[u64]) {
+    pub fn clear_dirty_for_chunks(&self, inode: u64, chunk_indices: &[u64]) {
         for shard in self.shards.iter() {
             let mut cache = shard.write().unwrap();
-            for ((ino, off), chunk) in cache.iter_mut() {
-                if *ino == inode && chunk_offsets.contains(off) {
+            for ((ino, idx), chunk) in cache.iter_mut() {
+                if *ino == inode && chunk_indices.contains(idx) {
                     chunk.dirty = false;
                 }
             }

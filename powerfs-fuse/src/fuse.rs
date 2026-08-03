@@ -584,7 +584,7 @@ impl PowerFsFs {
             .collect();
 
         // Flush in parallel batches
-        let mut flushed_offsets: Vec<u64> = Vec::new();
+        let mut flushed_indices: Vec<u64> = Vec::new();
         for batch in chunks_to_flush.chunks(batch_size) {
             let requests: Vec<_> = batch.iter().map(|(_, req)| req.clone()).collect();
             let results = self
@@ -600,18 +600,22 @@ impl PowerFsFs {
                     );
                     had_error = true;
                 } else {
-                    // Track successfully flushed chunks to clear their dirty flag.
-                    // Without this, evict_if_needed sees chunk.dirty == true and
-                    // cannot evict, causing unbounded cache growth.
-                    flushed_offsets.push(*chunk_idx * chunk_size);
+                    // Track successfully flushed chunk INDICES (not offsets) to
+                    // clear their dirty flag. The cache key is (inode,
+                    // chunk_index), so clear_dirty_for_chunks expects indices.
+                    // BUGFIX: previously pushed `chunk_idx * chunk_size`
+                    // (offsets), which only matched index 0 (offset 0 == index
+                    // 0), leaving all other chunks permanently dirty and
+                    // un-evictable → unbounded cache growth (1GB+ vs 512MB).
+                    flushed_indices.push(*chunk_idx);
                 }
             }
         }
 
         // Clear dirty flag for successfully flushed chunks so they can be evicted.
-        if !flushed_offsets.is_empty() {
+        if !flushed_indices.is_empty() {
             self.chunk_cache
-                .clear_dirty_for_chunks(inode, &flushed_offsets);
+                .clear_dirty_for_chunks(inode, &flushed_indices);
         }
 
         if had_error {
