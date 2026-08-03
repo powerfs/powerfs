@@ -379,7 +379,25 @@ impl MetadataCache {
                 existing.cached_at = Instant::now();
             }
         } else {
-            cache.put(inode, entry);
+            // Use push instead of put to capture the evicted entry. If the
+            // evicted entry is a pinned (open) inode, re-insert it to prevent
+            // loss of metadata needed by sync_size_chunks_on_close. Without
+            // this, high-concurrency workloads (e.g. IO500 mdtest) fill the
+            // LRU cache and evict open file entries, causing close to skip
+            // size/chunks sync → cross-client stale metadata / data loss.
+            let evicted = cache.push(inode, entry);
+            if let Some((evicted_inode, evicted_entry)) = evicted {
+                if evicted_inode != inode
+                    && self.pinned_inodes.read().unwrap().contains_key(&evicted_inode)
+                {
+                    // Re-insert the evicted pinned entry. This may evict
+                    // another entry, but pinned entries are few relative to
+                    // the 10000-entry cache, so cascading eviction of another
+                    // pinned entry is rare. If it happens, that entry's close
+                    // will still have its ChunkCache data for best-effort sync.
+                    let _ = cache.push(evicted_inode, evicted_entry);
+                }
+            }
         }
         drop(cache);
     }
