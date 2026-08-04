@@ -207,6 +207,16 @@ impl<'a> TlvDecoder<'a> {
         self.buf.len() - self.pos
     }
 
+    /// Return the unconsumed tail of the buffer.
+    ///
+    /// Used by handlers that need to extract a raw payload appended after the
+    /// TLV fields (e.g. the kernel `Write` request sends TLV body + raw file
+    /// bytes as a single frame, and the server receives both concatenated in
+    /// `msg.body`). After parsing all TLV fields, this returns the raw bytes.
+    pub fn remaining_slice(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }

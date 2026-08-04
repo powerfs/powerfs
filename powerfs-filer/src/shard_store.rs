@@ -14,6 +14,7 @@ const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persi
 const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
 const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
+const CF_FILE_DATA: &str = "file_data"; // Inline file data (replicated via Raft)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -98,6 +99,10 @@ pub struct ShardStore {
     // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
     // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
     open_counts: RwLock<HashMap<u64, u32>>,
+    // Inline file data (replicated via Raft, persisted to RocksDB).
+    // Keyed by inode. Replaces the per-Filer inline_data in net_handler,
+    // which was lost on leader switch.
+    file_data: RwLock<HashMap<u64, Vec<u8>>>,
 }
 
 impl ShardStore {
@@ -136,6 +141,7 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_FILE_DATA, make_cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -157,6 +163,7 @@ impl ShardStore {
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
             open_counts: RwLock::new(HashMap::new()),
+            file_data: RwLock::new(HashMap::new()),
         };
 
         store.load_data()?;
@@ -169,7 +176,36 @@ impl ShardStore {
         self.load_dir_entries()?;
         self.load_stats()?;
         self.load_root_inodes()?;
+        self.load_file_data()?;
         info!("Shard {} loaded data from rocksdb", self.shard_id.0);
+        Ok(())
+    }
+
+    fn load_file_data(&mut self) -> Result<(), String> {
+        let cf = match self.db.cf_handle(CF_FILE_DATA) {
+            Some(cf) => cf,
+            None => return Ok(()),
+        };
+
+        let mut file_data = self.file_data.write().unwrap();
+        let mut count = 0;
+        let mut it = self.db.raw_iterator_cf(cf);
+        it.seek_to_first();
+        while it.valid() {
+            if let (Some(key), Some(value)) = (it.key(), it.value()) {
+                let mut key_bytes = [0u8; 8];
+                key_bytes.copy_from_slice(&key.to_vec()[..8.min(key.len())]);
+                let inode = u64::from_be_bytes(key_bytes);
+                file_data.insert(inode, value.to_vec());
+                count += 1;
+            }
+            it.next();
+        }
+
+        info!(
+            "Shard {} loaded {} inline file data entries from rocksdb",
+            self.shard_id.0, count
+        );
         Ok(())
     }
 
@@ -533,7 +569,99 @@ impl ShardStore {
                     );
                 }
             }
+            ShardCommand::WriteFileData {
+                inode,
+                offset,
+                data,
+            } => {
+                self.write_file_data(inode, offset, data);
+            }
+            ShardCommand::DeleteFileData { inode } => {
+                self.delete_file_data(inode);
+            }
         }
+    }
+
+    /// Write inline file data at given offset (Raft-replicated).
+    /// Extends the buffer with zeros if writing beyond current end.
+    fn write_file_data(&self, inode: u64, offset: u64, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+
+        let cf = match self.db.cf_handle(CF_FILE_DATA) {
+            Some(cf) => cf,
+            None => {
+                log::error!("Shard {} CF_FILE_DATA not found", self.shard_id.0);
+                return;
+            }
+        };
+
+        let new_end = offset as usize + data.len();
+
+        {
+            let mut file_data = self.file_data.write().unwrap();
+            let buf = file_data.entry(inode).or_insert_with(Vec::new);
+            if buf.len() < new_end {
+                buf.resize(new_end, 0u8);
+            }
+            buf[offset as usize..new_end].copy_from_slice(&data);
+        }
+
+        // Persist to RocksDB
+        let key = inode.to_be_bytes();
+        let buf = self.file_data.read().unwrap();
+        if let Some(data) = buf.get(&inode) {
+            let _ = self.db.put_cf(cf, key, data);
+        }
+
+        debug!(
+            "Shard {} wrote file data: inode={}, offset={}, len={}",
+            self.shard_id.0,
+            inode,
+            offset,
+            data.len()
+        );
+    }
+
+    /// Read inline file data (Raft-replicated). Returns None if no data.
+    pub fn read_file_data(&self, inode: u64, offset: usize, length: usize) -> Option<Vec<u8>> {
+        let file_data = self.file_data.read().unwrap();
+        let buf = file_data.get(&inode)?;
+
+        if length == 0 {
+            return Some(Vec::new());
+        }
+
+        let start = offset.min(buf.len());
+        let end = (start + length).min(buf.len());
+        let mut out = buf[start..end].to_vec();
+        // Zero-fill trailing portion
+        if out.len() < length {
+            out.resize(length, 0u8);
+        }
+        Some(out)
+    }
+
+    /// Delete inline file data for an inode.
+    fn delete_file_data(&self, inode: u64) {
+        let cf = match self.db.cf_handle(CF_FILE_DATA) {
+            Some(cf) => cf,
+            None => return,
+        };
+
+        {
+            let mut file_data = self.file_data.write().unwrap();
+            file_data.remove(&inode);
+        }
+
+        let key = inode.to_be_bytes();
+        let _ = self.db.delete_cf(cf, key);
+
+        debug!(
+            "Shard {} deleted file data: inode={}",
+            self.shard_id.0, inode
+        );
     }
 
     fn create_file(&self, parent_inode: u64, name: String, inode: u64) {
@@ -704,41 +832,94 @@ impl ShardStore {
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
         let cf_dir_entries = self.db.cf_handle(CF_DIR_ENTRIES).unwrap();
 
-        let removed = {
+        // Phase 1: Under inodes+dir_entries locks, remove dir entry and
+        // determine the post-lock action (decrement nlink vs delete inode).
+        // Action enum: None = not found; Decrement(info) = hardlink, update
+        // nlink; DeleteData(inode, is_file) = nlink==0, delete inode+data.
+        enum PostAction {
+            Decrement(InodeInfo),
+            DeleteData(u64, bool),
+        }
+        let action = {
             let mut inodes = self.inodes.write().unwrap();
             let mut dir_entries = self.directory_entries.write().unwrap();
 
-            let mut removed = None;
             if let Some(dir) = dir_entries.get_mut(&parent_inode) {
                 if let Some(&inode) = dir.get(&name) {
                     let dir_entry_key = format!("{}:{}", parent_inode, name);
                     let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
-
-                    let inode_key = inode.to_be_bytes();
-                    let _ = self.db.delete_cf(cf_inodes, inode_key);
-
                     dir.remove(&name);
-                    if let Some(info) = inodes.remove(&inode) {
-                        let is_file = matches!(info.file_type, FileType::File);
-                        removed = Some(is_file);
+
+                    let nlink = inodes.get(&inode).map(|i| i.nlink).unwrap_or(0);
+                    if nlink > 1 {
+                        // Hardlink: decrement nlink in memory, persist outside lock
+                        if let Some(info) = inodes.get_mut(&inode) {
+                            info.nlink -= 1;
+                            PostAction::Decrement(info.clone())
+                        } else {
+                            // Inode not in memory (shouldn't happen) - dir entry
+                            // already removed, skip nlink persistence
+                            warn!(
+                                "Shard {} unlink: inode {} not in memory for hardlink decrement",
+                                self.shard_id.0, inode
+                            );
+                            PostAction::DeleteData(0, false)
+                        }
+                    } else {
+                        // nlink <= 1: remove inode from RocksDB + memory
+                        let inode_key = inode.to_be_bytes();
+                        let _ = self.db.delete_cf(cf_inodes, inode_key);
+                        let is_file = inodes
+                            .remove(&inode)
+                            .map(|info| matches!(info.file_type, FileType::File))
+                            .unwrap_or(false);
+                        PostAction::DeleteData(inode, is_file)
                     }
+                } else {
+                    PostAction::DeleteData(0, false) // not found, no-op
+                }
+            } else {
+                PostAction::DeleteData(0, false) // not found, no-op
+            }
+        };
+
+        // Phase 2: Outside locks, perform persistence (update_inode /
+        // delete_file_data acquire their own locks).
+        let mut inode_deleted = false;
+        let mut is_file_deleted = false;
+        let mut inode_val = 0;
+        match action {
+            PostAction::Decrement(info) => {
+                inode_val = info.inode;
+                let new_nlink = info.nlink;
+                let _ = self.update_inode(info.clone());
+                info!(
+                    "Shard {} unlinked hardlink: parent={}, name={}, inode={}, nlink -> {}",
+                    self.shard_id.0, parent_inode, name, inode_val, new_nlink
+                );
+            }
+            PostAction::DeleteData(inode, is_file) => {
+                if inode != 0 {
+                    inode_val = inode;
+                    inode_deleted = true;
+                    is_file_deleted = is_file;
+                    self.delete_file_data(inode);
                 }
             }
-            removed
-        };
-        {
+        }
+
+        // Stats only updated when inode is actually deleted (nlink reached 0)
+        if inode_deleted {
             let mut stats = self.stats.write().unwrap();
-            if let Some(is_file) = removed {
-                stats.inode_count -= 1;
-                if is_file {
-                    stats.file_count -= 1;
-                }
+            stats.inode_count -= 1;
+            if is_file_deleted {
+                stats.file_count -= 1;
             }
         }
         self.save_stats();
         info!(
-            "Shard {} deleted file: parent_inode={}, name={}",
-            self.shard_id.0, parent_inode, name
+            "Shard {} deleted file: parent_inode={}, name={}, inode={}, inode_deleted={}",
+            self.shard_id.0, parent_inode, name, inode_val, inode_deleted
         );
     }
 
@@ -891,6 +1072,11 @@ impl ShardStore {
                     .db
                     .put_cf(cf_dir_entries, new_key.as_bytes(), inode_value);
 
+                /* 从内存 HashMap 移除旧名称 (之前只删了 DB 没删内存,
+                 * 导致 Filer 服务运行期间 lookup/list_directory 仍能
+                 * 找到旧名称, remount 后 old_name 仍然存在). */
+                old_dir.remove(&old_name);
+
                 dir_entries.entry(new_parent_inode).or_default();
                 if let Some(new_dir) = dir_entries.get_mut(&new_parent_inode) {
                     new_dir.insert(new_name.clone(), inode);
@@ -996,13 +1182,23 @@ impl ShardStore {
         let mut result = Vec::new();
 
         if let Some(dir) = dir_entries.get(&parent_inode) {
-            for &inode in dir.values() {
-                if let Some(info) = inodes.get(&inode) {
+            // Iterate dir_entries keys (not just values) to return the
+            // authoritative name for each entry. Using InodeInfo.name is
+            // wrong because:
+            //  - Hard links: multiple names -> same inode, InodeInfo.name
+            //    only stores one name, causing duplicate entries in readdir
+            //  - Rename: if InodeInfo.name diverges from the dir_entries key
+            //    (e.g., stale cache, Raft replication gap), readdir returns
+            //    a name that lookup() cannot find -> ENOENT in userspace
+            for (name, &inode) in dir.iter() {
+                if let Some(mut info) = inodes.get(&inode).cloned() {
                     // Phase 3.5: 跳过 tombstoned 条目
                     if info.delete_time > 0 {
                         continue;
                     }
-                    result.push(info.clone());
+                    info.name = name.clone();
+                    info.parent_inode = parent_inode;
+                    result.push(info);
                 }
             }
         }
@@ -1610,6 +1806,8 @@ impl ShardStore {
             Some(mut info) => {
                 if let Some(s) = size {
                     info.size = s;
+                    // Truncate inline file data to match new size
+                    self.truncate_file_data(inode, s);
                 }
                 if let Some(m) = mode {
                     info.mode = m as u32;
@@ -1631,6 +1829,31 @@ impl ShardStore {
         let _ = self.update_inode(info);
     }
 
+    /// Truncate inline file data to new size. Removes data if size == 0.
+    fn truncate_file_data(&self, inode: u64, new_size: u64) {
+        let cf = match self.db.cf_handle(CF_FILE_DATA) {
+            Some(cf) => cf,
+            None => return,
+        };
+
+        let mut file_data = self.file_data.write().unwrap();
+        if new_size == 0 {
+            if file_data.remove(&inode).is_some() {
+                let key = inode.to_be_bytes();
+                let _ = self.db.delete_cf(cf, key);
+            }
+            return;
+        }
+
+        if let Some(buf) = file_data.get_mut(&inode) {
+            if (new_size as usize) < buf.len() {
+                buf.truncate(new_size as usize);
+                let key = inode.to_be_bytes();
+                let _ = self.db.put_cf(cf, key, buf);
+            }
+        }
+    }
+
     /// Set data-related inode attributes (size) - strong consistency path via Raft
     fn setattr_data(&self, inode: u64, size: Option<u64>) {
         let info = match self.get_inode(inode) {
@@ -1638,6 +1861,8 @@ impl ShardStore {
                 if let Some(s) = size {
                     info.size = s;
                     info.blocks = s.div_ceil(512);
+                    // Truncate inline file data to match new size
+                    self.truncate_file_data(inode, s);
                 }
                 let now = chrono::Utc::now().timestamp() as u64;
                 info.ctime = now;

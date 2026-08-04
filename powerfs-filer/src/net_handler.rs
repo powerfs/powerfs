@@ -91,6 +91,155 @@ impl FilerNetHandler {
         NetMessage::new(header).with_body(body)
     }
 
+    /// Build a response message carrying a separate data segment (e.g. file
+    /// contents for `Read`). The frame header's `data_len` covers both the
+    /// TLV body and the raw data segment so the kernel receiver, which splits
+    /// body/data by the TLV boundary, can recover both pieces.
+    fn build_response_with_data(
+        msg: &NetMessage,
+        status: u16,
+        body: Vec<u8>,
+        data: Vec<u8>,
+    ) -> NetMessage {
+        let flags = FrameFlags::new(FrameFlags::RESPONSE);
+        let header = powerfs_net::FrameHeader::new(
+            msg.header.msg_type,
+            flags,
+            msg.header.seq,
+            (body.len() + data.len()) as u32,
+        )
+        .with_status(status);
+        NetMessage::new(header).with_body(body).with_data(data)
+    }
+
+    /// Handle Read request (MsgType::Read = 0x0020).
+    ///
+    /// The kernel's `powerfs_net_read` sends a TLV body containing
+    /// (ino, offset, data_len) and expects the response `data` segment to
+    /// hold the read bytes. We serve the bytes from the Raft-replicated
+    /// file_data store in ShardStore; gaps or short reads are zero-filled.
+    async fn handle_read(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let offset = dec.next_u64(FieldId::Offset).unwrap_or(0);
+        let length = dec.next_u32(FieldId::DataLen).unwrap_or(0);
+
+        info!(
+            "FILER_NET_READ: ino={}, offset={}, length={}",
+            ino, offset, length
+        );
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        let length = length as usize;
+        let data = if length == 0 {
+            Vec::new()
+        } else {
+            match self.meta_shard_manager.read_file_data(ino, offset as usize, length) {
+                Some(data) => data,
+                None => vec![0u8; length],
+            }
+        };
+
+        info!(
+            "FILER_NET_READ: ino={}, returning {} bytes",
+            ino,
+            data.len()
+        );
+
+        Ok(Self::build_response_with_data(
+            msg,
+            STATUS_OK,
+            Vec::new(),
+            data,
+        ))
+    }
+
+    /// Handle Write request (MsgType::Write = 0x0021).
+    ///
+    /// The kernel's `powerfs_net_write` sends a TLV body containing
+    /// (ino, offset, data_len) followed by a raw data segment holding the
+    /// file bytes. Because the powerfs-net server reads the whole frame
+    /// payload into `msg.body`, the raw bytes live in the tail of
+    /// `msg.body` immediately after the TLV fields. We parse the TLV fields,
+    /// then take `remaining_slice()` as the file bytes.
+    ///
+    /// The write extends `inline_data[ino]` as needed (zero-filling gaps),
+    /// then updates the inode `size` via `setattr_data` so a subsequent
+    /// `getattr` reports the correct length (critical for cross-client and
+    /// remount visibility).
+    async fn handle_write(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let offset = dec.next_u64(FieldId::Offset).unwrap_or(0);
+        let declared_len = dec.next_u32(FieldId::DataLen).unwrap_or(0);
+        let payload = dec.remaining_slice().to_vec();
+
+        info!(
+            "FILER_NET_WRITE: ino={}, offset={}, declared_len={}, payload_len={}",
+            ino,
+            offset,
+            declared_len,
+            payload.len()
+        );
+
+        // Trust the actual payload length; declared_len is informational.
+        // If they disagree, the payload is the source of truth (the kernel
+        // sends them matching, but be defensive against malformed frames).
+        let write_len = payload.len();
+        if (write_len as u32) != declared_len {
+            warn!(
+                "FILER_NET_WRITE: declared_len={} != payload_len={} for ino={}, using payload",
+                declared_len, write_len, ino
+            );
+        }
+
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        if write_len == 0 {
+            let mut enc = TlvEncoder::new();
+            enc.add_u32(FieldId::DataLen, 0);
+            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+        }
+
+        let new_end = offset as usize + write_len;
+
+        // Write data via Raft replication (replaces per-Filer inline_data).
+        // This ensures leader switch does not lose data.
+        if let Err(e) = self
+            .meta_shard_manager
+            .write_file_data(ino, offset, payload.clone())
+            .await
+        {
+            warn!(
+                "FILER_NET_WRITE: write_file_data failed for ino={}: {}",
+                ino, e
+            );
+        }
+
+        // Update the authoritative inode size so getattr/stat reports the
+        // grown file. We only grow (never shrink) here; truncates come
+        // through SetAttr/SetAttrData.
+        if let Some(info) = self.meta_shard_manager.get_inode(ino) {
+            if (new_end as u64) > info.size {
+                let _ = self
+                    .meta_shard_manager
+                    .setattr_data(ino, shard_id, Some(new_end as u64))
+                    .await;
+            }
+        }
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u32(FieldId::DataLen, write_len as u32);
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
     /// Check if current node is the leader for the given shard.
     /// Returns Ok(()) if leader, or Err(redirect_response) if not.
     async fn check_leader(&self, msg: &NetMessage, shard_id: ShardId) -> Result<(), NetMessage> {
@@ -381,6 +530,8 @@ impl FilerNetHandler {
             .await
         {
             Ok(_) => {
+                // File data truncate is handled in ShardStore::setattr
+                // (Raft-replicated), so no need to truncate inline_data here.
                 // Notify other clients that this inode's metadata (and
                 // possibly size) changed. Without this, truncate operations
                 // via SetAttr are invisible to other clients' cached metadata
@@ -679,7 +830,13 @@ impl FilerNetHandler {
 
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
             Some(info) => {
-                let shard_id = self.shard_strategy.calculate_shard(info.inode);
+                // Directory entries live in the shard of parent_inode.
+                // Use parent_ino (not info.inode) for shard calculation so
+                // the delete targets the correct shard. For hardlinks,
+                // info.inode's stored parent/name may differ from the actual
+                // entry being unlinked, so we must pass parent_ino/name
+                // directly to delete_file instead of using delete_file_by_inode.
+                let shard_id = self.shard_strategy.calculate_shard(parent_ino);
 
                 // Check leader - redirect write requests to the correct leader
                 if let Err(redirect) = self.check_leader(msg, shard_id).await {
@@ -692,7 +849,7 @@ impl FilerNetHandler {
 
                 match self
                     .meta_shard_manager
-                    .delete_file_by_inode(info.inode, shard_id)
+                    .delete_file(parent_ino, &name)
                     .await
                 {
                     Ok(_) => {
@@ -813,6 +970,12 @@ impl FilerNetHandler {
 
         let entries = self.meta_shard_manager.list_directory(parent_ino);
 
+        info!(
+            "FILER_NET_READDIR: parent_ino={}, entries={}",
+            parent_ino,
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(",")
+        );
+
         // Filter by last_name for pagination
         let filtered: Vec<&InodeInfo> = if last_name.is_empty() {
             entries.iter().collect()
@@ -823,8 +986,12 @@ impl FilerNetHandler {
                 .collect()
         };
 
+        // has_more is true only when there are entries beyond the `limit` window.
+        // Previous logic `(limited.len() < limit) && !entries.is_empty()` was always
+        // true for non-empty dirs (since limited.len() <= limit always), causing the
+        // kernel to loop forever sending READDIR with the same last_name cursor.
+        let has_more = filtered.len() > limit as usize;
         let limited: Vec<&InodeInfo> = filtered.into_iter().take(limit as usize).collect();
-        let has_more = (limited.len() as u64) < limit && !entries.is_empty();
 
         let mut enc = TlvEncoder::new();
         enc.add_u32(FieldId::Count, limited.len() as u32);
@@ -1314,6 +1481,8 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            MsgType::Read => self.handle_read(msg).await,
+            MsgType::Write => self.handle_write(msg).await,
             MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
@@ -1477,6 +1646,8 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
+            MsgType::Read => self.handle_read(msg).await,
+            MsgType::Write => self.handle_write(msg).await,
             MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,

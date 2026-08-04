@@ -263,7 +263,13 @@ impl FrameHeader {
     }
 
     fn calc_header_crc(&self) -> u32 {
-        let mut crc: u32 = 0xFFFFFFFF;
+        // crc32c_append(prev, data) 的 prev 是"已完成的标准 CRC32C 值",
+        // 空数据 CRC32C = 0xFFFFFFFF ^ 0xFFFFFFFF = 0, 故初始值为 0.
+        // 逐步 append 后 crc 已是标准 CRC32C (初始 0xFFFFFFFF, 末尾 XOR 0xFFFFFFFF),
+        // 无需再 XOR. 之前用 0xFFFFFFFF 初始值 + 末尾 XOR 是双重错误, 实际算出
+        // raw_crc(0, data) (非标准), 与内核标准 CRC32C 不一致, 导致 Filer 报
+        // "invalid frame header".
+        let mut crc: u32 = 0;
         crc = crc32c::crc32c_append(crc, &self.magic);
         crc = crc32c::crc32c_append(crc, &[self.version]);
         crc = crc32c::crc32c_append(crc, &[self.flags]);
@@ -272,7 +278,7 @@ impl FrameHeader {
         crc = crc32c::crc32c_append(crc, &self.status.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.data_len.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.reserved);
-        crc ^ 0xFFFFFFFF
+        crc
     }
 
     pub fn verify_crc(&self) -> bool {

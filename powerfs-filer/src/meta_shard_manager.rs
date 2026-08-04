@@ -587,6 +587,40 @@ impl MetaShardManager {
         shard_store.lookup(parent_inode, name)
     }
 
+    /// Write file data via Raft replication (inline mode).
+    /// All filer nodes replicate the data, so leader switch does not lose data.
+    pub async fn write_file_data(
+        &self,
+        inode: u64,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let shard_id = self.shard_strategy.calculate_shard(inode);
+        let cmd = ShardCommand::WriteFileData {
+            inode,
+            offset,
+            data,
+        };
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+        Ok(())
+    }
+
+    /// Read file data (inline mode). Reads from local ShardStore.
+    /// Since data is Raft-replicated, any node can serve reads.
+    pub fn read_file_data(
+        &self,
+        inode: u64,
+        offset: usize,
+        length: usize,
+    ) -> Option<Vec<u8>> {
+        let shard_id = self.shard_strategy.calculate_shard(inode);
+        let stores = self.shard_stores.read().unwrap();
+        let shard_store = stores.get(&shard_id)?;
+        shard_store.read_file_data(inode, offset, length)
+    }
+
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
