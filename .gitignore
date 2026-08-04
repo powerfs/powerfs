@@ -2,6 +2,7 @@
 .trae/
 kernel/
 dynalock/
+lustre-release/
 cubefs/
 juicefs/
 output/
@@ -27,7 +28,6 @@ tifs/
 node_modules/
 log
 *.log
-!kernel/**/test_*.sh
 .cargo
 vendor/
 logs/
