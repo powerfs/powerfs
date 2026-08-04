@@ -11,6 +11,8 @@ use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventPr
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
 use powerfs_master::volume_client::VolumeClientPool;
+use powerfs_master::resilient_client::ResilientMasterClient;
+use powerfs_master::proto::powerfs::RegisterFilerRequest;
 
 use powerfs_filer::{
     BucketManager, EntryManager, FilerMetaServiceImpl, FilerNetHandler, FilerServer,
@@ -67,15 +69,40 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         .clone()
         .unwrap_or_else(|| "0.0.0.0".to_string());
 
+    // Advertise IP: 必须是其他节点/客户端可到达的地址（不能是 0.0.0.0）
+    // 优先级: filer.advertise_addr > filer.ip (非 0.0.0.0) > raft_peers[raft_id-1] 的 IP
+    // raft_address 用 advertise_ip，因为 RaftGroupManager.node_address 会用于
+    // REDIRECT 响应（check_leader 返回 REDIRECT 到自身时）
+    let advertise_ip = filer_cfg
+        .advertise_addr
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            filer_cfg.ip.as_deref().filter(|s| *s != "0.0.0.0" && *s != "::")
+        })
+        .or_else(|| {
+            if filer_cfg.raft_id > 0
+                && filer_cfg.raft_id as usize <= filer_cfg.raft_peers.len()
+            {
+                let peer = &filer_cfg.raft_peers[(filer_cfg.raft_id - 1) as usize];
+                peer.rfind(':').map(|pos| &peer[..pos])
+            } else {
+                None
+            }
+        })
+        .unwrap_or("0.0.0.0")
+        .to_string();
+
     let s3_address = format!("{}:{}", bind_ip, port);
     let grpc_address = format!("{}:{}", bind_ip, grpc_port);
     let net_address = format!("{}:{}", bind_ip, net_port);
-    // Raft communication uses gRPC port since Raft messages are sent via gRPC
-    let raft_address = format!("{}:{}", bind_ip, grpc_port);
+    // Raft address uses advertise IP (must be reachable by peers and clients)
+    let raft_address = format!("{}:{}", advertise_ip, grpc_port);
 
     info!("  S3 Address: {}", s3_address);
     info!("  gRPC Address: {}", grpc_address);
     info!("  Net Address: {}", net_address);
+    info!("  Raft Address: {} (advertise_ip={})", raft_address, advertise_ip);
     info!("  Data Dir: {}", filer_cfg.data_dir);
     info!("  Shard Count: {}", filer_cfg.shard_count);
     info!("  Raft ID: {}", filer_cfg.raft_id);
@@ -360,6 +387,107 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         info!("Net endpoint: {}", net_address);
     }
     info!("Connected to master(s): {:?}", master_addresses);
+
+    /* 向 Master 注册 filer 节点信息 (供内核 discover_filers 使用).
+     *
+     * 注册地址确定优先级:
+     *   1. filer.advertise_addr (配置显式指定)
+     *   2. filer.ip (若非 0.0.0.0/::)
+     *   3. raft_peers[raft_id-1] 的 IP 部分 (从 raft 集群配置推导)
+     *
+     * 使用 ResilientMasterClient 自动处理 leader 发现和 failover.
+     * 注册失败不阻止 filer 启动 (内核会回退到手动 filer_addr). */
+    {
+        let advertise_ip = filer_cfg.advertise_addr.as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                filer_cfg.ip.as_ref()
+                    .filter(|ip| !ip.is_empty() && ip.as_str() != "0.0.0.0" && ip.as_str() != "::")
+                    .cloned()
+            })
+            .or_else(|| {
+                /* 从 raft_peers 推导: raft_id 从 1 开始, peers 列表按 id 排序 */
+                let idx = filer_cfg.raft_id.checked_sub(1)? as usize;
+                let peer = filer_cfg.raft_peers.get(idx)?;
+                let ip_part = peer.rfind(':').map(|i| &peer[..i]).unwrap_or(peer);
+                Some(ip_part.to_string())
+            });
+
+        if let Some(ref adv_ip) = advertise_ip {
+            let shard_ids: Vec<u64> = (0..filer_cfg.shard_count as u64).collect();
+            let node_id_str = format!("filer-{}", filer_cfg.raft_id);
+
+            info!("Registering with Master: addr={}, net_port={}, shard_count={}",
+                  adv_ip, net_port, filer_cfg.shard_count);
+
+            let adv_ip_clone = adv_ip.clone();
+            let master_addrs_clone = master_addresses.clone();
+            let node_id_clone = node_id_str.clone();
+            let shard_ids_clone = shard_ids.clone();
+            tokio::spawn(async move {
+                /* 周期性向 Master 注册 filer 信息 (心跳机制).
+                 *
+                 * 设计原因:
+                 *   1. Master 的 filer_nodes 是内存态 (非 Raft 复制), leader 切换后
+                 *      新 leader 没有 filer 注册信息, 需要 filer 重新注册.
+                 *   2. Master 重启后 filer_nodes 也会丢失, 需要周期性恢复.
+                 *   3. 启动时 Master 可能还在 raft 选举中, 注册会失败, 需要重试.
+                 *
+                 * 策略:
+                 *   - 首次注册失败: 10 秒后重试 (快速恢复)
+                 *   - 注册成功: 60 秒后重新注册 (保持心跳, 应对 leader 切换)
+                 *   - 使用 ResilientMasterClient 自动处理 leader 发现和 failover */
+                match ResilientMasterClient::new(master_addrs_clone) {
+                    Ok(client) => {
+                        let req = RegisterFilerRequest {
+                            node_id: node_id_clone,
+                            address: adv_ip_clone,
+                            grpc_port: grpc_port as u32,
+                            http_port: port as u32,
+                            shard_count: shard_ids_clone.len() as u64,
+                            shard_ids: shard_ids_clone,
+                            net_port: net_port as u32,
+                        };
+
+                        loop {
+                            let result = client.call({
+                                let req = req.clone();
+                                move |mut c| {
+                                    let req = req.clone();
+                                    async move {
+                                        c.register_filer(tonic::Request::new(req)).await
+                                    }
+                                }
+                            }).await;
+
+                            match result {
+                                Ok(resp) => {
+                                    let inner = resp.into_inner();
+                                    if inner.success {
+                                        info!("Filer registered with Master successfully (will re-register in 60s)");
+                                        tokio::time::sleep(Duration::from_secs(60)).await;
+                                    } else {
+                                        warn!("Master rejected filer registration: {} (retry in 10s)", inner.error);
+                                        tokio::time::sleep(Duration::from_secs(10)).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Filer registration to Master failed (retry in 10s): {}", e);
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to create ResilientMasterClient for filer registration: {}", e);
+                    }
+                }
+            });
+        } else {
+            warn!("Could not determine filer advertise address; skipping Master registration. Set filer.advertise_addr in config to enable filer discovery.");
+        }
+    }
 
     filer_server.serve().await?;
 

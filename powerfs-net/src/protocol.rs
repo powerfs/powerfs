@@ -396,6 +396,9 @@ pub enum MsgType {
     WatchTopology = 0x0071,
     TopologyChanged = 0x0072,
     AssignVolumeV2 = 0x0073,
+    /// List registered filers (addr + net_port + health + shard_ids).
+    /// Used by kernel client on mount to discover filer nodes from Master.
+    ListFilers = 0x0074,
 
     // Extended Lease operations
     AcquireLease = 0x0080,
@@ -452,6 +455,7 @@ impl MsgType {
             0x0071 => Some(Self::WatchTopology),
             0x0072 => Some(Self::TopologyChanged),
             0x0073 => Some(Self::AssignVolumeV2),
+            0x0074 => Some(Self::ListFilers),
             0x0080 => Some(Self::AcquireLease),
             0x0081 => Some(Self::ReleaseLease),
             0x0082 => Some(Self::RenewLease),

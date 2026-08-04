@@ -242,6 +242,13 @@ impl FilerNetHandler {
 
     /// Check if current node is the leader for the given shard.
     /// Returns Ok(()) if leader, or Err(redirect_response) if not.
+    ///
+    /// When leader status is unknown (e.g., Raft election in progress after
+    /// filer restart), returns REDIRECT to the current node instead of
+    /// SERVER_ERROR. This maps to -EAGAIN (retryable) in the kernel, allowing
+    /// the VFS layer to retry the operation after election completes.
+    /// Returning SERVER_ERROR would map to -EREMOTEIO (permanent), causing
+    /// write failures during the brief election window.
     async fn check_leader(&self, msg: &NetMessage, shard_id: ShardId) -> Result<(), NetMessage> {
         match self
             .meta_shard_manager
@@ -265,15 +272,24 @@ impl FilerNetHandler {
                 ))
             }
             _ => {
-                // Unknown leader status - cluster not ready, reject write
+                // Leader status unknown (Raft election in progress).
+                // Return REDIRECT to self so the kernel retries with -EAGAIN
+                // instead of -EREMOTEIO (permanent error). The disconnect +
+                // reconnect cycle in the kernel's redirect handling provides
+                // natural backoff; after election completes, the next request
+                // will succeed or redirect to the real leader.
+                let self_grpc_addr = self.meta_shard_manager.get_node_grpc_address();
+                let net_addr = Self::grpc_addr_to_net_addr(&self_grpc_addr, self.net_port);
                 warn!(
-                    "Leader status unknown for shard {}, rejecting write",
-                    shard_id.0
+                    "Leader status unknown for shard {}, returning redirect to self {} (election in progress)",
+                    shard_id.0, net_addr
                 );
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Owner, &net_addr);
                 Err(Self::build_response(
                     msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
+                    STATUS_ERR_REDIRECT,
+                    enc.into_bytes(),
                 ))
             }
         }

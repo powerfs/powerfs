@@ -489,6 +489,57 @@ impl MasterNetHandler {
         ))
     }
 
+    /// Handle ListFilers request from kernel client.
+    ///
+    /// Returns all registered filer nodes with their powerfs-net addresses,
+    /// allowing the kernel to populate its connection pool without manual
+    /// configuration of each filer address.
+    ///
+    /// TLV response:
+    ///   Entries = filer_count
+    ///   Per filer: Owner=addr, Blksize=net_port, IsDir=is_healthy
+    async fn handle_list_filers(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            let mut enc = TlvEncoder::new();
+            enc.add_string(FieldId::Owner, &leader)?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        let filers = self.master.list_filers();
+        let count = filers.len() as u64;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Entries, count);
+
+        for f in &filers {
+            enc.add_string(FieldId::Owner, &f.address)?;
+            enc.add_u64(FieldId::Blksize, f.net_port as u64);
+            enc.add_u8(FieldId::IsDir, if f.is_healthy { 1 } else { 0 });
+            info!(
+                "NET_LIST_FILERS: addr={}, net_port={}, healthy={}, shards={:?}",
+                f.address, f.net_port, f.is_healthy, f.shard_ids
+            );
+        }
+
+        info!("NET_LIST_FILERS: returning {} filers", count);
+
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
+
     /// Helper: build a response message
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         let flags = FrameFlags::new(FrameFlags::RESPONSE);
@@ -525,6 +576,7 @@ impl PowerFsNetHandler for MasterNetHandler {
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::GetTopology => self.handle_get_topology(msg).await,
+            MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =
@@ -576,6 +628,7 @@ impl ServerRequestHandler for MasterNetHandler {
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::GetTopology => self.handle_get_topology(msg).await,
+            MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
                 let header =

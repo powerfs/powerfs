@@ -78,6 +78,10 @@ pub struct FilerConfig {
     pub raft_peers: Vec<String>,
     /// powerfs-net 二进制协议端口 - 必须配置
     pub net_port: u16,
+    /// 对外可达地址 (IP, 供 Master 注册和内核发现使用).
+    /// 若未设置, 从 raft_peers[raft_id-1] 提取 IP.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
     /// CRDT 后台维护任务执行间隔（秒），默认 60 秒
     #[serde(default)]
     pub crdt_maintenance_interval_secs: Option<u64>,

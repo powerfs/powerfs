@@ -1297,17 +1297,35 @@ impl MasterService for MasterGrpcServer {
     ) -> Result<Response<RegisterFilerResponse>, Status> {
         let req = request.into_inner();
 
+        /* Leader 检查: filer 注册必须在 leader 上执行,
+         * 否则 filer_nodes 不会对 ListFilers 可见 (内存态, 非 Raft 复制).
+         * 返回 failed_precondition 使 ResilientMasterClient 自动 failover.
+         * 注意: 必须用 get_leader_grpc_addr (gRPC端口), 不是 get_leader (net端口),
+         * 否则 ResilientMasterClient 无法匹配已配置的 gRPC 端点. */
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader_grpc_addr().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
+        }
+
         let filer_info = crate::master::FilerNodeInfo {
-            node_id: req.node_id,
-            address: req.address,
+            node_id: req.node_id.clone(),
+            address: req.address.clone(),
             grpc_port: req.grpc_port,
             http_port: req.http_port,
             net_port: req.net_port,
             is_healthy: true,
             leader_count: 0,
             total_shards: req.shard_count,
-            shard_ids: req.shard_ids,
+            shard_ids: req.shard_ids.clone(),
         };
+
+        info!(
+            "Registering filer: node_id={}, addr={}, net_port={}, shards={:?}",
+            req.node_id, req.address, req.net_port, req.shard_ids
+        );
 
         self.master.register_filer(filer_info);
 

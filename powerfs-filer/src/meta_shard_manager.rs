@@ -1662,6 +1662,12 @@ impl MetaShardManager {
             .await
     }
 
+    /// Get this node's gRPC address (for constructing redirect responses
+    /// when leader status is unknown during Raft election).
+    pub fn get_node_grpc_address(&self) -> String {
+        self.raft_group_manager.get_node_address().to_string()
+    }
+
     /// 批量分配 inode 区间（leader 单点 + CF_METADATA 持久化，§4 1.4）。
     /// fuse 在区间内本地分配，写路径零等待。
     pub async fn alloc_inode_batch(

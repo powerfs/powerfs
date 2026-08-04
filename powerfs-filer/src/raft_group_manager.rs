@@ -227,12 +227,19 @@ impl RaftGroup {
 
         let mut cfg = Config {
             id,
-            election_tick: 20,
+            // election_tick 决定选举超时范围 [election_tick, 2*election_tick) * tick_interval.
+            // tick_interval=50ms, election_tick=30 => 超时范围 [1.5s, 3s), 随机跨度 1.5s
+            // 足以避免 2 节点同时发起选举 (split vote). 之前 election_tick=20 跨度仅 1s,
+            // 停 1 个节点后剩余 2 节点频繁同时选举, 无法选出 leader.
+            election_tick: 30,
             heartbeat_tick: 5,
             max_size_per_msg: 1 << 20,
             max_inflight_msgs: 256,
             check_quorum: !peers.is_empty(),
-            pre_vote: false,
+            // 启用 PreVote: Candidate 先发 PreVote (不增加 term) 探测是否可能胜出,
+            // 收到 quorum 同意后才正式选举. 避免多节点同时选举导致的 split vote
+            // 和 term 无限增长. 这是 etcd/cockroachdb 等生产 Raft 实现的标准配置.
+            pre_vote: true,
             ..Default::default()
         };
         cfg.validate()
@@ -844,6 +851,12 @@ impl RaftGroupManager {
         }
     }
 
+    /// Get this node's gRPC address (used for Raft communication).
+    /// The caller can convert it to a net address by replacing the port.
+    pub fn get_node_address(&self) -> &str {
+        &self.node_address
+    }
+
     /// Register a peer node for Raft communication
     pub async fn register_peer(&self, peer: Peer) {
         let peer_id = peer.id;
@@ -960,11 +973,16 @@ impl RaftGroupManager {
                     continue;
                 }
 
-                // Send via gRPC
+                // 并发发送: 每条消息独立 spawn task.
+                // 之前串行 await 导致 filer-3 不可达时 gRPC 5s 超时阻塞了
+                // 发给 filer-2 的心跳, leader 的 check_quorum 因收不到 filer-2
+                // 的 Ack 而失败, 降级为 Follower. 并发后各 peer 互不阻塞.
                 let self_clone = self.clone();
-                self_clone
-                    .send_raft_message_to_peer(&peer_address, outgoing.shard_id, &msg)
-                    .await;
+                tokio::spawn(async move {
+                    self_clone
+                        .send_raft_message_to_peer(&peer_address, outgoing.shard_id, &msg)
+                        .await;
+                });
             }
 
             info!("Raft message transmitter stopped");
