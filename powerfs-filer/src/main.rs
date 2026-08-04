@@ -233,6 +233,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Load existing root inodes from shard stores (for persistence across restarts)
     meta_shard_manager.load_root_inodes_from_shards();
 
+    // Recover inode_generator by scanning existing inodes in RocksDB.
+    // Prevents inode number reuse after restart (was causing -ENOSPC in kernel).
+    meta_shard_manager.recover_inode_generator();
+
     let shard_scheduler = Arc::new(ShardScheduler::new(
         raft_group_manager.clone(),
         shard_strategy.clone(),

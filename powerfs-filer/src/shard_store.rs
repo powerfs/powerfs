@@ -1727,6 +1727,44 @@ impl ShardStore {
         );
     }
 
+    /// Scan CF_INODES for the maximum inode in [range_start, range_end).
+    /// Returns range_start if no inodes found in range.
+    /// Used by `MetaShardManager::recover_inode_generator` to advance the
+    /// in-memory counter past existing inodes after a restart.
+    ///
+    /// Keys in CF_INODES are `u64::to_be_bytes()` (big-endian), so they sort
+    /// numerically. We iterate backwards from the end and return the first
+    /// inode found within the range.
+    pub fn get_max_inode_in_range(&self, range_start: u64, range_end: u64) -> u64 {
+        let cf = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => return range_start,
+        };
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::End);
+        for item in iter {
+            if let Ok((key, _)) = item {
+                if key.len() != 8 {
+                    continue;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&key);
+                let inode = u64::from_be_bytes(arr);
+                if inode < range_start {
+                    // Gone below our range; no more candidates
+                    break;
+                }
+                if inode < range_end {
+                    // Found the max inode in our range
+                    return inode + 1;
+                }
+                // inode >= range_end: from a higher-numbered filer node,
+                // keep scanning backwards
+            }
+        }
+        range_start
+    }
+
     /// 批量分配 inode 区间 [start, end)（leader 单点 + CF_METADATA sync 持久化，§4 1.4）。
     /// 返回 (start, end)，fuse 在区间内本地分配，写路径零等待。
     pub fn alloc_inode_batch(&self, count: u32) -> Result<(u64, u64), String> {

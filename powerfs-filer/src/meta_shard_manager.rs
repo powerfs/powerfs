@@ -132,6 +132,9 @@ pub struct MetaShardManager {
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
     inode_generator: Arc<AtomicU64>,
+    /// Filer node id, used to partition the inode space
+    /// (each node owns [node_id*1B+1000, (node_id+1)*1B)).
+    node_id: u64,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
     leases: RwLock<HashMap<String, LeaseInfo>>,
@@ -159,6 +162,7 @@ impl MetaShardManager {
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
             inode_generator: Arc::new(AtomicU64::new(inode_base)),
+            node_id,
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
@@ -697,6 +701,44 @@ impl MetaShardManager {
 
     pub fn generate_inode(&self) -> u64 {
         self.inode_generator.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Recover inode_generator by scanning existing inodes in RocksDB.
+    ///
+    /// Problem: `inode_generator` is an in-memory AtomicU64 initialized to
+    /// `node_id * 1B + 1000` on every restart. If the filer allocated inodes
+    /// before restart, the counter resets and reuses existing inode numbers,
+    /// causing `-ENOSPC` in the kernel (`new_inode called for existing inode`).
+    ///
+    /// Fix: After all shard stores are loaded, scan `CF_INODES` for the max
+    /// inode in this node's range and advance `inode_generator` past it.
+    /// This is O(N) in inode count but runs once at startup.
+    pub fn recover_inode_generator(&self) {
+        let range_start = self.node_id * 1_000_000_000 + 1000;
+        let range_end = (self.node_id + 1) * 1_000_000_000;
+
+        let stores = self.shard_stores.read().unwrap();
+        let mut max_existing = range_start;
+        for store in stores.values() {
+            let max = store.get_max_inode_in_range(range_start, range_end);
+            if max > max_existing {
+                max_existing = max;
+            }
+        }
+
+        let current = self.inode_generator.load(Ordering::SeqCst);
+        if max_existing > current {
+            self.inode_generator.store(max_existing, Ordering::SeqCst);
+            info!(
+                "Recovered inode_generator: {} -> {} (node_id={}, scanned max={})",
+                current, max_existing, self.node_id, max_existing - 1
+            );
+        } else {
+            info!(
+                "inode_generator base {} is already >= scanned max {} (node_id={})",
+                current, max_existing, self.node_id
+            );
+        }
     }
 
     pub fn get_shard_strategy(&self) -> Arc<ShardStrategy> {
