@@ -211,6 +211,24 @@ impl MasterNetHandler {
 
         info!("NET_LOOKUP_VOLUME: volume_id={}", volume_id_str);
 
+        // Volume lookup reads topology state. Redirect non-leader requests
+        // to ensure the client gets up-to-date volume routing from the leader.
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            warn!(
+                "NET_LOOKUP_VOLUME: not leader; current leader is {}, returning redirect response",
+                leader
+            );
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Owner, &leader);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
         let original_id: u64 = volume_id_str.parse().unwrap_or(0);
 
         // Look up volume info. Modern volume servers use UUID-based IDs
@@ -281,6 +299,24 @@ impl MasterNetHandler {
             "NET_HEARTBEAT: node={}, ip={}, volumes={}",
             node_id_str, ip, volume_count
         );
+
+        // Heartbeat mutates Master topology state (add_node, volume registration).
+        // Only the Raft leader should process it; followers return REDIRECT.
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            warn!(
+                "NET_HEARTBEAT: not leader; current leader is {}, returning redirect response",
+                leader
+            );
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Owner, &leader);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
 
         let node_id = powerfs_common::types::NodeId(node_id_str);
 
@@ -383,6 +419,25 @@ impl MasterNetHandler {
         let replication = dec.next_string(FieldId::Replication).unwrap_or_default();
         let host = dec.next_string(FieldId::Owner).unwrap_or_default();
         let pid = dec.next_u64(FieldId::Limit).unwrap_or(0);
+
+        // KeepConnected registers/refreshes FUSE client info on the Master.
+        // Only the leader should process this to maintain a consistent client
+        // registry; followers return REDIRECT.
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            warn!(
+                "NET_KEEP_CONNECTED: not leader; current leader is {}, returning redirect response",
+                leader
+            );
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Owner, &leader);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
 
         if client_id.is_empty() {
             return Ok(Self::build_response(

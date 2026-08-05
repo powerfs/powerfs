@@ -933,6 +933,18 @@ impl FilerNetHandler {
             old_parent_ino, old_name, new_parent_ino, new_name
         );
 
+        // Check leader for the source shard (rename operates on old_parent's shard).
+        // Cross-shard rename returns an error in meta_shard_manager, so only
+        // old_parent's shard leader is checked here.
+        let shard_id = self.shard_strategy.calculate_shard(old_parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_RENAME: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
         match self
             .meta_shard_manager
             .rename(old_parent_ino, &old_name, new_parent_ino, &new_name)
@@ -1043,6 +1055,15 @@ impl FilerNetHandler {
             parent_ino, name, target
         );
 
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_SYMLINK: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
         match self
             .meta_shard_manager
             .create_symlink(parent_ino, &name, &target)
@@ -1073,6 +1094,15 @@ impl FilerNetHandler {
 
         info!("FILER_NET_READLINK: ino={}", ino);
 
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_READLINK: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
         match self.meta_shard_manager.get_inode(ino) {
             Some(info) => {
                 let target = info.symlink_target.unwrap_or_default();
@@ -1095,6 +1125,17 @@ impl FilerNetHandler {
             "FILER_NET_LINK: ino={}, new_parent={}, new_name={}",
             ino, new_parent_ino, new_name
         );
+
+        // Hard link creates a directory entry in new_parent's shard, so check
+        // leader for new_parent's shard.
+        let shard_id = self.shard_strategy.calculate_shard(new_parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_LINK: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
 
         match self
             .meta_shard_manager
