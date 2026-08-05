@@ -166,14 +166,14 @@ services:
     ports:
       - "8081:8080"    # gRPC端口
       - "8092:8092"    # HTTP管理端口
-      - "8902:8902"    # powerfs-net端口 (与HTTP端口不同!)
+      - "8902:8901"    # powerfs-net端口 (容器内统一8901)
     environment:
       - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 && nc -z 172.30.0.22 8902 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 && nc -z 172.30.0.22 8901 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -196,14 +196,14 @@ services:
     ports:
       - "8082:8080"    # gRPC端口
       - "8093:8093"    # HTTP管理端口
-      - "8903:8903"    # powerfs-net端口 (与HTTP端口不同!)
+      - "8903:8901"    # powerfs-net端口 (容器内统一8901)
     environment:
       - REDIS_URL=redis://redis:6379
     command: >
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 && nc -z 172.30.0.23 8903 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 && nc -z 172.30.0.23 8901 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3

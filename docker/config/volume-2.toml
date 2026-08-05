@@ -15,7 +15,7 @@ peers = ["172.30.0.11:9333"]
 [volume]
 grpc_port = 8080
 http_port = 8092              # HTTP管理端口 (与net_port不同!)
-net_port = 8902               # powerfs-net端口 (与http_port不同!)
+net_port = 8901               # powerfs-net端口 (统一8901, Docker网络内部端口可相同)
 data_dir = "/data"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
 node_id = "volume-server-2"
