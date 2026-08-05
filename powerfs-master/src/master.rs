@@ -76,6 +76,10 @@ pub struct MasterNode {
     filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
     shard_mapping: RwLock<HashMap<u64, String>>,
     stripe_round_robin: Arc<AtomicU32>,
+    /// Zone 管理: zone_id → ZoneInfo
+    zone_registry: RwLock<HashMap<u32, powerfs_common::types::ZoneInfo>>,
+    /// 下一个分配的 zone_id (从 1 开始, 原子递增)
+    next_zone_id: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -387,6 +391,8 @@ impl MasterNode {
             filer_nodes: RwLock::new(HashMap::new()),
             shard_mapping: RwLock::new(HashMap::new()),
             stripe_round_robin: Arc::new(AtomicU32::new(0)),
+            zone_registry: RwLock::new(HashMap::new()),
+            next_zone_id: Arc::new(AtomicU32::new(1)),
         };
 
         let master_clone = master.clone();
@@ -556,11 +562,9 @@ impl MasterNode {
         if self.is_leader.load(Ordering::Relaxed) {
             return convert_to_net_addr(&self.raft_address);
         }
-        // Otherwise, return the first peer's net address as a fallback
-        if let Some(first_peer) = self.peers.first() {
-            return convert_to_net_addr(&first_peer.address);
-        }
-        convert_to_net_addr(&self.raft_address)
+        // 无 leader 且自身非 leader: 返回空字符串, 让调用方返回 SERVER_ERROR
+        // (旧实现返回 first_peer 地址, 导致 follower 间互相 REDIRECT 形成循环)
+        String::new()
     }
 
     /// Returns the leader's gRPC address (`host:grpc_port`).
@@ -1078,6 +1082,7 @@ impl MasterNode {
             // 使用心跳中传递的 net_port 构建 Volume 路由地址
             if let Some(existing_route) = routes_map.get_mut(&vol.volume_id) {
                 existing_route.used = vol.used;
+                existing_route.file_count = vol.file_count;
                 existing_route.state = state;
                 existing_route.updated_at = Utc::now();
                 // 如果 net_port 有效，更新地址（支持 Volume 换地址场景）
@@ -1492,6 +1497,7 @@ impl MasterNode {
                 size: v.size,
                 read_only: v.read_only,
                 used: v.used,
+                file_count: v.file_count,
                 collection: v.collection.clone(),
             })
             .collect();
@@ -1518,6 +1524,7 @@ impl MasterNode {
                 size: v.size,
                 read_only: v.state == VolumeState::ReadOnly,
                 used: 0,
+                file_count: 0,
                 collection: v.collection.0.clone(),
             })
             .collect();
@@ -2145,6 +2152,92 @@ impl MasterNode {
             .collect()
     }
 
+    /// Register Filer: 分配 Zone + 选物理 volume
+    ///
+    /// 1. 分配新 zone_id (或复用已有)
+    /// 2. 从 volume_routes 选 N 个物理 volume (基于负载)
+    /// 3. 建立 zone → physical_volumes 映射
+    /// 4. 返回该 filer 的所有 Zone (旧 + 新)
+    ///
+    /// 多 Zone 设计:
+    ///   - 首次注册: 创建 1 个新 Zone, 返回 Vec(1)
+    ///   - 重启再注册: 返回该 filer_id 的所有已有 Zone, 不自动创建新 Zone
+    ///   - 扩容 (未来): 返回旧 Zone + 创建新 Zone
+    pub fn register_filer_zone(&self, filer_id: &str) -> Vec<powerfs_common::types::ZoneInfo> {
+        // 收集该 filer 的所有已有 Zone
+        let existing: Vec<powerfs_common::types::ZoneInfo> = {
+            let registry = self.zone_registry.read().unwrap();
+            registry
+                .values()
+                .filter(|z| z.owner_filer_id == filer_id)
+                .cloned()
+                .collect()
+        };
+
+        // 选 N 个物理 volume (按空闲比例排序, 取前 3 个)
+        let routes = self.list_volume_routes();
+        let mut sorted_routes: Vec<VolumeRoute> = routes.into_iter().collect();
+        sorted_routes.sort_by(|a, b| {
+            let free_a = if a.size > 0 { 1.0 - (a.used as f64 / a.size as f64) } else { 0.0 };
+            let free_b = if b.size > 0 { 1.0 - (b.used as f64 / b.size as f64) } else { 0.0 };
+            free_b.partial_cmp(&free_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let physical_volumes: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
+            .iter()
+            .take(3)
+            .map(|r| powerfs_common::types::ZoneVolume {
+                volume_id: r.volume_id,
+                addr: r.addr.clone(),
+                size: r.size,
+                used: r.used,
+            })
+            .collect();
+
+        if !existing.is_empty() {
+            // 重注册: 更新已有 Zone 的 physical_volumes (volume 路由可能已变化)
+            let mut registry = self.zone_registry.write().unwrap();
+            let mut result = Vec::with_capacity(existing.len());
+            for mut zone in existing {
+                if !physical_volumes.is_empty() {
+                    zone.physical_volumes = physical_volumes.clone();
+                }
+                registry.insert(zone.zone_id, zone.clone());
+                result.push(zone);
+            }
+            info!(
+                "MASTER_ZONE: returning {} existing zone(s) for filer={}, volumes={}",
+                result.len(),
+                filer_id,
+                result.iter().map(|z| z.physical_volumes.len()).sum::<usize>()
+            );
+            return result;
+        }
+
+        // 首次注册: 分配新 zone_id
+        let zone_id = self.next_zone_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let zone_info = powerfs_common::types::ZoneInfo {
+            zone_id,
+            owner_filer_id: filer_id.to_string(),
+            physical_volumes,
+        };
+
+        info!(
+            "MASTER_ZONE: allocated zone_id={} for filer={}, volumes={}",
+            zone_id,
+            filer_id,
+            zone_info.physical_volumes.len()
+        );
+
+        self.zone_registry
+            .write()
+            .unwrap()
+            .insert(zone_id, zone_info.clone());
+
+        vec![zone_info]
+    }
+
     /// Remove volume route
     pub fn remove_volume_route(&self, volume_id: u64) -> Option<VolumeRoute> {
         self.volume_routes.write().unwrap().remove(&volume_id)
@@ -2692,6 +2785,8 @@ impl Clone for MasterNode {
             filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),
             shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
             stripe_round_robin: self.stripe_round_robin.clone(),
+            zone_registry: RwLock::new(self.zone_registry.read().unwrap().clone()),
+            next_zone_id: self.next_zone_id.clone(),
         }
     }
 }

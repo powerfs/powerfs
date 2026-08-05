@@ -31,6 +31,7 @@ data_dir = "/data/filer"
 shard_count = 2
 raft_id = 1
 raft_peers = ["172.30.0.35:8889", "172.30.0.36:8889", "172.30.0.37:8889"]
+master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
 
 [s3]
 port = 9000

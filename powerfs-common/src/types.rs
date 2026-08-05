@@ -6,6 +6,50 @@ use std::str::FromStr;
 
 pub use crate::utils::{Checksum, ChecksumAlgorithm};
 
+// ========== Zone 编码常量 ==========
+// needle_id = (zone_id << 40) | counter
+// zone_id: 24 bits (最多 1677 万 Zone)
+// counter: 40 bits (每 Zone 最多 1 万亿 needle)
+
+pub const ZONE_ID_BITS: u32 = 24;
+pub const COUNTER_BITS: u32 = 40;
+pub const ZONE_ID_SHIFT: u32 = COUNTER_BITS; // 40
+pub const ZONE_ID_MASK: u64 = (1u64 << ZONE_ID_BITS) - 1; // 0xFFFFFF
+pub const COUNTER_MASK: u64 = (1u64 << COUNTER_BITS) - 1; // 0xFFFFFFFFFF
+
+/// 从 needle_id 提取 zone_id
+pub fn needle_zone_id(needle_id: u64) -> u32 {
+    ((needle_id >> ZONE_ID_SHIFT) & ZONE_ID_MASK) as u32
+}
+
+/// 从 needle_id 提取 counter
+pub fn needle_counter(needle_id: u64) -> u64 {
+    needle_id & COUNTER_MASK
+}
+
+/// 构造 needle_id
+pub fn make_needle_id(zone_id: u32, counter: u64) -> u64 {
+    ((zone_id as u64) << ZONE_ID_SHIFT) | (counter & COUNTER_MASK)
+}
+
+/// Zone 信息 (Master 管理, 分配给 Filer)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneInfo {
+    pub zone_id: u32,
+    pub owner_filer_id: String,
+    /// 映射到的物理 volume 列表
+    pub physical_volumes: Vec<ZoneVolume>,
+}
+
+/// Zone 内的物理 volume 条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneVolume {
+    pub volume_id: u64,
+    pub addr: String,
+    pub size: u64,
+    pub used: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct VolumeId(pub u64);
 
@@ -334,6 +378,7 @@ pub struct VolumeRoute {
     pub addr: String,
     pub size: u64,
     pub used: u64,
+    pub file_count: u64,
     pub state: VolumeState,
     pub node_id: String,
     pub updated_at: DateTime<Utc>,
@@ -346,6 +391,7 @@ impl VolumeRoute {
             addr,
             size,
             used: 0,
+            file_count: 0,
             state: VolumeState::Available,
             node_id,
             updated_at: Utc::now(),

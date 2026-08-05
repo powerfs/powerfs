@@ -822,15 +822,6 @@ pub fn decode_readdir_req(body: &[u8]) -> Result<(u64, u64, String), NetError> {
     Ok((parent_ino, limit, last_name))
 }
 
-/// Encode a data request (read/write)
-pub fn encode_data_req(ino: u64, offset: u64, data_len: u32) -> Result<Vec<u8>, NetError> {
-    let mut enc = TlvEncoder::new();
-    enc.add_u64(FieldId::Ino, ino);
-    enc.add_u64(FieldId::Offset, offset);
-    enc.add_u32(FieldId::DataLen, data_len);
-    Ok(enc.into_bytes())
-}
-
 /// Decode a data request
 pub fn decode_data_req(body: &[u8]) -> Result<(u64, u64, u32), NetError> {
     let mut dec = TlvDecoder::new(body);

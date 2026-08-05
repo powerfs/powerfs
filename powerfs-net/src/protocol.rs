@@ -357,10 +357,6 @@ pub enum MsgType {
     SetAttrData = 0x001C, // Strong-consistency SetAttr (size/chunks)
     SetAttrMeta = 0x001D, // Eventually-consistency SetAttr (mode/uid/gid)
 
-    // Data operations
-    Read = 0x0020,
-    Write = 0x0021,
-
     // Consistency operations
     PushDelta = 0x0030,
     PullDelta = 0x0031,
@@ -390,6 +386,15 @@ pub enum MsgType {
     ReadNeedleBlob = 0x0066,
     RangeLease = 0x0067,
     VolumeStatus = 0x0068,
+    /// Assign a new needle_id within a volume.
+    /// Filer → Volume Server: requests allocation of a needle_id.
+    /// Response: volume_id + needle_id.
+    /// This is a metadata-only operation (no data transfer).
+    AssignNeedle = 0x0069,
+    /// Register Filer with Master to get a Zone assignment.
+    /// Filer → Master: requests Zone allocation.
+    /// Response: zone_id + [(volume_id, addr, size, used), ...].
+    RegisterFiler = 0x006A,
 
     // Master topology & discovery operations
     GetTopology = 0x0070,
@@ -427,8 +432,6 @@ impl MsgType {
             0x001B => Some(Self::Link),
             0x001C => Some(Self::SetAttrData),
             0x001D => Some(Self::SetAttrMeta),
-            0x0020 => Some(Self::Read),
-            0x0021 => Some(Self::Write),
             0x0030 => Some(Self::PushDelta),
             0x0031 => Some(Self::PullDelta),
             0x0032 => Some(Self::Invalidate),
@@ -451,6 +454,8 @@ impl MsgType {
             0x0066 => Some(Self::ReadNeedleBlob),
             0x0067 => Some(Self::RangeLease),
             0x0068 => Some(Self::VolumeStatus),
+            0x0069 => Some(Self::AssignNeedle),
+            0x006A => Some(Self::RegisterFiler),
             0x0070 => Some(Self::GetTopology),
             0x0071 => Some(Self::WatchTopology),
             0x0072 => Some(Self::TopologyChanged),
@@ -472,11 +477,6 @@ impl MsgType {
     pub fn is_metadata(self) -> bool {
         let v = self.as_u16();
         (0x0010..=0x001D).contains(&v)
-    }
-
-    pub fn is_data(self) -> bool {
-        let v = self.as_u16();
-        v == 0x0020 || v == 0x0021
     }
 }
 
@@ -597,6 +597,12 @@ pub enum FieldId {
     /// Inode for lease validation (lease is registered per-inode, not per-needle).
     /// Used in Write/BatchWrite TLV alongside FileKey.
     Inode = 0x97,
+    /// Used space in bytes (for GetTopology volume status).
+    UsedSpace = 0x98,
+    /// File/needle count (for GetTopology volume status).
+    FileCount = 0x99,
+    /// Zone ID (for RegisterFiler response).
+    ZoneId = 0x9A,
 }
 
 impl FieldId {
@@ -664,6 +670,9 @@ impl FieldId {
             0x95 => Some(Self::Fid),
             0x96 => Some(Self::Chunks),
             0x97 => Some(Self::Inode),
+            0x98 => Some(Self::UsedSpace),
+            0x99 => Some(Self::FileCount),
+            0x9A => Some(Self::ZoneId),
             _ => None,
         }
     }

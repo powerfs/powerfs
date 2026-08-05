@@ -264,6 +264,24 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Prevents inode number reuse after restart (was causing -ENOSPC in kernel).
     meta_shard_manager.recover_inode_generator();
 
+    // 初始化 POSIX root inode (inode=1, 目录 "/").
+    // 首次启动或全新部署时必须创建, 否则 FUSE getattr(1) 返回 ENOENT,
+    // 导致挂载点显示为 d????????? (无法访问).
+    // format_posix_root 内部有幂等检查和 Raft leader 等待重试.
+    {
+        let mgr = meta_shard_manager.clone();
+        tokio::spawn(async move {
+            match mgr.format_posix_root().await {
+                Ok(ino) => {
+                    info!("POSIX root inode {} initialized", ino);
+                }
+                Err(e) => {
+                    error!("Failed to initialize POSIX root inode: {}", e);
+                }
+            }
+        });
+    }
+
     let shard_scheduler = Arc::new(ShardScheduler::new(
         raft_group_manager.clone(),
         shard_strategy.clone(),
@@ -359,6 +377,108 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             net_port,
             inode_notifier,
         ));
+
+        // === P2.3: Zone 注册 (异步, 不阻塞 Filer 启动) ===
+        // 向 Master 注册 Filer, 获取 Zone 分配 (多 Zone: 旧 + 新).
+        // 注册失败不阻止 Filer 启动, 但 handle_create 在 zones 为空时返回 SERVER_ERROR.
+        // 重试机制: Master Raft 选举可能需要几秒, Filer 持续重试直到注册成功.
+        {
+            let net_handler_for_zone = net_handler.clone();
+            let master_addrs_for_zone = master_addresses.clone();
+            let master_net_port = filer_cfg.master_net_port;
+            let filer_raft_id = filer_cfg.raft_id;
+
+            tokio::spawn(async move {
+                let filer_id = format!("filer-{}", filer_raft_id);
+
+                // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
+                let master_net_addrs: Vec<String> = master_addrs_for_zone
+                    .iter()
+                    .map(|addr| {
+                        let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr);
+                        format!("{}:{}", ip, master_net_port)
+                    })
+                    .collect();
+
+                info!(
+                    "FILER_ZONE: registering with Master (filer_id={}, net_addrs={:?})",
+                    filer_id, master_net_addrs
+                );
+
+                // 重试循环: Master Raft 选举期间可能返回 REDIRECT 循环或 NOT_LEADER,
+                // 持续重试直到成功. 间隔 5 秒, 避免刷屏日志.
+                // 同时: 如果 Zone 的 physical_volumes 为空 (Volume 心跳未到达),
+                // 也视为失败并重试.
+                const RETRY_INTERVAL_SECS: u64 = 5;
+                let mut attempt: u64 = 0;
+                loop {
+                    attempt += 1;
+                    let mut registered = false;
+
+                    for master_addr in &master_net_addrs {
+                        match powerfs_filer::zone_client::register_filer(master_addr, &filer_id)
+                            .await
+                        {
+                            Ok(zones) => {
+                                // 检查是否所有 Zone 都有物理 volume
+                                let total_vols: usize =
+                                    zones.iter().map(|z| z.physical_volumes.len()).sum();
+                                if total_vols == 0 {
+                                    warn!(
+                                        "FILER_ZONE: registered but got 0 physical volumes (attempt={}), volume servers may not be ready, retrying...",
+                                        attempt
+                                    );
+                                    break; // 跳出 master 循环, 进入重试
+                                }
+
+                                let zone_ids: Vec<u32> =
+                                    zones.iter().map(|z| z.zone_id).collect();
+                                info!(
+                                    "FILER_ZONE: registered successfully (attempt={}), zones={:?}, total_volumes={}",
+                                    attempt, zone_ids, total_vols
+                                );
+                                net_handler_for_zone.set_zones(zones);
+
+                                // P2.5: 从 chunk 映射恢复每个 Zone 的 counter, 避免 needle_id 重复
+                                let chunks = net_handler_for_zone
+                                    .meta_shard_manager
+                                    .list_all_chunks();
+                                let zone_ids = net_handler_for_zone.get_zones();
+                                for zone_id in zone_ids {
+                                    let recovered = powerfs_filer::zone_client::recover_counter(
+                                        zone_id, &chunks,
+                                    );
+                                    net_handler_for_zone.set_zone_counter(zone_id, recovered);
+                                    info!(
+                                        "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",
+                                        zone_id, recovered, chunks.len()
+                                    );
+                                }
+
+                                registered = true;
+                                break; // 注册成功, 跳出 master 循环
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "FILER_ZONE: register_filer failed on {} (attempt={}): {}",
+                                    master_addr, attempt, e
+                                );
+                            }
+                        }
+                    }
+
+                    if registered {
+                        return; // 注册成功, 退出重试循环
+                    }
+
+                    warn!(
+                        "FILER_ZONE: all master attempts failed (attempt={}), retrying in {}s...",
+                        attempt, RETRY_INTERVAL_SECS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
+                }
+            });
+        }
 
         // Wrap with ManagedNetHandler for session management + middleware
         let managed_handler = Arc::new(ManagedNetHandler::from_arc(

@@ -28,6 +28,7 @@ grpc_port = 8889               # gRPC端口
 net_port = 9334                # powerfs-net端口
 ip = "0.0.0.0"             # 绑定所有接口
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
 data_dir = "/data/filer"
 shard_count = 2
 raft_id = 2

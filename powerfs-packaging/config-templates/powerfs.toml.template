@@ -44,6 +44,7 @@ port = 8888                  # HTTP 端口 (必填)
 grpc_port = 8889             # gRPC 端口 (必填)
 net_port = 9334              # powerfs-net TLV 端口 (必填)
 master_addresses = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+master_net_port = 9334       # Master 的 powerfs-net 端口 (必填, 用于 Zone 注册)
 ip = "0.0.0.0"
 data_dir = "/data/filer"
 shard_count = 2

@@ -169,6 +169,17 @@ impl Volume {
         })
     }
 
+    /// 获取 volume 统计信息（心跳上报用）。
+    /// 返回 (used_bytes, total_bytes, needle_count)
+    pub fn get_stats(&self) -> (u64, u64, u64) {
+        let info = self.info.read().unwrap();
+        let used = info.used;
+        let total = info.size;
+        drop(info);
+        let needle_count = self.index.needle_count().unwrap_or(0);
+        (used, total, needle_count)
+    }
+
     /// 启动时同步 allocation CF：如果 RocksDB 中的分配状态与 needle 索引不一致，则更新
     fn sync_allocation_from_index(
         index: &VolumeMetadata,

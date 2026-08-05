@@ -307,8 +307,12 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(existing) = cache.get_mut(&inode) {
             if existing.name != entry.name || existing.parent != entry.parent {
-                // Rename: replace with the new entry's metadata
+                // Rename: replace with the new entry's metadata.
+                // Preserve xattrs from the old entry — they are local-only
+                // (not stored in the Filer) and would be lost on replace.
+                let preserved_xattrs = std::mem::take(&mut existing.xattrs);
                 *existing = entry;
+                existing.xattrs = preserved_xattrs;
             } else {
                 // Same name/parent: update metadata fields from the new entry.
                 //

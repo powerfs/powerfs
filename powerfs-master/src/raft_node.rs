@@ -280,6 +280,23 @@ impl RaftNode {
             let is_leader_now = ss.raft_state == StateRole::Leader;
             let prev = self.leader_state.swap(is_leader_now, Ordering::Relaxed);
 
+            if prev != is_leader_now {
+                info!(
+                    "Raft role changed: node {} is now {:?} (was {})",
+                    self.id,
+                    ss.raft_state,
+                    if prev { "Leader" } else { "Non-Leader" }
+                );
+            }
+        }
+
+        // 同步 leader_address: 每次 process_ready 都检查 raft.leader_id,
+        // 因为 follower 可能在无状态变更 (ss=None) 的情况下学到新 leader
+        // (例如收到 heartbeat 后 leader_id 被更新但角色未变).
+        // 旧实现只在 ss=Some 时更新 leader_address, 导致 follower 在选举后
+        // 仍返回空或陈旧的 leader 地址, 触发 REDIRECT 循环.
+        {
+            let is_leader_now = self.leader_state.load(Ordering::Relaxed);
             let new_leader_addr = if is_leader_now {
                 self.address.clone()
             } else {
@@ -295,15 +312,15 @@ impl RaftNode {
                     }
                 }
             };
-            *self.leader_address.write().unwrap() = new_leader_addr;
 
-            if prev != is_leader_now {
+            let mut leader_addr_guard = self.leader_address.write().unwrap();
+            let prev_addr = leader_addr_guard.clone();
+            if prev_addr != new_leader_addr {
                 info!(
-                    "Raft role changed: node {} is now {:?} (was {})",
-                    self.id,
-                    ss.raft_state,
-                    if prev { "Leader" } else { "Non-Leader" }
+                    "RAFT_DEBUG: leader_address updated: {} -> {} (leader_id={})",
+                    prev_addr, new_leader_addr, self.node.raft.leader_id
                 );
+                *leader_addr_guard = new_leader_addr;
             }
         }
 

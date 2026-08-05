@@ -14,7 +14,6 @@ const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persi
 const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
 const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
-const CF_FILE_DATA: &str = "file_data"; // Inline file data (replicated via Raft)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -99,10 +98,6 @@ pub struct ShardStore {
     // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
     // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
     open_counts: RwLock<HashMap<u64, u32>>,
-    // Inline file data (replicated via Raft, persisted to RocksDB).
-    // Keyed by inode. Replaces the per-Filer inline_data in net_handler,
-    // which was lost on leader switch.
-    file_data: RwLock<HashMap<u64, Vec<u8>>>,
 }
 
 impl ShardStore {
@@ -141,7 +136,6 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
-            ColumnFamilyDescriptor::new(CF_FILE_DATA, make_cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -163,7 +157,6 @@ impl ShardStore {
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
             open_counts: RwLock::new(HashMap::new()),
-            file_data: RwLock::new(HashMap::new()),
         };
 
         store.load_data()?;
@@ -176,36 +169,7 @@ impl ShardStore {
         self.load_dir_entries()?;
         self.load_stats()?;
         self.load_root_inodes()?;
-        self.load_file_data()?;
         info!("Shard {} loaded data from rocksdb", self.shard_id.0);
-        Ok(())
-    }
-
-    fn load_file_data(&mut self) -> Result<(), String> {
-        let cf = match self.db.cf_handle(CF_FILE_DATA) {
-            Some(cf) => cf,
-            None => return Ok(()),
-        };
-
-        let mut file_data = self.file_data.write().unwrap();
-        let mut count = 0;
-        let mut it = self.db.raw_iterator_cf(cf);
-        it.seek_to_first();
-        while it.valid() {
-            if let (Some(key), Some(value)) = (it.key(), it.value()) {
-                let mut key_bytes = [0u8; 8];
-                key_bytes.copy_from_slice(&key.to_vec()[..8.min(key.len())]);
-                let inode = u64::from_be_bytes(key_bytes);
-                file_data.insert(inode, value.to_vec());
-                count += 1;
-            }
-            it.next();
-        }
-
-        info!(
-            "Shard {} loaded {} inline file data entries from rocksdb",
-            self.shard_id.0, count
-        );
         Ok(())
     }
 
@@ -569,99 +533,7 @@ impl ShardStore {
                     );
                 }
             }
-            ShardCommand::WriteFileData {
-                inode,
-                offset,
-                data,
-            } => {
-                self.write_file_data(inode, offset, data);
-            }
-            ShardCommand::DeleteFileData { inode } => {
-                self.delete_file_data(inode);
-            }
         }
-    }
-
-    /// Write inline file data at given offset (Raft-replicated).
-    /// Extends the buffer with zeros if writing beyond current end.
-    fn write_file_data(&self, inode: u64, offset: u64, data: Vec<u8>) {
-        if data.is_empty() {
-            return;
-        }
-
-        let cf = match self.db.cf_handle(CF_FILE_DATA) {
-            Some(cf) => cf,
-            None => {
-                log::error!("Shard {} CF_FILE_DATA not found", self.shard_id.0);
-                return;
-            }
-        };
-
-        let new_end = offset as usize + data.len();
-
-        {
-            let mut file_data = self.file_data.write().unwrap();
-            let buf = file_data.entry(inode).or_insert_with(Vec::new);
-            if buf.len() < new_end {
-                buf.resize(new_end, 0u8);
-            }
-            buf[offset as usize..new_end].copy_from_slice(&data);
-        }
-
-        // Persist to RocksDB
-        let key = inode.to_be_bytes();
-        let buf = self.file_data.read().unwrap();
-        if let Some(data) = buf.get(&inode) {
-            let _ = self.db.put_cf(cf, key, data);
-        }
-
-        debug!(
-            "Shard {} wrote file data: inode={}, offset={}, len={}",
-            self.shard_id.0,
-            inode,
-            offset,
-            data.len()
-        );
-    }
-
-    /// Read inline file data (Raft-replicated). Returns None if no data.
-    pub fn read_file_data(&self, inode: u64, offset: usize, length: usize) -> Option<Vec<u8>> {
-        let file_data = self.file_data.read().unwrap();
-        let buf = file_data.get(&inode)?;
-
-        if length == 0 {
-            return Some(Vec::new());
-        }
-
-        let start = offset.min(buf.len());
-        let end = (start + length).min(buf.len());
-        let mut out = buf[start..end].to_vec();
-        // Zero-fill trailing portion
-        if out.len() < length {
-            out.resize(length, 0u8);
-        }
-        Some(out)
-    }
-
-    /// Delete inline file data for an inode.
-    fn delete_file_data(&self, inode: u64) {
-        let cf = match self.db.cf_handle(CF_FILE_DATA) {
-            Some(cf) => cf,
-            None => return,
-        };
-
-        {
-            let mut file_data = self.file_data.write().unwrap();
-            file_data.remove(&inode);
-        }
-
-        let key = inode.to_be_bytes();
-        let _ = self.db.delete_cf(cf, key);
-
-        debug!(
-            "Shard {} deleted file data: inode={}",
-            self.shard_id.0, inode
-        );
     }
 
     fn create_file(&self, parent_inode: u64, name: String, inode: u64) {
@@ -883,8 +755,8 @@ impl ShardStore {
             }
         };
 
-        // Phase 2: Outside locks, perform persistence (update_inode /
-        // delete_file_data acquire their own locks).
+        // Phase 2: Outside locks, perform persistence (update_inode
+        // acquires its own lock).
         let mut inode_deleted = false;
         let mut is_file_deleted = false;
         let mut inode_val = 0;
@@ -903,7 +775,6 @@ impl ShardStore {
                     inode_val = inode;
                     inode_deleted = true;
                     is_file_deleted = is_file;
-                    self.delete_file_data(inode);
                 }
             }
         }
@@ -1154,6 +1025,19 @@ impl ShardStore {
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
         self.inodes.read().unwrap().get(&inode).cloned()
+    }
+
+    /// 遍历所有 inode, 收集 chunk 映射 (needle_id, volume_id).
+    /// 用于 Filer 重启时恢复 Zone counter (P2.5).
+    pub fn list_all_chunks(&self) -> Vec<(u64, u64)> {
+        let inodes = self.inodes.read().unwrap();
+        let mut result = Vec::new();
+        for info in inodes.values() {
+            for chunk in &info.chunks {
+                result.push((chunk.needle_id, chunk.volume_id));
+            }
+        }
+        result
     }
 
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Option<InodeInfo> {
@@ -1844,11 +1728,12 @@ impl ShardStore {
             Some(mut info) => {
                 if let Some(s) = size {
                     info.size = s;
-                    // Truncate inline file data to match new size
-                    self.truncate_file_data(inode, s);
                 }
                 if let Some(m) = mode {
-                    info.mode = m as u32;
+                    // Preserve file type bits (S_IFMT), only update permission bits (0o7777).
+                    // Client sends only permission bits (st_mode & 0o7777), so overwriting
+                    // the entire mode would lose S_IFREG/S_IFDIR/S_IFLNK etc.
+                    info.mode = (info.mode & !0o7777) | (m as u32 & 0o7777);
                 }
                 if let Some(u) = uid {
                     info.uid = u as u32;
@@ -1867,31 +1752,6 @@ impl ShardStore {
         let _ = self.update_inode(info);
     }
 
-    /// Truncate inline file data to new size. Removes data if size == 0.
-    fn truncate_file_data(&self, inode: u64, new_size: u64) {
-        let cf = match self.db.cf_handle(CF_FILE_DATA) {
-            Some(cf) => cf,
-            None => return,
-        };
-
-        let mut file_data = self.file_data.write().unwrap();
-        if new_size == 0 {
-            if file_data.remove(&inode).is_some() {
-                let key = inode.to_be_bytes();
-                let _ = self.db.delete_cf(cf, key);
-            }
-            return;
-        }
-
-        if let Some(buf) = file_data.get_mut(&inode) {
-            if (new_size as usize) < buf.len() {
-                buf.truncate(new_size as usize);
-                let key = inode.to_be_bytes();
-                let _ = self.db.put_cf(cf, key, buf);
-            }
-        }
-    }
-
     /// Set data-related inode attributes (size) - strong consistency path via Raft
     fn setattr_data(&self, inode: u64, size: Option<u64>) {
         let info = match self.get_inode(inode) {
@@ -1899,8 +1759,6 @@ impl ShardStore {
                 if let Some(s) = size {
                     info.size = s;
                     info.blocks = s.div_ceil(512);
-                    // Truncate inline file data to match new size
-                    self.truncate_file_data(inode, s);
                 }
                 let now = chrono::Utc::now().timestamp() as u64;
                 info.ctime = now;
@@ -1926,7 +1784,7 @@ impl ShardStore {
         let info = match self.get_inode(inode) {
             Some(mut info) => {
                 if let Some(m) = mode {
-                    info.mode = m as u32;
+                    info.mode = (info.mode & !0o7777) | (m as u32 & 0o7777);
                 }
                 if let Some(u) = uid {
                     info.uid = u as u32;

@@ -1034,9 +1034,16 @@ impl FileSystem for PowerFsFs {
 
         match result {
             Ok(Some((filer_entry, path))) => {
-                // Resolve parent inode from the path
+                // Resolve parent inode from the path.
+                // If the Filer returns an empty path, fall back to the
+                // existing cache entry's parent to avoid treating the
+                // refresh as a rename (which would replace the entry and
+                // lose local-only state such as xattrs).
                 let parent = if path.is_empty() || path == "/" {
-                    ROOT_INODE
+                    self.cache
+                        .get_inode(inode)
+                        .map(|e| e.parent)
+                        .unwrap_or(ROOT_INODE)
                 } else {
                     // Get parent path (strip last component)
                     let parent_path = match path.rfind('/') {
@@ -1045,7 +1052,12 @@ impl FileSystem for PowerFsFs {
                         None => "/".to_string(),
                     };
                     // Try to resolve parent inode via lookup chain
-                    self.resolve_path_inode(&parent_path).unwrap_or(ROOT_INODE)
+                    self.resolve_path_inode(&parent_path).unwrap_or_else(|| {
+                        self.cache
+                            .get_inode(inode)
+                            .map(|e| e.parent)
+                            .unwrap_or(ROOT_INODE)
+                    })
                 };
 
                 let cached = self.entry_to_cached(parent, &filer_entry);
@@ -1077,10 +1089,13 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<(libc::stat64, Duration)> {
         debug!("setattr: inode={}, valid={:?}", inode, valid);
 
-        self.cache
-            .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-
+        // NOTE: Do NOT check the cache at the start of setattr. The kernel
+        // passes all needed fields via `attr` and `valid`, so reading from
+        // the cache is unnecessary. More importantly, checking the cache here
+        // introduces a self-invalidation race: the filer sends an Invalidate
+        // after processing the setattr RPC, and the InvalidateHandler (running
+        // in a separate thread) can evict the cache entry between the getattr
+        // (which repopulates the cache) and this check, causing spurious ENOENT.
         let mode = if valid.contains(fuse_backend_rs::abi::fuse_abi::SetattrValid::MODE) {
             Some(attr.st_mode & 0o7777)
         } else {
@@ -1184,7 +1199,37 @@ impl FileSystem for PowerFsFs {
         if let Some(updated) = self.cache.get_inode(inode) {
             Ok((self.create_stat(&updated), TTL))
         } else {
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            // Cache was invalidated (by InvalidateHandler) between update_attr
+            // and this check. Fetch fresh metadata from the filer instead of
+            // returning ENOENT. The setattr RPC already succeeded, so the
+            // filer has the updated attributes.
+            debug!(
+                "setattr: cache miss after RPC for inode={}, fetching fresh metadata",
+                inode
+            );
+            match self.client.get_entry_by_inode(inode) {
+                Ok(Some((filer_entry, path))) => {
+                    let parent = if path.is_empty() || path == "/" {
+                        ROOT_INODE
+                    } else {
+                        let parent_path = match path.rfind('/') {
+                            Some(0) => "/".to_string(),
+                            Some(pos) => path[..pos].to_string(),
+                            None => "/".to_string(),
+                        };
+                        self.resolve_path_inode(&parent_path).unwrap_or(ROOT_INODE)
+                    };
+                    let cached = self.entry_to_cached(parent, &filer_entry);
+                    Ok((self.create_stat(&cached), TTL))
+                }
+                _ => {
+                    warn!(
+                        "setattr: failed to fetch fresh metadata for inode={} after RPC",
+                        inode
+                    );
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                }
+            }
         }
     }
 
@@ -1263,9 +1308,31 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
 
-        let entry = self
-            .lookup_in_cache(parent, name_str)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        // Try cache first; if miss (e.g., after InvalidateHandler evicted the
+        // entry due to a prior setattr/chown), fetch from filer. This avoids
+        // a self-invalidation race where the chown's Invalidate clears the
+        // cache before unlink runs.
+        let entry = if let Some(e) = self.lookup_in_cache(parent, name_str) {
+            e
+        } else {
+            debug!(
+                "unlink: cache miss for '{}/{}', fetching from filer",
+                parent, name_str
+            );
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let shard_id = meta_client.calculate_shard_id(parent);
+            let name_owned = name_str.to_string();
+            let attr = self
+                .client
+                .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
+                .map_err(|e| {
+                    debug!("unlink: lookup RPC failed for '{}/{}': {}", parent, name_str, e);
+                    std::io::Error::from_raw_os_error(libc::ENOENT)
+                })?;
+            let entry = attr_to_cached_entry(&attr, parent, name_str);
+            self.cache.insert(entry.clone());
+            entry
+        };
 
         let should_delete = self.cache.dec_nlink(entry.inode);
 
@@ -1434,12 +1501,18 @@ impl FileSystem for PowerFsFs {
             generation: 0,
             cached_at: Instant::now(),
         };
-        self.cache.insert(entry.clone());
-        debug!("create: RPC done, inode={}, dir={}", inode, parent);
-
-        // create also opens the file: pin inode + track as open
+        // CRITICAL: Pin the inode BEFORE inserting the cache entry.
+        // The Filer pushes an Invalidate after the create RPC commits, and
+        // the InvalidateHandler (running in a separate thread) can process
+        // it between insert() and pin_inode(). If the entry is inserted but
+        // not pinned when the Invalidate arrives, the handler evicts it
+        // (is_pinned returns false). This causes sync_size_chunks_on_close
+        // to find an empty cache → skip metadata sync → data loss.
+        // Pinning before insert makes the handler skip the invalidation.
         self.open_inodes.write().unwrap().insert(inode);
         self.cache.pin_inode(inode);
+        self.cache.insert(entry.clone());
+        debug!("create: RPC done, inode={}, dir={}", inode, parent);
 
         Ok((
             self.create_fuse_entry(&entry),
@@ -2990,9 +3063,13 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("getxattr: inode={}, name={}", inode, name_str);
 
-        if self.cache.get_inode(inode).is_none() {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
+        // Do NOT return ENOENT when the inode is not in the cache.
+        // The kernel calls getxattr (e.g., security.selinux) after setattr,
+        // and the InvalidateHandler may have evicted the cache entry between
+        // the setattr and this call. Returning ENODATA is safe: PowerFS does
+        // not store xattrs, so the kernel treats the file as having no xattrs.
+        // Returning ENOENT here would cause the preceding operation (e.g.,
+        // chown) to report "No such file or directory" even though it succeeded.
 
         if let Some(value) = self.cache.get_xattr(inode, name_str) {
             if size == 0 {
@@ -3015,9 +3092,8 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<ListxattrReply> {
         debug!("listxattr: inode={}", inode);
 
-        if self.cache.get_inode(inode).is_none() {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
+        // Do NOT return ENOENT when the inode is not in the cache.
+        // See getxattr comment for rationale.
 
         let xattrs = self.cache.list_xattrs(inode);
         let mut buf = Vec::new();

@@ -19,6 +19,13 @@ use powerfs_net::{
 };
 use std::sync::Arc;
 
+/// Zone 运行时状态 (Filer 持有, 每个 Zone 独立 counter + volume 列表)
+struct ZoneState {
+    zone_id: u32,
+    counter: std::sync::atomic::AtomicU64,
+    volumes: Vec<powerfs_common::types::ZoneVolume>,
+}
+
 /// Filer Net Handler implementation
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
@@ -27,6 +34,11 @@ pub struct FilerNetHandler {
     pub net_port: u16,
     /// Inode notification broadcaster (optional, for cache invalidation)
     pub inode_notifier: Option<Arc<InodeNotifier>>,
+    /// 该 Filer 拥有的所有 Zone (多 Zone 设计: 旧 + 新)
+    /// 空 Vec = 未注册, 无法分配 needle_id
+    zones: std::sync::RwLock<Vec<ZoneState>>,
+    /// round-robin 选 Zone 的索引 (fetch_add % zones.len())
+    zone_rr: std::sync::atomic::AtomicU32,
 }
 
 impl FilerNetHandler {
@@ -40,6 +52,8 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: None,
+            zones: std::sync::RwLock::new(Vec::new()),
+            zone_rr: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -55,7 +69,99 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: Some(inode_notifier),
+            zones: std::sync::RwLock::new(Vec::new()),
+            zone_rr: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// 设置 Zone 列表 (从 Master RegisterFiler 获取后调用)
+    /// 替换所有已有 Zone, 保留已有 Zone 的 counter (若 zone_id 匹配)
+    pub fn set_zones(&self, new_zones: Vec<powerfs_common::types::ZoneInfo>) {
+        let mut zones = self.zones.write().unwrap();
+
+        // 保留已有 Zone 的 counter (若 zone_id 匹配), 避免 set_zones 重置 counter
+        let mut updated = Vec::with_capacity(new_zones.len());
+        for zi in new_zones {
+            let preserved_counter = zones
+                .iter()
+                .find(|z| z.zone_id == zi.zone_id)
+                .map(|z| z.counter.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(0);
+
+            updated.push(ZoneState {
+                zone_id: zi.zone_id,
+                counter: std::sync::atomic::AtomicU64::new(preserved_counter),
+                volumes: zi.physical_volumes.clone(),
+            });
+        }
+
+        let zone_ids: Vec<u32> = updated.iter().map(|z| z.zone_id).collect();
+        let total_vols: usize = updated.iter().map(|z| z.volumes.len()).sum();
+        info!(
+            "FILER_ZONE: set_zones count={}, zone_ids={:?}, total_volumes={}",
+            updated.len(),
+            zone_ids,
+            total_vols
+        );
+
+        *zones = updated;
+    }
+
+    /// 设置指定 Zone 的 needle_id counter (用于 recover_counter)
+    pub fn set_zone_counter(&self, zone_id: u32, counter: u64) {
+        let zones = self.zones.read().unwrap();
+        if let Some(z) = zones.iter().find(|z| z.zone_id == zone_id) {
+            z.counter.store(counter, std::sync::atomic::Ordering::SeqCst);
+            info!("FILER_ZONE: set zone_id={} counter={}", zone_id, counter);
+        } else {
+            warn!(
+                "FILER_ZONE: set_zone_counter zone_id={} not found (zones={})",
+                zone_id,
+                zones.len()
+            );
+        }
+    }
+
+    /// 返回所有 Zone 的 zone_id 列表 (用于 recover_counter, P2.5)
+    pub fn get_zones(&self) -> Vec<u32> {
+        let zones = self.zones.read().unwrap();
+        zones.iter().map(|z| z.zone_id).collect()
+    }
+
+    /// 为新文件分配 needle_id + 选 volume (多 Zone round-robin)
+    /// 返回 (volume_id, needle_id)
+    fn alloc_for_new_file(&self) -> Option<(u64, u64)> {
+        let zones = self.zones.read().unwrap();
+        if zones.is_empty() {
+            warn!("FILER_ZONE: no zones registered, cannot allocate needle_id");
+            return None;
+        }
+
+        // round-robin 选 Zone: zone_rr.fetch_add(1) % zones.len()
+        let rr = self
+            .zone_rr
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = (rr as usize) % zones.len();
+        let zone = &zones[idx];
+
+        // 从选中 Zone 的 counter 分配 needle_id
+        let needle_id =
+            crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+
+        // 从该 Zone 的 volumes 中选空闲比例最大的
+        let vol = crate::zone_client::select_volume(&zone.volumes)?;
+        let volume_id = vol.volume_id;
+
+        info!(
+            "FILER_ZONE: allocated needle_id={:#x} (zone={}, counter={}, rr_idx={}) volume_id={}",
+            needle_id,
+            zone.zone_id,
+            powerfs_common::types::needle_counter(needle_id),
+            idx,
+            volume_id
+        );
+
+        Some((volume_id, needle_id))
     }
 
     /// Notify subscribers that an inode's metadata has changed.
@@ -91,154 +197,17 @@ impl FilerNetHandler {
         NetMessage::new(header).with_body(body)
     }
 
-    /// Build a response message carrying a separate data segment (e.g. file
-    /// contents for `Read`). The frame header's `data_len` covers both the
-    /// TLV body and the raw data segment so the kernel receiver, which splits
-    /// body/data by the TLV boundary, can recover both pieces.
-    fn build_response_with_data(
-        msg: &NetMessage,
-        status: u16,
-        body: Vec<u8>,
-        data: Vec<u8>,
-    ) -> NetMessage {
-        let flags = FrameFlags::new(FrameFlags::RESPONSE);
-        let header = powerfs_net::FrameHeader::new(
-            msg.header.msg_type,
-            flags,
-            msg.header.seq,
-            (body.len() + data.len()) as u32,
-        )
-        .with_status(status);
-        NetMessage::new(header).with_body(body).with_data(data)
-    }
-
-    /// Handle Read request (MsgType::Read = 0x0020).
-    ///
-    /// The kernel's `powerfs_net_read` sends a TLV body containing
-    /// (ino, offset, data_len) and expects the response `data` segment to
-    /// hold the read bytes. We serve the bytes from the Raft-replicated
-    /// file_data store in ShardStore; gaps or short reads are zero-filled.
-    async fn handle_read(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let mut dec = TlvDecoder::new(&msg.body);
-        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let offset = dec.next_u64(FieldId::Offset).unwrap_or(0);
-        let length = dec.next_u32(FieldId::DataLen).unwrap_or(0);
-
-        info!(
-            "FILER_NET_READ: ino={}, offset={}, length={}",
-            ino, offset, length
-        );
-
-        let shard_id = self.shard_strategy.calculate_shard(ino);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
-            return Ok(redirect);
-        }
-
-        let length = length as usize;
-        let data = if length == 0 {
-            Vec::new()
-        } else {
-            match self.meta_shard_manager.read_file_data(ino, offset as usize, length) {
-                Some(data) => data,
-                None => vec![0u8; length],
-            }
-        };
-
-        info!(
-            "FILER_NET_READ: ino={}, returning {} bytes",
-            ino,
-            data.len()
-        );
-
-        Ok(Self::build_response_with_data(
-            msg,
-            STATUS_OK,
-            Vec::new(),
-            data,
-        ))
-    }
-
-    /// Handle Write request (MsgType::Write = 0x0021).
-    ///
-    /// The kernel's `powerfs_net_write` sends a TLV body containing
-    /// (ino, offset, data_len) followed by a raw data segment holding the
-    /// file bytes. Because the powerfs-net server reads the whole frame
-    /// payload into `msg.body`, the raw bytes live in the tail of
-    /// `msg.body` immediately after the TLV fields. We parse the TLV fields,
-    /// then take `remaining_slice()` as the file bytes.
-    ///
-    /// The write extends `inline_data[ino]` as needed (zero-filling gaps),
-    /// then updates the inode `size` via `setattr_data` so a subsequent
-    /// `getattr` reports the correct length (critical for cross-client and
-    /// remount visibility).
-    async fn handle_write(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let mut dec = TlvDecoder::new(&msg.body);
-        let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        let offset = dec.next_u64(FieldId::Offset).unwrap_or(0);
-        let declared_len = dec.next_u32(FieldId::DataLen).unwrap_or(0);
-        let payload = dec.remaining_slice().to_vec();
-
-        info!(
-            "FILER_NET_WRITE: ino={}, offset={}, declared_len={}, payload_len={}",
-            ino,
-            offset,
-            declared_len,
-            payload.len()
-        );
-
-        // Trust the actual payload length; declared_len is informational.
-        // If they disagree, the payload is the source of truth (the kernel
-        // sends them matching, but be defensive against malformed frames).
-        let write_len = payload.len();
-        if (write_len as u32) != declared_len {
-            warn!(
-                "FILER_NET_WRITE: declared_len={} != payload_len={} for ino={}, using payload",
-                declared_len, write_len, ino
-            );
-        }
-
-        let shard_id = self.shard_strategy.calculate_shard(ino);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
-            return Ok(redirect);
-        }
-
-        if write_len == 0 {
-            let mut enc = TlvEncoder::new();
-            enc.add_u32(FieldId::DataLen, 0);
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
-        }
-
-        let new_end = offset as usize + write_len;
-
-        // Write data via Raft replication (replaces per-Filer inline_data).
-        // This ensures leader switch does not lose data.
-        if let Err(e) = self
-            .meta_shard_manager
-            .write_file_data(ino, offset, payload.clone())
-            .await
-        {
-            warn!(
-                "FILER_NET_WRITE: write_file_data failed for ino={}: {}",
-                ino, e
-            );
-        }
-
-        // Update the authoritative inode size so getattr/stat reports the
-        // grown file. We only grow (never shrink) here; truncates come
-        // through SetAttr/SetAttrData.
-        if let Some(info) = self.meta_shard_manager.get_inode(ino) {
-            if (new_end as u64) > info.size {
-                let _ = self
-                    .meta_shard_manager
-                    .setattr_data(ino, shard_id, Some(new_end as u64))
-                    .await;
-            }
-        }
-
-        let mut enc = TlvEncoder::new();
-        enc.add_u32(FieldId::DataLen, write_len as u32);
-        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
-    }
+    // MsgType::Read (0x0020) and MsgType::Write (0x0021) handlers removed.
+    //
+    // 数据读写不再经过 Filer — 客户端 (FUSE/内核) 直连 Volume Server:
+    //   - 写: WriteNeedle (0x0062) / BatchWriteNeedle (0x0065) → Volume Server
+    //   - 读: ReadNeedle (0x0063) / ReadNeedleBlob (0x0066) → Volume Server
+    //
+    // Filer 只负责元数据 (Lookup/GetAttr/Create/SetAttr 等) 和 chunk 映射管理.
+    // 客户端从 GetAttr 响应的 Chunks 字段获取 (volume_id, needle_id) 后直连 volume.
+    //
+    // 旧的 handle_write/handle_read 将数据存入 Filer Raft 日志 (write_file_data),
+    // 违反了 Filer=元数据 / Volume=数据 的架构分离, 已删除.
 
     /// Check if current node is the leader for the given shard.
     /// Returns Ok(()) if leader, or Err(redirect_response) if not.
@@ -376,7 +345,7 @@ impl FilerNetHandler {
         // cross-client visibility (e.g. stat shows 2MB for a 20MB file).
         if let Some(chunk) = info.chunks.first() {
             enc.add_u64(FieldId::Cookie, 0);
-            enc.add_u64(FieldId::FileKey, chunk.offset);
+            enc.add_u64(FieldId::FileKey, chunk.needle_id);
         }
         Ok(())
     }
@@ -679,33 +648,31 @@ impl FilerNetHandler {
     }
 
     /// Handle Create request (create file)
+    ///
+    /// Zone-based needle_id allocation (P2.4):
+    ///   - Filer 自分配 needle_id = (zone_id << 40) | counter++
+    ///   - Filer 自选物理 volume (从 zone 映射列表中选空闲比例最大的)
+    ///   - 客户端不再传入 fid/cookie/offset, 由 Filer 完全自治
+    ///   - 通过 set_chunks 持久化 chunk 映射 (Raft 强一致)
+    ///   - 响应返回 VolumeId + FileKey 给客户端, 客户端直连 volume 读写
     async fn handle_create(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
-        // CRITICAL: encoder uses add_u32 for Mode/Uid/Gid, so decoder must use
-        // next_u32. Previously used next_u64, which fails (read_u64 requires
-        // length==8 but gets 4), leaving the cursor un-advanced past the field
-        // data. This desyncs the decoder, making all subsequent fields (Fid,
-        // Cookie, FileKey, Size) unparseable → has_fid always false.
         let mode = dec.next_u32(FieldId::Mode).unwrap_or(0o644) as u64;
         let uid = dec.next_u32(FieldId::Uid).unwrap_or(0) as u64;
         let gid = dec.next_u32(FieldId::Gid).unwrap_or(0) as u64;
 
-        // Parse optional chunk/fid info
-        let fid = dec.next_string(FieldId::Fid).ok();
-        let cookie = dec.next_u64(FieldId::Cookie).ok();
-        let offset = dec.next_u64(FieldId::FileKey).ok();
-        let chunk_size = dec.next_u64(FieldId::Size).ok();
+        // 客户端可能仍传入旧的 fid/cookie/offset 字段 (向后兼容), 但 Filer 忽略它们,
+        // 改由 Zone 自分配. 读取后丢弃, 避免影响后续字段解析.
+        let _ = dec.next_string(FieldId::Fid).ok();
+        let _ = dec.next_u64(FieldId::Cookie).ok();
+        let _ = dec.next_u64(FieldId::FileKey).ok();
+        let _ = dec.next_u64(FieldId::Size).ok();
 
         info!(
-            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, has_fid={}",
-            parent_ino,
-            name,
-            mode,
-            uid,
-            gid,
-            fid.is_some()
+            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}",
+            parent_ino, name, mode, uid, gid
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -719,6 +686,26 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
+        // === Zone 自分配 needle_id + volume_id (P2.4 核心) ===
+        // 在创建 inode 之前分配, 这样若分配失败 (zone 未注册) 可直接返回错误,
+        // 不会留下空 inode. 若分配成功但后续 create_file 失败, needle_id 会被
+        // "泄漏" (counter 已自增但无 chunk 映射), 这是可接受的:
+        //   - needle_id 空间巨大 (40 bits/zone, 1 万亿个)
+        //   - counter 单调递增, 不会重复
+        let (volume_id, needle_id) = match self.alloc_for_new_file() {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "FILER_NET_CREATE: zone not registered (zone_id=0), cannot allocate needle_id"
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ));
+            }
+        };
+
         match self
             .meta_shard_manager
             .create_file_with_shard(parent_ino, &name, shard_id)
@@ -731,19 +718,23 @@ impl FilerNetHandler {
                     .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
                     .await;
 
-                // Store chunk/fid info if provided
-                if let (Some(fid_str), Some(c), Some(o)) = (fid.clone(), cookie, offset) {
-                    let sz = chunk_size.unwrap_or(0);
-                    // Parse volume_id from Fid string (format: "volume_id,cookie,file_key")
-                    let volume_id = fid_str
-                        .split(',')
-                        .next()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    let _ = self
-                        .meta_shard_manager
-                        .set_chunks(ino, shard_id, fid_str, volume_id, c as u32, o, sz)
-                        .await;
+                // === 持久化 chunk 映射 (volume_id, needle_id) via Raft ===
+                // fid 格式 "volume_id,cookie,needle_id": set_chunks 从第 3 字段解析 needle_id
+                // offset=0: 新文件首 chunk 的字节偏移 (chunk.offset, 非 needle_id)
+                // size=0: 初始无数据, 后续 write 时更新
+                let fid_str = format!("{},0,{}", volume_id, needle_id);
+                if let Err(e) = self
+                    .meta_shard_manager
+                    .set_chunks(ino, shard_id, fid_str, volume_id, 0, 0, 0)
+                    .await
+                {
+                    warn!(
+                        "FILER_NET_CREATE: set_chunks failed for inode {} (needle_id={:#x}): {}",
+                        ino, needle_id, e
+                    );
+                    // set_chunks 失败不回滚 inode 创建 (inode 已 Raft 持久化).
+                    // needle_id 已分配但 chunk 映射缺失, 客户端写入会失败并重试.
+                    // 后续 GC 会清理无 chunk 的 inode.
                 }
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
@@ -755,17 +746,16 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
                 enc.add_string(FieldId::Name, &name)?;
-                // Return chunk/fid info in response
-                if let Some(fid_str) = fid {
-                    enc.add_string(FieldId::Fid, &fid_str)?;
-                }
-                if let Some(c) = cookie {
-                    enc.add_u64(FieldId::Cookie, c);
-                }
+                // === 返回 volume_id + needle_id 给客户端 (直连 volume 读写) ===
+                enc.add_u64(FieldId::VolumeId, volume_id);
+                enc.add_u64(FieldId::FileKey, needle_id);
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
-                warn!("FILER_NET_CREATE failed: {}", e);
+                warn!(
+                    "FILER_NET_CREATE failed: {} (needle_id={:#x} leaked, acceptable)",
+                    e, needle_id
+                );
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
@@ -1497,8 +1487,8 @@ impl PowerFsNetHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
-            MsgType::Read => self.handle_read(msg).await,
-            MsgType::Write => self.handle_write(msg).await,
+            // MsgType::Read (0x0020) / MsgType::Write (0x0021) removed —
+            // data operations go directly to Volume Server, not through Filer.
             MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
@@ -1662,8 +1652,8 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,
             MsgType::Link => self.handle_link(msg).await,
-            MsgType::Read => self.handle_read(msg).await,
-            MsgType::Write => self.handle_write(msg).await,
+            // MsgType::Read (0x0020) / MsgType::Write (0x0021) removed —
+            // data operations go directly to Volume Server, not through Filer.
             MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,

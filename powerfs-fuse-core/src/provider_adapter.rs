@@ -666,7 +666,7 @@ impl FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                parent_ino,
+                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
                 payload,
                 msg_type,
             )
@@ -727,7 +727,7 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                parent_ino,
+                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
                 payload,
                 powerfs_net::MsgType::Lookup,
             )
@@ -772,11 +772,15 @@ impl MetadataProvider for FacadeMetadataProvider {
 
         let payload = build_getattr_tlv(inode);
 
+        let shard_id = self
+            .facade
+            .meta_shard_client()
+            .calculate_shard_id(inode);
         let result = self
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                inode,
+                shard_id,
                 payload,
                 powerfs_net::MsgType::GetAttr,
             )
@@ -857,7 +861,7 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                parent_ino,
+                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
                 payload,
                 msg_type,
             )
@@ -922,7 +926,7 @@ impl MetadataProvider for FacadeMetadataProvider {
                 .facade
                 .submit_metadata_request_with_type(
                     crate::request_state::RequestKind::Metadata,
-                    ino,
+                    self.facade.meta_shard_client().calculate_shard_id(ino),
                     data_payload,
                     powerfs_net::MsgType::SetAttrData,
                 )
@@ -944,7 +948,7 @@ impl MetadataProvider for FacadeMetadataProvider {
                 .facade
                 .submit_metadata_request_with_type(
                     crate::request_state::RequestKind::Metadata,
-                    ino,
+                    self.facade.meta_shard_client().calculate_shard_id(ino),
                     meta_payload,
                     powerfs_net::MsgType::SetAttrMeta,
                 )
@@ -969,7 +973,7 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                inode,
+                self.facade.meta_shard_client().calculate_shard_id(inode),
                 payload,
                 msg_type,
             )
@@ -999,7 +1003,7 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                inode,
+                self.facade.meta_shard_client().calculate_shard_id(inode),
                 payload,
                 powerfs_net::MsgType::ReadDir,
             )

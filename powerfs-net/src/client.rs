@@ -750,36 +750,6 @@ impl PowerFsNetClient {
         Ok(())
     }
 
-    /// Read data from a file
-    pub async fn read_data(&self, ino: u64, offset: u64, length: u32) -> NetResult<Vec<u8>> {
-        let body = crate::serialize::encode_data_req(ino, offset, length)?;
-        let resp = self.send_request(MsgType::Read, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "read failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        Ok(resp.data.clone())
-    }
-
-    /// Write data to a file
-    pub async fn write_data(&self, ino: u64, offset: u64, data: &[u8]) -> NetResult<()> {
-        let body = crate::serialize::encode_data_req(ino, offset, data.len() as u32)?;
-        let resp = self.send_request(MsgType::Write, &body, data).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "write failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        Ok(())
-    }
-
     /// Create a symbolic link
     pub async fn create_symlink(
         &self,

@@ -153,11 +153,22 @@ while [ $timeout -gt 0 ]; do
     nc -z localhost 8081 >/dev/null 2>&1 && ready=$((ready + 1))
     nc -z localhost 8082 >/dev/null 2>&1 && ready=$((ready + 1))
     if [ $ready -ge 2 ]; then
-        echo "  [OK] $ready volume(s) ready"
+        echo "  [OK] $ready volume(s) ready (gRPC)"
         break
     fi
     sleep 1
     timeout=$((timeout - 1))
+done
+
+echo "  Verifying volume powerfs-net ports..."
+for pair in "8901:volume-1" "8902:volume-2" "8903:volume-3"; do
+    port="${pair%%:*}"
+    name="${pair##*:}"
+    if nc -z localhost "$port" >/dev/null 2>&1; then
+        echo "  [OK] $name net_port=$port ready"
+    else
+        echo "  [WARNING] $name net_port=$port not ready (powerfs-net listener)"
+    fi
 done
 
 echo ""
@@ -255,9 +266,9 @@ echo "  Redis:           $HOST_IP:6379"
 echo "  Master 1:        $HOST_IP:9333"
 echo "  Master 2:        $HOST_IP:9336"
 echo "  Master 3:        $HOST_IP:9337"
-echo "  Volume 1:        $HOST_IP:8080"
-echo "  Volume 2:        $HOST_IP:8081"
-echo "  Volume 3:        $HOST_IP:8082"
+echo "  Volume 1:        $HOST_IP:8080 (gRPC), $HOST_IP:8901 (powerfs-net)"
+echo "  Volume 2:        $HOST_IP:8081 (gRPC), $HOST_IP:8902 (powerfs-net)"
+echo "  Volume 3:        $HOST_IP:8082 (gRPC), $HOST_IP:8903 (powerfs-net)"
 echo "  Filer:           $HOST_IP:9001"
 echo "  S3 Backend:      $HOST_IP:9000"
 echo "  Monitor API:     $HOST_IP:8083"

@@ -591,40 +591,6 @@ impl MetaShardManager {
         shard_store.lookup(parent_inode, name)
     }
 
-    /// Write file data via Raft replication (inline mode).
-    /// All filer nodes replicate the data, so leader switch does not lose data.
-    pub async fn write_file_data(
-        &self,
-        inode: u64,
-        offset: u64,
-        data: Vec<u8>,
-    ) -> Result<(), String> {
-        let shard_id = self.shard_strategy.calculate_shard(inode);
-        let cmd = ShardCommand::WriteFileData {
-            inode,
-            offset,
-            data,
-        };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
-        Ok(())
-    }
-
-    /// Read file data (inline mode). Reads from local ShardStore.
-    /// Since data is Raft-replicated, any node can serve reads.
-    pub fn read_file_data(
-        &self,
-        inode: u64,
-        offset: usize,
-        length: usize,
-    ) -> Option<Vec<u8>> {
-        let shard_id = self.shard_strategy.calculate_shard(inode);
-        let stores = self.shard_stores.read().unwrap();
-        let shard_store = stores.get(&shard_id)?;
-        shard_store.read_file_data(inode, offset, length)
-    }
-
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
@@ -632,6 +598,17 @@ impl MetaShardManager {
         let shard_store = stores.get(&shard_id)?;
 
         shard_store.get_inode(inode)
+    }
+
+    /// 遍历所有 shard 的所有 inode, 收集 chunk 映射 (needle_id, volume_id).
+    /// 用于 Filer 重启时恢复 Zone counter (P2.5).
+    pub fn list_all_chunks(&self) -> Vec<(u64, u64)> {
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for shard_store in stores.values() {
+            result.extend(shard_store.list_all_chunks());
+        }
+        result
     }
 
     pub fn list_directory(&self, parent_inode: u64) -> Vec<InodeInfo> {
@@ -909,23 +886,34 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        // Wait for the command to be applied
-        if let Some(expected_mode) = mode {
+        // Wait for the command to be applied to the state machine.
+        // Must check ALL changed fields (mode, uid, gid, size), not just mode,
+        // otherwise chown (UID|GID only) returns before Raft applies the change,
+        // causing subsequent GetAttr to read stale data.
+        if mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() {
             let store = {
                 let stores = self.shard_stores.read().unwrap();
                 stores.get(&shard_id).cloned()
             };
             if let Some(store) = store {
                 let mut retries = 0;
-                while retries < 20 {
+                while retries < 50 {
                     if let Some(info) = store.get_inode(inode) {
-                        if info.mode == expected_mode as u32 {
+                        let mode_ok = mode.map_or(true, |m| (info.mode & 0o7777) == (m as u32 & 0o7777));
+                        let uid_ok = uid.map_or(true, |u| info.uid == u as u32);
+                        let gid_ok = gid.map_or(true, |g| info.gid == g as u32);
+                        let size_ok = size.map_or(true, |s| info.size == s);
+                        if mode_ok && uid_ok && gid_ok && size_ok {
                             return Ok(());
                         }
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     retries += 1;
                 }
+                warn!(
+                    "setattr timeout waiting for apply: inode={}, shard_id={:?}",
+                    inode, shard_id
+                );
                 return Err("setattr timeout waiting for apply".to_string());
             }
         }

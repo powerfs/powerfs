@@ -19,6 +19,7 @@ pub mod shard_scheduler;
 pub mod shard_store;
 pub mod shard_strategy;
 pub mod volume_router;
+pub mod zone_client;
 
 pub use bucket_manager::BucketManager;
 pub use crdt_orset::{

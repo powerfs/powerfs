@@ -280,18 +280,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let volumes = storage_manager.list_volumes();
             let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                 .into_iter()
-                .map(|v| powerfs_master::proto::VolumeShortInfo {
-                    volume_id: v.id.0,
-                    size: v.size,
-                    read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
-                    collection: v.collection.0.clone(),
-                    replica_placement: v.replica_count,
-                    ttl: v.ttl.0 as u32,
-                    disk_type: v.disk_type.0.clone(),
-                    used: v.used,
-                    file_count: v.next_file_key - 1,
-                    compact_status: 0,
-                    append_offset: 0,
+                .map(|v| {
+                    // 从 Volume 结构体获取真实统计 (used/needle_count)
+                    let (used, _total, needle_count) =
+                        storage_manager.get_volume(&v.id)
+                            .map(|vol| vol.get_stats())
+                            .unwrap_or((v.used, v.size, 0));
+                    powerfs_master::proto::VolumeShortInfo {
+                        volume_id: v.id.0,
+                        size: v.size,
+                        read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
+                        collection: v.collection.0.clone(),
+                        replica_placement: v.replica_count,
+                        ttl: v.ttl.0 as u32,
+                        disk_type: v.disk_type.0.clone(),
+                        used,
+                        file_count: needle_count,
+                        compact_status: 0,
+                        append_offset: 0,
+                    }
                 })
                 .collect();
 
@@ -317,18 +324,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let volumes = storage_manager.list_volumes();
                 let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                     .into_iter()
-                    .map(|v| powerfs_master::proto::VolumeShortInfo {
-                        volume_id: v.id.0,
-                        size: v.size,
-                        read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
-                        collection: v.collection.0.clone(),
-                        replica_placement: v.replica_count,
-                        ttl: v.ttl.0 as u32,
-                        disk_type: v.disk_type.0.clone(),
-                        used: v.used,
-                        file_count: v.next_file_key - 1,
-                        compact_status: 0,
-                        append_offset: 0,
+                    .map(|v| {
+                        let (used, _total, needle_count) =
+                            storage_manager.get_volume(&v.id)
+                                .map(|vol| vol.get_stats())
+                                .unwrap_or((v.used, v.size, 0));
+                        powerfs_master::proto::VolumeShortInfo {
+                            volume_id: v.id.0,
+                            size: v.size,
+                            read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
+                            collection: v.collection.0.clone(),
+                            replica_placement: v.replica_count,
+                            ttl: v.ttl.0 as u32,
+                            disk_type: v.disk_type.0.clone(),
+                            used,
+                            file_count: needle_count,
+                            compact_status: 0,
+                            append_offset: 0,
+                        }
                     })
                     .collect();
 

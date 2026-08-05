@@ -78,6 +78,9 @@ pub struct FilerConfig {
     pub raft_peers: Vec<String>,
     /// powerfs-net 二进制协议端口 - 必须配置
     pub net_port: u16,
+    /// Master 的 powerfs-net 端口 (用于 Zone 注册等 TLV 通信) - 必须配置
+    /// 注意: 与 master_addresses 中的端口 (HTTP/gRPC) 不同
+    pub master_net_port: u16,
     /// 对外可达地址 (IP, 供 Master 注册和内核发现使用).
     /// 若未设置, 从 raft_peers[raft_id-1] 提取 IP.
     #[serde(default)]
@@ -306,6 +309,11 @@ impl PowerFsConfig {
                 "filer.master_addresses must not be empty".to_string(),
             ));
         }
+        if self.filer.master_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "filer.master_net_port must be set (> 0)".to_string(),
+            ));
+        }
 
         // === S3 校验 ===
         if self.s3.port == 0 {
@@ -412,6 +420,7 @@ port = 8888              # HTTP端口 (必填)
 grpc_port = 8889         # gRPC端口 (必填)
 net_port = 9334          # powerfs-net端口 (必填)
 master_addresses = ["172.20.0.11:9333"]
+master_net_port = 9334   # Master的powerfs-net端口 (必填, 用于Zone注册)
 data_dir = "./data/filer"
 shard_count = 2
 raft_id = 1

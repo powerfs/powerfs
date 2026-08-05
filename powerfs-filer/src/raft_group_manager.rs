@@ -150,18 +150,6 @@ pub enum ShardCommand {
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
     },
-    /// Write file data (inline mode) via Raft replication.
-    /// Ensures all filer nodes have the same inline data, so leader
-    /// switch does not cause data loss.
-    WriteFileData {
-        inode: u64,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    /// Delete file data (inline mode) when file is removed.
-    DeleteFileData {
-        inode: u64,
-    },
 }
 
 impl ShardCommand {

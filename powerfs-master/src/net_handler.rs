@@ -465,15 +465,17 @@ impl MasterNetHandler {
         enc.add_string(FieldId::Owner, &leader)?;
         enc.add_u64(FieldId::Entries, volume_count);
 
-        // Encode each volume route: volume_id + addr + size
+        // Encode each volume route: volume_id + addr + size + used + file_count
         for route in routes.iter() {
             info!(
-                "NET_GET_TOPOLOGY: volume_id={}, addr={}, size={}",
-                route.volume_id, route.addr, route.size
+                "NET_GET_TOPOLOGY: volume_id={}, addr={}, size={}, used={}, file_count={}",
+                route.volume_id, route.addr, route.size, route.used, route.file_count
             );
             enc.add_u64(FieldId::VolumeId, route.volume_id);
             let _ = enc.add_string(FieldId::Owner, &route.addr);
             enc.add_u64(FieldId::Size, route.size);
+            enc.add_u64(FieldId::UsedSpace, route.used);
+            enc.add_u64(FieldId::FileCount, route.file_count);
         }
 
         info!(
@@ -489,8 +491,76 @@ impl MasterNetHandler {
         ))
     }
 
-    /// Handle ListFilers request from kernel client.
+    /// Handle RegisterFiler request: 分配 Zone + 选物理 volume
     ///
+    /// Request TLV: Owner = filer_id (string)
+    /// Response TLV (多 Zone):
+    ///   Entries(zone_count) + [ZoneId + Limit(vol_count) + [VolumeId + Owner(addr) + Size + UsedSpace] × N] × M
+    async fn handle_register_filer(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let filer_id = dec.next_string(FieldId::Owner).unwrap_or_default();
+
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader().await;
+            if leader.is_empty() {
+                // 无 leader (选举未完成): 返回 SERVER_ERROR 让 Filer 重试,
+                // 而非返回空地址的 REDIRECT 导致 Filer 端连接失败.
+                warn!(
+                    "NET_REGISTER_FILER: not leader and no leader elected yet, filer_id={}",
+                    filer_id
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            let mut enc = TlvEncoder::new();
+            enc.add_string(FieldId::Owner, &leader)?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_REDIRECT,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        info!(
+            "NET_REGISTER_FILER: filer_id={}, assigning zone(s)",
+            filer_id
+        );
+
+        let zones = self.master.register_filer_zone(&filer_id);
+
+        let mut enc = TlvEncoder::new();
+        // 多 Zone 编码: Entries=zone_count, 每个 Zone 含 ZoneId + Limit=vol_count + vol 条目
+        enc.add_u64(FieldId::Entries, zones.len() as u64);
+        for zone in &zones {
+            enc.add_u32(FieldId::ZoneId, zone.zone_id);
+            enc.add_u64(FieldId::Limit, zone.physical_volumes.len() as u64);
+            for vol in &zone.physical_volumes {
+                enc.add_u64(FieldId::VolumeId, vol.volume_id);
+                enc.add_string(FieldId::Owner, &vol.addr)?;
+                enc.add_u64(FieldId::Size, vol.size);
+                enc.add_u64(FieldId::UsedSpace, vol.used);
+            }
+        }
+
+        info!(
+            "NET_REGISTER_FILER: filer_id={}, zones={}, total_volumes={}",
+            filer_id,
+            zones.len(),
+            zones.iter().map(|z| z.physical_volumes.len()).sum::<usize>()
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes(), Vec::new()))
+    }
+
+    /// Handle ListFilers request from kernel client.
     /// Returns all registered filer nodes with their powerfs-net addresses,
     /// allowing the kernel to populate its connection pool without manual
     /// configuration of each filer address.
@@ -576,6 +646,7 @@ impl PowerFsNetHandler for MasterNetHandler {
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::GetTopology => self.handle_get_topology(msg).await,
+            MsgType::RegisterFiler => self.handle_register_filer(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
@@ -628,6 +699,7 @@ impl ServerRequestHandler for MasterNetHandler {
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(msg).await,
             MsgType::GetTopology => self.handle_get_topology(msg).await,
+            MsgType::RegisterFiler => self.handle_register_filer(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::Ping => {
                 let flags = FrameFlags::new(FrameFlags::RESPONSE);
