@@ -19,6 +19,7 @@ use axum::extract::Query;
 use axum::response::IntoResponse;
 use axum::{routing::get, Json, Router, Server};
 use log::{error, info};
+use powerfs_net::flow_control::FlowController;
 use prometheus::{register_int_gauge, Encoder, IntGauge};
 use serde_json::json;
 use std::collections::HashMap;
@@ -67,6 +68,78 @@ lazy_static::lazy_static! {
         "powerfs_volume_lease_disconnected_total",
         "Total leases removed by disconnect_holder since startup"
     ).unwrap();
+
+    // ===== Flow control metrics (Phase 1 S5) =====
+    // Cumulative counters mirrored as gauges (same pattern as lease metrics
+    // above; semantically equivalent for scrape-based collection).
+
+    // Current state (gauges)
+    static ref FLOW_ACTIVE_REQS: IntGauge = register_int_gauge!(
+        "powerfs_flow_active_reqs",
+        "In-flight requests being processed"
+    ).unwrap();
+
+    static ref FLOW_ACTIVE_CONNS: IntGauge = register_int_gauge!(
+        "powerfs_flow_active_conns",
+        "Currently registered connections"
+    ).unwrap();
+
+    static ref FLOW_SLOW_CONNS: IntGauge = register_int_gauge!(
+        "powerfs_flow_slow_conns",
+        "Connections currently marked slow (EWMA latency above threshold)"
+    ).unwrap();
+
+    // Cumulative counters (mirrored as gauges)
+    static ref FLOW_TOTAL_REQS: IntGauge = register_int_gauge!(
+        "powerfs_flow_total_reqs",
+        "Total requests completed since startup"
+    ).unwrap();
+
+    static ref FLOW_TOTAL_ERRS: IntGauge = register_int_gauge!(
+        "powerfs_flow_total_errs",
+        "Total requests completed with error since startup"
+    ).unwrap();
+
+    static ref FLOW_TOTAL_BYTES_SENT: IntGauge = register_int_gauge!(
+        "powerfs_flow_total_bytes_sent",
+        "Total response bytes sent since startup"
+    ).unwrap();
+
+    static ref FLOW_TOTAL_BYTES_RECV: IntGauge = register_int_gauge!(
+        "powerfs_flow_total_bytes_recv",
+        "Total request bytes received since startup"
+    ).unwrap();
+
+    // Latency histogram buckets (cumulative counts, mirrored as gauges)
+    static ref FLOW_LAT_BUCKET_1MS: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_1ms",
+        "Requests with latency <= 1ms (cumulative)"
+    ).unwrap();
+
+    static ref FLOW_LAT_BUCKET_10MS: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_10ms",
+        "Requests with latency <= 10ms (cumulative)"
+    ).unwrap();
+
+    static ref FLOW_LAT_BUCKET_100MS: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_100ms",
+        "Requests with latency <= 100ms (cumulative)"
+    ).unwrap();
+
+    static ref FLOW_LAT_BUCKET_1S: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_1s",
+        "Requests with latency <= 1s (cumulative)"
+    ).unwrap();
+
+    static ref FLOW_LAT_BUCKET_10S: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_10s",
+        "Requests with latency <= 10s (cumulative)"
+    ).unwrap();
+
+    static ref FLOW_LAT_BUCKET_INF: IntGauge = register_int_gauge!(
+        "powerfs_flow_latency_bucket_inf",
+        "Requests with latency > 10s (cumulative)"
+    ).unwrap();
 }
 
 /// Refresh prometheus gauges from a [`LeaseStats`] snapshot.
@@ -81,14 +154,42 @@ fn refresh_prometheus(stats: &powerfs_lease::LeaseStats) {
     LEASE_DISCONNECTED_TOTAL.set(stats.disconnected_total as i64);
 }
 
+/// Refresh flow control prometheus gauges from a FlowController snapshot.
+///
+/// Called periodically by the collector task (every 5s). All values are set
+/// as absolute (cumulative counters mirrored as gauges, same pattern as
+/// lease metrics).
+fn refresh_flow_prometheus(fc: &FlowController) {
+    let snap = fc.snapshot_global();
+    FLOW_ACTIVE_REQS.set(snap.active_reqs as i64);
+    FLOW_ACTIVE_CONNS.set(snap.active_conns as i64);
+    FLOW_SLOW_CONNS.set(snap.slow_conns as i64);
+    FLOW_TOTAL_REQS.set(snap.total_reqs as i64);
+    FLOW_TOTAL_ERRS.set(snap.total_errs as i64);
+    FLOW_TOTAL_BYTES_SENT.set(snap.total_bytes_sent as i64);
+    FLOW_TOTAL_BYTES_RECV.set(snap.total_bytes_recv as i64);
+    FLOW_LAT_BUCKET_1MS.set(snap.lat_buckets[0] as i64);
+    FLOW_LAT_BUCKET_10MS.set(snap.lat_buckets[1] as i64);
+    FLOW_LAT_BUCKET_100MS.set(snap.lat_buckets[2] as i64);
+    FLOW_LAT_BUCKET_1S.set(snap.lat_buckets[3] as i64);
+    FLOW_LAT_BUCKET_10S.set(snap.lat_buckets[4] as i64);
+    FLOW_LAT_BUCKET_INF.set(snap.lat_buckets[5] as i64);
+}
+
 /// Start the HTTP metrics server on the given address.
 ///
 /// Spawns a background tokio task. Returns immediately.
+///
+/// Exposes:
+/// - `/metrics` (Prometheus), `/admin/lease-stats`, `/admin/log-level` (lease State)
+/// - `/admin/flow/*` (flow control State, Phase 1 S4)
 pub async fn start_metrics_server(
     addr: SocketAddr,
     lease_mgr: Arc<RangeLeaseManager>,
+    flow_ctrl: Arc<FlowController>,
 ) -> Result<(), String> {
-    let app = Router::new()
+    // Lease & log-level routes (State = Arc<RangeLeaseManager>)
+    let lease_app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/lease-stats", get(lease_stats_handler))
         .route(
@@ -97,11 +198,32 @@ pub async fn start_metrics_server(
         )
         .with_state(lease_mgr);
 
+    // Flow control routes (State = Arc<FlowController>)
+    let flow_app = Router::new()
+        .route("/admin/flow/overview", get(flow_overview_handler))
+        .route("/admin/flow/connections", get(flow_connections_handler))
+        .route("/admin/flow/global", get(flow_global_handler))
+        .route("/admin/flow/slow", get(flow_slow_handler))
+        .route("/admin/flow/policy", get(flow_policy_handler))
+        .with_state(flow_ctrl.clone());
+
+    // Merge: 两个 Router<()> (State 已填充) 可直接 merge
+    let app = lease_app.merge(flow_app);
+
     info!("Volume metrics server listening on http://{}", addr);
 
     tokio::spawn(async move {
         if let Err(e) = Server::bind(&addr).serve(app.into_make_service()).await {
             error!("Volume metrics server error: {}", e);
+        }
+    });
+
+    // Spawn flow control metrics collector (refresh every 5s)
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            refresh_flow_prometheus(&flow_ctrl);
         }
     });
 
@@ -176,4 +298,44 @@ async fn set_log_level_handler(
             Json(json!({ "error": e })),
         ),
     }
+}
+
+// ===== Flow control admin (Phase 1 S4) =====
+//
+// GET /admin/flow/overview    → 总览 (policy + global + counts), 适合 dashboard 首页
+// GET /admin/flow/connections → 所有连接统计 (按 conn_id 排序)
+// GET /admin/flow/global      → 全局统计 (含 6 桶延迟直方图 + slow_conns)
+// GET /admin/flow/slow        → 慢连接列表 (slow=true)
+// GET /admin/flow/policy      → 策略信息 (name + load_factor)
+//
+// Handler 通过 powerfs_net::flow_admin 纯函数生成 JSON, 保持本层薄.
+
+async fn flow_overview_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+) -> Json<serde_json::Value> {
+    Json(powerfs_net::flow_admin::overview_json(&fc))
+}
+
+async fn flow_connections_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+) -> Json<serde_json::Value> {
+    Json(powerfs_net::flow_admin::connections_json(&fc))
+}
+
+async fn flow_global_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+) -> Json<serde_json::Value> {
+    Json(powerfs_net::flow_admin::global_json(&fc))
+}
+
+async fn flow_slow_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+) -> Json<serde_json::Value> {
+    Json(powerfs_net::flow_admin::slow_connections_json(&fc))
+}
+
+async fn flow_policy_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+) -> Json<serde_json::Value> {
+    Json(powerfs_net::flow_admin::policy_json(&fc))
 }

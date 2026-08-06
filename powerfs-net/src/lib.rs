@@ -21,6 +21,7 @@ pub mod client;
 pub mod client_conn;
 pub mod client_pool;
 pub mod errors;
+pub mod flow_admin;
 pub mod flow_control;
 pub mod flow_policy;
 pub mod io_loop;

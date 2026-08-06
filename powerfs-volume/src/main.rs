@@ -203,15 +203,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_lease_enabled(cfg.volume.lease_enabled);
 
+    // Start powerfs-net binary protocol server for Volume
+    // (bind first so we can share its FlowController with the metrics server)
+    let net_server = if net_port > 0 {
+        let net_bind_addr = format!("{}:{}", ip, net_port);
+        let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
+            Arc::new(volume_server.clone()),
+        ));
+        let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
+
+        info!("Starting powerfs-net Volume server on {}", net_bind_addr);
+        PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    // FlowController: from net_server if available, else standalone (empty stats)
+    let flow_ctrl = net_server
+        .as_ref()
+        .map(|s| s.flow_ctrl().clone())
+        .unwrap_or_else(|| Arc::new(powerfs_net::flow_control::FlowController::with_defaults()));
+
     // Start HTTP metrics & admin endpoints on http_port.
-    // Exposes /metrics (Prometheus) and /admin/lease-stats (JSON) for the
-    // lease subsystem. Failure to start is non-fatal: log and continue.
+    // Exposes /metrics (Prometheus), /admin/lease-stats, /admin/log-level,
+    // and /admin/flow/* (flow control, Phase 1 S4).
+    // Failure to start is non-fatal: log and continue.
     {
         let metrics_addr_str = format!("{}:{}", ip, http_port);
         if let Ok(metrics_addr) = metrics_addr_str.parse() {
             if let Err(e) = powerfs_volume::metrics::start_metrics_server(
                 metrics_addr,
                 volume_server.range_lease_mgr.clone(),
+                flow_ctrl,
             )
             .await
             {
@@ -225,24 +250,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Start powerfs-net binary protocol server for Volume
-    if net_port > 0 {
-        let net_bind_addr = format!("{}:{}", ip, net_port);
-        let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
-            Arc::new(volume_server.clone()),
-        ));
-        let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
-
-        info!("Starting powerfs-net Volume server on {}", net_bind_addr);
-        if let Ok(net_server) =
-            PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler).await
-        {
-            tokio::spawn(async move {
-                if let Err(e) = net_server.serve().await {
-                    error!("powerfs-net Volume server error: {:?}", e);
-                }
-            });
-        }
+    // Spawn net server serve loop
+    if let Some(net_server) = net_server {
+        tokio::spawn(async move {
+            if let Err(e) = net_server.serve().await {
+                error!("powerfs-net Volume server error: {:?}", e);
+            }
+        });
     }
 
     let master_addrs: Vec<&str> = master_address.iter().map(|s| s.as_str()).collect();
