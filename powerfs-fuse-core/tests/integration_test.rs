@@ -51,6 +51,9 @@ fn test_facade_config_custom_values() {
         mount_point: String::new(),
         collection: String::new(),
         replication: String::new(),
+        lease_mode: "range".to_string(),
+        lease_duration_ms: 30_000,
+        lease_renew_interval_ms: 10_000,
     };
 
     assert_eq!(config.master_addr, "192.168.1.100");
@@ -319,12 +322,8 @@ async fn test_client_cleanup() {
     let meta_config = MetaShardClientConfig::default();
     let volume_config = VolumeClientConfig::default();
 
-    let mut meta_client = MetaShardClient::new(
-        meta_config,
-        topology_manager.clone(),
-        0,
-        conn_pool.clone(),
-    );
+    let mut meta_client =
+        MetaShardClient::new(meta_config, topology_manager.clone(), 0, conn_pool.clone());
     let mut volume_client = VolumeClient::new(volume_config, topology_manager, conn_pool);
 
     meta_client.init();

@@ -234,18 +234,8 @@ async fn test_invalidation_e2e_broadcast_all_clients() {
 
     let client_a: u64 = 3001;
     let client_b: u64 = 3002;
-    let mut rx_a = setup_test_client(
-        &registry,
-        client_a,
-        "127.0.0.1:9201".parse().unwrap(),
-    )
-    .await;
-    let mut rx_b = setup_test_client(
-        &registry,
-        client_b,
-        "127.0.0.1:9202".parse().unwrap(),
-    )
-    .await;
+    let mut rx_a = setup_test_client(&registry, client_a, "127.0.0.1:9201".parse().unwrap()).await;
+    let mut rx_b = setup_test_client(&registry, client_b, "127.0.0.1:9202".parse().unwrap()).await;
 
     cache_a.insert(make_entry(400, 1, "broadcast.txt", 1));
     cache_b.insert(make_entry(400, 1, "broadcast.txt", 1));
@@ -279,12 +269,7 @@ async fn test_invalidation_e2e_zero_inode_ignored() {
     let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 4001;
-    let mut rx = setup_test_client(
-        &registry,
-        client_id,
-        "127.0.0.1:9301".parse().unwrap(),
-    )
-    .await;
+    let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9301".parse().unwrap()).await;
 
     // Send notification with inode=0 (should be ignored by handler)
     let processed = simulate_server_push(&mgr, client_id, 0, 5, &handler, &mut rx).await;
@@ -302,12 +287,7 @@ async fn test_invalidation_e2e_multiple_inodes() {
     let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 5001;
-    let mut rx = setup_test_client(
-        &registry,
-        client_id,
-        "127.0.0.1:9401".parse().unwrap(),
-    )
-    .await;
+    let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9401".parse().unwrap()).await;
 
     // Cache multiple inodes
     cache.insert(make_entry(100, 1, "file1.txt", 1));
@@ -344,12 +324,7 @@ async fn test_invalidation_e2e_idempotent_same_version() {
     let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
 
     let client_id: u64 = 6001;
-    let mut rx = setup_test_client(
-        &registry,
-        client_id,
-        "127.0.0.1:9501".parse().unwrap(),
-    )
-    .await;
+    let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9501".parse().unwrap()).await;
 
     cache.insert(make_entry(500, 1, "stable.txt", 5));
 
