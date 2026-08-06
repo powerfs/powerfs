@@ -433,6 +433,13 @@ pub enum MsgType {
     LeaseStatus = 0x0083,
     AcquireLeaseBatch = 0x0084,
 
+    /// Inode Metadata Lease (Phase 2 / 方案 A):
+    /// Managed by Filer, not Volume Server. Used when backend doesn't support
+    /// range lease (e.g., NVMe-oF target). FUSE client → Filer.
+    AcquireInodeLease = 0x0085,
+    ReleaseInodeLease = 0x0086,
+    RenewInodeLease = 0x0087,
+
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
     /// to the peer that leads the target shard group.
@@ -493,6 +500,9 @@ impl MsgType {
             0x0082 => Some(Self::RenewLease),
             0x0084 => Some(Self::AcquireLeaseBatch),
             0x0083 => Some(Self::LeaseStatus),
+            0x0085 => Some(Self::AcquireInodeLease),
+            0x0086 => Some(Self::ReleaseInodeLease),
+            0x0087 => Some(Self::RenewInodeLease),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -830,8 +840,7 @@ impl NetMessage {
         let mut hdr = self.header.clone();
         hdr.set_body_data_len(self.body.len() as u32, self.total_data_len());
 
-        let mut frame =
-            Vec::with_capacity(FrameHeader::SIZE + self.body.len() + self.data.len());
+        let mut frame = Vec::with_capacity(FrameHeader::SIZE + self.body.len() + self.data.len());
         let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
         hdr.encode(&mut hdr_buf);
         frame.extend_from_slice(&hdr_buf);
@@ -1001,11 +1010,7 @@ mod tests {
 
     #[test]
     fn test_notification_builder_sets_notify_flag() {
-        let msg = NetMessage::notification(
-            MsgType::Invalidate,
-            b"payload".to_vec(),
-            Vec::new(),
-        );
+        let msg = NetMessage::notification(MsgType::Invalidate, b"payload".to_vec(), Vec::new());
 
         assert!(msg.header.is_notify());
         assert!(!msg.is_request());

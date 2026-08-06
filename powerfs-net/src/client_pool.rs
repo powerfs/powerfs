@@ -335,9 +335,7 @@ impl ClientConnPool {
             Ok(h) => h,
             Err(_) => {
                 self.running.store(false, Ordering::SeqCst);
-                log::debug!(
-                    "ClientConnPool: start_health_check skipped (no tokio runtime active)"
-                );
+                log::debug!("ClientConnPool: start_health_check skipped (no tokio runtime active)");
                 return;
             }
         };
@@ -399,10 +397,7 @@ impl ClientConnPool {
                             addr_key
                         );
                         if let Err(e) = client.reconnect_internal().await {
-                            error!(
-                                "ClientConnPool: reconnect failed for {}: {:?}",
-                                addr_key, e
-                            );
+                            error!("ClientConnPool: reconnect failed for {}: {:?}", addr_key, e);
                         }
                     }
                 }
@@ -537,7 +532,12 @@ mod tests {
 
         let arc_handler: Arc<dyn NotificationHandler + Send + Sync> = Arc::new(CountingHandler);
         let shared = SharedNotificationHandler(arc_handler);
-        let msg = NetMessage::new(crate::protocol::FrameHeader::new(0, crate::protocol::FrameFlags::new(0), 0, 0));
+        let msg = NetMessage::new(crate::protocol::FrameHeader::new(
+            0,
+            crate::protocol::FrameFlags::new(0),
+            0,
+            0,
+        ));
 
         shared.handle_notification(&msg);
         shared.handle_notification(&msg);

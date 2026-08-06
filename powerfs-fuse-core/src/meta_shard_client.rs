@@ -1043,6 +1043,130 @@ impl MetaShardClient {
         serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
     }
 
+    // =====================================================================
+    // Inode Metadata Lease (方案 A, Phase 2)
+    // =====================================================================
+    //
+    // Filer-managed per-inode exclusive lease. Used when the Volume Server
+    // backend doesn't support range lease (e.g., NVMe-oF target). The lease
+    // is an admission-control mechanism: only the holder can write to the
+    // inode. Strong consistency (content_size + chunks atomicity) is still
+    // guaranteed by Raft (`UpdateInodeSizeChunks`); the lease prevents
+    // concurrent writers from producing conflicting intermediate states.
+    //
+    // Lifecycle:
+    //   1. acquire_inode_lease(inode) → token
+    //   2. write data to Volume Server (no lease validation)
+    //   3. update_inode_size_chunks (Raft atomic commit)
+    //   4. release_inode_lease(inode, token)
+    //
+    // The lease is in-memory on the Filer shard leader. If the leader
+    // changes, lease state is lost; clients retry acquire on the new leader
+    // (send_coherence_msg handles REDIRECT + retry transparently).
+
+    /// Acquire an exclusive inode metadata lease from the Filer.
+    ///
+    /// Returns `(token, expire_at_ms)` on success. The token must be passed
+    /// to `release_inode_lease` / `renew_inode_lease` later.
+    pub async fn acquire_inode_lease(
+        &self,
+        inode: u64,
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<(String, u64), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_u64(powerfs_net::FieldId::LeaseDuration, duration_ms);
+
+        let resp_body = self
+            .send_coherence_msg(MsgType::AcquireInodeLease, shard_id, enc.into_bytes())
+            .await?;
+
+        let mut dec = serialize::TlvDecoder::new(&resp_body);
+        let token = dec
+            .next_string(powerfs_net::FieldId::LeaseId)
+            .map_err(|e| format!("decode LeaseId: {:?}", e))?;
+        let expire_at_ms = dec
+            .next_u64(powerfs_net::FieldId::LeaseDuration)
+            .unwrap_or(duration_ms);
+
+        if token.is_empty() {
+            return Err("AcquireInodeLease response has empty token".to_string());
+        }
+
+        log::debug!(
+            "acquire_inode_lease: inode={} client={} duration_ms={} token={}... expire_at_ms={}",
+            inode,
+            client_id,
+            duration_ms,
+            &token[..token.len().min(16)],
+            expire_at_ms
+        );
+
+        Ok((token, expire_at_ms))
+    }
+
+    /// Release an inode metadata lease. Idempotent: releasing a non-existent
+    /// or expired lease returns Ok(()).
+    pub async fn release_inode_lease(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+
+        self.send_coherence_msg(MsgType::ReleaseInodeLease, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!("release_inode_lease: inode={} client={}", inode, client_id);
+
+        Ok(())
+    }
+
+    /// Renew an existing inode metadata lease. The holder and token must
+    /// match the original acquire.
+    pub async fn renew_inode_lease(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+        duration_ms: u64,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+        enc.add_u64(powerfs_net::FieldId::LeaseDuration, duration_ms);
+
+        self.send_coherence_msg(MsgType::RenewInodeLease, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!(
+            "renew_inode_lease: inode={} client={} duration_ms={}",
+            inode,
+            client_id,
+            duration_ms
+        );
+
+        Ok(())
+    }
+
     /// 关闭客户端
     pub fn close(&self) {
         self.stop_background_processor();
@@ -1185,9 +1309,8 @@ impl MetadataClient for MetaShardClient {
     ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let body =
-                serialize::encode_create_req(parent_ino, &name, mode, uid, gid, fid_info)
-                    .map_err(map_err)?;
+            let body = serialize::encode_create_req(parent_ino, &name, mode, uid, gid, fid_info)
+                .map_err(map_err)?;
             let resp = self
                 .send_coherence_msg(MsgType::Create, shard_id, body)
                 .await
@@ -1663,12 +1786,7 @@ mod tests {
             None,
         ));
         let config = MetaShardClientConfig::default();
-        let client = MetaShardClient::new(
-            config,
-            topology_manager.clone(),
-            1,
-            conn_pool,
-        );
+        let client = MetaShardClient::new(config, topology_manager.clone(), 1, conn_pool);
         client.init();
 
         (client, topology_manager)

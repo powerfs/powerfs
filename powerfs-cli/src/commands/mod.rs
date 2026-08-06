@@ -1,11 +1,11 @@
 mod assign;
 mod cluster_add;
-mod config_gen;
 mod cluster_remove;
 mod cluster_status;
 mod cluster_transfer;
 mod collection;
 mod compact;
+mod config_gen;
 mod conflicts;
 mod fsck;
 mod grow;
@@ -20,12 +20,12 @@ mod write;
 
 pub use assign::{assign, AssignArgs};
 pub use cluster_add::{cluster_add, ClusterAddArgs};
-pub use config_gen::{config_gen, ConfigGenArgs};
 pub use cluster_remove::{cluster_remove, ClusterRemoveArgs};
 pub use cluster_status::{cluster_status, ClusterStatusArgs};
 pub use cluster_transfer::{cluster_transfer, ClusterTransferArgs};
 pub use collection::{collection, CollectionArgs};
 pub use compact::{compact, CompactArgs};
+pub use config_gen::{config_gen, ConfigGenArgs};
 pub use conflicts::{conflicts, ConflictsArgs};
 pub use fsck::{fsck, FsckArgs};
 pub use grow::{grow, GrowArgs};

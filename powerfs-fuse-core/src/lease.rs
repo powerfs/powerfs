@@ -77,16 +77,21 @@ impl VolumeLeaseManager {
     }
 
     /// Release all leases for a given (volume_id, inode): extracts all tokens
-    /// from the cache, clears the cache, then releases each on the volume server.
+    /// from the cache, clears the cache, then returns them for server-side
+    /// release.
     ///
     /// This complements `invalidate()`: `invalidate()` only clears the local
     /// cache without notifying the server, causing server-side read lease
     /// accumulation that blocks other clients' write leases (stripe lease
     /// conflict). This method is called on close to ensure read leases are
     /// released on the server as well.
-    pub fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(String, String)> {
-        // 1. Extract all matching (token, client_id) and clear cache
-        let tokens: Vec<(String, String)> = {
+    ///
+    /// Returns `(stripe_start, token, client_id)` triples so the caller can
+    /// release each lease on the correct stripe (the server keys leases by
+    /// `(inode, stripe_start)`).
+    pub fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(u64, String, String)> {
+        // 1. Extract all matching (stripe_start, token, client_id) and clear cache
+        let tokens: Vec<(u64, String, String)> = {
             let mut cache = self.cache.write().unwrap();
             let keys_to_remove: Vec<LeaseKey> = cache
                 .keys()
@@ -96,12 +101,16 @@ impl VolumeLeaseManager {
             let mut result = Vec::new();
             for key in keys_to_remove {
                 if let Some(entry) = cache.remove(&key) {
-                    result.push((entry.token.clone(), (*self.client_id).clone()));
+                    result.push((
+                        key.stripe_start,
+                        entry.token.clone(),
+                        (*self.client_id).clone(),
+                    ));
                 }
             }
             result
         };
-        // 2. Return (token, client_id) list for async release by caller
+        // 2. Return (stripe_start, token, client_id) list for async release by caller
         tokens
     }
 }
@@ -194,14 +203,32 @@ impl powerfs_lease::LeaseManager for VolumeLeaseManager {
         let client_id = self.client_id.clone();
         let cache = self.cache.clone();
         let token_str = token.as_str().to_string();
-        Box::pin(async move {
-            // Remove from cache first (by (volume_id, inode)) to avoid reusing released token.
-            {
-                let mut guard = cache.write().unwrap();
-                guard.retain(|k, _| !(k.volume_id == volume_id && k.inode == inode));
+        // Look up stripe_start by token so we release the correct server-side
+        // lease entry (server keys leases by (inode, stripe_start)). Only
+        // remove the matching cache entry, not all entries for the inode.
+        let stripe_start = {
+            let mut guard = cache.write().unwrap();
+            let key_to_remove = guard
+                .iter()
+                .find(|(k, v)| k.volume_id == volume_id && k.inode == inode && v.token == token_str)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = &key_to_remove {
+                guard.remove(k);
             }
+            key_to_remove.map(|k| k.stripe_start)
+        };
+        Box::pin(async move {
+            // If stripe_start was not found (e.g., already evicted), fall back
+            // to 0 — the server will treat it as a no-op if no matching lease
+            // exists.
             facade
-                .release_lease(volume_id, inode, &client_id, &token_str)
+                .release_lease(
+                    volume_id,
+                    inode,
+                    stripe_start.unwrap_or(0),
+                    &client_id,
+                    &token_str,
+                )
                 .await
                 .map_err(map_err)?;
             Ok(())
@@ -226,7 +253,7 @@ impl powerfs_lease::LeaseManager for VolumeLeaseManager {
         None
     }
 
-    fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(String, String)> {
+    fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(u64, String, String)> {
         // Delegate to the inherent method
         VolumeLeaseManager::release_all_for_inode(self, volume_id, inode)
     }

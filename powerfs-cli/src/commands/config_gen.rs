@@ -1,6 +1,6 @@
 use clap::Args;
 use powerfs_common::config::{
-    FuseConfig, FilerConfig, GlobalConfig, MasterConfig, MonitorConfig, PowerFsConfig, S3Config,
+    FilerConfig, FuseConfig, GlobalConfig, MasterConfig, MonitorConfig, PowerFsConfig, S3Config,
     VolumeConfig,
 };
 use serde::Deserialize;
@@ -270,9 +270,8 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
         Some(path) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| format!("Failed to read topology file '{}': {}", path, e))?;
-            toml::from_str(&content).map_err(|e| {
-                format!("Failed to parse topology file '{}': {}", path, e)
-            })?
+            toml::from_str(&content)
+                .map_err(|e| format!("Failed to parse topology file '{}': {}", path, e))?
         }
         None => TopologyConfig::default(),
     };
@@ -354,7 +353,11 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
             ports.filer_grpc,
             Defaults::FILER_GRPC_PORT,
         ),
-        filer_net_port: opt_u16(args.filer_net_port, ports.filer_net, Defaults::FILER_NET_PORT),
+        filer_net_port: opt_u16(
+            args.filer_net_port,
+            ports.filer_net,
+            Defaults::FILER_NET_PORT,
+        ),
         s3_port: opt_u16(args.s3_port, ports.s3, Defaults::S3_PORT),
         monitor_port: opt_u16(args.monitor_port, ports.monitor, Defaults::MONITOR_PORT),
         s3_access_key: opt_str(&args.s3_access_key, s3.access_key, Defaults::S3_ACCESS_KEY),
@@ -672,6 +675,7 @@ fn build_config(
             initial_volume_count: cfg.initial_volume_count,
             device_capacity: None,
             advertise_addr: Some(ip.to_string()),
+            lease_enabled: true,
         },
         filer: FilerConfig {
             port: cfg.filer_port,
@@ -712,6 +716,7 @@ fn build_config(
             verbose: false,
             container: false,
             log_file: None,
+            lease: powerfs_common::config::LeaseConfig::default(),
         },
         monitor: MonitorConfig {
             addr: format!("0.0.0.0:{}", cfg.monitor_port),
@@ -732,7 +737,10 @@ fn build_config(
                     .first()
                     .unwrap_or(&"127.0.0.1:9333".to_string())
             ),
-            master_endpoints: master_addrs.iter().map(|a| format!("http://{}", a)).collect(),
+            master_endpoints: master_addrs
+                .iter()
+                .map(|a| format!("http://{}", a))
+                .collect(),
         },
     }
 }

@@ -594,11 +594,14 @@ mod tests {
         registry.register(conn.clone()).await;
 
         let ok = registry
-            .set_policy(3, ClientPolicy {
-                priority: 1,
-                rate_limit: 100,
-                max_concurrent: 10,
-            })
+            .set_policy(
+                3,
+                ClientPolicy {
+                    priority: 1,
+                    rate_limit: 100,
+                    max_concurrent: 10,
+                },
+            )
             .await;
         assert!(ok);
 

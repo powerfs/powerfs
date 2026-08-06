@@ -113,11 +113,7 @@ impl Worker {
                 } else {
                     debug!(
                         "Worker {}: request handled conn={} seq={} type={:#x} status={}",
-                        self.id,
-                        conn.id,
-                        seq,
-                        msg_type,
-                        resp.header.status
+                        self.id, conn.id, seq, msg_type, resp.header.status
                     );
                 }
             }
@@ -167,7 +163,11 @@ mod tests {
 
     #[async_trait]
     impl NetHandler for EchoHandler {
-        async fn handle(&self, _ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+        async fn handle(
+            &self,
+            _ctx: &mut RequestContext,
+            msg: &NetMessage,
+        ) -> NetResult<NetMessage> {
             let resp_header = FrameHeader::new(
                 msg.header.msg_type,
                 FrameFlags::new(FrameFlags::RESPONSE),
@@ -287,8 +287,12 @@ mod tests {
                 let cur = CONCURRENT.fetch_add(1, Ordering::SeqCst) + 1;
                 let mut max = MAX_CONCURRENT.load(Ordering::SeqCst);
                 while cur > max {
-                    match MAX_CONCURRENT.compare_exchange(max, cur, Ordering::SeqCst, Ordering::SeqCst)
-                    {
+                    match MAX_CONCURRENT.compare_exchange(
+                        max,
+                        cur,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
                         Ok(_) => break,
                         Err(v) => max = v,
                     }

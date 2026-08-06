@@ -201,7 +201,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grpc_port as u32,
         http_port as u32,
         &data_dir,
-    );
+    )
+    .with_lease_enabled(cfg.volume.lease_enabled);
 
     // Start HTTP metrics & admin endpoints on http_port.
     // Exposes /metrics (Prometheus) and /admin/lease-stats (JSON) for the
@@ -273,10 +274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|v| {
                     // 从 Volume 结构体获取真实统计 (used/needle_count)
-                    let (used, _total, needle_count) =
-                        storage_manager.get_volume(&v.id)
-                            .map(|vol| vol.get_stats())
-                            .unwrap_or((v.used, v.size, 0));
+                    let (used, _total, needle_count) = storage_manager
+                        .get_volume(&v.id)
+                        .map(|vol| vol.get_stats())
+                        .unwrap_or((v.used, v.size, 0));
                     powerfs_master::proto::VolumeShortInfo {
                         volume_id: v.id.0,
                         size: v.size,
@@ -316,10 +317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                     .into_iter()
                     .map(|v| {
-                        let (used, _total, needle_count) =
-                            storage_manager.get_volume(&v.id)
-                                .map(|vol| vol.get_stats())
-                                .unwrap_or((v.used, v.size, 0));
+                        let (used, _total, needle_count) = storage_manager
+                            .get_volume(&v.id)
+                            .map(|vol| vol.get_stats())
+                            .unwrap_or((v.used, v.size, 0));
                         powerfs_master::proto::VolumeShortInfo {
                             volume_id: v.id.0,
                             size: v.size,

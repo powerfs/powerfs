@@ -8,7 +8,7 @@
 //! 替代了旧的 gRPC ResilientMasterClient::register_filer 循环。
 
 use log::{debug, warn};
-use powerfs_common::types::{ZoneInfo, ZoneVolume, make_needle_id, needle_counter, needle_zone_id};
+use powerfs_common::types::{make_needle_id, needle_counter, needle_zone_id, ZoneInfo, ZoneVolume};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{FieldId, STATUS_ERR_REDIRECT, STATUS_OK};
 
@@ -38,7 +38,10 @@ pub struct FilerNodeRegistration {
 ///   reg: Filer 节点注册信息 (filer_id + advertise_addr + net_port + shard_ids)
 ///
 /// 注意: 使用循环处理 REDIRECT 而非递归, 避免深度重定向导致栈溢出。
-pub async fn register_filer(master_addr: &str, reg: &FilerNodeRegistration) -> Result<Vec<ZoneInfo>, String> {
+pub async fn register_filer(
+    master_addr: &str,
+    reg: &FilerNodeRegistration,
+) -> Result<Vec<ZoneInfo>, String> {
     let mut current_addr = master_addr.to_string();
     // 重定向深度限制: 防止 Master 持续返回 REDIRECT 导致无限循环
     // (旧实现使用 Box::pin 递归, 在 leader 未选举或指向自身时栈溢出)
@@ -114,7 +117,10 @@ pub async fn register_filer(master_addr: &str, reg: &FilerNodeRegistration) -> R
         }
 
         if reply.status != STATUS_OK {
-            return Err(format!("RegisterFiler failed: status={:#06x}", reply.status));
+            return Err(format!(
+                "RegisterFiler failed: status={:#06x}",
+                reply.status
+            ));
         }
 
         if reply.body.is_empty() {
@@ -169,7 +175,10 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
     debug!(
         "ZONE_CLIENT: registered zones={}, total_volumes={}",
         zones.len(),
-        zones.iter().map(|z| z.physical_volumes.len()).sum::<usize>()
+        zones
+            .iter()
+            .map(|z| z.physical_volumes.len())
+            .sum::<usize>()
     );
 
     Ok(zones)
@@ -200,8 +209,18 @@ pub fn alloc_needle_id(zone_id: u32, counter: &std::sync::atomic::AtomicU64) -> 
 /// 选空闲比例最大的 volume
 pub fn select_volume(volumes: &[ZoneVolume]) -> Option<&ZoneVolume> {
     volumes.iter().max_by(|a, b| {
-        let free_a = if a.size > 0 { 1.0 - (a.used as f64 / a.size as f64) } else { 0.0 };
-        let free_b = if b.size > 0 { 1.0 - (b.used as f64 / b.size as f64) } else { 0.0 };
-        free_a.partial_cmp(&free_b).unwrap_or(std::cmp::Ordering::Equal)
+        let free_a = if a.size > 0 {
+            1.0 - (a.used as f64 / a.size as f64)
+        } else {
+            0.0
+        };
+        let free_b = if b.size > 0 {
+            1.0 - (b.used as f64 / b.size as f64)
+        } else {
+            0.0
+        };
+        free_a
+            .partial_cmp(&free_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
     })
 }

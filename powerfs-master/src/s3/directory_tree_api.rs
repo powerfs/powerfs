@@ -399,10 +399,7 @@ impl DirectoryTreeApi for LocalDirectoryTree {
                     attr.ino = ino;
                 }
             }
-            self.entries
-                .write()
-                .unwrap()
-                .insert(path, (ino, entry));
+            self.entries.write().unwrap().insert(path, (ino, entry));
             Ok(ino)
         })
     }
@@ -424,7 +421,10 @@ impl DirectoryTreeApi for LocalDirectoryTree {
 
                 // Skip if already exists.
                 if self.entries.read().unwrap().contains_key(&current_path) {
-                    last_ino = self.entries.read().unwrap()
+                    last_ino = self
+                        .entries
+                        .read()
+                        .unwrap()
                         .get(&current_path)
                         .map(|(ino, _)| *ino)
                         .unwrap_or(0);
@@ -464,7 +464,10 @@ impl DirectoryTreeApi for LocalDirectoryTree {
                     generation: 0,
                 };
 
-                self.entries.write().unwrap().insert(current_path.clone(), (ino, entry));
+                self.entries
+                    .write()
+                    .unwrap()
+                    .insert(current_path.clone(), (ino, entry));
                 last_ino = ino;
             }
 

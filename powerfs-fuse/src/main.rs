@@ -121,6 +121,15 @@ fn main() {
     let volume_net_port = fuse_cfg.volume_net_port;
     let volume_addrs = fuse_cfg.volume_addresses.clone();
 
+    // Lease mode config (方案 A: inode / 方案 D: range)
+    let lease_mode = fuse_cfg.lease.mode.clone();
+    let lease_duration_ms = fuse_cfg.lease.lease_duration_ms;
+    let lease_renew_interval_ms = fuse_cfg.lease.renew_interval_ms;
+    info!(
+        "Lease mode: {} (duration={}ms, renew_interval={}ms)",
+        lease_mode, lease_duration_ms, lease_renew_interval_ms
+    );
+
     // 从配置获取filer地址（取第一个）
     let (filer_addr, filer_net_port) = if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
         // 解析 host:port 或 仅host
@@ -238,6 +247,9 @@ fn main() {
             volume_addrs,
             filer_addr,
             filer_net_port,
+            &lease_mode,
+            lease_duration_ms,
+            lease_renew_interval_ms,
             runtime_arc.clone(),
         )
         .await

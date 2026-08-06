@@ -17,8 +17,8 @@ use powerfs_common::{
 };
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
-use powerfs_net::{FieldId, PowerFsNetServer, ServerConnectionManager};
 use powerfs_net::serialize::TlvEncoder;
+use powerfs_net::{FieldId, PowerFsNetServer, ServerConnectionManager};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -2193,9 +2193,19 @@ impl MasterNode {
         let routes = self.list_volume_routes();
         let mut sorted_routes: Vec<VolumeRoute> = routes.into_iter().collect();
         sorted_routes.sort_by(|a, b| {
-            let free_a = if a.size > 0 { 1.0 - (a.used as f64 / a.size as f64) } else { 0.0 };
-            let free_b = if b.size > 0 { 1.0 - (b.used as f64 / b.size as f64) } else { 0.0 };
-            free_b.partial_cmp(&free_a).unwrap_or(std::cmp::Ordering::Equal)
+            let free_a = if a.size > 0 {
+                1.0 - (a.used as f64 / a.size as f64)
+            } else {
+                0.0
+            };
+            let free_b = if b.size > 0 {
+                1.0 - (b.used as f64 / b.size as f64)
+            } else {
+                0.0
+            };
+            free_b
+                .partial_cmp(&free_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let physical_volumes: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
@@ -2224,13 +2234,18 @@ impl MasterNode {
                 "MASTER_ZONE: returning {} existing zone(s) for filer={}, volumes={}",
                 result.len(),
                 filer_id,
-                result.iter().map(|z| z.physical_volumes.len()).sum::<usize>()
+                result
+                    .iter()
+                    .map(|z| z.physical_volumes.len())
+                    .sum::<usize>()
             );
             return result;
         }
 
         // 首次注册: 分配新 zone_id
-        let zone_id = self.next_zone_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let zone_id = self
+            .next_zone_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let zone_info = powerfs_common::types::ZoneInfo {
             zone_id,
@@ -3087,6 +3102,11 @@ mod tests {
             }
         }
         // After 6 calls (2 full cycles), all 3 volumes should have been picked.
-        assert_eq!(seen.len(), 3, "round-robin must distribute across all volumes, got: {:?}", seen);
+        assert_eq!(
+            seen.len(),
+            3,
+            "round-robin must distribute across all volumes, got: {:?}",
+            seen
+        );
     }
 }

@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{NeedleId, VolumeId};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, MsgType, NetMessage, NetHandler, RequestContext, STATUS_ERR_NOT_FOUND,
+    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_NOT_FOUND,
     STATUS_ERR_NO_SPACE, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::collections::HashMap;
@@ -94,28 +94,39 @@ impl VolumeNetHandler {
         );
 
         if !lease_token.is_empty() {
-            let lease_mgr = self.volume_server.range_lease_mgr.clone();
-            let validation_result = lease_mgr.validate_token_with_grace_period(
-                &lease_token,
-                &holder_client_id,
-                inode,
-                3000,
-            );
-            match validation_result {
-                Ok(()) => {
-                    debug!(
-                        "NET_WRITE_NEEDLE: lease validated for file_key={}",
-                        file_key
-                    );
-                }
-                Err(e) => {
-                    warn!("NET_WRITE_NEEDLE: lease validation failed: {}", e);
-                    return Ok(Self::build_response(
-                        msg,
-                        STATUS_ERR_SERVER_ERROR,
-                        Vec::new(),
-                        Vec::new(),
-                    ));
+            // 方案 A: when lease_enabled=false (e.g., NVMe-oF target backend),
+            // Volume Server skips range lease validation. Consistency is
+            // enforced by Filer's inode metadata lease (UpdateInodeSizeChunks
+            // Raft commit) instead.
+            if !self.volume_server.lease_enabled {
+                debug!(
+                    "NET_WRITE_NEEDLE: lease_enabled=false, skip validation for file_key={} inode={}",
+                    file_key, inode
+                );
+            } else {
+                let lease_mgr = self.volume_server.range_lease_mgr.clone();
+                let validation_result = lease_mgr.validate_token_with_grace_period(
+                    &lease_token,
+                    &holder_client_id,
+                    inode,
+                    3000,
+                );
+                match validation_result {
+                    Ok(()) => {
+                        debug!(
+                            "NET_WRITE_NEEDLE: lease validated for file_key={}",
+                            file_key
+                        );
+                    }
+                    Err(e) => {
+                        warn!("NET_WRITE_NEEDLE: lease validation failed: {}", e);
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    }
                 }
             }
         }
@@ -133,27 +144,23 @@ impl VolumeNetHandler {
             ServerError(String),
         }
 
-        match tokio::task::spawn_blocking(
-            move || -> std::result::Result<WriteOutcome, String> {
-                let volume = storage_manager
-                    .get_volume(&vid)
-                    .ok_or_else(|| format!("volume not found: {}", volume_id))?;
-                match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
-                    Ok(info) => {
-                        let mut enc = TlvEncoder::new();
-                        enc.add_u64(FieldId::FileKey, info.id.0);
-                        Ok(WriteOutcome::Ok(enc.into_bytes()))
-                    }
-                    Err(powerfs_common::error::PowerFsError::OutOfSpace) => {
-                        Ok(WriteOutcome::NoSpace)
-                    }
-                    Err(e) => {
-                        warn!("write_needle failed: {}", e);
-                        Ok(WriteOutcome::ServerError(e.to_string()))
-                    }
+        match tokio::task::spawn_blocking(move || -> std::result::Result<WriteOutcome, String> {
+            let volume = storage_manager
+                .get_volume(&vid)
+                .ok_or_else(|| format!("volume not found: {}", volume_id))?;
+            match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
+                Ok(info) => {
+                    let mut enc = TlvEncoder::new();
+                    enc.add_u64(FieldId::FileKey, info.id.0);
+                    Ok(WriteOutcome::Ok(enc.into_bytes()))
                 }
-            },
-        )
+                Err(powerfs_common::error::PowerFsError::OutOfSpace) => Ok(WriteOutcome::NoSpace),
+                Err(e) => {
+                    warn!("write_needle failed: {}", e);
+                    Ok(WriteOutcome::ServerError(e.to_string()))
+                }
+            }
+        })
         .await
         {
             Ok(Ok(WriteOutcome::Ok(body))) => {
@@ -354,28 +361,36 @@ impl VolumeNetHandler {
         );
 
         if !lease_token.is_empty() {
-            let lease_mgr = self.volume_server.range_lease_mgr.clone();
-            let validation_result = lease_mgr.validate_token_with_grace_period(
-                &lease_token,
-                &holder_client_id,
-                inode,
-                3000,
-            );
-            match validation_result {
-                Ok(()) => {
-                    debug!(
-                        "NET_BATCH_WRITE_NEEDLE: lease validated for file_key={}",
-                        file_key
-                    );
-                }
-                Err(e) => {
-                    warn!("NET_BATCH_WRITE_NEEDLE: lease validation failed: {}", e);
-                    return Ok(Self::build_response(
-                        msg,
-                        STATUS_ERR_SERVER_ERROR,
-                        Vec::new(),
-                        Vec::new(),
-                    ));
+            // 方案 A: when lease_enabled=false, skip range lease validation.
+            if !self.volume_server.lease_enabled {
+                debug!(
+                    "NET_BATCH_WRITE_NEEDLE: lease_enabled=false, skip validation for file_key={} inode={}",
+                    file_key, inode
+                );
+            } else {
+                let lease_mgr = self.volume_server.range_lease_mgr.clone();
+                let validation_result = lease_mgr.validate_token_with_grace_period(
+                    &lease_token,
+                    &holder_client_id,
+                    inode,
+                    3000,
+                );
+                match validation_result {
+                    Ok(()) => {
+                        debug!(
+                            "NET_BATCH_WRITE_NEEDLE: lease validated for file_key={}",
+                            file_key
+                        );
+                    }
+                    Err(e) => {
+                        warn!("NET_BATCH_WRITE_NEEDLE: lease validation failed: {}", e);
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    }
                 }
             }
         }

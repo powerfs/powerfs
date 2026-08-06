@@ -88,8 +88,10 @@ impl MasterClient {
             info!("VOLUME_HEARTBEAT: heartbeat already running, skipping");
             return Ok(());
         }
-        info!("VOLUME_HEARTBEAT: TLV heartbeat initialized (master_net={:?})",
-              self.master_net_addresses);
+        info!(
+            "VOLUME_HEARTBEAT: TLV heartbeat initialized (master_net={:?})",
+            self.master_net_addresses
+        );
         Ok(())
     }
 
@@ -124,18 +126,17 @@ impl MasterClient {
                     // 重定向后 current_addr 可能不同于 current_master() 返回的地址,
                     // 即使 leader == current_addr (leader 返回自己的地址), 也需要
                     // 更新索引以避免下次心跳再次经过重定向。
-                    let active_addr = if !leader.is_empty() { &leader } else { &current_addr };
-                    if let Some(idx) = self
-                        .master_net_addresses
-                        .iter()
-                        .position(|a| {
-                            // 按主机匹配 (地址可能带不同端口)
-                            let active_host =
-                                active_addr.split(':').next().unwrap_or(active_addr);
-                            let addr_host = a.split(':').next().unwrap_or(a);
-                            active_host == addr_host
-                        })
-                    {
+                    let active_addr = if !leader.is_empty() {
+                        &leader
+                    } else {
+                        &current_addr
+                    };
+                    if let Some(idx) = self.master_net_addresses.iter().position(|a| {
+                        // 按主机匹配 (地址可能带不同端口)
+                        let active_host = active_addr.split(':').next().unwrap_or(active_addr);
+                        let addr_host = a.split(':').next().unwrap_or(a);
+                        active_host == addr_host
+                    }) {
                         let current = self.current_master_index.load(Ordering::Relaxed);
                         if idx != current {
                             info!(

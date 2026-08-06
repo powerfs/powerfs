@@ -392,7 +392,11 @@ impl MetadataCache {
             let evicted = cache.push(inode, entry);
             if let Some((evicted_inode, evicted_entry)) = evicted {
                 if evicted_inode != inode
-                    && self.pinned_inodes.read().unwrap().contains_key(&evicted_inode)
+                    && self
+                        .pinned_inodes
+                        .read()
+                        .unwrap()
+                        .contains_key(&evicted_inode)
                 {
                     // Re-insert the evicted pinned entry. This may evict
                     // another entry, but pinned entries are few relative to

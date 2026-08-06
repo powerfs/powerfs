@@ -76,12 +76,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            filer_cfg.ip.as_deref().filter(|s| *s != "0.0.0.0" && *s != "::")
+            filer_cfg
+                .ip
+                .as_deref()
+                .filter(|s| *s != "0.0.0.0" && *s != "::")
         })
         .or_else(|| {
-            if filer_cfg.raft_id > 0
-                && filer_cfg.raft_id as usize <= filer_cfg.raft_peers.len()
-            {
+            if filer_cfg.raft_id > 0 && filer_cfg.raft_id as usize <= filer_cfg.raft_peers.len() {
                 let peer = &filer_cfg.raft_peers[(filer_cfg.raft_id - 1) as usize];
                 peer.rfind(':').map(|pos| &peer[..pos])
             } else {
@@ -100,7 +101,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     info!("  S3 Address: {}", s3_address);
     info!("  gRPC Address: {}", grpc_address);
     info!("  Net Address: {}", net_address);
-    info!("  Raft Address: {} (advertise_ip={})", raft_address, advertise_ip);
+    info!(
+        "  Raft Address: {} (advertise_ip={})",
+        raft_address, advertise_ip
+    );
     info!("  Data Dir: {}", filer_cfg.data_dir);
     info!("  Shard Count: {}", filer_cfg.shard_count);
     info!("  Raft ID: {}", filer_cfg.raft_id);
@@ -433,11 +437,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     let mut registered = false;
 
                     for master_addr in &master_net_addrs {
-                        match powerfs_filer::zone_client::register_filer(
-                            master_addr,
-                            &registration,
-                        )
-                        .await
+                        match powerfs_filer::zone_client::register_filer(master_addr, &registration)
+                            .await
                         {
                             Ok(zones) => {
                                 // 检查是否所有 Zone 都有物理 volume
@@ -451,8 +452,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                                     break; // 跳出 master 循环, 进入重试
                                 }
 
-                                let zone_ids: Vec<u32> =
-                                    zones.iter().map(|z| z.zone_id).collect();
+                                let zone_ids: Vec<u32> = zones.iter().map(|z| z.zone_id).collect();
                                 info!(
                                     "FILER_ZONE: registered successfully (attempt={}), zones={:?}, total_volumes={}",
                                     attempt, zone_ids, total_vols
@@ -462,16 +462,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                                 // P2.5: 首次成功注册后, 从 chunk 映射恢复每个 Zone 的 counter
                                 // (只在第一次注册成功时执行, 后续重注册不需要)
                                 if !zones_recovered {
-                                    let chunks = net_handler_for_zone
-                                        .meta_shard_manager
-                                        .list_all_chunks();
+                                    let chunks =
+                                        net_handler_for_zone.meta_shard_manager.list_all_chunks();
                                     let zone_ids = net_handler_for_zone.get_zones();
                                     for zone_id in zone_ids {
-                                        let recovered =
-                                            powerfs_filer::zone_client::recover_counter(
-                                                zone_id,
-                                                &chunks,
-                                            );
+                                        let recovered = powerfs_filer::zone_client::recover_counter(
+                                            zone_id, &chunks,
+                                        );
                                         net_handler_for_zone.set_zone_counter(zone_id, recovered);
                                         info!(
                                             "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",

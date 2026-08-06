@@ -56,6 +56,10 @@ pub struct FuseApp {
     volume_addrs: Vec<String>,
     filer_addr: String,
     filer_net_port: u16,
+    /// Lease mode: "range" (方案 D) or "inode" (方案 A)
+    lease_mode: String,
+    lease_duration_ms: u64,
+    lease_renew_interval_ms: u64,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -71,6 +75,9 @@ impl FuseApp {
         volume_addrs: Vec<String>,
         filer_addr: String,
         filer_net_port: u16,
+        lease_mode: &str,
+        lease_duration_ms: u64,
+        lease_renew_interval_ms: u64,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
         Ok(FuseApp {
@@ -83,6 +90,9 @@ impl FuseApp {
             volume_addrs,
             filer_addr,
             filer_net_port,
+            lease_mode: lease_mode.to_string(),
+            lease_duration_ms,
+            lease_renew_interval_ms,
             runtime,
         })
     }
@@ -137,6 +147,9 @@ impl FuseApp {
             mount_point: self.mount_point.clone(),
             collection: self.collection.clone(),
             replication: self.replication.clone(),
+            lease_mode: self.lease_mode.clone(),
+            lease_duration_ms: self.lease_duration_ms,
+            lease_renew_interval_ms: self.lease_renew_interval_ms,
         };
 
         let facade = Arc::new(
@@ -1368,7 +1381,10 @@ impl FileSystem for PowerFsFs {
                 .client
                 .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
                 .map_err(|e| {
-                    debug!("unlink: lookup RPC failed for '{}/{}': {}", parent, name_str, e);
+                    debug!(
+                        "unlink: lookup RPC failed for '{}/{}': {}",
+                        parent, name_str, e
+                    );
                     std::io::Error::from_raw_os_error(libc::ENOENT)
                 })?;
             let entry = attr_to_cached_entry(&attr, parent, name_str);
@@ -2514,33 +2530,63 @@ impl FileSystem for PowerFsFs {
             if let Some(entry) = self.cache.get_inode(inode) {
                 if let Some(ref fid) = entry.fid {
                     let client_id = self.client.client_id();
-                    // 4a. 释放 write lease（从 VolumeClient leases 表取 token）
-                    let token = self
-                        .client
-                        .get_valid_lease_token(fid.volume_id.0, inode)
-                        .unwrap_or_default();
-                    if let Err(e) =
-                        self.client
-                            .release_lease(fid.volume_id.0, inode, &client_id, &token)
-                    {
-                        debug!(
-                            "release: write lease release for inode {} failed (best-effort): {}",
-                            inode, e
-                        );
-                    }
-                    // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
-                    let read_tokens = self
-                        .lease_manager
-                        .release_all_for_inode(fid.volume_id.0, inode);
-                    for (tok, cid) in read_tokens {
-                        if let Err(e) = self
-                            .client
-                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
+
+                    // 方案 A (inode lease mode): release the single inode
+                    // metadata lease held from the Filer. Volume Server
+                    // leases are not used in this mode.
+                    if self.client.is_inode_lease_mode() {
+                        if let Some((token, _remaining)) =
+                            self.client.get_valid_inode_lease_token(inode)
                         {
-                            debug!(
-                                "release: read lease release for inode {} failed (best-effort): {}",
-                                inode, e
-                            );
+                            // release_inode_lease auto-invalidates cache on success
+                            if let Err(e) =
+                                self.client.release_inode_lease(inode, &client_id, &token)
+                            {
+                                debug!(
+                                    "release: inode lease release for inode {} failed (best-effort): {}",
+                                    inode, e
+                                );
+                                // On failure, manually invalidate to allow re-acquire
+                                self.client.invalidate_inode_lease(inode);
+                            }
+                        }
+                    } else {
+                        // 方案 D (range lease mode): release per-stripe leases
+                        // 4a. 释放 write lease（遍历所有 stripe lease，逐个远程释放）
+                        let write_tokens = self
+                            .client
+                            .get_all_valid_lease_tokens_for_inode(fid.volume_id.0, inode);
+                        for (stripe_start, token) in write_tokens {
+                            if let Err(e) = self.client.release_lease(
+                                fid.volume_id.0,
+                                inode,
+                                stripe_start,
+                                &client_id,
+                                &token,
+                            ) {
+                                debug!(
+                                    "release: write lease release for inode {} stripe_start={} failed (best-effort): {}",
+                                    inode, stripe_start, e
+                                );
+                            }
+                        }
+                        // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
+                        let read_tokens = self
+                            .lease_manager
+                            .release_all_for_inode(fid.volume_id.0, inode);
+                        for (stripe_start, tok, cid) in read_tokens {
+                            if let Err(e) = self.client.release_lease(
+                                fid.volume_id.0,
+                                inode,
+                                stripe_start,
+                                &cid,
+                                &tok,
+                            ) {
+                                debug!(
+                                    "release: read lease release for inode {} stripe_start={} failed (best-effort): {}",
+                                    inode, stripe_start, e
+                                );
+                            }
                         }
                     }
                 }
@@ -2550,24 +2596,36 @@ impl FileSystem for PowerFsFs {
             // clients), but keep the write lease for background flusher retry.
             if let Some(entry) = self.cache.get_inode(inode) {
                 if let Some(ref fid) = entry.fid {
-                    let read_tokens = self
-                        .lease_manager
-                        .release_all_for_inode(fid.volume_id.0, inode);
-                    for (tok, cid) in read_tokens {
-                        if let Err(e) = self
-                            .client
-                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
-                        {
-                            debug!(
-                                "release: read lease release for inode {} failed (best-effort): {}",
-                                inode, e
-                            );
+                    // 方案 A: keep the inode lease (for background flusher retry)
+                    if self.client.is_inode_lease_mode() {
+                        debug!(
+                            "release: keeping inode lease for inode {} (flush failed, retry pending)",
+                            inode
+                        );
+                    } else {
+                        // 方案 D: release read leases only
+                        let read_tokens = self
+                            .lease_manager
+                            .release_all_for_inode(fid.volume_id.0, inode);
+                        for (stripe_start, tok, cid) in read_tokens {
+                            if let Err(e) = self.client.release_lease(
+                                fid.volume_id.0,
+                                inode,
+                                stripe_start,
+                                &cid,
+                                &tok,
+                            ) {
+                                debug!(
+                                    "release: read lease release for inode {} stripe_start={} failed (best-effort): {}",
+                                    inode, stripe_start, e
+                                );
+                            }
                         }
+                        debug!(
+                            "release: keeping write lease for inode {} (flush failed, retry pending)",
+                            inode
+                        );
                     }
-                    debug!(
-                        "release: keeping write lease for inode {} (flush failed, retry pending)",
-                        inode
-                    );
                 }
             }
         }

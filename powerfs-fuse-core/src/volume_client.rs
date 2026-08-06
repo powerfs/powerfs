@@ -14,11 +14,21 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::serialize::TlvDecoder;
-use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NO_SPACE, STATUS_ERR_NOT_FOUND};
+use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND, STATUS_ERR_NO_SPACE};
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
     HashMap<RequestId, oneshot::Sender<Result<RequestResult, ClientError>>>;
+
+/// Stripe size for per-stripe range lease (64MB).
+/// Must match Volume Server's DEFAULT_STRIPE_SIZE.
+pub const LEASE_STRIPE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Compute stripe_start (byte offset of stripe boundary) from a file offset.
+#[inline]
+pub fn stripe_start_from_offset(offset: u64) -> u64 {
+    (offset / LEASE_STRIPE_SIZE) * LEASE_STRIPE_SIZE
+}
 
 /// 调度器统计信息
 #[derive(Debug, Clone)]
@@ -228,8 +238,10 @@ pub struct VolumeClient {
     mgmt_channel: Arc<TransportChannel>,
     /// Volume 路由表
     volume_router: Arc<DashMap<u64, VolumeInfo>>,
-    /// Lease 表 ((volume_id, inode) -> LeaseInfo)
-    leases: Arc<DashMap<(u64, u64), LeaseInfo>>,
+    /// Lease 表 ((volume_id, inode, stripe_start) -> LeaseInfo)
+    /// Per-stripe key ensures writes to different stripes get independent
+    /// leases, matching the server-side StripeKey granularity.
+    leases: Arc<DashMap<(u64, u64, u64), LeaseInfo>>,
     /// Per-server circuit breaker pool (one breaker per Volume server address)
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器
@@ -602,18 +614,18 @@ impl VolumeClient {
         result
     }
 
-    /// 获取指定 inode 的 Lease 状态
-    pub fn get_lease_state(&self, volume_id: u64, inode: u64) -> LeaseState {
+    /// 获取指定 inode 的指定 stripe 的 Lease 状态
+    pub fn get_lease_state(&self, volume_id: u64, inode: u64, stripe_start: u64) -> LeaseState {
         self.leases
-            .get(&(volume_id, inode))
+            .get(&(volume_id, inode, stripe_start))
             .map(|l| l.state)
             .unwrap_or(LeaseState::None)
     }
 
-    /// 检查指定 inode 的 Lease 是否有效
-    pub fn has_valid_lease(&self, volume_id: u64, inode: u64) -> bool {
+    /// 检查指定 inode 的指定 stripe 的 Lease 是否有效
+    pub fn has_valid_lease(&self, volume_id: u64, inode: u64, stripe_start: u64) -> bool {
         self.leases
-            .get(&(volume_id, inode))
+            .get(&(volume_id, inode, stripe_start))
             .map(|l| l.is_valid())
             .unwrap_or(false)
     }
@@ -625,21 +637,31 @@ impl VolumeClient {
             .any(|entry| entry.key().0 == volume_id && entry.value().is_valid())
     }
 
-    /// 获取指定 inode 的有效 lease token（如果存在且有效）
-    pub fn get_valid_lease_token(&self, volume_id: u64, inode: u64) -> Option<String> {
+    /// 获取指定 inode 的指定 stripe 的有效 lease token（如果存在且有效）
+    pub fn get_valid_lease_token(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+    ) -> Option<String> {
         self.leases
-            .get(&(volume_id, inode))
+            .get(&(volume_id, inode, stripe_start))
             .filter(|l| l.is_valid())
             .map(|l| l.token.clone())
     }
 
-    /// 获取指定 inode 的 lease 剩余时间（如果存在且有效）
+    /// 获取指定 inode 的指定 stripe 的 lease 剩余时间（如果存在且有效）
     ///
     /// 用于写路径在长操作前检查 lease 是否即将过期，剩余不足时主动续租，
     /// 避免 lease 在写操作中途过期导致服务端校验失败。
-    pub fn get_lease_remaining(&self, volume_id: u64, inode: u64) -> Option<std::time::Duration> {
+    pub fn get_lease_remaining(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+    ) -> Option<std::time::Duration> {
         self.leases
-            .get(&(volume_id, inode))
+            .get(&(volume_id, inode, stripe_start))
             .filter(|l| l.is_valid())
             .map(|l| l.remaining())
     }
@@ -809,15 +831,16 @@ impl VolumeClient {
         }
     }
 
-    /// 更新指定 inode 的 Lease
+    /// 更新指定 inode 的指定 stripe 的 Lease
     pub fn update_lease(
         &self,
         volume_id: u64,
         inode: u64,
+        stripe_start: u64,
         token: String,
         duration: std::time::Duration,
     ) {
-        let key = (volume_id, inode);
+        let key = (volume_id, inode, stripe_start);
         // Always overwrite token + duration: ensure_lease may acquire a NEW
         // token (e.g. after local expiry) and the cached entry must reflect
         // the latest server-side token. Previously this only called renew()
@@ -833,12 +856,43 @@ impl VolumeClient {
         lease.renew(duration);
     }
 
-    /// 释放指定 inode 的 Lease
-    pub fn release_lease(&self, volume_id: u64, inode: u64) {
-        let key = (volume_id, inode);
+    /// 释放指定 inode 的指定 stripe 的 Lease
+    pub fn release_lease(&self, volume_id: u64, inode: u64, stripe_start: u64) {
+        let key = (volume_id, inode, stripe_start);
         if let Some(mut lease) = self.leases.get_mut(&key) {
             lease.release();
         }
+    }
+
+    /// 释放指定 inode 的所有 stripe Lease（用于 close/release 路径）
+    pub fn release_all_leases_for_inode(&self, volume_id: u64, inode: u64) {
+        let keys: Vec<u64> = self
+            .leases
+            .iter()
+            .filter(|entry| entry.key().0 == volume_id && entry.key().1 == inode)
+            .map(|entry| entry.key().2)
+            .collect();
+        for stripe_start in keys {
+            if let Some(mut lease) = self.leases.get_mut(&(volume_id, inode, stripe_start)) {
+                lease.release();
+            }
+        }
+    }
+
+    /// 获取指定 inode 的所有有效 stripe lease token（用于远程释放）
+    /// 返回 (stripe_start, token) 列表
+    pub fn get_all_valid_lease_tokens_for_inode(
+        &self,
+        volume_id: u64,
+        inode: u64,
+    ) -> Vec<(u64, String)> {
+        self.leases
+            .iter()
+            .filter(|entry| {
+                entry.key().0 == volume_id && entry.key().1 == inode && entry.value().is_valid()
+            })
+            .map(|entry| (entry.key().2, entry.value().token.clone()))
+            .collect()
     }
 
     /// 异步获取 Lease: 直接构建 TLV 请求发送到 Volume Server
@@ -886,6 +940,7 @@ impl VolumeClient {
                 self.update_lease(
                     volume_id,
                     inode,
+                    stripe_start,
                     token.clone(),
                     Duration::from_millis(duration_ms),
                 );
@@ -992,13 +1047,15 @@ impl VolumeClient {
                     )));
                 }
 
-                // Cache the first token for the (volume_id, inode) pair so
-                // that ensure_lease / get_valid_lease_token can find it.
+                // Cache the first token for the (volume_id, inode, stripe_start)
+                // so that ensure_lease / get_valid_lease_token can find it.
                 // Subsequent tokens are returned to the caller for direct use.
                 if let Some((first_token, _)) = tokens.first() {
+                    let first_stripe_start = stripe_specs[0].0;
                     self.update_lease(
                         volume_id,
                         inode,
+                        first_stripe_start,
                         first_token.clone(),
                         Duration::from_millis(duration_ms),
                     );
@@ -1036,19 +1093,20 @@ impl VolumeClient {
         &self,
         volume_id: u64,
         inode: u64,
+        stripe_start: u64,
         client_id: &str,
         token: &str,
     ) -> ClientResult<()> {
         if token.is_empty() {
             // 无 token：尝试从 leases 表取（兼容旧调用路径）
             let tok = self
-                .get_valid_lease_token(volume_id, inode)
+                .get_valid_lease_token(volume_id, inode, stripe_start)
                 .ok_or_else(|| ClientError::Internal("No valid lease to release".into()))?;
             return self
-                .release_lease_remote_with_token(volume_id, inode, client_id, &tok)
+                .release_lease_remote_with_token(volume_id, inode, stripe_start, client_id, &tok)
                 .await;
         }
-        self.release_lease_remote_with_token(volume_id, inode, client_id, token)
+        self.release_lease_remote_with_token(volume_id, inode, stripe_start, client_id, token)
             .await
     }
 
@@ -1057,6 +1115,7 @@ impl VolumeClient {
         &self,
         volume_id: u64,
         inode: u64,
+        stripe_start: u64,
         client_id: &str,
         token: &str,
     ) -> ClientResult<()> {
@@ -1078,17 +1137,18 @@ impl VolumeClient {
 
         match result {
             Ok(resp) if resp.is_ok() => {
-                self.release_lease(volume_id, inode);
+                self.release_lease(volume_id, inode, stripe_start);
                 log::info!(
-                    "release_lease_remote: volume={}, inode={}, token={}",
+                    "release_lease_remote: volume={}, inode={}, stripe_start={}, token={}",
                     volume_id,
                     inode,
+                    stripe_start,
                     token
                 );
                 Ok(())
             }
             Ok(resp) => {
-                self.release_lease(volume_id, inode);
+                self.release_lease(volume_id, inode, stripe_start);
                 log::warn!(
                     "release_lease_remote: server returned error but clearing local lease. status={}",
                     resp.header.status
@@ -1096,7 +1156,7 @@ impl VolumeClient {
                 Ok(())
             }
             Err(e) => {
-                self.release_lease(volume_id, inode);
+                self.release_lease(volume_id, inode, stripe_start);
                 log::warn!(
                     "release_lease_remote: network error but clearing local lease. error={}",
                     e
@@ -1166,7 +1226,13 @@ impl VolumeClient {
     }
 
     /// 异步续租 Lease: 直接构建 TLV 请求发送到 Volume Server
-    pub async fn renew_lease(&self, volume_id: u64, inode: u64, token: &str) -> ClientResult<()> {
+    pub async fn renew_lease(
+        &self,
+        volume_id: u64,
+        inode: u64,
+        stripe_start: u64,
+        token: &str,
+    ) -> ClientResult<()> {
         let volume = self
             .volume_router
             .get(&volume_id)
@@ -1179,7 +1245,7 @@ impl VolumeClient {
 
         let duration_ms = self
             .leases
-            .get(&(volume_id, inode))
+            .get(&(volume_id, inode, stripe_start))
             .map(|l| {
                 l.expire_at
                     .saturating_duration_since(l.acquired_at)
@@ -1204,21 +1270,29 @@ impl VolumeClient {
                 let new_duration = Duration::from_millis(new_duration_ms);
 
                 // 更新本地缓存
-                self.update_lease(volume_id, inode, token.to_string(), new_duration);
-
-                log::debug!(
-                    "renew_lease: volume={}, inode={}, new_duration_ms={}",
+                self.update_lease(
                     volume_id,
                     inode,
+                    stripe_start,
+                    token.to_string(),
+                    new_duration,
+                );
+
+                log::debug!(
+                    "renew_lease: volume={}, inode={}, stripe_start={}, new_duration_ms={}",
+                    volume_id,
+                    inode,
+                    stripe_start,
                     new_duration_ms
                 );
                 Ok(())
             }
             Ok(resp) => {
                 log::warn!(
-                    "renew_lease: server error for volume={}, inode={}, status={}",
+                    "renew_lease: server error for volume={}, inode={}, stripe_start={}, status={}",
                     volume_id,
                     inode,
+                    stripe_start,
                     resp.header.status
                 );
                 Err(ClientError::Server(format!(
@@ -1690,16 +1764,21 @@ impl VolumeClient {
                 let now = Instant::now();
 
                 // 收集即将过期的 Lease
-                let to_renew: Vec<(u64, u64, String)> = {
+                let to_renew: Vec<(u64, u64, u64, String)> = {
                     let mut to_renew_inner = Vec::new();
                     for entry in leases.iter() {
-                        let (volume_id, inode) = *entry.key();
+                        let (volume_id, inode, stripe_start) = *entry.key();
                         let lease = entry.value();
                         if lease.state == LeaseState::Acquired && lease.is_valid() {
                             let remaining = lease.expire_at.saturating_duration_since(now);
                             // 如果剩余时间小于 10 秒，则需要续租
                             if remaining < Duration::from_secs(10) {
-                                to_renew_inner.push((volume_id, inode, lease.token.clone()));
+                                to_renew_inner.push((
+                                    volume_id,
+                                    inode,
+                                    stripe_start,
+                                    lease.token.clone(),
+                                ));
                             }
                         }
                     }
@@ -1716,7 +1795,7 @@ impl VolumeClient {
                 );
 
                 // 逐个进行续租
-                for (volume_id, inode, token) in to_renew {
+                for (volume_id, inode, stripe_start, token) in to_renew {
                     // 获取 volume 路由地址
                     let volume_addr = volume_router.get(&volume_id).map(|v| v.addr.clone());
 
@@ -1733,9 +1812,7 @@ impl VolumeClient {
 
                     // 获取或创建到 Volume 的连接
                     let vol_client =
-                        match get_or_create_volume_client_from_pool(&conn_pool, &addr)
-                            .await
-                        {
+                        match get_or_create_volume_client_from_pool(&conn_pool, &addr).await {
                             Ok(c) => c,
                             Err(e) => {
                                 log::warn!(
@@ -1771,12 +1848,15 @@ impl VolumeClient {
                     match result {
                         Ok(resp) if resp.is_ok() => {
                             // 续租成功，更新本地过期时间
-                            if let Some(mut lease_info) = leases.get_mut(&(volume_id, inode)) {
+                            if let Some(mut lease_info) =
+                                leases.get_mut(&(volume_id, inode, stripe_start))
+                            {
                                 lease_info.renew(Duration::from_millis(duration_ms));
                                 log::debug!(
-                                    "VolumeClient: Lease renewed successfully for volume={}, inode={}",
+                                    "VolumeClient: Lease renewed successfully for volume={}, inode={}, stripe_start={}",
                                     volume_id,
-                                    inode
+                                    inode,
+                                    stripe_start
                                 );
                             }
                         }
@@ -1936,7 +2016,7 @@ async fn process_volume_available_requests(
     conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
-    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
+    leases: &Arc<DashMap<(u64, u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> bool {
     // Lease 通道优先
@@ -2027,7 +2107,7 @@ async fn process_data_requests(
     conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
-    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
+    leases: &Arc<DashMap<(u64, u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
     notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
@@ -2206,7 +2286,7 @@ async fn process_data_request_internal(
     breakers: &Arc<CircuitBreakerPool>,
     _data_channels: &[Arc<TransportChannel>],
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
-    leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
+    leases: &Arc<DashMap<(u64, u64, u64), LeaseInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
 ) -> ClientResult<RequestResult> {
     let mut response_tx = req.response_tx.take();
@@ -2359,21 +2439,24 @@ async fn process_data_request_internal(
 
             // Verify per-inode lease is valid (token already embedded in TLV body by provider_adapter)
             let has_lease = {
-                let found = leases
-                    .get(&(req.shard_id, file_key))
-                    .map(|l| l.is_valid())
-                    .unwrap_or(false);
+                // Per-stripe key: check if any stripe lease exists for this (volume_id, inode)
+                let found = leases.iter().any(|entry| {
+                    entry.key().0 == req.shard_id
+                        && entry.key().1 == file_key
+                        && entry.value().is_valid()
+                });
                 if !found {
                     log::warn!(
                         "process_worker: per-inode lease MISSING shard={} file_key={}, total leases={}",
                         req.shard_id, file_key, leases.len(),
                     );
                     for entry in leases.iter().take(10) {
-                        let (k0, k1) = *entry.key();
+                        let (k0, k1, k2) = *entry.key();
                         log::warn!(
-                            "  existing lease key=({},{}) valid={}",
+                            "  existing lease key=({},{},{}) valid={}",
                             k0,
                             k1,
+                            k2,
                             entry.value().is_valid()
                         );
                     }
@@ -2845,6 +2928,7 @@ mod tests {
         client.update_lease(
             1,
             100,
+            0,
             "token-1".to_string(),
             std::time::Duration::from_secs(30),
         );
@@ -2859,23 +2943,24 @@ mod tests {
         let (client, _, _rt) = create_test_volume_client();
 
         // 初始无 Lease
-        assert_eq!(client.get_lease_state(1, 100), LeaseState::None);
-        assert!(!client.has_valid_lease(1, 100));
+        assert_eq!(client.get_lease_state(1, 100, 0), LeaseState::None);
+        assert!(!client.has_valid_lease(1, 100, 0));
 
         // 获取 Lease
         client.update_lease(
             1,
             100,
+            0,
             "token-1".to_string(),
             std::time::Duration::from_secs(30),
         );
-        assert_eq!(client.get_lease_state(1, 100), LeaseState::Acquired);
-        assert!(client.has_valid_lease(1, 100));
+        assert_eq!(client.get_lease_state(1, 100, 0), LeaseState::Acquired);
+        assert!(client.has_valid_lease(1, 100, 0));
 
         // 释放 Lease
-        client.release_lease(1, 100);
-        assert_eq!(client.get_lease_state(1, 100), LeaseState::Released);
-        assert!(!client.has_valid_lease(1, 100));
+        client.release_lease(1, 100, 0);
+        assert_eq!(client.get_lease_state(1, 100, 0), LeaseState::Released);
+        assert!(!client.has_valid_lease(1, 100, 0));
     }
 
     #[test]
@@ -2883,26 +2968,27 @@ mod tests {
         let (client, _, _rt) = create_test_volume_client();
 
         // No lease cached → None
-        assert!(client.get_lease_remaining(1, 100).is_none());
+        assert!(client.get_lease_remaining(1, 100, 0).is_none());
 
         // Acquire lease with 30s duration
         client.update_lease(
             1,
             100,
+            0,
             "token-remaining".to_string(),
             std::time::Duration::from_secs(30),
         );
 
         // remaining should be ~30s (allow slight timing slack)
         let remaining = client
-            .get_lease_remaining(1, 100)
+            .get_lease_remaining(1, 100, 0)
             .expect("lease should be valid");
         assert!(remaining <= std::time::Duration::from_secs(30));
         assert!(remaining > std::time::Duration::from_secs(28));
 
         // After release, get_lease_remaining returns None (is_valid false)
-        client.release_lease(1, 100);
-        assert!(client.get_lease_remaining(1, 100).is_none());
+        client.release_lease(1, 100, 0);
+        assert!(client.get_lease_remaining(1, 100, 0).is_none());
     }
 
     #[test]

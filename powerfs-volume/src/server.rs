@@ -35,6 +35,11 @@ pub struct VolumeServer {
     data_dir: String,
     pub range_lease_mgr: Arc<RangeLeaseManager>,
     pub io_stats: Arc<IoStatsCollector>,
+    /// Whether Volume Server supports range lease validation in write_needle.
+    /// Set to `false` for backends that don't support lease (e.g., NVMe-oF
+    /// target). When false, write_needle skips lease token validation;
+    /// consistency is enforced by Filer's inode metadata lease (方案 A).
+    pub lease_enabled: bool,
 }
 
 impl VolumeServer {
@@ -105,7 +110,18 @@ impl VolumeServer {
             data_dir: data_dir.to_string(),
             range_lease_mgr,
             io_stats: Arc::new(IoStatsCollector::new()),
+            lease_enabled: true,
         }
+    }
+
+    /// Configure lease support (方案 A vs 方案 D).
+    ///
+    /// Set to `false` when the backend doesn't support range lease (e.g.,
+    /// NVMe-oF target). When false, `write_needle` skips lease token
+    /// validation; consistency is enforced by Filer's inode metadata lease.
+    pub fn with_lease_enabled(mut self, enabled: bool) -> Self {
+        self.lease_enabled = enabled;
+        self
     }
 
     pub async fn start(mut self, address: &str) -> Result<()> {

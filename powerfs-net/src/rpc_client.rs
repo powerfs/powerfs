@@ -31,9 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::errors::{NetError, NetResult};
-use crate::protocol::{
-    build_frame, FrameFlags, FrameHeader, HandshakeRequest, HandshakeResponse,
-};
+use crate::protocol::{build_frame, FrameFlags, FrameHeader, HandshakeRequest, HandshakeResponse};
 use crate::{ClientType, MsgType, STATUS_OK};
 
 /// Default timeouts for one-shot RPCs.
@@ -95,7 +93,15 @@ pub async fn call_once(
     msg_type: MsgType,
     body: &[u8],
 ) -> NetResult<RpcReply> {
-    call_once_with(addr, client_type, client_id, msg_type, body, RpcOpts::default()).await
+    call_once_with(
+        addr,
+        client_type,
+        client_id,
+        msg_type,
+        body,
+        RpcOpts::default(),
+    )
+    .await
 }
 
 /// Same as [`call_once`] but with explicit timeouts.
@@ -124,11 +130,7 @@ pub struct NetRpcClient {
 impl NetRpcClient {
     /// Connect to `addr` and complete the handshake. The connection is kept
     /// open until the client is dropped or an I/O error occurs.
-    pub async fn connect(
-        addr: &str,
-        client_type: ClientType,
-        client_id: u64,
-    ) -> NetResult<Self> {
+    pub async fn connect(addr: &str, client_type: ClientType, client_id: u64) -> NetResult<Self> {
         Self::connect_with(addr, client_type, client_id, RpcOpts::default()).await
     }
 
@@ -199,10 +201,13 @@ impl RpcConnection {
             .map_err(|e| NetError::Connection(format!("send handshake: {e}")))?;
 
         let mut hs_resp_buf = vec![0u8; HandshakeResponse::SIZE];
-        tokio::time::timeout(opts.handshake_timeout, self.reader.read_exact(&mut hs_resp_buf))
-            .await
-            .map_err(|_| NetError::Timeout)?
-            .map_err(|e| NetError::Connection(format!("read handshake: {e}")))?;
+        tokio::time::timeout(
+            opts.handshake_timeout,
+            self.reader.read_exact(&mut hs_resp_buf),
+        )
+        .await
+        .map_err(|_| NetError::Timeout)?
+        .map_err(|e| NetError::Connection(format!("read handshake: {e}")))?;
         let hs_resp = HandshakeResponse::decode(&hs_resp_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake response".into()))?;
         if hs_resp.status != 0 {
@@ -301,14 +306,7 @@ mod tests {
     #[tokio::test]
     async fn call_once_to_closed_port_fails() {
         // Nothing listens on 127.0.0.1:1 on most CI envs.
-        let res = call_once(
-            "127.0.0.1:1",
-            ClientType::Master,
-            1,
-            MsgType::Ping,
-            &[],
-        )
-        .await;
+        let res = call_once("127.0.0.1:1", ClientType::Master, 1, MsgType::Ping, &[]).await;
         assert!(res.is_err());
     }
 }

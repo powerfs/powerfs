@@ -252,7 +252,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NetHandler for EchoHandler {
-        async fn handle(&self, _ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+        async fn handle(
+            &self,
+            _ctx: &mut RequestContext,
+            msg: &NetMessage,
+        ) -> NetResult<NetMessage> {
             let resp_header = FrameHeader::new(
                 msg.header.msg_type,
                 FrameFlags::new(FrameFlags::RESPONSE),

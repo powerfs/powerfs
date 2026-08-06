@@ -708,7 +708,10 @@ impl MetaShardManager {
             self.inode_generator.store(max_existing, Ordering::SeqCst);
             info!(
                 "Recovered inode_generator: {} -> {} (node_id={}, scanned max={})",
-                current, max_existing, self.node_id, max_existing - 1
+                current,
+                max_existing,
+                self.node_id,
+                max_existing - 1
             );
         } else {
             info!(
@@ -899,7 +902,8 @@ impl MetaShardManager {
                 let mut retries = 0;
                 while retries < 50 {
                     if let Some(info) = store.get_inode(inode) {
-                        let mode_ok = mode.map_or(true, |m| (info.mode & 0o7777) == (m as u32 & 0o7777));
+                        let mode_ok =
+                            mode.map_or(true, |m| (info.mode & 0o7777) == (m as u32 & 0o7777));
                         let uid_ok = uid.map_or(true, |u| info.uid == u as u32);
                         let gid_ok = gid.map_or(true, |g| info.gid == g as u32);
                         let size_ok = size.map_or(true, |s| info.size == s);

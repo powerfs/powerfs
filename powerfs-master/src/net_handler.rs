@@ -8,7 +8,7 @@ use crate::proto::powerfs::VolumeShortInfo;
 use log::{debug, error, info, warn};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, MsgType, NetMessage, NetHandler, RequestContext, STATUS_ERR_NOT_FOUND,
+    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_NOT_FOUND,
     STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use protobuf::Message as ProtoMessage;
@@ -653,10 +653,18 @@ impl MasterNetHandler {
             "NET_REGISTER_FILER: filer_id={}, zones={}, total_volumes={}",
             filer_id,
             zones.len(),
-            zones.iter().map(|z| z.physical_volumes.len()).sum::<usize>()
+            zones
+                .iter()
+                .map(|z| z.physical_volumes.len())
+                .sum::<usize>()
         );
 
-        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes(), Vec::new()))
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
     }
 
     /// Handle ListFilers request from kernel client.
@@ -770,7 +778,9 @@ impl MasterNetHandler {
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
-                    "failed to send message to step channel".to_string().into_bytes(),
+                    "failed to send message to step channel"
+                        .to_string()
+                        .into_bytes(),
                     Vec::new(),
                 ))
             }

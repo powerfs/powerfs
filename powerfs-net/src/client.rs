@@ -4,7 +4,7 @@
 //! powerfs-net binary protocol.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -561,9 +561,7 @@ impl PowerFsNetClient {
                 let body = payload[..body_len].to_vec();
                 let data = payload[body_len..].to_vec();
 
-                let message = NetMessage::new(header)
-                    .with_body(body)
-                    .with_data(data);
+                let message = NetMessage::new(header).with_body(body).with_data(data);
 
                 let seq = message.header.seq;
 
@@ -586,9 +584,7 @@ impl PowerFsNetClient {
                         "recv_loop: dispatched response seq={}, status={}",
                         seq, message.header.status
                     );
-                    metrics
-                        .responses_received
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.responses_received.fetch_add(1, Ordering::Relaxed);
                     let _ = sender.send(message);
                 } else {
                     warn!("recv_loop: no pending request for seq={}, dropping", seq);
@@ -731,9 +727,7 @@ impl PowerFsNetClient {
         // Create oneshot channel and register pending request
         let (tx, rx) = oneshot::channel::<NetMessage>();
         self.pending_requests.insert(seq, tx);
-        self.metrics
-            .requests_sent
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.requests_sent.fetch_add(1, Ordering::Relaxed);
 
         // Push frame to send_task via mpsc channel (no write_half lock needed)
         {
@@ -748,9 +742,7 @@ impl PowerFsNetClient {
                         );
                         self.pending_requests.remove(&seq);
                         *self.state.lock() = ClientState::Disconnected;
-                        self.metrics
-                            .request_errors
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
                         return Err(NetError::NotConnected);
                     }
                     debug!(
@@ -762,9 +754,7 @@ impl PowerFsNetClient {
                     self.pending_requests.remove(&seq);
                     *self.state.lock() = ClientState::Disconnected;
                     warn!("send_request_internal: frame_tx is None");
-                    self.metrics
-                        .request_errors
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(NetError::NotConnected);
                 }
             }
@@ -784,18 +774,14 @@ impl PowerFsNetClient {
                 // oneshot sender was dropped (likely recv_loop exited and
                 // drained pending_requests, or send_task drained on error)
                 warn!("send_request_internal: sender dropped for seq={}", seq);
-                self.metrics
-                    .request_errors
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
                 Err(NetError::Connection("connection terminated".into()))
             }
             Err(_elapsed) => {
                 warn!("send_request_internal: response timeout for seq={}", seq);
                 // Remove pending request on timeout (do NOT set state=Disconnected)
                 self.pending_requests.remove(&seq);
-                self.metrics
-                    .request_errors
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
                 Err(NetError::Timeout)
             }
         }

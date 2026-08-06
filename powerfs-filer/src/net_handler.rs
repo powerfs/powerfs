@@ -4,6 +4,7 @@
 //! using MetaShardManager, which is the authoritative metadata manager with sharded
 //! storage, Raft consensus, and strong consistency metadata operations.
 
+use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
 use crate::raft_group_manager::ShardId;
@@ -11,12 +12,12 @@ use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
 use powerfs_coherence::ChunkWire;
-use protobuf::Message as ProtoMessage;
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    ClientType, FieldId, MsgType, NetError, NetMessage, NetHandler, NetResult,
-    RequestContext, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
+    STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
+use protobuf::Message as ProtoMessage;
 use std::sync::Arc;
 
 /// Zone 运行时状态 (Filer 持有, 每个 Zone 独立 counter + volume 列表)
@@ -34,6 +35,8 @@ pub struct FilerNetHandler {
     pub net_port: u16,
     /// Inode notification broadcaster (optional, for cache invalidation)
     pub inode_notifier: Option<Arc<InodeNotifier>>,
+    /// Inode metadata lease manager (方案 A, Phase 2)
+    pub inode_lease_mgr: Arc<InodeLeaseManager>,
     /// 该 Filer 拥有的所有 Zone (多 Zone 设计: 旧 + 新)
     /// 空 Vec = 未注册, 无法分配 needle_id
     zones: std::sync::RwLock<Vec<ZoneState>>,
@@ -52,6 +55,7 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: None,
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
             zone_rr: std::sync::atomic::AtomicU32::new(0),
         }
@@ -69,6 +73,7 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: Some(inode_notifier),
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
             zone_rr: std::sync::atomic::AtomicU32::new(0),
         }
@@ -111,7 +116,8 @@ impl FilerNetHandler {
     pub fn set_zone_counter(&self, zone_id: u32, counter: u64) {
         let zones = self.zones.read().unwrap();
         if let Some(z) = zones.iter().find(|z| z.zone_id == zone_id) {
-            z.counter.store(counter, std::sync::atomic::Ordering::SeqCst);
+            z.counter
+                .store(counter, std::sync::atomic::Ordering::SeqCst);
             info!("FILER_ZONE: set zone_id={} counter={}", zone_id, counter);
         } else {
             warn!(
@@ -145,8 +151,7 @@ impl FilerNetHandler {
         let zone = &zones[idx];
 
         // 从选中 Zone 的 counter 分配 needle_id
-        let needle_id =
-            crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+        let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
 
         // 从该 Zone 的 volumes 中选空闲比例最大的
         let vol = crate::zone_client::select_volume(&zone.volumes)?;
@@ -845,11 +850,7 @@ impl FilerNetHandler {
                     return Ok(redirect);
                 }
 
-                match self
-                    .meta_shard_manager
-                    .delete_file(parent_ino, &name)
-                    .await
-                {
+                match self.meta_shard_manager.delete_file(parent_ino, &name).await {
                     Ok(_) => {
                         // B5: notify 目录条目变更（parent readdir 缓存 + 被删 inode 失效）
                         let now = crate::shard_store::ShardStore::current_time();
@@ -983,7 +984,11 @@ impl FilerNetHandler {
         info!(
             "FILER_NET_READDIR: parent_ino={}, entries={}",
             parent_ino,
-            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(",")
+            entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
         );
 
         // Filter by last_name for pagination
@@ -1220,7 +1225,10 @@ impl FilerNetHandler {
 
         info!(
             "FILER_NET_UPDATE_SIZE_CHUNKS: req.shard_id={}, inode={}, size={}, chunks={}",
-            req.shard_id, req.inode, req.size, req.chunks.len()
+            req.shard_id,
+            req.inode,
+            req.size,
+            req.chunks.len()
         );
 
         // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
@@ -1376,6 +1384,176 @@ impl FilerNetHandler {
         }
     }
 
+    /// Handle AcquireInodeLease request (方案 A, Phase 2).
+    ///
+    /// Request TLV: Ino, ClientId, LeaseDuration
+    /// Response TLV: LeaseId (token), LeaseDuration
+    async fn handle_acquire_inode_lease(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        if inode == 0 || client_id.is_empty() {
+            warn!(
+                "FILER_NET_ACQUIRE_INODE_LEASE: missing inode={} or client_id={}",
+                inode, client_id
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader (inode lease is in-memory on the leader)
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.inode_lease_mgr.acquire(inode, &client_id, duration_ms) {
+            Ok(result) => {
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::LeaseId, &result.token);
+                let _ = enc.add_u64(FieldId::LeaseDuration, result.expire_at_ms);
+                info!(
+                    "FILER_NET_ACQUIRE_INODE_LEASE: inode={} client={} duration_ms={}",
+                    inode, client_id, duration_ms
+                );
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_NET_ACQUIRE_INODE_LEASE: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
+
+    /// Handle ReleaseInodeLease request (方案 A, Phase 2).
+    ///
+    /// Request TLV: Ino, ClientId, LeaseToken
+    /// Response: STATUS_OK / STATUS_ERR_SERVER_ERROR
+    async fn handle_release_inode_lease(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!(
+                "FILER_NET_RELEASE_INODE_LEASE: missing inode={} client_id={} token={}",
+                inode,
+                client_id,
+                !token.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.inode_lease_mgr.release(inode, &client_id, &token) {
+            Ok(()) => {
+                debug!(
+                    "FILER_NET_RELEASE_INODE_LEASE: inode={} client={}",
+                    inode, client_id
+                );
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_NET_RELEASE_INODE_LEASE: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
+
+    /// Handle RenewInodeLease request (方案 A, Phase 2).
+    ///
+    /// Request TLV: Ino, ClientId, LeaseToken, LeaseDuration
+    /// Response: STATUS_OK / STATUS_ERR_SERVER_ERROR
+    async fn handle_renew_inode_lease(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let duration_ms = dec.next_u64(FieldId::LeaseDuration).unwrap_or(30000);
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!(
+                "FILER_NET_RENEW_INODE_LEASE: missing inode={} client_id={} token={}",
+                inode,
+                client_id,
+                !token.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self
+            .inode_lease_mgr
+            .renew(inode, &client_id, &token, duration_ms)
+        {
+            Ok(()) => {
+                debug!(
+                    "FILER_NET_RENEW_INODE_LEASE: inode={} client={} duration_ms={}",
+                    inode, client_id, duration_ms
+                );
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_NET_RENEW_INODE_LEASE: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
+
     /// Handle Raft inter-node message (MsgType::RaftMessage).
     ///
     /// Replaces the gRPC FilerMetaService::send_raft_message RPC.
@@ -1416,11 +1594,14 @@ impl FilerNetHandler {
         let shard_id = ShardId(shard_id_val);
         debug!(
             "FILER_RAFT: received raft message for shard {} (type={:?})",
-            shard_id.0,
-            raft_msg.msg_type
+            shard_id.0, raft_msg.msg_type
         );
 
-        match self.meta_shard_manager.step_raft_message(shard_id, raft_msg).await {
+        match self
+            .meta_shard_manager
+            .step_raft_message(shard_id, raft_msg)
+            .await
+        {
             Ok(_) => {
                 debug!("FILER_RAFT: stepped raft message for shard {}", shard_id.0);
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
@@ -1577,6 +1758,10 @@ impl NetHandler for FilerNetHandler {
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
             MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
+            // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
+            MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
+            MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
+            MsgType::RenewInodeLease => self.handle_renew_inode_lease(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),

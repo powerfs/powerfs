@@ -3,6 +3,7 @@ pub mod crdt_meta;
 pub mod crdt_orset;
 pub mod entry_manager;
 pub mod grpc_service;
+pub mod inode_lease_manager;
 pub mod inode_notifier;
 pub mod meta_shard_manager;
 pub mod metadata_store;

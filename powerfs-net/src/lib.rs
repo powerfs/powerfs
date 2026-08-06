@@ -38,11 +38,11 @@ pub use client::{
     ClientConfig, ClientEventListener, ClientMetrics, ClientMetricsSnapshot, ClientState,
     NotificationHandler, PowerFsNetClient,
 };
-pub use client_pool::{ClientConnPool, ClientPoolConfig, ServerEndpoint};
 pub use client_conn::{
     ClientConn, ClientConnInfo, ClientPolicy, ClientStats, CloseHandle, ConnHealthStatus,
     ConnMetricsSnapshot, ConnRegistry, ConnState, OutboundTx, RateLimiter,
 };
+pub use client_pool::{ClientConnPool, ClientPoolConfig, ServerEndpoint};
 pub use errors::{NetError, NetResult};
 pub use io_loop::IoLoop;
 pub use middleware::{

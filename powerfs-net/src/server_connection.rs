@@ -293,9 +293,10 @@ impl ServerConnectionManager {
         msg: &NetMessage,
         handler: Arc<dyn NetHandler>,
     ) -> NetResult<NetMessage> {
-        let conn = self.registry.get(client_id).ok_or_else(|| {
-            NetError::Connection(format!("Client {} not found", client_id))
-        })?;
+        let conn = self
+            .registry
+            .get(client_id)
+            .ok_or_else(|| NetError::Connection(format!("Client {} not found", client_id)))?;
 
         if *conn.state.read().await != ConnState::Active {
             return Err(NetError::Connection(format!(
@@ -349,9 +350,10 @@ impl ServerConnectionManager {
         msg: &NetMessage,
         handler: &dyn NetHandler,
     ) -> NetResult<NetMessage> {
-        let conn = self.registry.get(client_id).ok_or_else(|| {
-            NetError::Connection(format!("Client {} not found", client_id))
-        })?;
+        let conn = self
+            .registry
+            .get(client_id)
+            .ok_or_else(|| NetError::Connection(format!("Client {} not found", client_id)))?;
 
         let client_info = ClientInfo {
             client_id: conn.id,
@@ -474,9 +476,7 @@ mod tests {
     }
 
     /// Helper: create a registry with a registered test client.
-    async fn setup_registry_with_client(
-        client_id: u64,
-    ) -> (Arc<ConnRegistry>, Arc<ClientConn>) {
+    async fn setup_registry_with_client(client_id: u64) -> (Arc<ConnRegistry>, Arc<ClientConn>) {
         let registry = Arc::new(ConnRegistry::new());
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let conn = ClientConn::new(
@@ -599,12 +599,7 @@ mod tests {
         // Keep _rx alive so the outbound channel doesn't get dropped,
         // which would cause notify() to return false.
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let conn = ClientConn::new(
-            1,
-            "127.0.0.1:12345".parse().unwrap(),
-            ClientType::Fuse,
-            tx,
-        );
+        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, tx);
         registry.register(conn).await;
         let mgr = ServerConnectionManager::new(registry);
 

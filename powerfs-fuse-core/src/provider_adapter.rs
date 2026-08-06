@@ -674,7 +674,9 @@ impl FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
+                self.facade
+                    .meta_shard_client()
+                    .calculate_shard_id(parent_ino),
                 payload,
                 msg_type,
             )
@@ -735,7 +737,9 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
+                self.facade
+                    .meta_shard_client()
+                    .calculate_shard_id(parent_ino),
                 payload,
                 powerfs_net::MsgType::Lookup,
             )
@@ -780,10 +784,7 @@ impl MetadataProvider for FacadeMetadataProvider {
 
         let payload = build_getattr_tlv(inode);
 
-        let shard_id = self
-            .facade
-            .meta_shard_client()
-            .calculate_shard_id(inode);
+        let shard_id = self.facade.meta_shard_client().calculate_shard_id(inode);
         let result = self
             .facade
             .submit_metadata_request_with_type(
@@ -869,7 +870,9 @@ impl MetadataProvider for FacadeMetadataProvider {
             .facade
             .submit_metadata_request_with_type(
                 crate::request_state::RequestKind::Metadata,
-                self.facade.meta_shard_client().calculate_shard_id(parent_ino),
+                self.facade
+                    .meta_shard_client()
+                    .calculate_shard_id(parent_ino),
                 payload,
                 msg_type,
             )
@@ -1072,41 +1075,67 @@ fn parse_range_lease_response(payload: &[u8]) -> Option<(String, u64)> {
 }
 
 impl FacadeStorageProvider {
-    /// 获取/续期指定 (volume, inode) 的有效 lease 并返回 token。
+    /// 获取/续期指定 (volume, inode, stripe) 的有效 lease 并返回 token。
     /// 优先读缓存；若缓存未命中或已过期，向 Volume 发起 RangeLease 请求并更新缓存。
-    /// inode 用于 Volume Server 端的 lease 校验（lease 按 inode 注册）。
+    /// inode 用于 Volume Server 端的 lease 校验（lease 按 inode + stripe 注册）。
     ///
     /// P1-3: 当缓存 lease 有效但剩余时间低于 RENEW_THRESHOLD 时，主动续租，
     /// 避免 lease 在长写操作中途过期导致服务端 validate_token 失败。
+    ///
+    /// Phase 1: stripe_start 由 offset 计算，确保大文件写 stripe 1+ 时获取
+    /// 正确 stripe 的 lease，而非总是获取 stripe 0。
     async fn ensure_lease(
         &self,
         volume_id: u64,
         file_key: u64,
         inode: u64,
+        offset: u64,
     ) -> powerfs_common::error::Result<String> {
+        // 方案 A: inode metadata lease (Filer-managed).
+        //
+        // When lease_mode == "inode", the Volume Server backend doesn't
+        // support range lease (e.g., NVMe-oF target). We acquire a per-inode
+        // exclusive lease from the Filer instead. The token is still passed
+        // to write_needle, but Volume Server skips validation because
+        // lease_enabled=false. Consistency is guaranteed by Filer's
+        // UpdateInodeSizeChunks Raft commit.
+        if self.facade.is_inode_lease_mode() {
+            return self.ensure_inode_lease(inode).await;
+        }
+
+        // 方案 D: range lease (Volume Server-managed) — existing logic
         let vid = volume_id;
+        let stripe_start = crate::volume_client::stripe_start_from_offset(offset);
+
         // Fast path: use cached valid lease token via facade
-        // Cache key is (volume_id, inode) to match server-side lease registration
-        if let Some(tok) = self.facade.get_valid_lease_token(vid, inode) {
+        // Cache key is (volume_id, inode, stripe_start) to match server-side
+        // StripeKey { inode, stripe_start, stripe_count } registration.
+        if let Some(tok) = self.facade.get_valid_lease_token(vid, inode, stripe_start) {
             // P1-3: proactively renew if remaining time is below threshold.
             // This prevents lease expiry mid-write for long operations.
-            if let Some(remaining) = self.facade.get_lease_remaining(vid, inode) {
+            if let Some(remaining) = self.facade.get_lease_remaining(vid, inode, stripe_start) {
                 if remaining < RENEW_THRESHOLD {
                     log::debug!(
-                        "ensure_lease: proactive renew for volume={} inode={} remaining_ms={} < threshold_ms={}",
+                        "ensure_lease: proactive renew for volume={} inode={} stripe_start={} remaining_ms={} < threshold_ms={}",
                         vid,
                         inode,
+                        stripe_start,
                         remaining.as_millis(),
                         RENEW_THRESHOLD.as_millis()
                     );
                     // Best-effort renew: if it fails, fall back to the
                     // existing valid token (server-side grace period covers
                     // brief overruns). A failed renew is not fatal.
-                    if let Err(e) = self.facade.renew_lease(vid, inode, &tok).await {
+                    if let Err(e) = self
+                        .facade
+                        .renew_lease(vid, inode, stripe_start, &tok)
+                        .await
+                    {
                         log::warn!(
-                            "ensure_lease: proactive renew failed for volume={} inode={} err={} (falling back to existing token)",
+                            "ensure_lease: proactive renew failed for volume={} inode={} stripe_start={} err={} (falling back to existing token)",
                             vid,
                             inode,
+                            stripe_start,
                             e
                         );
                     }
@@ -1119,13 +1148,14 @@ impl FacadeStorageProvider {
         let duration_ms = 60_000; // 1 min default exclusive lease
                                   // Register lease with real inode (not file_key) so server-side
                                   // validate_token_with_grace_period(token, holder, inode) matches
-        let payload = build_range_lease_tlv(inode, 0, 1, &client_id, true, duration_ms);
+        let payload = build_range_lease_tlv(inode, stripe_start, 1, &client_id, true, duration_ms);
 
         log::debug!(
-            "ensure_lease: acquiring for volume={} file_key={} inode={} client={}",
+            "ensure_lease: acquiring for volume={} file_key={} inode={} stripe_start={} client={}",
             volume_id,
             file_key,
             inode,
+            stripe_start,
             client_id
         );
 
@@ -1156,22 +1186,93 @@ impl FacadeStorageProvider {
             ))
         })?;
 
-        // Store lease via facade with inode as cache key
+        // Store lease via facade with (inode, stripe_start) as cache key
         self.facade.update_lease(
             vid,
             inode,
+            stripe_start,
             lease_token.clone(),
             Duration::from_millis(duration_ms),
         );
 
         log::debug!(
-            "ensure_lease: acquired token={:.16}... for volume={} inode={}",
+            "ensure_lease: acquired token={:.16}... for volume={} inode={} stripe_start={}",
             lease_token,
             volume_id,
-            inode
+            inode,
+            stripe_start
         );
 
         Ok(lease_token)
+    }
+
+    /// Ensure an inode metadata lease is held (方案 A, Phase 2).
+    ///
+    /// Filer-managed per-inode exclusive lease. Used when the Volume Server
+    /// backend doesn't support range lease (e.g., NVMe-oF target).
+    ///
+    /// Flow:
+    /// 1. Fast path: if a cached lease is still valid, return it. Proactively
+    ///    renew if remaining time < RENEW_THRESHOLD.
+    /// 2. Slow path: acquire a new lease from the Filer, cache it, return token.
+    ///
+    /// The returned token is passed to `write_needle` as the `LeaseToken`
+    /// field. Volume Server skips validation because `lease_enabled=false`.
+    async fn ensure_inode_lease(&self, inode: u64) -> powerfs_common::error::Result<String> {
+        // Fast path: use cached valid inode lease token
+        if let Some((token, remaining)) = self.facade.get_valid_inode_lease_token(inode) {
+            // P1-3: proactively renew if remaining time is below threshold.
+            if remaining < RENEW_THRESHOLD {
+                let client_id = self.facade.client_id();
+                let duration_ms = self.facade.lease_duration_ms();
+                log::debug!(
+                    "ensure_inode_lease: proactive renew for inode={} remaining_ms={} < threshold_ms={}",
+                    inode,
+                    remaining.as_millis(),
+                    RENEW_THRESHOLD.as_millis()
+                );
+                // Best-effort renew: if it fails, fall back to existing token.
+                // The Filer's grace period covers brief overruns.
+                // renew_inode_lease auto-updates cache on success.
+                if let Err(e) = self
+                    .facade
+                    .renew_inode_lease(inode, &client_id, &token, duration_ms)
+                    .await
+                {
+                    log::warn!(
+                        "ensure_inode_lease: proactive renew failed for inode={} err={} (falling back to existing token)",
+                        inode,
+                        e
+                    );
+                }
+            }
+            return Ok(token);
+        }
+
+        // Slow path: acquire new inode lease from Filer
+        // acquire_inode_lease auto-caches the token on success.
+        let client_id = self.facade.client_id();
+        let duration_ms = self.facade.lease_duration_ms();
+
+        log::debug!(
+            "ensure_inode_lease: acquiring for inode={} client={}",
+            inode,
+            client_id
+        );
+
+        let (token, _expire_at_ms) = self
+            .facade
+            .acquire_inode_lease(inode, &client_id, duration_ms)
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("AcquireInodeLease failed: {}", e)))?;
+
+        log::debug!(
+            "ensure_inode_lease: acquired token={:.16}... for inode={}",
+            token,
+            inode
+        );
+
+        Ok(token)
     }
 
     /// 写入数据时使用指定的 lease token（若提供），否则自动获取。
@@ -1183,7 +1284,7 @@ impl FacadeStorageProvider {
         volume_id: u64,
         file_key: u64,
         inode: u64,
-        _offset: i64,
+        offset: i64,
         _size: i32,
         data: &[u8],
         lease_token: Option<&str>,
@@ -1193,14 +1294,14 @@ impl FacadeStorageProvider {
             if !t.is_empty() {
                 t.to_string()
             } else {
-                self.ensure_lease(volume_id, file_key, inode)
+                self.ensure_lease(volume_id, file_key, inode, offset as u64)
                     .await
                     .map_err(|e| {
                         PowerFsError::Internal(format!("Failed to acquire lease: {}", e))
                     })?
             }
         } else {
-            self.ensure_lease(volume_id, file_key, inode)
+            self.ensure_lease(volume_id, file_key, inode, offset as u64)
                 .await
                 .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?
         };
@@ -1246,7 +1347,7 @@ impl StorageProvider for FacadeStorageProvider {
         &self,
         volume_id: u64,
         file_key: u64,
-        _offset: i64,
+        offset: i64,
         _size: i32,
         data: &[u8],
     ) -> Result<()> {
@@ -1255,7 +1356,7 @@ impl StorageProvider for FacadeStorageProvider {
         // FieldId::FileKey, so server-side falls back to file_key as inode.
         // Register lease with file_key as inode to match.
         let lease_token = self
-            .ensure_lease(volume_id, file_key, file_key)
+            .ensure_lease(volume_id, file_key, file_key, offset as u64)
             .await
             .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?;
         let client_id = self.facade.client_id();
@@ -1293,12 +1394,16 @@ impl StorageProvider for FacadeStorageProvider {
             combined_data.extend_from_slice(data);
         }
 
+        // Use the first entry's offset for stripe calculation. If entries
+        // is empty, default to offset 0 (stripe 0).
+        let first_offset = entries.first().map(|(off, _, _, _)| *off).unwrap_or(0) as u64;
+
         // Acquire a valid lease BEFORE submitting the write
         // batch_write_blob uses build_batch_write_tlv which does NOT include
         // FieldId::FileKey, so server-side falls back to file_key as inode.
         // Register lease with file_key as inode to match.
         let lease_token = self
-            .ensure_lease(volume_id, file_key, file_key)
+            .ensure_lease(volume_id, file_key, file_key, first_offset)
             .await
             .map_err(|e| PowerFsError::Internal(format!("Failed to acquire lease: {}", e)))?;
         let client_id = self.facade.client_id();

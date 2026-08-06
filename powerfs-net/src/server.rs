@@ -29,8 +29,8 @@ use crate::errors::{NetError, NetResult};
 use crate::io_loop::IoLoop;
 use crate::protocol::*;
 use crate::server_connection::{NetHandler, ServerConnectionManager};
-use crate::worker::Worker;
 use crate::work::Work;
+use crate::worker::Worker;
 
 /// Server configuration (tunable parameters)
 #[derive(Debug, Clone)]
@@ -78,11 +78,7 @@ struct ShutdownState {
 }
 
 impl PowerFsNetServer {
-    pub async fn bind(
-        addr: &str,
-        port: u16,
-        handler: Arc<dyn NetHandler>,
-    ) -> NetResult<Self> {
+    pub async fn bind(addr: &str, port: u16, handler: Arc<dyn NetHandler>) -> NetResult<Self> {
         Self::bind_inner(addr, port, handler, ServerConfig::default()).await
     }
 
@@ -450,21 +446,15 @@ impl PowerFsNetServer {
 
         // handshake 需要读写 stream, 完成后返回 stream + client_id
         let peer = addr;
-        let (stream, client_id, client_type) = match Self::handle_handshake(
-            stream,
-            handler.clone(),
-            manager.clone(),
-            peer,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Handshake failed from {}: {:?}", peer, e);
-                self.decrement_connections().await;
-                return;
-            }
-        };
+        let (stream, client_id, client_type) =
+            match Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Handshake failed from {}: {:?}", peer, e);
+                    self.decrement_connections().await;
+                    return;
+                }
+            };
 
         // 发送 handshake response (在 handshake 内部已完成, 这里 stream 已可拆分)
         stream.set_nodelay(true).ok();
@@ -494,10 +484,7 @@ impl PowerFsNetServer {
         let io_loop_idx = (client_id as usize) % io_loops.len();
         let io_loop = io_loops[io_loop_idx].clone();
 
-        debug!(
-            "Assigned client {} to IoLoop {}",
-            client_id, io_loop_idx
-        );
+        debug!("Assigned client {} to IoLoop {}", client_id, io_loop_idx);
 
         // IoLoop.manage 会 spawn task 管理该连接
         // 连接断开后 IoLoop 会自动执行断连清理 + decrement_connections

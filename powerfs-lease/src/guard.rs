@@ -205,7 +205,11 @@ mod tests {
             None
         }
 
-        fn release_all_for_inode(&self, _volume_id: u64, _inode: u64) -> Vec<(String, String)> {
+        fn release_all_for_inode(
+            &self,
+            _volume_id: u64,
+            _inode: u64,
+        ) -> Vec<(u64, String, String)> {
             Vec::new()
         }
 

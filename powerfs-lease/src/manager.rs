@@ -53,12 +53,16 @@ pub trait LeaseManager: Send + Sync {
     fn state(&self, volume_id: u64, inode: u64) -> Option<LeaseState>;
 
     /// Release all leases for a given (volume_id, inode) pair.
-    /// Returns the list of (token, client_id) pairs that were released.
+    /// Returns the list of (stripe_start, token, client_id) triples that were
+    /// released.
     ///
     /// This is used by FUSE `release()` to clean up all read leases held by
     /// this client on a file before close, preventing server-side lease
     /// accumulation that blocks other clients' write leases.
-    fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(String, String)>;
+    ///
+    /// `stripe_start` is included so the caller can release each lease on the
+    /// correct stripe (the server keys leases by (inode, stripe_start)).
+    fn release_all_for_inode(&self, volume_id: u64, inode: u64) -> Vec<(u64, String, String)>;
 
     /// Invalidate (drop local cache for) all leases on a given (volume_id, inode).
     /// Does NOT notify the server — use `release_all_for_inode` for that.

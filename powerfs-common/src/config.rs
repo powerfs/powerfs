@@ -63,6 +63,12 @@ pub struct VolumeConfig {
     /// 广播地址 - Volume Server对外可达地址（如 "172.20.0.21"），用于Master注册volume路由
     /// 必须配置，不能使用0.0.0.0，否则FUSE客户端无法连接
     pub advertise_addr: Option<String>,
+    /// Whether Volume Server supports range lease validation in write_needle.
+    /// Set to `false` for backends that don't support lease (e.g., NVMe-oF target).
+    /// When false, write_needle skips lease token validation; consistency is
+    /// enforced by Filer's inode metadata lease (方案 A) instead.
+    #[serde(default = "default_true")]
+    pub lease_enabled: bool,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -138,6 +144,47 @@ pub struct FuseConfig {
     pub verbose: bool,
     pub container: bool,
     pub log_file: Option<String>,
+    /// Lease 模式配置 (可选，缺省为 range 模式)
+    #[serde(default)]
+    pub lease: LeaseConfig,
+}
+
+/// Lease 模式配置
+/// - "range" (方案 D，默认): Volume Server 管理 per-stripe range lease
+/// - "inode"  (方案 A):       Filer 管理 per-inode metadata lease
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseConfig {
+    /// Lease 模式: "range" 或 "inode"
+    #[serde(default = "default_lease_mode")]
+    pub mode: String,
+    /// Lease 有效期 (毫秒)
+    #[serde(default = "default_lease_duration_ms")]
+    pub lease_duration_ms: u64,
+    /// 续租间隔 (毫秒)
+    #[serde(default = "default_renew_interval_ms")]
+    pub renew_interval_ms: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_lease_mode(),
+            lease_duration_ms: default_lease_duration_ms(),
+            renew_interval_ms: default_renew_interval_ms(),
+        }
+    }
+}
+
+fn default_lease_mode() -> String {
+    "range".to_string()
+}
+
+fn default_lease_duration_ms() -> u64 {
+    30000
+}
+
+fn default_renew_interval_ms() -> u64 {
+    10000
 }
 
 /// Monitor 服务配置 - 所有地址必须显式配置
@@ -371,6 +418,25 @@ impl PowerFsConfig {
             ));
         }
 
+        // === Lease 模式校验 ===
+        let mode = &self.fuse.lease.mode;
+        if mode != "range" && mode != "inode" {
+            return Err(ConfigError::ValidationError(format!(
+                "fuse.lease.mode must be 'range' or 'inode', got '{}'",
+                mode
+            )));
+        }
+        if self.fuse.lease.lease_duration_ms == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.lease.lease_duration_ms must be > 0".to_string(),
+            ));
+        }
+        if self.fuse.lease.renew_interval_ms == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.lease.renew_interval_ms must be > 0".to_string(),
+            ));
+        }
+
         // === Monitor 校验 ===
         if self.monitor.addr.is_empty() {
             return Err(ConfigError::ValidationError(
@@ -422,6 +488,7 @@ master_net_port = 9334   # Master的powerfs-net端口 (必填, 用于TLV心跳)
 node_id = "volume-server-1"
 max_volume_size = 10737418240
 initial_volume_count = 4
+lease_enabled = true          # Volume Server 是否支持 range lease (NVMe-oF target 设为 false)
 
 [filer]
 port = 8888              # HTTP端口 (必填)
@@ -456,6 +523,11 @@ replication = "000"
 threads = 8
 verbose = false
 container = false
+
+[fuse.lease]
+mode = "range"               # "range" (方案D, 默认) 或 "inode" (方案A, NVMe-oF target)
+lease_duration_ms = 30000    # lease 有效期 30s
+renew_interval_ms = 10000    # 续租间隔 10s
 
 [monitor]
 addr = "0.0.0.0:8081"                      # (必填) 监听地址
@@ -493,4 +565,8 @@ impl std::error::Error for ConfigError {}
 
 fn default_initial_volume_count() -> u32 {
     4
+}
+
+fn default_true() -> bool {
+    true
 }
