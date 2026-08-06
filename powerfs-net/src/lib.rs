@@ -21,6 +21,7 @@ pub mod client;
 pub mod client_conn;
 pub mod client_pool;
 pub mod errors;
+pub mod flow_control;
 pub mod io_loop;
 pub mod middleware;
 pub mod protocol;
@@ -44,6 +45,10 @@ pub use client_conn::{
 };
 pub use client_pool::{ClientConnPool, ClientPoolConfig, ServerEndpoint};
 pub use errors::{NetError, NetResult};
+pub use flow_control::{
+    Channel, ConnStats, ConnStatsSnapshot, FlowController, GlobalStats, GlobalStatsSnapshot,
+    SlowConnTracker, SlowConnTrackerConfig, SlowStateChange,
+};
 pub use io_loop::IoLoop;
 pub use middleware::{
     FnHandler, LoggingMiddleware, MetricsMiddleware, Middleware, NextHandler, PipelineBuilder,
