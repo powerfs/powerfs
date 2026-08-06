@@ -813,6 +813,11 @@ pub struct RaftGroupManager {
     message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
     apply_tx: mpsc::Sender<ApplyEntry>,
     peers: RwLock<HashMap<u64, Peer>>,
+    // Persistent TLV connections for Raft message transport (per peer addr).
+    // Replaces call_once (which created a new TCP connection per message).
+    // Key = peer net_address ("ip:net_port"). Each peer has its own Mutex
+    // so messages to different peers can be sent concurrently.
+    peer_conns: tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<powerfs_net::NetRpcClient>>>>,
 }
 
 impl RaftGroupManager {
@@ -832,6 +837,7 @@ impl RaftGroupManager {
             message_tx,
             apply_tx,
             peers: RwLock::new(HashMap::new()),
+            peer_conns: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -859,10 +865,9 @@ impl RaftGroupManager {
     /// Send a Raft message to a peer via TLV (MsgType::RaftMessage).
     ///
     /// Replaces the gRPC FilerMetaService::send_raft_message RPC.
-    /// Uses the unified `powerfs_net::call_once` transport (Layer A):
-    /// connect → handshake → send TLV frame → read response.
-    /// Each message is independent — no channel caching needed because
-    /// Raft messages are low-frequency.
+    /// Uses persistent `NetRpcClient` connections (one per peer addr) with
+    /// auto-reconnect, replacing the former `call_once` which created a new
+    /// TCP connection per message.
     async fn send_raft_message_to_peer(
         &self,
         peer_net_addr: &str,
@@ -882,18 +887,70 @@ impl RaftGroupManager {
         let _ = enc.add_bytes(FieldId::RaftPayload, &payload);
         let body = enc.into_bytes();
 
-        let client_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
-        match powerfs_net::call_once(
-            peer_net_addr,
-            powerfs_net::ClientType::Filer,
-            client_id,
-            powerfs_net::MsgType::RaftMessage,
-            &body,
-        )
-        .await
+        // Use stable client_id (node_id) so the server can track the
+        // connection across reconnects. channel=DATA (Raft is inter-service
+        // control, not lease/meta).
+        let client_id = self.node_id;
+
+        // Get or create persistent connection for this peer addr.
+        // The global lock is only held briefly to look up / insert the
+        // per-peer Arc<Mutex<NetRpcClient>>. The actual send happens under
+        // the per-peer mutex, so different peers can send concurrently.
+        let conn_arc = {
+            let conns = self.peer_conns.lock().await;
+            conns.get(peer_net_addr).cloned()
+        };
+
+        let conn_arc = if let Some(arc) = conn_arc {
+            arc
+        } else {
+            // No existing connection — create one (NOT holding the global lock
+            // to avoid blocking other peers during this peer's connect).
+            match powerfs_net::NetRpcClient::connect(
+                peer_net_addr,
+                powerfs_net::ClientType::Filer,
+                client_id,
+                powerfs_net::CHANNEL_DATA,
+            )
+            .await
+            {
+                Ok(client) => {
+                    let arc = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+                    // Re-check: another task may have inserted a connection
+                    // while we were connecting. If so, use the existing one
+                    // and drop ours (prevents duplicate connections with the
+                    // same client_id, which causes server-side registry races).
+                    let mut conns = self.peer_conns.lock().await;
+                    if let Some(existing) = conns.get(peer_net_addr) {
+                        log::debug!(
+                            "FILER_RAFT: duplicate connection to {} discarded (race won by another task)",
+                            peer_net_addr
+                        );
+                        existing.clone()
+                    } else {
+                        info!(
+                            "FILER_RAFT: established persistent connection to {}",
+                            peer_net_addr
+                        );
+                        conns.insert(peer_net_addr.to_string(), arc.clone());
+                        arc
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "FILER_RAFT: failed to connect to {}: {}",
+                        peer_net_addr, e
+                    );
+                    return;
+                }
+            }
+        };
+
+        // Send via persistent connection with auto-reconnect.
+        let mut conn = conn_arc.lock().await;
+        match conn
+            .call_with_retry(powerfs_net::MsgType::RaftMessage, &body)
+            .await
         {
             Ok(reply) if reply.is_ok() => {
                 debug!(

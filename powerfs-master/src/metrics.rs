@@ -1,6 +1,10 @@
-use axum::{routing::get, Router, Server};
+use axum::extract::Query;
+use axum::response::IntoResponse;
+use axum::{routing::get, Json, Router, Server};
 use log::{error, info};
 use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
+use serde_json::json;
+use std::collections::HashMap;
 
 lazy_static::lazy_static! {
     pub static ref RAFT_TERM: Gauge = register_gauge!(
@@ -45,7 +49,12 @@ lazy_static::lazy_static! {
 }
 
 pub async fn start_metrics_server(addr: &str) -> Result<(), String> {
-    let app = Router::new().route("/metrics", get(metrics_handler));
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route(
+            "/admin/log-level",
+            get(get_log_level_handler).put(set_log_level_handler),
+        );
 
     let addr = addr
         .parse()
@@ -68,4 +77,38 @@ async fn metrics_handler() -> String {
     let metrics = prometheus::gather();
     encoder.encode(&metrics, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
+}
+
+// ===== Dynamic log level control =====
+
+async fn get_log_level_handler() -> Json<serde_json::Value> {
+    Json(json!({ "level": powerfs_common::dynamic_log::get_log_level() }))
+}
+
+async fn set_log_level_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let level = match params.get("level") {
+        Some(l) => l.as_str(),
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'level' query parameter" })),
+            )
+        }
+    };
+    let prev = powerfs_common::dynamic_log::get_log_level().to_string();
+    match powerfs_common::dynamic_log::set_log_level(level) {
+        Ok(()) => {
+            info!("log level changed via HTTP: {} -> {}", prev, level);
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "level": level, "prev": prev })),
+            )
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e })),
+        ),
+    }
 }

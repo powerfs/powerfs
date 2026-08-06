@@ -185,6 +185,7 @@ mod tests {
             id,
             "127.0.0.1:1234".parse().unwrap(),
             ClientType::Kernel,
+            crate::protocol::CHANNEL_DATA,
             tx,
         )
     }

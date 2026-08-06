@@ -228,6 +228,7 @@ impl MasterClient {
             master_addr,
             powerfs_net::ClientType::Volume,
             client_id,
+            powerfs_net::CHANNEL_DATA,
             powerfs_net::MsgType::Heartbeat,
             &body,
         )

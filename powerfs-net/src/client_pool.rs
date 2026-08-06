@@ -34,7 +34,7 @@ use tokio::time::interval;
 
 use crate::client::{ClientConfig, NotificationHandler, PowerFsNetClient};
 use crate::errors::NetResult;
-use crate::protocol::{ClientType, NetMessage};
+use crate::protocol::{ ClientType, NetMessage, CHANNEL_DATA, CHANNEL_META};
 
 /// Describes a server endpoint to connect to.
 ///
@@ -85,6 +85,26 @@ impl ServerEndpoint {
 impl std::fmt::Display for ServerEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{} ({:?})", self.addr, self.port, self.service_type)
+    }
+}
+
+/// Build the DashMap key for a connection.
+///
+/// Format: `"addr:port#channel"` — the `#` separator avoids ambiguity with
+/// IPv6 addresses (which contain `:`). The `channel` suffix distinguishes
+/// the data TCP connection from the meta TCP connection for the same
+/// `addr:port`, mirroring the kernel-side
+/// `POWERFS_NET_SERVER_VOLUME` / `POWERFS_NET_SERVER_VOLUME_META` split.
+fn make_pool_key(addr: &str, port: u16, channel: u8) -> String {
+    format!("{}:{}#{}", addr, port, channel)
+}
+
+/// Human-readable label for a channel value (for logging).
+fn channel_label(channel: u8) -> &'static str {
+    if channel == CHANNEL_META {
+        "meta"
+    } else {
+        "data"
     }
 }
 
@@ -145,6 +165,12 @@ impl NotificationHandler for SharedNotificationHandler {
 pub struct ClientConnPool {
     /// Connections keyed by `"addr:port"`.
     connections: DashMap<String, Arc<PowerFsNetClient>>,
+    /// Per-key mutexes to prevent concurrent connection creation for the same
+    /// `addr:port:channel` key. Without this, multiple threads calling
+    /// `get_or_connect` simultaneously (e.g. at FUSE startup when data/lease/
+    /// mgmt processors all start at once) create duplicate TCP connections
+    /// with the same `client_id`, causing server-side ConnRegistry collisions.
+    per_key_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// FUSE client ID (shared across all connections).
     client_id: u64,
     /// Pool configuration.
@@ -170,6 +196,7 @@ impl ClientConnPool {
     ) -> Self {
         Self {
             connections: DashMap::new(),
+            per_key_locks: DashMap::new(),
             client_id,
             config,
             notification_handler: parking_lot::RwLock::new(notification_handler),
@@ -179,23 +206,77 @@ impl ClientConnPool {
 
     /// Get an existing connection or create a new one.
     ///
-    /// If a connection to `addr:port` already exists and is connected, it is
-    /// reused. Otherwise a new `PowerFsNetClient` is created, connected, and
-    /// stored in the pool.
-    pub async fn get_or_connect(&self, addr: &str, port: u16) -> NetResult<Arc<PowerFsNetClient>> {
-        let key = format!("{}:{}", addr, port);
+    /// If a connection to `addr:port` with the given `channel` already exists
+    /// and is connected, it is reused. Otherwise a new `PowerFsNetClient` is
+    /// created, connected, and stored in the pool.
+    ///
+    /// `channel` selects the physical TCP connection:
+    /// - [`CHANNEL_DATA`] (0): data path (write/read needle, large frames)
+    /// - [`CHANNEL_META`] (1): meta path (lease acquire/renew/release, small frames)
+    ///
+    /// Same `addr:port` with different `channel` values produce independent
+    /// TCP connections, physically isolating large data frames from small
+    /// lease requests. This mirrors the kernel-side
+    /// `POWERFS_NET_SERVER_VOLUME` / `POWERFS_NET_SERVER_VOLUME_META` split.
+    pub async fn get_or_connect(
+        &self,
+        addr: &str,
+        port: u16,
+        channel: u8,
+    ) -> NetResult<Arc<PowerFsNetClient>> {
+        let key = make_pool_key(addr, port, channel);
 
         // Fast path: reuse existing connected client.
         if let Some(entry) = self.connections.get(&key) {
             if entry.is_connected() {
+                debug!(
+                    "ClientConnPool: reuse existing connection {} (channel={})",
+                    key,
+                    channel_label(channel)
+                );
                 return Ok(entry.clone());
             }
             // Stale connection — drop the reference and create a new one below.
+            debug!(
+                "ClientConnPool: stale connection {} (channel={}), creating new",
+                key,
+                channel_label(channel)
+            );
             drop(entry);
         }
 
-        // Slow path: create new connection.
-        self.create_connection(addr, port, &key).await
+        // Slow path: acquire per-key lock to prevent concurrent connection
+        // creation. Without this, multiple threads (e.g. FUSE startup with
+        // data/lease/mgmt processors) create duplicate TCP connections with
+        // the same client_id, causing server-side ConnRegistry collisions.
+        let key_lock = self
+            .per_key_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = key_lock.lock().await;
+
+        // Double-check after acquiring lock: another task may have created
+        // the connection while we were waiting for the lock.
+        if let Some(entry) = self.connections.get(&key) {
+            if entry.is_connected() {
+                debug!(
+                    "ClientConnPool: reuse connection {} created by another task (channel={})",
+                    key,
+                    channel_label(channel)
+                );
+                return Ok(entry.clone());
+            }
+            drop(entry);
+        }
+
+        debug!(
+            "ClientConnPool: slow path creating connection {} (channel={}, client_id={})",
+            key,
+            channel_label(channel),
+            self.client_id
+        );
+        self.create_connection(addr, port, channel, &key).await
     }
 
     /// Get an existing connection or create a new one via `ServerEndpoint`.
@@ -203,7 +284,8 @@ impl ClientConnPool {
         &self,
         endpoint: &ServerEndpoint,
     ) -> NetResult<Arc<PowerFsNetClient>> {
-        self.get_or_connect(&endpoint.addr, endpoint.port).await
+        self.get_or_connect(&endpoint.addr, endpoint.port, CHANNEL_DATA)
+            .await
     }
 
     /// Get an existing connection or create a new one from an `"addr:port"` string.
@@ -211,20 +293,52 @@ impl ClientConnPool {
     /// Convenience method matching the existing `DashMap<String, ...>` usage
     /// pattern in MetaShardClient / VolumeClient. If the string lacks a port
     /// (no `:`), port 9334 is assumed.
+    ///
+    /// Uses [`CHANNEL_DATA`] (data path). For lease requests, use
+    /// [`get_or_connect_addr_channel`] with [`CHANNEL_META`].
     pub async fn get_or_connect_addr(&self, addr_port: &str) -> NetResult<Arc<PowerFsNetClient>> {
+        self.get_or_connect_addr_channel(addr_port, CHANNEL_DATA)
+            .await
+    }
+
+    /// Same as [`get_or_connect_addr`] but allows selecting the channel.
+    ///
+    /// Use [`CHANNEL_META`] for lease requests (acquire/renew/release) to
+    /// avoid being blocked by large data frames on the data connection.
+    pub async fn get_or_connect_addr_channel(
+        &self,
+        addr_port: &str,
+        channel: u8,
+    ) -> NetResult<Arc<PowerFsNetClient>> {
         let (addr, port) = match addr_port.rsplit_once(':') {
             Some((h, p)) => (h, p.parse::<u16>().unwrap_or(9334)),
             None => (addr_port, 9334),
         };
-        self.get_or_connect(addr, port).await
+        self.get_or_connect(addr, port, channel).await
     }
 
     /// Peek at an existing connection without creating a new one.
     ///
     /// Returns `None` if no connection exists or it is not connected.
     /// Useful for checking connection state without triggering a connect.
+    ///
+    /// Uses [`CHANNEL_DATA`]. For other channels use [`get_if_connected_channel`].
     pub fn get_if_connected(&self, addr_port: &str) -> Option<Arc<PowerFsNetClient>> {
-        let entry = self.connections.get(addr_port)?;
+        self.get_if_connected_channel(addr_port, CHANNEL_DATA)
+    }
+
+    /// Same as [`get_if_connected`] but allows selecting the channel.
+    pub fn get_if_connected_channel(
+        &self,
+        addr_port: &str,
+        channel: u8,
+    ) -> Option<Arc<PowerFsNetClient>> {
+        let (addr, port) = match addr_port.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().unwrap_or(9334)),
+            None => (addr_port, 9334),
+        };
+        let key = make_pool_key(addr, port, channel);
+        let entry = self.connections.get(&key)?;
         if entry.is_connected() {
             Some(entry.clone())
         } else {
@@ -237,13 +351,19 @@ impl ClientConnPool {
         &self,
         addr: &str,
         port: u16,
+        channel: u8,
         key: &str,
     ) -> NetResult<Arc<PowerFsNetClient>> {
+        debug!(
+            "ClientConnPool: create_connection addr={}:{}, channel={}, client_id={}, key={}",
+            addr, port, channel_label(channel), self.client_id, key
+        );
         let config = ClientConfig {
             addr: addr.to_string(),
             port,
             client_id: self.client_id,
             client_type: ClientType::Fuse,
+            channel,
             connect_timeout: self.config.connect_timeout,
             request_timeout: self.config.request_timeout,
             max_retries: self.config.max_retries,
@@ -265,16 +385,29 @@ impl ClientConnPool {
         // Store in pool (replacing any stale entry).
         self.connections.insert(key.to_string(), client.clone());
 
-        info!("ClientConnPool: connected to {}", key);
+        info!(
+            "ClientConnPool: connected to {} (channel={}, client_id={})",
+            key,
+            channel_label(channel),
+            self.client_id
+        );
         Ok(client)
     }
 
     /// Remove a connection from the pool (e.g. permanently failed server).
+    ///
+    /// Removes both data and meta connections for the given `addr:port`.
     pub async fn remove(&self, addr: &str, port: u16) {
-        let key = format!("{}:{}", addr, port);
-        if let Some((_, client)) = self.connections.remove(&key) {
-            info!("ClientConnPool: removed connection to {}", key);
-            let _ = client.disconnect().await;
+        for channel in [CHANNEL_DATA, CHANNEL_META] {
+            let key = make_pool_key(addr, port, channel);
+            if let Some((_, client)) = self.connections.remove(&key) {
+                info!(
+                    "ClientConnPool: removed connection {} (channel={})",
+                    key,
+                    channel_label(channel)
+                );
+                let _ = client.disconnect().await;
+            }
         }
     }
 
@@ -511,7 +644,7 @@ mod tests {
     async fn test_pool_get_or_connect_failure() {
         // Connecting to an unreachable port should return an error, not panic.
         let pool = ClientConnPool::new(1, ClientPoolConfig::default(), None);
-        let result = pool.get_or_connect("127.0.0.1", 1).await;
+        let result = pool.get_or_connect("127.0.0.1", 1, CHANNEL_DATA).await;
         assert!(result.is_err());
         // The failed connection should not be stored in the pool.
         assert!(pool.is_empty());

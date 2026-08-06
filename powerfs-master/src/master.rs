@@ -2813,67 +2813,103 @@ impl MasterNode {
         }
 
         // Start Raft message forwarder (TLV transport, replaces gRPC RaftService)
+        //
+        // Uses NetRpcClient persistent connections (one per peer) instead of
+        // call_once (which created a new TCP connection per message). Raft
+        // heartbeats are frequent (~100ms), so connection reuse is critical.
         let message_rx = self.message_tx.subscribe();
         let raft_peers = self.peers.clone();
         let my_raft_id = self.raft_id;
 
         tokio::spawn(async move {
             let mut message_rx = message_rx;
+            // Persistent connections: peer_id → NetRpcClient
+            let mut peer_conns: std::collections::HashMap<u64, powerfs_net::NetRpcClient> =
+                std::collections::HashMap::new();
 
             info!(
-                "RAFT_DEBUG: Raft message forwarder (TLV) started for node {}",
+                "RAFT_DEBUG: Raft message forwarder (TLV persistent) started for node {}",
                 my_raft_id
             );
 
             while let Ok(msg) = message_rx.recv().await {
                 // Find the peer net address for this message
-                if let Some(peer) = raft_peers.iter().find(|p| p.id == msg.to_id) {
-                    debug!(
-                        "RAFT_DEBUG: forwarding message to peer {} at {} (TLV)",
-                        msg.to_id, peer.net_address
-                    );
-                    // Build TLV body: ShardId=0 (Master single-group) + RaftPayload.
-                    // Transport (connect/handshake/frame/read) is handled by call_once.
-                    let mut enc = TlvEncoder::new();
-                    let _ = enc.add_u64(FieldId::ShardId, 0);
-                    let _ = enc.add_bytes(FieldId::RaftPayload, &msg.message);
-                    let body = enc.into_bytes();
+                let peer = match raft_peers.iter().find(|p| p.id == msg.to_id) {
+                    Some(p) => p,
+                    None => {
+                        warn!("RAFT_DEBUG: no peer found for id {}", msg.to_id);
+                        continue;
+                    }
+                };
 
-                    let client_id = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(1);
-                    match powerfs_net::call_once(
-                        &peer.net_address,
-                        powerfs_net::ClientType::Master,
-                        client_id,
-                        powerfs_net::MsgType::RaftMessage,
-                        &body,
-                    )
-                    .await
-                    {
-                        Ok(reply) if reply.is_ok() => {}
-                        Ok(reply) => {
-                            warn!(
-                                "RAFT_DEBUG: peer {} returned status={:#06x}: {}",
-                                peer.net_address,
-                                reply.status,
-                                reply.body_str()
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "RAFT_DEBUG: failed to send TLV message to {}: {}",
-                                peer.net_address, e
-                            );
+                debug!(
+                    "RAFT_DEBUG: forwarding message to peer {} at {} (TLV persistent)",
+                    msg.to_id, peer.net_address
+                );
+
+                // Build TLV body: ShardId=0 (Master single-group) + RaftPayload.
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u64(FieldId::ShardId, 0);
+                let _ = enc.add_bytes(FieldId::RaftPayload, &msg.message);
+                let body = enc.into_bytes();
+
+                // Get or create persistent connection for this peer.
+                // client_id is stable per node (derived from raft_id) so the
+                // server can track the connection across reconnects.
+                let client_id = my_raft_id;
+                let entry = match peer_conns.entry(msg.to_id) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        match powerfs_net::NetRpcClient::connect(
+                            &peer.net_address,
+                            powerfs_net::ClientType::Master,
+                            client_id,
+                            powerfs_net::CHANNEL_DATA,
+                        )
+                        .await
+                        {
+                            Ok(client) => {
+                                info!(
+                                    "RAFT_DEBUG: established persistent connection to peer {} at {}",
+                                    msg.to_id, peer.net_address
+                                );
+                                e.insert(client)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "RAFT_DEBUG: failed to connect to peer {} at {}: {}",
+                                    msg.to_id, peer.net_address, e
+                                );
+                                continue;
+                            }
                         }
                     }
-                } else {
-                    warn!("RAFT_DEBUG: no peer found for id {}", msg.to_id);
+                };
+
+                // Send via persistent connection with auto-reconnect.
+                match entry
+                    .call_with_retry(powerfs_net::MsgType::RaftMessage, &body)
+                    .await
+                {
+                    Ok(reply) if reply.is_ok() => {}
+                    Ok(reply) => {
+                        warn!(
+                            "RAFT_DEBUG: peer {} returned status={:#06x}: {}",
+                            peer.net_address,
+                            reply.status,
+                            reply.body_str()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "RAFT_DEBUG: failed to send TLV message to {}: {}",
+                            peer.net_address, e
+                        );
+                    }
                 }
             }
 
-            info!("RAFT_DEBUG: Raft message forwarder (TLV) stopped");
+            info!("RAFT_DEBUG: Raft message forwarder (TLV persistent) stopped");
         });
 
         // Keep the master running

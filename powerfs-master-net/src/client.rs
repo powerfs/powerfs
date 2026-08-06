@@ -351,6 +351,7 @@ impl TlvMasterClient {
             port,
             client_id: 0,
             client_type: config.client_type,
+            channel: powerfs_net::protocol::CHANNEL_DATA,
             connect_timeout: config.connect_timeout,
             request_timeout: config.request_timeout,
             max_retries: 1, // TlvMasterClient handles retries itself

@@ -91,6 +91,12 @@ impl CircuitBreaker {
         inner.state
     }
 
+    /// 获取当前连续失败次数 (用于调试日志)
+    pub fn failure_count(&self) -> u32 {
+        let inner = self.state.lock().unwrap();
+        inner.failure_count
+    }
+
     /// 检查是否允许请求通过
     pub fn is_available(&self) -> bool {
         let mut inner = self.state.lock().unwrap();
@@ -275,7 +281,15 @@ impl CircuitBreakerPool {
 
     /// Record a failure for the given server address.
     pub fn record_failure(&self, addr: &str) {
-        self.get_or_create(addr).record_failure();
+        let cb = self.get_or_create(addr);
+        let count = cb.failure_count();
+        log::info!(
+            "CircuitBreaker: record_failure addr={} failure_count={}/{}",
+            addr,
+            count + 1,
+            self.default_config.failure_threshold
+        );
+        cb.record_failure();
     }
 
     /// Get the current circuit state for the given server.

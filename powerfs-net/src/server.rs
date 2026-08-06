@@ -446,7 +446,7 @@ impl PowerFsNetServer {
 
         // handshake 需要读写 stream, 完成后返回 stream + client_id
         let peer = addr;
-        let (stream, client_id, client_type) =
+        let (stream, client_id, client_type, channel) =
             match Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -463,7 +463,7 @@ impl PowerFsNetServer {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // 创建 ClientConn
-        let conn = ClientConn::new(client_id, peer, client_type, outbound_tx);
+        let conn = ClientConn::new(client_id, peer, client_type, channel, outbound_tx);
 
         // 注册到 ConnRegistry (单一数据源: 状态/lease/统计/通知都在 ClientConn 中)
         registry.register(conn.clone()).await;
@@ -522,13 +522,13 @@ impl PowerFsNetServer {
     // Handshake
     // ========================================================================
 
-    /// Handle handshake and return the stream along with (client_id, client_type)
+    /// Handle handshake and return the stream along with (client_id, client_type, channel)
     async fn handle_handshake(
         mut stream: TcpStream,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
         peer_addr: SocketAddr,
-    ) -> NetResult<(TcpStream, u64, ClientType)> {
+    ) -> NetResult<(TcpStream, u64, ClientType, u8)> {
         let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
         stream.read_exact(&mut req_buf).await?;
 
@@ -542,9 +542,12 @@ impl PowerFsNetServer {
         let client_type = ClientType::from_u8(req.client_type)
             .ok_or_else(|| NetError::Protocol("unknown client type".into()))?;
 
+        let channel = req.channel;
+        let ch_str = if channel == crate::protocol::CHANNEL_META { "meta" } else { "data" };
+
         info!(
-            "Handshake: client_id={} client_type={:?} addr={}",
-            req.client_id, client_type, peer_addr
+            "Handshake: client_id={} client_type={:?} channel={} addr={}",
+            req.client_id, client_type, ch_str, peer_addr
         );
 
         // Send handshake response
@@ -559,7 +562,7 @@ impl PowerFsNetServer {
         // Notify handler — done by caller
         let _ = (handler, manager); // suppress unused warnings
 
-        Ok((stream, client_id, client_type))
+        Ok((stream, client_id, client_type, channel))
     }
 
     // ========================================================================

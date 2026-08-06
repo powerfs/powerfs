@@ -22,7 +22,7 @@
 
 use crate::protocol::{ClientType, NetMessage};
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -184,6 +184,10 @@ pub struct ClientConn {
     pub addr: SocketAddr,
     /// 客户端类型 (Fuse/Kernel/Admin)
     pub client_type: ClientType,
+    /// 通路类型: 0=data, 1=meta (握手登记, 收帧校验)
+    pub channel: u8,
+    /// route_hash (握手时从 client_id 计算, 收帧校验防错乱)
+    pub route_hash: u8,
 
     /// 连接状态
     pub state: RwLock<ConnState>,
@@ -206,19 +210,29 @@ pub struct ClientConn {
     pub close_handle: RwLock<Option<CloseHandle>>,
 }
 
+/// 计算 route_hash: 复用 `protocol::calc_route_hash` (与内核 pfs_route_hash 一一致).
+/// 服务端收帧时校验 route_hash 是否匹配本连接, 防止帧串到错误连接.
+fn calc_route_hash(client_id: u64, channel: u8) -> u8 {
+    crate::protocol::calc_route_hash(client_id, channel)
+}
+
 impl ClientConn {
     pub fn new(
         id: u64,
         addr: SocketAddr,
         client_type: ClientType,
+        channel: u8,
         outbound_tx: OutboundTx,
     ) -> Arc<Self> {
         let now = Instant::now();
+        let route_hash = calc_route_hash(id, channel);
         Arc::new(Self {
             id,
             holder_uuid: RwLock::new(None),
             addr,
             client_type,
+            channel,
+            route_hash,
             state: RwLock::new(ConnState::Active),
             policy: RwLock::new(ClientPolicy::default()),
             stats: RwLock::new(ClientStats {
@@ -331,9 +345,13 @@ pub struct ClientConnInfo {
 ///
 /// 线程安全, 使用 DashMap 支持高并发读写.
 /// 提供: register / unregister / get / disconnect / set_config / list
+///
+/// 双通道支持: 同一 client_id 可有 data(0) 和 meta(1) 两个通道连接,
+/// 内部按 (client_id, channel) 二级索引存储, 避免通道间互相覆盖.
 pub struct ConnRegistry {
-    /// client_id → ClientConn
-    conns: DashMap<u64, Arc<ClientConn>>,
+    /// client_id → (channel → ClientConn)
+    /// 双通道: data(CHANNEL_DATA=0) + meta(CHANNEL_META=1) 独立存储
+    conns: DashMap<u64, HashMap<u8, Arc<ClientConn>>>,
     /// holder_uuid → client_id (lease 校验时用)
     by_holder: DashMap<String, u64>,
 }
@@ -346,29 +364,115 @@ impl ConnRegistry {
         }
     }
 
-    /// 注册新连接
+    /// 注册新连接 (按 channel 独立存储)
+    ///
+    /// 同一 client_id 的 data 和 meta 通道连接分别存储,
+    /// 互不覆盖. 重复注册同 channel 的连接会覆盖旧连接
+    /// (重连场景: 新连接替换旧连接).
     pub async fn register(&self, conn: Arc<ClientConn>) {
         let id = conn.id;
+        let channel = conn.channel;
         if let Some(holder) = conn.holder_uuid.read().await.as_ref() {
             self.by_holder.insert(holder.clone(), id);
         }
-        self.conns.insert(id, conn);
+        // 按 (client_id, channel) 存储, 两个通道互不干扰
+        let mut entry = self.conns.entry(id).or_insert_with(HashMap::new);
+        if entry.insert(channel, conn.clone()).is_some() {
+            log::debug!(
+                "ConnRegistry: register replaced old conn for client_id={} channel={} (reconnect)",
+                id,
+                channel
+            );
+            // 旧连接的 holder 不清除 (by_holder 按 client_id 索引, 新连接已覆盖)
+        } else {
+            log::debug!(
+                "ConnRegistry: register new conn client_id={} channel={}",
+                id,
+                channel
+            );
+        }
     }
 
     /// 注销连接 (断连时调用)
     ///
+    /// 按 (client_id, channel) 精确移除, 不影响同 client_id 的其他通道.
+    /// 当 client_id 的所有通道都注销后, 清理 by_holder 索引.
+    ///
+    /// `check_conn` 用于身份校验: 当客户端重连后, 旧连接的 cleanup 可能
+    /// 误删新连接 (同 channel). 传入 Some(&conn) 可确保只移除指定连接.
+    ///
     /// 返回被移除的 ClientConn (供 on_disconnect 清理 lease)
-    pub async fn unregister(&self, id: u64) -> Option<Arc<ClientConn>> {
-        let conn = self.conns.remove(&id).map(|(_, c)| c)?;
-        if let Some(holder) = conn.holder_uuid.read().await.as_ref() {
-            self.by_holder.remove(holder);
+    pub async fn unregister(
+        &self,
+        id: u64,
+        check_conn: Option<&Arc<ClientConn>>,
+    ) -> Option<Arc<ClientConn>> {
+        let channel = check_conn.map(|c| c.channel);
+
+        // 身份校验 + 精确移除
+        let removed = {
+            let mut entry = self.conns.get_mut(&id)?;
+            let inner = entry.value_mut();
+            // 如果有 check_conn, 校验同一 channel 的连接是否是同一个
+            if let (Some(check), Some(ch)) = (check_conn, channel) {
+                if let Some(existing) = inner.get(&ch) {
+                    if !Arc::ptr_eq(existing, check) {
+                        // 不同连接 (client 重连后旧连接 cleanup 误触),
+                        // 不移除新连接
+                        return None;
+                    }
+                }
+            }
+            // 按 channel 移除 (如果有 channel 信息), 否则移除第一个
+            if let Some(ch) = channel {
+                inner.remove(&ch)
+            } else {
+                // 向后兼容: 无 channel 信息时移除第一个
+                let key = inner.keys().next().copied();
+                key.and_then(|k| inner.remove(&k))
+            }
+        };
+
+        // 如果该 client_id 的所有通道都已注销, 清理外层 entry 和 holder
+        let should_clean_holder = {
+            if let Some(entry) = self.conns.get(&id) {
+                entry.value().is_empty()
+            } else {
+                true
+            }
+        };
+        if should_clean_holder {
+            self.conns.remove(&id);
         }
-        Some(conn)
+
+        if let Some(ref conn) = removed {
+            if should_clean_holder {
+                if let Some(holder) = conn.holder_uuid.read().await.as_ref() {
+                    self.by_holder.remove(holder);
+                }
+            }
+        }
+
+        removed
     }
 
-    /// 获取连接
+    /// 获取连接 (返回任意通道的连接, 优先 meta 通道)
+    ///
+    /// 用于通知推送等不区分通道的场景. 如需特定通道, 使用 [`get_by_channel`].
     pub fn get(&self, id: u64) -> Option<Arc<ClientConn>> {
-        self.conns.get(&id).map(|r| r.value().clone())
+        let entry = self.conns.get(&id)?;
+        let inner = entry.value();
+        // 优先返回 meta 通道 (通知推送通常走 meta)
+        inner
+            .get(&1)
+            .or_else(|| inner.values().next())
+            .cloned()
+    }
+
+    /// 获取指定通道的连接
+    pub fn get_by_channel(&self, id: u64, channel: u8) -> Option<Arc<ClientConn>> {
+        let entry = self.conns.get(&id)?;
+        entry.value().get(&channel).cloned()
     }
 
     /// 通过 holder UUID 获取连接
@@ -377,48 +481,65 @@ impl ConnRegistry {
         self.get(id)
     }
 
-    /// 主动断开指定连接
+    /// 主动断开指定 client_id 的所有通道连接
     pub async fn disconnect(&self, id: u64) -> bool {
-        if let Some(conn) = self.get(id) {
+        let entry = match self.conns.get(&id) {
+            Some(e) => e,
+            None => return false,
+        };
+        let conns: Vec<Arc<ClientConn>> = entry.value().values().cloned().collect();
+        drop(entry);
+        for conn in conns {
             conn.disconnect().await;
-            true
-        } else {
-            false
         }
+        true
     }
 
-    /// 设置客户端策略
+    /// 设置客户端策略 (应用到所有通道)
     pub async fn set_policy(&self, id: u64, policy: ClientPolicy) -> bool {
-        if let Some(conn) = self.get(id) {
-            *conn.policy.write().await = policy;
-            true
-        } else {
-            false
+        let entry = match self.conns.get(&id) {
+            Some(e) => e,
+            None => return false,
+        };
+        let conns: Vec<Arc<ClientConn>> = entry.value().values().cloned().collect();
+        drop(entry);
+        if conns.is_empty() {
+            return false;
         }
+        for conn in conns {
+            *conn.policy.write().await = policy.clone();
+        }
+        true
     }
 
-    /// 列出所有连接信息 (管理/监控)
+    /// 列出所有连接信息 (管理/监控, 含所有通道)
     pub async fn list(&self) -> Vec<ClientConnInfo> {
         let mut result = Vec::new();
         for entry in self.conns.iter() {
-            let conn = entry.value();
-            let stats = conn.stats.read().await;
-            result.push(ClientConnInfo {
-                id: conn.id,
-                addr: conn.addr,
-                client_type: conn.client_type,
-                state: *conn.state.read().await,
-                holder: conn.holder_uuid.read().await.clone(),
-                request_count: stats.request_count,
-                error_count: stats.error_count,
-            });
+            for conn in entry.value().values() {
+                let stats = conn.stats.read().await;
+                result.push(ClientConnInfo {
+                    id: conn.id,
+                    addr: conn.addr,
+                    client_type: conn.client_type,
+                    state: *conn.state.read().await,
+                    holder: conn.holder_uuid.read().await.clone(),
+                    request_count: stats.request_count,
+                    error_count: stats.error_count,
+                });
+            }
         }
         result
     }
 
-    /// 活跃连接数
+    /// 活跃客户端数 (按 client_id 计数, 非通道数)
     pub fn count(&self) -> usize {
         self.conns.len()
+    }
+
+    /// 活跃连接数 (含所有通道)
+    pub fn conn_count(&self) -> usize {
+        self.conns.iter().map(|e| e.value().len()).sum()
     }
 
     // ========================================================================
@@ -427,7 +548,7 @@ impl ConnRegistry {
 
     /// 向指定客户端推送通知消息
     ///
-    /// 直接通过 `ClientConn.outbound_tx` 发送，无需中间 channel 转发。
+    /// 优先通过 meta 通道发送 (通知通常走 meta 通道).
     /// 返回 true 表示已排队，false 表示客户端不存在或通道关闭。
     pub fn notify(&self, client_id: u64, msg: &NetMessage) -> bool {
         if let Some(conn) = self.get(client_id) {
@@ -437,14 +558,19 @@ impl ConnRegistry {
         }
     }
 
-    /// 向所有活跃客户端广播通知
+    /// 向所有活跃客户端广播通知 (每客户端仅发一次, 优先 meta 通道)
     ///
     /// 返回成功接收的客户端数量。
     pub fn broadcast(&self, msg: &NetMessage) -> usize {
         let mut count = 0;
         for entry in self.conns.iter() {
-            if entry.value().notify(msg) {
-                count += 1;
+            let inner = entry.value();
+            // 优先 meta 通道, 回退到任意通道
+            let conn = inner.get(&1).or_else(|| inner.values().next());
+            if let Some(conn) = conn {
+                if conn.notify(msg) {
+                    count += 1;
+                }
             }
         }
         count
@@ -454,19 +580,20 @@ impl ConnRegistry {
     // 聚合监控 (替代 ServerConnectionManager 的 metrics/health 方法)
     // ========================================================================
 
-    /// 获取聚合指标快照 (所有连接的统计汇总)
+    /// 获取聚合指标快照 (所有通道连接的统计汇总)
     pub async fn metrics_snapshot(&self) -> ConnMetricsSnapshot {
         let mut snapshot = ConnMetricsSnapshot::default();
         for entry in self.conns.iter() {
-            let conn = entry.value();
-            let stats = conn.stats.read().await;
-            snapshot.total_requests += stats.request_count;
-            snapshot.total_errors += stats.error_count;
-            snapshot.total_bytes_sent += stats.bytes_sent;
-            snapshot.total_bytes_recv += stats.bytes_recv;
-            snapshot.total_sessions += 1;
-            if *conn.state.read().await == ConnState::Active {
-                snapshot.active_sessions += 1;
+            for conn in entry.value().values() {
+                let stats = conn.stats.read().await;
+                snapshot.total_requests += stats.request_count;
+                snapshot.total_errors += stats.error_count;
+                snapshot.total_bytes_sent += stats.bytes_sent;
+                snapshot.total_bytes_recv += stats.bytes_recv;
+                snapshot.total_sessions += 1;
+                if *conn.state.read().await == ConnState::Active {
+                    snapshot.active_sessions += 1;
+                }
             }
         }
         snapshot
@@ -487,7 +614,7 @@ impl ConnRegistry {
         self.conns.iter().map(|e| *e.key()).collect()
     }
 
-    /// 获取指定连接的统计信息
+    /// 获取指定连接的统计信息 (优先 meta 通道)
     pub async fn get_stats(&self, client_id: u64) -> Option<ClientStats> {
         let conn = self.get(client_id)?;
         let stats = conn.stats.read().await;
@@ -530,6 +657,7 @@ mod tests {
             id,
             "127.0.0.1:1234".parse().unwrap(),
             ClientType::Kernel,
+            0,
             tx,
         )
     }
@@ -568,7 +696,7 @@ mod tests {
         assert!(registry.get(1).is_some());
         assert!(registry.get_by_holder("holder-1").is_some());
 
-        let removed = registry.unregister(1).await;
+        let removed = registry.unregister(1, None).await;
         assert!(removed.is_some());
         assert_eq!(registry.count(), 0);
         assert!(registry.get(1).is_none());
@@ -622,5 +750,87 @@ mod tests {
 
         let list = registry.list().await;
         assert_eq!(list.len(), 5);
+    }
+
+    /// 辅助函数: 创建指定 channel 的连接
+    fn make_conn_channel(id: u64, channel: u8) -> Arc<ClientConn> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        ClientConn::new(
+            id,
+            "127.0.0.1:1234".parse().unwrap(),
+            ClientType::Fuse,
+            channel,
+            tx,
+        )
+    }
+
+    /// 双通道场景: 同一 client_id 的 data(0) + meta(1) 通道连接共存,
+    /// 一个通道断连不影响另一个通道.
+    #[tokio::test]
+    async fn test_conn_registry_dual_channel() {
+        let registry = ConnRegistry::new();
+
+        // 注册 data 通道连接
+        let data_conn = make_conn_channel(100, 0);
+        data_conn.set_holder("holder-dual".to_string()).await;
+        registry.register(data_conn.clone()).await;
+
+        // 注册 meta 通道连接 (同一 client_id, 不同 channel)
+        let meta_conn = make_conn_channel(100, 1);
+        registry.register(meta_conn.clone()).await;
+
+        // 两个通道都应可获取
+        assert_eq!(registry.count(), 1); // 1 个 client_id
+        assert_eq!(registry.conn_count(), 2); // 2 个通道连接
+        assert!(registry.get_by_channel(100, 0).is_some()); // data
+        assert!(registry.get_by_channel(100, 1).is_some()); // meta
+        assert!(registry.get(100).is_some()); // 任意通道
+
+        // data 通道断连: 注销 data 通道, meta 通道应不受影响
+        let removed = registry.unregister(100, Some(&data_conn)).await;
+        assert!(removed.is_some());
+        assert_eq!(registry.count(), 1); // client_id 仍存在
+        assert_eq!(registry.conn_count(), 1); // 只剩 1 个通道
+        assert!(registry.get_by_channel(100, 0).is_none()); // data 已注销
+        assert!(registry.get_by_channel(100, 1).is_some()); // meta 仍在
+        assert!(registry.get(100).is_some()); // 仍可获取 (meta)
+
+        // meta 通道断连: 注销 meta 通道, client_id 应完全清除
+        let removed = registry.unregister(100, Some(&meta_conn)).await;
+        assert!(removed.is_some());
+        assert_eq!(registry.count(), 0); // client_id 已清除
+        assert_eq!(registry.conn_count(), 0);
+        assert!(registry.get(100).is_none());
+        assert!(registry.get_by_holder("holder-dual").is_none());
+    }
+
+    /// 重连场景: 同通道新连接替换旧连接
+    #[tokio::test]
+    async fn test_conn_registry_reconnect_same_channel() {
+        let registry = ConnRegistry::new();
+
+        // 注册 meta 通道连接
+        let old_meta = make_conn_channel(200, 1);
+        old_meta.set_holder("holder-reconn".to_string()).await;
+        registry.register(old_meta.clone()).await;
+
+        // 重连: 新 meta 通道连接替换旧连接
+        let new_meta = make_conn_channel(200, 1);
+        registry.register(new_meta.clone()).await;
+
+        // 注册表应只有 1 个通道连接 (新连接替换了旧连接)
+        assert_eq!(registry.conn_count(), 1);
+        let current = registry.get_by_channel(200, 1).unwrap();
+        assert!(Arc::ptr_eq(&current, &new_meta));
+
+        // 旧连接的 unregister 不应影响新连接 (身份校验)
+        let removed = registry.unregister(200, Some(&old_meta)).await;
+        assert!(removed.is_none()); // 旧连接已不在注册表中, 返回 None
+        assert!(registry.get_by_channel(200, 1).is_some()); // 新连接仍在
+
+        // 新连接的 unregister 正常工作
+        let removed = registry.unregister(200, Some(&new_meta)).await;
+        assert!(removed.is_some());
+        assert!(registry.get(200).is_none());
     }
 }

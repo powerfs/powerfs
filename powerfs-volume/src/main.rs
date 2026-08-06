@@ -57,15 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&args.config);
     let volume_cfg = cfg.volume.clone();
 
+    // Initialize env_logger at Debug (max verbosity) so its internal filter never
+    // blocks messages.  The effective level is gated by log::set_max_level()
+    // via powerfs_common::dynamic_log, allowing runtime adjustment via HTTP.
     let log_level = cfg.global.log_level.clone();
     env_logger::Builder::new()
-        .filter_level(match log_level.as_str() {
-            "debug" => log::LevelFilter::Debug,
-            "warn" => log::LevelFilter::Warn,
-            "error" => log::LevelFilter::Error,
-            _ => log::LevelFilter::Info,
-        })
+        .filter_level(log::LevelFilter::Debug)
         .init();
+    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
 
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();

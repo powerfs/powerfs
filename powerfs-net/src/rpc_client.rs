@@ -7,17 +7,17 @@
 //! # Two usage modes
 //!
 //! - **One-shot** ([`call_once`]): opens a fresh short-lived connection per
-//!   call. Suitable for low-frequency RPCs (Raft messages, RegisterFiler).
+//!   call. Suitable for low-frequency RPCs (RegisterFiler, zone queries).
 //!   No state to manage; the caller just gets a reply.
 //! - **Persistent** ([`NetRpcClient`]): keeps the connection open across
-//!   multiple `call()`s. Suitable for high-frequency RPCs (Heartbeat) where
-//!   connection setup cost matters.
+//!   multiple `call()`s. Suitable for high-frequency RPCs (Raft messages,
+//!   Heartbeat) where connection setup cost matters.
 //!
 //! # Wire sequence (both modes)
 //!
 //! 1. TCP connect (with timeout)
-//! 2. powerfs-net handshake (HandshakeRequest → HandshakeResponse)
-//! 3. Send TLV frame (`build_frame` with `FrameFlags::REQUEST`)
+//! 2. powerfs-net handshake (HandshakeRequest with channel → HandshakeResponse)
+//! 3. Send TLV frame (`build_frame_with_route_hash` with `FrameFlags::REQUEST`)
 //! 4. Read response FrameHeader + body
 //!
 //! Redirection (STATUS_ERR_REDIRECT) is NOT handled here — it is a routing
@@ -31,7 +31,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::errors::{NetError, NetResult};
-use crate::protocol::{build_frame, FrameFlags, FrameHeader, HandshakeRequest, HandshakeResponse};
+use crate::protocol::{
+    build_frame_with_route_hash, calc_route_hash, FrameFlags, FrameHeader, HandshakeRequest,
+    HandshakeResponse,
+};
 use crate::{ClientType, MsgType, STATUS_OK};
 
 /// Default timeouts for one-shot RPCs.
@@ -81,8 +84,11 @@ impl Default for RpcOpts {
 /// Perform a one-shot RPC: open a fresh connection, send one request, read
 /// one reply, then drop the connection.
 ///
-/// Suitable for low-frequency calls (Raft messages, RegisterFiler). Each call
+/// Suitable for low-frequency calls (RegisterFiler, zone queries). Each call
 /// is independent; no channel caching is performed.
+///
+/// `channel` selects the physical path (CHANNEL_DATA or CHANNEL_META). For
+/// inter-service RPCs (Master/Filer/Volume), CHANNEL_DATA is the norm.
 ///
 /// The caller supplies a stable `client_id` (used in the handshake) — callers
 /// typically derive it from `SystemTime::now()`.
@@ -90,6 +96,7 @@ pub async fn call_once(
     addr: &str,
     client_type: ClientType,
     client_id: u64,
+    channel: u8,
     msg_type: MsgType,
     body: &[u8],
 ) -> NetResult<RpcReply> {
@@ -97,6 +104,7 @@ pub async fn call_once(
         addr,
         client_type,
         client_id,
+        channel,
         msg_type,
         body,
         RpcOpts::default(),
@@ -109,29 +117,40 @@ pub async fn call_once_with(
     addr: &str,
     client_type: ClientType,
     client_id: u64,
+    channel: u8,
     msg_type: MsgType,
     body: &[u8],
     opts: RpcOpts,
 ) -> NetResult<RpcReply> {
-    let mut conn = RpcConnection::connect(addr, client_type, client_id, &opts).await?;
+    let mut conn = RpcConnection::connect(addr, client_type, client_id, channel, &opts).await?;
     conn.call(msg_type, body, &opts).await
 }
 
 /// Persistent RPC client — keeps the connection open across multiple calls.
 ///
-/// Suitable for high-frequency RPCs (Heartbeat). Acquire via [`NetRpcClient::connect`],
-/// then issue repeated [`NetRpcClient::call`] requests.
+/// Suitable for high-frequency RPCs (Raft messages, Heartbeat). Acquire via
+/// [`NetRpcClient::connect`], then issue repeated [`NetRpcClient::call`]
+/// requests. If the connection breaks, call [`NetRpcClient::reconnect`].
 pub struct NetRpcClient {
     conn: RpcConnection,
     seq: AtomicU32,
     opts: RpcOpts,
+    addr: String,
+    client_type: ClientType,
+    client_id: u64,
+    channel: u8,
 }
 
 impl NetRpcClient {
     /// Connect to `addr` and complete the handshake. The connection is kept
     /// open until the client is dropped or an I/O error occurs.
-    pub async fn connect(addr: &str, client_type: ClientType, client_id: u64) -> NetResult<Self> {
-        Self::connect_with(addr, client_type, client_id, RpcOpts::default()).await
+    pub async fn connect(
+        addr: &str,
+        client_type: ClientType,
+        client_id: u64,
+        channel: u8,
+    ) -> NetResult<Self> {
+        Self::connect_with(addr, client_type, client_id, channel, RpcOpts::default()).await
     }
 
     /// Connect with explicit timeouts.
@@ -139,20 +158,66 @@ impl NetRpcClient {
         addr: &str,
         client_type: ClientType,
         client_id: u64,
+        channel: u8,
         opts: RpcOpts,
     ) -> NetResult<Self> {
-        let conn = RpcConnection::connect(addr, client_type, client_id, &opts).await?;
+        let conn = RpcConnection::connect(addr, client_type, client_id, channel, &opts).await?;
         Ok(Self {
             conn,
             seq: AtomicU32::new(1),
             opts,
+            addr: addr.to_string(),
+            client_type,
+            client_id,
+            channel,
         })
     }
 
+    /// Reconnect after a connection failure. Reuses the stored addr /
+    /// client_type / client_id / channel / opts.
+    pub async fn reconnect(&mut self) -> NetResult<()> {
+        log::info!(
+            "NetRpcClient: reconnecting to {} (client_type={:?}, channel={}, client_id={})",
+            self.addr,
+            self.client_type,
+            self.channel,
+            self.client_id
+        );
+        self.conn =
+            RpcConnection::connect(&self.addr, self.client_type, self.client_id, self.channel, &self.opts)
+                .await?;
+        Ok(())
+    }
+
     /// Send a request on the persistent connection and read the reply.
+    /// On I/O error, the caller should call [`reconnect`](Self::reconnect).
     pub async fn call(&mut self, msg_type: MsgType, body: &[u8]) -> NetResult<RpcReply> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.conn.call_seq(msg_type, body, seq, &self.opts).await
+    }
+
+    /// Like [`call`](Self::call) but auto-reconnects once on failure.
+    /// Suitable for Raft message forwarding where transparent retry is wanted.
+    pub async fn call_with_retry(&mut self, msg_type: MsgType, body: &[u8]) -> NetResult<RpcReply> {
+        match self.call(msg_type, body).await {
+            Ok(reply) => Ok(reply),
+            Err(e) => {
+                log::warn!(
+                    "NetRpcClient: call failed ({}), reconnecting to {}",
+                    e,
+                    self.addr
+                );
+                self.reconnect().await?;
+                self.call(msg_type, body).await
+            }
+        }
+    }
+
+    /// Whether the underlying connection is still usable.
+    pub fn is_connected(&self) -> bool {
+        // RpcConnection doesn't track state; treat existence as connected.
+        // A broken connection will surface as an error on the next call.
+        true
     }
 }
 
@@ -163,6 +228,8 @@ impl NetRpcClient {
 struct RpcConnection {
     writer: tokio::net::tcp::OwnedWriteHalf,
     reader: tokio::net::tcp::OwnedReadHalf,
+    client_id: u64,
+    channel: u8,
 }
 
 impl RpcConnection {
@@ -170,6 +237,7 @@ impl RpcConnection {
         addr: &str,
         client_type: ClientType,
         client_id: u64,
+        channel: u8,
         opts: &RpcOpts,
     ) -> NetResult<Self> {
         // 1. TCP connect with timeout.
@@ -178,10 +246,15 @@ impl RpcConnection {
             .map_err(|_| NetError::Timeout)??;
         let (reader, writer) = stream.into_split();
 
-        let mut conn = Self { reader, writer };
+        let mut conn = Self {
+            reader,
+            writer,
+            client_id,
+            channel,
+        };
 
-        // 2. powerfs-net handshake.
-        conn.handshake(client_type, client_id, opts).await?;
+        // 2. powerfs-net handshake (carries channel for server-side validation).
+        conn.handshake(client_type, client_id, channel, opts).await?;
 
         Ok(conn)
     }
@@ -190,9 +263,10 @@ impl RpcConnection {
         &mut self,
         client_type: ClientType,
         client_id: u64,
+        channel: u8,
         opts: &RpcOpts,
     ) -> NetResult<()> {
-        let hs_req = HandshakeRequest::new(client_type, client_id);
+        let hs_req = HandshakeRequest::new(client_type, client_id, channel);
         let mut hs_buf = vec![0u8; HandshakeRequest::SIZE];
         hs_req.encode(&mut hs_buf);
         self.writer
@@ -215,6 +289,17 @@ impl RpcConnection {
                 "handshake rejected by peer".to_string(),
             ));
         }
+        let ch_str = if channel == crate::protocol::CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
+        log::debug!(
+            "RpcConnection: handshake ok addr client_id={} channel={} route_hash=0x{:02x}",
+            client_id,
+            ch_str,
+            calc_route_hash(client_id, channel)
+        );
         Ok(())
     }
 
@@ -235,13 +320,19 @@ impl RpcConnection {
         seq: u32,
         opts: &RpcOpts,
     ) -> NetResult<RpcReply> {
-        // 3. Build & send TLV request frame.
-        let frame = build_frame(
+        // 3. Build & send TLV request frame with route_hash (client_id + channel).
+        //    Server-side io_loop validates route_hash to detect frames on wrong
+        //    connections. Using build_frame (route_hash=0) would bypass the
+        //    channel check, which is fragile — build_frame_with_route_hash is
+        //    the correct path for all client→server requests.
+        let frame = build_frame_with_route_hash(
             msg_type as u16,
             FrameFlags::new(FrameFlags::REQUEST),
             seq,
             body,
             &[],
+            self.client_id,
+            self.channel,
         );
         self.writer
             .write_all(&frame)
@@ -306,7 +397,15 @@ mod tests {
     #[tokio::test]
     async fn call_once_to_closed_port_fails() {
         // Nothing listens on 127.0.0.1:1 on most CI envs.
-        let res = call_once("127.0.0.1:1", ClientType::Master, 1, MsgType::Ping, &[]).await;
+        let res = call_once(
+            "127.0.0.1:1",
+            ClientType::Master,
+            1,
+            crate::protocol::CHANNEL_DATA,
+            MsgType::Ping,
+            &[],
+        )
+        .await;
         assert!(res.is_err());
     }
 }

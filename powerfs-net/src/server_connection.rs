@@ -208,7 +208,7 @@ impl ServerConnectionManager {
     ///
     /// Delegates to `ConnRegistry::unregister()`.
     pub async fn unregister_session(&self, client_id: u64) {
-        if let Some(conn) = self.registry.unregister(client_id).await {
+        if let Some(conn) = self.registry.unregister(client_id, None).await {
             let stats = conn.stats.read().await;
             log::info!(
                 "[Server] Client disconnected: id={}, duration={}s, requests={}, errors={}",
@@ -483,6 +483,7 @@ mod tests {
             client_id,
             "127.0.0.1:12345".parse().unwrap(),
             ClientType::Fuse,
+            0,
             tx,
         );
         registry.register(conn.clone()).await;
@@ -599,7 +600,7 @@ mod tests {
         // Keep _rx alive so the outbound channel doesn't get dropped,
         // which would cause notify() to return false.
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, tx);
+        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, 0, tx);
         registry.register(conn).await;
         let mgr = ServerConnectionManager::new(registry);
 
@@ -620,6 +621,7 @@ mod tests {
                 i * 10,
                 "127.0.0.1:12345".parse().unwrap(),
                 ClientType::Fuse,
+                0,
                 tx,
             );
             registry.register(conn).await;
@@ -642,6 +644,7 @@ mod tests {
                 i + 1,
                 "127.0.0.1:12345".parse().unwrap(),
                 ClientType::Fuse,
+                0,
                 tx,
             );
             registry.register(conn).await;

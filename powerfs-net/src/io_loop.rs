@@ -7,7 +7,7 @@
 //!   - 解析帧为 NetMessage
 //!   - 封装为 Work 推送到 WorkQueue
 //!   - write_task 消费 outbound_rx, 将响应/通知帧写入 TCP
-//!   - 连接断开时执行清理: registry.unregister + handler.on_disconnect + manager.unregister_session
+//!   - 连接断开时执行清理: registry.unregister (带身份校验) + handler.on_disconnect
 //!
 //! 不处理业务逻辑, 只做 IO 收发 + 断连清理.
 //! 连接按 hash(client_id) % N 分配到 IO Loop.
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::client_conn::{ClientConn, CloseHandle, ConnRegistry, ConnState};
 use crate::errors::{NetError, NetResult};
-use crate::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage, STATUS_OK};
+use crate::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage, PROTOCOL_VERSION, STATUS_OK};
 use crate::server_connection::{NetHandler, ServerConnectionManager};
 use crate::work::Work;
 
@@ -106,7 +106,7 @@ impl IoLoop {
     ///   2. spawn read_task: 读取帧 → 封装 Work → 推送 WorkQueue
     ///   3. 等待任一 task 结束
     ///   4. 标记 conn.state = Closed
-    ///   5. 执行断连清理: registry.unregister + handler.on_disconnect + manager.unregister_session
+    ///   5. 执行断连清理: registry.unregister (带身份校验) + handler.on_disconnect
     #[allow(clippy::too_many_arguments)]
     async fn run_connection(
         conn: Arc<ClientConn>,
@@ -118,8 +118,9 @@ impl IoLoop {
         peer: std::net::SocketAddr,
         registry: Arc<ConnRegistry>,
         handler: Arc<dyn NetHandler>,
-        manager: Option<Arc<ServerConnectionManager>>,
+        manager: Option<Arc<ServerConnectionManager>>, // 目前未使用, 保留以备将来扩展
     ) {
+        let _ = &manager; // 避免未使用变量警告
         // write_task: 独占 write_half, 消费 outbound_rx (响应帧 + 通知帧)
         let write_task = tokio::spawn(async move {
             while let Some(frame) = outbound_rx.recv().await {
@@ -147,6 +148,40 @@ impl IoLoop {
                 // 读取帧
                 match Self::read_frame(&mut read_half).await {
                     Ok(msg) => {
+                        // === P3.10 防错乱校验 (服务端稳定性第一) ===
+                        // 1. protocol_ver 必须匹配 (版本升级一致性检查)
+                        if msg.header.protocol_ver != PROTOCOL_VERSION {
+                            warn!(
+                                "IoLoop: protocol_ver mismatch from {}: got={} expected={}, closing",
+                                peer, msg.header.protocol_ver, PROTOCOL_VERSION
+                            );
+                            read_conn.stats.write().await.error_count += 1;
+                            break;
+                        }
+                        // 2. route_hash channel 位必须匹配连接 channel (防帧串连接)
+                        let frame_channel = msg.header.route_hash & 0x01;
+                        if frame_channel != read_conn.channel {
+                            warn!(
+                                "IoLoop: channel mismatch from {}: frame={} conn={}, closing",
+                                peer, frame_channel, read_conn.channel
+                            );
+                            read_conn.stats.write().await.error_count += 1;
+                            break;
+                        }
+                        // 3. route_hash 高7位校验 (route_hash=0 时跳过, 兼容发现阶段)
+                        if msg.header.route_hash != 0 {
+                            let frame_hash = msg.header.route_hash >> 1;
+                            let conn_hash = read_conn.route_hash >> 1;
+                            if frame_hash != conn_hash {
+                                warn!(
+                                    "IoLoop: route_hash mismatch from {}: frame=0x{:02x} conn=0x{:02x}, closing",
+                                    peer, msg.header.route_hash, read_conn.route_hash
+                                );
+                                read_conn.stats.write().await.error_count += 1;
+                                break;
+                            }
+                        }
+
                         read_conn.touch().await;
                         read_conn.stats.write().await.request_count += 1;
 
@@ -198,14 +233,23 @@ impl IoLoop {
         *conn.state.write().await = ConnState::Closed;
 
         // === 断连清理 ===
-        // 1. 从注册表注销 (返回被移除的 conn)
-        if let Some(removed_conn) = registry.unregister(conn.id).await {
-            // 2. 通知 handler 执行业务清理 (释放 lease 等)
+        // 从注册表注销 (带身份校验, 防止误删同 client_id 的其他连接).
+        // 注意: 不再调用 mgr.unregister_session(), 因为它内部调用
+        // registry.unregister(client_id, None) 不带身份校验, 会误删
+        // 同 client_id 的 data/meta 通道连接.
+        if let Some(removed_conn) = registry.unregister(conn.id, Some(&conn)).await {
+            // 通知 handler 执行业务清理 (释放 lease 等)
             handler.on_disconnect(removed_conn.id).await;
-        }
-        // 3. 从会话管理器注销
-        if let Some(ref mgr) = manager {
-            mgr.unregister_session(conn.id).await;
+
+            // 记录断连日志 (原 unregister_session 的功能)
+            let stats = removed_conn.stats.read().await;
+            info!(
+                "[Server] Client disconnected: id={}, duration={}s, requests={}, errors={}",
+                removed_conn.id,
+                stats.connected_at.elapsed().as_secs(),
+                stats.request_count,
+                stats.error_count
+            );
         }
 
         info!("IoLoop: connection {} closed and cleaned up", peer);
@@ -313,7 +357,7 @@ mod tests {
         let (server_stream, _) = listener.accept().await.unwrap();
         let mut client_stream = connect_handle.await.unwrap();
 
-        let req = HandshakeRequest::new(ClientType::Fuse, 42);
+        let req = HandshakeRequest::new(ClientType::Fuse, 42, 0);
         let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
         req.encode(&mut req_buf);
 

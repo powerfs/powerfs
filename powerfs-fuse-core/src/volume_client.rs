@@ -14,6 +14,7 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::serialize::TlvDecoder;
+use powerfs_net::protocol::{CHANNEL_DATA, CHANNEL_META};
 use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND, STATUS_ERR_NO_SPACE};
 
 /// 请求等待者类型别名
@@ -345,13 +346,40 @@ impl VolumeClient {
         *self.default_volume_addrs.lock().unwrap() = addrs;
     }
 
-    /// 获取或创建到指定地址的 volume 连接
+    /// 获取或创建到指定地址的 volume 连接 (data 通路, 默认).
+    ///
+    /// 向后兼容: 等价于 `get_or_create_volume_client_channel(addr, CHANNEL_DATA)`.
+    /// lease 相关请求 (acquire/renew/release) 应改用
+    /// `get_or_create_volume_client_channel(addr, CHANNEL_META)` 走 meta 通路,
+    /// 避免 write_needle 大帧阻塞 lease 小请求.
     pub async fn get_or_create_volume_client(
         &self,
         addr: &str,
     ) -> ClientResult<Arc<PowerFsNetClient>> {
+        self.get_or_create_volume_client_channel(addr, CHANNEL_DATA)
+            .await
+    }
+
+    /// 获取或创建到指定地址的 volume 连接 (按通路类型区分).
+    ///
+    /// `channel` 取值:
+    /// - [`CHANNEL_DATA`] (0): data 通路 (write/read needle, 大帧)
+    /// - [`CHANNEL_META`] (1): meta 通路 (lease acquire/renew/release, 小请求)
+    ///
+    /// 同一 addr:port 的 data/meta 是两条独立 TCP 连接, 物理隔离,
+    /// 与内核 `POWERFS_NET_SERVER_VOLUME` / `POWERFS_NET_SERVER_VOLUME_META` 对齐.
+    pub async fn get_or_create_volume_client_channel(
+        &self,
+        addr: &str,
+        channel: u8,
+    ) -> ClientResult<Arc<PowerFsNetClient>> {
+        let ch_str = if channel == CHANNEL_META { "meta" } else { "data" };
+        log::debug!(
+            "VolumeClient: get_or_create_volume_client_channel addr={} channel={}",
+            addr, ch_str
+        );
         self.conn_pool
-            .get_or_connect_addr(addr)
+            .get_or_connect_addr_channel(addr, channel)
             .await
             .map_err(ClientError::from_net_error)
     }
@@ -895,7 +923,7 @@ impl VolumeClient {
             .collect()
     }
 
-    /// 异步获取 Lease: 直接构建 TLV 请求发送到 Volume Server
+    /// 异步获取 Lease: 直接构建 TLV 请求发送到 Volume Server (走 meta 通路).
     #[allow(clippy::too_many_arguments)]
     pub async fn acquire_lease(
         &self,
@@ -913,7 +941,15 @@ impl VolumeClient {
             .map(|v| v.clone())
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+        // lease 请求走 meta 通路, 与 write_needle 大帧物理隔离,
+        // 避免 write_needle 阻塞 lease 续约导致 -110 超时.
+        log::debug!(
+            "acquire_lease: channel=meta addr={} volume={} inode={} stripe_start={} stripe_count={} exclusive={} duration_ms={}",
+            volume.addr, volume_id, inode, stripe_start, stripe_count, exclusive, duration_ms
+        );
+        let vol_client = self
+            .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
+            .await?;
 
         let mut enc = powerfs_net::serialize::TlvEncoder::new();
         enc.add_u64(FieldId::Ino, inode);
@@ -923,8 +959,13 @@ impl VolumeClient {
         enc.add_u64(FieldId::Mode, if exclusive { 1 } else { 0 });
         enc.add_u64(FieldId::LeaseDuration, duration_ms);
 
+        let body = enc.into_bytes();
+        log::debug!(
+            "acquire_lease: sending AcquireLease to addr={} body_len={}",
+            volume.addr, body.len()
+        );
         let result = vol_client
-            .send_request(powerfs_net::MsgType::AcquireLease, &enc.into_bytes(), &[])
+            .send_request(powerfs_net::MsgType::AcquireLease, &body, &[])
             .await;
 
         match result {
@@ -989,7 +1030,10 @@ impl VolumeClient {
             .map(|v| v.clone())
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+        // lease 批量请求走 meta 通路.
+        let vol_client = self
+            .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
+            .await?;
 
         // Encode specs blob: each spec is 16 bytes (stripe_start + stripe_count, both u64 LE)
         let mut specs_blob = Vec::with_capacity(stripe_specs.len() * 16);
@@ -1125,14 +1169,26 @@ impl VolumeClient {
             .map(|v| v.clone())
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+        // lease 释放走 meta 通路.
+        log::debug!(
+            "release_lease_remote: channel=meta addr={} volume={} inode={} stripe_start={}",
+            volume.addr, volume_id, inode, stripe_start
+        );
+        let vol_client = self
+            .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
+            .await?;
 
         let mut enc = powerfs_net::serialize::TlvEncoder::new();
         enc.add_string(FieldId::LeaseToken, token)?;
         enc.add_string(FieldId::ClientId, client_id)?;
 
+        let body = enc.into_bytes();
+        log::debug!(
+            "release_lease_remote: sending ReleaseLease to addr={} body_len={}",
+            volume.addr, body.len()
+        );
         let result = vol_client
-            .send_request(powerfs_net::MsgType::ReleaseLease, &enc.into_bytes(), &[])
+            .send_request(powerfs_net::MsgType::ReleaseLease, &body, &[])
             .await;
 
         match result {
@@ -1171,6 +1227,9 @@ impl VolumeClient {
     /// 与 acquire_lease/release_lease 一样使用直接网络发送，确保 WriteNeedle
     /// 在 lease 有效期内到达 Volume Server。data_queue 的异步处理可能延迟
     /// 30 秒（request_timeout），导致 lease 被释放后 WriteNeedle 才被处理。
+    ///
+    /// 走 data 通路 (CHANNEL_DATA): write_needle 是大帧 (可达 1MB+),
+    /// 与 lease 小请求 (meta 通路) 物理隔离, 避免互相阻塞.
     pub async fn send_write_needle_direct(
         &self,
         volume_id: u64,
@@ -1182,7 +1241,14 @@ impl VolumeClient {
             .map(|v| v.clone())
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+        // write_needle 走 data 通路 (大帧, 与 lease 小请求物理隔离).
+        log::debug!(
+            "send_write_needle_direct: channel=data addr={} volume={} payload_len={}",
+            volume.addr, volume_id, payload.len()
+        );
+        let vol_client = self
+            .get_or_create_volume_client_channel(&volume.addr, CHANNEL_DATA)
+            .await?;
 
         let result = vol_client
             .send_request(powerfs_net::MsgType::WriteNeedle, &payload, &[])
@@ -1192,9 +1258,10 @@ impl VolumeClient {
             Ok(resp) if resp.is_ok() => {
                 self.breakers.record_success(&volume.addr);
                 log::debug!(
-                    "send_write_needle_direct: volume={}, addr={}",
+                    "send_write_needle_direct: volume={}, addr={}, resp_body_len={}",
                     volume_id,
-                    volume.addr
+                    volume.addr,
+                    resp.body.len()
                 );
                 Ok(resp.body)
             }
@@ -1225,7 +1292,7 @@ impl VolumeClient {
         }
     }
 
-    /// 异步续租 Lease: 直接构建 TLV 请求发送到 Volume Server
+    /// 异步续租 Lease: 直接构建 TLV 请求发送到 Volume Server (走 meta 通路).
     pub async fn renew_lease(
         &self,
         volume_id: u64,
@@ -1239,7 +1306,14 @@ impl VolumeClient {
             .map(|v| v.clone())
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
-        let vol_client = self.get_or_create_volume_client(&volume.addr).await?;
+        // lease 续租走 meta 通路.
+        log::debug!(
+            "renew_lease: channel=meta addr={} volume={} inode={} stripe_start={}",
+            volume.addr, volume_id, inode, stripe_start
+        );
+        let vol_client = self
+            .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
+            .await?;
 
         let client_id = self.config.client_id.clone();
 
@@ -1259,8 +1333,13 @@ impl VolumeClient {
         enc.add_string(FieldId::ClientId, &client_id)?;
         enc.add_u64(FieldId::LeaseDuration, duration_ms);
 
+        let body = enc.into_bytes();
+        log::debug!(
+            "renew_lease: sending RenewLease to addr={} body_len={} duration_ms={}",
+            volume.addr, body.len(), duration_ms
+        );
         let result = vol_client
-            .send_request(powerfs_net::MsgType::RenewLease, &enc.into_bytes(), &[])
+            .send_request(powerfs_net::MsgType::RenewLease, &body, &[])
             .await;
 
         match result {
@@ -1810,19 +1889,24 @@ impl VolumeClient {
                         }
                     };
 
-                    // 获取或创建到 Volume 的连接
-                    let vol_client =
-                        match get_or_create_volume_client_from_pool(&conn_pool, &addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                log::warn!(
-                                    "VolumeClient: Lease renewer failed to connect volume={}: {}",
-                                    volume_id,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
+                    // 获取或创建到 Volume 的连接 (走 meta 通路, lease 续租小请求)
+                    let vol_client = match get_or_create_volume_client_from_pool_channel(
+                        &conn_pool,
+                        &addr,
+                        CHANNEL_META,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::warn!(
+                                "VolumeClient: Lease renewer failed to connect volume={} (meta): {}",
+                                volume_id,
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                     // 构建续租请求
                     let mut enc = powerfs_net::serialize::TlvEncoder::new();
@@ -1988,16 +2072,29 @@ fn deliver_result(
     }
 }
 
-/// 从连接池获取或创建到指定地址的 volume 客户端
+/// 从连接池获取或创建到指定地址的 volume 客户端 (data 通路, 默认).
 ///
 /// 连接的创建/复用/健康检查统一由 `powerfs_net::ClientConnPool` 管理，
 /// 这里仅做错误类型转换以保持既有 `ClientResult` 返回签名。
+///
+/// lease 相关调用方应改用 `get_or_create_volume_client_from_pool_channel`
+/// 并传入 `CHANNEL_META`, 走 meta 通路.
+#[allow(dead_code)]
 async fn get_or_create_volume_client_from_pool(
     conn_pool: &Arc<powerfs_net::ClientConnPool>,
     addr: &str,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
+    get_or_create_volume_client_from_pool_channel(conn_pool, addr, CHANNEL_DATA).await
+}
+
+/// 从连接池获取或创建到指定地址的 volume 客户端 (按通路类型区分).
+async fn get_or_create_volume_client_from_pool_channel(
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
+    addr: &str,
+    channel: u8,
+) -> ClientResult<Arc<PowerFsNetClient>> {
     conn_pool
-        .get_or_connect_addr(addr)
+        .get_or_connect_addr_channel(addr, channel)
         .await
         .map_err(ClientError::from_net_error)
 }
@@ -2333,26 +2430,31 @@ async fn process_data_request_internal(
     }
 
     log::debug!(
-        "process_data_request_internal: connecting to volume at {}",
-        volume_addr
+        "process_data_request_internal: connecting to volume at {} (channel=data, kind={:?})",
+        volume_addr, kind
     );
 
-    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
-        .await
-        .map_err(|e| {
-            let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-            log::error!(
-                "process_data_request_internal: failed to get volume client: {}",
-                e
-            );
-            deliver_result(
-                &mut response_tx,
-                &request_id,
-                Err(err.clone()),
-                response_waiters,
-            );
-            err
-        })?;
+    // data 请求 (read/write needle) 走 data 通路 (CHANNEL_DATA).
+    let vol_client = get_or_create_volume_client_from_pool_channel(
+        conn_pool,
+        &volume_addr,
+        CHANNEL_DATA,
+    )
+    .await
+    .map_err(|e| {
+        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+        log::error!(
+            "process_data_request_internal: failed to get volume client (data): {}",
+            e
+        );
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            Err(err.clone()),
+            response_waiters,
+        );
+        err
+    })?;
 
     let resolved_msg_type = powerfs_net::MsgType::from_u16(msg_type).unwrap_or(match kind {
         RequestKind::Read => powerfs_net::MsgType::ReadNeedleBlob,
@@ -2561,18 +2663,28 @@ async fn process_lease_request_internal(
         return result;
     }
 
-    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
-        .await
-        .map_err(|e| {
-            let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-            deliver_result(
-                &mut response_tx,
-                &request_id,
-                Err(err.clone()),
-                response_waiters,
-            );
-            err
-        })?;
+    // lease 请求 (acquire/renew/release) 走 meta 通路 (CHANNEL_META),
+    // 与 write_needle 大帧物理隔离, 避免被大帧阻塞导致 -110 超时.
+    let vol_client = get_or_create_volume_client_from_pool_channel(
+        conn_pool,
+        &volume_addr,
+        CHANNEL_META,
+    )
+    .await
+    .map_err(|e| {
+        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+        log::error!(
+            "process_lease_request_internal: failed to get volume client (meta): {}",
+            e
+        );
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            Err(err.clone()),
+            response_waiters,
+        );
+        err
+    })?;
 
     let msg_type = powerfs_net::MsgType::from_u16(req.context.msg_type)
         .unwrap_or(powerfs_net::MsgType::ReadNeedleBlob);
@@ -2663,18 +2775,23 @@ async fn process_mgmt_request_internal(
         return result;
     }
 
-    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
-        .await
-        .map_err(|e| {
-            let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-            deliver_result(
-                &mut response_tx,
-                &request_id,
-                Err(err.clone()),
-                response_waiters,
-            );
-            err
-        })?;
+    // 管理请求 (statfs 等) 走 data 通路 (量小, 与 data 共享, 不阻塞 lease).
+    let vol_client = get_or_create_volume_client_from_pool_channel(
+        conn_pool,
+        &volume_addr,
+        CHANNEL_DATA,
+    )
+    .await
+    .map_err(|e| {
+        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+        deliver_result(
+            &mut response_tx,
+            &request_id,
+            Err(err.clone()),
+            response_waiters,
+        );
+        err
+    })?;
 
     let msg_type = powerfs_net::MsgType::from_u16(req.context.msg_type)
         .unwrap_or(powerfs_net::MsgType::StatFs);

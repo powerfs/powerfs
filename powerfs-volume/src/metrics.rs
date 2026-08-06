@@ -15,10 +15,13 @@
 //! for scrape-based collection.
 
 use crate::range_lease::RangeLeaseManager;
+use axum::extract::Query;
+use axum::response::IntoResponse;
 use axum::{routing::get, Json, Router, Server};
 use log::{error, info};
 use prometheus::{register_int_gauge, Encoder, IntGauge};
 use serde_json::json;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -88,6 +91,10 @@ pub async fn start_metrics_server(
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/lease-stats", get(lease_stats_handler))
+        .route(
+            "/admin/log-level",
+            get(get_log_level_handler).put(set_log_level_handler),
+        )
         .with_state(lease_mgr);
 
     info!("Volume metrics server listening on http://{}", addr);
@@ -128,4 +135,45 @@ async fn lease_stats_handler(
         "expired_total": stats.expired_total,
         "disconnected_total": stats.disconnected_total,
     }))
+}
+
+// ===== Dynamic log level control =====
+//
+// GET  /admin/log-level           → {"level":"info"}
+// PUT  /admin/log-level?level=debug → {"level":"debug","prev":"info"}
+// PUT  /admin/log-level?level=warn  → {"level":"warn","prev":"debug"}
+
+async fn get_log_level_handler() -> Json<serde_json::Value> {
+    Json(json!({ "level": powerfs_common::dynamic_log::get_log_level() }))
+}
+
+async fn set_log_level_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let level = match params.get("level") {
+        Some(l) => l.as_str(),
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'level' query parameter" })),
+            )
+        }
+    };
+    let prev = powerfs_common::dynamic_log::get_log_level().to_string();
+    match powerfs_common::dynamic_log::set_log_level(level) {
+        Ok(()) => {
+            info!(
+                "log level changed via HTTP: {} -> {}",
+                prev, level
+            );
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "level": level, "prev": prev })),
+            )
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e })),
+        ),
+    }
 }

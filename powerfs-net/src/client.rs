@@ -158,6 +158,11 @@ pub struct ClientConfig {
     pub port: u16,
     pub client_id: u64,
     pub client_type: ClientType,
+    /// 通路类型: CHANNEL_DATA=0 (默认), CHANNEL_META=1.
+    /// 与内核 POWERFS_NET_CHANNEL_DATA/META 对齐. 同一 volume server 建立
+    /// 两条独立 TCP 连接 (data + meta), 物理隔离 write_needle 大帧与 lease
+    /// 小请求, 避免 write_needle 阻塞 lease 续约导致 -110 超时.
+    pub channel: u8,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub max_retries: u32,
@@ -173,6 +178,7 @@ impl Default for ClientConfig {
             port: 9333,
             client_id: 0,
             client_type: ClientType::Fuse,
+            channel: CHANNEL_DATA,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_retries: 3,
@@ -354,7 +360,15 @@ impl PowerFsNetClient {
             }
         };
 
-        info!("Connecting to {}:{}", self.config.addr, self.config.port);
+        let ch_str = if self.config.channel == CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
+        info!(
+            "Connecting to {}:{} (channel={}, client_id={}, client_type={:?})",
+            self.config.addr, self.config.port, ch_str, self.config.client_id, self.config.client_type
+        );
 
         let connect_result =
             tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await;
@@ -382,11 +396,19 @@ impl PowerFsNetClient {
             let _ = socket2::TcpKeepalive::new();
         }
 
-        // Send handshake
-        let req = HandshakeRequest::new(self.config.client_type, self.config.client_id);
+        // Send handshake (携带 channel 字段, 服务端据此登记连接类型)
+        let req = HandshakeRequest::new(
+            self.config.client_type,
+            self.config.client_id,
+            self.config.channel,
+        );
         let mut buf = vec![0u8; HandshakeRequest::SIZE];
         req.encode(&mut buf);
         tcp_stream.write_all(&buf).await?;
+        debug!(
+            "handshake: sent request channel={} (route_hash low bit), client_id={}",
+            ch_str, self.config.client_id
+        );
 
         // Receive handshake response
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
@@ -399,7 +421,10 @@ impl PowerFsNetClient {
             return Err(NetError::Connection("handshake rejected".into()));
         }
 
-        info!("Connected to server_id={}", resp.server_id);
+        info!(
+            "Connected to {}:{} server_id={} (channel={})",
+            self.config.addr, self.config.port, resp.server_id, ch_str
+        );
 
         // Split stream into read and write halves for pipeline mode
         let (read_half, write_half) = tcp_stream.into_split();
@@ -646,16 +671,25 @@ impl PowerFsNetClient {
         body: &[u8],
         data: &[u8],
     ) -> NetResult<NetMessage> {
-        debug!("send_request: type={:?}", msg_type);
+        let ch_str = if self.config.channel == CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
+        debug!(
+            "send_request: type={:?} channel={} addr={}:{}",
+            msg_type, ch_str, self.config.addr, self.config.port
+        );
         // Auto-reconnect if stream is broken (with coordination to prevent
         // concurrent reconnect storms)
         {
             let frame_tx = self.frame_tx.lock().await;
             let connected = frame_tx.is_some() && self.state() == ClientState::Connected;
             debug!(
-                "send_request: frame_tx_is_some={}, state={:?}",
+                "send_request: frame_tx_is_some={}, state={:?}, channel={}",
                 frame_tx.is_some(),
-                self.state()
+                self.state(),
+                ch_str
             );
             if !connected {
                 drop(frame_tx);
@@ -665,13 +699,19 @@ impl PowerFsNetClient {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    warn!("send_request: stream broken, reconnecting...");
+                    warn!(
+                        "send_request: stream broken, reconnecting (channel={}, addr={}:{})",
+                        ch_str, self.config.addr, self.config.port
+                    );
                     let result = self.reconnect_internal().await;
                     self.reconnecting.store(false, Ordering::Release);
                     result?;
                 } else {
                     // Another request is already reconnecting — wait for it
-                    debug!("send_request: waiting for concurrent reconnect...");
+                    debug!(
+                        "send_request: waiting for concurrent reconnect (channel={})",
+                        ch_str
+                    );
                     let max_wait = self.config.connect_timeout * 3;
                     let start = std::time::Instant::now();
                     while self.reconnecting.load(Ordering::Acquire) && start.elapsed() < max_wait {
@@ -682,7 +722,10 @@ impl PowerFsNetClient {
                             "reconnect by concurrent caller failed".into(),
                         ));
                     }
-                    debug!("send_request: concurrent reconnect done");
+                    debug!(
+                        "send_request: concurrent reconnect done (channel={})",
+                        ch_str
+                    );
                 }
             }
         }
@@ -708,20 +751,35 @@ impl PowerFsNetClient {
     ) -> NetResult<NetMessage> {
         let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let frame = build_frame(
+        // 构建 frame 时写入 route_hash (高7位=client_id hash, 低1位=channel).
+        // 服务端 io_loop 收帧时校验 route_hash:
+        //   1. channel 位必须匹配连接 channel (防帧串连接)
+        //   2. 高7位必须匹配握手时登记的 client_id hash
+        // 若不设置 route_hash (=0), meta 通路连接的帧会被 channel 校验拒绝.
+        let frame = build_frame_with_route_hash(
             msg_type.as_u16(),
             FrameFlags::new(FrameFlags::REQUEST),
             seq,
             body,
             data,
+            self.config.client_id,
+            self.config.channel,
         );
 
+        let ch_str = if self.config.channel == CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
         debug!(
-            "Sending request: type={:?} seq={} body_len={} data_len={}",
+            "Sending request: type={:?} seq={} body_len={} data_len={} channel={} client_id={} route_hash=0x{:02x}",
             msg_type,
             seq,
             body.len(),
-            data.len()
+            data.len(),
+            ch_str,
+            self.config.client_id,
+            calc_route_hash(self.config.client_id, self.config.channel)
         );
 
         // Create oneshot channel and register pending request
@@ -746,8 +804,8 @@ impl PowerFsNetClient {
                         return Err(NetError::NotConnected);
                     }
                     debug!(
-                        "send_request_internal: frame pushed to send_task, seq={}",
-                        seq
+                        "send_request_internal: frame pushed to send_task, seq={} channel={} addr={}:{}",
+                        seq, ch_str, self.config.addr, self.config.port
                     );
                 }
                 None => {
@@ -764,21 +822,37 @@ impl PowerFsNetClient {
         // Timeout here does NOT destroy the connection — the frame may still
         // be in the send_task's queue or in the TCP buffer. Other requests'
         // responses can still arrive via recv_loop.
-        debug!("send_request_internal: waiting for response, seq={}", seq);
+        debug!(
+            "send_request_internal: waiting for response, seq={} channel={} addr={}:{}",
+            seq, ch_str, self.config.addr, self.config.port
+        );
         match tokio::time::timeout(self.config.request_timeout, rx).await {
             Ok(Ok(response)) => {
-                debug!("send_request_internal: response received, seq={}", seq);
+                debug!(
+                    "send_request_internal: response received, seq={} channel={} status={}",
+                    seq, ch_str, response.header.status
+                );
                 Ok(response)
             }
             Ok(Err(_recv_err)) => {
                 // oneshot sender was dropped (likely recv_loop exited and
                 // drained pending_requests, or send_task drained on error)
-                warn!("send_request_internal: sender dropped for seq={}", seq);
+                warn!(
+                    "send_request_internal: sender dropped for seq={} channel={} addr={}:{}",
+                    seq, ch_str, self.config.addr, self.config.port
+                );
                 self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
                 Err(NetError::Connection("connection terminated".into()))
             }
             Err(_elapsed) => {
-                warn!("send_request_internal: response timeout for seq={}", seq);
+                warn!(
+                    "send_request_internal: response timeout for seq={} channel={} addr={}:{} timeout_ms={}",
+                    seq,
+                    ch_str,
+                    self.config.addr,
+                    self.config.port,
+                    self.config.request_timeout.as_millis()
+                );
                 // Remove pending request on timeout (do NOT set state=Disconnected)
                 self.pending_requests.remove(&seq);
                 self.metrics.request_errors.fetch_add(1, Ordering::Relaxed);
@@ -792,6 +866,15 @@ impl PowerFsNetClient {
     /// backoff; on final failure the caller should try again later (we
     /// intentionally do not loop forever here).
     pub async fn reconnect_internal(&self) -> NetResult<()> {
+        let ch_str = if self.config.channel == CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
+        warn!(
+            "reconnect_internal: addr={}:{} channel={} client_id={}",
+            self.config.addr, self.config.port, ch_str, self.config.client_id
+        );
         // Stop send_task (drop frame_tx to signal send_task to exit)
         {
             let mut frame_tx_guard = self.frame_tx.lock().await;
@@ -818,28 +901,40 @@ impl PowerFsNetClient {
 
         // Try up to 3 times with backoff
         for attempt in 1..=3u32 {
-            info!("Reconnect attempt {}", attempt);
+            info!(
+                "Reconnect attempt {} (addr={}:{}, channel={})",
+                attempt, self.config.addr, self.config.port, ch_str
+            );
             self.fire_event_reconnect_attempt(attempt);
             self.metrics
                 .reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
             match self.connect().await {
                 Ok(()) => {
-                    info!("Reconnected successfully");
+                    info!(
+                        "Reconnected successfully (addr={}:{}, channel={})",
+                        self.config.addr, self.config.port, ch_str
+                    );
                     self.metrics
                         .reconnect_successes
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(e) => {
-                    warn!("Reconnect attempt {} failed: {}", attempt, e);
+                    warn!(
+                        "Reconnect attempt {} failed (addr={}:{}, channel={}): {}",
+                        attempt, self.config.addr, self.config.port, ch_str, e
+                    );
                     if attempt < 3 {
                         tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                     }
                 }
             }
         }
-        error!("Failed to reconnect after 3 attempts");
+        error!(
+            "Failed to reconnect after 3 attempts (addr={}:{}, channel={})",
+            self.config.addr, self.config.port, ch_str
+        );
         self.metrics
             .reconnect_failures
             .fetch_add(1, Ordering::Relaxed);

@@ -34,15 +34,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = load_config(&args.config);
 
-    let log_level = cfg.global.log_level.as_str();
+    let log_level = cfg.global.log_level.clone();
     env_logger::Builder::new()
-        .filter_level(match log_level {
-            "debug" => log::LevelFilter::Debug,
-            "warn" => log::LevelFilter::Warn,
-            "error" => log::LevelFilter::Error,
-            _ => log::LevelFilter::Info,
-        })
+        .filter_level(log::LevelFilter::Debug)
         .init();
+    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
 
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 

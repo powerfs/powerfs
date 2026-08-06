@@ -80,6 +80,7 @@ pub async fn register_filer(
             &current_addr,
             powerfs_net::ClientType::Filer,
             client_id,
+            powerfs_net::CHANNEL_DATA,
             powerfs_net::MsgType::RegisterFiler,
             &body,
         )

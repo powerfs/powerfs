@@ -100,24 +100,32 @@ impl ClientType {
 // Handshake
 // ============================================================================
 
-/// Handshake request (18 bytes)
+/// Handshake request (20 bytes)
 #[derive(Debug, Clone)]
 pub struct HandshakeRequest {
     pub magic: [u8; 4],  // "PFSN"
     pub version: u8,     // 0x01
     pub client_type: u8, // ClientType
+    pub channel: u8,     // 0=data, 1=meta (通路类型, 服务端登记+收帧校验)
+    pub reserved: u8,    // 对齐
     pub client_id: u64,  // Unique client identifier
     pub features: u32,   // Supported features
 }
 
-impl HandshakeRequest {
-    pub const SIZE: usize = 18;
+/// Channel constants (与内核 POWERFS_NET_CHANNEL_DATA/META 一致)
+pub const CHANNEL_DATA: u8 = 0;
+pub const CHANNEL_META: u8 = 1;
 
-    pub fn new(client_type: ClientType, client_id: u64) -> Self {
+impl HandshakeRequest {
+    pub const SIZE: usize = 20;
+
+    pub fn new(client_type: ClientType, client_id: u64, channel: u8) -> Self {
         Self {
             magic: *PROTOCOL_MAGIC,
             version: PROTOCOL_VERSION,
             client_type: client_type as u8,
+            channel,
+            reserved: 0,
             client_id,
             features: 0,
         }
@@ -127,8 +135,10 @@ impl HandshakeRequest {
         buf[0..4].copy_from_slice(&self.magic);
         buf[4] = self.version;
         buf[5] = self.client_type;
-        buf[6..14].copy_from_slice(&self.client_id.to_le_bytes());
-        buf[14..18].copy_from_slice(&self.features.to_le_bytes());
+        buf[6] = self.channel;
+        buf[7] = self.reserved;
+        buf[8..16].copy_from_slice(&self.client_id.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.features.to_le_bytes());
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
@@ -144,8 +154,10 @@ impl HandshakeRequest {
             magic,
             version: buf[4],
             client_type: buf[5],
-            client_id: u64::from_le_bytes(buf[6..14].try_into().ok()?),
-            features: u32::from_le_bytes(buf[14..18].try_into().ok()?),
+            channel: buf[6],
+            reserved: buf[7],
+            client_id: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            features: u32::from_le_bytes(buf[16..20].try_into().ok()?),
         })
     }
 }
@@ -229,7 +241,8 @@ impl HandshakeResponse {
 ///   status: 2B   - Response status code (0=OK)
 ///   data_len: 4B - Total data length (body + data segment)
 ///   body_len: 4B - Body segment length (data segment = data_len - body_len)
-///   reserved: 2B - Reserved for future use
+///   route_hash: 1B - 高7位=client_id hash, 低1位=channel (防错乱校验)
+///   protocol_ver: 1B - 协议版本 (版本升级一致性检查)
 ///   header_crc: 4B - CRC32C of header (fields before this)
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
@@ -241,7 +254,8 @@ pub struct FrameHeader {
     pub status: u16,
     pub data_len: u32,
     pub body_len: u32,
-    pub reserved: [u8; 2],
+    pub route_hash: u8,
+    pub protocol_ver: u8,
     pub header_crc: u32,
 }
 
@@ -258,7 +272,8 @@ impl FrameHeader {
             status: 0,
             data_len,
             body_len: 0,
-            reserved: [0u8; 2],
+            route_hash: 0,
+            protocol_ver: PROTOCOL_VERSION,
             header_crc: 0,
         };
         hdr.header_crc = hdr.calc_header_crc();
@@ -281,12 +296,6 @@ impl FrameHeader {
     }
 
     fn calc_header_crc(&self) -> u32 {
-        // crc32c_append(prev, data) 的 prev 是"已完成的标准 CRC32C 值",
-        // 空数据 CRC32C = 0xFFFFFFFF ^ 0xFFFFFFFF = 0, 故初始值为 0.
-        // 逐步 append 后 crc 已是标准 CRC32C (初始 0xFFFFFFFF, 末尾 XOR 0xFFFFFFFF),
-        // 无需再 XOR. 之前用 0xFFFFFFFF 初始值 + 末尾 XOR 是双重错误, 实际算出
-        // raw_crc(0, data) (非标准), 与内核标准 CRC32C 不一致, 导致 Filer 报
-        // "invalid frame header".
         let mut crc: u32 = 0;
         crc = crc32c::crc32c_append(crc, &self.magic);
         crc = crc32c::crc32c_append(crc, &[self.version]);
@@ -296,7 +305,7 @@ impl FrameHeader {
         crc = crc32c::crc32c_append(crc, &self.status.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.data_len.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.body_len.to_le_bytes());
-        crc = crc32c::crc32c_append(crc, &self.reserved);
+        crc = crc32c::crc32c_append(crc, &[self.route_hash, self.protocol_ver]);
         crc
     }
 
@@ -318,7 +327,8 @@ impl FrameHeader {
         buf[12..14].copy_from_slice(&self.status.to_le_bytes());
         buf[14..18].copy_from_slice(&self.data_len.to_le_bytes());
         buf[18..22].copy_from_slice(&self.body_len.to_le_bytes());
-        buf[22..24].copy_from_slice(&self.reserved);
+        buf[22] = self.route_hash;
+        buf[23] = self.protocol_ver;
         buf[24..28].copy_from_slice(&self.header_crc.to_le_bytes());
     }
 
@@ -340,7 +350,8 @@ impl FrameHeader {
             status: u16::from_le_bytes(buf[12..14].try_into().ok()?),
             data_len: u32::from_le_bytes(buf[14..18].try_into().ok()?),
             body_len: u32::from_le_bytes(buf[18..22].try_into().ok()?),
-            reserved: buf[22..24].try_into().ok()?,
+            route_hash: buf[22],
+            protocol_ver: buf[23],
             header_crc: u32::from_le_bytes(buf[24..28].try_into().ok()?),
         };
         if !hdr.verify_crc() {
@@ -876,6 +887,62 @@ pub fn build_frame(
     frame
 }
 
+/// Build a frame with `route_hash` set (client → server requests).
+///
+/// `route_hash` is computed from `client_id` and `channel`:
+/// - high 7 bits = hash of `client_id` (identifies the client)
+/// - low 1 bit = `channel` (0=data, 1=meta, identifies the physical path)
+///
+/// The server validates `route_hash` to detect frames arriving on the wrong
+/// connection (e.g. a lease frame on a data connection). Without this, the
+/// server's channel-mismatch check in `io_loop.rs` would close meta-channel
+/// connections because `build_frame` leaves `route_hash=0`.
+///
+/// Mirrors the kernel-side `pfs_route_hash` computation.
+pub fn build_frame_with_route_hash(
+    msg_type: u16,
+    flags: FrameFlags,
+    seq: u32,
+    body: &[u8],
+    data: &[u8],
+    client_id: u64,
+    channel: u8,
+) -> Vec<u8> {
+    let data_len = body.len() as u32 + data.len() as u32;
+    let mut header = FrameHeader::new(msg_type, flags, seq, data_len);
+    header.set_body_data_len(body.len() as u32, data_len);
+    header.route_hash = calc_route_hash(client_id, channel);
+    header.header_crc = header.calc_header_crc();
+
+    let mut frame = Vec::with_capacity(FrameHeader::SIZE + body.len() + data.len());
+    let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+    header.encode(&mut hdr_buf);
+    frame.extend_from_slice(&hdr_buf);
+    frame.extend_from_slice(body);
+    frame.extend_from_slice(data);
+
+    frame
+}
+
+/// Compute `route_hash` from `client_id` and `channel`.
+///
+/// Layout (1 byte):
+/// - bit 0: `channel` (0=data, 1=meta)
+/// - bits 1-7: hash of `client_id` (high 7 bits of a 64-bit mix)
+///
+/// `route_hash=0` is reserved as "unset" — the server skips validation
+/// for frames with `route_hash=0` (backward compat with discovery-phase
+/// frames that have no client_id yet).
+///
+/// Mirrors the kernel-side `pfs_route_hash` computation in `powerfs_net.h`.
+pub fn calc_route_hash(client_id: u64, channel: u8) -> u8 {
+    let mut h = client_id;
+    h ^= h >> 32;
+    h = h.wrapping_mul(0x9E3779B97F4A7C15);
+    h ^= h >> 32;
+    ((h >> 25) as u8) << 1 | (channel & 0x01)
+}
+
 /// Parse a frame header from buffer
 pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
     FrameHeader::decode(buf)
@@ -887,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_handshake_encode_decode() {
-        let req = HandshakeRequest::new(ClientType::Fuse, 12345);
+        let req = HandshakeRequest::new(ClientType::Fuse, 12345, 0);
         let mut buf = vec![0u8; HandshakeRequest::SIZE];
         req.encode(&mut buf);
 
