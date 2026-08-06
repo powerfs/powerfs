@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::flow_policy::{AdmissionDecision, FlowCtx, FlowPolicy};
+
 /// 通道类型 (与协议 CHANNEL_DATA / CHANNEL_META 对应)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
@@ -357,15 +359,18 @@ pub enum SlowStateChange {
     Recovered,
 }
 
-/// 流控控制器 (统一入口, 持有全局统计 + per-conn 统计 + 慢连接跟踪器)
+/// 流控控制器 (统一入口, 持有全局统计 + per-conn 统计 + 慢连接跟踪器 + 策略)
 ///
-/// Phase 1: 只提供统计收集和慢连接标记, 无 admit() 准入决策
-/// Phase 2: 增加 FlowPolicy + admit()
+/// Phase 1 S1: 统计收集 + 慢连接标记 (on_request_start/complete)
+/// Phase 1 S2: 增加 FlowPolicy + admit() 准入决策
+/// Phase 2: load_factor 负载反馈
 pub struct FlowController {
     global: GlobalStats,
     /// conn_id → ConnStats (用 Arc 共享, 供 IoLoop/Worker 直接持有引用避免查表)
     conns: RwLock<HashMap<u64, Arc<ConnStats>>>,
     slow_tracker: SlowConnTracker,
+    /// 可插拔准入策略 (None 时永远放行, 用于无流控场景)
+    policy: RwLock<Option<Arc<dyn FlowPolicy>>>,
 }
 
 impl FlowController {
@@ -374,6 +379,7 @@ impl FlowController {
             global: GlobalStats::new(),
             conns: RwLock::new(HashMap::new()),
             slow_tracker,
+            policy: RwLock::new(None),
         }
     }
 
@@ -514,6 +520,71 @@ impl FlowController {
     pub fn slow_conn_count(&self) -> u32 {
         self.global.slow_conns.load(Ordering::Relaxed)
     }
+
+    // ----- Phase 1 S2: 准入策略集成 -----
+
+    /// 安装准入策略 (运行时可替换)
+    ///
+    /// 传入 `None` 可禁用流控 (所有请求放行).
+    /// 调用方在 `on_request_start` 之前应调用 `admit()` 检查准入.
+    pub fn set_policy(&self, policy: Option<Arc<dyn FlowPolicy>>) {
+        *self.policy.write() = policy;
+    }
+
+    /// 安装默认 AdaptiveConcurrencyPolicy (便捷方法)
+    pub fn set_default_policy(&self) {
+        self.set_policy(Some(Arc::new(
+            crate::flow_policy::AdaptiveConcurrencyPolicy::with_defaults(),
+        )));
+    }
+
+    /// 准入决策: 是否允许新请求
+    ///
+    /// 返回 `Admit` 时, 调用方应调 `on_request_start` 并处理请求.
+    /// 返回 `Reject(reason)` 时, 调用方应返回 BUSY / EAGAIN.
+    ///
+    /// 注意: `admit()` 只做决策, 不修改计数. admit 与 on_request_start 之间
+    /// 的竞态是 best-effort (防雪崩, 非精确限流).
+    pub fn admit(&self, conn_id: u64, msg_type: u16, est_bytes: usize) -> AdmissionDecision {
+        // 先读 policy (read lock), 再读 conns (read lock)
+        // 锁顺序: policy → conns (其他路径无反向获取, 不会死锁)
+        let policy_guard = self.policy.read();
+        let Some(policy) = policy_guard.as_ref() else {
+            return AdmissionDecision::Admit; // 无策略, 放行
+        };
+        let conns = self.conns.read();
+        let Some(stats) = conns.get(&conn_id) else {
+            return AdmissionDecision::Admit; // 连接不存在, 放行 (后续 start 会失败)
+        };
+        let ctx = FlowCtx {
+            conn: stats,
+            global: &self.global,
+            msg_type,
+            est_bytes,
+        };
+        policy.admit(&ctx)
+    }
+
+    /// 当前负载因子 (0-3, Phase 2 用于响应帧 flags bit 6-7)
+    ///
+    /// Phase 1: 始终返回 0 (策略未实现 load_factor 计算)
+    /// Phase 2: FlowController 基于 global active/max 计算
+    pub fn current_load_factor(&self) -> u8 {
+        let policy_guard = self.policy.read();
+        if let Some(policy) = policy_guard.as_ref() {
+            return policy.load_factor();
+        }
+        0
+    }
+
+    /// 策略名称 (供 HTTP API / 日志)
+    pub fn policy_name(&self) -> &'static str {
+        let policy_guard = self.policy.read();
+        match policy_guard.as_ref() {
+            Some(p) => p.name(),
+            None => "none",
+        }
+    }
 }
 
 /// 获取当前时间 (纳秒, 单调时钟)
@@ -528,6 +599,7 @@ fn current_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_policy::{AdmissionDecision, FlowPolicy, RejectReason};
 
     fn make_stats(conn_id: u64) -> ConnStats {
         ConnStats::new(
@@ -795,5 +867,146 @@ mod tests {
         assert_eq!(s.bytes_sent.load(Ordering::Relaxed), 0);
         assert_eq!(s.active_reqs.load(Ordering::Relaxed), 0);
         assert!(!s.slow.load(Ordering::Relaxed));
+    }
+
+    // ----- Phase 1 S2: admit 集成测试 -----
+
+    #[test]
+    fn test_admit_no_policy_always_admit() {
+        // 无策略时, admit 永远放行
+        let fc = FlowController::with_defaults();
+        let stats = fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        // 填满 active_reqs
+        for _ in 0..100 {
+            stats.active_reqs.fetch_add(1, Ordering::Relaxed);
+        }
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Admit);
+        assert_eq!(fc.policy_name(), "none");
+    }
+
+    #[test]
+    fn test_admit_with_default_policy_idle() {
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Admit);
+        assert_eq!(fc.policy_name(), "adaptive-concurrency");
+    }
+
+    #[test]
+    fn test_admit_reject_conn_full() {
+        let fc = FlowController::with_defaults();
+        let policy = Arc::new(crate::flow_policy::AdaptiveConcurrencyPolicy::new(256, 4))
+            as Arc<dyn FlowPolicy>;
+        fc.set_policy(Some(policy));
+        let stats = fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        // 填满 per-conn (4)
+        for _ in 0..4 {
+            stats.active_reqs.fetch_add(1, Ordering::Relaxed);
+        }
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Reject(RejectReason::ConnFull));
+    }
+
+    #[test]
+    fn test_admit_reject_global_full() {
+        let fc = FlowController::with_defaults();
+        let policy = Arc::new(crate::flow_policy::AdaptiveConcurrencyPolicy::new(8, 64))
+            as Arc<dyn FlowPolicy>;
+        fc.set_policy(Some(policy));
+        fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        // 填满全局 (8)
+        for _ in 0..8 {
+            fc.global.active_reqs.fetch_add(1, Ordering::Relaxed);
+        }
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Reject(RejectReason::GlobalFull));
+    }
+
+    #[test]
+    fn test_admit_reject_slow_conn() {
+        let fc = FlowController::with_defaults();
+        let policy = Arc::new(crate::flow_policy::AdaptiveConcurrencyPolicy::new(256, 4))
+            as Arc<dyn FlowPolicy>;
+        fc.set_policy(Some(policy));
+        let stats = fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        // 标记为慢, 上限减半 = 2
+        stats.slow.store(true, Ordering::Relaxed);
+        for _ in 0..2 {
+            stats.active_reqs.fetch_add(1, Ordering::Relaxed);
+        }
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Reject(RejectReason::SlowConn));
+    }
+
+    #[test]
+    fn test_admit_unknown_conn_admits() {
+        // 连接不存在时放行 (后续 on_request_start 会失败)
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        let d = fc.admit(999, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Admit);
+    }
+
+    #[test]
+    fn test_admit_does_not_mutate_counters() {
+        // admit 只决策, 不递增 active_reqs (调用方负责 on_request_start)
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        let stats = fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Admit);
+        assert_eq!(stats.active_reqs.load(Ordering::Relaxed), 0);
+        assert_eq!(fc.snapshot_global().active_reqs, 0);
+    }
+
+    #[test]
+    fn test_set_policy_replace_at_runtime() {
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        assert_eq!(fc.policy_name(), "adaptive-concurrency");
+
+        // 运行时替换为 NullPolicy
+        fc.set_policy(Some(Arc::new(crate::flow_policy::NullPolicy)));
+        assert_eq!(fc.policy_name(), "null");
+
+        // 禁用流控
+        fc.set_policy(None);
+        assert_eq!(fc.policy_name(), "none");
+    }
+
+    #[test]
+    fn test_admit_full_lifecycle_with_policy() {
+        // 完整流程: admit (Admit) → on_request_start → on_request_complete
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        let stats = fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+
+        // admit 放行
+        let d = fc.admit(1, 1, 1024);
+        assert_eq!(d, AdmissionDecision::Admit);
+
+        // 调用方负责 on_request_start
+        fc.on_request_start(&stats);
+        assert_eq!(stats.active_reqs.load(Ordering::Relaxed), 1);
+
+        // 完成请求
+        fc.on_request_complete(&stats, 5_000, 1_024, false);
+        assert_eq!(stats.active_reqs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_current_load_factor_phase1() {
+        let fc = FlowController::with_defaults();
+        fc.set_default_policy();
+        // Phase 1: load_factor 始终返回 0
+        assert_eq!(fc.current_load_factor(), 0);
+
+        // 无策略也返回 0
+        fc.set_policy(None);
+        assert_eq!(fc.current_load_factor(), 0);
     }
 }

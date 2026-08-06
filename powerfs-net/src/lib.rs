@@ -22,6 +22,7 @@ pub mod client_conn;
 pub mod client_pool;
 pub mod errors;
 pub mod flow_control;
+pub mod flow_policy;
 pub mod io_loop;
 pub mod middleware;
 pub mod protocol;
@@ -48,6 +49,10 @@ pub use errors::{NetError, NetResult};
 pub use flow_control::{
     Channel, ConnStats, ConnStatsSnapshot, FlowController, GlobalStats, GlobalStatsSnapshot,
     SlowConnTracker, SlowConnTrackerConfig, SlowStateChange,
+};
+pub use flow_policy::{
+    AdaptiveConcurrencyPolicy, AdmissionDecision, FlowCtx, FlowPolicy, NullPolicy, PolicySnapshot,
+    RejectReason,
 };
 pub use io_loop::IoLoop;
 pub use middleware::{
