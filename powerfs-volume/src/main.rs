@@ -5,7 +5,7 @@ use powerfs_common::{
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
-use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
@@ -232,16 +232,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(volume_server.clone()),
         ));
 
-        // Wrap with ManagedNetHandler for session management + middleware
         let net_manager = Arc::new(ServerConnectionManager::new());
-        let managed_handler = Arc::new(ManagedNetHandler::from_arc(
-            net_manager.clone(),
-            net_handler,
-        ));
+        let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
         info!("Starting powerfs-net Volume server on {}", net_bind_addr);
         if let Ok(net_server) =
-            PowerFsNetServer::bind_with_manager(&ip, net_port, managed_handler, net_manager).await
+            PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler, net_manager).await
         {
             tokio::spawn(async move {
                 if let Err(e) = net_server.serve().await {
@@ -254,13 +250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master_addrs: Vec<&str> = master_address.iter().map(|s| s.as_str()).collect();
     let master_client = MasterClient::new(NewMasterClientParams {
         master_addresses: &master_addrs,
+        master_net_port: volume_cfg.master_net_port,
         node_id: node_id.clone(),
-        grpc_port: grpc_port as u32,
         http_port: http_port as u32,
         net_port: net_port as u32,
-        data_center: &data_center,
-        rack: &rack,
-        public_url: &format!("http://{}:{}", ip, http_port),
         ip: &ip,
     });
 

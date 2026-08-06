@@ -58,6 +58,8 @@ pub struct VolumeConfig {
     pub device_capacity: Option<u64>,
     /// powerfs-net 二进制协议端口 - 必须配置，必须与http_port不同
     pub net_port: u16,
+    /// Master的powerfs-net端口 (必填, 用于TLV心跳注册)
+    pub master_net_port: u16,
     /// 广播地址 - Volume Server对外可达地址（如 "172.20.0.21"），用于Master注册volume路由
     /// 必须配置，不能使用0.0.0.0，否则FUSE客户端无法连接
     pub advertise_addr: Option<String>,
@@ -263,6 +265,11 @@ impl PowerFsConfig {
                 "volume.http_port and volume.net_port must be different (HTTP port conflicts with powerfs-net port)".to_string(),
             ));
         }
+        if self.volume.master_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "volume.master_net_port must be set (> 0) for TLV heartbeat".to_string(),
+            ));
+        }
         if self.volume.node_id.is_empty() {
             return Err(ConfigError::ValidationError(
                 "volume.node_id must be set".to_string(),
@@ -411,6 +418,7 @@ http_port = 8091         # HTTP管理端口 (必填，必须与net_port不同)
 net_port = 8901          # powerfs-net端口 (必填，必须与http_port不同)
 data_dir = "./data/volume"
 master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
+master_net_port = 9334   # Master的powerfs-net端口 (必填, 用于TLV心跳)
 node_id = "volume-server-1"
 max_volume_size = 10737418240
 initial_volume_count = 4

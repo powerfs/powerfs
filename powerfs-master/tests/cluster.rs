@@ -334,6 +334,7 @@ impl ClusterBuilder {
                     peers.push(Peer {
                         id: j as u64,
                         address: format!("127.0.0.1:{}", 10000 + j),
+                        net_address: format!("127.0.0.1:{}", 10000 + j),
                     });
                 }
             }

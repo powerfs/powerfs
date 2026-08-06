@@ -666,6 +666,7 @@ fn build_config(
             net_port: cfg.volume_net_port,
             data_dir: format!("{}/volume", cfg.data_dir),
             master_addresses: master_addrs.to_vec(),
+            master_net_port: cfg.master_net_port,
             node_id: "volume-server-1".to_string(),
             max_volume_size: cfg.max_volume_size,
             initial_volume_count: cfg.initial_volume_count,

@@ -24,6 +24,10 @@ const SNAPSHOT_THRESHOLD: u64 = 10000;
 pub struct Peer {
     pub id: u64,
     pub address: String,
+    /// powerfs-net address (ip:net_port) for TLV Raft transport.
+    /// Derived from `address` (gRPC ip:port) by replacing the port with
+    /// the local node's `net_port`. Used by the TLV raft message forwarder.
+    pub net_address: String,
 }
 
 /// RaftNode manages the Raft state machine for a single master node

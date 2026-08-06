@@ -15,7 +15,8 @@ use crate::errors::{NetError, NetResult};
 use crate::middleware::{
     LoggingMiddleware, MetricsMiddleware, NextHandler, RequestMetrics, RequestPipeline,
 };
-use crate::protocol::{ClientType, NetMessage};
+use crate::protocol::{ClientType, FieldId, MsgType, NetMessage};
+use crate::serialize::TlvEncoder;
 
 use super::request_context::{ClientInfo, RequestContext};
 
@@ -157,11 +158,22 @@ impl ClientSession {
 
 /// Trait for business-level request handlers
 ///
-/// Implemented by MasterNode/VolumeServer/MetaShardManager
-/// to handle the actual business logic for each request type.
+/// Unified handler trait for processing net requests.
+///
+/// Implemented by MasterNode/VolumeServer/MetaShardManager to handle the
+/// actual business logic for each request type. Merges the former
+/// `PowerFsNetHandler` (server-facing lifecycle) and `ServerRequestHandler`
+/// (business dispatch) into a single trait.
 #[async_trait::async_trait]
-pub trait ServerRequestHandler: Send + Sync {
+pub trait NetHandler: Send + Sync {
+    /// Handle a request and return a response.
     async fn handle(&self, ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage>;
+
+    /// Called when a client connects. Default no-op.
+    async fn on_connect(&self, _client_id: u64, _client_type: ClientType) {}
+
+    /// Called when a client disconnects. Default no-op.
+    async fn on_disconnect(&self, _client_id: u64) {}
 }
 
 /// Aggregated metrics snapshot for admin/monitoring
@@ -380,7 +392,7 @@ impl ServerConnectionManager {
         &self,
         client_id: u64,
         msg: &NetMessage,
-        handler: &dyn ServerRequestHandler,
+        handler: &dyn NetHandler,
     ) -> NetResult<NetMessage> {
         let session_info = self.get_client_info(client_id).await?;
         self.touch_session(client_id).await;
@@ -400,7 +412,7 @@ impl ServerConnectionManager {
         &self,
         client_id: u64,
         msg: &NetMessage,
-        handler: Arc<dyn ServerRequestHandler>,
+        handler: Arc<dyn NetHandler>,
     ) -> NetResult<NetMessage> {
         let session_info = self.get_client_info(client_id).await?;
         self.touch_session(client_id).await;
@@ -532,6 +544,45 @@ impl ServerConnectionManager {
         success_count
     }
 
+    // ========================================================================
+    // High-level typed notification helpers
+    //
+    // These build the NetMessage internally so upper-layer services (e.g.
+    // InodeNotifier) do not need to depend on `protocol::{FrameHeader,
+    // FrameFlags}`, `serialize::TlvEncoder`, or `FieldId` directly.
+    // ========================================================================
+
+    /// Push an Invalidate(inode, version) notification to a single client.
+    ///
+    /// Returns `Ok(true)` if queued, `Ok(false)` if the channel is full,
+    /// `Err` if the client has no notification channel.
+    pub async fn push_invalidate_notification(
+        &self,
+        client_id: u64,
+        inode: u64,
+        version: u64,
+    ) -> NetResult<bool> {
+        let msg = Self::build_invalidate_message(inode, version);
+        self.send_notification(client_id, msg).await
+    }
+
+    /// Broadcast an Invalidate(inode, version) notification to all clients.
+    ///
+    /// Returns the number of clients that received the notification.
+    pub async fn broadcast_invalidate_notification(&self, inode: u64, version: u64) -> usize {
+        let msg = Self::build_invalidate_message(inode, version);
+        self.broadcast_notification(&msg).await
+    }
+
+    /// Build an Invalidate notification message (shared by push + broadcast).
+    fn build_invalidate_message(inode: u64, version: u64) -> NetMessage {
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_u64(FieldId::Version, version);
+        let body = enc.into_bytes();
+        NetMessage::notification(MsgType::Invalidate, body, Vec::new())
+    }
+
     /// Check if a client has a notification channel registered
     pub async fn has_notification_channel(&self, client_id: u64) -> bool {
         let channels = self.notification_channels.read().await;
@@ -566,8 +617,8 @@ impl Default for ServerConnectionManager {
     }
 }
 
-/// Bridge from ServerRequestHandler to NextHandler for middleware pipeline
-struct HandlerBridge(Arc<dyn ServerRequestHandler>);
+/// Bridge from NetHandler to NextHandler for middleware pipeline
+struct HandlerBridge(Arc<dyn NetHandler>);
 
 #[async_trait::async_trait]
 impl NextHandler for HandlerBridge {
@@ -604,7 +655,7 @@ mod tests {
     struct TestHandler;
 
     #[async_trait::async_trait]
-    impl ServerRequestHandler for TestHandler {
+    impl NetHandler for TestHandler {
         async fn handle(
             &self,
             _ctx: &mut RequestContext,
@@ -617,7 +668,7 @@ mod tests {
     struct ErrorHandler;
 
     #[async_trait::async_trait]
-    impl ServerRequestHandler for ErrorHandler {
+    impl NetHandler for ErrorHandler {
         async fn handle(
             &self,
             _ctx: &mut RequestContext,

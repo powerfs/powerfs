@@ -8,10 +8,10 @@ use crate::proto::powerfs::VolumeShortInfo;
 use log::{debug, error, info, warn};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, RequestContext,
-    ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR,
-    STATUS_OK,
+    FieldId, MsgType, NetMessage, NetHandler, RequestContext, STATUS_ERR_NOT_FOUND,
+    STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
+use protobuf::Message as ProtoMessage;
 use std::sync::Arc;
 
 /// Master Net Handler implementation
@@ -91,12 +91,14 @@ impl MasterNetHandler {
         node_id: &str,
         ip: &str,
         port: u32,
+        net_port: u32,
         volumes: &[VolumeShortInfo],
     ) -> Result<Vec<u8>, powerfs_net::NetError> {
         let mut enc = TlvEncoder::new();
         enc.add_string(FieldId::ClientId, node_id)?;
         enc.add_string(FieldId::Owner, ip)?;
         enc.add_u64(FieldId::Blksize, port as u64);
+        enc.add_u64(FieldId::NetPort, net_port as u64);
         enc.add_u64(FieldId::Entries, volumes.len() as u64);
 
         for vol in volumes {
@@ -104,6 +106,8 @@ impl MasterNetHandler {
             enc.add_u64(FieldId::Size, vol.size);
             enc.add_u64(FieldId::Mode, vol.read_only as u64);
             enc.add_string(FieldId::Name, &vol.collection)?;
+            enc.add_u64(FieldId::UsedSpace, vol.used);
+            enc.add_u64(FieldId::FileCount, vol.file_count);
         }
         Ok(enc.into_bytes())
     }
@@ -293,6 +297,7 @@ impl MasterNetHandler {
         let node_id_str = dec.next_string(FieldId::ClientId).unwrap_or_default();
         let ip = dec.next_string(FieldId::Owner).unwrap_or_default();
         let port = dec.next_u64(FieldId::Blksize).unwrap_or(0) as u32;
+        let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
         let volume_count = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
 
         info!(
@@ -327,6 +332,8 @@ impl MasterNetHandler {
                 let size = dec.next_u64(FieldId::Size).unwrap_or(0);
                 let state = dec.next_u64(FieldId::Mode).unwrap_or(0) as i32;
                 let collection = dec.next_string(FieldId::Name).unwrap_or_default();
+                let used = dec.next_u64(FieldId::UsedSpace).unwrap_or(0);
+                let file_count = dec.next_u64(FieldId::FileCount).unwrap_or(0);
 
                 volumes.push(VolumeShortInfo {
                     volume_id,
@@ -336,8 +343,8 @@ impl MasterNetHandler {
                     replica_placement: 1,
                     ttl: 0,
                     disk_type: "ssd".to_string(),
-                    used: 0,
-                    file_count: 0,
+                    used,
+                    file_count,
                     compact_status: 0,
                     append_offset: 0,
                 });
@@ -373,7 +380,7 @@ impl MasterNetHandler {
                     ip: ip.clone(),
                     grpc_port: port,
                     http_port: port,
-                    net_port: 0,
+                    net_port,
                 })
                 .await;
 
@@ -546,9 +553,15 @@ impl MasterNetHandler {
         ))
     }
 
-    /// Handle RegisterFiler request: 分配 Zone + 选物理 volume
+    /// Handle RegisterFiler request: register filer node + 分配 Zone + 选物理 volume
     ///
-    /// Request TLV: Owner = filer_id (string)
+    /// Request TLV:
+    ///   Owner       = filer_id (string, e.g. "filer-1")
+    ///   FilerAddress = filer advertise address (string, "ip:net_port") — for ListFilers discovery
+    ///   Blksize     = net_port (u64) — for ListFilers discovery
+    ///   Limit       = shard_count (u64)
+    ///   ShardIdList = packed u64 LE array of shard ids (bytes)
+    ///
     /// Response TLV (多 Zone):
     ///   Entries(zone_count) + [ZoneId + Limit(vol_count) + [VolumeId + Owner(addr) + Size + UsedSpace] × N] × M
     async fn handle_register_filer(
@@ -557,6 +570,12 @@ impl MasterNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let filer_id = dec.next_string(FieldId::Owner).unwrap_or_default();
+        // Filer node discovery fields (optional for backward compat — old clients
+        // that only send Owner will skip node registration, but zone allocation still works)
+        let filer_addr = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
+        let net_port = dec.next_u64(FieldId::Blksize).unwrap_or(0) as u32;
+        let shard_count = dec.next_u64(FieldId::Limit).unwrap_or(0);
+        let shard_ids_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
 
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
@@ -582,6 +601,31 @@ impl MasterNetHandler {
                 enc.into_bytes(),
                 Vec::new(),
             ));
+        }
+
+        // Register filer node for ListFilers discovery (replaces gRPC RegisterFiler).
+        // Only register if the filer provided discovery info (addr + shard_ids).
+        if !filer_addr.is_empty() && !filer_id.is_empty() {
+            let shard_ids: Vec<u64> = shard_ids_blob
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                .collect();
+            let filer_info = crate::master::FilerNodeInfo {
+                node_id: filer_id.clone(),
+                address: filer_addr.clone(),
+                grpc_port: 0, // gRPC being removed; not used by TLV clients
+                http_port: 0,
+                net_port,
+                is_healthy: true,
+                leader_count: 0,
+                total_shards: shard_count,
+                shard_ids,
+            };
+            self.master.register_filer(filer_info);
+            info!(
+                "NET_REGISTER_FILER: registered filer node id={}, addr={}, net_port={}",
+                filer_id, filer_addr, net_port
+            );
         }
 
         info!(
@@ -665,72 +709,82 @@ impl MasterNetHandler {
         ))
     }
 
-    /// Helper: build a response message
-    fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
-        let flags = FrameFlags::new(FrameFlags::RESPONSE);
-        let header = powerfs_net::FrameHeader::new(
-            msg.header.msg_type,
-            flags,
-            msg.header.seq,
-            (body.len() + data.len()) as u32,
-        )
-        .with_status(status);
-        NetMessage::new(header).with_body(body).with_data(data)
-    }
-}
-
-#[async_trait::async_trait]
-impl PowerFsNetHandler for MasterNetHandler {
-    async fn handle_request(
+    /// Handle Raft inter-node message (MsgType::RaftMessage).
+    ///
+    /// Replaces the gRPC RaftService::send_raft_message RPC.
+    /// Decodes the TLV body (ShardId + RaftPayload), deserializes the
+    /// protobuf eraftpb::Message, and steps it into the local Raft node.
+    ///
+    /// The Master runs a single (non-sharded) Raft group, so `ShardId` is
+    /// accepted for protocol parity with the Filer but ignored (default 0).
+    ///
+    /// Request TLV:
+    ///   ShardId     = shard id (u64, ignored by Master, default 0)
+    ///   RaftPayload = serialized eraftpb::Message (bytes)
+    /// Response: STATUS_OK (empty body) or STATUS_ERR_SERVER_ERROR (error string).
+    async fn handle_raft_message(
         &self,
-        client_id: u64,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        let msg_type = msg
-            .msg_type()
-            .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_val = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let payload = dec.next_bytes(FieldId::RaftPayload).unwrap_or_default();
+
+        if payload.is_empty() {
+            warn!(
+                "MASTER_RAFT: received empty RaftPayload for shard {}",
+                shard_id_val
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                b"empty raft payload".to_vec(),
+                Vec::new(),
+            ));
+        }
+
+        let mut raft_msg = raft::eraftpb::Message::new();
+        if let Err(e) = ProtoMessage::merge_from_bytes(&mut raft_msg, &payload) {
+            warn!("MASTER_RAFT: failed to deserialize Raft message: {}", e);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                format!("failed to deserialize: {}", e).into_bytes(),
+                Vec::new(),
+            ));
+        }
 
         debug!(
-            "NET_MASTER: handling request {:?}, client_id={}, seq={}",
-            msg_type, client_id, msg.header.seq
+            "MASTER_RAFT: received raft message (type={:?}, to={}, from={})",
+            raft_msg.msg_type, raft_msg.to, raft_msg.from
         );
 
-        match msg_type {
-            MsgType::Assign => self.handle_assign(msg).await,
-            MsgType::LookupVolume => self.handle_lookup_volume(msg).await,
-            MsgType::Heartbeat => self.handle_heartbeat(msg).await,
-            MsgType::KeepConnected => self.handle_keep_connected(msg).await,
-            MsgType::GetTopology => self.handle_get_topology(msg).await,
-            MsgType::RegisterFiler => self.handle_register_filer(msg).await,
-            MsgType::ListFilers => self.handle_list_filers(msg).await,
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
+        let step_tx = self.master.raft_step_tx();
+        match step_tx.send(raft_msg).await {
+            Ok(_) => {
+                debug!("MASTER_RAFT: stepped raft message");
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
             }
-            _ => {
-                warn!("NET_MASTER: unsupported message type {:?}", msg_type);
-                Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
+            Err(e) => {
+                warn!("MASTER_RAFT: failed to step raft message: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    "failed to send message to step channel".to_string().into_bytes(),
+                    Vec::new(),
+                ))
             }
         }
     }
 
-    async fn on_connect(&self, client_id: u64, client_type: powerfs_net::ClientType) {
-        info!(
-            "NET_MASTER: client connected, id={}, type={:?}",
-            client_id, client_type
-        );
-    }
-
-    async fn on_disconnect(&self, client_id: u64) {
-        info!("NET_MASTER: client disconnected, id={}", client_id);
+    /// Helper: build a response message
+    fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
+        NetMessage::response(msg, status, body, data)
     }
 }
 
 #[async_trait::async_trait]
-impl ServerRequestHandler for MasterNetHandler {
+impl NetHandler for MasterNetHandler {
     async fn handle(
         &self,
         ctx: &mut RequestContext,
@@ -756,18 +810,24 @@ impl ServerRequestHandler for MasterNetHandler {
             MsgType::GetTopology => self.handle_get_topology(msg).await,
             MsgType::RegisterFiler => self.handle_register_filer(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
-            }
+            MsgType::RaftMessage => self.handle_raft_message(msg).await,
+            MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
                 warn!("NET_MASTER: unsupported message type {:?}", msg_type);
                 Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
             }
         }
+    }
+
+    async fn on_connect(&self, client_id: u64, client_type: powerfs_net::ClientType) {
+        info!(
+            "NET_MASTER: client connected, id={}, type={:?}",
+            client_id, client_type
+        );
+    }
+
+    async fn on_disconnect(&self, client_id: u64) {
+        info!("NET_MASTER: client disconnected, id={}", client_id);
     }
 }
 

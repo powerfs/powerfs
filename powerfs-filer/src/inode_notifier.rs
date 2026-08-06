@@ -23,10 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use powerfs_net::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage};
-use powerfs_net::serialize::TlvEncoder;
 use powerfs_net::server_connection::ServerConnectionManager;
-use powerfs_net::FieldId;
 
 /// Result type for InodeNotifier operations
 pub type NotifyResult<T> = std::result::Result<T, String>;
@@ -100,7 +97,11 @@ impl InodeNotifier {
 
     /// Notify all subscribers that an inode has changed
     ///
-    /// Builds an Invalidate message and sends it to all subscribed clients.
+    /// Pushes an Invalidate(inode, version) notification to each subscribed
+    /// client via the ServerConnectionManager. The message is built inside
+    /// the net layer, so this module no longer depends on `protocol` or
+    /// `serialize` internals.
+    ///
     /// Returns the number of clients notified successfully.
     pub async fn notify(&self, inode: u64, version: u64) -> usize {
         let client_ids: Vec<u64> = {
@@ -115,13 +116,12 @@ impl InodeNotifier {
             return 0;
         }
 
-        let msg = self.build_invalidate_message(inode, version);
         let mut success_count = 0;
 
         for client_id in client_ids {
             match self
                 .connection_manager
-                .send_notification(client_id, msg.clone())
+                .push_invalidate_notification(client_id, inode, version)
                 .await
             {
                 Ok(true) => {
@@ -159,8 +159,10 @@ impl InodeNotifier {
     /// Used for global events like volume reassignment. Returns the number
     /// of clients notified.
     pub async fn broadcast(&self, inode: u64, version: u64) -> usize {
-        let msg = self.build_invalidate_message(inode, version);
-        let count = self.connection_manager.broadcast_notification(&msg).await;
+        let count = self
+            .connection_manager
+            .broadcast_invalidate_notification(inode, version)
+            .await;
         log::debug!(
             "InodeNotifier: broadcast Invalidate(inode={}, v={}) to {} clients",
             inode,
@@ -168,23 +170,6 @@ impl InodeNotifier {
             count
         );
         count
-    }
-
-    /// Build an Invalidate message for the given inode and version
-    fn build_invalidate_message(&self, inode: u64, version: u64) -> NetMessage {
-        let mut enc = TlvEncoder::new();
-        enc.add_u64(FieldId::Ino, inode);
-        enc.add_u64(FieldId::Version, version);
-        let body = enc.into_bytes();
-
-        let header = FrameHeader::new(
-            MsgType::Invalidate.as_u16(),
-            FrameFlags::new(FrameFlags::NOTIFY),
-            0,                 // seq is not used for NOTIFY
-            body.len() as u32, // CRITICAL: must match actual body length
-        );
-
-        NetMessage::new(header).with_body(body)
     }
 
     /// Get the number of subscribers for an inode
@@ -247,15 +232,30 @@ mod tests {
         assert_eq!(notifier.subscriber_count(1), 1); // client 200 still there
     }
 
-    #[test]
-    fn test_build_invalidate_message() {
+    #[tokio::test]
+    async fn test_notify_no_subscribers() {
         let mgr = Arc::new(ServerConnectionManager::new());
         let notifier = InodeNotifier::new(mgr);
 
-        let msg = notifier.build_invalidate_message(42, 100);
+        // No subscribers → notify is a no-op returning 0.
+        assert_eq!(notifier.notify(42, 100).await, 0);
+        assert_eq!(notifier.broadcast(42, 100).await, 0);
+    }
 
-        assert_eq!(msg.msg_type(), Some(MsgType::Invalidate));
-        assert!(msg.header.flags & FrameFlags::NOTIFY != 0);
-        assert!(!msg.body.is_empty());
+    #[tokio::test]
+    async fn test_notify_drops_disconnected_subscriber() {
+        let mgr = Arc::new(ServerConnectionManager::new());
+        let notifier = InodeNotifier::new(mgr);
+
+        // Subscribe a client that has no live notification channel. The
+        // high-level push_invalidate_notification returns Err, and notify
+        // should clean up the stale subscription.
+        notifier.subscribe(42, 100);
+        assert_eq!(notifier.subscriber_count(42), 1);
+
+        let delivered = notifier.notify(42, 100).await;
+        assert_eq!(delivered, 0);
+        // Stale subscription should have been removed by the Err path.
+        assert_eq!(notifier.subscriber_count(42), 0);
     }
 }

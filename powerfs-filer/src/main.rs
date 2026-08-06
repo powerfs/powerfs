@@ -11,15 +11,13 @@ use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventPr
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
 use powerfs_master::volume_client::VolumeClientPool;
-use powerfs_master::resilient_client::ResilientMasterClient;
-use powerfs_master::proto::powerfs::RegisterFilerRequest;
 
 use powerfs_filer::{
     BucketManager, EntryManager, FilerMetaServiceImpl, FilerNetHandler, FilerServer,
     MetaShardManager, MetadataStore, RaftGroupManager, S3Handler, ShardId, ShardScheduler,
     ShardStrategy, VolumeRouter,
 };
-use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -378,18 +376,36 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             inode_notifier,
         ));
 
-        // === P2.3: Zone 注册 (异步, 不阻塞 Filer 启动) ===
-        // 向 Master 注册 Filer, 获取 Zone 分配 (多 Zone: 旧 + 新).
-        // 注册失败不阻止 Filer 启动, 但 handle_create 在 zones 为空时返回 SERVER_ERROR.
-        // 重试机制: Master Raft 选举可能需要几秒, Filer 持续重试直到注册成功.
+        // === P2.3 + Phase A1: Zone 注册 + Filer 节点发现 (异步, 不阻塞 Filer 启动) ===
+        // 向 Master 发送 RegisterFiler TLV 请求, 同时完成:
+        //   1. Zone 分配 (获取 needle_id 空间 + 物理 volume 列表)
+        //   2. Filer 节点发现注册 (供 kernel ListFilers 使用, 替代旧 gRPC RegisterFiler)
+        //
+        // 持续重试 + 周期性重注册 (60s 心跳):
+        //   - 首次注册失败: 5 秒后重试 (Master Raft 选举可能需要几秒)
+        //   - 注册成功: 60 秒后重新注册 (保持心跳, 应对 Master leader 切换后 filer_nodes 丢失)
+        //   - Zone 的 physical_volumes 为空 (Volume 心跳未到达) 也视为失败并重试
         {
             let net_handler_for_zone = net_handler.clone();
             let master_addrs_for_zone = master_addresses.clone();
             let master_net_port = filer_cfg.master_net_port;
             let filer_raft_id = filer_cfg.raft_id;
+            let shard_count = filer_cfg.shard_count as u64;
+            let net_port_for_reg = net_port;
+            // Filer 的可到达地址 (供 kernel 通过 ListFilers 发现本 Filer)
+            let advertise_addr_for_reg = format!("{}:{}", advertise_ip, net_port);
 
             tokio::spawn(async move {
                 let filer_id = format!("filer-{}", filer_raft_id);
+                let shard_ids: Vec<u64> = (0..shard_count).collect();
+
+                let registration = powerfs_filer::zone_client::FilerNodeRegistration {
+                    filer_id: filer_id.clone(),
+                    advertise_addr: advertise_addr_for_reg.clone(),
+                    net_port: net_port_for_reg as u32,
+                    shard_count,
+                    shard_ids,
+                };
 
                 // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
                 let master_net_addrs: Vec<String> = master_addrs_for_zone
@@ -401,23 +417,25 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     .collect();
 
                 info!(
-                    "FILER_ZONE: registering with Master (filer_id={}, net_addrs={:?})",
-                    filer_id, master_net_addrs
+                    "FILER_ZONE: registering with Master (filer_id={}, net_addrs={:?}, advertise={})",
+                    filer_id, master_net_addrs, advertise_addr_for_reg
                 );
 
-                // 重试循环: Master Raft 选举期间可能返回 REDIRECT 循环或 NOT_LEADER,
-                // 持续重试直到成功. 间隔 5 秒, 避免刷屏日志.
-                // 同时: 如果 Zone 的 physical_volumes 为空 (Volume 心跳未到达),
-                // 也视为失败并重试.
                 const RETRY_INTERVAL_SECS: u64 = 5;
+                const HEARTBEAT_INTERVAL_SECS: u64 = 60;
                 let mut attempt: u64 = 0;
+                let mut zones_recovered = false;
+
                 loop {
                     attempt += 1;
                     let mut registered = false;
 
                     for master_addr in &master_net_addrs {
-                        match powerfs_filer::zone_client::register_filer(master_addr, &filer_id)
-                            .await
+                        match powerfs_filer::zone_client::register_filer(
+                            master_addr,
+                            &registration,
+                        )
+                        .await
                         {
                             Ok(zones) => {
                                 // 检查是否所有 Zone 都有物理 volume
@@ -439,20 +457,26 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                                 );
                                 net_handler_for_zone.set_zones(zones);
 
-                                // P2.5: 从 chunk 映射恢复每个 Zone 的 counter, 避免 needle_id 重复
-                                let chunks = net_handler_for_zone
-                                    .meta_shard_manager
-                                    .list_all_chunks();
-                                let zone_ids = net_handler_for_zone.get_zones();
-                                for zone_id in zone_ids {
-                                    let recovered = powerfs_filer::zone_client::recover_counter(
-                                        zone_id, &chunks,
-                                    );
-                                    net_handler_for_zone.set_zone_counter(zone_id, recovered);
-                                    info!(
-                                        "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",
-                                        zone_id, recovered, chunks.len()
-                                    );
+                                // P2.5: 首次成功注册后, 从 chunk 映射恢复每个 Zone 的 counter
+                                // (只在第一次注册成功时执行, 后续重注册不需要)
+                                if !zones_recovered {
+                                    let chunks = net_handler_for_zone
+                                        .meta_shard_manager
+                                        .list_all_chunks();
+                                    let zone_ids = net_handler_for_zone.get_zones();
+                                    for zone_id in zone_ids {
+                                        let recovered =
+                                            powerfs_filer::zone_client::recover_counter(
+                                                zone_id,
+                                                &chunks,
+                                            );
+                                        net_handler_for_zone.set_zone_counter(zone_id, recovered);
+                                        info!(
+                                            "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",
+                                            zone_id, recovered, chunks.len()
+                                        );
+                                    }
+                                    zones_recovered = true;
                                 }
 
                                 registered = true;
@@ -468,26 +492,26 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     }
 
                     if registered {
-                        return; // 注册成功, 退出重试循环
+                        // 注册成功: 60 秒后重新注册 (心跳, 应对 Master leader 切换)
+                        attempt = 0; // 重置 attempt 计数
+                        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
+                            .await;
+                    } else {
+                        warn!(
+                            "FILER_ZONE: all master attempts failed (attempt={}), retrying in {}s...",
+                            attempt, RETRY_INTERVAL_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
+                            .await;
                     }
-
-                    warn!(
-                        "FILER_ZONE: all master attempts failed (attempt={}), retrying in {}s...",
-                        attempt, RETRY_INTERVAL_SECS
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS)).await;
                 }
             });
         }
 
-        // Wrap with ManagedNetHandler for session management + middleware
-        let managed_handler = Arc::new(ManagedNetHandler::from_arc(
-            net_manager.clone(),
-            net_handler,
-        ));
+        let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
         if let Ok(net_server) =
-            PowerFsNetServer::bind_with_manager(&bind_ip, net_port, managed_handler, net_manager)
+            PowerFsNetServer::bind_with_manager(&bind_ip, net_port, net_handler, net_manager)
                 .await
         {
             tokio::spawn(async move {
@@ -508,106 +532,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     }
     info!("Connected to master(s): {:?}", master_addresses);
 
-    /* 向 Master 注册 filer 节点信息 (供内核 discover_filers 使用).
-     *
-     * 注册地址确定优先级:
-     *   1. filer.advertise_addr (配置显式指定)
-     *   2. filer.ip (若非 0.0.0.0/::)
-     *   3. raft_peers[raft_id-1] 的 IP 部分 (从 raft 集群配置推导)
-     *
-     * 使用 ResilientMasterClient 自动处理 leader 发现和 failover.
-     * 注册失败不阻止 filer 启动 (内核会回退到手动 filer_addr). */
-    {
-        let advertise_ip = filer_cfg.advertise_addr.as_deref()
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| {
-                filer_cfg.ip.as_ref()
-                    .filter(|ip| !ip.is_empty() && ip.as_str() != "0.0.0.0" && ip.as_str() != "::")
-                    .cloned()
-            })
-            .or_else(|| {
-                /* 从 raft_peers 推导: raft_id 从 1 开始, peers 列表按 id 排序 */
-                let idx = filer_cfg.raft_id.checked_sub(1)? as usize;
-                let peer = filer_cfg.raft_peers.get(idx)?;
-                let ip_part = peer.rfind(':').map(|i| &peer[..i]).unwrap_or(peer);
-                Some(ip_part.to_string())
-            });
-
-        if let Some(ref adv_ip) = advertise_ip {
-            let shard_ids: Vec<u64> = (0..filer_cfg.shard_count as u64).collect();
-            let node_id_str = format!("filer-{}", filer_cfg.raft_id);
-
-            info!("Registering with Master: addr={}, net_port={}, shard_count={}",
-                  adv_ip, net_port, filer_cfg.shard_count);
-
-            let adv_ip_clone = adv_ip.clone();
-            let master_addrs_clone = master_addresses.clone();
-            let node_id_clone = node_id_str.clone();
-            let shard_ids_clone = shard_ids.clone();
-            tokio::spawn(async move {
-                /* 周期性向 Master 注册 filer 信息 (心跳机制).
-                 *
-                 * 设计原因:
-                 *   1. Master 的 filer_nodes 是内存态 (非 Raft 复制), leader 切换后
-                 *      新 leader 没有 filer 注册信息, 需要 filer 重新注册.
-                 *   2. Master 重启后 filer_nodes 也会丢失, 需要周期性恢复.
-                 *   3. 启动时 Master 可能还在 raft 选举中, 注册会失败, 需要重试.
-                 *
-                 * 策略:
-                 *   - 首次注册失败: 10 秒后重试 (快速恢复)
-                 *   - 注册成功: 60 秒后重新注册 (保持心跳, 应对 leader 切换)
-                 *   - 使用 ResilientMasterClient 自动处理 leader 发现和 failover */
-                match ResilientMasterClient::new(master_addrs_clone) {
-                    Ok(client) => {
-                        let req = RegisterFilerRequest {
-                            node_id: node_id_clone,
-                            address: adv_ip_clone,
-                            grpc_port: grpc_port as u32,
-                            http_port: port as u32,
-                            shard_count: shard_ids_clone.len() as u64,
-                            shard_ids: shard_ids_clone,
-                            net_port: net_port as u32,
-                        };
-
-                        loop {
-                            let result = client.call({
-                                let req = req.clone();
-                                move |mut c| {
-                                    let req = req.clone();
-                                    async move {
-                                        c.register_filer(tonic::Request::new(req)).await
-                                    }
-                                }
-                            }).await;
-
-                            match result {
-                                Ok(resp) => {
-                                    let inner = resp.into_inner();
-                                    if inner.success {
-                                        info!("Filer registered with Master successfully (will re-register in 60s)");
-                                        tokio::time::sleep(Duration::from_secs(60)).await;
-                                    } else {
-                                        warn!("Master rejected filer registration: {} (retry in 10s)", inner.error);
-                                        tokio::time::sleep(Duration::from_secs(10)).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Filer registration to Master failed (retry in 10s): {}", e);
-                                    tokio::time::sleep(Duration::from_secs(10)).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to create ResilientMasterClient for filer registration: {}", e);
-                    }
-                }
-            });
-        } else {
-            warn!("Could not determine filer advertise address; skipping Master registration. Set filer.advertise_addr in config to enable filer discovery.");
-        }
-    }
+    // Phase A1: Filer 节点发现注册已合并到上面的 TLV RegisterFiler 循环中
+    // (Zone 注册 + 节点发现 + 60s 心跳重注册, 替代旧 gRPC ResilientMasterClient).
 
     filer_server.serve().await?;
 

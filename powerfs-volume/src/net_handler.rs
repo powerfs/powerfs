@@ -3,8 +3,8 @@ use log::{debug, error, info, warn};
 use powerfs_common::types::{NeedleId, VolumeId};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, FrameFlags, MsgType, NetMessage, PowerFsNetHandler, RequestContext,
-    ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    FieldId, MsgType, NetMessage, NetHandler, RequestContext, STATUS_ERR_NOT_FOUND,
+    STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,7 +66,14 @@ impl VolumeNetHandler {
         let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
         // inode for lease validation (lease is registered by inode, not file_key)
         let inode = dec.next_u64(FieldId::Inode).unwrap_or(file_key);
-        let data = dec.next_bytes(FieldId::DataLen).unwrap_or_default();
+        // Data is sent in the frame's data segment (not in TLV body).
+        // The kernel client sends data via the data segment; fall back to
+        // DataLen TLV field for backward compatibility with older clients.
+        let data = if !msg.data.is_empty() {
+            msg.data.clone()
+        } else {
+            dec.next_bytes(FieldId::DataLen).unwrap_or_default()
+        };
         let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
         let holder_client_id = dec
             .next_string(FieldId::ClientId)
@@ -758,46 +765,37 @@ impl VolumeNetHandler {
     }
 
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
-        let flags = FrameFlags::new(FrameFlags::RESPONSE);
-        let header = powerfs_net::FrameHeader::new(
-            msg.header.msg_type,
-            flags,
-            msg.header.seq,
-            (body.len() + data.len()) as u32,
-        )
-        .with_status(status);
-        NetMessage::new(header).with_body(body).with_data(data)
+        NetMessage::response(msg, status, body, data)
     }
 }
 
 #[async_trait::async_trait]
-impl PowerFsNetHandler for VolumeNetHandler {
-    async fn handle_request(
+impl NetHandler for VolumeNetHandler {
+    async fn handle(
         &self,
-        client_id: u64,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
-    ) -> Result<NetMessage, powerfs_net::NetError> {
+    ) -> powerfs_net::NetResult<NetMessage> {
         let msg_type = msg
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
-        info!(
-            "NET_VOLUME: handling request {:?} (raw={}), client_id={}, seq={}",
-            msg_type, msg.header.msg_type, client_id, msg.header.seq
-        );
-
-        let is_lookup = matches!(msg_type, MsgType::LookupVolume);
-        info!(
-            "NET_VOLUME: is_lookup_volume={}, msg_type_as_u16={}",
-            is_lookup,
-            msg_type.as_u16()
+        debug!(
+            "NET_VOLUME: handling request {:?}, trace={}, client_id={}, seq={}",
+            msg_type,
+            ctx.trace_id(),
+            ctx.client.client_id,
+            msg.header.seq
         );
 
         match msg_type {
-            MsgType::WriteNeedle => self.handle_write_needle(msg, client_id).await,
+            MsgType::WriteNeedle => self.handle_write_needle(msg, ctx.client.client_id).await,
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => self.handle_batch_write_needle(msg, client_id).await,
+            MsgType::BatchWriteNeedle => {
+                self.handle_batch_write_needle(msg, ctx.client.client_id)
+                    .await
+            }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::AcquireLease => self.handle_acquire_lease(msg),
@@ -806,13 +804,7 @@ impl PowerFsNetHandler for VolumeNetHandler {
             MsgType::RenewLease => self.handle_renew_lease(msg),
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::StatFs => Ok(self.handle_statfs(msg)),
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
-            }
+            MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
                 warn!("NET_VOLUME: unsupported message type {:?}", msg_type);
                 Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
@@ -854,56 +846,6 @@ impl PowerFsNetHandler for VolumeNetHandler {
                 "NET_VOLUME: released {} total leases for disconnected client={}",
                 total_removed, client_id
             );
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ServerRequestHandler for VolumeNetHandler {
-    async fn handle(
-        &self,
-        ctx: &mut RequestContext,
-        msg: &NetMessage,
-    ) -> powerfs_net::NetResult<NetMessage> {
-        let msg_type = msg
-            .msg_type()
-            .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
-
-        debug!(
-            "NET_VOLUME: handling request {:?}, trace={}, client_id={}, seq={}",
-            msg_type,
-            ctx.trace_id(),
-            ctx.client.client_id,
-            msg.header.seq
-        );
-
-        match msg_type {
-            MsgType::WriteNeedle => self.handle_write_needle(msg, ctx.client.client_id).await,
-            MsgType::ReadNeedle => self.handle_read_needle(msg).await,
-            MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
-            MsgType::BatchWriteNeedle => {
-                self.handle_batch_write_needle(msg, ctx.client.client_id)
-                    .await
-            }
-            MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
-            MsgType::RangeLease => self.handle_range_lease(msg),
-            MsgType::AcquireLease => self.handle_acquire_lease(msg),
-            MsgType::AcquireLeaseBatch => self.handle_acquire_lease_batch(msg),
-            MsgType::ReleaseLease => self.handle_release_lease(msg),
-            MsgType::RenewLease => self.handle_renew_lease(msg),
-            MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
-            MsgType::StatFs => Ok(self.handle_statfs(msg)),
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
-            }
-            _ => {
-                warn!("NET_VOLUME: unsupported message type {:?}", msg_type);
-                Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
-            }
         }
     }
 }

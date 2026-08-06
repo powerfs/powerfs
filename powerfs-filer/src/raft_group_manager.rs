@@ -1,6 +1,8 @@
 use bytes;
 use log::{debug, error, info, warn};
 use powerfs_common::raft::RocksDbRaftStorage;
+use powerfs_net::serialize::TlvEncoder;
+use powerfs_net::FieldId;
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeType, Message as RaftMessage};
 use raft::storage::Storage;
@@ -12,10 +14,6 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tonic::transport::Channel;
-
-use crate::powerfs::filer_meta_service_client::FilerMetaServiceClient;
-use crate::powerfs::RaftMessageRequest;
 
 const SNAPSHOT_THRESHOLD: u64 = 10000;
 
@@ -815,7 +813,6 @@ pub struct RaftGroupManager {
     message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
     apply_tx: mpsc::Sender<ApplyEntry>,
     peers: RwLock<HashMap<u64, Peer>>,
-    filer_channels: RwLock<HashMap<String, Channel>>,
 }
 
 impl RaftGroupManager {
@@ -835,7 +832,6 @@ impl RaftGroupManager {
             message_tx,
             apply_tx,
             peers: RwLock::new(HashMap::new()),
-            filer_channels: RwLock::new(HashMap::new()),
         }
     }
 
@@ -853,84 +849,73 @@ impl RaftGroupManager {
         info!("Registered peer: id={}", peer_id);
     }
 
-    /// Get peer address by ID
-    pub async fn get_peer_address(&self, peer_id: u64) -> Option<String> {
+    /// Get peer's powerfs-net address (ip:net_port) by ID.
+    /// Used for TLV Raft message transport (replaces gRPC address).
+    pub async fn get_peer_net_address(&self, peer_id: u64) -> Option<String> {
         let peers = self.peers.read().await;
-        peers.get(&peer_id).map(|p| p.address.clone())
+        peers.get(&peer_id).map(|p| p.net_address.clone())
     }
 
-    /// Send a Raft message to a peer via gRPC
+    /// Send a Raft message to a peer via TLV (MsgType::RaftMessage).
+    ///
+    /// Replaces the gRPC FilerMetaService::send_raft_message RPC.
+    /// Uses the unified `powerfs_net::call_once` transport (Layer A):
+    /// connect → handshake → send TLV frame → read response.
+    /// Each message is independent — no channel caching needed because
+    /// Raft messages are low-frequency.
     async fn send_raft_message_to_peer(
         &self,
-        peer_address: &str,
+        peer_net_addr: &str,
         shard_id: ShardId,
         message: &RaftMessage,
     ) {
-        let channel = match self.get_or_create_filer_channel(peer_address).await {
-            Ok(ch) => ch,
-            Err(e) => {
-                error!("Failed to get channel for peer {}: {}", peer_address, e);
-                return;
-            }
-        };
-
-        let mut buf = Vec::new();
-        if let Err(e) = message.write_to_vec(&mut buf) {
+        // Serialize the Raft message (protobuf eraftpb::Message)
+        let mut payload = Vec::new();
+        if let Err(e) = message.write_to_vec(&mut payload) {
             error!("Failed to serialize Raft message: {}", e);
             return;
         }
 
-        let mut client = FilerMetaServiceClient::new(channel);
-        let request = RaftMessageRequest {
-            shard_id: shard_id.0,
-            message: buf,
-        };
+        // Build TLV body: ShardId + RaftPayload
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::ShardId, shard_id.0);
+        let _ = enc.add_bytes(FieldId::RaftPayload, &payload);
+        let body = enc.into_bytes();
 
-        match client.send_raft_message(tonic::Request::new(request)).await {
-            Ok(_) => {
+        let client_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        match powerfs_net::call_once(
+            peer_net_addr,
+            powerfs_net::ClientType::Filer,
+            client_id,
+            powerfs_net::MsgType::RaftMessage,
+            &body,
+        )
+        .await
+        {
+            Ok(reply) if reply.is_ok() => {
                 debug!(
                     "Raft message sent to peer {} for shard {}",
-                    peer_address, shard_id.0
+                    peer_net_addr, shard_id.0
+                );
+            }
+            Ok(reply) => {
+                warn!(
+                    "Failed to send Raft message to peer {}: status={:#06x}: {}",
+                    peer_net_addr,
+                    reply.status,
+                    reply.body_str()
                 );
             }
             Err(e) => {
                 warn!(
                     "Failed to send Raft message to peer {}: {}",
-                    peer_address, e
+                    peer_net_addr, e
                 );
-                // Invalidate the channel so we try to reconnect next time
-                let mut channels = self.filer_channels.write().await;
-                channels.remove(peer_address);
             }
         }
-    }
-
-    /// Get or create a gRPC channel to a Filer peer
-    async fn get_or_create_filer_channel(&self, peer_address: &str) -> Result<Channel, String> {
-        {
-            let channels = self.filer_channels.read().await;
-            if let Some(ch) = channels.get(peer_address) {
-                return Ok(ch.clone());
-            }
-        }
-
-        info!("Creating new channel to filer peer: {}", peer_address);
-        let grpc_addr = format!("http://{}", peer_address);
-        let endpoint = Channel::from_shared(grpc_addr)
-            .map_err(|e| format!("invalid address: {}", e))?
-            .connect_timeout(Duration::from_secs(3));
-
-        // Wrap with explicit timeout as a safety net
-        let channel = tokio::time::timeout(Duration::from_secs(5), endpoint.connect())
-            .await
-            .map_err(|_| "connection timed out".to_string())?
-            .map_err(|e| format!("failed to connect: {}", e))?;
-
-        let mut channels = self.filer_channels.write().await;
-        channels.insert(peer_address.to_string(), channel.clone());
-
-        info!("Successfully connected to filer peer: {}", peer_address);
-        Ok(channel)
     }
 
     /// Start the Raft message transmission loop
@@ -946,7 +931,7 @@ impl RaftGroupManager {
             info!("Raft message transmitter started");
 
             while let Ok(outgoing) = message_rx.recv().await {
-                let peer_address = match self.get_peer_address(outgoing.to_id).await {
+                let peer_net_addr = match self.get_peer_net_address(outgoing.to_id).await {
                     Some(addr) => addr,
                     None => {
                         warn!("Peer {} not found for Raft message", outgoing.to_id);
@@ -968,7 +953,7 @@ impl RaftGroupManager {
                 let self_clone = self.clone();
                 tokio::spawn(async move {
                     self_clone
-                        .send_raft_message_to_peer(&peer_address, outgoing.shard_id, &msg)
+                        .send_raft_message_to_peer(&peer_net_addr, outgoing.shard_id, &msg)
                         .await;
                 });
             }

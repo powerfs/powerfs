@@ -341,12 +341,14 @@ impl PowerFsNetClient {
                     }
                 };
 
-                // Read body + data (header.data_len covers both body and data segments)
-                let data_len = header.data_len as usize;
-                let mut all_data = Vec::with_capacity(data_len);
-                if data_len > 0 {
-                    all_data.resize(data_len, 0u8);
-                    if let Err(e) = reader.read_exact(&mut all_data).await {
+                // Read body + data (header.data_len = body_len + data segment len)
+                let total_len = header.data_len as usize;
+                let body_len = header.body_len as usize;
+
+                let mut payload = Vec::with_capacity(total_len);
+                if total_len > 0 {
+                    payload.resize(total_len, 0u8);
+                    if let Err(e) = reader.read_exact(&mut payload).await {
                         warn!("recv_loop: data read error: {:?}", e);
                         *connected.lock() = false;
                         // Notify all pending requests of the error
@@ -355,7 +357,12 @@ impl PowerFsNetClient {
                     }
                 }
 
-                let message = NetMessage::new(header).with_body(all_data);
+                let body = payload[..body_len].to_vec();
+                let data = payload[body_len..].to_vec();
+
+                let message = NetMessage::new(header)
+                    .with_body(body)
+                    .with_data(data);
 
                 let seq = message.header.seq;
 

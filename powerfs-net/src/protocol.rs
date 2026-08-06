@@ -77,6 +77,9 @@ pub enum ClientType {
     Fuse = 0x01,
     Kernel = 0x02,
     Admin = 0x03,
+    Volume = 0x04,
+    Filer = 0x05,
+    Master = 0x06,
 }
 
 impl ClientType {
@@ -85,6 +88,9 @@ impl ClientType {
             0x01 => Some(Self::Fuse),
             0x02 => Some(Self::Kernel),
             0x03 => Some(Self::Admin),
+            0x04 => Some(Self::Volume),
+            0x05 => Some(Self::Filer),
+            0x06 => Some(Self::Master),
             _ => None,
         }
     }
@@ -215,14 +221,15 @@ impl HandshakeResponse {
 /// Frame header (28 bytes)
 ///
 /// Layout:
-///   magic: 4B   - "PFSN"
-///   version: 1B - Protocol version
-///   flags: 1B   - FrameFlags
-///   seq: 4B     - Sequence number
+///   magic: 4B    - "PFSN"
+///   version: 1B  - Protocol version
+///   flags: 1B    - FrameFlags
+///   seq: 4B      - Sequence number
 ///   msg_type: 2B - Message type
-///   status: 2B  - Response status code (0=OK)
+///   status: 2B   - Response status code (0=OK)
 ///   data_len: 4B - Total data length (body + data segment)
-///   reserved: 6B - Reserved for future use
+///   body_len: 4B - Body segment length (data segment = data_len - body_len)
+///   reserved: 2B - Reserved for future use
 ///   header_crc: 4B - CRC32C of header (fields before this)
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
@@ -233,7 +240,8 @@ pub struct FrameHeader {
     pub msg_type: u16,
     pub status: u16,
     pub data_len: u32,
-    pub reserved: [u8; 6],
+    pub body_len: u32,
+    pub reserved: [u8; 2],
     pub header_crc: u32,
 }
 
@@ -249,11 +257,21 @@ impl FrameHeader {
             msg_type,
             status: 0,
             data_len,
-            reserved: [0u8; 6],
+            body_len: 0,
+            reserved: [0u8; 2],
             header_crc: 0,
         };
         hdr.header_crc = hdr.calc_header_crc();
         hdr
+    }
+
+    /// Set body_len and data_len, then recompute CRC.
+    /// Called by build_frame before encoding to ensure body/data boundary
+    /// is correctly recorded in the header.
+    pub fn set_body_data_len(&mut self, body_len: u32, data_len: u32) {
+        self.body_len = body_len;
+        self.data_len = data_len;
+        self.header_crc = self.calc_header_crc();
     }
 
     pub fn with_status(mut self, status: u16) -> Self {
@@ -277,6 +295,7 @@ impl FrameHeader {
         crc = crc32c::crc32c_append(crc, &self.msg_type.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.status.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.data_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, &self.body_len.to_le_bytes());
         crc = crc32c::crc32c_append(crc, &self.reserved);
         crc
     }
@@ -298,7 +317,8 @@ impl FrameHeader {
         buf[10..12].copy_from_slice(&self.msg_type.to_le_bytes());
         buf[12..14].copy_from_slice(&self.status.to_le_bytes());
         buf[14..18].copy_from_slice(&self.data_len.to_le_bytes());
-        buf[18..24].copy_from_slice(&self.reserved);
+        buf[18..22].copy_from_slice(&self.body_len.to_le_bytes());
+        buf[22..24].copy_from_slice(&self.reserved);
         buf[24..28].copy_from_slice(&self.header_crc.to_le_bytes());
     }
 
@@ -319,7 +339,8 @@ impl FrameHeader {
             msg_type: u16::from_le_bytes(buf[10..12].try_into().ok()?),
             status: u16::from_le_bytes(buf[12..14].try_into().ok()?),
             data_len: u32::from_le_bytes(buf[14..18].try_into().ok()?),
-            reserved: buf[18..24].try_into().ok()?,
+            body_len: u32::from_le_bytes(buf[18..22].try_into().ok()?),
+            reserved: buf[22..24].try_into().ok()?,
             header_crc: u32::from_le_bytes(buf[24..28].try_into().ok()?),
         };
         if !hdr.verify_crc() {
@@ -411,6 +432,12 @@ pub enum MsgType {
     RenewLease = 0x0082,
     LeaseStatus = 0x0083,
     AcquireLeaseBatch = 0x0084,
+
+    // Raft inter-node operations
+    /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
+    /// to the peer that leads the target shard group.
+    /// Request: ShardId + RaftPayload. Response: STATUS_OK / STATUS_ERR.
+    RaftMessage = 0x0090,
 }
 
 impl MsgType {
@@ -466,6 +493,7 @@ impl MsgType {
             0x0082 => Some(Self::RenewLease),
             0x0084 => Some(Self::AcquireLeaseBatch),
             0x0083 => Some(Self::LeaseStatus),
+            0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
     }
@@ -603,6 +631,15 @@ pub enum FieldId {
     FileCount = 0x99,
     /// Zone ID (for RegisterFiler response).
     ZoneId = 0x9A,
+    /// Packed u64 LE array of shard ids (for RegisterFiler request — filer node discovery).
+    ShardIdList = 0x9B,
+    /// Filer advertise address (string, "ip:net_port" — for RegisterFiler request).
+    FilerAddress = 0x9C,
+    /// Volume server powerfs-net port (for Heartbeat — so Master knows the TLV port).
+    NetPort = 0x9D,
+    /// Serialized Raft protocol message (eraftpb::Message protobuf bytes).
+    /// Used by MsgType::RaftMessage for Filer inter-node Raft transport.
+    RaftPayload = 0x9E,
 }
 
 impl FieldId {
@@ -673,6 +710,10 @@ impl FieldId {
             0x98 => Some(Self::UsedSpace),
             0x99 => Some(Self::FileCount),
             0x9A => Some(Self::ZoneId),
+            0x9B => Some(Self::ShardIdList),
+            0x9C => Some(Self::FilerAddress),
+            0x9D => Some(Self::NetPort),
+            0x9E => Some(Self::RaftPayload),
             _ => None,
         }
     }
@@ -713,6 +754,54 @@ impl NetMessage {
         self
     }
 
+    /// Build a response for the given request.
+    ///
+    /// Copies `msg_type` and `seq` from `req`, sets the RESPONSE flag and the
+    /// provided `status`, and attaches the supplied `body` and `data` segments.
+    ///
+    /// Upper-layer handlers should use this instead of reaching into
+    /// `FrameHeader`/`FrameFlags` directly.
+    pub fn response(req: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> Self {
+        let data_len = body.len() as u32 + data.len() as u32;
+        let header = FrameHeader::new(
+            req.header.msg_type,
+            FrameFlags::new(FrameFlags::RESPONSE),
+            req.header.seq,
+            data_len,
+        )
+        .with_status(status);
+        // body_len is recorded at serialization time by `to_frame`, which
+        // calls `set_body_data_len` before encoding so the receiver can
+        // split the payload into body and data segments correctly.
+        let mut msg = Self::new(header);
+        msg.body = body;
+        msg.data = data;
+        msg
+    }
+
+    /// Convenience wrapper for a successful response (STATUS_OK).
+    pub fn ok_response(req: &NetMessage, body: Vec<u8>, data: Vec<u8>) -> Self {
+        Self::response(req, STATUS_OK, body, data)
+    }
+
+    /// Build a server-pushed notification message.
+    ///
+    /// Uses the NOTIFY flag with `seq = 0` (notifications are fire-and-forget)
+    /// and attaches the supplied `body` and `data` segments.
+    pub fn notification(msg_type: MsgType, body: Vec<u8>, data: Vec<u8>) -> Self {
+        let data_len = body.len() as u32 + data.len() as u32;
+        let header = FrameHeader::new(
+            msg_type.as_u16(),
+            FrameFlags::new(FrameFlags::NOTIFY),
+            0,
+            data_len,
+        );
+        let mut msg = Self::new(header);
+        msg.body = body;
+        msg.data = data;
+        msg
+    }
+
     pub fn total_data_len(&self) -> u32 {
         self.body.len() as u32 + self.data.len() as u32
     }
@@ -732,6 +821,24 @@ impl NetMessage {
     pub fn msg_type(&self) -> Option<MsgType> {
         MsgType::from_u16(self.header.msg_type)
     }
+
+    /// Serialize this message to a wire frame (header + body + data).
+    ///
+    /// Sets `body_len` and `data_len` on a cloned header so the receiver
+    /// can split the payload into body and data segments correctly.
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut hdr = self.header.clone();
+        hdr.set_body_data_len(self.body.len() as u32, self.total_data_len());
+
+        let mut frame =
+            Vec::with_capacity(FrameHeader::SIZE + self.body.len() + self.data.len());
+        let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
+        hdr.encode(&mut hdr_buf);
+        frame.extend_from_slice(&hdr_buf);
+        frame.extend_from_slice(&self.body);
+        frame.extend_from_slice(&self.data);
+        frame
+    }
 }
 
 // ============================================================================
@@ -747,7 +854,8 @@ pub fn build_frame(
     data: &[u8],
 ) -> Vec<u8> {
     let data_len = body.len() as u32 + data.len() as u32;
-    let header = FrameHeader::new(msg_type, flags, seq, data_len);
+    let mut header = FrameHeader::new(msg_type, flags, seq, data_len);
+    header.set_body_data_len(body.len() as u32, data_len);
 
     let mut frame = Vec::with_capacity(FrameHeader::SIZE + body.len() + data.len());
     let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
@@ -844,5 +952,80 @@ mod tests {
                 assert_eq!(fid.as_u8(), v);
             }
         }
+    }
+
+    fn make_request_msg(seq: u32, body: &[u8]) -> NetMessage {
+        let header = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            seq,
+            body.len() as u32,
+        );
+        NetMessage::new(header).with_body(body.to_vec())
+    }
+
+    #[test]
+    fn test_response_builder_carries_seq_and_type() {
+        let req = make_request_msg(42, b"req-body");
+        let resp = NetMessage::response(&req, STATUS_OK, b"ok".to_vec(), Vec::new());
+
+        assert!(resp.is_response());
+        assert!(resp.is_ok());
+        assert_eq!(resp.header.seq, 42);
+        assert_eq!(resp.header.msg_type, MsgType::Lookup.as_u16());
+        assert_eq!(resp.body, b"ok");
+        assert!(resp.data.is_empty());
+    }
+
+    #[test]
+    fn test_response_builder_with_error_status() {
+        let req = make_request_msg(7, b"");
+        let resp = NetMessage::response(&req, STATUS_ERR_NOT_FOUND, Vec::new(), Vec::new());
+
+        assert!(resp.is_response());
+        assert!(!resp.is_ok());
+        assert_eq!(resp.header.status, STATUS_ERR_NOT_FOUND);
+        assert_eq!(resp.header.seq, 7);
+    }
+
+    #[test]
+    fn test_ok_response_builder_shorthand() {
+        let req = make_request_msg(99, b"");
+        let resp = NetMessage::ok_response(&req, b"body".to_vec(), b"data".to_vec());
+
+        assert!(resp.is_ok());
+        assert_eq!(resp.body, b"body");
+        assert_eq!(resp.data, b"data");
+        assert_eq!(resp.total_data_len(), 8);
+    }
+
+    #[test]
+    fn test_notification_builder_sets_notify_flag() {
+        let msg = NetMessage::notification(
+            MsgType::Invalidate,
+            b"payload".to_vec(),
+            Vec::new(),
+        );
+
+        assert!(msg.header.is_notify());
+        assert!(!msg.is_request());
+        assert!(!msg.is_response());
+        assert_eq!(msg.header.seq, 0); // notifications are fire-and-forget
+        assert_eq!(msg.msg_type(), Some(MsgType::Invalidate));
+        assert_eq!(msg.body, b"payload");
+    }
+
+    #[test]
+    fn test_notification_builder_roundtrips_through_frame() {
+        // The notification must serialize cleanly so IoLoop can write it
+        // and the FUSE/kernel client can decode the header.
+        let msg = NetMessage::notification(MsgType::TopologyChanged, Vec::new(), Vec::new());
+        let frame = msg.to_frame();
+
+        assert!(frame.len() >= FrameHeader::SIZE);
+        let decoded = FrameHeader::decode(&frame[..FrameHeader::SIZE]).unwrap();
+        assert!(decoded.is_notify());
+        assert_eq!(decoded.msg_type, MsgType::TopologyChanged.as_u16());
+        assert!(decoded.verify_crc());
     }
 }

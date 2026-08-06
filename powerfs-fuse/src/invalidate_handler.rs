@@ -131,22 +131,14 @@ mod tests {
     use super::*;
     use crate::cache::{CachedEntry, ChunkCache};
     use powerfs_net::serialize::TlvEncoder;
-    use powerfs_net::{FrameFlags, FrameHeader};
     use std::collections::HashMap;
 
     fn make_invalidate_msg(inode: u64, version: u64) -> NetMessage {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::Ino, inode);
         enc.add_u64(FieldId::Version, version);
-
-        let header = FrameHeader::new(
-            MsgType::Invalidate.as_u16(),
-            FrameFlags::new(FrameFlags::NOTIFY),
-            0,
-            0,
-        );
-
-        NetMessage::new(header).with_body(enc.into_bytes())
+        let body = enc.into_bytes();
+        NetMessage::notification(MsgType::Invalidate, body, Vec::new())
     }
 
     fn make_test_entry(inode: u64, name: &str, generation: u64) -> CachedEntry {
@@ -239,13 +231,7 @@ mod tests {
         let cache = Arc::new(MetadataCache::new());
         let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
 
-        let header = FrameHeader::new(
-            MsgType::Ping.as_u16(),
-            FrameFlags::new(FrameFlags::NOTIFY),
-            0,
-            0,
-        );
-        let msg = NetMessage::new(header);
+        let msg = NetMessage::notification(MsgType::Ping, Vec::new(), Vec::new());
 
         handler.handle_notification(&msg);
     }

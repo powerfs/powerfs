@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_create() {
-        let body = encode_create_req(1, "hello.txt", 0o644, 1000, 1000).unwrap();
+        let body = encode_create_req(1, "hello.txt", 0o644, 1000, 1000, None).unwrap();
         let (parent_ino, name, mode, uid, gid) = decode_create_req(&body).unwrap();
         assert_eq!(parent_ino, 1);
         assert_eq!(name, "hello.txt");

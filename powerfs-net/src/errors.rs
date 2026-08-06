@@ -39,3 +39,12 @@ pub enum NetError {
 }
 
 pub type NetResult<T> = Result<T, NetError>;
+
+impl NetError {
+    /// Returns true if the error represents a client disconnect (EOF).
+    ///
+    /// Used by IoLoop to distinguish clean disconnects from protocol errors.
+    pub fn is_eof(&self) -> bool {
+        matches!(self, NetError::Protocol(msg) if msg.contains("EOF"))
+    }
+}

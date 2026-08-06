@@ -17,7 +17,8 @@ use powerfs_common::{
 };
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
-use powerfs_net::{ManagedNetHandler, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{FieldId, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::serialize::TlvEncoder;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -263,9 +264,18 @@ impl MasterNode {
         let peer_list: Vec<Peer> = peers
             .into_iter()
             .enumerate()
-            .map(|(i, addr)| Peer {
-                id: (i + 1) as u64,
-                address: addr,
+            .map(|(i, addr)| {
+                // Derive the powerfs-net address (ip:net_port) from the peer's
+                // gRPC address (ip:port) by replacing the port with this node's
+                // `net_port`. All master nodes in the cluster share the same
+                // `net_port`, so this yields the correct TLV endpoint.
+                let peer_ip = addr.split(':').next().unwrap_or(&addr);
+                let net_address = format!("{}:{}", peer_ip, net_port);
+                Peer {
+                    id: (i + 1) as u64,
+                    address: addr,
+                    net_address,
+                }
             })
             .filter(|p| p.id != raft_id)
             .collect();
@@ -418,14 +428,11 @@ impl MasterNode {
                 //    than shipping volume deltas.
                 let net_mgr_opt = master_clone.net_manager.read().unwrap().clone();
                 if let Some(net_mgr) = net_mgr_opt {
-                    let header = powerfs_net::FrameHeader::new(
-                        powerfs_net::MsgType::TopologyChanged.as_u16(),
-                        powerfs_net::FrameFlags::new(powerfs_net::FrameFlags::NOTIFY),
-                        0,
-                        0,
-                    )
-                    .with_status(powerfs_net::STATUS_OK);
-                    let notify_msg = powerfs_net::NetMessage::new(header);
+                    let notify_msg = powerfs_net::NetMessage::notification(
+                        powerfs_net::MsgType::TopologyChanged,
+                        Vec::new(),
+                        Vec::new(),
+                    );
                     let n = net_mgr.broadcast_notification(&notify_msg).await;
                     if n > 0 {
                         debug!(
@@ -2652,13 +2659,12 @@ impl MasterNode {
         let server_address = self.address;
 
         tokio::spawn(async move {
-            let raft_server = crate::raft_server::RaftGrpcServer::new(master_clone.clone());
+            // Phase D: Raft inter-node transport migrated to TLV (MsgType::RaftMessage).
+            // The RaftGrpcServer is no longer registered here; only the MasterService
+            // gRPC server remains (retained for monitoring/admin RPCs).
             let master_server = crate::server::MasterGrpcServer::new(master_clone, kv_cache_clone);
 
             tonic::transport::Server::builder()
-                .add_service(
-                    crate::proto::powerfs::raft_service_server::RaftServiceServer::new(raft_server),
-                )
                 .add_service(
                     crate::proto::powerfs::master_service_server::MasterServiceServer::new(
                         master_server,
@@ -2679,21 +2685,17 @@ impl MasterNode {
             let net_addr = format!("{}:{}", self.address.ip(), net_port);
             let net_handler = Arc::new(crate::net_handler::MasterNetHandler::new(self.clone()));
 
-            // Wrap with ManagedNetHandler for session management + middleware
             let net_manager = Arc::new(ServerConnectionManager::new());
             // Share the manager so the broadcast task can push NOTIFY
             // frames (e.g. VolumeLocation updates) to TLV clients.
             *self.net_manager.write().unwrap() = Some(net_manager.clone());
-            let managed_handler = Arc::new(ManagedNetHandler::from_arc(
-                net_manager.clone(),
-                net_handler,
-            ));
+            let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
             info!("Starting powerfs-net server on {}", net_addr);
             if let Ok(net_server) = PowerFsNetServer::bind_with_manager(
                 &self.address.ip().to_string(),
                 net_port,
-                managed_handler,
+                net_handler,
                 net_manager,
             )
             .await
@@ -2706,39 +2708,68 @@ impl MasterNode {
             }
         }
 
-        // Start Raft message forwarder
+        // Start Raft message forwarder (TLV transport, replaces gRPC RaftService)
         let message_rx = self.message_tx.subscribe();
         let raft_peers = self.peers.clone();
         let my_raft_id = self.raft_id;
 
         tokio::spawn(async move {
-            let raft_client = crate::raft_client::RaftGrpcClient::new(3, 1000);
             let mut message_rx = message_rx;
 
             info!(
-                "RAFT_DEBUG: Raft message forwarder started for node {}",
+                "RAFT_DEBUG: Raft message forwarder (TLV) started for node {}",
                 my_raft_id
             );
 
             while let Ok(msg) = message_rx.recv().await {
-                // Find the peer address for this message
+                // Find the peer net address for this message
                 if let Some(peer) = raft_peers.iter().find(|p| p.id == msg.to_id) {
-                    info!(
-                        "RAFT_DEBUG: forwarding message to peer {} at {}",
-                        msg.to_id, peer.address
+                    debug!(
+                        "RAFT_DEBUG: forwarding message to peer {} at {} (TLV)",
+                        msg.to_id, peer.net_address
                     );
-                    if let Err(e) = raft_client.send_raft_message(&peer.address, msg).await {
-                        warn!(
-                            "RAFT_DEBUG: failed to send message to {}: {}",
-                            peer.address, e
-                        );
+                    // Build TLV body: ShardId=0 (Master single-group) + RaftPayload.
+                    // Transport (connect/handshake/frame/read) is handled by call_once.
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_u64(FieldId::ShardId, 0);
+                    let _ = enc.add_bytes(FieldId::RaftPayload, &msg.message);
+                    let body = enc.into_bytes();
+
+                    let client_id = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(1);
+                    match powerfs_net::call_once(
+                        &peer.net_address,
+                        powerfs_net::ClientType::Master,
+                        client_id,
+                        powerfs_net::MsgType::RaftMessage,
+                        &body,
+                    )
+                    .await
+                    {
+                        Ok(reply) if reply.is_ok() => {}
+                        Ok(reply) => {
+                            warn!(
+                                "RAFT_DEBUG: peer {} returned status={:#06x}: {}",
+                                peer.net_address,
+                                reply.status,
+                                reply.body_str()
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "RAFT_DEBUG: failed to send TLV message to {}: {}",
+                                peer.net_address, e
+                            );
+                        }
                     }
                 } else {
                     warn!("RAFT_DEBUG: no peer found for id {}", msg.to_id);
                 }
             }
 
-            info!("RAFT_DEBUG: Raft message forwarder stopped");
+            info!("RAFT_DEBUG: Raft message forwarder (TLV) stopped");
         });
 
         // Keep the master running

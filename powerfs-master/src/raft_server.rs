@@ -112,32 +112,17 @@ impl RaftService for RaftGrpcServer {
 
     async fn send_raft_message(
         &self,
-        request: Request<RaftMessage>,
+        _request: Request<RaftMessage>,
     ) -> Result<Response<RaftMessageResponse>, Status> {
-        let req = request.into_inner();
-
-        let raft_msg = match EraftpbMessage::parse_from_bytes(&req.message) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to parse raft message: {}", e);
-                return Ok(Response::new(RaftMessageResponse {
-                    success: false,
-                    error: format!("failed to parse raft message: {}", e),
-                }));
-            }
-        };
-
-        let step_tx = self.master.raft_step_tx();
-        if step_tx.send(raft_msg).await.is_err() {
-            return Ok(Response::new(RaftMessageResponse {
-                success: false,
-                error: "failed to send message to step channel".to_string(),
-            }));
-        }
-
+        // Phase D: Raft inter-node transport migrated to TLV (MsgType::RaftMessage).
+        // This gRPC handler is retained for proto compatibility but is no longer
+        // the active transport path. Return an error so any stale caller fails fast.
+        warn!(
+            "send_raft_message: gRPC Raft transport is deprecated; use TLV MsgType::RaftMessage instead"
+        );
         Ok(Response::new(RaftMessageResponse {
-            success: true,
-            error: String::new(),
+            success: false,
+            error: "gRPC raft transport deprecated; use TLV MsgType::RaftMessage".to_string(),
         }))
     }
 

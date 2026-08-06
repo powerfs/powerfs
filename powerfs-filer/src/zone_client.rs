@@ -2,17 +2,30 @@
 //!
 //! Filer 启动时向 Master 发送 RegisterFiler 请求，获取 Zone 分配。
 //! Zone 内 needle_id 由 Filer 自管理，不需要跟 Master 频繁通信。
+//!
+//! Phase A1: 合并了 gRPC RegisterFiler 的节点发现功能 — TLV 请求现在同时
+//! 携带 Zone 分配请求和 Filer 节点发现信息 (addr, net_port, shard_ids),
+//! 替代了旧的 gRPC ResilientMasterClient::register_filer 循环。
 
 use log::{debug, warn};
 use powerfs_common::types::{ZoneInfo, ZoneVolume, make_needle_id, needle_counter, needle_zone_id};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
-use powerfs_net::{
-    build_frame, ClientType, FieldId, FrameFlags, FrameHeader, HandshakeRequest,
-    HandshakeResponse, MsgType, STATUS_OK, STATUS_ERR_REDIRECT,
-};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use powerfs_net::{FieldId, STATUS_ERR_REDIRECT, STATUS_OK};
+
+/// Filer 节点发现信息 (随 RegisterFiler 请求一起发送, 替代 gRPC RegisterFiler)
+#[derive(Debug, Clone)]
+pub struct FilerNodeRegistration {
+    /// Filer 标识 (如 "filer-1")
+    pub filer_id: String,
+    /// Filer 的可到达地址 "ip:net_port" (供 kernel ListFilers 使用)
+    pub advertise_addr: String,
+    /// powerfs-net 端口
+    pub net_port: u32,
+    /// 该 filer 持有的 shard 数量
+    pub shard_count: u64,
+    /// 该 filer 持有的 shard id 列表
+    pub shard_ids: Vec<u64>,
+}
 
 /// 向 Master 发送 RegisterFiler 请求，获取 Zone 分配 (多 Zone)。
 ///
@@ -21,92 +34,64 @@ use tokio::net::TcpStream;
 ///   - 重启再注册: 返回 Vec(N) (该 filer 的所有已有 Zone)
 ///
 /// 参数:
-///   master_addr: Master 的 "ip:port" 地址
-///   filer_id: Filer 标识 (如 "filer-1" 或地址)
+///   master_addr: Master 的 "ip:net_port" 地址
+///   reg: Filer 节点注册信息 (filer_id + advertise_addr + net_port + shard_ids)
 ///
 /// 注意: 使用循环处理 REDIRECT 而非递归, 避免深度重定向导致栈溢出。
-pub async fn register_filer(master_addr: &str, filer_id: &str) -> Result<Vec<ZoneInfo>, String> {
+pub async fn register_filer(master_addr: &str, reg: &FilerNodeRegistration) -> Result<Vec<ZoneInfo>, String> {
     let mut current_addr = master_addr.to_string();
     // 重定向深度限制: 防止 Master 持续返回 REDIRECT 导致无限循环
     // (旧实现使用 Box::pin 递归, 在 leader 未选举或指向自身时栈溢出)
     const MAX_REDIRECTS: usize = 5;
 
+    // Pre-encode shard_ids as packed u64 LE blob (once, reused across redirects)
+    let shard_ids_blob: Vec<u8> = reg
+        .shard_ids
+        .iter()
+        .flat_map(|id| id.to_le_bytes())
+        .collect();
+
     for depth in 0..MAX_REDIRECTS {
         debug!(
             "ZONE_CLIENT: register_filer attempt {} master={}, filer_id={}",
-            depth, current_addr, filer_id
+            depth, current_addr, reg.filer_id
         );
 
-        let stream = tokio::time::timeout(
-            Duration::from_secs(3),
-            TcpStream::connect(&current_addr),
-        )
-        .await
-        .map_err(|_| format!("connect timeout to master {}", current_addr))?
-        .map_err(|e| format!("connect failed to master {}: {}", current_addr, e))?;
+        // 构建 RegisterFiler 请求 — 同时包含 Zone 分配和节点发现信息
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::Owner, &reg.filer_id);
+        let _ = enc.add_string(FieldId::FilerAddress, &reg.advertise_addr);
+        let _ = enc.add_u64(FieldId::Blksize, reg.net_port as u64);
+        let _ = enc.add_u64(FieldId::Limit, reg.shard_count);
+        if !shard_ids_blob.is_empty() {
+            let _ = enc.add_bytes(FieldId::ShardIdList, &shard_ids_blob);
+        }
+        let body = enc.into_bytes();
 
-        let (mut reader, mut writer) = stream.into_split();
-
-        // 握手: Master powerfs-net 服务器要求新连接先完成握手
-        // 使用时间戳作为 client_id 避免多 Filer 同时注册时 session 冲突
+        // 统一 RPC 客户端 (Layer A): connect → handshake → send → read
         let client_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
-        let hs_req = HandshakeRequest::new(ClientType::Fuse, client_id);
-        let mut hs_buf = vec![0u8; HandshakeRequest::SIZE];
-        hs_req.encode(&mut hs_buf);
-        writer
-            .write_all(&hs_buf)
-            .await
-            .map_err(|e| format!("send handshake failed: {}", e))?;
-
-        let mut hs_resp_buf = vec![0u8; HandshakeResponse::SIZE];
-        tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut hs_resp_buf))
-            .await
-            .map_err(|_| "handshake response timeout".to_string())?
-            .map_err(|e| format!("read handshake response failed: {}", e))?;
-        let hs_resp = HandshakeResponse::decode(&hs_resp_buf)
-            .ok_or_else(|| "invalid handshake response".to_string())?;
-        if hs_resp.status != 0 {
-            return Err(format!("handshake rejected by master {}", current_addr));
-        }
-
-        // 构建 RegisterFiler 请求
-        let mut enc = TlvEncoder::new();
-        let _ = enc.add_string(FieldId::Owner, filer_id);
-
-        let frame = build_frame(
-            MsgType::RegisterFiler as u16,
-            FrameFlags::new(FrameFlags::REQUEST),
-            1,
-            &enc.into_bytes(),
-            &[],
-        );
-
-        writer
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("send failed: {}", e))?;
-
-        // 读取响应头
-        let mut hdr_buf = [0u8; FrameHeader::SIZE];
-        tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut hdr_buf))
-            .await
-            .map_err(|_| "read header timeout".to_string())?
-            .map_err(|e| format!("read header failed: {}", e))?;
-
-        let header = FrameHeader::decode(&hdr_buf)
-            .ok_or_else(|| "invalid response header".to_string())?;
+        let reply = match powerfs_net::call_once(
+            &current_addr,
+            powerfs_net::ClientType::Filer,
+            client_id,
+            powerfs_net::MsgType::RegisterFiler,
+            &body,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!("register_filer to {} failed: {}", current_addr, e));
+            }
+        };
 
         // 处理 REDIRECT: 切换到 leader 地址, 继续下一轮循环 (而非递归)
-        if header.status == STATUS_ERR_REDIRECT {
-            let body_len = header.data_len as usize;
-            if body_len > 0 {
-                let mut body = vec![0u8; body_len];
-                reader.read_exact(&mut body).await
-                    .map_err(|e| format!("read redirect body: {}", e))?;
-                let mut dec = TlvDecoder::new(&body);
+        if reply.status == STATUS_ERR_REDIRECT {
+            if !reply.body.is_empty() {
+                let mut dec = TlvDecoder::new(&reply.body);
                 if let Ok(leader_addr) = dec.next_string(FieldId::Owner) {
                     if leader_addr.is_empty() {
                         return Err("redirected to empty leader address".to_string());
@@ -128,23 +113,15 @@ pub async fn register_filer(master_addr: &str, filer_id: &str) -> Result<Vec<Zon
             return Err("redirected but no leader address".to_string());
         }
 
-        if header.status != STATUS_OK {
-            return Err(format!("RegisterFiler failed: status={:#06x}", header.status));
+        if reply.status != STATUS_OK {
+            return Err(format!("RegisterFiler failed: status={:#06x}", reply.status));
         }
 
-        // 读取响应 body
-        let body_len = header.data_len as usize;
-        if body_len == 0 {
+        if reply.body.is_empty() {
             return Err("empty response body".to_string());
         }
 
-        let mut body = vec![0u8; body_len];
-        tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut body))
-            .await
-            .map_err(|_| "read body timeout".to_string())?
-            .map_err(|e| format!("read body failed: {}", e))?;
-
-        return parse_zones_response(&body, filer_id);
+        return parse_zones_response(&reply.body, &reg.filer_id);
     }
 
     Err(format!(

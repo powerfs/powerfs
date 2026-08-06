@@ -11,11 +11,11 @@ use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
 use powerfs_coherence::ChunkWire;
+use protobuf::Message as ProtoMessage;
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    ClientType, FieldId, FrameFlags, MsgType, NetError, NetMessage, NetResult, PowerFsNetHandler,
-    RequestContext, ServerRequestHandler, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT,
-    STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    ClientType, FieldId, MsgType, NetError, NetMessage, NetHandler, NetResult,
+    RequestContext, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 
@@ -186,15 +186,7 @@ impl FilerNetHandler {
 
     /// Build a response message
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>) -> NetMessage {
-        let flags = FrameFlags::new(FrameFlags::RESPONSE);
-        let header = powerfs_net::FrameHeader::new(
-            msg.header.msg_type,
-            flags,
-            msg.header.seq,
-            body.len() as u32,
-        )
-        .with_status(status);
-        NetMessage::new(header).with_body(body)
+        NetMessage::response(msg, status, body, Vec::new())
     }
 
     // MsgType::Read (0x0020) and MsgType::Write (0x0021) handlers removed.
@@ -1383,182 +1375,73 @@ impl FilerNetHandler {
             }
         }
     }
-}
 
-#[async_trait::async_trait]
-impl PowerFsNetHandler for FilerNetHandler {
-    async fn handle_request(&self, client_id: u64, msg: &NetMessage) -> NetResult<NetMessage> {
-        let msg_type = msg
-            .msg_type()
-            .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
+    /// Handle Raft inter-node message (MsgType::RaftMessage).
+    ///
+    /// Replaces the gRPC FilerMetaService::send_raft_message RPC.
+    /// Decodes the TLV body (ShardId + RaftPayload), deserializes the
+    /// protobuf eraftpb::Message, and steps it into the local Raft group.
+    ///
+    /// Request TLV:
+    ///   ShardId    = shard id (u64)
+    ///   RaftPayload = serialized eraftpb::Message (bytes)
+    /// Response: STATUS_OK (empty body) or STATUS_ERR_SERVER_ERROR (error string).
+    async fn handle_raft_message(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_val = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let payload = dec.next_bytes(FieldId::RaftPayload).unwrap_or_default();
 
+        if payload.is_empty() {
+            warn!(
+                "FILER_RAFT: received empty RaftPayload for shard {}",
+                shard_id_val
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                b"empty raft payload".to_vec(),
+            ));
+        }
+
+        let mut raft_msg = raft::eraftpb::Message::new();
+        if let Err(e) = ProtoMessage::merge_from_bytes(&mut raft_msg, &payload) {
+            warn!("FILER_RAFT: failed to deserialize Raft message: {}", e);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                format!("failed to deserialize: {}", e).into_bytes(),
+            ));
+        }
+
+        let shard_id = ShardId(shard_id_val);
         debug!(
-            "FILER_NET: handling request {:?}, client_id={}, seq={}",
-            msg_type, client_id, msg.header.seq
+            "FILER_RAFT: received raft message for shard {} (type={:?})",
+            shard_id.0,
+            raft_msg.msg_type
         );
 
-        match msg_type {
-            MsgType::Lookup => {
-                let response = self.handle_lookup(msg).await?;
-                // Phase 2: auto-subscribe client to parent directory for
-                // callback invalidation. On any change to this directory,
-                // the Filer will push an Invalidate notification so the
-                // client can evict its cached entry.
-                //
-                // Also subscribe to the returned entry inode (when it is a
-                // regular file) so that content mutations (setattr /
-                // write_chunks) on that file trigger an Invalidate to this
-                // client. Without this, a second client that only looked up
-                // the file would never receive content-change notifications.
-                if response.header.status == STATUS_OK {
-                    info!(
-                        "FILER_NET_LOOKUP_DEBUG: status=OK, has_notifier={}",
-                        self.inode_notifier.is_some()
-                    );
-                    if let Some(ref notifier) = self.inode_notifier {
-                        let mut dec = TlvDecoder::new(&msg.body);
-                        let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
-                        if parent_ino != 0 {
-                            notifier.subscribe(parent_ino, client_id);
-                            info!(
-                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (lookup)",
-                                client_id, parent_ino
-                            );
-                        }
-                        // Subscribe to the returned entry inode as well so
-                        // file content changes are pushed to this client.
-                        if let Ok(entry_ino) =
-                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
-                        {
-                            if entry_ino != 0 && entry_ino != parent_ino {
-                                notifier.subscribe(entry_ino, client_id);
-                                info!(
-                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (lookup)",
-                                    client_id, entry_ino
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(response)
+        match self.meta_shard_manager.step_raft_message(shard_id, raft_msg).await {
+            Ok(_) => {
+                debug!("FILER_RAFT: stepped raft message for shard {}", shard_id.0);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
-            MsgType::ReadDir => {
-                let response = self.handle_readdir(msg).await?;
-                // Phase 2: auto-subscribe client to the listed directory.
-                if response.header.status == STATUS_OK {
-                    if let Some(ref notifier) = self.inode_notifier {
-                        let parent_ino = TlvDecoder::new(&msg.body)
-                            .next_u64(FieldId::ParentIno)
-                            .unwrap_or(0);
-                        if parent_ino != 0 {
-                            notifier.subscribe(parent_ino, client_id);
-                            debug!(
-                                "FILER_NET: subscribed client {} to dir inode {} (readdir)",
-                                client_id, parent_ino
-                            );
-                        }
-                    }
-                }
-                Ok(response)
-            }
-            MsgType::GetAttr => self.handle_getattr(msg).await,
-            MsgType::SetAttr => self.handle_setattr(msg).await,
-            MsgType::SetAttrData => self.handle_setattr_data(msg).await,
-            MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
-            MsgType::Create => {
-                let response = self.handle_create(msg).await?;
-                // Subscribe the creating client to the parent directory and
-                // the new inode so it receives subsequent Invalidate
-                // notifications (e.g., another client truncating the file).
-                // The pre-create Lookups returned ENOENT so no subscription
-                // was established; without this the creator never receives
-                // cross-client change notifications for the new file.
-                if response.header.status == STATUS_OK {
-                    if let Some(ref notifier) = self.inode_notifier {
-                        let parent_ino = TlvDecoder::new(&msg.body)
-                            .next_u64(FieldId::ParentIno)
-                            .unwrap_or(0);
-                        if parent_ino != 0 {
-                            notifier.subscribe(parent_ino, client_id);
-                            info!(
-                                "FILER_NET_SUBSCRIBE: client {} subscribed to dir inode {} (create)",
-                                client_id, parent_ino
-                            );
-                        }
-                        if let Ok(entry_ino) =
-                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
-                        {
-                            if entry_ino != 0 && entry_ino != parent_ino {
-                                notifier.subscribe(entry_ino, client_id);
-                                info!(
-                                    "FILER_NET_SUBSCRIBE: client {} subscribed to entry inode {} (create)",
-                                    client_id, entry_ino
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(response)
-            }
-            MsgType::Mkdir => {
-                let response = self.handle_mkdir(msg).await?;
-                if response.header.status == STATUS_OK {
-                    if let Some(ref notifier) = self.inode_notifier {
-                        let parent_ino = TlvDecoder::new(&msg.body)
-                            .next_u64(FieldId::ParentIno)
-                            .unwrap_or(0);
-                        if parent_ino != 0 {
-                            notifier.subscribe(parent_ino, client_id);
-                        }
-                        if let Ok(entry_ino) =
-                            TlvDecoder::new(&response.body).next_u64(FieldId::Ino)
-                        {
-                            if entry_ino != 0 && entry_ino != parent_ino {
-                                notifier.subscribe(entry_ino, client_id);
-                            }
-                        }
-                    }
-                }
-                Ok(response)
-            }
-            MsgType::Unlink => self.handle_unlink(msg).await,
-            MsgType::Rmdir => self.handle_rmdir(msg).await,
-            MsgType::Rename => self.handle_rename(msg).await,
-            MsgType::StatFs => self.handle_statfs(msg).await,
-            MsgType::Symlink => self.handle_symlink(msg).await,
-            MsgType::Readlink => self.handle_readlink(msg).await,
-            MsgType::Link => self.handle_link(msg).await,
-            // MsgType::Read (0x0020) / MsgType::Write (0x0021) removed —
-            // data operations go directly to Volume Server, not through Filer.
-            MsgType::AllocInodeBatch => self.handle_alloc_inode_batch(msg).await,
-            MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
-            MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
-            MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
-            // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
-            }
-            _ => {
-                warn!("FILER_NET: unsupported message type {:?}", msg_type);
-                Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
+            Err(e) => {
+                warn!(
+                    "FILER_RAFT: step_raft_message failed for shard {}: {}",
+                    shard_id.0, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
             }
         }
     }
-
-    async fn on_connect(&self, _client_id: u64, _client_type: ClientType) {
-        info!(
-            "FILER_NET: client connected, id={}, type={:?}",
-            _client_id, _client_type
-        );
-    }
 }
 
 #[async_trait::async_trait]
-impl ServerRequestHandler for FilerNetHandler {
+impl NetHandler for FilerNetHandler {
     async fn handle(&self, ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
         let msg_type = msg
             .msg_type()
@@ -1575,11 +1458,6 @@ impl ServerRequestHandler for FilerNetHandler {
         match msg_type {
             MsgType::Lookup => {
                 let response = self.handle_lookup(msg).await?;
-                // Phase 2: subscribe client to parent dir + entry inode for
-                // callback invalidation. This must live in the
-                // ServerRequestHandler::handle path (not PowerFsNetHandler)
-                // because ManagedNetHandler dispatches via
-                // process_with_pipeline which calls ServerRequestHandler.
                 if response.header.status == STATUS_OK {
                     if let Some(ref notifier) = self.inode_notifier {
                         let client_id = ctx.client.client_id;
@@ -1699,18 +1577,20 @@ impl ServerRequestHandler for FilerNetHandler {
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
             MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
+            MsgType::RaftMessage => self.handle_raft_message(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
-            MsgType::Ping => {
-                let flags = FrameFlags::new(FrameFlags::RESPONSE);
-                let header =
-                    powerfs_net::FrameHeader::new(msg.header.msg_type, flags, msg.header.seq, 0)
-                        .with_status(STATUS_OK);
-                Ok(NetMessage::new(header))
-            }
+            MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
                 warn!("FILER_NET: unsupported message type {:?}", msg_type);
                 Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))
             }
         }
+    }
+
+    async fn on_connect(&self, _client_id: u64, _client_type: ClientType) {
+        info!(
+            "FILER_NET: client connected, id={}, type={:?}",
+            _client_id, _client_type
+        );
     }
 }

@@ -83,6 +83,7 @@ async fn test_two_node_election() {
         vec![Peer {
             id: 2,
             address: "127.0.0.1:10002".to_string(),
+            net_address: "127.0.0.1:10002".to_string(),
         }],
         db_path1.to_str().unwrap(),
         leader_state,
@@ -98,6 +99,7 @@ async fn test_two_node_election() {
         vec![Peer {
             id: 1,
             address: "127.0.0.1:10001".to_string(),
+            net_address: "127.0.0.1:10001".to_string(),
         }],
         db_path2.to_str().unwrap(),
         leader_state,
