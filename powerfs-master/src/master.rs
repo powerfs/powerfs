@@ -77,6 +77,10 @@ pub struct MasterNode {
     filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
     shard_mapping: RwLock<HashMap<u64, String>>,
     stripe_round_robin: Arc<AtomicU32>,
+    /// Round-robin counter for single-volume assignment (assign_volume).
+    /// Ensures writes are distributed across all writable volumes instead
+    /// of always picking the first one returned by HashMap iteration.
+    volume_round_robin: Arc<AtomicU32>,
     /// Zone 管理: zone_id → ZoneInfo
     zone_registry: RwLock<HashMap<u32, powerfs_common::types::ZoneInfo>>,
     /// 下一个分配的 zone_id (从 1 开始, 原子递增)
@@ -401,6 +405,7 @@ impl MasterNode {
             filer_nodes: RwLock::new(HashMap::new()),
             shard_mapping: RwLock::new(HashMap::new()),
             stripe_round_robin: Arc::new(AtomicU32::new(0)),
+            volume_round_robin: Arc::new(AtomicU32::new(0)),
             zone_registry: RwLock::new(HashMap::new()),
             next_zone_id: Arc::new(AtomicU32::new(1)),
         };
@@ -1706,7 +1711,10 @@ impl MasterNode {
         excluded: &[u64],
     ) -> Option<(VolumeId, NodeId)> {
         let volumes = self.volumes.read().unwrap();
-        select_writable_volume_from(&volumes, collection, nodes, mode, excluded)
+        // Advance the round-robin counter so consecutive calls pick different
+        // volumes, distributing write load across all writable volumes.
+        let start_idx = self.volume_round_robin.fetch_add(1, Ordering::Relaxed) as usize;
+        select_writable_volume_from(&volumes, collection, nodes, mode, excluded, start_idx)
     }
 
     /// 批量分配 stripe volumes
@@ -2815,6 +2823,7 @@ impl Clone for MasterNode {
             filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),
             shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
             stripe_round_robin: self.stripe_round_robin.clone(),
+            volume_round_robin: self.volume_round_robin.clone(),
             zone_registry: RwLock::new(self.zone_registry.read().unwrap().clone()),
             next_zone_id: self.next_zone_id.clone(),
         }
@@ -2825,12 +2834,17 @@ impl Clone for MasterNode {
 ///
 /// Operates on a borrowed volume table so it can be unit-tested without
 /// spinning up a full Master node.
+///
+/// `start_idx` is a round-robin hint: when multiple candidates match, the
+/// function picks `candidates[start_idx % len]` instead of always returning
+/// the first one. This distributes write load across all writable volumes.
 fn select_writable_volume_from(
     volumes: &HashMap<VolumeId, VolumeInfo>,
     collection: &Collection,
     nodes: &[DataNodeInfo],
     mode: &VolumeAllocationMode,
     excluded: &[u64],
+    start_idx: usize,
 ) -> Option<(VolumeId, NodeId)> {
     // Build the candidate id list according to the allocation mode. `None`
     // means "scan all volumes" (Auto).
@@ -2844,6 +2858,7 @@ fn select_writable_volume_from(
 
     // First pass: try the pinned list (Manual / Hybrid fixed set).
     if let Some(ids) = pinned {
+        let mut candidates: Vec<(VolumeId, NodeId)> = Vec::new();
         for vid in ids {
             if excluded.contains(vid) {
                 continue;
@@ -2861,8 +2876,12 @@ fn select_writable_volume_from(
                 if !nodes.iter().any(|n| n.id == vinfo.node_id) {
                     continue;
                 }
-                return Some((VolumeId(*vid), vinfo.node_id.clone()));
+                candidates.push((VolumeId(*vid), vinfo.node_id.clone()));
             }
+        }
+        if !candidates.is_empty() {
+            let pick = candidates[start_idx % candidates.len()].clone();
+            return Some(pick);
         }
         // Manual mode never falls back to auto-scan.
         if matches!(mode, VolumeAllocationMode::Manual { .. }) {
@@ -2871,6 +2890,9 @@ fn select_writable_volume_from(
     }
 
     // Auto pass (also the Hybrid fallback): scan all volumes.
+    // Collect all candidates first, then round-robin select to distribute
+    // write load evenly across available volumes.
+    let mut candidates: Vec<(VolumeId, NodeId)> = Vec::new();
     for (vid, vinfo) in volumes.iter() {
         if excluded.contains(&vid.0) {
             continue;
@@ -2887,10 +2909,14 @@ fn select_writable_volume_from(
         if !nodes.iter().any(|n| n.id == vinfo.node_id) {
             continue;
         }
-        return Some((*vid, vinfo.node_id.clone()));
+        candidates.push((*vid, vinfo.node_id.clone()));
     }
 
-    None
+    if candidates.is_empty() {
+        return None;
+    }
+    let pick = candidates[start_idx % candidates.len()].clone();
+    Some(pick)
 }
 
 #[cfg(test)]
@@ -2946,7 +2972,7 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default(); // Auto
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert_eq!(pick.map(|(v, _)| v.0), Some(1));
     }
 
@@ -2958,7 +2984,7 @@ mod tests {
             volume_ids: vec![2],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -2973,7 +2999,7 @@ mod tests {
             volume_ids: vec![2],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert!(pick.is_none(), "Manual must not fall back to auto-scan");
     }
 
@@ -2989,7 +3015,7 @@ mod tests {
             auto_count: 1,
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -3002,7 +3028,7 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -3014,7 +3040,7 @@ mod tests {
             volume_ids: vec![1],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0);
         assert!(pick.is_none(), "blacklist must override Manual pin");
     }
 
@@ -3024,7 +3050,7 @@ mod tests {
         let nodes = vec![node("n1")]; // ghost not present
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert!(pick.is_none());
     }
 
@@ -3035,7 +3061,32 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[]);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
         assert!(pick.is_none());
+    }
+
+    #[test]
+    fn test_round_robin_distributes_across_volumes() {
+        // Three writable volumes in the same collection — round-robin
+        // should cycle through all of them instead of always returning
+        // the first one.
+        let volumes = build_volumes(&[
+            (1, "default", "n1", 0, 100),
+            (2, "default", "n1", 0, 100),
+            (3, "default", "n1", 0, 100),
+        ]);
+        let nodes = vec![node("n1")];
+        let mode = VolumeAllocationMode::default();
+        let coll = Collection("default".to_string());
+
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..6 {
+            let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], i);
+            if let Some((vid, _)) = pick {
+                seen.insert(vid.0);
+            }
+        }
+        // After 6 calls (2 full cycles), all 3 volumes should have been picked.
+        assert_eq!(seen.len(), 3, "round-robin must distribute across all volumes, got: {:?}", seen);
     }
 }
