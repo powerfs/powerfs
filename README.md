@@ -1,246 +1,149 @@
-# README.md
+# PowerFS
 
-PowerFS
+**One storage for HPC + AI. Rust-native. Zero jitter.**
 
-**Next-Gen Zero-Jitter Unified Storage for HPC + AI Converged Clusters**
+Unified POSIX / S3 / KV cache in a single cluster — eliminating the three-stack fragmentation that plagues HPC+AI converged infrastructure.
 
-[Introduction](https://github.com/powerfs/powerfs/tree/master#introduction) • [Architecture](https://github.com/powerfs/powerfs/tree/master#architecture) • [Core Features](https://github.com/powerfs/powerfs/tree/master#core-features) • [Roadmap](https://github.com/powerfs/powerfs/tree/master#roadmap) • [Scenarios](https://github.com/powerfs/powerfs/tree/master#application-scenarios) • [Benchmark](https://github.com/powerfs/powerfs/tree/master#benchmark) • [License](https://github.com/powerfs/powerfs/tree/master#license)
-
----
-
-## 🚩 Core Pain Points Solved
-
-Traditional converged clusters are forced to run **three isolated storage stacks**, resulting in high cost, data silos and low GPU utilization:
-
-- **HPC storage (Lustre/BeeGFS)**: Great for large sequential I/O, poor for random tiny KV I/O, severe inference jitter
-- **Cloud/AI storage (Ceph/CubeFS)**: Flexible object storage, lacks complete POSIX semantics and massive parallel capability
-- **Independent KV cache (Redis/local SSD)**: Extra operation burden, cannot unify data lifecycle
-
-**PowerFS terminates the multi-stack fragmentation** with one unified architecture.
+[Architecture](#architecture) • [Quick Start](#quick-start) • [Benchmark](#benchmark) • [Roadmap](#roadmap) • [Articles](articles/) • [License](#license)
 
 ---
 
-## Introduction
+## Why PowerFS?
 
-**PowerFS** is a **rust-from-scratch, zero-jitter unified parallel file system** designed exclusively for the new HPC + AI converged infrastructure. It eliminates the decades-old industry dilemma: **HPC file systems are bad at AI inference KV cache, and AI/cloud storage cannot sustain large-scale HPC parallel I/O**.
-
-By introducing **protocol-agnostic data layer + three-interface unified architecture + Filer Raft strong consistency + Volume Lease Lock linearizability**, PowerFS unifies POSIX / S3 / KV in one single cluster, delivering stable HPC simulation throughput and ultra-low-latency LLM inference cache performance at the same time.
-
-Traditional storage solutions face obvious bottlenecks in converged HPC and AI scenarios. Professional HPC file systems suffer from complex deployment, heavy operation and maintenance, severe I/O jitter and poor small-file performance, and cannot adapt to AI inference workloads. Common cloud-native storage lacks massive parallel computing capability and native LLM KV cache support, resulting in insufficient overall cluster resource utilization.
-
-PowerFS innovates a **dual-engine fusion architecture of parallel file storage and native KV cache**, with a **Filer Raft based strong consistency model** for metadata (content_size, chunks list) and **per-stripe (64MB) Lease Lock** for data linearizability. Cross-client cache coherence is maintained via **Callback Invalidation** (Filer pushes invalidate notifications to subscribed clients), eliminating broadcast storms while preserving strong visibility guarantees. It unifies traditional HPC scientific computing, large-scale parallel simulation, AI dataset training and LLM inference cache services into one storage stack.
+| The Problem | The PowerFS Solution |
+|---|---|
+| HPC storage (Lustre/BeeGFS) can't do AI KV inference | Built-in KV Cache engine + GPU Direct zero-copy |
+| Cloud storage (Ceph) lacks POSIX + massive parallel I/O | Filer Raft strong consistency, 10K+ MPI parallel |
+| Three isolated stacks = data silos + high cost | One unified architecture, one data pool, one deployment |
 
 ---
 
-## Core Design Philosophy
+## Key Features
 
-- **Pure Rust Stack**: Complete user-state I/O implementation, no GC jitter, memory safety, ultra-stable latency under long-time high load
-- **Protocol-Agnostic Data Layer**: All file, object, and KV data lands on a unified `Needle` binary format, stored once, shared everywhere
-- **Filer Raft Strong Consistency**: All metadata operations (mkdir/create/unlink/rename/setattr/lookup/readdir) go through Filer Raft commit, ensuring linearizable metadata across the cluster
-- **Per-Stripe Lease Lock Linearizability**: File data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks; Follower writes must acquire Lease from Leader
-- **Callback Invalidation**: Filer pushes invalidate notifications to subscribed clients on metadata changes, replacing broadcast storms with targeted push, enabling cross-client visibility without client polling
-- **Bucket-Based Sharding**: Each bucket (top-level directory) is an independent Raft group; cross-shard operations return EXDEV (like Linux mount boundary), enabling horizontal scaling without cross-shard coordination
-- **Three-Interface Unified**: Native FUSE/POSIX + KV + S3 interfaces, one data pool for all workloads
-- **Full Hardware Offloading**: Native adaptation to SPDK, RDMA and GPU Direct, end-to-end zero-copy hardware acceleration (Transport trait abstraction unifies TCP/RDMA/QUIC)
-- **Lightweight Enterprise-Grade**: Simplified architecture, linear horizontal scaling, low operation and maintenance costs, enterprise-level high availability and fault tolerance
-
----
-
-## Core Features
-
-### ⚡ Extreme HPC Parallel Capability
-
-- Distributed sharded metadata architecture (bucket-based sharding, each bucket an independent Raft group), supporting 10,000+ MPI process concurrent read and write
-- POSIX-compatible via Filer Raft strong consistency, compatible with mainstream HPC simulation software and parallel computing frameworks
-- Adaptive file striping (2MB chunk size) and multi-node aggregated I/O, supporting PB-level cluster aggregated bandwidth
-- Fine-grained job-level QoS and I/O isolation, eliminating resource preemption and ensuring zero-jitter steady-state operation
-- Optimized ultra-large directory and massive small-file scenarios, solving traditional HPC storage small-file performance bottlenecks
-
-### 🧠 Native LLM KV Cache Engine (Industry Exclusive)
-
-- Built-in dedicated KV tensor storage engine, no third-party components, deeply optimized for LLM inference characteristics
-- O(1) constant-time KV addressing, microsecond-level access latency, supporting incremental update and partial overwriting
-- Dual elimination strategy of LRU hot and cold sorting + TTL session expiration, realizing intelligent cache automatic management
-- Session-level cache isolation and hot data resident mechanism, greatly improving long-text inference token generation throughput
-- Native GPU Direct zero-copy transmission, extending GPU HBM video memory with NVMe storage to completely solve LLM inference video memory bottlenecks
-
-### 🪣 S3 Object Interface
-
-- Standard S3 protocol compatibility, version management, multi-part upload, perfect for AI dataset storage, model snapshot and batch data archiving
-- Native S3 Gateway built into PowerFS Master, supporting AWS CLI/SDK and S3 Browser
-- Object data stored in distributed Volume Server nodes using unified Needle format
-
-### 🔒 Strong Consistency Engine (Filer Raft + Callback Invalidation)
-
-- **Filer Raft Strong Consistency**: All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) go through Raft commit on 3+ Filer nodes, ensuring linearizable metadata
-- **Per-Stripe Lease Lock**: File data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks; Follower writes must acquire Lease from Leader for linearizable data writes
-- **Callback Invalidation**: Filer pushes targeted invalidate notifications to subscribed clients on metadata changes (setattr, size/chunks sync), replacing broadcast storms with precise push
-- **Cross-Client Read Visibility**: open-time getattr bypasses TTL to fetch latest metadata from Filer; Lease response carries current chunk list to avoid extra getattr; truncate visibility guaranteed across clients
-- **Creator Subscription**: Filer Create/Mkdir establishes creator subscription to ensure Invalidate notifications reach the creating client
-- **Bucket-Based Sharding**: Each bucket (top-level directory) is an independent Raft group; cross-shard operations return EXDEV (like Linux mount boundary)
-- **fsck Tool**: Scans Filer metadata vs Volume actual data blocks, cleans orphaned inodes/chunks from failed metadata sync; idempotent deletion (NeedleNotFound treated as success)
-
-### 🚀 Ultra-Low Latency Hardware Acceleration
-
-- SPDK user-state NVMe bare disk I/O, bypassing kernel file system and system call overhead, maximizing hardware IOPS and bandwidth
-- Full-link RDMA lossless network instead of TCP, eliminating network soft interrupts and kernel protocol stack overhead
-- Dual-client mode: lightweight FUSE user client + high-performance Linux kernel client
-- No periodic jitter caused by runtime GC, stable p99/p999 latency under full-load cluster
-
-### 🛠 Lightweight & Highly Available OPS
-
-- Stateless master scheduling cluster based on Raft consensus, no single point of failure, unlimited horizontal scaling
-- Rack-aware topology scheduling, realizing local I/O and intelligent data load balancing
-- Dual storage engine of multi-replica & EC erasure coding, adaptive hot and cold data hierarchical storage
-- Automatic node/disk fault detection, data migration and cluster self-healing
-- Simplified deployment and operation, significantly lower maintenance costs than traditional Lustre/BeeGFS
+- **Rust-native, zero GC** — No STW jitter, stable p99 under sustained full load
+- **Three interfaces, one data pool** — POSIX (FUSE/Kernel) + S3 + KV cache, stored once, shared everywhere
+- **Filer Raft strong consistency** — Linearizable metadata via Raft commit, Leader Lease Read for zero-RTT reads
+- **Volume Lease linearizability** — Per-stripe (64MB) exclusive lock, 60s reuse, RAII auto-release
+- **NVMe-oF direct + SPDK bare metal** — Bypass Volume Server, connect NVMe-oF Target all-flash array directly; or use Volume Server with SPDK NVMe bare-disk I/O, bypassing kernel filesystem entirely
+- **Full hardware offload** — SPDK / RDMA / GPU Direct, end-to-end zero-copy from NVMe to GPU HBM
+- **40x metadata performance** — Lock-free optimization, 2M+ ops/s single-thread
 
 ---
 
 ## Architecture
 
-PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
-
-### 3-Layer Decoupled Architecture
-
-1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) go through Raft commit on 3+ Filer nodes, ensuring linearizable metadata. Bucket-based sharding: each bucket (top-level directory) is an independent Raft group, enabling horizontal scaling without cross-shard coordination. Cross-client cache coherence maintained via Callback Invalidation (Filer pushes targeted invalidate notifications to subscribed clients).
-
-2. **Master Raft Global Scheduling Layer**: High availability cluster providing Volume routing, cluster topology management, resource allocation and Volume assignment. Master is stateless for filesystem metadata (DirectoryTree was deleted as dead code in Step B1); all filesystem metadata is managed by Filer Raft. Bucket creation requires Filer to request and bind Volume from Master to specific Volume Server.
-
-3. **Multi-Interface Unified Data Layer**: Unified protocol-agnostic volume using `Needle` binary format, natively integrates FUSE/POSIX + KV + S3 three interfaces, one data pool for all workloads. Data consistency guaranteed by Volume Server-managed per-stripe (64MB) Lease Locks.
-   - **HPC Parallel File Engine**: Optimized for supercomputing simulation, large-file parallel reading and writing, and scientific computing batch workloads
-   - **AI Native KV Cache Engine**: Dedicatedly optimized for LLM training and inference KV tensor high-speed cache scenarios
-   - **S3 Object Storage Engine**: Standard S3 protocol compatibility for AI dataset storage, model snapshot and batch data archiving
-
-### Distributed Communication Architecture
-
-PowerFS adopts a **three-client independent communication architecture**, where each client manages its own connections and request queues, completely eliminating single-connection bottlenecks:
-
-- **MasterClient**: Cluster topology management, Volume route retrieval, Leader discovery and failover (via `ResilientMasterClient` from `powerfs-master` crate)
-- **MetaShardClient**: Metadata shard client, handles inode/dentry operations via Filer Raft (mkdir/create/unlink/rename/lookup/readdir/setattr), implements `MetadataClient` trait
-- **VolumeClient**: Data volume client, data read/write, Lease lock management and renewal heartbeat, implements `LeaseManager` trait
-
-Clients are fully decoupled and coordinated through the FuseClientFacade, with no need to know the underlying connection method or Leader location. Filer leader switch is handled via MetadataClient internal 3 retries, transparent to upper layers.
-
-> **Note**: FUSE and kernel file system use TLV protocol via `TlvMasterClient` from `powerfs-master-net` crate for communication with Master. Fuse to server communication must NOT use gRPC.
-
-### Dual Consistency Paths
-
-PowerFS implements a **dual-channel consistency mechanism** combining strong metadata consistency with linearizable data consistency:
-
-- **Strong Consistency Path (Filer Raft)**: All metadata operations (mkdir/create/unlink/rename/readdir/lookup/setattr) and file metadata (content_size, chunks list) go through Filer Raft commit. close operation must sync content_size and chunks list to Filer before releasing lease. Raft read operations use Leader Lease Read to avoid extra RTT.
-- **Linearizability Path (Volume Lease Lock)**: File data operations (open, read, write, close, flush) use Lease lock mechanism (Follower applies to Leader) for strong consistency. Data lease lock is per-stripe (64MB) and managed by Volume Server. Lease response includes current content_size and chunks list to avoid separate getattr.
-
-### Cross-Client Cache Coherence
-
-PowerFS uses **Callback Invalidation** for cross-client cache coherence:
-
-- **Subscription**: Filer automatically subscribes clients on Lookup/ReadDir; Create/Mkdir establishes creator subscription
-- **Invalidate Push**: Filer pushes invalidate notifications on metadata changes (setattr, update_inode_size_chunks)
-- **Client Invalidation**: InvalidateHandler clears MetadataCache + ChunkCache on notification
-- **Pinned Inode Protection**: Opened files (pinned) skip invalidation to protect in-progress writes
-- **Reference Counting**: pinned_inodes uses HashMap<u64, u32> for concurrent open/release
-- **Dirty Chunk Protection**: InvalidateHandler skips cache invalidation when inode has dirty chunks to prevent flusher failures
-- **TTL Bypass**: getattr for non-open files bypasses TTL and fetches latest metadata from Filer to ensure cross-client truncate visibility
-
-### TLV Protocol
-
-PowerFS uses a custom TLV (Type-Length-Value) protocol for network communication:
-
 ```
-Tag (2B) + Length (4B uint32 big-endian) + Value (max 4GB)
+┌──────────────────────────────────────────────────────────────┐
+│                    POSIX (FUSE/Kernel) / S3 / KV              │
+│                    FuseClientFacade (Unified)                 │
+│  ┌────────────┐  ┌──────────────┐  ┌───────────────────────┐ │
+│  │MasterClient│  │MetaShardClient│  │    VolumeClient       │ │
+│  │ (Topology) │  │(Filer Raft)  │  │  (Read/Write + Lease) │ │
+│  └─────┬──────┘  └──────┬───────┘  └──────────┬────────────┘ │
+└────────┼────────────────┼─────────────────────┼──────────────┘
+         │                │ ← Callback Invalidation Push ──┐
+         │                │                               │
+┌────────▼────────────────▼───────────────────────────────▼────┐
+│              Filer (Raft Strong Consistency)                  │
+│  Bucket-based sharding, each bucket = independent Raft group  │
+│  [Shard 0: Raft+RocksDB] [Shard 1] [Shard N] ...             │
+└────────┬────────────────┬───────────────────────────────────┘
+┌────────▼────────────────▼───────────────────────────────────┐
+│              Master (Raft Scheduling + Volume Routing)        │
+└────────┬─────────────────────────────────────────────────────┘
+         │
+         │  Two storage modes:
+         │  ┌─────────────────────────────────────────────────┐
+         ▼  ▼                                                 │
+┌─────────────────────────────┐  ┌─────────────────────────────┴──┐
+│  Mode A: Volume Server      │  │  Mode B: NVMe-oF Direct         │
+│  SPDK NVMe bare-disk I/O    │  │  Connect NVMe-oF Target array   │
+│  Needle + Lease Lock        │  │  directly, no Volume Server      │
+│  [Volume 1] [Volume 2] ...  │  │  All-flash array handles I/O     │
+└─────────────────────────────┘  └──────────────────────────────────┘
+│  Unified Needle Binary Format + RocksDB Index                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-- Supports up to 4GB Value transmission, breaking the traditional 64KB limit
-- Field-based data transmission for easy extension
-- Uses `bytes::Bytes` for zero-copy compatibility with RDMA
-- TLV encoder/decoder uses matching types: create uses u32 for Mode/Uid/Gid, mkdir uses u64; handle_setattr uses loop-based decoding for optional fields
+**Dual storage modes**:
+- **Mode A (Volume Server)**: SPDK NVMe bare-disk I/O, bypassing kernel filesystem — for clusters with local NVMe SSDs
+- **Mode B (NVMe-oF Direct)**: Connect NVMe-oF Target all-flash array directly, bypassing Volume Server entirely — for enterprise all-flash deployments
 
-### Hardware Acceleration
-
-Native integration of SPDK NVMe user-state I/O, RDMA lossless network and GPU Direct zero-copy transmission, fully releasing the performance of NVMe SSD, high-speed network and GPU heterogeneous computing resources. Transport trait abstraction unifies TCP/RDMA/QUIC interfaces.
+**Dual consistency**: Filer Raft for metadata (linearizable) + Volume Lease Lock for data (per-stripe 64MB exclusive). Cross-client coherence via Callback Invalidation (Filer pushes to subscribed clients, no broadcast storms).
 
 ---
 
-## 📌 Advantage Comparison
+## Quick Start
 
-|Storage Type|HPC Parallel Stability|AI KV Inference Performance|Multi-Protocol Consistency|Jitter Control|
-|---|---|---|---|---|
-|Lustre/BeeGFS|Excellent|Poor|Single protocol|Medium jitter|
-|Ceph/CubeFS|Weak|Medium|Fake multi-protocol|High jitter|
-|**PowerFS**|**Excellent**|**Excellent**|**True unified multi-protocol**|**Zero jitter**|
+```bash
+git clone https://github.com/powerfs/powerfs.git
+cd powerfs/docker
 
----
+# Build & launch full cluster (Redis + Masters + Volumes + Filers + FUSE)
+sudo ./build_powerfs_image.sh
+docker compose -f docker-compose.test.yml up -d
+```
 
-## Application Scenarios
+Or build from source:
 
-- **HPC Supercomputing**: Fluid dynamics, meteorology, material simulation, large-scale MPI parallel jobs
-- **AI Training Cluster**: Massive dataset storage, high-throughput model reading/writing, model file persistent storage
-- **LLM Inference Cluster**: Long-context KV cache acceleration, GPU memory overflow offloading, high-concurrency inference service optimization
-- **HPC+AI Converged Data Center**: Unified storage resource pooling, isolated coexistence of supercomputing and intelligent computing workloads
+```bash
+cargo build --release
 
----
+# 1. Start Redis
+docker run -d --name redis -p 6379:6379 redis:7-alpine
 
-## ⚡ Performance Highlights
+# 2. Start 3 Masters (Raft)
+./target/release/powerfs-master --config config/master-{1,2,3}.toml
 
+# 3. Start 3 Volumes
+./target/release/powerfs-volume --config config/volume-{1,2,3}.toml
 
-### Enterprise Edition (Lock-Free Optimization)
-- **40x** faster single-thread metadata operations (mkdir/lookup/rmdir)
-- **55x** faster multi-thread metadata operations (8 threads)
-- **10.6x** faster directory listing (10,000 entries)
-- Zero deadlock under large directory copy operations
-- Separate statfs channel ensures `df` works under high load
+# 4. Init Filers (format root inode, run once per Filer)
+./target/release/powerfs-init --config config/filer-{1,2,3}.toml
 
-### GPU Utilization
-- GPU utilization increased from 40%~50% to 90%+ for LLM inference (with KV cache engine)
+# 5. Start 3 Filers
+./target/release/powerfs-filer --config config/filer-{1,2,3}.toml
+
+# 6. Mount
+./target/release/powerfs-fuse --config config/fuse.toml
+```
+
+**Default credentials**: admin / admin123 · **S3**: powerfs / powerfs123 @ http://localhost:9000
 
 ---
 
 ## Benchmark
 
-> **Note**: The following benchmark data was collected after the strong-consistency refactor (Filer Raft + Callback Invalidation). Tests run in container environment with standard `fio` and `io500` commands (no script replacements).
+> After Filer Raft strong-consistency refactor. Tests run with standard `fio` and `io500` in container environment.
 
-### Enterprise Edition Lock-Free Optimization Performance Comparison
+### Metadata Performance (Lock-Free Optimization)
 
-The Enterprise Edition introduces significant lock-free optimizations to the metadata management layer, delivering dramatic performance improvements for concurrent workloads.
+| Operation | Community (Single Lock) | Enterprise (Lock-Free) | Speedup |
+|---|---|---|---|
+| Single-thread mkdir+lookup+rmdir | ~50K ops/s | **~2M ops/s** | **40x** |
+| Multi-thread (8) mkdir+lookup+rmdir | ~10K ops/s | **~550K ops/s** | **55x** |
+| list_dir (10K entries) | ~50ms | **~4.7ms** | **10.6x** |
 
-#### Test Environment
-- **Hardware**: 8-core CPU, NVMe SSD
-- **Test Method**: Local MetadataManager benchmark (no network overhead)
-- **Metrics**: Operations per second (ops/s)
+### GPU Utilization
 
-#### Performance Comparison
+- LLM inference GPU utilization: **40-50% → 90%+** (with KV cache engine)
 
-| Operation | Community Edition (Single Lock) | Enterprise Edition (Lock-Free) | Improvement |
-|-----------|----------------------------------|--------------------------------|-------------|
-| Single-thread mkdir+lookup+rmdir | ~50,000 ops/s | **~2,000,000 ops/s** | **40x** |
-| Single-thread create+unlink | ~60,000 ops/s | **~2,220,000 ops/s** | **37x** |
-| Multi-thread (8) mkdir+lookup+rmdir | ~10,000 ops/s | **~550,000 ops/s** | **55x** |
-| Multi-thread (8) create+unlink | ~12,000 ops/s | **~600,000 ops/s** | **50x** |
-| list_dir (10,000 entries) | ~50ms | **~4.7ms** | **10.6x** |
+### Comparison
 
-#### Lock-Free Optimization Features
+| Storage | HPC Parallel | AI KV Inference | Multi-Protocol | Jitter |
+|---|---|---|---|---|
+| Lustre/BeeGFS | Excellent | Poor | Single protocol | Medium |
+| Ceph/CubeFS | Weak | Medium | Fake multi-protocol | High |
+| **PowerFS** | **Excellent** | **Excellent** | **True unified** | **Zero** |
 
-1. **Sharded DirCache**: Directory cache partitioned by parent inode hash (CPU cores × 2 shards), eliminating global lock contention
-2. **Per-Queue Single-Thread Consumption**: Each shard managed by dedicated worker thread, no cross-thread synchronization
-3. **Atomic Reference Counting**: Inode reference count managed via atomic operations, reducing lock scope
-4. **Optimistic Size Update**: File size updates with insize/outsize check, avoiding unnecessary locks on concurrent writes
-5. **Separate statfs Channel**: Dedicated gRPC channel for space queries, ensuring `df` works under high load
-6. **Generation Management**: Inode generation tracking prevents stale handles after file deletion
+---
 
-#### Real-World Impact
+## Application Scenarios
 
-- **Large Directory Copy**: `cp -prf /usr/bin .` (665 files) completes in seconds without deadlock
-- **Concurrent File Operations**: Supports 10,000+ MPI processes concurrent read/write without performance degradation
-- **Steady-State Operation**: Zero jitter under full load, stable p99/p999 latency
-
-### Benchmark Outlook
-
-PowerFS targets leading performance among mainstream open-source distributed storage systems, with core advantages as follows:
-
-- **vs General Cloud-Native Storage**: Higher parallel computing concurrency, lower steady-state jitter, native KV cache AI acceleration capability
-- **vs Traditional HPC File System**: Lighter architecture, lower O&M cost, better small-file performance, natively adapted to AI inference scenarios
-- **vs Lightweight Distributed Storage**: Complete POSIX HPC semantics, enterprise-level high availability and QoS isolation, professional supercomputing cluster carrying capacity
+- **HPC Supercomputing**: MPI parallel simulation, fluid dynamics, meteorology
+- **AI Training**: Massive dataset loading, model checkpoint I/O
+- **LLM Inference**: KV cache offloading, long-context acceleration, GPU memory extension
+- **Converged Data Center**: One storage pool for HPC + AI workloads
 
 ---
 
@@ -699,7 +602,10 @@ Options:
   -h, --help             Print help
 ```
 
-### Architecture Overview
+## Architecture Details
+
+<details>
+<summary>Full Architecture Diagram (click to expand)</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -753,7 +659,10 @@ Options:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Consistency Model
+</details>
+
+<details>
+<summary>Dual Consistency Model (click to expand)</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -777,7 +686,10 @@ Options:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Protocol Stack
+</details>
+
+<details>
+<summary>TLV Protocol Stack (click to expand)</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -791,8 +703,10 @@ Options:
 │  • Multiplexed channels (data/lease/mgmt)              │
 │  • Circuit breaker for fault tolerance                 │
 │  • Automatic reconnection and retry                    │
-└─────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 ---
 

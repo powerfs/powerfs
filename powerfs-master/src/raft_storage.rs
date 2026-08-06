@@ -96,6 +96,17 @@ pub enum RaftCommand {
         volume_id: u64,
         new_next_key: u64,
     },
+    /// P1.3: Persist Zone registration (zone_id → physical volumes mapping).
+    /// Proposed when Filer registers and Master allocates a new Zone.
+    /// Survives Master restart by replaying from Raft log.
+    RegisterZone {
+        zone: powerfs_common::types::ZoneInfo,
+    },
+    /// P1.3: Persist Zone update (re-registration with updated physical volumes).
+    /// Proposed when Filer re-registers and volume routes have changed.
+    UpdateZone {
+        zone: powerfs_common::types::ZoneInfo,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)
@@ -476,6 +487,52 @@ impl RocksDbStorage {
 
         info!("Loaded {} log entries", entries.len());
         Ok(())
+    }
+
+    /// P1.3: Extract Zone-related commands (RegisterZone/UpdateZone) from the
+    /// in-memory log entries cache. Called during Master startup to restore
+    /// zone_registry from persisted Raft log (since `cfg.applied` is set to
+    /// `commit_index`, Raft will not replay already-applied entries).
+    pub fn get_zone_commands(&self) -> Vec<RaftCommand> {
+        let entries = self.entries.read().unwrap();
+        let mut zone_cmds = Vec::new();
+        let mut total_normal = 0u64;
+        let mut total_non_empty = 0u64;
+        let mut total_deserialized = 0u64;
+        let mut total_failed = 0u64;
+
+        for entry in entries.iter() {
+            // Only process normal proposals (not conf changes)
+            if entry.entry_type != raft::eraftpb::EntryType::EntryNormal {
+                continue;
+            }
+            total_normal += 1;
+            if entry.data.is_empty() {
+                continue;
+            }
+            total_non_empty += 1;
+            match RaftCommand::deserialize(&entry.data) {
+                Ok(cmd) => {
+                    total_deserialized += 1;
+                    match &cmd {
+                        RaftCommand::RegisterZone { .. } | RaftCommand::UpdateZone { .. } => {
+                            zone_cmds.push(cmd);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(_) => {
+                    total_failed += 1;
+                }
+            }
+        }
+
+        info!(
+            "P1.3 get_zone_commands: total_normal={}, non_empty={}, deserialized={}, failed={}, zone_cmds={}",
+            total_normal, total_non_empty, total_deserialized, total_failed, zone_cmds.len()
+        );
+
+        zone_cmds
     }
 
     /// Append entries to the storage

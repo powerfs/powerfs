@@ -314,6 +314,9 @@ impl MasterNode {
         let message_tx = raft_node.get_message_tx();
         let mut apply_rx = raft_node.take_apply_rx();
 
+        // P1.3: Extract Zone commands from Raft log for replay after restart
+        let zone_commands = raft_node.take_zone_commands();
+
         // Spawn the Raft event loop (processes ticks, proposals, and messages)
         tokio::spawn(async move {
             if let Err(e) = raft_node.run().await {
@@ -409,6 +412,32 @@ impl MasterNode {
             zone_registry: RwLock::new(HashMap::new()),
             next_zone_id: Arc::new(AtomicU32::new(1)),
         };
+
+        // P1.3: Replay Zone commands from Raft log to restore zone_registry.
+        // Raft sets cfg.applied = commit_index, so already-applied entries
+        // (including RegisterZone/UpdateZone) won't be re-applied by the Raft
+        // event loop. We manually replay them here to restore in-memory state.
+        if !zone_commands.is_empty() {
+            info!(
+                "P1.3: replaying {} Zone commands from Raft log to restore zone_registry",
+                zone_commands.len()
+            );
+            for cmd in zone_commands {
+                let entry = ApplyEntry {
+                    index: 0,
+                    command: cmd,
+                };
+                if let Err(e) = master.apply_command(entry).await {
+                    warn!("P1.3: failed to replay Zone command: {}", e);
+                }
+            }
+            let zone_count = master.zone_registry.read().unwrap().len();
+            let next_zid = master.next_zone_id.load(std::sync::atomic::Ordering::SeqCst);
+            info!(
+                "P1.3: zone_registry restored: {} zones, next_zone_id={}",
+                zone_count, next_zid
+            );
+        }
 
         let master_clone = master.clone();
         tokio::spawn(async move {
@@ -832,6 +861,28 @@ impl MasterNode {
                         );
                     }
                 }
+            }
+            RaftCommand::RegisterZone { zone } => {
+                let zone_id = zone.zone_id;
+                self.zone_registry
+                    .write()
+                    .unwrap()
+                    .insert(zone_id, zone);
+                // Recover next_zone_id to avoid reusing zone_id after restart
+                let current = self.next_zone_id.load(std::sync::atomic::Ordering::SeqCst);
+                if zone_id >= current {
+                    self.next_zone_id
+                        .store(zone_id + 1, std::sync::atomic::Ordering::SeqCst);
+                }
+                debug!("Applied RegisterZone via Raft: zone_id={}", zone_id);
+            }
+            RaftCommand::UpdateZone { zone } => {
+                let zone_id = zone.zone_id;
+                self.zone_registry
+                    .write()
+                    .unwrap()
+                    .insert(zone_id, zone);
+                debug!("Applied UpdateZone via Raft: zone_id={}", zone_id);
             }
         }
 
@@ -2178,7 +2229,11 @@ impl MasterNode {
     ///   - 首次注册: 创建 1 个新 Zone, 返回 Vec(1)
     ///   - 重启再注册: 返回该 filer_id 的所有已有 Zone, 不自动创建新 Zone
     ///   - 扩容 (未来): 返回旧 Zone + 创建新 Zone
-    pub fn register_filer_zone(&self, filer_id: &str) -> Vec<powerfs_common::types::ZoneInfo> {
+    /// P1.3: Zone 注册/更新通过 Raft 持久化, Master 重启后从 Raft 日志重放恢复.
+    pub async fn register_filer_zone(
+        &self,
+        filer_id: &str,
+    ) -> Vec<powerfs_common::types::ZoneInfo> {
         // 收集该 filer 的所有已有 Zone
         let existing: Vec<powerfs_common::types::ZoneInfo> = {
             let registry = self.zone_registry.read().unwrap();
@@ -2221,13 +2276,28 @@ impl MasterNode {
 
         if !existing.is_empty() {
             // 重注册: 更新已有 Zone 的 physical_volumes (volume 路由可能已变化)
-            let mut registry = self.zone_registry.write().unwrap();
+            // P1.3: 通过 Raft 持久化 UpdateZone
             let mut result = Vec::with_capacity(existing.len());
             for mut zone in existing {
                 if !physical_volumes.is_empty() {
                     zone.physical_volumes = physical_volumes.clone();
                 }
-                registry.insert(zone.zone_id, zone.clone());
+                // P1.3: propose UpdateZone (apply 到内存 + Raft 日志持久化)
+                let cmd = crate::raft_storage::RaftCommand::UpdateZone {
+                    zone: zone.clone(),
+                };
+                if let Err(e) = self.propose_command(cmd).await {
+                    warn!(
+                        "MASTER_ZONE: failed to persist UpdateZone for zone_id={}: {} \
+                         (memory updated, may not survive restart)",
+                        zone.zone_id, e
+                    );
+                    // Fallback: 直接更新内存 (与旧行为一致)
+                    self.zone_registry
+                        .write()
+                        .unwrap()
+                        .insert(zone.zone_id, zone.clone());
+                }
                 result.push(zone);
             }
             info!(
@@ -2260,10 +2330,22 @@ impl MasterNode {
             zone_info.physical_volumes.len()
         );
 
-        self.zone_registry
-            .write()
-            .unwrap()
-            .insert(zone_id, zone_info.clone());
+        // P1.3: propose RegisterZone (apply 到内存 + Raft 日志持久化)
+        let cmd = crate::raft_storage::RaftCommand::RegisterZone {
+            zone: zone_info.clone(),
+        };
+        if let Err(e) = self.propose_command(cmd).await {
+            warn!(
+                "MASTER_ZONE: failed to persist RegisterZone for zone_id={}: {} \
+                 (memory updated, may not survive restart)",
+                zone_id, e
+            );
+            // Fallback: 直接更新内存 (与旧行为一致)
+            self.zone_registry
+                .write()
+                .unwrap()
+                .insert(zone_id, zone_info.clone());
+        }
 
         vec![zone_info]
     }

@@ -46,6 +46,9 @@ pub struct RaftNode {
     propose_rx: mpsc::Receiver<ProposeRequest>,
     /// Broadcast channel for sending raft messages to peers
     message_tx: tokio::sync::broadcast::Sender<OutgoingMessage>,
+    /// P1.3: Zone commands extracted from Raft log during startup.
+    /// Consumed by MasterNode::new() to restore zone_registry.
+    zone_commands: Vec<RaftCommand>,
     /// Receiver for outgoing messages (unused, broadcast subscribers are created via subscribe())
     #[allow(dead_code)]
     message_rx: tokio::sync::broadcast::Receiver<OutgoingMessage>,
@@ -165,6 +168,17 @@ impl RaftNode {
 
         let logger = Logger::root(Discard, slog::o!());
 
+        // P1.3: Extract Zone commands from Raft log before creating RawNode
+        // (which takes ownership of storage). These are replayed by MasterNode
+        // to restore zone_registry after restart.
+        let zone_commands = storage.get_zone_commands();
+        if !zone_commands.is_empty() {
+            info!(
+                "P1.3: extracted {} Zone commands from Raft log for replay",
+                zone_commands.len()
+            );
+        }
+
         let node = RawNode::new(&cfg, storage.clone(), &logger)
             .map_err(|e| format!("failed to create raft node: {}", e))?;
 
@@ -198,6 +212,7 @@ impl RaftNode {
             propose_tx,
             propose_rx,
             message_tx,
+            zone_commands,
             message_rx,
             step_tx,
             step_rx,
@@ -208,6 +223,13 @@ impl RaftNode {
             leader_state,
             leader_address,
         })
+    }
+
+    /// P1.3: Take Zone commands extracted from Raft log.
+    /// Called by MasterNode::new() to replay RegisterZone/UpdateZone
+    /// and restore zone_registry after Master restart.
+    pub fn take_zone_commands(&mut self) -> Vec<RaftCommand> {
+        std::mem::take(&mut self.zone_commands)
     }
 
     /// Start the Raft event loop

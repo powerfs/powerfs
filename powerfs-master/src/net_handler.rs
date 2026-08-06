@@ -633,7 +633,7 @@ impl MasterNetHandler {
             filer_id
         );
 
-        let zones = self.master.register_filer_zone(&filer_id);
+        let zones = self.master.register_filer_zone(&filer_id).await;
 
         let mut enc = TlvEncoder::new();
         // 多 Zone 编码: Entries=zone_count, 每个 Zone 含 ZoneId + Limit=vol_count + vol 条目
