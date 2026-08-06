@@ -78,10 +78,13 @@ pub trait FlowPolicy: Send + Sync {
     /// 准入决策: 是否允许新请求
     fn admit(&self, ctx: &FlowCtx) -> AdmissionDecision;
 
-    /// 当前负载因子 (0-3, Phase 2 用; Phase 1 返回 0)
+    /// 当前负载因子 (0-3), 基于全局在途请求数计算.
     ///
     /// 0=空闲(0-25%), 1=正常(25-50%), 2=较忙(50-75%), 3=满载(75-100%)
-    fn load_factor(&self) -> u8;
+    ///
+    /// Phase 2: FlowController 调用此方法并传入 `global_active`,
+    /// 将结果 stamp 到响应帧 flags bits 6-7, 客户端据此自适应调整.
+    fn load_factor(&self, global_active: u32) -> u8;
 
     /// 策略名称
     fn name(&self) -> &'static str;
@@ -132,25 +135,6 @@ impl AdaptiveConcurrencyPolicy {
     pub fn set_max_active_per_conn(&self, v: u32) {
         self.max_active_per_conn.store(v, Ordering::Relaxed);
     }
-
-    /// 计算负载因子 (0-3)
-    ///
-    /// 基于全局 active/max 比率. Phase 2 由 FlowController 调用并写入响应帧 flags.
-    pub fn compute_load_factor(&self, global_active: u32) -> u8 {
-        let max = self.max_active_global.load(Ordering::Relaxed);
-        if max == 0 {
-            return 3; // 无上限配置视为满载 (异常防御)
-        }
-        // ratio = global_active / max, 映射到 0-3
-        // 用乘法避免浮点: (global_active * 4) / max
-        let scaled = (global_active as u64) * 4 / max as u64;
-        match scaled {
-            0 => 0,          // 0-25%
-            1 => 1,          // 25-50%
-            2 => 2,          // 50-75%
-            _ => 3,          // 75-100%+
-        }
-    }
 }
 
 impl FlowPolicy for AdaptiveConcurrencyPolicy {
@@ -185,10 +169,20 @@ impl FlowPolicy for AdaptiveConcurrencyPolicy {
         AdmissionDecision::Admit
     }
 
-    fn load_factor(&self) -> u8 {
-        // Phase 1: 无活跃统计引用, 返回 0
-        // Phase 2: FlowController 会调 compute_load_factor(global_active)
-        0
+    fn load_factor(&self, global_active: u32) -> u8 {
+        let max = self.max_active_global.load(Ordering::Relaxed);
+        if max == 0 {
+            return 3; // 无上限配置视为满载 (异常防御)
+        }
+        // ratio = global_active / max, 映射到 0-3
+        // 用乘法避免浮点: (global_active * 4) / max
+        let scaled = (global_active as u64) * 4 / max as u64;
+        match scaled {
+            0 => 0,          // 0-25%
+            1 => 1,          // 25-50%
+            2 => 2,          // 50-75%
+            _ => 3,          // 75-100%+
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -203,7 +197,7 @@ impl FlowPolicy for NullPolicy {
     fn admit(&self, _ctx: &FlowCtx) -> AdmissionDecision {
         AdmissionDecision::Admit
     }
-    fn load_factor(&self) -> u8 {
+    fn load_factor(&self, _global_active: u32) -> u8 {
         0
     }
     fn name(&self) -> &'static str {
@@ -336,41 +330,43 @@ mod tests {
     }
 
     #[test]
-    fn test_load_factor_phase1() {
-        let policy = AdaptiveConcurrencyPolicy::with_defaults();
-        // Phase 1: load_factor() 始终返回 0
-        assert_eq!(policy.load_factor(), 0);
+    fn test_load_factor_idle() {
+        let policy = AdaptiveConcurrencyPolicy::new(256, 64);
+        // 0 active → 0
+        assert_eq!(policy.load_factor(0), 0);
+        // 20% → 0
+        assert_eq!(policy.load_factor(51), 0); // 51*4/256 = 0
     }
 
     #[test]
-    fn test_compute_load_factor() {
+    fn test_load_factor_levels() {
         let policy = AdaptiveConcurrencyPolicy::new(100, 64);
 
         // 0% → 0
-        assert_eq!(policy.compute_load_factor(0), 0);
+        assert_eq!(policy.load_factor(0), 0);
         // 20% → 0
-        assert_eq!(policy.compute_load_factor(20), 0);
+        assert_eq!(policy.load_factor(20), 0);
         // 25% → 1
-        assert_eq!(policy.compute_load_factor(25), 1);
+        assert_eq!(policy.load_factor(25), 1);
         // 49% → 1
-        assert_eq!(policy.compute_load_factor(49), 1);
+        assert_eq!(policy.load_factor(49), 1);
         // 50% → 2
-        assert_eq!(policy.compute_load_factor(50), 2);
+        assert_eq!(policy.load_factor(50), 2);
         // 74% → 2
-        assert_eq!(policy.compute_load_factor(74), 2);
+        assert_eq!(policy.load_factor(74), 2);
         // 75% → 3
-        assert_eq!(policy.compute_load_factor(75), 3);
+        assert_eq!(policy.load_factor(75), 3);
         // 100% → 3
-        assert_eq!(policy.compute_load_factor(100), 3);
+        assert_eq!(policy.load_factor(100), 3);
         // 120% → 3
-        assert_eq!(policy.compute_load_factor(120), 3);
+        assert_eq!(policy.load_factor(120), 3);
     }
 
     #[test]
-    fn test_compute_load_factor_max_zero_defense() {
+    fn test_load_factor_max_zero_defense() {
         let policy = AdaptiveConcurrencyPolicy::new(0, 64);
         // max=0 视为满载 (异常防御)
-        assert_eq!(policy.compute_load_factor(0), 3);
+        assert_eq!(policy.load_factor(0), 3);
     }
 
     #[test]

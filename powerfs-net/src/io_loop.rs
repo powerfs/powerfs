@@ -141,6 +141,7 @@ impl IoLoop {
 
         // read_task: 读取帧 → Work → WorkQueue
         let read_conn = conn.clone();
+        let read_flow_ctrl = flow_ctrl.clone();
         let read_task = tokio::spawn(async move {
             loop {
                 // 检查关闭信号 (非阻塞)
@@ -195,13 +196,17 @@ impl IoLoop {
 
                         // 处理 Ping (控制帧, 直接回复, 不走 Worker)
                         if let Some(MsgType::Ping) = msg.msg_type() {
-                            let resp_header = FrameHeader::new(
+                            let lf = read_flow_ctrl.current_load_factor();
+                            let mut resp_header = FrameHeader::new(
                                 MsgType::Ping.as_u16(),
                                 FrameFlags::new(FrameFlags::RESPONSE),
                                 msg.header.seq,
                                 0,
                             )
                             .with_status(STATUS_OK);
+                            // Phase 2: stamp load_factor so clients can probe
+                            // server load via Ping without sending real requests.
+                            resp_header.set_load_factor(lf);
                             let resp = NetMessage::new(resp_header);
                             let _ = read_conn.send_response(&resp);
                             continue;

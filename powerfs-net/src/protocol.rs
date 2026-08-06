@@ -33,6 +33,12 @@ impl FrameFlags {
     pub const BATCH: u8 = 0x08;
     pub const ACK: u8 = 0x10;
 
+    /// Bits 6-7: server load_factor (Phase 2).
+    /// Encoded as 2-bit level (0-3) for backward-compatible piggyback on
+    /// response frames. Old clients ignore these bits; old servers fill 0.
+    pub const LOAD_FACTOR_SHIFT: u8 = 6;
+    pub const LOAD_FACTOR_MASK: u8 = 0xC0;
+
     pub fn new(bits: u8) -> Self {
         Self(bits)
     }
@@ -293,6 +299,25 @@ impl FrameHeader {
         self.status = status;
         self.header_crc = self.calc_header_crc();
         self
+    }
+
+    /// Stamp server load_factor (0-3) into flags bits 6-7, recompute CRC.
+    ///
+    /// Phase 2: called by Worker before sending a response so the client can
+    /// adapt its admission concurrency. Values >3 are clamped to 3.
+    pub fn set_load_factor(&mut self, lf: u8) {
+        let level = lf.min(3);
+        self.flags = (self.flags & !FrameFlags::LOAD_FACTOR_MASK)
+            | (level << FrameFlags::LOAD_FACTOR_SHIFT);
+        self.header_crc = self.calc_header_crc();
+    }
+
+    /// Extract server load_factor (0-3) from flags bits 6-7.
+    ///
+    /// Phase 2: called by kernel client on response receipt to adjust
+    /// admission concurrency.
+    pub fn load_factor(&self) -> u8 {
+        (self.flags & FrameFlags::LOAD_FACTOR_MASK) >> FrameFlags::LOAD_FACTOR_SHIFT
     }
 
     fn calc_header_crc(&self) -> u32 {
@@ -1099,5 +1124,84 @@ mod tests {
         assert!(decoded.is_notify());
         assert_eq!(decoded.msg_type, MsgType::TopologyChanged.as_u16());
         assert!(decoded.verify_crc());
+    }
+
+    // ----- Phase 2: load_factor flag encoding -----
+
+    #[test]
+    fn test_set_and_get_load_factor() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::RESPONSE),
+            1,
+            0,
+        );
+        assert_eq!(hdr.load_factor(), 0); // default
+
+        for lf in 0..=3 {
+            hdr.set_load_factor(lf);
+            assert_eq!(hdr.load_factor(), lf);
+            assert!(hdr.verify_crc(), "CRC must be valid after set_load_factor({})", lf);
+        }
+    }
+
+    #[test]
+    fn test_load_factor_clamped() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Ping.as_u16(),
+            FrameFlags::new(FrameFlags::RESPONSE),
+            1,
+            0,
+        );
+        hdr.set_load_factor(255);
+        assert_eq!(hdr.load_factor(), 3);
+        hdr.set_load_factor(5);
+        assert_eq!(hdr.load_factor(), 3);
+    }
+
+    #[test]
+    fn test_load_factor_preserves_other_flags() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::RESPONSE | FrameFlags::BATCH),
+            42,
+            100,
+        );
+        hdr.set_load_factor(2);
+        // RESPONSE and BATCH bits must survive
+        assert!(hdr.flags & FrameFlags::RESPONSE != 0);
+        assert!(hdr.flags & FrameFlags::BATCH != 0);
+        assert_eq!(hdr.load_factor(), 2);
+        assert!(hdr.verify_crc());
+    }
+
+    #[test]
+    fn test_load_factor_survives_encode_decode() {
+        let mut hdr = FrameHeader::new(
+            MsgType::WriteNeedle.as_u16(),
+            FrameFlags::new(FrameFlags::RESPONSE),
+            7,
+            2048,
+        );
+        hdr.set_load_factor(3);
+
+        let mut buf = vec![0u8; FrameHeader::SIZE];
+        hdr.encode(&mut buf);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.load_factor(), 3);
+        assert!(decoded.verify_crc());
+    }
+
+    #[test]
+    fn test_load_factor_backward_compat_zero() {
+        // Old server fills flags=RESPONSE (0x02), load_factor bits = 00.
+        // New client reads load_factor=0 (idle). No breakage.
+        let hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::RESPONSE),
+            1,
+            0,
+        );
+        assert_eq!(hdr.load_factor(), 0);
     }
 }

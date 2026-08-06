@@ -76,7 +76,8 @@ pub fn slow_connections_json(fc: &FlowController) -> Value {
 
 /// 策略信息 (name + load_factor)
 ///
-/// Phase 2 load_factor 会反映服务器负载 (0-3), Phase 1 始终为 0.
+/// load_factor (0-3) 反映服务器当前负载, 基于 global active_reqs / max_active_global
+/// 比率计算. Worker 在发送响应时将此值 stamp 到帧头 flags bits 6-7.
 pub fn policy_json(fc: &FlowController) -> Value {
     json!({
         "name": fc.policy_name(),
@@ -174,6 +175,7 @@ mod tests {
         fc.set_default_policy();
         let v = policy_json(&fc);
         assert_eq!(v["name"], "adaptive-concurrency");
-        assert_eq!(v["load_factor"], 0); // Phase 1 始终 0
+        // 0 active_reqs → load_factor=0 (idle)
+        assert_eq!(v["load_factor"], 0);
     }
 }

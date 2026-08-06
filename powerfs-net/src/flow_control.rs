@@ -577,12 +577,13 @@ impl FlowController {
 
     /// 当前负载因子 (0-3, Phase 2 用于响应帧 flags bit 6-7)
     ///
-    /// Phase 1: 始终返回 0 (策略未实现 load_factor 计算)
-    /// Phase 2: FlowController 基于 global active/max 计算
+    /// Phase 2: 基于 global active_reqs 和策略的 max_active_global 计算比率.
+    /// Worker 在发送响应前调用此方法, 将结果 stamp 到响应帧 flags bits 6-7.
     pub fn current_load_factor(&self) -> u8 {
         let policy_guard = self.policy.read();
         if let Some(policy) = policy_guard.as_ref() {
-            return policy.load_factor();
+            let global_active = self.global.active_reqs.load(Ordering::Relaxed);
+            return policy.load_factor(global_active);
         }
         0
     }
@@ -1009,14 +1010,44 @@ mod tests {
     }
 
     #[test]
-    fn test_current_load_factor_phase1() {
+    fn test_current_load_factor_no_policy() {
         let fc = FlowController::with_defaults();
-        fc.set_default_policy();
-        // Phase 1: load_factor 始终返回 0
+        // 无策略 → 0
+        assert_eq!(fc.current_load_factor(), 0);
+    }
+
+    #[test]
+    fn test_current_load_factor_with_policy() {
+        let fc = FlowController::with_defaults();
+        let policy = Arc::new(crate::flow_policy::AdaptiveConcurrencyPolicy::new(100, 64))
+            as Arc<dyn FlowPolicy>;
+        fc.set_policy(Some(policy));
+        fc.register_conn(1, "127.0.0.1:1001".into(), Channel::Data);
+        let stats = fc.get_conn(1).unwrap();
+
+        // 0 active → lf=0
         assert_eq!(fc.current_load_factor(), 0);
 
-        // 无策略也返回 0
-        fc.set_policy(None);
-        assert_eq!(fc.current_load_factor(), 0);
+        // 25 active (25%) → lf=1
+        for _ in 0..25 {
+            fc.on_request_start(&stats);
+        }
+        assert_eq!(fc.current_load_factor(), 1);
+
+        // 50 active (50%) → lf=2
+        for _ in 0..25 {
+            fc.on_request_start(&stats);
+        }
+        assert_eq!(fc.current_load_factor(), 2);
+
+        // 75 active (75%) → lf=3
+        for _ in 0..25 {
+            fc.on_request_start(&stats);
+        }
+        assert_eq!(fc.current_load_factor(), 3);
+
+        // complete 1 → 74 active → lf=2
+        fc.on_request_complete(&stats, 1_000, 100, false);
+        assert_eq!(fc.current_load_factor(), 2);
     }
 }

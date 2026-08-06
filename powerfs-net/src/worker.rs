@@ -18,7 +18,7 @@ use std::time::Instant;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
-use crate::client_conn::ConnState;
+use crate::client_conn::{ClientConn, ConnState};
 use crate::flow_control::FlowController;
 use crate::flow_policy::AdmissionDecision;
 use crate::protocol::{FrameFlags, FrameHeader, NetMessage, STATUS_ERR_SERVER_ERROR};
@@ -109,7 +109,7 @@ impl Worker {
                         self.id, conn.id, seq, msg_type, reason.as_str()
                     );
                     let resp = Self::build_error_response(&work.msg);
-                    let _ = conn.send_response(&resp);
+                    self.send_with_flow(conn, resp);
                     return; // 未处理, 不调 on_request_complete
                 }
             },
@@ -141,7 +141,8 @@ impl Worker {
         match result {
             Ok(resp) => {
                 // 发送响应 (通过 conn.outbound_tx → IoLoop write_task)
-                if !conn.send_response(&resp) {
+                // Phase 2: stamp load_factor onto flags bits 6-7
+                if !self.send_with_flow(conn, resp) {
                     // 通道关闭 = 连接已断开, IoLoop 会处理清理
                     debug!(
                         "Worker {}: outbound channel closed for conn={} seq={}",
@@ -149,8 +150,8 @@ impl Worker {
                     );
                 } else {
                     debug!(
-                        "Worker {}: request handled conn={} seq={} type={:#x} status={}",
-                        self.id, conn.id, seq, msg_type, resp.header.status
+                        "Worker {}: request handled conn={} seq={} type={:#x}",
+                        self.id, conn.id, seq, msg_type
                     );
                 }
             }
@@ -160,9 +161,9 @@ impl Worker {
                     self.id, conn.id, seq, msg_type, e
                 );
 
-                // 构造错误响应
+                // 构造错误响应 (同样 stamp load_factor)
                 let error_resp = Self::build_error_response(&work.msg);
-                let _ = conn.send_response(&error_resp);
+                self.send_with_flow(conn, error_resp);
 
                 // 更新错误统计
                 conn.stats.write().await.error_count += 1;
@@ -190,6 +191,16 @@ impl Worker {
         )
         .with_status(STATUS_ERR_SERVER_ERROR);
         NetMessage::new(header)
+    }
+
+    /// Phase 2: 将当前 load_factor stamp 到响应帧 flags bits 6-7, 然后发送.
+    ///
+    /// 所有响应路径 (Ok / Err / Reject) 均通过此方法发送, 确保客户端
+    /// 每次请求都能收到最新的服务器负载反馈.
+    fn send_with_flow(&self, conn: &ClientConn, mut resp: NetMessage) -> bool {
+        let lf = self.flow_ctrl.current_load_factor();
+        resp.header.set_load_factor(lf);
+        conn.send_response(&resp)
     }
 }
 
