@@ -4,9 +4,9 @@
 //! powerfs-net binary protocol.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
@@ -17,7 +17,6 @@ use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::*;
-use crate::serialize::{DirEntry, EntryInfo};
 
 /// Drain all pending requests from a DashMap and notify each waiter with an
 /// error (empty-header) NetMessage.  Used by send_task/recv_loop/disconnect
@@ -39,6 +38,117 @@ fn drain_pending_with_error(pr: &DashMap<u32, oneshot::Sender<NetMessage>>) {
             )));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ClientState — client-side connection state machine
+// ---------------------------------------------------------------------------
+
+/// Client-side connection state.
+///
+/// Replaces the former `connected: bool` flag with a proper state machine
+/// that distinguishes the connecting/reconnecting phases from steady-state
+/// connected and disconnected.
+///
+/// ```text
+///   Disconnected ──connect()──► Connecting ──handshake_ok──► Connected
+///        ▲                          │                           │
+///        │                          │                       error/disconnect
+///        │                      handshake_fail                  │
+///        │                          ▼                           ▼
+///        └──────────────────── Reconnecting ◄──────────────────┘
+///                                  │
+///                              3× fail
+///                                  ▼
+///                            Disconnected
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientState {
+    /// Initial state or after explicit disconnect.
+    Disconnected,
+    /// Inside `connect()` — TCP connect + handshake in progress.
+    Connecting,
+    /// Connection established, send_task/recv_loop running.
+    Connected,
+    /// Inside `reconnect_internal()` — attempting to re-establish connection.
+    Reconnecting,
+}
+
+// ---------------------------------------------------------------------------
+// ClientMetrics — lock-free connection-level counters
+// ---------------------------------------------------------------------------
+
+/// Lock-free metrics for a single client connection.
+///
+/// All fields are atomic so they can be updated from the hot path
+/// (send_request, recv_loop, send_task) without taking locks.
+#[derive(Debug, Default)]
+pub struct ClientMetrics {
+    /// Total requests sent (before response).
+    pub requests_sent: AtomicU64,
+    /// Total responses received (success or error).
+    pub responses_received: AtomicU64,
+    /// Total request errors (timeout, network, server error).
+    pub request_errors: AtomicU64,
+    /// Total reconnect attempts (individual connect() calls inside
+    /// reconnect_internal, not the number of reconnect_internal invocations).
+    pub reconnect_attempts: AtomicU64,
+    /// Total successful reconnects.
+    pub reconnect_successes: AtomicU64,
+    /// Total failed reconnects (exhausted all 3 attempts).
+    pub reconnect_failures: AtomicU64,
+}
+
+impl ClientMetrics {
+    /// Snapshot all counters into a plain struct (for admin/monitoring).
+    pub fn snapshot(&self) -> ClientMetricsSnapshot {
+        ClientMetricsSnapshot {
+            requests_sent: self.requests_sent.load(Ordering::Relaxed),
+            responses_received: self.responses_received.load(Ordering::Relaxed),
+            request_errors: self.request_errors.load(Ordering::Relaxed),
+            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
+            reconnect_successes: self.reconnect_successes.load(Ordering::Relaxed),
+            reconnect_failures: self.reconnect_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Read-only snapshot of [`ClientMetrics`] for admin/monitoring.
+#[derive(Debug, Default, Clone)]
+pub struct ClientMetricsSnapshot {
+    pub requests_sent: u64,
+    pub responses_received: u64,
+    pub request_errors: u64,
+    pub reconnect_attempts: u64,
+    pub reconnect_successes: u64,
+    pub reconnect_failures: u64,
+}
+
+// ---------------------------------------------------------------------------
+// ClientEventListener — connection lifecycle event trait
+// ---------------------------------------------------------------------------
+
+/// Trait for receiving client-side connection lifecycle events.
+///
+/// Implement this to react to connect/disconnect/reconnect events without
+/// polling `is_connected()`. Installed via
+/// [`PowerFsNetClient::set_event_listener`].
+///
+/// All methods have default no-op implementations, so implementers only
+/// override the events they care about.
+pub trait ClientEventListener: Send + Sync {
+    /// Called after a successful connect() or reconnect.
+    fn on_connected(&self, _addr: &str, _port: u16) {}
+
+    /// Called after the connection is lost (detected by send_task/recv_loop
+    /// errors) or after an explicit disconnect().
+    fn on_disconnected(&self, _addr: &str, _port: u16) {}
+
+    /// Called before each reconnect attempt (1-based).
+    fn on_reconnect_attempt(&self, _addr: &str, _port: u16, _attempt: u32) {}
+
+    /// Called after all reconnect attempts failed.
+    fn on_reconnect_failed(&self, _addr: &str, _port: u16, _attempts: u32) {}
 }
 
 /// Configuration for the net client
@@ -89,9 +199,16 @@ pub struct PowerFsNetClient {
     read_half: Arc<Mutex<Option<OwnedReadHalf>>>,
     seq_counter: AtomicU32,
     inflight_sem: Arc<Semaphore>,
-    connected: Arc<parking_lot::Mutex<bool>>,
+    /// Connection state machine (replaces former `connected: bool`).
+    state: Arc<parking_lot::Mutex<ClientState>>,
+    /// Timestamp of the last successful connect (for uptime calculation).
+    connected_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    /// Lock-free connection-level metrics.
+    metrics: Arc<ClientMetrics>,
     /// Optional handler for server-pushed notifications
     notification_handler: Arc<parking_lot::Mutex<Option<Box<dyn NotificationHandler>>>>,
+    /// Optional listener for connection lifecycle events.
+    event_listener: Arc<parking_lot::Mutex<Option<Box<dyn ClientEventListener>>>>,
     /// Pending requests waiting for responses (seq → oneshot sender).
     /// Keys are inserted by send_request_internal and removed by recv_loop.
     ///
@@ -119,8 +236,11 @@ impl PowerFsNetClient {
             write_half: Arc::new(Mutex::new(None)),
             read_half: Arc::new(Mutex::new(None)),
             seq_counter: AtomicU32::new(0),
-            connected: Arc::new(parking_lot::Mutex::new(false)),
+            state: Arc::new(parking_lot::Mutex::new(ClientState::Disconnected)),
+            connected_at: Arc::new(parking_lot::Mutex::new(None)),
+            metrics: Arc::new(ClientMetrics::default()),
             notification_handler: Arc::new(parking_lot::Mutex::new(None)),
+            event_listener: Arc::new(parking_lot::Mutex::new(None)),
             pending_requests: Arc::new(DashMap::new()),
             recv_loop_handle: Arc::new(Mutex::new(None)),
             frame_tx: Arc::new(Mutex::new(None)),
@@ -135,12 +255,90 @@ impl PowerFsNetClient {
         *h = Some(handler);
     }
 
+    /// Set an event listener to receive connection lifecycle events.
+    pub fn set_event_listener(&self, listener: Box<dyn ClientEventListener>) {
+        let mut l = self.event_listener.lock();
+        *l = Some(listener);
+    }
+
+    /// Get the current connection state.
+    pub fn state(&self) -> ClientState {
+        *self.state.lock()
+    }
+
+    /// Get a snapshot of connection-level metrics.
+    pub fn metrics(&self) -> ClientMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Connection uptime in seconds (0 if not connected).
+    pub fn uptime_secs(&self) -> u64 {
+        self.connected_at
+            .lock()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers for state transitions + event notification
+    // -----------------------------------------------------------------------
+
+    /// Transition to the given state and fire the appropriate event.
+    fn set_state(&self, new_state: ClientState) {
+        let old_state = {
+            let mut s = self.state.lock();
+            let old = *s;
+            *s = new_state;
+            old
+        };
+        // Fire events only on meaningful transitions.
+        if old_state != new_state {
+            match new_state {
+                ClientState::Connected => {
+                    *self.connected_at.lock() = Some(Instant::now());
+                    self.fire_event_connected();
+                }
+                ClientState::Disconnected => {
+                    *self.connected_at.lock() = None;
+                    self.fire_event_disconnected();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn fire_event_connected(&self) {
+        if let Some(ref l) = *self.event_listener.lock() {
+            l.on_connected(&self.config.addr, self.config.port);
+        }
+    }
+
+    fn fire_event_disconnected(&self) {
+        if let Some(ref l) = *self.event_listener.lock() {
+            l.on_disconnected(&self.config.addr, self.config.port);
+        }
+    }
+
+    fn fire_event_reconnect_attempt(&self, attempt: u32) {
+        if let Some(ref l) = *self.event_listener.lock() {
+            l.on_reconnect_attempt(&self.config.addr, self.config.port, attempt);
+        }
+    }
+
+    fn fire_event_reconnect_failed(&self, attempts: u32) {
+        if let Some(ref l) = *self.event_listener.lock() {
+            l.on_reconnect_failed(&self.config.addr, self.config.port, attempts);
+        }
+    }
+
     /// Connect to the server
     pub async fn connect(&self) -> NetResult<()> {
-        // Check if already connected (frame_tx exists and connected flag is set)
-        if *self.connected.lock() && self.frame_tx.lock().await.is_some() {
+        // Check if already connected (frame_tx exists and state is Connected)
+        if self.state() == ClientState::Connected && self.frame_tx.lock().await.is_some() {
             return Ok(());
         }
+
+        self.set_state(ClientState::Connecting);
 
         // Fast path: if addr is already an IP, construct SocketAddr directly (no DNS)
         let addr: SocketAddr = match self.config.addr.parse::<IpAddr>() {
@@ -207,13 +405,15 @@ impl PowerFsNetClient {
         let (read_half, write_half) = tcp_stream.into_split();
         *self.write_half.lock().await = Some(write_half);
         *self.read_half.lock().await = Some(read_half);
-        *self.connected.lock() = true;
 
         // Start background send task (owns write_half via mpsc, no lock contention)
         self.start_send_task().await;
 
         // Start background receive loop
         self.start_recv_loop().await;
+
+        // Mark connected (fires on_connected event)
+        self.set_state(ClientState::Connected);
 
         Ok(())
     }
@@ -242,7 +442,7 @@ impl PowerFsNetClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         *self.frame_tx.lock().await = Some(tx);
 
-        let connected = self.connected.clone();
+        let state = self.state.clone();
         let pending_requests = self.pending_requests.clone();
         let write_timeout = self.config.request_timeout;
 
@@ -266,7 +466,7 @@ impl PowerFsNetClient {
                     Ok(Ok(())) => { /* frame sent, response will arrive via recv_loop */ }
                     Ok(Err(e)) => {
                         warn!("send_task: write error: {:?}", e);
-                        *connected.lock() = false;
+                        *state.lock() = ClientState::Disconnected;
                         drain_pending_with_error(&pending_requests);
                         break;
                     }
@@ -276,7 +476,7 @@ impl PowerFsNetClient {
                              draining all pending requests and marking connection dead",
                             write_timeout
                         );
-                        *connected.lock() = false;
+                        *state.lock() = ClientState::Disconnected;
                         drain_pending_with_error(&pending_requests);
                         break;
                     }
@@ -300,7 +500,8 @@ impl PowerFsNetClient {
         let read_half = self.read_half.clone();
         let pending_requests = self.pending_requests.clone();
         let notification_handler = self.notification_handler.clone();
-        let connected = self.connected.clone();
+        let state = self.state.clone();
+        let metrics = self.metrics.clone();
 
         let handle = tokio::spawn(async move {
             info!("PowerFsNetClient: recv_loop started");
@@ -334,7 +535,7 @@ impl PowerFsNetClient {
                     },
                     Err(e) => {
                         warn!("recv_loop: header read error: {:?}", e);
-                        *connected.lock() = false;
+                        *state.lock() = ClientState::Disconnected;
                         // Notify all pending requests of the error
                         drain_pending_with_error(&pending_requests);
                         break;
@@ -350,7 +551,7 @@ impl PowerFsNetClient {
                     payload.resize(total_len, 0u8);
                     if let Err(e) = reader.read_exact(&mut payload).await {
                         warn!("recv_loop: data read error: {:?}", e);
-                        *connected.lock() = false;
+                        *state.lock() = ClientState::Disconnected;
                         // Notify all pending requests of the error
                         drain_pending_with_error(&pending_requests);
                         break;
@@ -385,6 +586,9 @@ impl PowerFsNetClient {
                         "recv_loop: dispatched response seq={}, status={}",
                         seq, message.header.status
                     );
+                    metrics
+                        .responses_received
+                        .fetch_add(1, Ordering::Relaxed);
                     let _ = sender.send(message);
                 } else {
                     warn!("recv_loop: no pending request for seq={}, dropping", seq);
@@ -425,13 +629,14 @@ impl PowerFsNetClient {
         // Clear pending requests
         drain_pending_with_error(&self.pending_requests);
 
-        *self.connected.lock() = false;
+        // Transition to Disconnected (fires on_disconnected event)
+        self.set_state(ClientState::Disconnected);
         Ok(())
     }
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
-        *self.connected.lock()
+        self.state() == ClientState::Connected
     }
 
     /// Send a request and wait for response
@@ -450,11 +655,11 @@ impl PowerFsNetClient {
         // concurrent reconnect storms)
         {
             let frame_tx = self.frame_tx.lock().await;
-            let connected = frame_tx.is_some() && *self.connected.lock();
+            let connected = frame_tx.is_some() && self.state() == ClientState::Connected;
             debug!(
-                "send_request: frame_tx_is_some={}, connected={}",
+                "send_request: frame_tx_is_some={}, state={:?}",
                 frame_tx.is_some(),
-                connected
+                self.state()
             );
             if !connected {
                 drop(frame_tx);
@@ -471,21 +676,17 @@ impl PowerFsNetClient {
                 } else {
                     // Another request is already reconnecting — wait for it
                     debug!("send_request: waiting for concurrent reconnect...");
-                    let waited = Duration::from_millis(0);
                     let max_wait = self.config.connect_timeout * 3;
                     let start = std::time::Instant::now();
                     while self.reconnecting.load(Ordering::Acquire) && start.elapsed() < max_wait {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    if !*self.connected.lock() {
+                    if self.state() != ClientState::Connected {
                         return Err(NetError::Connection(
                             "reconnect by concurrent caller failed".into(),
                         ));
                     }
-                    debug!(
-                        "send_request: concurrent reconnect done, waited {:?}",
-                        waited
-                    );
+                    debug!("send_request: concurrent reconnect done");
                 }
             }
         }
@@ -530,6 +731,9 @@ impl PowerFsNetClient {
         // Create oneshot channel and register pending request
         let (tx, rx) = oneshot::channel::<NetMessage>();
         self.pending_requests.insert(seq, tx);
+        self.metrics
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
 
         // Push frame to send_task via mpsc channel (no write_half lock needed)
         {
@@ -543,7 +747,10 @@ impl PowerFsNetClient {
                             seq, e
                         );
                         self.pending_requests.remove(&seq);
-                        *self.connected.lock() = false;
+                        *self.state.lock() = ClientState::Disconnected;
+                        self.metrics
+                            .request_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Err(NetError::NotConnected);
                     }
                     debug!(
@@ -553,8 +760,11 @@ impl PowerFsNetClient {
                 }
                 None => {
                     self.pending_requests.remove(&seq);
-                    *self.connected.lock() = false;
+                    *self.state.lock() = ClientState::Disconnected;
                     warn!("send_request_internal: frame_tx is None");
+                    self.metrics
+                        .request_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(NetError::NotConnected);
                 }
             }
@@ -574,12 +784,18 @@ impl PowerFsNetClient {
                 // oneshot sender was dropped (likely recv_loop exited and
                 // drained pending_requests, or send_task drained on error)
                 warn!("send_request_internal: sender dropped for seq={}", seq);
+                self.metrics
+                    .request_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 Err(NetError::Connection("connection terminated".into()))
             }
             Err(_elapsed) => {
                 warn!("send_request_internal: response timeout for seq={}", seq);
-                // Remove pending request on timeout (do NOT set connected=false)
+                // Remove pending request on timeout (do NOT set state=Disconnected)
                 self.pending_requests.remove(&seq);
+                self.metrics
+                    .request_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 Err(NetError::Timeout)
             }
         }
@@ -612,14 +828,21 @@ impl PowerFsNetClient {
         }
         *self.write_half.lock().await = None;
         *self.read_half.lock().await = None;
-        *self.connected.lock() = false;
+        self.set_state(ClientState::Reconnecting);
 
         // Try up to 3 times with backoff
-        for attempt in 1..=3 {
+        for attempt in 1..=3u32 {
             info!("Reconnect attempt {}", attempt);
+            self.fire_event_reconnect_attempt(attempt);
+            self.metrics
+                .reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
             match self.connect().await {
                 Ok(()) => {
                     info!("Reconnected successfully");
+                    self.metrics
+                        .reconnect_successes
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(e) => {
@@ -631,6 +854,11 @@ impl PowerFsNetClient {
             }
         }
         error!("Failed to reconnect after 3 attempts");
+        self.metrics
+            .reconnect_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.fire_event_reconnect_failed(3);
+        self.set_state(ClientState::Disconnected);
         Err(NetError::Connection("reconnection failed".into()))
     }
 
@@ -668,195 +896,6 @@ impl PowerFsNetClient {
     pub async fn ping(&self) -> NetResult<()> {
         let _resp = self.send_request_internal(MsgType::Ping, &[], &[]).await?;
         Ok(())
-    }
-
-    // ========================================================================
-    // High-level convenience methods
-    // ========================================================================
-
-    /// Lookup a directory entry
-    pub async fn lookup(&self, parent_ino: u64, name: &str) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_lookup_req(parent_ino, name)?;
-        let resp = self.send_request(MsgType::Lookup, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "lookup failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_entry_resp(&resp.body)
-    }
-
-    /// Create a file or directory
-    pub async fn create(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_create_req(parent_ino, name, mode, uid, gid, None)?;
-        let resp = self.send_request(MsgType::Create, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "create failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_entry_resp(&resp.body)
-    }
-
-    /// Delete a file or directory
-    pub async fn delete(&self, ino: u64, is_dir: bool) -> NetResult<()> {
-        let body = crate::serialize::encode_delete_req(ino, is_dir)?;
-        let msg_type = if is_dir {
-            MsgType::Rmdir
-        } else {
-            MsgType::Unlink
-        };
-        let resp = self.send_request(msg_type, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "delete failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Rename a file or directory
-    pub async fn rename(
-        &self,
-        old_parent_ino: u64,
-        old_name: &str,
-        new_parent_ino: u64,
-        new_name: &str,
-    ) -> NetResult<()> {
-        let body = crate::serialize::encode_rename_req(
-            old_parent_ino,
-            old_name,
-            new_parent_ino,
-            new_name,
-        )?;
-        let resp = self.send_request(MsgType::Rename, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "rename failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Create a symbolic link
-    pub async fn create_symlink(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        target: &str,
-    ) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_symlink_req(parent_ino, name, target)?;
-        let resp = self.send_request(MsgType::Symlink, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "symlink failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_entry_resp(&resp.body)
-    }
-
-    /// Read a symbolic link target
-    pub async fn readlink(&self, ino: u64) -> NetResult<String> {
-        let body = crate::serialize::encode_readlink_req(ino)?;
-        let resp = self.send_request(MsgType::Readlink, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "readlink failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_readlink_resp(&resp.body)
-    }
-
-    /// Create a hard link
-    pub async fn create_hard_link(&self, ino: u64, parent_ino: u64, name: &str) -> NetResult<()> {
-        let body = crate::serialize::encode_link_req(ino, parent_ino, name)?;
-        let resp = self.send_request(MsgType::Link, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "link failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Get file attributes
-    pub async fn getattr(&self, ino: u64) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_getattr_req(ino)?;
-        let resp = self.send_request(MsgType::GetAttr, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "getattr failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_entry_resp(&resp.body)
-    }
-
-    /// Set file attributes
-    pub async fn setattr(
-        &self,
-        ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-    ) -> NetResult<EntryInfo> {
-        let body = crate::serialize::encode_setattr_req(ino, mode, uid, gid, size)?;
-        let resp = self.send_request(MsgType::SetAttr, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "setattr failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_entry_resp(&resp.body)
-    }
-
-    /// Read directory entries
-    pub async fn readdir(&self, ino: u64, offset: u64, count: u32) -> NetResult<Vec<DirEntry>> {
-        let body = crate::serialize::encode_readdir_req(ino, offset, count)?;
-        let resp = self.send_request(MsgType::ReadDir, &body, &[]).await?;
-
-        if !resp.is_ok() {
-            return Err(NetError::ServerError(format!(
-                "readdir failed: status={}",
-                resp.header.status
-            )));
-        }
-
-        crate::serialize::decode_readdir_resp(&resp.body)
     }
 }
 

@@ -83,35 +83,133 @@ impl PowerFsNetServer {
         port: u16,
         handler: Arc<dyn NetHandler>,
     ) -> NetResult<Self> {
-        Self::bind_inner(addr, port, handler, None, ServerConfig::default()).await
+        Self::bind_inner(addr, port, handler, ServerConfig::default()).await
     }
 
-    /// Bind with automatic session management via ServerConnectionManager
+    /// Bind with automatic session management via ServerConnectionManager.
+    ///
+    /// The server creates a `ConnRegistry` internally and wraps it in a
+    /// `ServerConnectionManager` with the default middleware pipeline.
+    /// Access the manager via `server.manager()` after binding.
     pub async fn bind_with_manager(
         addr: &str,
         port: u16,
         handler: Arc<dyn NetHandler>,
-        manager: Arc<ServerConnectionManager>,
     ) -> NetResult<Self> {
-        Self::bind_inner(addr, port, handler, Some(manager), ServerConfig::default()).await
+        Self::bind_with_pipeline(addr, port, handler, None, ServerConfig::default()).await
     }
 
-    /// Bind with custom server configuration (IoLoop/Worker counts, queue size)
+    /// Bind with an externally-created `ConnRegistry`.
+    ///
+    /// Use this when other components (e.g. `InodeNotifier`) need to share
+    /// the same connection registry as the server. The server creates a
+    /// `ServerConnectionManager` from the provided registry.
+    pub async fn bind_with_registry(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        registry: Arc<ConnRegistry>,
+    ) -> NetResult<Self> {
+        Self::bind_with_registry_and_config(addr, port, handler, registry, ServerConfig::default())
+            .await
+    }
+
+    /// Bind with an externally-created `ConnRegistry` and custom config.
+    pub async fn bind_with_registry_and_config(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        registry: Arc<ConnRegistry>,
+        config: ServerConfig,
+    ) -> NetResult<Self> {
+        let socket_addr: SocketAddr = format!("{}:{}", addr, port)
+            .parse()
+            .map_err(|e| NetError::Protocol(format!("invalid address: {}", e)))?;
+
+        let listener = TcpListener::bind(socket_addr).await?;
+        let manager = Arc::new(ServerConnectionManager::new(registry.clone()));
+
+        info!(
+            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled, shared_registry)",
+            addr,
+            port,
+            config.num_io_loops,
+            config.num_workers,
+            config.work_queue_capacity,
+        );
+
+        Ok(Self {
+            listener,
+            handler,
+            manager: Some(manager),
+            registry,
+            config,
+            shutdown: Arc::new(RwLock::new(ShutdownState::default())),
+        })
+    }
+
+    /// Bind with a custom middleware pipeline and server configuration.
+    ///
+    /// If `pipeline` is `None`, a default pipeline (logging + metrics) is used.
+    pub async fn bind_with_pipeline(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        pipeline: Option<crate::middleware::RequestPipeline>,
+        config: ServerConfig,
+    ) -> NetResult<Self> {
+        let socket_addr: SocketAddr = format!("{}:{}", addr, port)
+            .parse()
+            .map_err(|e| NetError::Protocol(format!("invalid address: {}", e)))?;
+
+        let listener = TcpListener::bind(socket_addr).await?;
+        let registry = Arc::new(ConnRegistry::new());
+
+        let manager = {
+            let mgr = ServerConnectionManager::new(registry.clone());
+            let mgr = if let Some(p) = pipeline {
+                mgr.with_pipeline(p)
+            } else {
+                mgr
+            };
+            Arc::new(mgr)
+        };
+
+        info!(
+            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled)",
+            addr,
+            port,
+            config.num_io_loops,
+            config.num_workers,
+            config.work_queue_capacity,
+        );
+
+        Ok(Self {
+            listener,
+            handler,
+            manager: Some(manager),
+            registry,
+            config,
+            shutdown: Arc::new(RwLock::new(ShutdownState::default())),
+        })
+    }
+
+    /// Bind with custom server configuration (IoLoop/Worker counts, queue size).
+    ///
+    /// Creates a `ServerConnectionManager` with the default pipeline.
     pub async fn bind_with_config(
         addr: &str,
         port: u16,
         handler: Arc<dyn NetHandler>,
-        manager: Option<Arc<ServerConnectionManager>>,
         config: ServerConfig,
     ) -> NetResult<Self> {
-        Self::bind_inner(addr, port, handler, manager, config).await
+        Self::bind_with_pipeline(addr, port, handler, None, config).await
     }
 
     async fn bind_inner(
         addr: &str,
         port: u16,
         handler: Arc<dyn NetHandler>,
-        manager: Option<Arc<ServerConnectionManager>>,
         config: ServerConfig,
     ) -> NetResult<Self> {
         let socket_addr: SocketAddr = format!("{}:{}", addr, port)
@@ -120,19 +218,18 @@ impl PowerFsNetServer {
 
         let listener = TcpListener::bind(socket_addr).await?;
         info!(
-            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt={})",
+            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=disabled)",
             addr,
             port,
             config.num_io_loops,
             config.num_workers,
             config.work_queue_capacity,
-            if manager.is_some() { "enabled" } else { "disabled" },
         );
 
         Ok(Self {
             listener,
             handler,
-            manager,
+            manager: None,
             registry: Arc::new(ConnRegistry::new()),
             config,
             shutdown: Arc::new(RwLock::new(ShutdownState::default())),
@@ -378,32 +475,17 @@ impl PowerFsNetServer {
         // 创建 ClientConn
         let conn = ClientConn::new(client_id, peer, client_type, outbound_tx);
 
-        // 注册到 ConnRegistry
+        // 注册到 ConnRegistry (单一数据源: 状态/lease/统计/通知都在 ClientConn 中)
         registry.register(conn.clone()).await;
 
-        // 注册到 ServerConnectionManager (session 管理 + metrics)
+        // 注册到 ServerConnectionManager (仅日志, session 数据由 ConnRegistry 管理)
         if let Some(ref mgr) = manager {
             mgr.register_session(client_id, client_type, peer).await;
         }
 
-        // 设置通知转发: manager notification channel → conn.outbound_tx
-        if let Some(ref mgr) = manager {
-            let notification_rx = mgr.register_notification_channel(client_id).await;
-            let conn = conn.clone();
-            tokio::spawn(async move {
-                let mut rx = notification_rx;
-                while let Some(msg) = rx.recv().await {
-                    debug!(
-                        "Forwarding notification to client {}: type={:?}",
-                        client_id,
-                        msg.msg_type()
-                    );
-                    if !conn.notify(&msg) {
-                        break; // outbound channel closed
-                    }
-                }
-            });
-        }
+        // 通知推送: ServerConnectionManager.send_notification() 直接调用
+        // ConnRegistry::notify() → ClientConn::notify() → outbound_tx,
+        // 无需中间 channel 转发任务。
 
         // 通知 handler
         handler.on_connect(client_id, client_type).await;
@@ -517,18 +599,10 @@ impl PowerFsNetServer {
     }
 
     async fn force_disconnect_all(&self) {
-        // 通过 registry 断开所有连接
+        // 通过 registry 断开所有连接 (单一数据源, 无需 manager 重复)
         let conns = self.registry.list().await;
         for info in conns {
             self.registry.disconnect(info.id).await;
-        }
-
-        // 通过 manager force disconnect (兼容)
-        if let Some(ref mgr) = self.manager {
-            let sessions = mgr.list_client_ids().await;
-            for id in sessions {
-                mgr.force_disconnect(id).await;
-            }
         }
     }
 
@@ -607,8 +681,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_with_manager() {
         let handler = Arc::new(EchoHandler);
-        let manager = Arc::new(ServerConnectionManager::new());
-        let server = PowerFsNetServer::bind_with_manager("127.0.0.1", 0, handler, manager)
+        let server = PowerFsNetServer::bind_with_manager("127.0.0.1", 0, handler)
             .await
             .unwrap();
 
@@ -643,13 +716,19 @@ mod tests {
         }
 
         let pipeline = PipelineBuilder::full_tracing();
-        let manager = Arc::new(ServerConnectionManager::new().with_pipeline(pipeline));
         let handler = Arc::new(EchoRequestHandler) as Arc<dyn NetHandler>;
 
-        let server = PowerFsNetServer::bind_with_manager("127.0.0.1", 0, handler, manager.clone())
-            .await
-            .unwrap();
+        let server = PowerFsNetServer::bind_with_pipeline(
+            "127.0.0.1",
+            0,
+            handler,
+            Some(pipeline),
+            ServerConfig::default(),
+        )
+        .await
+        .unwrap();
         let addr = server.local_addr().unwrap();
+        let manager = server.manager().unwrap().clone();
 
         let server_handle = tokio::spawn(async move {
             server.serve().await.unwrap();
@@ -729,13 +808,19 @@ mod tests {
         }
 
         let pipeline = PipelineBuilder::default_build();
-        let manager = Arc::new(ServerConnectionManager::new().with_pipeline(pipeline));
         let handler = Arc::new(EchoRequestHandler) as Arc<dyn NetHandler>;
 
-        let server = PowerFsNetServer::bind_with_manager("127.0.0.1", 0, handler, manager.clone())
-            .await
-            .unwrap();
+        let server = PowerFsNetServer::bind_with_pipeline(
+            "127.0.0.1",
+            0,
+            handler,
+            Some(pipeline),
+            ServerConfig::default(),
+        )
+        .await
+        .unwrap();
         let addr = server.local_addr().unwrap();
+        let manager = server.manager().unwrap().clone();
 
         let server_handle = tokio::spawn(async move {
             server.serve().await.unwrap();

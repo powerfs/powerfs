@@ -120,27 +120,29 @@ impl MasterClient {
 
             match self.send_heartbeat_once(&current_addr, &volumes).await {
                 Ok(leader) => {
-                    // 心跳成功; 如果 leader 指向不同的 master, 更新索引
-                    if !leader.is_empty() && leader != current_addr {
-                        if let Some(idx) = self
-                            .master_net_addresses
-                            .iter()
-                            .position(|a| {
-                                // 按主机匹配 (leader 可能带不同端口)
-                                let leader_host =
-                                    leader.split(':').next().unwrap_or(&leader);
-                                let addr_host = a.split(':').next().unwrap_or(a);
-                                leader_host == addr_host
-                            })
-                        {
-                            let current = self.current_master_index.load(Ordering::Relaxed);
-                            if idx != current {
-                                info!(
-                                    "VOLUME_HEARTBEAT: switching to leader master: {} (index {})",
-                                    leader, idx
-                                );
-                                self.current_master_index.store(idx, Ordering::Relaxed);
-                            }
+                    // 心跳成功; 更新 current_master_index 指向实际处理心跳的 master。
+                    // 重定向后 current_addr 可能不同于 current_master() 返回的地址,
+                    // 即使 leader == current_addr (leader 返回自己的地址), 也需要
+                    // 更新索引以避免下次心跳再次经过重定向。
+                    let active_addr = if !leader.is_empty() { &leader } else { &current_addr };
+                    if let Some(idx) = self
+                        .master_net_addresses
+                        .iter()
+                        .position(|a| {
+                            // 按主机匹配 (地址可能带不同端口)
+                            let active_host =
+                                active_addr.split(':').next().unwrap_or(active_addr);
+                            let addr_host = a.split(':').next().unwrap_or(a);
+                            active_host == addr_host
+                        })
+                    {
+                        let current = self.current_master_index.load(Ordering::Relaxed);
+                        if idx != current {
+                            info!(
+                                "VOLUME_HEARTBEAT: switching to leader master: {} (index {})",
+                                active_addr, idx
+                            );
+                            self.current_master_index.store(idx, Ordering::Relaxed);
                         }
                     }
                     return Ok(());

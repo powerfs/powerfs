@@ -333,6 +333,25 @@ impl Volume {
             return Err(PowerFsError::OutOfSpace);
         }
 
+        // Physical space check: append_offset advances on every write (including
+        // overwrites of the same needle_id), while used_bytes only tracks logical
+        // space (deduplicated). Without this check, repeated flushes of the same
+        // chunk fill the physical file while free_bytes (logical) stays high,
+        // causing "write beyond volume size" errors in the backend.
+        let physical_size = volume_size + VOLUME_DATA_OFFSET;
+        if alloc_stats.append_offset + required_space > physical_size {
+            info_guard.state = VolumeState::Full;
+            log::warn!(
+                "Volume {} physically full: append_offset={} + required={} > physical_size={} (logical free_bytes={})",
+                volume_id.0,
+                alloc_stats.append_offset,
+                required_space,
+                physical_size,
+                alloc_stats.free_bytes
+            );
+            return Err(PowerFsError::OutOfSpace);
+        }
+
         let offset = alloc_stats.append_offset;
 
         let needle_bytes = needle.to_bytes();

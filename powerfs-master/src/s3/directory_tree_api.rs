@@ -294,3 +294,220 @@ impl Clone for RemoteDirectoryTree {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LocalDirectoryTree — in-memory implementation for tests
+// ---------------------------------------------------------------------------
+
+/// In-memory `DirectoryTreeApi` implementation for unit tests.
+///
+/// The Master gRPC server returns `UNIMPLEMENTED` for all directory-tree
+/// operations (they have moved to the Filer Raft).  Tests that exercise the
+/// S3 layer therefore cannot use `RemoteDirectoryTree` — they need this
+/// local mock which stores entries in a `HashMap`.
+pub struct LocalDirectoryTree {
+    /// full_path → (inode, Entry)
+    entries: std::sync::RwLock<std::collections::HashMap<String, (u64, Entry)>>,
+    next_inode: std::sync::atomic::AtomicU64,
+}
+
+impl Default for LocalDirectoryTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalDirectoryTree {
+    pub fn new() -> Self {
+        let mut map = std::collections::HashMap::new();
+        // Root directory always exists at "/" with inode 1.
+        map.insert(
+            "/".to_string(),
+            (
+                1,
+                Entry {
+                    name: String::new(),
+                    directory: String::new(),
+                    attributes: Some(crate::proto::FuseAttributes {
+                        ino: 1,
+                        mode: 0o40755,
+                        nlink: 2,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: 4096,
+                        blksize: 4096,
+                        blocks: 1,
+                        atime: 0,
+                        mtime: 0,
+                        ctime: 0,
+                        crtime: 0,
+                        perm: 0o755,
+                    }),
+                    chunks: vec![],
+                    hard_link_id: String::new(),
+                    hard_link_counter: 0,
+                    extended: std::collections::HashMap::new(),
+                    content_size: 4096,
+                    disk_size: 4096,
+                    ttl: String::new(),
+                    symlink_target: String::new(),
+                    owner: String::new(),
+                    generation: 0,
+                },
+            ),
+        );
+        Self {
+            entries: std::sync::RwLock::new(map),
+            next_inode: std::sync::atomic::AtomicU64::new(2),
+        }
+    }
+
+    fn alloc_inode(&self) -> u64 {
+        self.next_inode
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn full_path(directory: &str, name: &str) -> String {
+        if directory == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", directory, name)
+        }
+    }
+}
+
+impl DirectoryTreeApi for LocalDirectoryTree {
+    fn get_entry(&self, path: &str) -> BoxFuture<'_, Option<Entry>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            self.entries
+                .read()
+                .unwrap()
+                .get(&path)
+                .map(|(_, e)| e.clone())
+        })
+    }
+
+    fn create_entry(&self, entry: Entry) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let path = Self::full_path(&entry.directory, &entry.name);
+            let ino = self.alloc_inode();
+            let mut entry = entry.clone();
+            if let Some(ref mut attr) = entry.attributes {
+                if attr.ino == 0 {
+                    attr.ino = ino;
+                }
+            }
+            self.entries
+                .write()
+                .unwrap()
+                .insert(path, (ino, entry));
+            Ok(ino)
+        })
+    }
+
+    fn create_directory(&self, path: &str) -> BoxFuture<'_, Result<u64>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+            let mut current_path = "/".to_string();
+            let mut last_ino = 1u64;
+
+            for part in parts {
+                let parent_path = current_path.clone();
+                current_path = if current_path == "/" {
+                    format!("/{}", part)
+                } else {
+                    format!("{}/{}", current_path, part)
+                };
+
+                // Skip if already exists.
+                if self.entries.read().unwrap().contains_key(&current_path) {
+                    last_ino = self.entries.read().unwrap()
+                        .get(&current_path)
+                        .map(|(ino, _)| *ino)
+                        .unwrap_or(0);
+                    continue;
+                }
+
+                let ino = self.alloc_inode();
+                let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+                let entry = Entry {
+                    name: part.to_string(),
+                    directory: parent_path,
+                    attributes: Some(crate::proto::FuseAttributes {
+                        ino,
+                        mode: 0o40755,
+                        nlink: 2,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: 4096,
+                        blksize: 4096,
+                        blocks: 1,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                        crtime: now,
+                        perm: 0o755,
+                    }),
+                    chunks: vec![],
+                    hard_link_id: String::new(),
+                    hard_link_counter: 0,
+                    extended: std::collections::HashMap::new(),
+                    content_size: 4096,
+                    disk_size: 4096,
+                    ttl: String::new(),
+                    symlink_target: String::new(),
+                    owner: String::new(),
+                    generation: 0,
+                };
+
+                self.entries.write().unwrap().insert(current_path.clone(), (ino, entry));
+                last_ino = ino;
+            }
+
+            Ok(last_ino)
+        })
+    }
+
+    fn delete_entry(&self, path: &str) -> BoxFuture<'_, Result<bool>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            let mut entries = self.entries.write().unwrap();
+            if entries.remove(&path).is_some() {
+                Ok(true)
+            } else {
+                Err(PowerFsError::FileNotFound(path))
+            }
+        })
+    }
+
+    fn list_entries(
+        &self,
+        directory: &str,
+        limit: u64,
+        last_name: &str,
+    ) -> BoxFuture<'_, Vec<Entry>> {
+        let directory = directory.to_string();
+        let last_name = last_name.to_string();
+        Box::pin(async move {
+            let entries = self.entries.read().unwrap();
+            let mut result: Vec<Entry> = entries
+                .values()
+                .filter_map(|(_, e)| {
+                    if e.directory == directory && e.name > last_name {
+                        Some(e.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // Sort by name for deterministic pagination.
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+            result.truncate(limit as usize);
+            result
+        })
+    }
+}

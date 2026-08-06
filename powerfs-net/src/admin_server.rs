@@ -17,9 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
-use crate::server_connection::{
-    ClientSession, HealthStatus, MetricsSnapshot, ServerConnectionManager,
-};
+use crate::server_connection::{HealthStatus, MetricsSnapshot, ServerConnectionManager};
 
 /// Admin server configuration
 #[derive(Debug, Clone)]
@@ -190,8 +188,8 @@ async fn handle_metrics(manager: &Arc<ServerConnectionManager>) -> String {
 }
 
 async fn handle_sessions(manager: &Arc<ServerConnectionManager>) -> String {
-    let sessions = manager.get_active_sessions().await;
-    let ids: Vec<u64> = sessions.iter().map(|s| s.client_id).collect();
+    let sessions = manager.registry().list().await;
+    let ids: Vec<u64> = sessions.iter().map(|s| s.id).collect();
     json_response("200 OK", &ids)
 }
 
@@ -200,9 +198,22 @@ async fn handle_session_detail(manager: &Arc<ServerConnectionManager>, id_str: &
         Ok(v) => v,
         Err(_) => return build_response("400 Bad Request", "text/plain", "Invalid client ID"),
     };
-    let session = manager.get_session(id).await;
-    match session {
-        Some(s) => json_response("200 OK", &s),
+    let conn = manager.registry().get(id);
+    match conn {
+        Some(conn) => {
+            let state = format!("{:?}", *conn.state.read().await);
+            let stats = conn.stats.read().await;
+            let view = ClientSessionView {
+                client_id: conn.id,
+                client_type: format!("{:?}", conn.client_type),
+                address: conn.addr.to_string(),
+                state,
+                request_count: stats.request_count,
+                error_count: stats.error_count,
+                connected_ms_ago: stats.connected_at.elapsed().as_millis() as u64,
+            };
+            json_response("200 OK", &view)
+        }
         None => build_response("404 Not Found", "text/plain", "Session not found"),
     }
 }
@@ -279,25 +290,26 @@ impl Serialize for MetricsSnapshot {
     }
 }
 
-impl Serialize for ClientSession {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("ClientSession", 7)?;
-        s.serialize_field("client_id", &self.client_id)?;
-        s.serialize_field("client_type", &format!("{:?}", self.client_type))?;
-        s.serialize_field("address", &self.address.to_string())?;
-        s.serialize_field("state", &format!("{:?}", self.state))?;
-        s.serialize_field("request_count", &self.request_count)?;
-        s.serialize_field("error_count", &self.error_count)?;
-        let elapsed_ms = self.connected_at.elapsed().as_millis() as u64;
-        s.serialize_field("connected_ms_ago", &elapsed_ms)?;
-        s.end()
-    }
+/// Serializable view of a client connection for the admin API.
+///
+/// `ClientConn`'s mutable fields live behind `RwLock`s and cannot implement
+/// the synchronous `Serialize` trait directly, so we snapshot the relevant
+/// fields into this plain struct before serializing.
+#[derive(Serialize)]
+struct ClientSessionView {
+    client_id: u64,
+    client_type: String,
+    address: String,
+    state: String,
+    request_count: u64,
+    error_count: u64,
+    connected_ms_ago: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_conn::{ClientConn, ConnRegistry};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -330,11 +342,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_server_endpoints() {
-        let manager = Arc::new(ServerConnectionManager::new());
-        let addr: SocketAddr = "127.0.0.1:19334".parse().unwrap();
-        manager
-            .register_session(1, crate::protocol::ClientType::Fuse, addr)
-            .await;
+        let registry = Arc::new(ConnRegistry::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let conn = ClientConn::new(
+            1,
+            "127.0.0.1:19334".parse().unwrap(),
+            crate::protocol::ClientType::Fuse,
+            tx,
+        );
+        registry.register(conn).await;
+        let manager = Arc::new(ServerConnectionManager::new(registry));
 
         let config = AdminServerConfig {
             addr: "127.0.0.1".into(),

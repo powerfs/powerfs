@@ -35,11 +35,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::circuit_breaker::CircuitBreakerPool;
 use crate::client_error::{ClientError, ClientResult};
-use crate::meta_shard_client::{
-    process_request_internal, PendingRequest, RequestResult, SharedNotificationHandler,
-};
+use crate::meta_shard_client::{process_request_internal, PendingRequest, RequestResult};
 use crate::topology::ShardInfo;
-use powerfs_net::PowerFsNetClient;
 
 /// 每个 worker 负责的分片数（可配，默认 16）
 const SHARDS_PER_WORKER: usize = 16;
@@ -70,28 +67,24 @@ impl ShardedRpcPool {
     /// 创建 pool 并启动 worker 任务
     pub fn new(
         worker_count: usize,
-        filer_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+        conn_pool: Arc<powerfs_net::ClientConnPool>,
         default_filer_addr: Arc<std::sync::Mutex<String>>,
         breakers: Arc<CircuitBreakerPool>,
         shard_router: Arc<DashMap<u64, ShardInfo>>,
-        client_id: u64,
-        notification_handler: SharedNotificationHandler,
     ) -> Self {
         let worker_count = worker_count.clamp(MIN_WORKERS, MAX_WORKERS);
         let mut workers = Vec::with_capacity(worker_count);
 
         for i in 0..worker_count {
             let (tx, rx) = mpsc::unbounded_channel::<WorkerEntry>();
-            let fc = filer_connections.clone();
+            let cp = conn_pool.clone();
             let dfa = default_filer_addr.clone();
             let br = breakers.clone();
             let sr = shard_router.clone();
-            let cid = client_id;
-            let nh = notification_handler.clone();
 
             tokio::spawn(async move {
                 info!("ShardedRpcPool: worker {} started", i);
-                worker_loop(rx, fc, dfa, br, sr, cid, nh).await;
+                worker_loop(rx, cp, dfa, br, sr).await;
                 info!("ShardedRpcPool: worker {} stopped", i);
             });
 
@@ -141,25 +134,21 @@ impl ShardedRpcPool {
 /// 这与 volume_client 阶段0 的 process_data_requests 模式一致。
 async fn worker_loop(
     mut rx: mpsc::UnboundedReceiver<WorkerEntry>,
-    filer_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: Arc<powerfs_net::ClientConnPool>,
     default_filer_addr: Arc<std::sync::Mutex<String>>,
     breakers: Arc<CircuitBreakerPool>,
     shard_router: Arc<DashMap<u64, ShardInfo>>,
-    client_id: u64,
-    notification_handler: SharedNotificationHandler,
 ) {
     while let Some((req, reply_tx)) = rx.recv().await {
-        let fc = filer_connections.clone();
+        let cp = conn_pool.clone();
         let dfa = default_filer_addr.clone();
         let br = breakers.clone();
         let sr = shard_router.clone();
-        let cid = client_id;
-        let nh = notification_handler.clone();
 
         // 并发派发 — spawn 独立任务执行 process_request_internal。
         // 单个请求的网络超时/redirect 重试不影响队列内其他请求。
         tokio::spawn(async move {
-            let result = process_request_internal(req, &fc, &dfa, &br, &sr, cid, &nh).await;
+            let result = process_request_internal(req, &cp, &dfa, &br, &sr).await;
             let _ = reply_tx.send(result);
         });
     }

@@ -562,7 +562,15 @@ impl VolumeProvider for FacadeVolumeProvider {
         }
 
         // Parse TLV response: Limit(count), Owner(url), Backend(dc)
-        let mut dec = powerfs_net::TlvDecoder::new(&resp.body);
+        // Some transports (e.g. MockServer) place the payload in the data
+        // segment rather than the body segment, so fall back to resp.data
+        // when resp.body is empty — same pattern as assign_volume.
+        let body = if !resp.body.is_empty() {
+            &resp.body
+        } else {
+            &resp.data
+        };
+        let mut dec = powerfs_net::TlvDecoder::new(body);
         let _count = dec.next_u64(powerfs_net::FieldId::Limit).unwrap_or(0);
         let url = dec
             .next_string(powerfs_net::FieldId::Owner)

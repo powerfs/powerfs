@@ -433,7 +433,7 @@ impl MasterNode {
                         Vec::new(),
                         Vec::new(),
                     );
-                    let n = net_mgr.broadcast_notification(&notify_msg).await;
+                    let n = net_mgr.broadcast_notification(&notify_msg);
                     if n > 0 {
                         debug!(
                             "Broadcast TopologyChanged NOTIFY to {} TLV clients (new={}, del={}, leader={})",
@@ -2684,11 +2684,6 @@ impl MasterNode {
         if net_port > 0 {
             let net_addr = format!("{}:{}", self.address.ip(), net_port);
             let net_handler = Arc::new(crate::net_handler::MasterNetHandler::new(self.clone()));
-
-            let net_manager = Arc::new(ServerConnectionManager::new());
-            // Share the manager so the broadcast task can push NOTIFY
-            // frames (e.g. VolumeLocation updates) to TLV clients.
-            *self.net_manager.write().unwrap() = Some(net_manager.clone());
             let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
             info!("Starting powerfs-net server on {}", net_addr);
@@ -2696,10 +2691,14 @@ impl MasterNode {
                 &self.address.ip().to_string(),
                 net_port,
                 net_handler,
-                net_manager,
             )
             .await
             {
+                // Share the manager so the broadcast task can push NOTIFY
+                // frames (e.g. VolumeLocation updates) to TLV clients.
+                if let Some(manager) = net_server.manager() {
+                    *self.net_manager.write().unwrap() = Some(manager.clone());
+                }
                 tokio::spawn(async move {
                     if let Err(e) = net_server.serve().await {
                         error!("powerfs-net server error: {:?}", e);

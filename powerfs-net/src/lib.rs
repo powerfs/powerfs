@@ -19,7 +19,7 @@
 pub mod admin_server;
 pub mod client;
 pub mod client_conn;
-pub mod connection;
+pub mod client_pool;
 pub mod errors;
 pub mod io_loop;
 pub mod middleware;
@@ -29,18 +29,20 @@ pub mod rpc_client;
 pub mod serialize;
 pub mod server;
 pub mod server_connection;
-pub mod transport;
 pub mod work;
 pub mod worker;
 
 pub use admin_server::{AdminServer, AdminServerConfig};
 
-pub use client::{ClientConfig, NotificationHandler, PowerFsNetClient};
-pub use client_conn::{
-    ClientConn, ClientConfig as ClientConnConfig, ClientConnInfo, ClientStats, CloseHandle,
-    ConnRegistry, ConnState, OutboundTx,
+pub use client::{
+    ClientConfig, ClientEventListener, ClientMetrics, ClientMetricsSnapshot, ClientState,
+    NotificationHandler, PowerFsNetClient,
 };
-pub use connection::ConnectionManager;
+pub use client_pool::{ClientConnPool, ClientPoolConfig, ServerEndpoint};
+pub use client_conn::{
+    ClientConn, ClientConnInfo, ClientPolicy, ClientStats, CloseHandle, ConnHealthStatus,
+    ConnMetricsSnapshot, ConnRegistry, ConnState, OutboundTx, RateLimiter,
+};
 pub use errors::{NetError, NetResult};
 pub use io_loop::IoLoop;
 pub use middleware::{
@@ -53,8 +55,7 @@ pub use rpc_client::{call_once, call_once_with, NetRpcClient, RpcOpts, RpcReply}
 pub use serialize::{DirEntry, EntryInfo, TlvDecoder, TlvEncoder};
 pub use server::{PowerFsNetServer, ServerConfig};
 pub use server_connection::{
-    ClientSession, HealthStatus, MetricsSnapshot, NetHandler, RateLimiter, ServerConnectionManager,
-    SessionState,
+    HealthStatus, MetricsSnapshot, NetHandler, ServerConnectionManager, SessionState,
 };
 pub use work::Work;
 pub use worker::Worker;

@@ -163,10 +163,22 @@ impl FuseApp {
         // server-pushed Invalidate notifications from the Filer and evicts
         // stale metadata cache entries when another client modifies the
         // same directory.
+        //
+        // The handler is installed on the shared ClientConnPool so that every
+        // Filer connection (current and future, including post-reconnect)
+        // receives Invalidate frames. Volume connections in the pool will also
+        // carry the handler, but Volume servers never push Invalidate frames,
+        // so the handler is simply never invoked for those connections.
         let invalidate_handler = Arc::new(crate::invalidate_handler::InvalidateHandler::new(
             cache.clone(),
             chunk_cache.clone(),
         ));
+        sync_client
+            .facade()
+            .conn_pool()
+            .set_notification_handler(invalidate_handler.clone());
+        // Also store on MetaShardClient for API compatibility (callers that
+        // query the handler via meta_shard_client()).
         sync_client
             .facade()
             .meta_shard_client()
@@ -473,6 +485,17 @@ impl PowerFsFs {
         inodes
     }
 
+    /// Check if an inode has any remaining dirty chunks.
+    fn has_dirty_for_inode(&self, inode: u64) -> bool {
+        for shard in &self.dirty_shards {
+            let set = shard.read().unwrap();
+            if set.iter().any(|(ino, _)| *ino == inode) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Flush dirty chunks for an inode. Acquires per-inode flush lock to
     /// serialize with release callback's lease release.
     fn flush_dirty_chunks(&self, inode: u64, lease_token: Option<&str>) -> std::io::Result<()> {
@@ -643,6 +666,25 @@ impl PowerFsFs {
                     "flush_all_dirty_chunks: flush inode {} failed (will retry next cycle): {}",
                     inode, e
                 );
+            } else if !self.has_dirty_for_inode(inode) {
+                // All dirty chunks for this inode have been successfully flushed.
+                // If release() left the inode pinned (because flush failed at
+                // close time), now is the time to sync metadata and unpin it.
+                // This prevents permanent pin leaks when the volume was
+                // temporarily unavailable during release().
+                if let Err(e) = self.sync_size_chunks_on_close(inode) {
+                    warn!(
+                        "flush_all_dirty_chunks: post-flush sync for inode {} failed: {}",
+                        inode, e
+                    );
+                } else {
+                    self.chunk_cache.clear_dirty(inode);
+                    self.cache.unpin_inode(inode);
+                    debug!(
+                        "flush_all_dirty_chunks: post-flush sync + unpin for inode {} succeeded",
+                        inode
+                    );
+                }
             }
         }
 
@@ -2440,8 +2482,22 @@ impl FileSystem for PowerFsFs {
 
         // Phase 4.3/4.4: 移除 open_inodes 追踪（getattr 恢复短 TTL）
         self.open_inodes.write().unwrap().remove(&inode);
-        // Unpin inode from MetadataCache (restore normal TTL expiry)
-        self.cache.unpin_inode(inode);
+
+        // Only unpin the inode if flush succeeded. If flush failed, dirty
+        // chunks remain and the background flusher needs the inode metadata
+        // (fid, volume_id) to retry. Unpinning would let the 30s TTL expire
+        // the entry, causing "inode not in cache" errors on every retry cycle.
+        // The inode stays pinned until the background flusher successfully
+        // writes the data (it will call clear_dirty, and the next release of
+        // the file — if reopened — will unpin normally).
+        if flush_result.is_ok() {
+            self.cache.unpin_inode(inode);
+        } else {
+            warn!(
+                "release: keeping inode {} pinned (flush failed, dirty chunks remain for retry)",
+                inode
+            );
+        }
 
         // 4. 释放 Volume lease（best-effort，close 时释放 write + read lease）
         //    write lease: 由 ensure_lease 缓存，通过 VolumeClient 释放
@@ -2449,37 +2505,69 @@ impl FileSystem for PowerFsFs {
         //    清本地缓存），否则残留的读 lease 会阻止其他客户端获取写 lease
         //    （stripe lease conflict）。
         //    仍在 flush lock 内 —— 后台 flusher 此刻被阻塞，不会用旧 token 写入。
-        if let Some(entry) = self.cache.get_inode(inode) {
-            if let Some(ref fid) = entry.fid {
-                let client_id = self.client.client_id();
-                // 4a. 释放 write lease（从 VolumeClient leases 表取 token）
-                let token = self
-                    .client
-                    .get_valid_lease_token(fid.volume_id.0, inode)
-                    .unwrap_or_default();
-                if let Err(e) =
-                    self.client
-                        .release_lease(fid.volume_id.0, inode, &client_id, &token)
-                {
-                    debug!(
-                        "release: write lease release for inode {} failed (best-effort): {}",
-                        inode, e
-                    );
-                }
-                // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
-                let read_tokens = self
-                    .lease_manager
-                    .release_all_for_inode(fid.volume_id.0, inode);
-                for (tok, cid) in read_tokens {
-                    if let Err(e) = self
+        //
+        //    If flush failed, keep the write lease so the background flusher
+        //    can retry without re-acquiring (which may fail if the volume
+        //    server is under load). Read leases are still released to avoid
+        //    blocking other clients' write leases on shared files.
+        if flush_result.is_ok() {
+            if let Some(entry) = self.cache.get_inode(inode) {
+                if let Some(ref fid) = entry.fid {
+                    let client_id = self.client.client_id();
+                    // 4a. 释放 write lease（从 VolumeClient leases 表取 token）
+                    let token = self
                         .client
-                        .release_lease(fid.volume_id.0, inode, &cid, &tok)
+                        .get_valid_lease_token(fid.volume_id.0, inode)
+                        .unwrap_or_default();
+                    if let Err(e) =
+                        self.client
+                            .release_lease(fid.volume_id.0, inode, &client_id, &token)
                     {
                         debug!(
-                            "release: read lease release for inode {} failed (best-effort): {}",
+                            "release: write lease release for inode {} failed (best-effort): {}",
                             inode, e
                         );
                     }
+                    // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
+                    let read_tokens = self
+                        .lease_manager
+                        .release_all_for_inode(fid.volume_id.0, inode);
+                    for (tok, cid) in read_tokens {
+                        if let Err(e) = self
+                            .client
+                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
+                        {
+                            debug!(
+                                "release: read lease release for inode {} failed (best-effort): {}",
+                                inode, e
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // Flush failed: release read leases only (to avoid blocking other
+            // clients), but keep the write lease for background flusher retry.
+            if let Some(entry) = self.cache.get_inode(inode) {
+                if let Some(ref fid) = entry.fid {
+                    let read_tokens = self
+                        .lease_manager
+                        .release_all_for_inode(fid.volume_id.0, inode);
+                    for (tok, cid) in read_tokens {
+                        if let Err(e) = self
+                            .client
+                            .release_lease(fid.volume_id.0, inode, &cid, &tok)
+                        {
+                            debug!(
+                                "release: read lease release for inode {} failed (best-effort): {}",
+                                inode, e
+                            );
+                        }
+                    }
+                    debug!(
+                        "release: keeping write lease for inode {} (flush failed, retry pending)",
+                        inode
+                    );
                 }
             }
         }

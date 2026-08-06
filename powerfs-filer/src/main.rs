@@ -361,10 +361,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     });
 
     if net_port > 0 {
-        // Phase 2: Create ServerConnectionManager and InodeNotifier first,
-        // so the FilerNetHandler can push Invalidate notifications to clients
-        // when directory metadata changes.
-        let net_manager = Arc::new(ServerConnectionManager::new());
+        // Phase 2: Create ConnRegistry + ServerConnectionManager and
+        // InodeNotifier first, so the FilerNetHandler can push Invalidate
+        // notifications to clients when directory metadata changes.
+        // The registry is shared with the server via bind_with_registry.
+        let net_registry = Arc::new(powerfs_net::ConnRegistry::new());
+        let net_manager = Arc::new(ServerConnectionManager::new(net_registry.clone()));
         let inode_notifier = Arc::new(powerfs_filer::inode_notifier::InodeNotifier::new(
             net_manager.clone(),
         ));
@@ -511,7 +513,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
         if let Ok(net_server) =
-            PowerFsNetServer::bind_with_manager(&bind_ip, net_port, net_handler, net_manager)
+            PowerFsNetServer::bind_with_registry(&bind_ip, net_port, net_handler, net_registry)
                 .await
         {
             tokio::spawn(async move {

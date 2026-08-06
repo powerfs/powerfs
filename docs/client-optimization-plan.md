@@ -474,7 +474,7 @@ feat: complete Phase 1 per-server circuit breaker integration
 ## References
 
 - [data-consistency-design.md](data-consistency-design.md) - Data consistency architecture
-- [distributed-communication-architecture.md](distributed-communication-architecture.md) - Communication architecture
+- [network-architecture.md](network-architecture.md) - Network architecture (powerfs-net)
 - [improvement-plan.md](improvement-plan.md) - General improvement plan
 - Known Issues in README.md - Lessons learned from past issues
 

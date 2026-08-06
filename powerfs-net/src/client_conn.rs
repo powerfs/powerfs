@@ -6,14 +6,18 @@
 //! - 连接状态 (Active/Suspended/Closing/Closed)
 //! - holder 身份 (UUID, 替代分散的 client_id_map)
 //! - 持有的 lease (inode + token, 快速断连清理)
-//! - 可配置属性 (优先级/限速/并发)
+//! - 可配置策略 (优先级/限速/并发)
+//! - 速率限制 (Token Bucket, 每连接独立)
 //! - 统计信息 (请求数/错误数/字节数)
+//! - 通知推送 (Server→Client Invalidate 等)
 //!
 //! [`ConnRegistry`] 是全局连接注册表, 提供增删改查:
 //! - register / unregister
 //! - get / get_by_holder
 //! - disconnect (主动断开)
-//! - set_config (动态配置)
+//! - set_policy (动态策略)
+//! - notify / broadcast (通知推送)
+//! - metrics_snapshot / health_check (聚合监控)
 //! - list (管理/监控)
 
 use crate::protocol::{ClientType, NetMessage};
@@ -23,6 +27,60 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
+
+// ---------------------------------------------------------------------------
+// RateLimiter — 令牌桶限流器 (从 server_connection.rs 合并而来)
+// ---------------------------------------------------------------------------
+
+/// Simple token bucket rate limiter for per-client rate limiting.
+///
+/// Each `ClientConn` owns one instance so rate limiting is enforced at the
+/// connection level without consulting a separate `ServerConnectionManager`.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    max_tokens: u64,
+    refill_rate: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: u64, refill_rate_per_sec: f64) -> Self {
+        Self {
+            max_tokens,
+            refill_rate: refill_rate_per_sec,
+            tokens: max_tokens as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed.
+    pub fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill);
+        let refill = elapsed.as_secs_f64() * self.refill_rate;
+        self.tokens = (self.tokens + refill).min(self.max_tokens as f64);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn available_tokens(&self) -> u64 {
+        self.tokens as u64
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        // 1000 tokens max, 100 tokens/sec refill (10 req/s sustained)
+        Self::new(1000, 100.0)
+    }
+}
 
 /// 连接状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +95,14 @@ pub enum ConnState {
     Closed,
 }
 
-/// 客户端配置 (可动态修改)
+/// 客户端策略 (可动态修改)
+///
+/// 表示服务端对单个客户端连接施加的 QoS 策略，
+/// 与 [`crate::client::ClientConfig`]（客户端连接配置）语义不同：
+/// - `ClientConfig` 描述"如何连接"（地址、超时、重试）
+/// - `ClientPolicy` 描述"如何限流"（优先级、速率、并发上限）
 #[derive(Debug, Clone)]
-pub struct ClientConfig {
+pub struct ClientPolicy {
     /// 请求优先级 (0=最高)
     pub priority: u8,
     /// 速率限制 (req/s, 0=不限)
@@ -48,7 +111,7 @@ pub struct ClientConfig {
     pub max_concurrent: u16,
 }
 
-impl Default for ClientConfig {
+impl Default for ClientPolicy {
     fn default() -> Self {
         Self {
             priority: 8,
@@ -124,8 +187,8 @@ pub struct ClientConn {
 
     /// 连接状态
     pub state: RwLock<ConnState>,
-    /// 客户端配置 (可动态修改)
-    pub config: RwLock<ClientConfig>,
+    /// 客户端策略 (可动态修改)
+    pub policy: RwLock<ClientPolicy>,
     /// 客户端统计
     pub stats: RwLock<ClientStats>,
 
@@ -133,6 +196,9 @@ pub struct ClientConn {
     pub held_leases: RwLock<HashSet<u64>>,
     /// 持有的 lease token 列表
     pub held_tokens: RwLock<HashSet<String>>,
+
+    /// 每连接速率限制器 (Token Bucket)
+    pub rate_limiter: RwLock<RateLimiter>,
 
     /// 出站帧通道 (响应帧 + 通知帧), IoLoop write_task 消费
     pub outbound_tx: OutboundTx,
@@ -154,7 +220,7 @@ impl ClientConn {
             addr,
             client_type,
             state: RwLock::new(ConnState::Active),
-            config: RwLock::new(ClientConfig::default()),
+            policy: RwLock::new(ClientPolicy::default()),
             stats: RwLock::new(ClientStats {
                 connected_at: now,
                 last_activity: now,
@@ -162,6 +228,7 @@ impl ClientConn {
             }),
             held_leases: RwLock::new(HashSet::new()),
             held_tokens: RwLock::new(HashSet::new()),
+            rate_limiter: RwLock::new(RateLimiter::default()),
             outbound_tx,
             close_handle: RwLock::new(None),
         })
@@ -213,6 +280,23 @@ impl ClientConn {
     /// 更新活动时间
     pub async fn touch(&self) {
         self.stats.write().await.last_activity = Instant::now();
+    }
+
+    /// 检查速率限制 (Token Bucket)
+    ///
+    /// 返回 true 表示允许请求通过，false 表示被限流。
+    pub async fn check_rate_limit(&self) -> bool {
+        self.rate_limiter.write().await.try_acquire()
+    }
+
+    /// 记录请求完成 (更新统计)
+    pub async fn record_request(&self, success: bool) {
+        let mut stats = self.stats.write().await;
+        stats.request_count += 1;
+        if !success {
+            stats.error_count += 1;
+        }
+        stats.last_activity = Instant::now();
     }
 
     /// 发送响应帧 (Worker 调用)
@@ -303,10 +387,10 @@ impl ConnRegistry {
         }
     }
 
-    /// 设置客户端配置
-    pub async fn set_config(&self, id: u64, config: ClientConfig) -> bool {
+    /// 设置客户端策略
+    pub async fn set_policy(&self, id: u64, policy: ClientPolicy) -> bool {
         if let Some(conn) = self.get(id) {
-            *conn.config.write().await = config;
+            *conn.policy.write().await = policy;
             true
         } else {
             false
@@ -336,6 +420,98 @@ impl ConnRegistry {
     pub fn count(&self) -> usize {
         self.conns.len()
     }
+
+    // ========================================================================
+    // 通知推送 (Server→Client)
+    // ========================================================================
+
+    /// 向指定客户端推送通知消息
+    ///
+    /// 直接通过 `ClientConn.outbound_tx` 发送，无需中间 channel 转发。
+    /// 返回 true 表示已排队，false 表示客户端不存在或通道关闭。
+    pub fn notify(&self, client_id: u64, msg: &NetMessage) -> bool {
+        if let Some(conn) = self.get(client_id) {
+            conn.notify(msg)
+        } else {
+            false
+        }
+    }
+
+    /// 向所有活跃客户端广播通知
+    ///
+    /// 返回成功接收的客户端数量。
+    pub fn broadcast(&self, msg: &NetMessage) -> usize {
+        let mut count = 0;
+        for entry in self.conns.iter() {
+            if entry.value().notify(msg) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    // ========================================================================
+    // 聚合监控 (替代 ServerConnectionManager 的 metrics/health 方法)
+    // ========================================================================
+
+    /// 获取聚合指标快照 (所有连接的统计汇总)
+    pub async fn metrics_snapshot(&self) -> ConnMetricsSnapshot {
+        let mut snapshot = ConnMetricsSnapshot::default();
+        for entry in self.conns.iter() {
+            let conn = entry.value();
+            let stats = conn.stats.read().await;
+            snapshot.total_requests += stats.request_count;
+            snapshot.total_errors += stats.error_count;
+            snapshot.total_bytes_sent += stats.bytes_sent;
+            snapshot.total_bytes_recv += stats.bytes_recv;
+            snapshot.total_sessions += 1;
+            if *conn.state.read().await == ConnState::Active {
+                snapshot.active_sessions += 1;
+            }
+        }
+        snapshot
+    }
+
+    /// 健康检查 (用于监控系统)
+    pub async fn health_check(&self) -> ConnHealthStatus {
+        let snapshot = self.metrics_snapshot().await;
+        ConnHealthStatus {
+            healthy: true,
+            active_sessions: snapshot.active_sessions,
+            total_sessions: snapshot.total_sessions,
+        }
+    }
+
+    /// 列出所有活跃客户端 ID
+    pub fn list_client_ids(&self) -> Vec<u64> {
+        self.conns.iter().map(|e| *e.key()).collect()
+    }
+
+    /// 获取指定连接的统计信息
+    pub async fn get_stats(&self, client_id: u64) -> Option<ClientStats> {
+        let conn = self.get(client_id)?;
+        let stats = conn.stats.read().await;
+        Some(stats.clone())
+    }
+}
+
+/// 聚合连接指标快照 (跨所有连接)
+#[derive(Debug, Default, Clone)]
+pub struct ConnMetricsSnapshot {
+    pub total_requests: u64,
+    pub total_errors: u64,
+    pub total_bytes_sent: u64,
+    pub total_bytes_recv: u64,
+    pub active_sessions: usize,
+    pub total_sessions: usize,
+}
+
+/// 连接健康状态
+#[derive(Debug, Clone)]
+pub struct ConnHealthStatus {
+    pub healthy: bool,
+    pub active_sessions: usize,
+    pub total_sessions: usize,
 }
 
 impl Default for ConnRegistry {
@@ -418,7 +594,7 @@ mod tests {
         registry.register(conn.clone()).await;
 
         let ok = registry
-            .set_config(3, ClientConfig {
+            .set_policy(3, ClientPolicy {
                 priority: 1,
                 rate_limit: 100,
                 max_concurrent: 10,
@@ -426,7 +602,7 @@ mod tests {
             .await;
         assert!(ok);
 
-        let cfg = conn.config.read().await;
+        let cfg = conn.policy.read().await;
         assert_eq!(cfg.priority, 1);
         assert_eq!(cfg.rate_limit, 100);
         assert_eq!(cfg.max_concurrent, 10);

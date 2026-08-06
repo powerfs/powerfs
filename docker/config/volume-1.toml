@@ -18,6 +18,7 @@ http_port = 8091              # HTTP管理端口 (与net_port不同!)
 net_port = 8901               # powerfs-net端口 (与http_port不同!)
 data_dir = "/data"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334
 node_id = "volume-server-1"
 max_volume_size = 107374182400
 initial_volume_count = 4

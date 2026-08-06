@@ -362,6 +362,17 @@ impl VolumeMetadata {
         // append_offset 仍然前进（append-only 模型，物理文件持续增长）。
         if !is_update {
             stats.used_bytes += data_size;
+        } else if let Some(ref old) = old_needle {
+            // 更新已有 needle 时，按大小差值调整 used_bytes。
+            // 例如 append 场景：needle 从 1KB 增长到 2KB，used_bytes 应增加 1KB。
+            use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE};
+            let old_total =
+                (NEEDLE_HEADER_SIZE as u64) + (old.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+            if data_size > old_total {
+                stats.used_bytes += data_size - old_total;
+            } else if data_size < old_total {
+                stats.used_bytes = stats.used_bytes.saturating_sub(old_total - data_size);
+            }
         }
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
         stats.append_offset += data_size;

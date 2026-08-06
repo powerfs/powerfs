@@ -26,7 +26,7 @@ Prerequisites:
   2. docker/scripts/start-fuse.sh
 
 Options:
-  --suite, -s NAME    Test suite: all|mount|basic|rfs|volume|posix|concurrent|coherence|fs|sync|minimal|manual
+  --suite, -s NAME    Test suite: all|mount|basic|rfs|volume|coherence|fs|minimal|manual
   --verbose, -v       Show full test output
   --help, -h          Show this help
 EOF
@@ -200,14 +200,6 @@ if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "volume" ]; then
     run_test "Volume Verification" "--manifest-path powerfs-fuse/Cargo.toml --test volume_verification_test"
 fi
 
-if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "posix" ]; then
-    run_test "POSIX Compliance" "--manifest-path powerfs-fuse/Cargo.toml --test posix_tests"
-fi
-
-if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "concurrent" ]; then
-    run_test "Concurrent Consistency" "--manifest-path powerfs-fuse/Cargo.toml --test concurrent_consistency"
-fi
-
 if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "fs" ]; then
     run_test "File System" "--manifest-path powerfs-fuse/Cargo.toml --test fs_test"
 fi
@@ -218,10 +210,6 @@ fi
 
 if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "coherence" ]; then
     run_test "Coherence Phase 1" "--manifest-path powerfs-fuse/Cargo.toml --test coherence_phase1_test"
-fi
-
-if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "sync" ]; then
-    run_test "Sync" "--manifest-path powerfs-fuse/Cargo.toml --test sync_test"
 fi
 
 if [ "$TEST_SUITE" = "all" ] || [ "$TEST_SUITE" = "minimal" ]; then

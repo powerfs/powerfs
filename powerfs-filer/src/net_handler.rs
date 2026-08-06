@@ -175,7 +175,7 @@ impl FilerNetHandler {
                 inode, version, sub_count
             );
             tokio::spawn(async move {
-                let count = notifier.notify(inode, version).await;
+                let count = notifier.notify(inode, version);
                 info!(
                     "FILER_NET_NOTIFY: notified {} clients about inode {} change (v={})",
                     count, inode, version

@@ -71,7 +71,7 @@ impl FrameFlags {
 // ============================================================================
 
 /// Client type for handshake
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ClientType {
     Fuse = 0x01,

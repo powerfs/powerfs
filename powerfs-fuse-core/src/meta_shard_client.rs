@@ -13,18 +13,7 @@ use crate::request_state::{RequestContext, RequestKind};
 use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
 use powerfs_net::client::NotificationHandler;
-use powerfs_net::{ClientConfig, NetMessage, PowerFsNetClient};
-
-/// Wrapper to convert `Arc<dyn NotificationHandler>` into
-/// `Box<dyn NotificationHandler>` so it can be re-installed on every
-/// new `PowerFsNetClient` after a reconnect.
-struct ArcNotificationHandler(Arc<dyn NotificationHandler + Send + Sync>);
-
-impl NotificationHandler for ArcNotificationHandler {
-    fn handle_notification(&self, msg: &NetMessage) {
-        self.0.handle_notification(msg);
-    }
-}
+use powerfs_net::PowerFsNetClient;
 
 /// 根据 RequestKind 获取默认 MsgType
 pub(crate) fn default_msg_type_for_kind(kind: RequestKind) -> powerfs_net::MsgType {
@@ -260,8 +249,8 @@ pub struct MetaShardClient {
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器引用
     topology_manager: Arc<ClusterTopologyManager>,
-    /// Filer 连接池 (addr -> PowerFsNetClient) - DashMap for lock-free reads
-    filer_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    /// 统一连接池 (由 powerfs_net::ClientConnPool 管理 addr -> PowerFsNetClient)
+    conn_pool: Arc<powerfs_net::ClientConnPool>,
     /// 请求完成监听器
     listeners: Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     /// 后台处理是否在运行
@@ -292,6 +281,7 @@ impl MetaShardClient {
         config: MetaShardClientConfig,
         topology_manager: Arc<ClusterTopologyManager>,
         client_id: u64,
+        conn_pool: Arc<powerfs_net::ClientConnPool>,
     ) -> Self {
         Self {
             breakers: Arc::new(CircuitBreakerPool::new(
@@ -306,7 +296,7 @@ impl MetaShardClient {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
             config,
             topology_manager,
-            filer_connections: Arc::new(DashMap::new()),
+            conn_pool,
             listeners: Arc::new(Mutex::new(Vec::new())),
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -321,60 +311,21 @@ impl MetaShardClient {
     /// `Invalidate` messages from the Filer.  The handler is applied to
     /// every new Filer connection so the client can evict stale metadata
     /// cache entries when another client modifies the same directory.
+    ///
+    /// Note: the actual installation on connections is handled by the
+    /// `ClientConnPool` (configured at pool creation time). This method
+    /// only stores the handler in the struct field for API compatibility.
     pub fn set_notification_handler(&self, handler: Arc<dyn NotificationHandler + Send + Sync>) {
-        *self.notification_handler.write().unwrap() = Some(handler.clone());
-        // Apply to all existing connections
-        for entry in self.filer_connections.iter() {
-            entry.set_notification_handler(Box::new(ArcNotificationHandler(handler.clone())));
-        }
+        *self.notification_handler.write().unwrap() = Some(handler);
     }
 
     /// 获取或创建到指定 filer 地址的连接
     async fn get_or_create_filer_client(&self, addr: &str) -> ClientResult<Arc<PowerFsNetClient>> {
-        // 先检查是否已有连接 (DashMap lock-free read)
-        if let Some(entry) = self.filer_connections.get(addr) {
-            if entry.is_connected() {
-                return Ok(entry.clone());
-            }
-        }
-
-        // 创建新连接
-        let (host, port) = parse_addr(addr)?;
-        let client_config = ClientConfig {
-            addr: host,
-            port,
-            client_id: self.client_id,
-            client_type: powerfs_net::ClientType::Fuse,
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
-            max_retries: 3,
-            retry_delay: Duration::from_millis(100),
-            heartbeat_interval: Duration::from_secs(30),
-            max_inflight_requests: 256,
-        };
-
-        log::info!(
-            "MetaShardClient: creating Filer connection to {} with client_id={}",
-            addr,
-            self.client_id
-        );
-        let client = Arc::new(PowerFsNetClient::new(client_config));
-        client
-            .connect()
+        // 连接复用、懒创建、通知处理器安装均由 ClientConnPool 统一管理
+        self.conn_pool
+            .get_or_connect_addr(addr)
             .await
-            .map_err(ClientError::from_net_error)?;
-
-        // Phase 2: Apply notification handler to new Filer connection so
-        // the client receives server-pushed Invalidate messages.
-        if let Some(h) = self.notification_handler.read().unwrap().clone() {
-            client.set_notification_handler(Box::new(ArcNotificationHandler(h)));
-        }
-
-        // 保存到连接池
-        self.filer_connections
-            .insert(addr.to_string(), client.clone());
-
-        Ok(client)
+            .map_err(ClientError::from_net_error)
     }
 
     /// 添加请求完成监听器
@@ -465,7 +416,8 @@ impl MetaShardClient {
     /// 启动后台处理循环
     ///
     /// 串行处理循环已被 ShardedRpcPool 取代（submit_*_and_wait 直接走 pool）。
-    /// 此方法仅启动连接健康检查任务（periodic ping + reconnect）。
+    /// 连接健康检查（periodic ping + reconnect）现由 `ClientConnPool::start_health_check`
+    /// 统一管理，在 `init()` 中启动。此方法仅设置运行标志。
     pub fn start_background_processor(&self) {
         let mut running = self.background_running.lock().unwrap();
         if *running {
@@ -474,62 +426,8 @@ impl MetaShardClient {
         *running = true;
 
         log::info!(
-            "MetaShardClient: Background processor started (health-check only, dispatch via ShardedRpcPool)"
+            "MetaShardClient: Background processor started (dispatch via ShardedRpcPool, health-check via ClientConnPool)"
         );
-
-        // ---- Connection health task: periodic ping + graceful reconnect ----
-        // Without this, a connection whose far end silently dropped (NAT /
-        // idle LB / power failure) would only be discovered on the next
-        // user request via a confusing "early eof" error.  Instead we
-        // softly probe every 15s and try reconnect on any error; failed
-        // reconnects are retried on the next tick so transient blips do
-        // not wedge any single request.
-        let filer_connections_cp = self.filer_connections.clone();
-        let background_running_cp = self.background_running.clone();
-        let state_cp = self.state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(15));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                if !*background_running_cp.lock().unwrap() {
-                    break;
-                }
-                let s = *state_cp.lock().unwrap();
-                if s == MetaShardClientState::Closed {
-                    break;
-                }
-                ticker.tick().await;
-
-                // Snapshot the pool to avoid long lock holds across network ops.
-                let addrs: Vec<String> = filer_connections_cp
-                    .iter()
-                    .map(|entry| entry.key().clone())
-                    .collect();
-                for addr in addrs {
-                    let client = match filer_connections_cp.get(&addr) {
-                        Some(c) => c.clone(),
-                        None => continue,
-                    };
-                    if client.is_connected() {
-                        if let Err(e) = client.ping().await {
-                            log::warn!(
-                                "MetaShardClient: ping failed for {}, reconnecting: {:?}",
-                                addr,
-                                e
-                            );
-                            // Try a single reconnect inline; on failure we
-                            // keep the entry but leave !connected so next
-                            // request triggers get_or_create_filer_client
-                            // which calls connect() again.
-                            let _ = client.reconnect_internal().await;
-                        }
-                    } else {
-                        let _ = client.reconnect_internal().await;
-                    }
-                }
-            }
-            log::info!("MetaShardClient: connection health task stopped");
-        });
     }
 
     /// 停止后台处理循环
@@ -562,6 +460,10 @@ impl MetaShardClient {
             self.setup_default_routes();
         }
 
+        // 启动统一连接池的健康检查（periodic ping + reconnect），
+        // 取代旧的内嵌健康检查任务。必须在 tokio 运行时上下文中调用。
+        self.conn_pool.start_health_check();
+
         // ShardedRpcPool 延迟到首次 submit_*_and_wait 时创建（需要 tokio 运行时上下文）
         *self.state.lock().unwrap() = MetaShardClientState::Ready;
         log::info!(
@@ -578,12 +480,10 @@ impl MetaShardClient {
             let worker_count = calc_worker_count(shard_count);
             let pool = ShardedRpcPool::new(
                 worker_count,
-                self.filer_connections.clone(),
+                self.conn_pool.clone(),
                 self.default_filer_addr.clone(),
                 self.breakers.clone(),
                 self.shard_router.clone(),
-                self.client_id,
-                self.notification_handler.clone(),
             );
             *guard = Some(Arc::new(pool));
         }
@@ -1511,14 +1411,12 @@ async fn process_available_requests(
     data_channel: &Arc<TransportChannel>,
     control_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_filer_addr: &Arc<Mutex<String>>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
     _topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
-    client_id: u64,
-    notification_handler: &SharedNotificationHandler,
 ) -> bool {
     // 优先处理控制请求
     if control_channel.can_accept() {
@@ -1529,12 +1427,10 @@ async fn process_available_requests(
             let request_id = req.context.request_id.clone();
             let result = process_request_internal(
                 req,
-                filer_connections,
+                conn_pool,
                 default_filer_addr,
                 breakers,
                 shard_router,
-                client_id,
-                notification_handler,
             )
             .await;
 
@@ -1563,12 +1459,10 @@ async fn process_available_requests(
             let request_id = req.context.request_id.clone();
             let result = process_request_internal(
                 req,
-                filer_connections,
+                conn_pool,
                 default_filer_addr,
                 breakers,
                 shard_router,
-                client_id,
-                notification_handler,
             )
             .await;
 
@@ -1596,12 +1490,10 @@ async fn process_available_requests(
 /// 包含 redirect 重试逻辑（最多 5 次，指数退避）。
 pub(crate) async fn process_request_internal(
     req: PendingRequest,
-    filer_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_filer_addr: &Arc<Mutex<String>>,
     breakers: &Arc<CircuitBreakerPool>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
-    client_id: u64,
-    notification_handler: &SharedNotificationHandler,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let kind = req.context.kind;
@@ -1639,14 +1531,8 @@ pub(crate) async fn process_request_internal(
             return Err(ClientError::NoShardLeader(shard_id));
         }
 
-        // 2) 获取或创建到该 leader 的连接
-        let filer_client = get_or_create_filer_client(
-            filer_connections,
-            &leader_addr,
-            client_id,
-            notification_handler,
-        )
-        .await?;
+        // 2) 获取或创建到该 leader 的连接（client_id / 通知处理器由连接池统一安装）
+        let filer_client = get_or_create_filer_client(conn_pool, &leader_addr).await?;
 
         // 3) Per-server circuit breaker check
         if !breakers.check(&leader_addr) {
@@ -1733,83 +1619,25 @@ pub(crate) async fn process_request_internal(
     }
 }
 
-/// Type alias for the notification handler shared state.
-pub(crate) type SharedNotificationHandler =
-    Arc<std::sync::RwLock<Option<Arc<dyn NotificationHandler + Send + Sync>>>>;
-
 /// 获取或创建到指定地址的 filer 连接（自由函数版本，供后台处理器使用）
 ///
-/// Phase 2 fix: accepts `client_id` and `notification_handler` so that
-/// connections created by ShardedRpcPool workers use the correct client
-/// identity in the Filer handshake and receive server-pushed Invalidate
-/// notifications. Previously this function hardcoded `client_id: 0` and
-/// never installed the notification handler, causing all FUSE clients to
-/// share the same session and miss cache invalidation callbacks.
+/// 连接的创建、复用、client_id 握手以及通知处理器安装均由 `ClientConnPool`
+/// 统一管理。这里先以 `get_if_connected` 走快速 peek 路径，未命中时再调用
+/// `get_or_connect_addr` 完成懒创建。
 async fn get_or_create_filer_client(
-    connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     addr: &str,
-    client_id: u64,
-    notification_handler: &SharedNotificationHandler,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
-    // 先检查是否已有连接 (DashMap lock-free read)
-    if let Some(entry) = connections.get(addr) {
-        if entry.is_connected() {
-            return Ok(entry.clone());
-        }
+    // 先检查是否已有连接 (peek-only, 不触发创建)
+    if let Some(client) = conn_pool.get_if_connected(addr) {
+        return Ok(client);
     }
 
-    // 解析地址
-    let (host, port) = parse_addr(addr)?;
-
-    // 创建新连接
-    let client_config = ClientConfig {
-        addr: host,
-        port,
-        client_id,
-        client_type: powerfs_net::ClientType::Fuse,
-        connect_timeout: Duration::from_secs(5),
-        request_timeout: Duration::from_secs(5),
-        max_retries: 3,
-        retry_delay: Duration::from_millis(100),
-        heartbeat_interval: Duration::from_secs(30),
-        max_inflight_requests: 256,
-    };
-
-    log::info!(
-        "MetaShardClient(standalone): creating Filer connection to {} with client_id={}",
-        addr,
-        client_id
-    );
-    let client = Arc::new(PowerFsNetClient::new(client_config));
-    client
-        .connect()
+    // 慢路径：由连接池创建新连接（通知处理器在池创建时已配置）
+    conn_pool
+        .get_or_connect_addr(addr)
         .await
-        .map_err(ClientError::from_net_error)?;
-
-    // Phase 2: Apply notification handler so the client receives
-    // server-pushed Invalidate messages for cache invalidation.
-    if let Some(h) = notification_handler.read().unwrap().clone() {
-        client.set_notification_handler(Box::new(ArcNotificationHandler(h)));
-    }
-
-    // 保存到连接池
-    connections.insert(addr.to_string(), client.clone());
-
-    Ok(client)
-}
-
-/// 解析地址字符串为 (host, port)
-fn parse_addr(addr: &str) -> ClientResult<(String, u16)> {
-    let parts: Vec<&str> = addr.split(':').collect();
-    if parts.len() == 2 {
-        let host = parts[0].to_string();
-        let port = parts[1]
-            .parse::<u16>()
-            .map_err(|_| ClientError::InvalidAddress(addr.to_string()))?;
-        Ok((host, port))
-    } else {
-        Err(ClientError::InvalidAddress(addr.to_string()))
-    }
+        .map_err(ClientError::from_net_error)
 }
 
 #[cfg(test)]
@@ -1829,8 +1657,18 @@ mod tests {
             .insert(1, ShardInfo::new(1, "127.0.0.1:9334".to_string()));
         topology_manager.update_topology(topology);
 
+        let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+            1,
+            powerfs_net::ClientPoolConfig::default(),
+            None,
+        ));
         let config = MetaShardClientConfig::default();
-        let client = MetaShardClient::new(config, topology_manager.clone(), 1);
+        let client = MetaShardClient::new(
+            config,
+            topology_manager.clone(),
+            1,
+            conn_pool,
+        );
         client.init();
 
         (client, topology_manager)

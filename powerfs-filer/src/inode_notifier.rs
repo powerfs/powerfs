@@ -103,7 +103,7 @@ impl InodeNotifier {
     /// `serialize` internals.
     ///
     /// Returns the number of clients notified successfully.
-    pub async fn notify(&self, inode: u64, version: u64) -> usize {
+    pub fn notify(&self, inode: u64, version: u64) -> usize {
         let client_ids: Vec<u64> = {
             let subs = self.subscribers.read().unwrap();
             subs.get(&inode)
@@ -122,7 +122,6 @@ impl InodeNotifier {
             match self
                 .connection_manager
                 .push_invalidate_notification(client_id, inode, version)
-                .await
             {
                 Ok(true) => {
                     log::debug!(
@@ -158,11 +157,10 @@ impl InodeNotifier {
     ///
     /// Used for global events like volume reassignment. Returns the number
     /// of clients notified.
-    pub async fn broadcast(&self, inode: u64, version: u64) -> usize {
+    pub fn broadcast(&self, inode: u64, version: u64) -> usize {
         let count = self
             .connection_manager
-            .broadcast_invalidate_notification(inode, version)
-            .await;
+            .broadcast_invalidate_notification(inode, version);
         log::debug!(
             "InodeNotifier: broadcast Invalidate(inode={}, v={}) to {} clients",
             inode,
@@ -193,11 +191,16 @@ impl InodeNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use powerfs_net::client_conn::ConnRegistry;
     use powerfs_net::server_connection::ServerConnectionManager;
+
+    fn make_manager() -> Arc<ServerConnectionManager> {
+        Arc::new(ServerConnectionManager::new(Arc::new(ConnRegistry::new())))
+    }
 
     #[test]
     fn test_subscribe_unsubscribe() {
-        let mgr = Arc::new(ServerConnectionManager::new());
+        let mgr = make_manager();
         let notifier = InodeNotifier::new(mgr);
 
         notifier.subscribe(1, 100);
@@ -215,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_multiple_inodes() {
-        let mgr = Arc::new(ServerConnectionManager::new());
+        let mgr = make_manager();
         let notifier = InodeNotifier::new(mgr);
 
         notifier.subscribe(1, 100);
@@ -232,19 +235,19 @@ mod tests {
         assert_eq!(notifier.subscriber_count(1), 1); // client 200 still there
     }
 
-    #[tokio::test]
-    async fn test_notify_no_subscribers() {
-        let mgr = Arc::new(ServerConnectionManager::new());
+    #[test]
+    fn test_notify_no_subscribers() {
+        let mgr = make_manager();
         let notifier = InodeNotifier::new(mgr);
 
         // No subscribers → notify is a no-op returning 0.
-        assert_eq!(notifier.notify(42, 100).await, 0);
-        assert_eq!(notifier.broadcast(42, 100).await, 0);
+        assert_eq!(notifier.notify(42, 100), 0);
+        assert_eq!(notifier.broadcast(42, 100), 0);
     }
 
-    #[tokio::test]
-    async fn test_notify_drops_disconnected_subscriber() {
-        let mgr = Arc::new(ServerConnectionManager::new());
+    #[test]
+    fn test_notify_drops_disconnected_subscriber() {
+        let mgr = make_manager();
         let notifier = InodeNotifier::new(mgr);
 
         // Subscribe a client that has no live notification channel. The
@@ -253,7 +256,7 @@ mod tests {
         notifier.subscribe(42, 100);
         assert_eq!(notifier.subscriber_count(42), 1);
 
-        let delivered = notifier.notify(42, 100).await;
+        let delivered = notifier.notify(42, 100);
         assert_eq!(delivered, 0);
         // Stale subscription should have been removed by the Err path.
         assert_eq!(notifier.subscriber_count(42), 0);

@@ -14,7 +14,7 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::serialize::TlvDecoder;
-use powerfs_net::{ClientConfig, FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND};
+use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NO_SPACE, STATUS_ERR_NOT_FOUND};
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
@@ -234,8 +234,8 @@ pub struct VolumeClient {
     breakers: Arc<CircuitBreakerPool>,
     /// 拓扑管理器
     topology_manager: Arc<ClusterTopologyManager>,
-    /// Volume 连接池 (addr -> PowerFsNetClient) - DashMap for lock-free reads
-    volume_connections: Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    /// 统一连接池 (由 powerfs-net 的 ClientConnPool 管理 addr -> PowerFsNetClient)
+    conn_pool: Arc<powerfs_net::ClientConnPool>,
     /// 默认 Volume 地址列表
     default_volume_addrs: Arc<Mutex<Vec<String>>>,
     /// 请求等待者映射 (request_id -> oneshot sender)
@@ -276,7 +276,11 @@ pub struct VolumeClient {
 }
 
 impl VolumeClient {
-    pub fn new(config: VolumeClientConfig, topology_manager: Arc<ClusterTopologyManager>) -> Self {
+    pub fn new(
+        config: VolumeClientConfig,
+        topology_manager: Arc<ClusterTopologyManager>,
+        conn_pool: Arc<powerfs_net::ClientConnPool>,
+    ) -> Self {
         // 创建多个数据通道组成通道池
         let data_channels = vec![
             Arc::new(TransportChannel::new(config.data_channel.clone())),
@@ -319,7 +323,7 @@ impl VolumeClient {
             mgmt_notify: Arc::new(tokio::sync::Notify::new()),
             config,
             topology_manager,
-            volume_connections: Arc::new(DashMap::new()),
+            conn_pool,
             default_volume_addrs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -334,7 +338,10 @@ impl VolumeClient {
         &self,
         addr: &str,
     ) -> ClientResult<Arc<PowerFsNetClient>> {
-        get_or_create_volume_client_from_pool(&self.volume_connections, addr).await
+        self.conn_pool
+            .get_or_connect_addr(addr)
+            .await
+            .map_err(ClientError::from_net_error)
     }
 
     /// 注册请求等待者
@@ -459,6 +466,10 @@ impl VolumeClient {
         self.cleanup_expired_leases();
         *self.state.lock().unwrap() = VolumeClientState::Ready;
         log::info!("VolumeClient: Initialized");
+
+        // 启动统一连接池的健康检查 (ping + 自动重连)
+        self.conn_pool.start_health_check();
+        log::info!("VolumeClient: Connection pool health check started");
 
         // 启动 Lease 续租心跳后台任务
         self.start_lease_renewer();
@@ -1127,6 +1138,19 @@ impl VolumeClient {
                 );
                 Ok(resp.body)
             }
+            Ok(resp) if resp.header.status == STATUS_ERR_NO_SPACE => {
+                // Volume full is a permanent condition, not a transient
+                // failure. Do NOT trip the circuit breaker — the client
+                // should request a new volume from Master instead.
+                log::warn!(
+                    "send_write_needle_direct: volume {} is full (ENOSPC), not tripping breaker",
+                    volume_id
+                );
+                Err(ClientError::Server(format!(
+                    "WriteNeedle failed: ENOSPC (volume full): status={}",
+                    resp.header.status
+                )))
+            }
             Ok(resp) => {
                 self.breakers.record_failure(&volume.addr);
                 Err(ClientError::Server(format!(
@@ -1408,7 +1432,7 @@ impl VolumeClient {
         let data_queue = self.data_queue.clone();
         let data_channels = self.data_channels.clone();
         let breakers = self.breakers.clone();
-        let volume_connections = self.volume_connections.clone();
+        let conn_pool = self.conn_pool.clone();
         let default_volume_addrs = self.default_volume_addrs.clone();
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
@@ -1449,7 +1473,7 @@ impl VolumeClient {
                     &data_queue,
                     &data_channels,
                     &breakers,
-                    &volume_connections,
+                    &conn_pool,
                     &default_volume_addrs,
                     &volume_router,
                     &leases,
@@ -1481,7 +1505,7 @@ impl VolumeClient {
         let lease_queue = self.lease_queue.clone();
         let lease_channel = self.lease_channel.clone();
         let breakers = self.breakers.clone();
-        let volume_connections = self.volume_connections.clone();
+        let conn_pool = self.conn_pool.clone();
         let default_volume_addrs = self.default_volume_addrs.clone();
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
@@ -1522,7 +1546,7 @@ impl VolumeClient {
                     &lease_queue,
                     &lease_channel,
                     &breakers,
-                    &volume_connections,
+                    &conn_pool,
                     &default_volume_addrs,
                     &volume_router,
                     &response_waiters,
@@ -1553,7 +1577,7 @@ impl VolumeClient {
         let mgmt_queue = self.mgmt_queue.clone();
         let mgmt_channel = self.mgmt_channel.clone();
         let breakers = self.breakers.clone();
-        let volume_connections = self.volume_connections.clone();
+        let conn_pool = self.conn_pool.clone();
         let default_volume_addrs = self.default_volume_addrs.clone();
         let state = self.state.clone();
         let volume_router = self.volume_router.clone();
@@ -1592,7 +1616,7 @@ impl VolumeClient {
                     &mgmt_queue,
                     &mgmt_channel,
                     &breakers,
-                    &volume_connections,
+                    &conn_pool,
                     &default_volume_addrs,
                     &volume_router,
                     &response_waiters,
@@ -1642,7 +1666,7 @@ impl VolumeClient {
         *running = true;
 
         let leases = self.leases.clone();
-        let volume_connections = self.volume_connections.clone();
+        let conn_pool = self.conn_pool.clone();
         let volume_router = self.volume_router.clone();
         let lease_renewer_running = self.lease_renewer_running.clone();
         let interval = self.lease_renew_interval;
@@ -1709,7 +1733,7 @@ impl VolumeClient {
 
                     // 获取或创建到 Volume 的连接
                     let vol_client =
-                        match get_or_create_volume_client_from_pool(&volume_connections, &addr)
+                        match get_or_create_volume_client_from_pool(&conn_pool, &addr)
                             .await
                         {
                             Ok(c) => c,
@@ -1791,7 +1815,7 @@ impl VolumeClient {
     pub async fn process_data_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_data_request_internal(
             req,
-            &self.volume_connections,
+            &self.conn_pool,
             &self.default_volume_addrs,
             &self.breakers,
             &self.data_channels,
@@ -1806,7 +1830,7 @@ impl VolumeClient {
     pub async fn process_lease_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_lease_request_internal(
             req,
-            &self.volume_connections,
+            &self.conn_pool,
             &self.default_volume_addrs,
             &self.breakers,
             &self.lease_channel,
@@ -1820,7 +1844,7 @@ impl VolumeClient {
     pub async fn process_mgmt_request(&self, req: PendingRequest) -> ClientResult<RequestResult> {
         process_mgmt_request_internal(
             req,
-            &self.volume_connections,
+            &self.conn_pool,
             &self.default_volume_addrs,
             &self.breakers,
             &self.mgmt_channel,
@@ -1884,84 +1908,18 @@ fn deliver_result(
     }
 }
 
-/// 生成 volume 连接的唯一 client_id。
-///
-/// 组合维度：
-/// - **hostname**（容器名/节点名）：区分不同物理/容器节点
-/// - **PID**：区分同一节点上的不同 fuse 进程（不同挂载点）
-/// - **原子计数器**：区分同一进程内的多个连接（不同 volume server）
-///
-/// 输出 u64：高 48 位 = hash(hostname + PID)，低 16 位 = 计数器（65536 连接/进程）
-fn generate_volume_conn_id() -> u64 {
-    use std::hash::{Hash, Hasher};
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // PID: 同节点不同 fuse 进程（挂载点）得到不同 hash
-    std::process::id().hash(&mut hasher);
-    // hostname: 不同容器/节点得到不同 hash
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        hostname.hash(&mut hasher);
-    } else if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
-        hostname.trim().hash(&mut hasher);
-    }
-    let base = hasher.finish();
-
-    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // 高 48 位 base + 低 16 位 counter
-    (base << 16) | (counter & 0xFFFF)
-}
-
 /// 从连接池获取或创建到指定地址的 volume 客户端
+///
+/// 连接的创建/复用/健康检查统一由 `powerfs_net::ClientConnPool` 管理，
+/// 这里仅做错误类型转换以保持既有 `ClientResult` 返回签名。
 async fn get_or_create_volume_client_from_pool(
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     addr: &str,
 ) -> ClientResult<Arc<PowerFsNetClient>> {
-    // 先检查是否已有连接 (DashMap lock-free read)
-    if let Some(entry) = volume_connections.get(addr) {
-        if entry.is_connected() {
-            return Ok(entry.clone());
-        }
-    }
-
-    // 解析地址
-    let parts: Vec<&str> = addr.split(':').collect();
-    if parts.len() != 2 {
-        return Err(ClientError::InvalidAddress(addr.to_string()));
-    }
-    let host = parts[0].to_string();
-    let port = parts[1]
-        .parse::<u16>()
-        .map_err(|_| ClientError::InvalidAddress(addr.to_string()))?;
-
-    // 创建新连接
-    // 生成唯一 client_id：基于 hostname(区分节点) + PID(区分同节点不同挂载点进程) + 计数器(区分同进程多连接)
-    // 避免所有连接共用 client_id=0，导致一个连接断开时 server 清理 session 影响所有连接
-    let conn_client_id = generate_volume_conn_id();
-
-    let client_config = ClientConfig {
-        addr: host,
-        port,
-        client_id: conn_client_id,
-        client_type: powerfs_net::ClientType::Fuse,
-        connect_timeout: Duration::from_secs(5),
-        request_timeout: Duration::from_secs(10),
-        max_retries: 3,
-        retry_delay: Duration::from_millis(100),
-        heartbeat_interval: Duration::from_secs(30),
-        max_inflight_requests: 256,
-    };
-
-    let client = Arc::new(PowerFsNetClient::new(client_config));
-    client
-        .connect()
+    conn_pool
+        .get_or_connect_addr(addr)
         .await
-        .map_err(ClientError::from_net_error)?;
-
-    // 保存到连接池
-    volume_connections.insert(addr.to_string(), client.clone());
-
-    Ok(client)
+        .map_err(ClientError::from_net_error)
 }
 
 /// 处理 Volume 队列中所有可用的请求，返回是否处理了至少一个
@@ -1975,7 +1933,7 @@ async fn process_volume_available_requests(
     lease_channel: &Arc<TransportChannel>,
     mgmt_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
@@ -1987,7 +1945,7 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_lease_request_internal(
                 req,
-                volume_connections,
+                conn_pool,
                 default_volume_addrs,
                 breakers,
                 lease_channel,
@@ -2005,7 +1963,7 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_mgmt_request_internal(
                 req,
-                volume_connections,
+                conn_pool,
                 default_volume_addrs,
                 breakers,
                 mgmt_channel,
@@ -2023,7 +1981,7 @@ async fn process_volume_available_requests(
         if let Some(req) = next_req {
             let _ = process_data_request_internal(
                 req,
-                volume_connections,
+                conn_pool,
                 default_volume_addrs,
                 breakers,
                 data_channels,
@@ -2066,7 +2024,7 @@ async fn process_data_requests(
     data_queue: &Arc<RequestQueue>,
     data_channels: &[Arc<TransportChannel>],
     breakers: &Arc<CircuitBreakerPool>,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     leases: &Arc<DashMap<(u64, u64), LeaseInfo>>,
@@ -2089,7 +2047,7 @@ async fn process_data_requests(
         let request_id = next_req.context.request_id.clone();
         channel.add_request(request_id.clone());
 
-        let volume_connections = volume_connections.clone();
+        let conn_pool = conn_pool.clone();
         let default_volume_addrs = default_volume_addrs.clone();
         let breakers = breakers.clone();
         let volume_router = volume_router.clone();
@@ -2110,7 +2068,7 @@ async fn process_data_requests(
             let empty_channels: Vec<Arc<TransportChannel>> = Vec::new();
             let _ = process_data_request_internal(
                 next_req,
-                &volume_connections,
+                &conn_pool,
                 &default_volume_addrs,
                 &breakers,
                 &empty_channels,
@@ -2135,7 +2093,7 @@ async fn process_lease_requests(
     lease_queue: &Arc<RequestQueue>,
     lease_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
@@ -2150,7 +2108,7 @@ async fn process_lease_requests(
         let request_id = next_req.context.request_id.clone();
         lease_channel.add_request(request_id.clone());
 
-        let volume_connections = volume_connections.clone();
+        let conn_pool = conn_pool.clone();
         let default_volume_addrs = default_volume_addrs.clone();
         let breakers = breakers.clone();
         let volume_router = volume_router.clone();
@@ -2167,7 +2125,7 @@ async fn process_lease_requests(
             // process_lease_request_internal 的 _lease_channel 参数未使用，借用 guard.channel
             let _ = process_lease_request_internal(
                 next_req,
-                &volume_connections,
+                &conn_pool,
                 &default_volume_addrs,
                 &breakers,
                 &guard.channel,
@@ -2191,7 +2149,7 @@ async fn process_mgmt_requests(
     mgmt_queue: &Arc<RequestQueue>,
     mgmt_channel: &Arc<TransportChannel>,
     breakers: &Arc<CircuitBreakerPool>,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     volume_router: &Arc<DashMap<u64, VolumeInfo>>,
     response_waiters: &Arc<Mutex<VolumeResponseWaiters>>,
@@ -2206,7 +2164,7 @@ async fn process_mgmt_requests(
         let request_id = next_req.context.request_id.clone();
         mgmt_channel.add_request(request_id.clone());
 
-        let volume_connections = volume_connections.clone();
+        let conn_pool = conn_pool.clone();
         let default_volume_addrs = default_volume_addrs.clone();
         let breakers = breakers.clone();
         let volume_router = volume_router.clone();
@@ -2223,7 +2181,7 @@ async fn process_mgmt_requests(
             // process_mgmt_request_internal 的 _mgmt_channel 参数未使用，借用 guard.channel
             let _ = process_mgmt_request_internal(
                 next_req,
-                &volume_connections,
+                &conn_pool,
                 &default_volume_addrs,
                 &breakers,
                 &guard.channel,
@@ -2243,7 +2201,7 @@ async fn process_mgmt_requests(
 #[allow(clippy::too_many_arguments)]
 async fn process_data_request_internal(
     mut req: PendingRequest,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _data_channels: &[Arc<TransportChannel>],
@@ -2299,7 +2257,7 @@ async fn process_data_request_internal(
         volume_addr
     );
 
-    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
+    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
@@ -2442,6 +2400,17 @@ async fn process_data_request_internal(
                         resp.data,
                     ))
                 }
+                Ok(resp) if resp.header.status == STATUS_ERR_NO_SPACE => {
+                    // ENOSPC is not a transient failure — do not trip the breaker.
+                    log::warn!(
+                        "process_data_request: volume {} is full (ENOSPC), not tripping breaker",
+                        req.shard_id
+                    );
+                    Err(ClientError::Server(format!(
+                        "Server error (ENOSPC): {}",
+                        resp.header.status
+                    )))
+                }
                 Ok(resp) => {
                     breakers.record_failure(&volume_addr);
                     Err(ClientError::Server(format!(
@@ -2470,7 +2439,7 @@ async fn process_data_request_internal(
 /// Lease 请求处理（自由函数版本）
 async fn process_lease_request_internal(
     mut req: PendingRequest,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _lease_channel: &Arc<TransportChannel>,
@@ -2509,7 +2478,7 @@ async fn process_lease_request_internal(
         return result;
     }
 
-    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
+    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
@@ -2536,6 +2505,17 @@ async fn process_lease_request_internal(
                 resp.data,
             ))
         }
+        Ok(resp) if resp.header.status == STATUS_ERR_NO_SPACE => {
+            // ENOSPC is not a transient failure — do not trip the breaker.
+            log::warn!(
+                "process_lease_request: volume {} is full (ENOSPC), not tripping breaker",
+                req.shard_id
+            );
+            Err(ClientError::Server(format!(
+                "Server error (ENOSPC): {}",
+                resp.header.status
+            )))
+        }
         Ok(resp) => {
             breakers.record_failure(&volume_addr);
             Err(ClientError::Server(format!(
@@ -2561,7 +2541,7 @@ async fn process_lease_request_internal(
 /// 管理请求处理（自由函数版本）
 async fn process_mgmt_request_internal(
     mut req: PendingRequest,
-    volume_connections: &Arc<DashMap<String, Arc<PowerFsNetClient>>>,
+    conn_pool: &Arc<powerfs_net::ClientConnPool>,
     _default_volume_addrs: &Arc<Mutex<Vec<String>>>,
     breakers: &Arc<CircuitBreakerPool>,
     _mgmt_channel: &Arc<TransportChannel>,
@@ -2600,7 +2580,7 @@ async fn process_mgmt_request_internal(
         return result;
     }
 
-    let vol_client = get_or_create_volume_client_from_pool(volume_connections, &volume_addr)
+    let vol_client = get_or_create_volume_client_from_pool(conn_pool, &volume_addr)
         .await
         .map_err(|e| {
             let err = ClientError::Network(format!("Failed to get volume client: {}", e));
@@ -2802,7 +2782,12 @@ mod tests {
         topology_manager.update_topology(topology);
 
         let config = VolumeClientConfig::default();
-        let client = VolumeClient::new(config, topology_manager.clone());
+        let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+            1,
+            powerfs_net::ClientPoolConfig::default(),
+            None,
+        ));
+        let client = VolumeClient::new(config, topology_manager.clone(), conn_pool);
 
         // 启动 Tokio runtime 以支持异步操作（如 lease renewer）
         let runtime = tokio::runtime::Runtime::new().unwrap();

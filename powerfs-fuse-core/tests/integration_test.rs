@@ -64,8 +64,13 @@ fn test_facade_config_custom_values() {
 #[test]
 fn test_meta_shard_client_initialization() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager, 0);
+    let mut client = MetaShardClient::new(config, topology_manager, 0, conn_pool);
 
     // 验证初始状态
     assert_eq!(client.state(), MetaShardClientState::Init);
@@ -81,8 +86,13 @@ fn test_meta_shard_client_initialization() {
 #[tokio::test]
 async fn test_volume_client_initialization() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let config = VolumeClientConfig::default();
-    let mut client = VolumeClient::new(config, topology_manager);
+    let mut client = VolumeClient::new(config, topology_manager, conn_pool);
 
     // 验证初始状态
     assert_eq!(client.state(), VolumeClientState::Init);
@@ -98,8 +108,13 @@ async fn test_volume_client_initialization() {
 #[tokio::test]
 async fn test_request_submission_without_network() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager.clone(), 0);
+    let mut client = MetaShardClient::new(config, topology_manager.clone(), 0, conn_pool);
     client.init();
 
     // 创建请求上下文
@@ -148,8 +163,13 @@ async fn test_request_submission_without_network() {
 #[tokio::test]
 async fn test_volume_request_submission_without_network() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let config = VolumeClientConfig::default();
-    let mut client = VolumeClient::new(config, topology_manager);
+    let mut client = VolumeClient::new(config, topology_manager, conn_pool);
     client.init();
 
     // 创建数据请求
@@ -291,11 +311,21 @@ fn test_request_id_uniqueness() {
 #[tokio::test]
 async fn test_client_cleanup() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let meta_config = MetaShardClientConfig::default();
     let volume_config = VolumeClientConfig::default();
 
-    let mut meta_client = MetaShardClient::new(meta_config, topology_manager.clone(), 0);
-    let mut volume_client = VolumeClient::new(volume_config, topology_manager);
+    let mut meta_client = MetaShardClient::new(
+        meta_config,
+        topology_manager.clone(),
+        0,
+        conn_pool.clone(),
+    );
+    let mut volume_client = VolumeClient::new(volume_config, topology_manager, conn_pool);
 
     meta_client.init();
     volume_client.init();
@@ -325,8 +355,13 @@ fn test_request_kind_priority() {
 #[test]
 fn test_meta_shard_client_queue_operations() {
     let topology_manager = Arc::new(ClusterTopologyManager::new());
+    let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+        0,
+        powerfs_net::ClientPoolConfig::default(),
+        None,
+    ));
     let config = MetaShardClientConfig::default();
-    let mut client = MetaShardClient::new(config, topology_manager, 0);
+    let mut client = MetaShardClient::new(config, topology_manager, 0, conn_pool);
     client.init();
 
     // 创建多个请求

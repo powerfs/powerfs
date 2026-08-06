@@ -4,7 +4,7 @@ use powerfs_common::types::{NeedleId, VolumeId};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, MsgType, NetMessage, NetHandler, RequestContext, STATUS_ERR_NOT_FOUND,
-    STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    STATUS_ERR_NO_SPACE, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,35 +124,59 @@ impl VolumeNetHandler {
         let vid = VolumeId(volume_id);
         let nid = NeedleId(file_key);
 
+        // Distinguish OutOfSpace from other errors so the client can handle
+        // ENOSPC without tripping the circuit breaker (volume full is a
+        // permanent condition, not a transient failure).
+        enum WriteOutcome {
+            Ok(Vec<u8>),
+            NoSpace,
+            ServerError(String),
+        }
+
         match tokio::task::spawn_blocking(
-            move || -> Result<Option<Vec<u8>>, powerfs_common::error::PowerFsError> {
-                if let Some(volume) = storage_manager.get_volume(&vid) {
-                    match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
-                        Ok(info) => {
-                            let mut enc = TlvEncoder::new();
-                            enc.add_u64(FieldId::FileKey, info.id.0);
-                            Ok(Some(enc.into_bytes()))
-                        }
-                        Err(e) => {
-                            warn!("write_needle failed: {}", e);
-                            Ok(None)
-                        }
+            move || -> std::result::Result<WriteOutcome, String> {
+                let volume = storage_manager
+                    .get_volume(&vid)
+                    .ok_or_else(|| format!("volume not found: {}", volume_id))?;
+                match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
+                    Ok(info) => {
+                        let mut enc = TlvEncoder::new();
+                        enc.add_u64(FieldId::FileKey, info.id.0);
+                        Ok(WriteOutcome::Ok(enc.into_bytes()))
                     }
-                } else {
-                    warn!("write_needle: volume not found: {}", volume_id);
-                    Ok(None)
+                    Err(powerfs_common::error::PowerFsError::OutOfSpace) => {
+                        Ok(WriteOutcome::NoSpace)
+                    }
+                    Err(e) => {
+                        warn!("write_needle failed: {}", e);
+                        Ok(WriteOutcome::ServerError(e.to_string()))
+                    }
                 }
             },
         )
         .await
         {
-            Ok(Ok(Some(body))) => Ok(Self::build_response(msg, STATUS_OK, body, Vec::new())),
-            Ok(Ok(None)) => Ok(Self::build_response(
-                msg,
-                STATUS_ERR_SERVER_ERROR,
-                Vec::new(),
-                Vec::new(),
-            )),
+            Ok(Ok(WriteOutcome::Ok(body))) => {
+                Ok(Self::build_response(msg, STATUS_OK, body, Vec::new()))
+            }
+            Ok(Ok(WriteOutcome::NoSpace)) => {
+                warn!("write_needle: volume {} is full (OutOfSpace)", volume_id);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_NO_SPACE,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Ok(Ok(WriteOutcome::ServerError(msg_str))) => {
+                warn!("write_needle server error: {}", msg_str);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
             Ok(Err(e)) => {
                 warn!("write_needle inner error: {}", e);
                 Ok(Self::build_response(

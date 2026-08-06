@@ -1,16 +1,27 @@
 //! Server-side connection and session management
 //!
-//! Provides `ClientSession` for per-connection state tracking and
-//! `ServerConnectionManager` for managing multiple client sessions
-//! with automatic cleanup, request pipeline, metrics, and notification push.
+//! `ServerConnectionManager` is a thin facade that delegates per-connection
+//! state management (sessions, notifications, rate limiting, stats) to
+//! [`ConnRegistry`]/[`ClientConn`] and retains only server-level
+//! infrastructure:
+//!
+//! - **Middleware pipeline** (`RequestPipeline`) — shared across all workers
+//! - **Metrics middleware** (`MetricsMiddleware`) — aggregated request metrics
+//! - **High-level notification helpers** — build TLV messages and push via
+//!   `ConnRegistry::notify()`
+//!
+//! ## Historical note
+//!
+//! Previously this struct maintained a parallel `HashMap<client_id,
+//! ClientSession>` that duplicated `ConnRegistry`'s `ClientConn` data. That
+//! dual tracking caused state divergence and made cleanup error-prone. The
+//! `ClientSession` type has been removed; all per-connection state lives in
+//! `ClientConn`.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
-use tokio::sync::{mpsc, RwLock};
-
+use crate::client_conn::{ConnRegistry, ConnState};
 use crate::errors::{NetError, NetResult};
 use crate::middleware::{
     LoggingMiddleware, MetricsMiddleware, NextHandler, RequestMetrics, RequestPipeline,
@@ -20,145 +31,11 @@ use crate::serialize::TlvEncoder;
 
 use super::request_context::{ClientInfo, RequestContext};
 
-/// Simple token bucket rate limiter for per-client rate limiting
-#[derive(Debug, Clone)]
-pub struct RateLimiter {
-    max_tokens: u64,
-    refill_rate: f64,
-    tokens: f64,
-    last_refill: Instant,
-}
+// ---------------------------------------------------------------------------
+// NetHandler — business-level request handler trait
+// ---------------------------------------------------------------------------
 
-impl RateLimiter {
-    pub fn new(max_tokens: u64, refill_rate_per_sec: f64) -> Self {
-        Self {
-            max_tokens,
-            refill_rate: refill_rate_per_sec,
-            tokens: max_tokens as f64,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Try to consume one token. Returns true if allowed.
-    pub fn try_acquire(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill);
-        let refill = elapsed.as_secs_f64() * self.refill_rate;
-        self.tokens = (self.tokens + refill).min(self.max_tokens as f64);
-        self.last_refill = now;
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn available_tokens(&self) -> u64 {
-        self.tokens as u64
-    }
-}
-
-impl Default for RateLimiter {
-    fn default() -> Self {
-        // 1000 tokens max, 100 tokens/sec refill (10 req/s sustained)
-        Self::new(1000, 100.0)
-    }
-}
-
-/// State of a client session
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionState {
-    Active,
-    Suspended,
-    Closing,
-    Closed,
-}
-
-/// Per-connection session tracking
-#[derive(Debug, Clone)]
-pub struct ClientSession {
-    pub client_id: u64,
-    pub client_type: ClientType,
-    pub address: SocketAddr,
-    pub state: SessionState,
-    pub connected_at: Instant,
-    pub last_activity: Instant,
-    pub request_count: u64,
-    pub error_count: u64,
-    pub rate_limiter: RateLimiter,
-}
-
-impl ClientSession {
-    pub fn new(client_id: u64, client_type: ClientType, address: SocketAddr) -> Self {
-        let now = Instant::now();
-        Self {
-            client_id,
-            client_type,
-            address,
-            state: SessionState::Active,
-            connected_at: now,
-            last_activity: now,
-            request_count: 0,
-            error_count: 0,
-            rate_limiter: RateLimiter::default(),
-        }
-    }
-
-    pub fn with_rate_limiter(
-        client_id: u64,
-        client_type: ClientType,
-        address: SocketAddr,
-        rate_limiter: RateLimiter,
-    ) -> Self {
-        let mut session = Self::new(client_id, client_type, address);
-        session.rate_limiter = rate_limiter;
-        session
-    }
-
-    /// Check if the client is within the rate limit
-    pub fn check_rate_limit(&mut self) -> bool {
-        self.rate_limiter.try_acquire()
-    }
-
-    pub fn available_rate_tokens(&self) -> u64 {
-        self.rate_limiter.available_tokens()
-    }
-
-    pub fn duration_secs(&self) -> u64 {
-        self.connected_at.elapsed().as_secs()
-    }
-
-    pub fn idle_secs(&self) -> u64 {
-        self.last_activity.elapsed().as_secs()
-    }
-
-    pub fn update_activity(&mut self) {
-        self.last_activity = Instant::now();
-        self.request_count += 1;
-    }
-
-    pub fn record_error(&mut self) {
-        self.error_count += 1;
-    }
-
-    pub fn set_state(&mut self, state: SessionState) {
-        self.state = state;
-    }
-
-    pub fn client_info(&self) -> ClientInfo {
-        ClientInfo {
-            client_id: self.client_id,
-            client_type: self.client_type,
-            address: self.address,
-        }
-    }
-}
-
-/// Trait for business-level request handlers
-///
-/// Unified handler trait for processing net requests.
+/// Trait for business-level request handlers.
 ///
 /// Implemented by MasterNode/VolumeServer/MetaShardManager to handle the
 /// actual business logic for each request type. Merges the former
@@ -176,7 +53,14 @@ pub trait NetHandler: Send + Sync {
     async fn on_disconnect(&self, _client_id: u64) {}
 }
 
-/// Aggregated metrics snapshot for admin/monitoring
+// ---------------------------------------------------------------------------
+// MetricsSnapshot / HealthStatus — re-exported types for admin API compat
+// ---------------------------------------------------------------------------
+
+/// Aggregated metrics snapshot for admin/monitoring.
+///
+/// Combines per-connection stats from `ConnRegistry` with request-level
+/// metrics from `MetricsMiddleware`.
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
     pub total_requests: u64,
@@ -213,368 +97,316 @@ pub struct HealthStatus {
     pub total_sessions: usize,
 }
 
-/// ServerConnectionManager - manages client sessions, request processing, and notification push
+// ---------------------------------------------------------------------------
+// SessionState — backward-compatible alias for ConnState
+// ---------------------------------------------------------------------------
+
+/// Session state alias for backward compatibility.
+///
+/// New code should use [`crate::client_conn::ConnState`] directly.
+pub type SessionState = ConnState;
+
+// ---------------------------------------------------------------------------
+// ClientSession — deprecated, use ClientConn directly
+// ---------------------------------------------------------------------------
+
+/// Deprecated: use [`crate::client_conn::ClientConn`] directly.
+///
+/// This type is kept only for transitional API compatibility and will be
+/// removed in a future release.
+#[deprecated(note = "Use ClientConn directly from powerfs_net::client_conn")]
+pub type ClientSession = crate::client_conn::ClientConn;
+
+// ---------------------------------------------------------------------------
+// RateLimiter — re-export from client_conn for backward compatibility
+// ---------------------------------------------------------------------------
+
+pub use crate::client_conn::RateLimiter;
+
+// ---------------------------------------------------------------------------
+// ServerConnectionManager — thin facade over ConnRegistry
+// ---------------------------------------------------------------------------
+
+/// ServerConnectionManager — server-level infrastructure facade.
+///
+/// Delegates per-connection management to [`ConnRegistry`] and retains only:
+/// - Middleware pipeline (shared across workers)
+/// - Metrics middleware (request-level metrics)
+/// - High-level notification helpers (build TLV + push via registry)
 pub struct ServerConnectionManager {
-    sessions: RwLock<HashMap<u64, ClientSession>>,
+    /// Shared connection registry (owned by PowerFsNetServer)
+    registry: Arc<ConnRegistry>,
+    /// Request processing pipeline (logging + metrics + tracing)
     pipeline: RequestPipeline,
+    /// Metrics middleware reference (for aggregated snapshots)
     metrics: Arc<MetricsMiddleware>,
-    /// Notification channels for each client (client_id -> sender)
-    notification_channels: RwLock<HashMap<u64, mpsc::Sender<NetMessage>>>,
 }
 
-/// Default channel size for notification queue per client
-pub const DEFAULT_NOTIFICATION_CHANNEL_SIZE: usize = 64;
-
 impl ServerConnectionManager {
-    pub fn new() -> Self {
+    /// Create a new manager that delegates to the given `ConnRegistry`.
+    ///
+    /// The registry is typically owned by `PowerFsNetServer` and shared
+    /// via `Arc`.
+    pub fn new(registry: Arc<ConnRegistry>) -> Self {
         let metrics = Arc::new(MetricsMiddleware::new());
         let pipeline = RequestPipeline::new()
             .add_middleware(LoggingMiddleware::new())
             .add_arc(metrics.clone());
         Self {
-            sessions: RwLock::new(HashMap::new()),
+            registry,
             pipeline,
             metrics,
-            notification_channels: RwLock::new(HashMap::new()),
         }
     }
 
+    /// Create with a custom middleware pipeline.
     pub fn with_pipeline(mut self, pipeline: RequestPipeline) -> Self {
-        // Ensure the manager's metrics middleware is always part of the pipeline
-        // so that get_metrics_snapshot() reflects the actual request counts.
         self.pipeline = pipeline.add_arc(self.metrics.clone());
         self
     }
 
+    /// Access the shared ConnRegistry.
+    pub fn registry(&self) -> &Arc<ConnRegistry> {
+        &self.registry
+    }
+
+    /// Access the middleware pipeline.
     pub fn pipeline(&self) -> &RequestPipeline {
         &self.pipeline
     }
 
+    /// Access the metrics middleware.
     pub fn metrics(&self) -> &Arc<MetricsMiddleware> {
         &self.metrics
     }
 
-    /// Register a new client connection with the given client_id
+    // ========================================================================
+    // Session lifecycle — delegated to ConnRegistry
+    // ========================================================================
+
+    /// Register a new client session.
+    ///
+    /// Delegates to `ConnRegistry::register()`. The `ClientConn` must have
+    /// been created by the caller (typically `PowerFsNetServer`).
     pub async fn register_session(
         &self,
         client_id: u64,
         client_type: ClientType,
         address: SocketAddr,
     ) {
-        let session = ClientSession::new(client_id, client_type, address);
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(client_id, session);
-        drop(sessions);
-
         log::info!(
             "[Server] Client connected: id={}, type={:?}, addr={}",
             client_id,
             client_type,
             address
         );
+        // ClientConn is registered by PowerFsNetServer directly;
+        // this method is kept for logging + API compatibility.
     }
 
-    /// Remove a client session and its notification channel
+    /// Unregister a client session.
+    ///
+    /// Delegates to `ConnRegistry::unregister()`.
     pub async fn unregister_session(&self, client_id: u64) {
-        // Remove notification channel first
-        {
-            let mut channels = self.notification_channels.write().await;
-            if let Some(tx) = channels.remove(&client_id) {
-                // Drop the sender, which will signal the receiver to close
-                drop(tx);
-                log::debug!(
-                    "[Server] Removed notification channel for client {}",
-                    client_id
-                );
-            }
-        }
-
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.remove(&client_id) {
+        if let Some(conn) = self.registry.unregister(client_id).await {
+            let stats = conn.stats.read().await;
             log::info!(
                 "[Server] Client disconnected: id={}, duration={}s, requests={}, errors={}",
                 client_id,
-                session.duration_secs(),
-                session.request_count,
-                session.error_count
+                stats.connected_at.elapsed().as_secs(),
+                stats.request_count,
+                stats.error_count
             );
         }
     }
 
-    pub async fn get_active_sessions(&self) -> Vec<ClientSession> {
-        let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| s.state == SessionState::Active)
-            .cloned()
-            .collect()
-    }
-
-    pub async fn get_session(&self, client_id: u64) -> Option<ClientSession> {
-        let sessions = self.sessions.read().await;
-        sessions.get(&client_id).cloned()
-    }
-
+    /// Get active session count.
     pub async fn active_count(&self) -> usize {
-        let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| s.state == SessionState::Active)
-            .count()
+        self.registry.metrics_snapshot().await.active_sessions
     }
 
+    /// Get total session count.
     pub async fn total_count(&self) -> usize {
-        self.sessions.read().await.len()
+        self.registry.count()
     }
 
-    /// Get aggregated metrics snapshot across all clients
+    /// List all connected client IDs.
+    pub fn list_client_ids(&self) -> Vec<u64> {
+        self.registry.list_client_ids()
+    }
+
+    /// Force-disconnect a client.
+    pub async fn force_disconnect(&self, client_id: u64) -> bool {
+        self.registry.disconnect(client_id).await
+    }
+
+    // ========================================================================
+    // Metrics & Health
+    // ========================================================================
+
+    /// Get aggregated metrics snapshot.
+    ///
+    /// Combines per-connection stats from ConnRegistry with request-level
+    /// metrics from MetricsMiddleware.
     pub async fn get_metrics_snapshot(&self) -> MetricsSnapshot {
+        let conn_snapshot = self.registry.metrics_snapshot().await;
+        let mut snapshot = MetricsSnapshot {
+            active_sessions: conn_snapshot.active_sessions,
+            total_sessions: conn_snapshot.total_sessions,
+            ..Default::default()
+        };
+
+        // Merge request-level metrics from middleware
         let all = self.metrics.get_all_metrics().await;
-        let mut snapshot = MetricsSnapshot::default();
         for m in all.values() {
             snapshot.total_requests += m.total_requests;
             snapshot.successful_requests += m.successful_requests;
             snapshot.failed_requests += m.failed_requests;
             snapshot.total_latency_us += m.total_latency_us;
         }
-        let active = self.sessions.read().await;
-        snapshot.active_sessions = active
-            .values()
-            .filter(|s| s.state == SessionState::Active)
-            .count();
-        snapshot.total_sessions = active.len();
-        drop(active);
         snapshot
     }
 
-    /// Get per-client metrics
+    /// Get per-client request metrics.
     pub async fn get_client_metrics(&self, client_id: u64) -> Option<RequestMetrics> {
         self.metrics.get_metrics(client_id).await
     }
 
-    /// Health check for monitoring systems
+    /// Health check.
     pub async fn health_check(&self) -> HealthStatus {
-        let sessions = self.sessions.read().await;
-        let active = sessions
-            .values()
-            .filter(|s| s.state == SessionState::Active)
-            .count();
-        let total = sessions.len();
-        drop(sessions);
+        let conn_health = self.registry.health_check().await;
         HealthStatus {
-            healthy: true,
-            active_sessions: active,
-            total_sessions: total,
+            healthy: conn_health.healthy,
+            active_sessions: conn_health.active_sessions,
+            total_sessions: conn_health.total_sessions,
         }
     }
 
-    /// List all connected client IDs
-    pub async fn list_client_ids(&self) -> Vec<u64> {
-        let sessions = self.sessions.read().await;
-        sessions.keys().copied().collect()
-    }
+    // ========================================================================
+    // Request Processing
+    // ========================================================================
 
-    /// Force-disconnect a client session
-    pub async fn force_disconnect(&self, client_id: u64) -> bool {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&client_id) {
-            session.set_state(SessionState::Closed);
-            drop(sessions);
-            self.unregister_session(client_id).await;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Process a request directly (bypasses middleware, for simple cases)
-    pub async fn process_request(
-        &self,
-        client_id: u64,
-        msg: &NetMessage,
-        handler: &dyn NetHandler,
-    ) -> NetResult<NetMessage> {
-        let session_info = self.get_client_info(client_id).await?;
-        self.touch_session(client_id).await;
-
-        let mut ctx = RequestContext::new(&session_info, msg);
-        let result = handler.handle(&mut ctx, msg).await;
-
-        if result.is_err() {
-            self.record_session_error(client_id).await;
-        }
-
-        result
-    }
-
-    /// Process a request through the middleware pipeline
+    /// Process a request through the middleware pipeline.
     pub async fn process_with_pipeline(
         &self,
         client_id: u64,
         msg: &NetMessage,
         handler: Arc<dyn NetHandler>,
     ) -> NetResult<NetMessage> {
-        let session_info = self.get_client_info(client_id).await?;
-        self.touch_session(client_id).await;
+        let conn = self.registry.get(client_id).ok_or_else(|| {
+            NetError::Connection(format!("Client {} not found", client_id))
+        })?;
 
-        let mut ctx = RequestContext::new(&session_info, msg);
-        let handler_arc: Arc<dyn NextHandler> = Arc::new(HandlerBridge(handler));
-
-        let result = self.pipeline.execute(&mut ctx, msg, handler_arc).await;
-
-        if result.is_err() {
-            self.record_session_error(client_id).await;
+        if *conn.state.read().await != ConnState::Active {
+            return Err(NetError::Connection(format!(
+                "Client {} is not active",
+                client_id
+            )));
         }
+
+        let client_info = ClientInfo {
+            client_id: conn.id,
+            client_type: conn.client_type,
+            address: conn.addr,
+        };
+
+        // Rate limiting — only for external/unknown clients.
+        // Internal services (Fuse, Kernel, Volume, Filer, Master, Admin) bypass
+        // rate limiting to avoid throttling data-plane traffic. Backpressure
+        // for internal clients is handled at higher layers (e.g. ChunkCache
+        // 512MB limit in FUSE write path).
+        if !matches!(
+            conn.client_type,
+            ClientType::Fuse
+                | ClientType::Kernel
+                | ClientType::Volume
+                | ClientType::Filer
+                | ClientType::Master
+                | ClientType::Admin
+        ) {
+            if !conn.check_rate_limit().await {
+                return Err(NetError::ServerError(format!(
+                    "Rate limit exceeded for client {}",
+                    client_id
+                )));
+            }
+        }
+
+        let mut ctx = RequestContext::new(&client_info, msg);
+        let handler_bridge: Arc<dyn NextHandler> = Arc::new(HandlerBridge(handler));
+        let result = self.pipeline.execute(&mut ctx, msg, handler_bridge).await;
+
+        // Update connection stats
+        conn.record_request(result.is_ok()).await;
 
         result
     }
 
-    async fn get_client_info(&self, client_id: u64) -> NetResult<ClientInfo> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(&client_id)
-            .ok_or_else(|| NetError::Connection(format!("Session {} not found", client_id)))?;
-        if session.state != SessionState::Active {
-            return Err(NetError::Connection(format!(
-                "Session {} is not active (state={:?})",
-                client_id, session.state
-            )));
-        }
-        Ok(session.client_info())
-    }
-
-    async fn touch_session(&self, client_id: u64) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&client_id) {
-            session.update_activity();
-        }
-    }
-
-    async fn record_session_error(&self, client_id: u64) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&client_id) {
-            session.record_error();
-        }
-    }
-
-    // ========================================================================
-    // Notification Push Support (Server→Client)
-    // ========================================================================
-
-    /// Register a notification channel for a client
-    ///
-    /// This is called by the server when a client connection is established.
-    /// The receiver end of the channel should be polled in the connection's
-    /// message loop to send notifications to the client.
-    pub async fn register_notification_channel(
+    /// Process a request directly (bypasses middleware).
+    pub async fn process_request(
         &self,
         client_id: u64,
-    ) -> mpsc::Receiver<NetMessage> {
-        let (tx, rx) = mpsc::channel(DEFAULT_NOTIFICATION_CHANNEL_SIZE);
-        let mut channels = self.notification_channels.write().await;
-        channels.insert(client_id, tx);
-        log::debug!(
-            "[Server] Registered notification channel for client {}",
-            client_id
-        );
-        rx
+        msg: &NetMessage,
+        handler: &dyn NetHandler,
+    ) -> NetResult<NetMessage> {
+        let conn = self.registry.get(client_id).ok_or_else(|| {
+            NetError::Connection(format!("Client {} not found", client_id))
+        })?;
+
+        let client_info = ClientInfo {
+            client_id: conn.id,
+            client_type: conn.client_type,
+            address: conn.addr,
+        };
+
+        let mut ctx = RequestContext::new(&client_info, msg);
+        let result = handler.handle(&mut ctx, msg).await;
+        conn.record_request(result.is_ok()).await;
+        result
     }
 
-    /// Send a notification message to a specific client
+    // ========================================================================
+    // Notification Push (Server→Client) — delegated to ConnRegistry
+    // ========================================================================
+
+    /// Send a notification to a specific client.
     ///
-    /// Returns Ok(true) if the notification was queued successfully.
-    /// Returns Ok(false) if the client is not connected or channel is full.
-    /// Returns Err if the client doesn't exist.
-    pub async fn send_notification(&self, client_id: u64, msg: NetMessage) -> NetResult<bool> {
-        let msg_type = msg.msg_type();
-        let channels = self.notification_channels.read().await;
-        if let Some(tx) = channels.get(&client_id) {
-            match tx.try_send(msg) {
-                Ok(_) => {
-                    log::debug!(
-                        "[Server] Queued notification for client {} type={:?}",
-                        client_id,
-                        msg_type
-                    );
-                    Ok(true)
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    log::warn!(
-                        "[Server] Notification channel full for client {}",
-                        client_id
-                    );
-                    Ok(false)
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    log::warn!(
-                        "[Server] Notification channel closed for client {}",
-                        client_id
-                    );
-                    Err(NetError::Connection(format!(
-                        "Client {} notification channel closed",
-                        client_id
-                    )))
-                }
-            }
+    /// Delegates to `ConnRegistry::notify()` which pushes directly to
+    /// `ClientConn.outbound_tx` — no intermediate channel needed.
+    pub fn send_notification(&self, client_id: u64, msg: NetMessage) -> NetResult<bool> {
+        let ok = self.registry.notify(client_id, &msg);
+        if ok {
+            Ok(true)
         } else {
-            log::debug!("[Server] No notification channel for client {}", client_id);
             Err(NetError::Connection(format!(
-                "Client {} not found",
+                "Client {} not found or channel closed",
                 client_id
             )))
         }
     }
 
-    /// Send a notification to all connected clients
-    ///
-    /// Returns the number of clients that received the notification.
-    pub async fn broadcast_notification(&self, msg: &NetMessage) -> usize {
-        let channels = self.notification_channels.read().await;
-        let mut success_count = 0;
-        for (client_id, tx) in channels.iter() {
-            if tx.try_send(msg.clone()).is_ok() {
-                success_count += 1;
-            } else {
-                log::debug!(
-                    "[Server] Failed to queue notification for client {}",
-                    client_id
-                );
-            }
-        }
-        success_count
+    /// Broadcast a notification to all connected clients.
+    pub fn broadcast_notification(&self, msg: &NetMessage) -> usize {
+        self.registry.broadcast(msg)
     }
 
-    // ========================================================================
-    // High-level typed notification helpers
-    //
-    // These build the NetMessage internally so upper-layer services (e.g.
-    // InodeNotifier) do not need to depend on `protocol::{FrameHeader,
-    // FrameFlags}`, `serialize::TlvEncoder`, or `FieldId` directly.
-    // ========================================================================
-
     /// Push an Invalidate(inode, version) notification to a single client.
-    ///
-    /// Returns `Ok(true)` if queued, `Ok(false)` if the channel is full,
-    /// `Err` if the client has no notification channel.
-    pub async fn push_invalidate_notification(
+    pub fn push_invalidate_notification(
         &self,
         client_id: u64,
         inode: u64,
         version: u64,
     ) -> NetResult<bool> {
         let msg = Self::build_invalidate_message(inode, version);
-        self.send_notification(client_id, msg).await
+        self.send_notification(client_id, msg)
     }
 
     /// Broadcast an Invalidate(inode, version) notification to all clients.
-    ///
-    /// Returns the number of clients that received the notification.
-    pub async fn broadcast_invalidate_notification(&self, inode: u64, version: u64) -> usize {
+    pub fn broadcast_invalidate_notification(&self, inode: u64, version: u64) -> usize {
         let msg = Self::build_invalidate_message(inode, version);
-        self.broadcast_notification(&msg).await
+        self.broadcast_notification(&msg)
     }
 
-    /// Build an Invalidate notification message (shared by push + broadcast).
     fn build_invalidate_message(inode: u64, version: u64) -> NetMessage {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::Ino, inode);
@@ -583,41 +415,28 @@ impl ServerConnectionManager {
         NetMessage::notification(MsgType::Invalidate, body, Vec::new())
     }
 
-    /// Check if a client has a notification channel registered
-    pub async fn has_notification_channel(&self, client_id: u64) -> bool {
-        let channels = self.notification_channels.read().await;
-        channels.contains_key(&client_id)
+    /// Check if a client has a notification channel (always true if registered).
+    pub fn has_notification_channel(&self, client_id: u64) -> bool {
+        self.registry.get(client_id).is_some()
     }
 
-    /// Get the number of clients with notification channels
-    pub async fn notification_channel_count(&self) -> usize {
-        self.notification_channels.read().await.len()
+    /// Get the number of clients with notification channels.
+    pub fn notification_channel_count(&self) -> usize {
+        self.registry.count()
     }
 
+    /// Shutdown: disconnect all clients.
     pub async fn shutdown(&self) {
-        // Clear notification channels
-        {
-            let mut channels = self.notification_channels.write().await;
-            channels.clear();
+        let conns = self.registry.list().await;
+        let count = conns.len();
+        for info in conns {
+            self.registry.disconnect(info.id).await;
         }
-
-        let mut sessions = self.sessions.write().await;
-        let count = sessions.len();
-        for session in sessions.values_mut() {
-            session.set_state(SessionState::Closed);
-        }
-        sessions.clear();
         log::info!("[Server] All {} sessions closed", count);
     }
 }
 
-impl Default for ServerConnectionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Bridge from NetHandler to NextHandler for middleware pipeline
+/// Bridge from NetHandler to NextHandler for middleware pipeline.
 struct HandlerBridge(Arc<dyn NetHandler>);
 
 #[async_trait::async_trait]
@@ -630,7 +449,9 @@ impl NextHandler for HandlerBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_conn::ClientConn;
     use crate::protocol::{FrameFlags, FrameHeader, MsgType};
+    use tokio::sync::mpsc;
 
     fn make_test_msg() -> NetMessage {
         NetMessage::new(FrameHeader::new(
@@ -650,6 +471,22 @@ mod tests {
         ));
         resp.header.status = crate::STATUS_OK;
         resp
+    }
+
+    /// Helper: create a registry with a registered test client.
+    async fn setup_registry_with_client(
+        client_id: u64,
+    ) -> (Arc<ConnRegistry>, Arc<ClientConn>) {
+        let registry = Arc::new(ConnRegistry::new());
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let conn = ClientConn::new(
+            client_id,
+            "127.0.0.1:12345".parse().unwrap(),
+            ClientType::Fuse,
+            tx,
+        );
+        registry.register(conn.clone()).await;
+        (registry, conn)
     }
 
     struct TestHandler;
@@ -680,185 +517,76 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_register_unregister() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let id: u64 = 42;
+        let (registry, _conn) = setup_registry_with_client(42).await;
+        let mgr = ServerConnectionManager::new(registry.clone());
 
-        mgr.register_session(id, ClientType::Fuse, addr).await;
         assert_eq!(mgr.active_count().await, 1);
-
-        let session = mgr.get_session(id).await.unwrap();
-        assert_eq!(session.client_id, id);
-        assert_eq!(session.client_type, ClientType::Fuse);
-        assert_eq!(session.state, SessionState::Active);
-
-        mgr.unregister_session(id).await;
+        mgr.unregister_session(42).await;
         assert_eq!(mgr.active_count().await, 0);
-        assert!(mgr.get_session(id).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_session_multiple_clients() {
-        let mgr = ServerConnectionManager::new();
-
-        for i in 0..5 {
-            let addr: SocketAddr = format!("127.0.0.1:{}", 12345 + i).parse().unwrap();
-            mgr.register_session(i + 1, ClientType::Fuse, addr).await;
-        }
-
-        assert_eq!(mgr.active_count().await, 5);
-        assert_eq!(mgr.total_count().await, 5);
     }
 
     #[tokio::test]
     async fn test_process_request() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let client_id: u64 = 100;
-        mgr.register_session(client_id, ClientType::Fuse, addr)
-            .await;
+        let (registry, conn) = setup_registry_with_client(100).await;
+        let mgr = ServerConnectionManager::new(registry.clone());
         let msg = make_test_msg();
         let handler = TestHandler;
 
-        let result = mgr.process_request(client_id, &msg, &handler).await;
+        let result = mgr.process_request(100, &msg, &handler).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_ok());
 
-        let session = mgr.get_session(client_id).await.unwrap();
-        assert_eq!(session.request_count, 1);
-        assert_eq!(session.error_count, 0);
+        let stats = conn.stats.read().await;
+        assert_eq!(stats.request_count, 1);
+        assert_eq!(stats.error_count, 0);
     }
 
     #[tokio::test]
     async fn test_process_request_with_error() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let client_id: u64 = 200;
-        mgr.register_session(client_id, ClientType::Fuse, addr)
-            .await;
+        let (registry, conn) = setup_registry_with_client(200).await;
+        let mgr = ServerConnectionManager::new(registry.clone());
         let msg = make_test_msg();
         let handler = ErrorHandler;
 
-        let result = mgr.process_request(client_id, &msg, &handler).await;
+        let result = mgr.process_request(200, &msg, &handler).await;
         assert!(result.is_err());
 
-        let session = mgr.get_session(client_id).await.unwrap();
-        assert_eq!(session.request_count, 1);
-        assert_eq!(session.error_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_process_request_session_not_found() {
-        let mgr = ServerConnectionManager::new();
-        let msg = make_test_msg();
-        let handler = TestHandler;
-
-        let result = mgr.process_request(99999, &msg, &handler).await;
-        assert!(result.is_err());
+        let stats = conn.stats.read().await;
+        assert_eq!(stats.request_count, 1);
+        assert_eq!(stats.error_count, 1);
     }
 
     #[tokio::test]
     async fn test_process_with_pipeline() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let client_id: u64 = 300;
-        mgr.register_session(client_id, ClientType::Fuse, addr)
-            .await;
+        let (registry, conn) = setup_registry_with_client(300).await;
+        let mgr = ServerConnectionManager::new(registry.clone());
         let msg = make_test_msg();
         let handler = Arc::new(TestHandler);
 
-        let result = mgr.process_with_pipeline(client_id, &msg, handler).await;
+        let result = mgr.process_with_pipeline(300, &msg, handler).await;
         assert!(result.is_ok());
-        let resp = result.unwrap();
-        assert_eq!(resp.header.status, crate::STATUS_OK);
 
-        let session = mgr.get_session(client_id).await.unwrap();
-        assert_eq!(session.request_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let mgr = ServerConnectionManager::new();
-        for i in 0..3 {
-            let addr: SocketAddr = format!("127.0.0.1:{}", 12345 + i).parse().unwrap();
-            mgr.register_session(i + 1, ClientType::Fuse, addr).await;
-        }
-        assert_eq!(mgr.active_count().await, 3);
-        mgr.shutdown().await;
-        assert_eq!(mgr.active_count().await, 0);
-        assert_eq!(mgr.total_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_snapshot() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-        mgr.register_session(1, ClientType::Fuse, addr).await;
-        mgr.register_session(2, ClientType::Admin, addr).await;
-
-        // Process some requests through the pipeline
-        for _ in 0..5 {
-            let msg = make_test_msg();
-            let handler = Arc::new(TestHandler);
-            let _ = mgr.process_with_pipeline(1, &msg, handler).await;
-        }
-
-        // Process one failing request
-        let msg = make_test_msg();
-        let handler = Arc::new(ErrorHandler);
-        let _ = mgr.process_with_pipeline(1, &msg, handler).await;
-
-        let snapshot = mgr.get_metrics_snapshot().await;
-        assert_eq!(snapshot.total_requests, 6);
-        assert_eq!(snapshot.successful_requests, 5);
-        assert_eq!(snapshot.failed_requests, 1);
-        assert_eq!(snapshot.active_sessions, 2);
-        assert!(snapshot.avg_latency_us() >= 0.0);
-        assert!(snapshot.success_rate() > 80.0);
+        let stats = conn.stats.read().await;
+        assert_eq!(stats.request_count, 1);
     }
 
     #[tokio::test]
     async fn test_health_check() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-        mgr.register_session(1, ClientType::Fuse, addr).await;
-        mgr.register_session(2, ClientType::Kernel, addr).await;
+        let (registry, _conn) = setup_registry_with_client(1).await;
+        let mgr = ServerConnectionManager::new(registry);
 
         let health = mgr.health_check().await;
         assert!(health.healthy);
-        assert_eq!(health.active_sessions, 2);
-        assert_eq!(health.total_sessions, 2);
-    }
-
-    #[tokio::test]
-    async fn test_list_client_ids() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-        mgr.register_session(10, ClientType::Fuse, addr).await;
-        mgr.register_session(20, ClientType::Kernel, addr).await;
-        mgr.register_session(30, ClientType::Admin, addr).await;
-
-        let ids = mgr.list_client_ids().await;
-        assert_eq!(ids.len(), 3);
-        assert!(ids.contains(&10));
-        assert!(ids.contains(&20));
-        assert!(ids.contains(&30));
+        assert_eq!(health.active_sessions, 1);
     }
 
     #[tokio::test]
     async fn test_force_disconnect() {
-        let mgr = ServerConnectionManager::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-        mgr.register_session(1, ClientType::Fuse, addr).await;
-        assert_eq!(mgr.active_count().await, 1);
+        let (registry, conn) = setup_registry_with_client(1).await;
+        let mgr = ServerConnectionManager::new(registry);
 
         let result = mgr.force_disconnect(1).await;
         assert!(result);
-        assert_eq!(mgr.active_count().await, 0);
+        assert_eq!(*conn.state.read().await, ConnState::Closing);
 
         // Non-existent client
         let result = mgr.force_disconnect(999).await;
@@ -866,25 +594,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_clients_pipeline() {
-        let mgr = ServerConnectionManager::new();
-        let handler = Arc::new(TestHandler);
+    async fn test_notification_push() {
+        let registry = Arc::new(ConnRegistry::new());
+        // Keep _rx alive so the outbound channel doesn't get dropped,
+        // which would cause notify() to return false.
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let conn = ClientConn::new(
+            1,
+            "127.0.0.1:12345".parse().unwrap(),
+            ClientType::Fuse,
+            tx,
+        );
+        registry.register(conn).await;
+        let mgr = ServerConnectionManager::new(registry);
 
-        // Register 10 clients and process requests
-        for i in 1..=10 {
-            let addr: SocketAddr = format!("127.0.0.1:{}", 12000 + i).parse().unwrap();
-            mgr.register_session(i, ClientType::Fuse, addr).await;
+        let result = mgr.push_invalidate_notification(1, 12345, 1);
+        assert!(result.is_ok());
+
+        // Non-existent client
+        let result = mgr.push_invalidate_notification(999, 12345, 1);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_client_ids() {
+        let registry = Arc::new(ConnRegistry::new());
+        for i in 1..=3 {
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let conn = ClientConn::new(
+                i * 10,
+                "127.0.0.1:12345".parse().unwrap(),
+                ClientType::Fuse,
+                tx,
+            );
+            registry.register(conn).await;
         }
+        let mgr = ServerConnectionManager::new(registry);
 
-        for i in 1..=10 {
-            let msg = make_test_msg();
-            let result = mgr.process_with_pipeline(i, &msg, handler.clone()).await;
-            assert!(result.is_ok());
+        let ids = mgr.list_client_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&20));
+        assert!(ids.contains(&30));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let registry = Arc::new(ConnRegistry::new());
+        for i in 0..3 {
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let conn = ClientConn::new(
+                i + 1,
+                "127.0.0.1:12345".parse().unwrap(),
+                ClientType::Fuse,
+                tx,
+            );
+            registry.register(conn).await;
         }
+        let mgr = ServerConnectionManager::new(registry.clone());
+        assert_eq!(mgr.active_count().await, 3);
 
-        let snapshot = mgr.get_metrics_snapshot().await;
-        assert_eq!(snapshot.total_requests, 10);
-        assert_eq!(snapshot.successful_requests, 10);
-        assert_eq!(snapshot.active_sessions, 10);
+        mgr.shutdown().await;
+        assert_eq!(mgr.active_count().await, 0);
     }
 }

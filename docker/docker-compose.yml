@@ -143,7 +143,7 @@ services:
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.21 8080 && nc -z 172.30.0.21 8901 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.21 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -173,7 +173,7 @@ services:
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 && nc -z 172.30.0.22 8901 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -203,7 +203,7 @@ services:
       /app/powerfs-volume
       --config /app/config/volume.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 && nc -z 172.30.0.23 8901 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3

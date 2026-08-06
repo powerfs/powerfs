@@ -5,7 +5,7 @@ use powerfs_common::{
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
-use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::PowerFsNetServer;
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
@@ -231,13 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
             Arc::new(volume_server.clone()),
         ));
-
-        let net_manager = Arc::new(ServerConnectionManager::new());
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
         info!("Starting powerfs-net Volume server on {}", net_bind_addr);
         if let Ok(net_server) =
-            PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler, net_manager).await
+            PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler).await
         {
             tokio::spawn(async move {
                 if let Err(e) = net_server.serve().await {

@@ -7,6 +7,6 @@ pub mod server;
 
 pub use auth::AuthManager;
 pub use cache::S3Cache;
-pub use directory_tree_api::{DirectoryTreeApi, RemoteDirectoryTree};
+pub use directory_tree_api::{DirectoryTreeApi, LocalDirectoryTree, RemoteDirectoryTree};
 pub use master_api::MasterApi;
 pub use server::S3Server;

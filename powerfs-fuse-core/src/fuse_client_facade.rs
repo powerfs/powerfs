@@ -247,6 +247,8 @@ pub struct FuseClientFacade {
     meta_shard_client: Arc<MetaShardClient>,
     /// Volume 客户端
     volume_client: Arc<VolumeClient>,
+    /// 统一连接池 — Master/Filer/Volume 连接共享复用
+    conn_pool: Arc<powerfs_net::ClientConnPool>,
     /// Master 统计上报器（KeepConnected 心跳）。
     /// 字段仅持有所有权以保持后台任务存活；Drop 时 `shutdown_tx` 会被释放，
     /// 上报循环检测到通道关闭后自动退出。
@@ -259,6 +261,17 @@ impl FuseClientFacade {
     pub async fn new(config: FuseClientFacadeConfig) -> Result<Self, String> {
         // 创建拓扑管理器
         let topology_manager = Arc::new(ClusterTopologyManager::new());
+
+        // 创建统一连接池 — Master/Filer/Volume 共享复用
+        let pool_config = powerfs_net::ClientPoolConfig {
+            request_timeout: config.request_timeout,
+            ..Default::default()
+        };
+        let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+            config.client_identity.client_id,
+            pool_config,
+            None,
+        ));
 
         // 创建 Master 客户端
         let master_client_config = MasterClientConfig {
@@ -279,6 +292,7 @@ impl FuseClientFacade {
             meta_config,
             topology_manager.clone(),
             config.client_identity.client_id,
+            conn_pool.clone(),
         );
 
         // 创建 Volume 客户端
@@ -289,7 +303,11 @@ impl FuseClientFacade {
             client_id: config.client_identity.client_id.to_string(),
             ..Default::default()
         };
-        let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
+        let volume_client = Arc::new(VolumeClient::new(
+            volume_config,
+            topology_manager.clone(),
+            conn_pool.clone(),
+        ));
 
         Ok(Self {
             config,
@@ -297,16 +315,31 @@ impl FuseClientFacade {
             master_client,
             meta_shard_client: Arc::new(meta_shard_client),
             volume_client,
+            conn_pool,
             stats_reporter: None,
         })
     }
 
     /// 从配置构建 FuseClientFacade（推荐使用）
     ///
-    /// 每个客户端独立管理自己的网络连接，不再需要外部注入 net_client。
+    /// 统一连接池由 FuseClientFacade 持有，MetaShardClient 与 VolumeClient
+    /// 共享同一 `ClientConnPool`，避免连接管理重复实现。
     pub async fn build_from_config(config: FuseClientFacadeConfig) -> Result<Self, String> {
         // 创建拓扑管理器
         let topology_manager = Arc::new(ClusterTopologyManager::new());
+
+        // 创建统一连接池 — Master/Filer/Volume 共享复用
+        // 通知处理器在 fuse.rs 中创建 InvalidateHandler 后通过
+        // `set_notification_handler` 安装（pool 已支持运行时替换）。
+        let pool_config = powerfs_net::ClientPoolConfig {
+            request_timeout: config.request_timeout,
+            ..Default::default()
+        };
+        let conn_pool = Arc::new(powerfs_net::ClientConnPool::new(
+            config.client_identity.client_id,
+            pool_config,
+            None,
+        ));
 
         // 创建 Master 客户端（会自动创建自己的网络连接）
         let master_client_config = MasterClientConfig {
@@ -359,18 +392,19 @@ impl FuseClientFacade {
         let topology = topology.ok_or_else(|| "Failed to get topology".to_string())?;
         master_client.update_topology(topology);
 
-        // 创建 MetaShard 客户端（会自动创建自己的网络连接池）
+        // 创建 MetaShard 客户端（共享连接池）
         let meta_config = MetaShardClientConfig::default();
         let meta_shard_client = MetaShardClient::new(
             meta_config,
             topology_manager.clone(),
             config.client_identity.client_id,
+            conn_pool.clone(),
         );
         meta_shard_client
             .set_default_filer_addr(format!("{}:{}", config.filer_addr, config.filer_port));
         meta_shard_client.init();
 
-        // 创建 Volume 客户端（暂时为空，后续改造）
+        // 创建 Volume 客户端（共享连接池）
         // CRITICAL: sync volume_config.client_id with client_identity.client_id so
         // that background lease renewal uses the same client_id as acquire/release.
         // Otherwise the Volume Server rejects renewals with "Lease holder mismatch".
@@ -378,7 +412,11 @@ impl FuseClientFacade {
             client_id: config.client_identity.client_id.to_string(),
             ..Default::default()
         };
-        let volume_client = Arc::new(VolumeClient::new(volume_config, topology_manager.clone()));
+        let volume_client = Arc::new(VolumeClient::new(
+            volume_config,
+            topology_manager.clone(),
+            conn_pool.clone(),
+        ));
 
         // 设置默认 Volume 地址（从配置获取）
         if !config.volume_addrs.is_empty() {
@@ -390,6 +428,9 @@ impl FuseClientFacade {
         }
 
         volume_client.init();
+
+        // 启动连接池后台健康检查（ping + 自动重连）
+        conn_pool.start_health_check();
 
         // 启动 Master 统计上报器（TLV KeepConnected 心跳 + 拓扑变更通知）
         let reporter_config = crate::stats_reporter::StatsReporterConfig {
@@ -420,6 +461,7 @@ impl FuseClientFacade {
             master_client,
             meta_shard_client: Arc::new(meta_shard_client),
             volume_client,
+            conn_pool,
             stats_reporter,
         };
 
@@ -428,6 +470,11 @@ impl FuseClientFacade {
         facade.volume_client.start_background_processor();
 
         Ok(facade)
+    }
+
+    /// 获取共享连接池引用（用于安装通知处理器等）
+    pub fn conn_pool(&self) -> &Arc<powerfs_net::ClientConnPool> {
+        &self.conn_pool
     }
 
     /// 获取 Master 客户端引用
@@ -801,6 +848,8 @@ impl FuseClientFacade {
         self.meta_shard_client.close();
         self.volume_client.close();
         self.master_client.disconnect();
+        // 停止连接池后台健康检查；连接本身由各 PowerFsNetClient Drop 时清理
+        self.conn_pool.stop_health_check();
         log::info!("FuseClientFacade: All clients closed");
     }
 }
