@@ -27,6 +27,16 @@ pub enum Channel {
     Meta,
 }
 
+impl Channel {
+    /// 从协议层 channel 字节 (CHANNEL_DATA=0, CHANNEL_META=1) 转换
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            crate::protocol::CHANNEL_META => Channel::Meta,
+            _ => Channel::Data,
+        }
+    }
+}
+
 /// 单连接统计 (全原子, 可并发读写)
 ///
 /// 字段语义:

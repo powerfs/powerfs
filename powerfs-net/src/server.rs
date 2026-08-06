@@ -26,6 +26,7 @@ use tokio::time::Instant;
 
 use crate::client_conn::{ClientConn, ConnRegistry};
 use crate::errors::{NetError, NetResult};
+use crate::flow_control::{Channel, FlowController};
 use crate::io_loop::IoLoop;
 use crate::protocol::*;
 use crate::server_connection::{NetHandler, ServerConnectionManager};
@@ -69,6 +70,8 @@ pub struct PowerFsNetServer {
     registry: Arc<ConnRegistry>,
     config: ServerConfig,
     shutdown: Arc<RwLock<ShutdownState>>,
+    /// 流控控制器 (per-server, 共享给 IoLoop/Worker)
+    flow_ctrl: Arc<FlowController>,
 }
 
 #[derive(Default)]
@@ -141,6 +144,7 @@ impl PowerFsNetServer {
             registry,
             config,
             shutdown: Arc::new(RwLock::new(ShutdownState::default())),
+            flow_ctrl: Arc::new(FlowController::with_defaults()),
         })
     }
 
@@ -187,6 +191,7 @@ impl PowerFsNetServer {
             registry,
             config,
             shutdown: Arc::new(RwLock::new(ShutdownState::default())),
+            flow_ctrl: Arc::new(FlowController::with_defaults()),
         })
     }
 
@@ -229,6 +234,7 @@ impl PowerFsNetServer {
             registry: Arc::new(ConnRegistry::new()),
             config,
             shutdown: Arc::new(RwLock::new(ShutdownState::default())),
+            flow_ctrl: Arc::new(FlowController::with_defaults()),
         })
     }
 
@@ -245,6 +251,11 @@ impl PowerFsNetServer {
     /// Get the connection registry (for admin/monitoring)
     pub fn registry(&self) -> &Arc<ConnRegistry> {
         &self.registry
+    }
+
+    /// Get the flow controller (for admin/monitoring, S4 HTTP API)
+    pub fn flow_ctrl(&self) -> &Arc<FlowController> {
+        &self.flow_ctrl
     }
 
     // ========================================================================
@@ -364,6 +375,7 @@ impl PowerFsNetServer {
                 self.registry.clone(),
                 self.handler.clone(),
                 self.manager.clone(),
+                self.flow_ctrl.clone(),
             ));
             loops.push(io_loop);
         }
@@ -375,6 +387,7 @@ impl PowerFsNetServer {
     fn spawn_worker_pool(&self, work_rx: mpsc::Receiver<Work>) {
         let handler = self.handler.clone();
         let manager = self.manager.clone();
+        let flow_ctrl = self.flow_ctrl.clone();
         let num_workers = self.config.num_workers;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
 
@@ -395,8 +408,9 @@ impl PowerFsNetServer {
                 // spawn 处理任务
                 let handler = handler.clone();
                 let manager = manager.clone();
+                let flow_ctrl = flow_ctrl.clone();
                 tokio::spawn(async move {
-                    let worker = Worker::new(0, handler, manager);
+                    let worker = Worker::new(0, handler, manager, flow_ctrl);
                     worker.process_work(work).await;
                     drop(permit);
                 });
@@ -467,6 +481,10 @@ impl PowerFsNetServer {
 
         // 注册到 ConnRegistry (单一数据源: 状态/lease/统计/通知都在 ClientConn 中)
         registry.register(conn.clone()).await;
+
+        // 注册到 FlowController (流控统计: per-conn ConnStats)
+        self.flow_ctrl
+            .register_conn(client_id, peer.to_string(), Channel::from_u8(channel));
 
         // 注册到 ServerConnectionManager (仅日志, session 数据由 ConnRegistry 管理)
         if let Some(ref mgr) = manager {

@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::client_conn::{ClientConn, CloseHandle, ConnRegistry, ConnState};
 use crate::errors::{NetError, NetResult};
+use crate::flow_control::FlowController;
 use crate::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage, PROTOCOL_VERSION, STATUS_OK};
 use crate::server_connection::{NetHandler, ServerConnectionManager};
 use crate::work::Work;
@@ -37,6 +38,8 @@ pub struct IoLoop {
     handler: Arc<dyn NetHandler>,
     /// 会话管理器 (断连注销 session, 可选)
     manager: Option<Arc<ServerConnectionManager>>,
+    /// 流控控制器 (断连时注销连接统计)
+    flow_ctrl: Arc<FlowController>,
 }
 
 impl IoLoop {
@@ -46,6 +49,7 @@ impl IoLoop {
         registry: Arc<ConnRegistry>,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
+        flow_ctrl: Arc<FlowController>,
     ) -> Self {
         Self {
             id,
@@ -53,6 +57,7 @@ impl IoLoop {
             registry,
             handler,
             manager,
+            flow_ctrl,
         }
     }
 
@@ -72,6 +77,7 @@ impl IoLoop {
         let registry = self.registry.clone();
         let handler = self.handler.clone();
         let manager = self.manager.clone();
+        let flow_ctrl = self.flow_ctrl.clone();
 
         tokio::spawn(async move {
             let peer = conn.addr;
@@ -94,6 +100,7 @@ impl IoLoop {
                 registry,
                 handler,
                 manager,
+                flow_ctrl,
             )
             .await;
         });
@@ -119,6 +126,7 @@ impl IoLoop {
         registry: Arc<ConnRegistry>,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>, // 目前未使用, 保留以备将来扩展
+        flow_ctrl: Arc<FlowController>,
     ) {
         let _ = &manager; // 避免未使用变量警告
         // write_task: 独占 write_half, 消费 outbound_rx (响应帧 + 通知帧)
@@ -232,6 +240,9 @@ impl IoLoop {
         // 标记连接已关闭
         *conn.state.write().await = ConnState::Closed;
 
+        // === 流控: 注销连接统计 (停止该连接的统计收集) ===
+        flow_ctrl.unregister_conn(conn.id);
+
         // === 断连清理 ===
         // 从注册表注销 (带身份校验, 防止误删同 client_id 的其他连接).
         // 注意: 不再调用 mgr.unregister_session(), 因为它内部调用
@@ -315,7 +326,15 @@ mod tests {
     fn make_io_loop(work_tx: mpsc::Sender<Work>) -> Arc<IoLoop> {
         let registry = Arc::new(ConnRegistry::new());
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
-        Arc::new(IoLoop::new(0, work_tx, registry, handler, None))
+        let flow_ctrl = Arc::new(FlowController::with_defaults());
+        Arc::new(IoLoop::new(
+            0,
+            work_tx,
+            registry,
+            handler,
+            None,
+            flow_ctrl,
+        ))
     }
 
     #[tokio::test]

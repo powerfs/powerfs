@@ -13,11 +13,14 @@
 //! (registry.unregister + handler.on_disconnect + manager.unregister_session).
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::client_conn::ConnState;
+use crate::flow_control::FlowController;
+use crate::flow_policy::AdmissionDecision;
 use crate::protocol::{FrameFlags, FrameHeader, NetMessage, STATUS_ERR_SERVER_ERROR};
 use crate::server_connection::{NetHandler, ServerConnectionManager};
 use crate::work::Work;
@@ -32,6 +35,8 @@ pub struct Worker {
     handler: Arc<dyn NetHandler>,
     /// 会话管理器 (可选, 启用时通过 pipeline 处理请求)
     manager: Option<Arc<ServerConnectionManager>>,
+    /// 流控控制器 (admit + on_request_start/complete)
+    flow_ctrl: Arc<FlowController>,
 }
 
 impl Worker {
@@ -39,11 +44,13 @@ impl Worker {
         id: usize,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
+        flow_ctrl: Arc<FlowController>,
     ) -> Self {
         Self {
             id,
             handler,
             manager,
+            flow_ctrl,
         }
     }
 
@@ -85,6 +92,30 @@ impl Worker {
             );
         }
 
+        // === 流控: admit + on_request_start ===
+        // admit 只决策, Admit 后调 on_request_start 递增计数.
+        // Reject 时直接返回 BUSY 响应, 不调 start/complete (未实际处理).
+        let proc_start = Instant::now();
+        let est_bytes = work.msg.body.len();
+        let flow_stats = self.flow_ctrl.get_conn(conn.id);
+        match &flow_stats {
+            Some(stats) => match self.flow_ctrl.admit(conn.id, msg_type, est_bytes) {
+                AdmissionDecision::Admit => {
+                    self.flow_ctrl.on_request_start(stats);
+                }
+                AdmissionDecision::Reject(reason) => {
+                    warn!(
+                        "Worker {}: admit reject conn={} seq={} type={:#x} reason={}",
+                        self.id, conn.id, seq, msg_type, reason.as_str()
+                    );
+                    let resp = Self::build_error_response(&work.msg);
+                    let _ = conn.send_response(&resp);
+                    return; // 未处理, 不调 on_request_complete
+                }
+            },
+            None => {} // 连接未注册到 flow_ctrl, 跳过流控 (兼容性)
+        }
+
         // 调用业务处理器
         // - 若存在会话管理器, 通过 pipeline 处理 (含中间件、metrics、session 校验)
         // - 否则构建最小 context 直接调用 handler.handle
@@ -99,6 +130,12 @@ impl Worker {
             };
             let mut ctx = crate::request_context::RequestContext::new(&session_info, &work.msg);
             self.handler.handle(&mut ctx, &work.msg).await
+        };
+
+        // 计算响应字节数 (供流控统计, 在 match 消费 result 前借取)
+        let (resp_bytes, is_err) = match &result {
+            Ok(resp) => (resp.body.len() as u64, false),
+            Err(_) => (0, true),
         };
 
         match result {
@@ -130,6 +167,13 @@ impl Worker {
                 // 更新错误统计
                 conn.stats.write().await.error_count += 1;
             }
+        }
+
+        // === 流控: on_request_complete (记录延迟/字节/错误) ===
+        if let Some(stats) = &flow_stats {
+            let latency_us = proc_start.elapsed().as_micros() as u64;
+            self.flow_ctrl
+                .on_request_complete(stats, latency_us, resp_bytes, is_err);
         }
 
         // 更新活动时间
@@ -204,7 +248,12 @@ mod tests {
     async fn test_worker_processes_request() {
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(0, handler, None);
+        let worker = Worker::new(
+            0,
+            handler,
+            None,
+            Arc::new(FlowController::with_defaults()),
+        );
 
         let conn = make_conn(42);
         let msg = make_request(1, b"hello");
@@ -223,7 +272,12 @@ mod tests {
     async fn test_worker_skips_closed_conn() {
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(0, handler, None);
+        let worker = Worker::new(
+            0,
+            handler,
+            None,
+            Arc::new(FlowController::with_defaults()),
+        );
 
         let conn = make_conn(42);
         *conn.state.write().await = ConnState::Closed;
@@ -255,7 +309,12 @@ mod tests {
 
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(FailHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(0, handler, None);
+        let worker = Worker::new(
+            0,
+            handler,
+            None,
+            Arc::new(FlowController::with_defaults()),
+        );
 
         let conn = make_conn(42);
         let msg = make_request(1, b"hello");
@@ -312,7 +371,12 @@ mod tests {
         }
 
         let handler = Arc::new(SlowHandler) as Arc<dyn NetHandler>;
-        let worker = Arc::new(Worker::new(0, handler, None));
+        let worker = Arc::new(Worker::new(
+            0,
+            handler,
+            None,
+            Arc::new(FlowController::with_defaults()),
+        ));
 
         // 模拟并发处理 (类似 server.rs 的 Semaphore 模式)
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
