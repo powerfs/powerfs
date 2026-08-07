@@ -204,7 +204,10 @@ pub async fn start_metrics_server(
         .route("/admin/flow/connections", get(flow_connections_handler))
         .route("/admin/flow/global", get(flow_global_handler))
         .route("/admin/flow/slow", get(flow_slow_handler))
-        .route("/admin/flow/policy", get(flow_policy_handler))
+        .route(
+            "/admin/flow/policy",
+            get(flow_policy_handler).put(flow_policy_set_handler),
+        )
         .with_state(flow_ctrl.clone());
 
     // Merge: 两个 Router<()> (State 已填充) 可直接 merge
@@ -338,4 +341,60 @@ async fn flow_policy_handler(
     axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
 ) -> Json<serde_json::Value> {
     Json(powerfs_net::flow_admin::policy_json(&fc))
+}
+
+/// PUT /admin/flow/policy?max_active_global=N&max_active_per_conn=M
+///
+/// 运行时调整 AdaptiveConcurrencyPolicy 参数, 便于测试 load_factor 联动.
+async fn flow_policy_set_handler(
+    axum::extract::State(fc): axum::extract::State<Arc<FlowController>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let mut changed = Vec::new();
+
+    if let Some(v) = params.get("max_active_global") {
+        match v.parse::<u32>() {
+            Ok(n) if n > 0 => {
+                if fc.set_max_active_global(n) {
+                    changed.push(format!("max_active_global={}", n));
+                } else {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "adaptive-concurrency policy not installed"})),
+                    );
+                }
+            }
+            _ => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid max_active_global"})),
+                );
+            }
+        }
+    }
+
+    if let Some(v) = params.get("max_active_per_conn") {
+        match v.parse::<u32>() {
+            Ok(n) if n > 0 => {
+                if fc.set_max_active_per_conn(n) {
+                    changed.push(format!("max_active_per_conn={}", n));
+                }
+            }
+            _ => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid max_active_per_conn"})),
+                );
+            }
+        }
+    }
+
+    info!("flow policy adjusted via HTTP: {}", changed.join(", "));
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "changed": changed,
+            "load_factor": fc.current_load_factor(),
+        })),
+    )
 }

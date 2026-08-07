@@ -1,5 +1,6 @@
 ./powerfs-fuse/Cargo.toml
 .trae/
+linux*
 kernel/
 dynalock/
 lustre-release/

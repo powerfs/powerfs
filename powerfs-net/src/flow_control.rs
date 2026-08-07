@@ -548,6 +548,37 @@ impl FlowController {
         )));
     }
 
+    /// 运行时调整 AdaptiveConcurrencyPolicy 的 max_active_global.
+    /// 如果当前未安装 AdaptiveConcurrencyPolicy, 则忽略.
+    pub fn set_max_active_global(&self, max: u32) -> bool {
+        let guard = self.policy.read();
+        if let Some(policy) = guard.as_ref() {
+            if let Some(acp) = policy
+                .as_any()
+                .downcast_ref::<crate::flow_policy::AdaptiveConcurrencyPolicy>()
+            {
+                acp.set_max_active_global(max);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 运行时调整 AdaptiveConcurrencyPolicy 的 max_active_per_conn.
+    pub fn set_max_active_per_conn(&self, max: u32) -> bool {
+        let guard = self.policy.read();
+        if let Some(policy) = guard.as_ref() {
+            if let Some(acp) = policy
+                .as_any()
+                .downcast_ref::<crate::flow_policy::AdaptiveConcurrencyPolicy>()
+            {
+                acp.set_max_active_per_conn(max);
+                return true;
+            }
+        }
+        false
+    }
+
     /// 准入决策: 是否允许新请求
     ///
     /// 返回 `Admit` 时, 调用方应调 `on_request_start` 并处理请求.

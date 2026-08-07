@@ -25,6 +25,7 @@
 //! - 慢连接的 per-conn 上限减半 (降级, 避免拖累全局)
 //! - 上限可通过 AtomicU32 运行时调整 (HTTP API)
 
+use std::any::Any;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::flow_control::{ConnStats, GlobalStats};
@@ -88,6 +89,9 @@ pub trait FlowPolicy: Send + Sync {
 
     /// 策略名称
     fn name(&self) -> &'static str;
+
+    /// 用于 downcast (运行时调整策略参数)
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// 默认策略: 自适应并发上限
@@ -188,6 +192,10 @@ impl FlowPolicy for AdaptiveConcurrencyPolicy {
     fn name(&self) -> &'static str {
         "adaptive-concurrency"
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Null 策略: 永远放行 (用于禁用流控, 调试场景)
@@ -202,6 +210,10 @@ impl FlowPolicy for NullPolicy {
     }
     fn name(&self) -> &'static str {
         "null"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

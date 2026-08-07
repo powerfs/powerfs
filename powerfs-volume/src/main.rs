@@ -226,6 +226,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.flow_ctrl().clone())
         .unwrap_or_else(|| Arc::new(powerfs_net::flow_control::FlowController::with_defaults()));
 
+    // Enable AdaptiveConcurrencyPolicy so the server computes load_factor
+    // from active_reqs/max_active ratio and stamps it on response frames.
+    flow_ctrl.set_default_policy();
+    info!("flow control: adaptive concurrency policy enabled");
+
     // Start HTTP metrics & admin endpoints on http_port.
     // Exposes /metrics (Prometheus), /admin/lease-stats, /admin/log-level,
     // and /admin/flow/* (flow control, Phase 1 S4).
