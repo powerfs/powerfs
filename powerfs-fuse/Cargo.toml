@@ -41,6 +41,7 @@ powerfs-master = { path = "../powerfs-master" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 powerfs-coherence = { path = "../powerfs-coherence" }
+powerfs-layout = { path = "../powerfs-layout" }
 fuse-backend-rs = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
@@ -53,6 +54,7 @@ rand = { workspace = true }
 env_logger = { workspace = true }
 clap = { workspace = true }
 lru = { workspace = true }
+dashmap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 num_cpus = "1.16"

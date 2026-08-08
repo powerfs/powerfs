@@ -1,5 +1,6 @@
 use crate::cache::{CachedEntry, ChunkCache, MetadataCache, ROOT_INODE};
 use bytes::BytesMut;
+use dashmap::DashMap;
 use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -43,6 +44,23 @@ const TTL_OPEN: Duration = Duration::ZERO;
 /// increased to 4MB to keep prefetch memory bounded.
 const PREFETCH_CHUNKS: u64 = 4;
 const FUSE_APPEND: u32 = 0x400;
+
+/// P2.5: Inline 小文件数据硬上限 (与 Filer 端 `INLINE_HARD_LIMIT` 一致).
+/// 超过此大小的文件不能走 Inline 模式; inline buffer 累积超过此值时
+/// 写入返回 EFBIG (待 MIGRATE_INLINE RPC 实现后改为自动迁移到 Flat).
+const INLINE_HARD_LIMIT: usize = 8 * 1024;
+
+/// P2.5: Inline 模式文件的内存缓冲。open/create 时填充, write 追加并标记 dirty,
+/// read 切片返回, release 时若 dirty 则同步到 Filer (inline_data).
+///
+/// `dirty` 标记用于避免只读 open → release 时把 (可能已过时的) 数据回写 Filer,
+/// 防止覆盖其他客户端的并发写入 (Inline 模式无 volume lease 互斥).
+/// create 的新文件初始 dirty=false; 首次 write 后 dirty=true.
+#[derive(Debug, Default)]
+struct InlineBuffer {
+    data: Vec<u8>,
+    dirty: bool,
+}
 
 /// FUSE application that manages the mount lifecycle
 #[allow(dead_code)]
@@ -218,6 +236,8 @@ impl FuseApp {
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
             open_inodes: Arc::new(RwLock::new(HashSet::new())),
+            inline_buffers: Arc::new(DashMap::new()),
+            inline_max_sizes: Arc::new(DashMap::new()),
         };
 
         let fs_arc = Arc::new(fs);
@@ -371,6 +391,19 @@ struct PowerFsFs {
     /// open() 时加入，release() 时移除。getattr() 对其中的 inode 使用长 TTL
     /// （size/chunks 在 open→release 期间权威，因数据 lease 排他）。
     open_inodes: Arc<RwLock<HashSet<u64>>>,
+    /// P2.5: Inline 模式文件的写入缓冲。key = inode, value = InlineBuffer.
+    ///
+    /// 生命周期: create(inline) → 初始化空 buffer; write → 追加并标 dirty;
+    /// read → 服务; release → 若 dirty 则取出作为 inline_data 发 Filer, 然后移除。
+    ///
+    /// 仅 Inline 模式 (MetadataAttr.is_inline) 的 inode 会出现在此 map 中;
+    /// Flat 模式文件不经此 buffer (走 chunk_cache + Volume Server).
+    inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
+    /// P2.5: Inline 模式 inode 的阈值 (来自 CREATE 响应 max_size)。
+    /// write 累计超过此阈值 (且未超 8KB 硬上限) 时, 理论上应迁移到 Flat;
+    /// 当前 MVP 阶段未实现 MIGRATE_INLINE, 故允许 buffer 增长到 8KB 硬上限,
+    /// 超过则返回 EFBIG。此字段保留供后续迁移逻辑使用。
+    inline_max_sizes: Arc<DashMap<u64, u32>>,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -812,6 +845,8 @@ impl PowerFsFs {
             size: entry.content_size,
             chunks: chunks_wire,
             client_id: self.client.client_id(),
+            // Flat 路径: 无 inline_data (Inline 模式在 release 中提前返回, 不走此函数)
+            inline_data: None,
         };
 
         // retry + timeout：总超时 10s，重试间隔 500ms 递增
@@ -1242,6 +1277,22 @@ impl FileSystem for PowerFsFs {
             None
         };
 
+        // P2.5: Inline 模式 truncate 安全检查. 必须在 Filer setattr RPC 之前,
+        // 否则 Filer 已接受 size 变更但客户端返回 EFBIG → 元数据/数据不一致
+        // (Filer size=大值, 但 inline buffer 无法扩展到 >8KB).
+        // 正确行为: 超过 8KB 硬上限直接拒绝 (待 MIGRATE_INLINE 实现后改为迁移).
+        if let Some(new_size) = size {
+            if self.inline_buffers.contains_key(&inode)
+                && new_size as usize > INLINE_HARD_LIMIT
+            {
+                warn!(
+                    "setattr inline: inode={} truncate to {} > INLINE_HARD_LIMIT={}, rejecting before RPC",
+                    inode, new_size, INLINE_HARD_LIMIT
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+            }
+        }
+
         // Step 2: 通过 MetadataClient.setattr RPC 走 Filer Raft leader（强一致）
         // 同步 mode/uid/gid/atime/mtime/size 到 filer。
         //
@@ -1291,18 +1342,33 @@ impl FileSystem for PowerFsFs {
         // flush 到 volume server 后，其他客户端读取时 attrs.size 可能仍为旧值（28），
         // 导致读取 28 字节（6 新 + 22 旧），而非正确的 6 字节。
         if let Some(new_size) = size {
-            // 清除 ChunkCache：truncate 丢弃所有缓存数据，下次 read/write 从头开始
-            self.chunk_cache.remove_inode_chunks(inode);
-            // truncate 到 0 时清除 chunks 列表（无数据块）
-            if new_size == 0 {
-                self.cache.update_chunks(inode, Vec::new());
+            // P2.5: Inline 模式 truncate — 调整 inline buffer 大小并标记 dirty.
+            // (8KB 硬上限已在 RPC 前的早期检查中拒绝, 此处 new_size 必然 <= 8KB)
+            if self.inline_buffers.contains_key(&inode) {
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.data.resize(new_size as usize, 0);
+                    inline_buf.dirty = true;
+                }
+                debug!(
+                    "setattr inline: inode={} truncated buffer to {}",
+                    inode, new_size
+                );
+                // 更新 content_size 与 size 一致, 跳过 chunk_cache 逻辑 (Inline 无 chunks)
+                self.cache.update_size(inode, new_size);
+            } else {
+                // Flat 模式 truncate: 清除 ChunkCache，truncate 丢弃所有缓存数据
+                self.chunk_cache.remove_inode_chunks(inode);
+                // truncate 到 0 时清除 chunks 列表（无数据块）
+                if new_size == 0 {
+                    self.cache.update_chunks(inode, Vec::new());
+                }
+                // 更新 content_size 与 size 一致（update_attr 只更新 size，不更新 content_size）
+                self.cache.update_size(inode, new_size);
+                debug!(
+                    "setattr: truncated inode={} to size={}, cleared chunk cache",
+                    inode, new_size
+                );
             }
-            // 更新 content_size 与 size 一致（update_attr 只更新 size，不更新 content_size）
-            self.cache.update_size(inode, new_size);
-            debug!(
-                "setattr: truncated inode={} to size={}, cleared chunk cache",
-                inode, new_size
-            );
         }
 
         if let Some(updated) = self.cache.get_inode(inode) {
@@ -1495,6 +1561,9 @@ impl FileSystem for PowerFsFs {
             }
 
             self.cache.remove(entry.inode);
+            // P2.5: 清理可能残留的 inline buffer (文件被 unlink 时仍打开的罕见场景)
+            self.inline_buffers.remove(&entry.inode);
+            self.inline_max_sizes.remove(&entry.inode);
         } else {
             // Not the last hard link - just remove the path mapping
             if let Some(path) = entry_path {
@@ -1560,6 +1629,71 @@ impl FileSystem for PowerFsFs {
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
 
+        // P2.5: Inline 模式分支。Filer 在 CREATE 响应中返回
+        // Placement::Inline { max_size } (无 volume_id/needle_id)。
+        // 客户端初始化空 inline buffer, 后续 write 追加到 buffer,
+        // release 时一次性发 Filer (inline_data), 完全绕过 Volume Server。
+        if attr.is_inline() {
+            let inline_max = attr
+                .inline_max_size
+                .unwrap_or(INLINE_HARD_LIMIT as u32) as usize;
+            info!(
+                "FUSE create inline: inode={}, max_size={}, create_rpc={}ms, total={}ms",
+                inode,
+                inline_max,
+                create_ms,
+                t0.elapsed().as_millis()
+            );
+            // 初始化空 inline buffer + 记录阈值
+            self.inline_buffers.insert(
+                inode,
+                InlineBuffer {
+                    data: Vec::with_capacity(inline_max),
+                    dirty: false,
+                },
+            );
+            self.inline_max_sizes.insert(inode, inline_max as u32);
+
+            let entry = CachedEntry {
+                inode,
+                parent,
+                name: name_str.to_string(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                nlink: 1,
+                fid: None, // Inline 模式无 volume/needle
+                size: 0,
+                mode: file_mode,
+                uid: ctx.uid,
+                gid: ctx.gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                xattrs: HashMap::new(),
+                chunks: Vec::new(), // Inline 模式无 chunk 映射
+                hard_link_id: String::new(),
+                hard_link_counter: 0,
+                content_size: 0,
+                disk_size: 0,
+                generation: 0,
+                cached_at: Instant::now(),
+            };
+            // CRITICAL: 同 Flat 路径, pin 必须在 insert 之前, 防止 Filer
+            // Invalidate 在 insert→pin 之间到达导致 entry 被驱逐。
+            self.open_inodes.write().unwrap().insert(inode);
+            self.cache.pin_inode(inode);
+            self.cache.insert(entry.clone());
+            debug!("create: inline mode, inode={}, dir={}", inode, parent);
+            return Ok((
+                self.create_fuse_entry(&entry),
+                Some(inode),
+                fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
+                None,
+            ));
+        }
+
+        // === Flat 模式 (原路径) ===
         // 从 Filer 响应提取自分配的 volume_id/needle_id（权威值）
         let volume_id = attr.volume_id.ok_or_else(|| {
             error!(
@@ -1817,6 +1951,61 @@ impl FileSystem for PowerFsFs {
             }
         };
 
+        // P2.5: Inline 模式刷新. open 时若文件是 inline 模式 (已关闭的 inline
+        // 文件被重新打开), 从 Filer getattr 拉取 inline_data 填充 buffer.
+        // 数据在 Filer 元数据中, 一次 RPC 拿全, 后续 read 直接从 buffer 服务.
+        //
+        // 跳过条件: inode 已在 inline_buffers 中 (create 刚创建仍在写, 或
+        // 并发 open 第二次进入) — 此时本地 buffer 权威, 无需刷新.
+        if !self.inline_buffers.contains_key(&inode) {
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let parent_for_getattr = parent;
+            let ino = inode;
+            let attr_result = self
+                .client
+                .block_on(async move { meta_client.getattr(ino, parent_for_getattr).await });
+            match attr_result {
+                Ok(attr) if attr.is_inline() => {
+                    // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
+                    self.cache.set_content_size(inode, attr.size);
+                    if let Some(max_size) = attr.inline_max_size {
+                        self.inline_max_sizes.insert(inode, max_size);
+                    }
+                    // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
+                    let data = attr.inline_data.unwrap_or_default();
+                    debug!(
+                        "open: inline mode inode={}, fetched {} bytes from filer",
+                        inode,
+                        data.len()
+                    );
+                    self.inline_buffers.insert(
+                        inode,
+                        InlineBuffer {
+                            data,
+                            dirty: false,
+                        },
+                    );
+                }
+                Ok(_) => {
+                    // Flat 模式文件: 清理可能残留的 inline buffer (文件已被迁移)
+                    if self.inline_buffers.remove(&inode).is_some() {
+                        self.inline_max_sizes.remove(&inode);
+                        debug!(
+                            "open: inode={} is flat, removed stale inline buffer",
+                            inode
+                        );
+                    }
+                }
+                Err(e) => {
+                    // getattr 失败不阻塞 open (best-effort, 同 open_count_inc)
+                    debug!(
+                        "open: inline refresh getattr for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            }
+        }
+
         // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
         let req = powerfs_coherence::OpenCountRequest {
@@ -1857,6 +2046,34 @@ impl FileSystem for PowerFsFs {
             .cache
             .get_inode(inode)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        // P2.5: Inline 模式读取分支. 数据在 inline_buffers 中 (内存),
+        // 直接切片返回, 完全绕过 Volume Server + chunk_cache + lease.
+        // 仅 Inline 模式 inode (create/open 时插入 inline_buffers) 走此路径.
+        if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+            let file_size = inline_buf.data.len() as u64;
+            if offset >= file_size {
+                debug!(
+                    "read inline: inode={} offset={} >= file_size={}, returning 0",
+                    inode, offset, file_size
+                );
+                return Ok(0);
+            }
+            let end = std::cmp::min(offset + size as u64, file_size);
+            let start = offset as usize;
+            let end_idx = end as usize;
+            // Clone the slice (≤8KB) to release the DashMap read guard before I/O,
+            // avoiding holding the shard lock during write_all.
+            let slice = inline_buf.data[start..end_idx].to_vec();
+            drop(inline_buf);
+            w.write_all(&slice)?;
+            let n = end_idx - start;
+            debug!(
+                "read inline: inode={} offset={} size={} -> {} bytes",
+                inode, offset, size, n
+            );
+            return Ok(n);
+        }
 
         let fid = entry
             .fid
@@ -2264,6 +2481,50 @@ impl FileSystem for PowerFsFs {
             offset = latest_entry.size;
         }
 
+        // P2.5: Inline 模式写入分支. 文件数据缓存在 inline_buffers 中,
+        // write 直接覆盖/追加到 buffer, 完全绕过 Volume Server + chunk_cache.
+        // release 时若 dirty, buffer 作为 inline_data 一次性发 Filer (Raft 复制).
+        //
+        // 仅 Inline 模式 inode (create/open 时插入 inline_buffers) 走此路径;
+        // Flat 模式文件不在 inline_buffers 中, 走下面的 fid 分支.
+        if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+            let new_end = offset + read_len as u64;
+            if new_end > INLINE_HARD_LIMIT as u64 {
+                warn!(
+                    "write inline: inode={} new_end={} > INLINE_HARD_LIMIT={} — \
+                     inline overflow (MIGRATE_INLINE not yet implemented, returning EFBIG)",
+                    inode, new_end, INLINE_HARD_LIMIT
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+            }
+            // 支持 offset <= buf_len (覆盖/追加); offset > buf_len 零填充间隙
+            let buf_len = inline_buf.data.len() as u64;
+            if offset > buf_len {
+                inline_buf.data.resize(offset as usize, 0);
+            }
+            let start = offset as usize;
+            let end = new_end as usize;
+            if inline_buf.data.len() < end {
+                inline_buf.data.resize(end, 0);
+            }
+            inline_buf.data[start..end].copy_from_slice(&buf[..]);
+            inline_buf.dirty = true; // 标记已修改, release 时需同步到 Filer
+            let new_size = new_end;
+            drop(inline_buf); // 释放 DashMap 写锁后再更新 cache
+
+            // 同步 cache content_size (供 getattr/read 使用)
+            if let Some(current_entry) = self.cache.get_inode(inode) {
+                if new_size > current_entry.size {
+                    self.cache.update_size(inode, new_size);
+                }
+            }
+            debug!(
+                "write inline: inode={} offset={} len={} buffer_len={}",
+                inode, offset, read_len, new_size
+            );
+            return Ok(read_len);
+        }
+
         // Phase 3.3+: lease 由 provider_adapter::ensure_lease 内部管理（带缓存复用），
         // 不再在 write 路径显式 acquire/release lease，避免每个 4K write 触发 3 次
         // block_on 同步网络往返。首次 write 时 ensure_lease 获取 lease 并缓存，
@@ -2493,6 +2754,114 @@ impl FileSystem for PowerFsFs {
         // 释放 lease 后仍用旧 token 写入（TOCTOU 竞争导致 "Lease token not found"）。
         let flush_lock = self.get_flush_lock(inode);
         let _flush_guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // P2.5: Inline 模式 close 路径. 数据在 inline_buffers 中, 无需 flush
+        // 到 Volume Server, 无需释放 volume lease. 仅当 dirty 时把 buffer 作为
+        // inline_data 发 Filer (单次 Raft 提交 = 数据 + 元数据).
+        //
+        // 完全绕过 Flat 路径的 flush_dirty_chunks / sync_size_chunks_on_close /
+        // lease 释放, 直接完成 close 序列后返回.
+        if let Some((_, inline_buf)) = self.inline_buffers.remove(&inode) {
+            self.inline_max_sizes.remove(&inode);
+            let parent = self
+                .cache
+                .get_inode(inode)
+                .map(|e| e.parent)
+                .unwrap_or(inode);
+            let size = inline_buf.data.len() as u64;
+
+            // 仅当 write 修改过 (dirty) 才同步; 只读 open → release 不回写,
+            // 避免覆盖其他客户端的并发写入 (Inline 无 volume lease 互斥).
+            let sync_result: std::io::Result<()> = if inline_buf.dirty {
+                let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
+                    shard_id: parent, // dir_ino 作为 shard_id
+                    inode,
+                    size,
+                    chunks: Vec::new(), // Inline 模式 chunks 为空
+                    client_id: self.client.client_id(),
+                    inline_data: Some(inline_buf.data),
+                };
+                // retry + timeout (与 Flat 路径 sync_size_chunks_on_close 一致)
+                let max_retries = 5u32;
+                let mut last_err = String::new();
+                let mut ok = false;
+                for attempt in 1..=max_retries {
+                    let meta_client = self.client.facade().meta_shard_client().clone();
+                    let req = req.clone();
+                    let result = self.client.block_on(async move {
+                        meta_client.update_inode_size_chunks(&req).await
+                    });
+                    match result {
+                        Ok(resp) if resp.success => {
+                            info!(
+                                "release inline: inode={} synced size={} (attempt {})",
+                                inode, size, attempt
+                            );
+                            ok = true;
+                            break;
+                        }
+                        Ok(resp) => {
+                            last_err = resp.error;
+                            warn!(
+                                "release inline: inode={} attempt {} failed: {}",
+                                inode, attempt, last_err
+                            );
+                        }
+                        Err(e) => {
+                            last_err = e;
+                            warn!(
+                                "release inline: inode={} attempt {} error: {}",
+                                inode, attempt, last_err
+                            );
+                        }
+                    }
+                    if attempt < max_retries {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500 * (attempt as u64),
+                        ));
+                    }
+                }
+                if ok {
+                    Ok(())
+                } else {
+                    error!(
+                        "release inline: inode={} FAILED after {} attempts: {} — data may be lost",
+                        inode, max_retries, last_err
+                    );
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                }
+            } else {
+                debug!(
+                    "release inline: inode={} not dirty (read-only open), skip sync",
+                    inode
+                );
+                Ok(())
+            };
+
+            // open_count_dec (best-effort, 同 Flat 路径)
+            let meta_shard_client = self.client.facade().meta_shard_client().clone();
+            let req = powerfs_coherence::OpenCountRequest {
+                shard_id: parent,
+                inode,
+            };
+            if let Err(e) = self
+                .client
+                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
+            {
+                debug!(
+                    "release inline: open_count_dec for inode {} failed (best-effort): {}",
+                    inode, e
+                );
+            }
+
+            // 移除 open_inodes 追踪 + unpin (Inline 无 flush 失败重试, 总是 unpin)
+            self.open_inodes.write().unwrap().remove(&inode);
+            self.cache.unpin_inode(inode);
+
+            sync_result?;
+            debug!("release inline: inode={} closed, size={}", inode, size);
+            return Ok(());
+        }
 
         // 1. Flush dirty data chunks to volume server (lock held — call impl directly)
         //
@@ -3101,6 +3470,13 @@ impl FileSystem for PowerFsFs {
         _handle: Self::Handle,
     ) -> std::io::Result<()> {
         debug!("fsync: inode={}", inode);
+        // P2.5: Inline 模式文件无 chunk_cache dirty 数据 (数据在 inline_buffers).
+        // fsync 为 no-op: 数据在 release 时一次性 Raft 提交到 Filer (持久化).
+        // (Inline 文件 <8KB, 写入→关闭窗口极短; 中途 fsync 同步留作后续优化.)
+        if self.inline_buffers.contains_key(&inode) {
+            debug!("fsync: inode={} is inline, no-op (data persisted on release)", inode);
+            return Ok(());
+        }
         match self.flush_dirty_chunks(inode, None) {
             Ok(()) => Ok(()),
             Err(e) => {

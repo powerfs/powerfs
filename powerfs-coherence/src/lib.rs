@@ -117,6 +117,10 @@ pub struct UpdateInodeSizeChunksRequest {
     pub size: u64,
     pub chunks: Vec<ChunkWire>,
     pub client_id: String,
+    /// P2.5: Inline 小文件数据 (≤ 8KB). Some 时表示 Inline 模式,
+    /// 数据直接存 Filer 元数据, chunks 应为空. None 时走原 Flat 路径.
+    #[serde(default)]
+    pub inline_data: Option<Vec<u8>>,
 }
 
 /// update_inode_size_chunks 响应体

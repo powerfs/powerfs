@@ -1670,17 +1670,32 @@ if (req->error == -E2BIG) {
 - ✅ 安全性：默认禁用（不改变现有 Flat 行为）；客户端 `decode_attr_resp` 跳过未知 TLV 字段，
   未实现 inline 的客户端不受影响
 
-**P2.5b - 客户端 inline 写路径**：
+**P2.5b - 客户端 inline 写/读路径**（已实现）：
 - FUSE [fuse.rs](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs)：
-  - CREATE 响应解析 Placement::Inline
-  - WRITE 路径：累计 < max_size 时暂存内存，不直连 Volume Server
-  - CLOSE 路径：发送 inline_data 到 Filer
-  - READ 路径：从 GETATTR 响应读 inline_data
-  - 迁移检测：累计 > max_size × 1.5 时调 MIGRATE_INLINE
-- 内核 [powerfs_fs.c](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_fs.c)：
-  - `powerfs_init_inode` 检测 Inline placement
-  - `powerfs_file_write_iter` 路径分支
-  - `powerfs_file_read_iter` 从 inline_data 读
+  - ✅ `PowerFsFs.inline_buffers: DashMap<u64, InlineBuffer>`：inline 模式 inode 的
+    内存写入缓冲（`InlineBuffer { data, dirty }`），替代修改 CachedEntry
+  - ✅ CREATE：`attr.is_inline()` 分支，不要求 volume_id/needle_id，初始化空 buffer +
+    记录 `inline_max_size`
+  - ✅ WRITE：`inline_buffers.get_mut` 命中时直接覆盖/追加到 buffer，标记 `dirty=true`，
+    完全绕过 Volume Server + chunk_cache；超 8KB 硬上限返回 EFBIG（待 MIGRATE_INLINE）
+  - ✅ READ：`inline_buffers.get` 命中时切片返回，绕过 Volume Server + lease
+  - ✅ OPEN：getattr 刷新 inline_data 填充 buffer（重开已关闭的 inline 文件）；
+    dirty 标记避免只读 open→release 回写覆盖并发写入
+  - ✅ RELEASE：dirty 时把 buffer 作为 `inline_data` 单次 Raft 提交到 Filer
+    （retry+timeout，同 Flat 路径），跳过 flush/lease 释放；非 dirty 跳过 sync
+  - ✅ SETATTR(truncate)：调整 buffer 大小并标记 dirty
+  - ✅ UNLINK：清理残留 inline buffer；FSYNC：inline 文件 no-op（release 时持久化）
+- 客户端 RPC [meta_shard_client.rs](file:///home/portion/powerfs/powerfs-fuse-core/src/meta_shard_client.rs)：
+  - ✅ `update_inode_size_chunks`：`req.inline_data` 存在时编码为 FileLayout
+    (Placement::Inline + ChunkEncoding::InlineData)，与 Filer 解码对称
+  - ✅ `attr_from_resp_with_layout`：从响应 body 解析 FileLayout，提取
+    placement / inline_data / inline_max_size 到 `MetadataAttr`
+  - ✅ `MetadataAttr::is_inline()` 辅助方法
+- 传输类型 [lib.rs](file:///home/portion/powerfs/powerfs-coherence/src/lib.rs)：
+  - ✅ `UpdateInodeSizeChunksRequest.inline_data: Option<Vec<u8>>`
+- ⏳ 迁移检测：累计 > max_size × 1.5 时调 MIGRATE_INLINE（P2.5c 实现 handle_migrate_inline）
+- ⏳ 内核 [powerfs_fs.c](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_fs.c)：
+  内核态 inline 路径待 P2.5c（当前 FUSE 客户端已完整覆盖用户态路径）
 
 **P2.5c - 0 字节文件优化**：
 - CREATE 后无 WRITE 即 CLOSE：inline_data = vec![]

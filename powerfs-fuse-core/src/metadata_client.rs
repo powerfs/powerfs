@@ -12,6 +12,7 @@
 //! - 取代废弃的 MetadataProvider trait（仅支持 read，不支持 write）
 
 use powerfs_common::error::Result;
+use powerfs_layout::placement::Placement;
 
 /// 元数据属性（FUSE 回调需要的字段子集）
 #[derive(Clone, Debug)]
@@ -33,11 +34,30 @@ pub struct MetadataAttr {
     pub volume_id: Option<u64>,
     /// Filer create 响应返回的 needle_id（file_key）。
     pub file_key: Option<u64>,
+    /// P2.5: 数据分布策略 (Inline/Flat/Stripe...), 来自 FileLayout TLV.
+    /// None 表示响应未携带 FileLayout (如 mkdir).
+    pub placement: Option<Placement>,
+    /// P2.5: Inline 数据 (来自 GETATTR/LOOKUP 响应的 ChunkEncoding::InlineData).
+    /// 文件以 Inline 模式存储时, 数据直接在 Filer 元数据中, 客户端一次 RPC 拿全.
+    pub inline_data: Option<Vec<u8>>,
+    /// P2.5: Inline 阈值 (来自 CREATE 响应 Placement::Inline.max_size).
+    /// 客户端据此判断累计写入是否超阈值 (需迁移到 Flat).
+    pub inline_max_size: Option<u32>,
 }
 
 impl MetadataAttr {
     pub fn is_dir(&self) -> bool {
         self.file_type == libc::DT_DIR
+    }
+
+    /// P2.5: 文件是否以 Inline 模式存储 (数据在 Filer 元数据中).
+    /// create 响应携带 `Placement::Inline` 时为 true; lookup/getattr 响应
+    /// 携带 `Placement::Inline` (已关闭的 inline 文件) 时也为 true.
+    pub fn is_inline(&self) -> bool {
+        matches!(
+            self.placement.as_ref(),
+            Some(Placement::Inline { .. })
+        )
     }
 }
 

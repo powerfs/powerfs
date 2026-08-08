@@ -1058,8 +1058,29 @@ impl MetaShardClient {
         enc.add_u64(FieldId::Size, req.size);
         let _ = enc.add_string(FieldId::ClientId, &req.client_id);
 
-        // chunks → FileLayout binary TLV
-        if !req.chunks.is_empty() {
+        // P2.5: Inline 模式 — 把 inline_data 编码为 FileLayout
+        // (Placement::Inline + ChunkEncoding::InlineData), 与 Filer 端
+        // handle_update_inode_size_chunks 的解码逻辑对称. chunks 应为空.
+        // Flat 模式 — chunks 编码为 FileLayout (Placement::Flat + PerChunk).
+        if let Some(data) = &req.inline_data {
+            // 安全上限: 与 Filer 端 INLINE_HARD_LIMIT (8KB) 一致
+            if data.len() > 8 * 1024 {
+                return Err(format!(
+                    "inline_data too large: {} bytes > 8KB",
+                    data.len()
+                ));
+            }
+            let max_size = (8 * 1024u32).max(data.len() as u32);
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size },
+                reliability: Reliability::SingleReplica,
+                reliability_state: ReliabilityState::default(),
+                compression: CompressionState::default(),
+                encoding: ChunkEncoding::InlineData { data: data.clone() },
+            };
+            encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| format!("encode_file_layout: {}", e))?;
+        } else if !req.chunks.is_empty() {
             let chunks: Vec<ChunkRef> = req
                 .chunks
                 .iter()
@@ -1372,7 +1393,38 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         // lookup/getattr 响应通常为 None（chunks 由单独字段编码）。
         volume_id: resp.volume_id,
         file_key: resp.file_key,
+        // 默认无 FileLayout (mkdir/symlink 等简单响应). 需要布局信息的调用点
+        // (lookup/getattr/create) 用 attr_from_resp_with_layout.
+        placement: None,
+        inline_data: None,
+        inline_max_size: None,
     }
+}
+
+/// P2.5: 从响应 body 解析 FileLayout (best-effort). 无布局字段时返回 None.
+fn parse_layout_from_body(body: &[u8]) -> Option<powerfs_layout::layout::FileLayout> {
+    use powerfs_net::serialize::TlvDecoder;
+    let mut dec = TlvDecoder::new(body);
+    powerfs_layout::codec::decode_file_layout(&mut dec).ok()
+}
+
+/// P2.5: 构造 MetadataAttr 并从响应 body 解析 FileLayout, 提取
+/// Placement / InlineData / InlineMaxSize. 用于 lookup/getattr/create
+/// (这些响应携带 FileLayout TLV).
+fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> MetadataAttr {
+    let mut attr = attr_from_resp(resp);
+    if let Some(layout) = parse_layout_from_body(body) {
+        attr.inline_max_size = match &layout.placement {
+            powerfs_layout::placement::Placement::Inline { max_size } => Some(*max_size),
+            _ => None,
+        };
+        attr.inline_data = match &layout.encoding {
+            powerfs_layout::encoding::ChunkEncoding::InlineData { data } => Some(data.clone()),
+            _ => None,
+        };
+        attr.placement = Some(layout.placement);
+    }
+    attr
 }
 
 impl MetadataClient for MetaShardClient {
@@ -1390,7 +1442,7 @@ impl MetadataClient for MetaShardClient {
                 .await
                 .map_err(map_err)?;
             let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+            Ok(attr_from_resp_with_layout(attr_resp, &resp))
         })
     }
 
@@ -1435,7 +1487,7 @@ impl MetadataClient for MetaShardClient {
                 .await
                 .map_err(map_err)?;
             let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+            Ok(attr_from_resp_with_layout(attr_resp, &resp))
         })
     }
 
@@ -1589,7 +1641,7 @@ impl MetadataClient for MetaShardClient {
                 .await
                 .map_err(map_err)?;
             let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+            Ok(attr_from_resp_with_layout(attr_resp, &resp))
         })
     }
 
