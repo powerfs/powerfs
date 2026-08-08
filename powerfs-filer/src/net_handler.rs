@@ -1491,6 +1491,89 @@ impl FilerNetHandler {
         }
     }
 
+    /// P2.5c: handle_migrate_inline_alloc — Inline → Flat 迁移分配.
+    ///
+    /// 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
+    /// needle_id), **不修改 inode 元数据** (保留 inline_data 用于 crash
+    /// safety). 客户端拿到分配后把数据放入 chunk_cache, close 时 flush +
+    /// sync_size_chunks_on_close 原子完成切换 (inline_data=None + Flat chunks).
+    ///
+    /// crash safety: 若客户端在分配后崩溃, Filer 仍有 inline_data, 文件仍可
+    /// 作为 Inline 读; 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败).
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = VolumeId + FileKey(needle_id) / Name=error
+    async fn handle_migrate_inline_alloc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+
+        info!(
+            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id={}, inode={}",
+            shard_id_raw, inode
+        );
+
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(shard_id_raw);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        // best-effort: 校验 inode 存在且为 Inline 模式 (有 inline_data).
+        // 不强制失败 — 若已被其他客户端迁移, 仍分配 (容错).
+        if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+            if info.inline_data.is_none() && info.chunks.is_empty() {
+                warn!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
+                     may already be migrated or never written, allocating anyway",
+                    inode
+                );
+            }
+        } else {
+            warn!(
+                "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} not found, returning error",
+                inode
+            );
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Name, &format!("inode {} not found", inode));
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_NOT_FOUND,
+                enc.into_bytes(),
+            ));
+        }
+
+        // 分配 (volume_id, needle_id) — 同 CREATE Flat 路径
+        let (volume_id, needle_id) = match self.alloc_for_new_file() {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: zone not registered, cannot allocate"
+                );
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, "zone not registered");
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ));
+            }
+        };
+
+        info!(
+            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} allocated volume_id={}, needle_id={:#x} \
+             (inode NOT modified, inline_data preserved for crash safety)",
+            inode, volume_id, needle_id
+        );
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::VolumeId, volume_id);
+        enc.add_u64(FieldId::FileKey, needle_id);
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
     /// Handle AcquireInodeLease request (方案 A, Phase 2).
     ///
     /// Request TLV: Ino, ClientId, LeaseDuration
@@ -1865,6 +1948,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::UpdateInodeSizeChunks => self.handle_update_inode_size_chunks(msg).await,
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
             MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
+            MsgType::MigrateInlineAlloc => self.handle_migrate_inline_alloc(msg).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,

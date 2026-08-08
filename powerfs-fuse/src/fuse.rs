@@ -46,8 +46,9 @@ const PREFETCH_CHUNKS: u64 = 4;
 const FUSE_APPEND: u32 = 0x400;
 
 /// P2.5: Inline 小文件数据硬上限 (与 Filer 端 `INLINE_HARD_LIMIT` 一致).
-/// 超过此大小的文件不能走 Inline 模式; inline buffer 累积超过此值时
-/// 写入返回 EFBIG (待 MIGRATE_INLINE RPC 实现后改为自动迁移到 Flat).
+/// 超过此大小的文件不能走 Inline 模式. P2.5c: inline buffer 累积超过
+/// max_size×1.5 (滞后窗口, 上限此值) 时自动迁移到 Flat (MIGRATE_INLINE_ALLOC).
+/// 仅当迁移 RPC 失败时才返回 EFBIG.
 const INLINE_HARD_LIMIT: usize = 8 * 1024;
 
 /// P2.5: Inline 模式文件的内存缓冲。open/create 时填充, write 追加并标记 dirty,
@@ -1280,7 +1281,9 @@ impl FileSystem for PowerFsFs {
         // P2.5: Inline 模式 truncate 安全检查. 必须在 Filer setattr RPC 之前,
         // 否则 Filer 已接受 size 变更但客户端返回 EFBIG → 元数据/数据不一致
         // (Filer size=大值, 但 inline buffer 无法扩展到 >8KB).
-        // 正确行为: 超过 8KB 硬上限直接拒绝 (待 MIGRATE_INLINE 实现后改为迁移).
+        // P2.5c: write 路径已实现自动迁移 (MIGRATE_INLINE_ALLOC), 但 truncate
+        // 到 >8KB 是罕见场景 (通常文件通过 write 增长, 非 truncate), 暂保留
+        // EFBIG 拒绝. 后续可扩展为 truncate 迁移 (resize buffer + migrate).
         if let Some(new_size) = size {
             if self.inline_buffers.contains_key(&inode)
                 && new_size as usize > INLINE_HARD_LIMIT
@@ -2490,14 +2493,111 @@ impl FileSystem for PowerFsFs {
         // write 直接覆盖/追加到 buffer, 完全绕过 Volume Server + chunk_cache.
         // release 时若 dirty, buffer 作为 inline_data 一次性发 Filer (Raft 复制).
         //
-        // 仅 Inline 模式 inode (create/open 时插入 inline_buffers) 走此路径;
-        // Flat 模式文件不在 inline_buffers 中, 走下面的 fid 分支.
+        // P2.5c: 当累计写入超 max_size×1.5 (滞后窗口) 时, 自动迁移到 Flat:
+        //   1. 合并 inline_buffer + 当前 write → merged_data
+        //   2. 调 Filer MIGRATE_INLINE_ALLOC 分配 (volume_id, needle_id)
+        //   3. merged_data 放入 chunk_cache (dirty), close 时 flush 写 Volume Server
+        //   4. 切换 cache 到 Flat (fid/chunks/content_size)
+        //   5. close 时 sync_size_chunks_on_close 原子清除 inline_data + 设 Flat chunks
+        // crash safety: Filer 不修改 inode (保留 inline_data), 客户端崩溃后文件
+        // 仍可作 Inline 读; needle_id 泄漏可接受 (同 CREATE 失败).
         if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
             let new_end = offset + read_len as u64;
+            let max_size = self
+                .inline_max_sizes
+                .get(&inode)
+                .map(|v| *v as u64)
+                .unwrap_or(INLINE_HARD_LIMIT as u64);
+            // 迁移阈值 = min(max_size × 1.5, INLINE_HARD_LIMIT). 滞后窗口避免边界抖动.
+            let migrate_threshold = (max_size * 3 / 2).min(INLINE_HARD_LIMIT as u64);
+
+            if new_end > migrate_threshold {
+                // P2.5c: 自动迁移. 先合并数据 (不修改 inline_buf, 失败时 buffer 不受影响),
+                // 再调 Filer 分配. 成功后切换 Flat; 失败返回 EFBIG, inline buffer 保持原状.
+                let merged_data = {
+                    let mut data = inline_buf.data.clone();
+                    let buf_len = data.len() as u64;
+                    if offset > buf_len {
+                        data.resize(offset as usize, 0);
+                    }
+                    let start = offset as usize;
+                    let end = new_end as usize;
+                    if data.len() < end {
+                        data.resize(end, 0);
+                    }
+                    data[start..end].copy_from_slice(&buf[..]);
+                    data
+                };
+                drop(inline_buf); // 释放 DashMap 写锁后再做 RPC (block_on)
+
+                let parent = entry.parent;
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                match self.client.block_on(async move {
+                    meta_client.migrate_inline_alloc(parent, inode).await
+                }) {
+                    Ok((volume_id, needle_id)) => {
+                        info!(
+                            "write inline migrate: inode={} new_end={} > threshold={} → \
+                             Flat volume_id={} needle_id={:#x}",
+                            inode, new_end, migrate_threshold, volume_id, needle_id
+                        );
+                        // 数据放入 chunk_cache (dirty). 必须放入: 否则后续 append 走
+                        // Flat 路径时 chunk 0 不在 cache → no_data_before 优化跳过
+                        // read-before-write → 零填充覆盖迁移数据.
+                        let mtime = chrono::Utc::now().timestamp() as u64;
+                        self.chunk_cache
+                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+
+                        // 切换 cache 到 Flat 模式
+                        let fid = Fid {
+                            volume_id: VolumeId(volume_id),
+                            cookie: 0,
+                            file_key: needle_id,
+                        };
+                        let new_size = new_end;
+                        let chunks = vec![CachedFileChunk {
+                            offset: 0,
+                            size: new_size,
+                            mtime,
+                            needle_id,
+                            volume_id,
+                            crc32: 0,
+                        }];
+                        self.cache.update_fid(inode, fid);
+                        self.cache.update_chunks(inode, chunks);
+                        self.cache.update_size(inode, new_size);
+
+                        // 移除 inline buffer, 后续 write 走 Flat 路径
+                        self.inline_buffers.remove(&inode);
+                        self.inline_max_sizes.remove(&inode);
+
+                        debug!(
+                            "write inline migrate done: inode={} size={} → Flat, \
+                             subsequent writes → Volume Server",
+                            inode, new_size
+                        );
+                        return Ok(read_len);
+                    }
+                    Err(e) => {
+                        // 迁移失败: inline_buffer 未修改 (仅 clone), 数据安全.
+                        // 返回 EFBIG, 应用层可重试或关闭. close 时 inline_data
+                        // (≤ 8KB) 正常同步到 Filer.
+                        error!(
+                            "write inline migrate FAILED: inode={} new_end={} error={} — \
+                             EFBIG, inline buffer unmodified",
+                            inode, new_end, e
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+                    }
+                }
+            }
+
+            // 未超阈值: 原有 inline 写路径 (直接覆盖/追加 buffer)
+            // 安全检查: new_end 不应超 INLINE_HARD_LIMIT (migrate_threshold <= HARD_LIMIT,
+            // 超阈值已迁移). 保留作防御.
             if new_end > INLINE_HARD_LIMIT as u64 {
                 warn!(
-                    "write inline: inode={} new_end={} > INLINE_HARD_LIMIT={} — \
-                     inline overflow (MIGRATE_INLINE not yet implemented, returning EFBIG)",
+                    "write inline: inode={} new_end={} > INLINE_HARD_LIMIT={} (unexpected)",
                     inode, new_end, INLINE_HARD_LIMIT
                 );
                 return Err(std::io::Error::from_raw_os_error(libc::EFBIG));

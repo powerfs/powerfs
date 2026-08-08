@@ -530,6 +530,13 @@ pub enum MsgType {
     UpdateInodeSizeChunks = 0x0034,
     OpenCountInc = 0x0035,
     OpenCountDec = 0x0036,
+    /// P2.5c: Inline → Flat 迁移分配. 客户端 write 超 max_size×1.5 时调用.
+    /// Filer 仅分配 (volume_id, needle_id), **不修改 inode** (保留 inline_data
+    /// 用于 crash safety). 客户端拿到分配后把数据放入 chunk_cache, close 时
+    /// flush + sync 原子完成 Inline→Flat 切换 (清除 inline_data + 设 Flat chunks).
+    /// Request: ShardId + Ino
+    /// Response: VolumeId + FileKey(needle_id)
+    MigrateInlineAlloc = 0x0037,
 
     // Status
     StatFs = 0x0040,

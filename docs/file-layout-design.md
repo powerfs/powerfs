@@ -2,7 +2,7 @@
 
 > 文档创建：2026-08-07
 > 最后更新：2026-08-08
-> 状态：**P2 实施中**（二进制 TLV 编码已落地，含 UpdateInodeSizeChunks）
+> 状态：**P2.5c 实施完成**（Inline 小文件 + 自动迁移 Flat, 客户端驱动 crash-safe）
 > 取代：`file_layout_stripe_design.md`（布局部分）、`ecplan.md`（布局部分）
 
 ---
@@ -349,28 +349,48 @@ Inline 模式将微小文件数据直接存储在 Filer 元数据中，绕过 Vo
 
 #### 4.6.6 超阈值迁移策略
 
-文件增长超 inline 阈值时自动迁移到 Flat/Stripe。采用**滞后窗口**避免边界抖动：
+文件增长超 inline 阈值时自动迁移到 Flat。采用**滞后窗口**避免边界抖动：
 
 ```
-迁移触发条件: 累计写入 > max_size × 1.5
-默认: 4KB 阈值 → 6KB 才迁移；8KB 阈值 → 12KB 才迁移
+迁移触发条件: 累计写入 > min(max_size × 1.5, INLINE_HARD_LIMIT)
+默认: 4KB 阈值 → 6KB 才迁移；8KB 阈值 → 8KB (硬上限) 才迁移
 
-迁移流程:
-1. 客户端 WRITE 触发迁移检测
-2. 客户端调 Filer MIGRATE_INLINE RPC:
+迁移流程 (客户端驱动, crash-safe):
+1. 客户端 WRITE 触发迁移检测 (new_end > migrate_threshold)
+2. 客户端合并 inline_buffer + 当前 write → merged_data (不修改 inline_buffer)
+3. 客户端调 Filer MIGRATE_INLINE_ALLOC RPC:
    a. Filer 分配 (volume_id, needle_id)
-   b. Filer 把 inline_data + 客户端 pending 写合并
-   c. Filer 发 WriteNeedle 到 Volume Server
-   d. Filer 更新元数据: Inline -> Flat + PerChunk[1]
-   e. Filer 返回新 (volume_id, needle_id)
-3. 客户端切换到 Flat 模式，后续写直连 Volume Server
-4. 原 inline_data 从 Filer 元数据移除（Raft 提交）
+   b. Filer **不修改 inode** (保留 inline_data 用于 crash safety)
+   c. Filer 返回 (volume_id, needle_id)
+4. 客户端把 merged_data 放入 chunk_cache (dirty, chunk 0)
+   - 必须放入: 否则后续 append 走 Flat 路径时 chunk 0 不在 cache
+     → no_data_before 优化跳过 read-before-write → 零填充覆盖迁移数据
+5. 客户端切换 cache 到 Flat: fid=(volume_id, needle_id), chunks=[{0,size,needle,volume}]
+6. 客户端移除 inline_buffers/inline_max_sizes, 后续 write 走 Flat 路径
+7. close 时:
+   a. flush_dirty_chunks: 把 chunk_cache 数据写到 Volume Server (needle_id)
+   b. sync_size_chunks_on_close: UPDATE_INODE_SIZE_CHUNKS (Flat + PerChunk[1], inline_data=None)
+      → 原子清除 Filer inline_data + 设置 Flat chunks (Raft 提交)
+
+crash safety:
+- 步骤 3 后崩溃: Filer 仍有 inline_data, 文件仍可作 Inline 读; needle_id 泄漏 (同 CREATE 失败)
+- 步骤 4-6 后崩溃: chunk_cache 丢失 (同 Flat write 崩溃); Filer 仍有 inline_data (旧数据)
+- 步骤 7 后: Filer Flat + chunks, Volume Server 有数据. 完全一致
 ```
+
+**为何客户端驱动 (非 Filer 驱动)**：
+- Filer 无 Volume Server 写入接口 (仅 S3 handler 有 volume_client_pool)
+- 客户端已有 chunk_cache + flush_dirty_chunks 机制, 复用更简单
+- crash-safe: inline_data 在 close sync 时才清除, 之前任何崩溃都可恢复
+- 迁移是**一次性**的, 对小文件成本可接受 (< 8KB 数据转移)
 
 **滞后窗口的必要性**：
 - 不带窗口：4KB 文件每次写都触发迁移 → 回退 → 再迁移，抖动严重
 - 带 1.5x 窗口：4KB 文件写到 6KB 才迁移，期间累计在 inline，一次性迁移到 Volume Server
 - 迁移是**一次性**的，对小文件来说成本可接受（< 8KB 数据转移）
+
+**truncate 限制**：setattr (ftruncate) 到 >8KB 仍返回 EFBIG (未实现迁移).
+通常文件通过 write 增长而非 truncate, 此为罕见场景, 后续可扩展.
 
 #### 4.6.7 Inline 数据不压缩
 

@@ -1119,6 +1119,40 @@ impl MetaShardClient {
         })
     }
 
+    /// P2.5c: Inline → Flat 迁移分配. 客户端 write 超 max_size×1.5 时调用.
+    /// Filer 仅分配 (volume_id, needle_id), 不修改 inode (crash safety).
+    /// 返回 (volume_id, needle_id), 客户端把数据放入 chunk_cache, close 时
+    /// flush + sync 原子完成切换.
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = VolumeId + FileKey(needle_id)
+    pub async fn migrate_inline_alloc(
+        &self,
+        shard_id: u64,
+        inode: u64,
+    ) -> Result<(u64, u64), String> {
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, shard_id);
+        enc.add_u64(FieldId::Ino, inode);
+
+        let body = enc.into_bytes();
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::MigrateInlineAlloc, shard_id, body)
+            .await?;
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        let volume_id = dec
+            .next_u64(FieldId::VolumeId)
+            .map_err(|_| "migrate_inline_alloc: response missing VolumeId".to_string())?;
+        let needle_id = dec
+            .next_u64(FieldId::FileKey)
+            .map_err(|_| "migrate_inline_alloc: response missing FileKey".to_string())?;
+        Ok((volume_id, needle_id))
+    }
+
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
     ///
     /// TLV 编码: Request = ShardId + Ino
