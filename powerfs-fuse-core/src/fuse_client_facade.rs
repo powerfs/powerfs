@@ -56,11 +56,25 @@ pub(crate) fn proto_entry_to_traits(entry: &ProtoEntry) -> powerfs_common::trait
         })
         .collect();
 
+    let replica_chunks = entry
+        .replica_chunks
+        .iter()
+        .map(|c| powerfs_common::traits::FileChunk {
+            offset: c.offset,
+            size: c.size,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
+            crc32: c.crc32,
+            mtime: c.mtime,
+        })
+        .collect();
+
     powerfs_common::traits::Entry {
         name: entry.name.clone(),
         directory: entry.directory.clone(),
         attributes,
         chunks,
+        replica_chunks,
         hard_link_id: entry.hard_link_id.clone(),
         hard_link_counter: entry.hard_link_counter,
         extended: entry.extended.clone(),
@@ -105,11 +119,25 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
         })
         .collect();
 
+    let replica_chunks = entry
+        .replica_chunks
+        .iter()
+        .map(|c| ProtoFileChunk {
+            offset: c.offset,
+            size: c.size,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
+            crc32: c.crc32,
+            mtime: c.mtime,
+        })
+        .collect();
+
     ProtoEntry {
         name: entry.name.clone(),
         directory: entry.directory.clone(),
         attributes,
         chunks,
+        replica_chunks,
         hard_link_id: entry.hard_link_id.clone(),
         hard_link_counter: entry.hard_link_counter,
         extended: entry.extended.clone(),

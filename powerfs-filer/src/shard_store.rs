@@ -1775,12 +1775,18 @@ impl ShardStore {
             .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
         info.size = size;
         info.blocks = size.div_ceil(512);
+        // P4: 只在 chunks 实际变化时才重置 reliability_state,
+        // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
+        // 不必要地清空 replica_chunks.
+        let chunks_changed = info.chunks != chunks;
         info.chunks = chunks;
         info.inline_data = inline_data;
         info.mtime = Self::current_time();
         // P4: 如果文件已 Replicated 但数据更新了 (追加写), 重置为 PendingReplicated
         // 让 scrubber 重新复制新 chunk. 同时清空旧的 replica_chunks.
-        if info.reliability_state == powerfs_layout::reliability::ReliabilityState::Replicated {
+        if chunks_changed
+            && info.reliability_state == powerfs_layout::reliability::ReliabilityState::Replicated
+        {
             log::info!(
                 "Shard {} P4: inode {} data changed, resetting Replicated -> PendingReplicated",
                 self.shard_id.0,

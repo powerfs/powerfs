@@ -48,6 +48,7 @@ fn inode_info_to_entry(info: &crate::shard_store::InodeInfo) -> Entry {
         directory: "/".to_string(),
         attributes,
         chunks,
+        replica_chunks: Vec::new(),
         hard_link_id: String::new(),
         hard_link_counter: 0,
         extended: std::collections::HashMap::new(),

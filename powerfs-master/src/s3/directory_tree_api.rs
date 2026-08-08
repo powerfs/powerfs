@@ -190,6 +190,7 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                     symlink_target: String::new(),
                     owner: String::new(),
                     generation: 0,
+                    replica_chunks: Vec::new(),
                 };
 
                 let request = CreateEntryRequest {
@@ -354,6 +355,7 @@ impl LocalDirectoryTree {
                     symlink_target: String::new(),
                     owner: String::new(),
                     generation: 0,
+                    replica_chunks: Vec::new(),
                 },
             ),
         );
@@ -462,6 +464,7 @@ impl DirectoryTreeApi for LocalDirectoryTree {
                     symlink_target: String::new(),
                     owner: String::new(),
                     generation: 0,
+                    replica_chunks: Vec::new(),
                 };
 
                 self.entries

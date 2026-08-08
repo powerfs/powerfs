@@ -2275,11 +2275,37 @@ impl MasterNode {
             .collect();
 
         if !existing.is_empty() {
-            // 重注册: 更新已有 Zone 的 physical_volumes (volume 路由可能已变化)
-            // P1.3: 通过 Raft 持久化 UpdateZone
+            // 重注册: 保留已有 Zone 的 volume_id 集合 (稳定性),
+            // 仅从当前 volume routes 更新 addr/size/used.
+            // 不能重新选 top-3, 否则文件写入的 volume 可能不再属于 Zone,
+            // 导致 scrubber 找不到 volume 地址 (P4 bug: addr not found).
+            let route_map: std::collections::HashMap<u64, &VolumeRoute> = sorted_routes
+                .iter()
+                .map(|r| (r.volume_id, r))
+                .collect();
             let mut result = Vec::with_capacity(existing.len());
             for mut zone in existing {
-                if !physical_volumes.is_empty() {
+                // 更新已有 volume 的 addr/size/used, 保留 volume_id 不变
+                zone.physical_volumes = zone
+                    .physical_volumes
+                    .iter()
+                    .filter_map(|zv| {
+                        route_map.get(&zv.volume_id).map(|r| {
+                            powerfs_common::types::ZoneVolume {
+                                volume_id: zv.volume_id,
+                                addr: r.addr.clone(),
+                                size: r.size,
+                                used: r.used,
+                            }
+                        })
+                    })
+                    .collect();
+                // 如果原有 volume 全部下线 (route_map 中找不到), 补充 top-3 中的 volume
+                if zone.physical_volumes.is_empty() && !physical_volumes.is_empty() {
+                    warn!(
+                        "MASTER_ZONE: zone_id={} all original volumes offline, falling back to top-3",
+                        zone.zone_id
+                    );
                     zone.physical_volumes = physical_volumes.clone();
                 }
                 // P1.3: propose UpdateZone (apply 到内存 + Raft 日志持久化)

@@ -1135,6 +1135,20 @@ impl PowerFsFs {
             })
             .collect();
 
+        // P4: 映射 replica_chunks (读路径 failover 使用)
+        let replica_chunks: Vec<CachedFileChunk> = entry
+            .replica_chunks
+            .iter()
+            .map(|chunk| CachedFileChunk {
+                offset: chunk.offset,
+                size: chunk.size,
+                mtime: chunk.mtime,
+                needle_id: chunk.needle_id,
+                volume_id: chunk.volume_id,
+                crc32: chunk.crc32,
+            })
+            .collect();
+
         // Reconstruct file-level Fid from chunks[0]: needle_id = file_key,
         // volume_id = volume_id. cookie is no longer stored per-chunk (set to 0;
         // not used for data operations since chunks carry needle_id directly).
@@ -1209,7 +1223,7 @@ impl PowerFsFs {
             disk_size: entry.disk_size,
             generation: entry.generation,
             placement: None,
-            replica_chunks: Vec::new(),
+            replica_chunks,
             cached_at: Instant::now(),
         }
     }

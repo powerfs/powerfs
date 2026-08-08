@@ -101,6 +101,10 @@ pub struct Entry {
     pub directory: String,
     pub attributes: Option<EntryAttributes>,
     pub chunks: Vec<FileChunk>,
+    /// P4: 副本 chunk 列表 (读路径 failover 使用).
+    /// 主 volume 不可用时从副本 volume 读取相同 needle_id.
+    #[serde(default)]
+    pub replica_chunks: Vec<FileChunk>,
     pub hard_link_id: String,
     pub hard_link_counter: u32,
     pub extended: HashMap<String, Vec<u8>>,

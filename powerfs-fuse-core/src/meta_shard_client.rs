@@ -1159,7 +1159,7 @@ impl MetaShardClient {
         key: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::serialize::TlvEncoder;
         use powerfs_net::FieldId;
 
         let mut enc = TlvEncoder::new();
@@ -1519,13 +1519,31 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
 
 /// P4: 从响应 body 解析 FieldId::ReplicaChunks.
 /// 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节, 与 codec 格式一致).
+/// 使用原始字节扫描, 因为 TlvDecoder 是顺序解码器, decode_file_layout 的
+/// while-loop 会跳过 ReplicaChunks (未知字段), 导致后续 next_bytes 找不到.
 fn parse_replica_chunks_from_body(body: &[u8]) -> Vec<powerfs_layout::encoding::ChunkRef> {
-    use powerfs_net::serialize::TlvDecoder;
-    let mut dec = TlvDecoder::new(body);
-    // 跳过已解析的 FileLayout 字段, 查找 ReplicaChunks
-    let bytes = match dec.next_bytes(powerfs_net::FieldId::ReplicaChunks) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+    // Scan raw TLV bytes for FieldId::ReplicaChunks
+    let target_byte = powerfs_net::FieldId::ReplicaChunks as u8;
+    let mut pos = 0;
+    let bytes: Vec<u8> = loop {
+        if pos + 5 > body.len() {
+            return Vec::new();
+        }
+        let field_id = body[pos];
+        let length = u32::from_be_bytes([
+            body[pos + 1],
+            body[pos + 2],
+            body[pos + 3],
+            body[pos + 4],
+        ]) as usize;
+        pos += 5;
+        if pos + length > body.len() {
+            return Vec::new();
+        }
+        if field_id == target_byte {
+            break body[pos..pos + length].to_vec();
+        }
+        pos += length;
     };
     if bytes.len() < 4 {
         return Vec::new();

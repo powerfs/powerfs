@@ -822,6 +822,7 @@ message Entry {
     string symlink_target = 11;
     string owner = 12;  // 资源归属用户ID（空字符串表示无归属/系统资源）
     uint64 generation = 13;  // 代次号，每次元数据变更递增
+    repeated FileChunk replica_chunks = 14;  // P4: 副本 chunk 列表 (读路径 failover)
 }
 
 enum StorageBackend {

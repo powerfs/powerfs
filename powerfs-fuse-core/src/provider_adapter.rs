@@ -218,6 +218,9 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     // Decode FileLayout from remaining TLV fields (binary TLV, replaces JSON Chunks).
     // If no layout fields are present, decode_file_layout returns a default
     // FileLayout with empty ChunkEncoding::PerChunk.
+    // P4: Save remaining bytes BEFORE decode_file_layout, because its while-loop
+    // consumes ALL remaining fields (including ReplicaChunks via the _ => skip branch).
+    let remaining_before_layout = dec.remaining_slice().to_vec();
     let layout = decode_file_layout(&mut dec).unwrap_or(FileLayout {
         placement: Placement::Flat,
         reliability: Reliability::SingleReplica,
@@ -253,6 +256,15 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         _ => Vec::new(),
     };
 
+    // P4: 解析 FieldId::ReplicaChunks (副本 chunk 列表, 读路径 failover 使用).
+    // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
+    // Scan the saved bytes (before decode_file_layout consumed them) because
+    // decode_file_layout's while-loop skips unknown fields including ReplicaChunks.
+    let replica_chunks: Vec<powerfs_common::traits::FileChunk> =
+        scan_tlv_for_field(&remaining_before_layout, powerfs_net::FieldId::ReplicaChunks)
+            .map(|bytes| parse_replica_chunks(&bytes))
+            .unwrap_or_default();
+
     let entry_name = if name.is_empty() {
         let path_name = path.rsplit('/').next().unwrap_or(path);
         path_name.to_string()
@@ -278,6 +290,7 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         directory: String::new(),
         attributes: Some(attributes),
         chunks,
+        replica_chunks,
         hard_link_id: String::new(),
         hard_link_counter: 0,
         extended: std::collections::HashMap::new(),
@@ -296,6 +309,64 @@ fn parse_unix_time(secs: u64) -> Option<chrono::DateTime<Utc>> {
         return None;
     }
     chrono::DateTime::from_timestamp(secs as i64, 0)
+}
+
+/// P4: Scan raw TLV bytes for a specific field, returning its payload.
+/// This is needed because TlvDecoder::next_field() skips unknown fields,
+/// so decode_file_layout consumes ReplicaChunks before we can read it.
+fn scan_tlv_for_field(buf: &[u8], target: powerfs_net::FieldId) -> Option<Vec<u8>> {
+    let target_byte = target as u8;
+    let mut pos = 0;
+    while pos + 5 <= buf.len() {
+        let field_id = buf[pos];
+        let length = u32::from_be_bytes([
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+        ]) as usize;
+        pos += 5;
+        if pos + length > buf.len() {
+            break; // malformed
+        }
+        if field_id == target_byte {
+            return Some(buf[pos..pos + length].to_vec());
+        }
+        pos += length;
+    }
+    None
+}
+
+/// P4: 解析 FieldId::ReplicaChunks 的 payload.
+/// 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节, 与 codec 格式一致).
+fn parse_replica_chunks(bytes: &[u8]) -> Vec<powerfs_common::traits::FileChunk> {
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+    const CHUNK_REF_SIZE: usize = 44;
+    let needed = count * CHUNK_REF_SIZE;
+    if bytes.len() < 4 + needed {
+        log::warn!(
+            "parse_replica_chunks: truncated, need {} bytes, have {}",
+            4 + needed,
+            bytes.len()
+        );
+        return Vec::new();
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = 4 + i * CHUNK_REF_SIZE;
+        chunks.push(powerfs_common::traits::FileChunk {
+            offset: u64::from_le_bytes(bytes[base..base + 8].try_into().unwrap()),
+            size: u64::from_le_bytes(bytes[base + 8..base + 16].try_into().unwrap()),
+            needle_id: u64::from_le_bytes(bytes[base + 16..base + 24].try_into().unwrap()),
+            volume_id: u64::from_le_bytes(bytes[base + 24..base + 32].try_into().unwrap()),
+            crc32: u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap()),
+            mtime: u64::from_le_bytes(bytes[base + 36..base + 44].try_into().unwrap()),
+        });
+    }
+    chunks
 }
 
 /// Parse TLV response for create - returns ino

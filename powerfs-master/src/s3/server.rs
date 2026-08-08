@@ -624,6 +624,7 @@ pub mod handlers {
             symlink_target: "".to_string(),
             owner: String::new(),
             generation: 0,
+            replica_chunks: Vec::new(),
         };
 
         match state.directory_tree.create_entry(entry).await {
@@ -1113,6 +1114,7 @@ pub mod handlers {
             symlink_target: "".to_string(),
             owner: String::new(),
             generation: 0,
+            replica_chunks: Vec::new(),
         };
 
         match state.directory_tree.create_entry(entry).await {

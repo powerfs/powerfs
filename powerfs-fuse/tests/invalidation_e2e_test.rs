@@ -43,6 +43,7 @@ fn make_entry(inode: u64, parent: u64, name: &str, generation: u64) -> CachedEnt
         disk_size: 0,
         generation,
         placement: None,
+        replica_chunks: Vec::new(),
         cached_at: Instant::now(),
     }
 }
