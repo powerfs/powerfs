@@ -2343,6 +2343,17 @@ impl FileSystem for PowerFsFs {
         if entry.placement.is_some() && entry.fid.is_none() {
             let placement = entry.placement.as_ref().unwrap();
             let stripe_chunks = entry.chunks.clone();
+            // Guard: Stripe path requires at least one chunk to route reads.
+            // Empty chunks + placement=Some can happen if metadata is incomplete
+            // (e.g., inline file misclassified). Return EIO instead of panicking.
+            if stripe_chunks.is_empty() {
+                log::warn!(
+                    "read stripe: inode={} has placement={:?} but no chunks, returning EIO",
+                    inode,
+                    placement
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
             let chunk_size = self.chunk_cache.chunk_size();
 
             let file_size = if entry.size > 0 {
@@ -2767,6 +2778,10 @@ impl FileSystem for PowerFsFs {
                         Err(e) => {
                             // P4: 读路径 failover — 主 volume 读取失败时,
                             // 从 replica_chunks 中查找同 offset 的副本 volume 读取.
+                            debug!(
+                                "read_blob failover attempt: inode={} offset={} err={} replicas={}",
+                                inode, chunk_offset, e, entry.replica_chunks.len()
+                            );
                             let replica_map: HashMap<u64, (u64, u64)> = entry
                                 .replica_chunks
                                 .iter()
