@@ -114,14 +114,73 @@ impl ChunkEncoding {
 
     /// 读取范围选择: 给定 [offset, offset+length), 返回涉及的 chunk 列表
     ///
-    /// TODO: P2 实现时完善, 支持 StripeDescriptor 模式的几何展开
-    pub fn select_range(&self, _offset: u64, _length: u64) -> Vec<&ChunkRef> {
-        todo!("select_range: 按 offset 范围过滤 chunks, StripeDescriptor 模式需展开")
+    /// - `PerChunk`/`Paginated`: 过滤已存在的 chunks, 返回重叠部分的克隆
+    /// - `StripeDescriptor`: 几何计算生成涉及范围的 chunks (owned)
+    /// - `InlineData`: 返回空 (数据内联, 无 chunk)
+    ///
+    /// 返回 owned `ChunkRef` 而非引用, 因为 StripeDescriptor 的 chunks 是
+    /// 按需生成的, 不存在预分配的实体可引用.
+    pub fn select_range(&self, offset: u64, length: u64) -> Vec<ChunkRef> {
+        let range_end = offset.saturating_add(length);
+        if length == 0 {
+            return Vec::new();
+        }
+
+        match self {
+            ChunkEncoding::InlineData { .. } => Vec::new(),
+
+            ChunkEncoding::PerChunk { chunks } | ChunkEncoding::Paginated { chunks, .. } => {
+                chunks
+                    .iter()
+                    .filter(|c| {
+                        let chunk_end = c.offset.saturating_add(c.size);
+                        // 区间重叠: chunk [c.offset, chunk_end) ∩ [offset, range_end) ≠ ∅
+                        c.offset < range_end && chunk_end > offset
+                    })
+                    .cloned()
+                    .collect()
+            }
+
+            ChunkEncoding::StripeDescriptor {
+                start_needle_id,
+                chunk_size,
+                chunk_count,
+                volume_ids,
+                start_volume_idx,
+            } => {
+                if volume_ids.is_empty() || *chunk_count == 0 || *chunk_size == 0 {
+                    return Vec::new();
+                }
+                let cs = *chunk_size as u64;
+                let total = *chunk_count as u64;
+
+                // 计算涉及的 chunk 索引范围 [first_idx, last_idx]
+                let first_idx = offset / cs;
+                let last_idx = (range_end.saturating_sub(1)) / cs;
+
+                // 限制在有效范围内
+                let first_idx = first_idx.min(total - 1);
+                let last_idx = last_idx.min(total - 1);
+
+                let vol_count = volume_ids.len() as u64;
+                (first_idx..=last_idx)
+                    .map(|i| {
+                        let vol_idx = ((*start_volume_idx as u64 + i) % vol_count) as usize;
+                        ChunkRef {
+                            offset: i * cs,
+                            size: cs,
+                            needle_id: start_needle_id + i,
+                            volume_id: volume_ids[vol_idx],
+                            crc32: 0,
+                            mtime: 0,
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// StripeDescriptor 模式: 展开为 PerChunk (调试/兼容用)
-    ///
-    /// TODO: P2 实现时完善
     pub fn expand_to_perchunk(&self) -> Result<ChunkEncoding, LayoutError> {
         match self {
             ChunkEncoding::StripeDescriptor {
@@ -233,5 +292,168 @@ mod tests {
             }
             _ => panic!("expected PerChunk"),
         }
+    }
+
+    // ===== select_range 单元测试 =====
+
+    fn make_chunk(offset: u64, size: u64, needle_id: u64, vol_id: u64) -> ChunkRef {
+        ChunkRef {
+            offset,
+            size,
+            needle_id,
+            volume_id: vol_id,
+            crc32: 0,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn select_range_inline_returns_empty() {
+        let e = ChunkEncoding::InlineData { data: vec![1, 2, 3] };
+        assert!(e.select_range(0, 3).is_empty());
+    }
+
+    #[test]
+    fn select_range_perchunk_full_overlap() {
+        let e = ChunkEncoding::PerChunk {
+            chunks: vec![
+                make_chunk(0, 1024, 1, 10),
+                make_chunk(1024, 1024, 2, 20),
+                make_chunk(2048, 1024, 3, 30),
+            ],
+        };
+        let selected = e.select_range(0, 3072);
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn select_range_perchunk_partial() {
+        let e = ChunkEncoding::PerChunk {
+            chunks: vec![
+                make_chunk(0, 1024, 1, 10),
+                make_chunk(1024, 1024, 2, 20),
+                make_chunk(2048, 1024, 3, 30),
+            ],
+        };
+        // [512, 1536) → 涉及 chunk 0 和 chunk 1
+        let selected = e.select_range(512, 1024);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].needle_id, 1);
+        assert_eq!(selected[1].needle_id, 2);
+    }
+
+    #[test]
+    fn select_range_perchunk_boundary() {
+        let e = ChunkEncoding::PerChunk {
+            chunks: vec![
+                make_chunk(0, 1024, 1, 10),
+                make_chunk(1024, 1024, 2, 20),
+            ],
+        };
+        // 恰好 [0, 1024) → 只有 chunk 0
+        let selected = e.select_range(0, 1024);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].needle_id, 1);
+        // 恰好 [1024, 2048) → 只有 chunk 1
+        let selected = e.select_range(1024, 1024);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].needle_id, 2);
+    }
+
+    #[test]
+    fn select_range_perchunk_no_overlap() {
+        let e = ChunkEncoding::PerChunk {
+            chunks: vec![make_chunk(0, 1024, 1, 10)],
+        };
+        // [2048, 3072) → 不涉及任何 chunk
+        let selected = e.select_range(2048, 1024);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_range_zero_length() {
+        let e = ChunkEncoding::PerChunk {
+            chunks: vec![make_chunk(0, 1024, 1, 10)],
+        };
+        assert!(e.select_range(0, 0).is_empty());
+    }
+
+    #[test]
+    fn select_range_stripe_descriptor() {
+        let e = ChunkEncoding::StripeDescriptor {
+            start_needle_id: 100,
+            chunk_size: 1024,
+            chunk_count: 10,
+            volume_ids: vec![10, 20],
+            start_volume_idx: 0,
+        };
+        // [1024, 3072) → 涉及 chunk 1, 2 (索引 1~2)
+        let selected = e.select_range(1024, 2048);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].needle_id, 101);
+        assert_eq!(selected[0].volume_id, 20);
+        assert_eq!(selected[1].needle_id, 102);
+        assert_eq!(selected[1].volume_id, 10);
+    }
+
+    #[test]
+    fn select_range_stripe_descriptor_full() {
+        let e = ChunkEncoding::StripeDescriptor {
+            start_needle_id: 100,
+            chunk_size: 1024,
+            chunk_count: 4,
+            volume_ids: vec![10, 20, 30, 40],
+            start_volume_idx: 0,
+        };
+        let selected = e.select_range(0, 4096);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].needle_id, 100);
+        assert_eq!(selected[3].needle_id, 103);
+    }
+
+    #[test]
+    fn select_range_stripe_descriptor_beyond_end() {
+        let e = ChunkEncoding::StripeDescriptor {
+            start_needle_id: 100,
+            chunk_size: 1024,
+            chunk_count: 4,
+            volume_ids: vec![10, 20],
+            start_volume_idx: 0,
+        };
+        // 请求范围超出文件末尾 → 限制到 chunk_count
+        let selected = e.select_range(0, 100_000);
+        assert_eq!(selected.len(), 4);
+    }
+
+    #[test]
+    fn select_range_stripe_descriptor_start_volume_idx() {
+        let e = ChunkEncoding::StripeDescriptor {
+            start_needle_id: 100,
+            chunk_size: 1024,
+            chunk_count: 4,
+            volume_ids: vec![10, 20, 30],
+            start_volume_idx: 1, // 从 vol 20 开始
+        };
+        let selected = e.select_range(0, 4096);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].volume_id, 20); // (1+0) % 3 = 1 → vol_ids[1] = 20
+        assert_eq!(selected[1].volume_id, 30); // (1+1) % 3 = 2 → vol_ids[2] = 30
+        assert_eq!(selected[2].volume_id, 10); // (1+2) % 3 = 0 → vol_ids[0] = 10
+        assert_eq!(selected[3].volume_id, 20); // (1+3) % 3 = 1 → vol_ids[1] = 20
+    }
+
+    #[test]
+    fn select_range_paginated() {
+        let e = ChunkEncoding::Paginated {
+            chunks: vec![
+                make_chunk(0, 1024, 1, 10),
+                make_chunk(1024, 1024, 2, 20),
+            ],
+            total_count: 10,
+            has_more: true,
+            next_offset: 2048,
+        };
+        let selected = e.select_range(512, 1024);
+        assert_eq!(selected.len(), 2);
     }
 }
