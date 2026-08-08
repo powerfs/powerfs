@@ -60,6 +60,7 @@ serde_json = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
 futures = { workspace = true }
+crc32fast = "1.4"
 
 [dev-dependencies]
 rfs_tester = { path = "../rfs_tester" }

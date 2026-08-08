@@ -764,7 +764,7 @@ impl PowerFsFs {
                     .client
                     .write_blob_batch_with_lease(requests, lease_token);
 
-                for ((chunk_idx, _), result) in batch.iter().zip(results.iter()) {
+                for ((chunk_idx, req), result) in batch.iter().zip(results.iter()) {
                     if let Err(e) = result {
                         self.mark_dirty(inode, *chunk_idx);
                         error!(
@@ -773,6 +773,10 @@ impl PowerFsFs {
                         );
                         had_error = true;
                     } else {
+                        // Compute CRC32 of flushed data for read-path verification
+                        let crc = crc32fast::hash(&req.data);
+                        let chunk_offset = *chunk_idx * chunk_size;
+                        self.cache.update_chunk_crc32(inode, chunk_offset, crc);
                         flushed_indices.push(*chunk_idx);
                     }
                 }
@@ -862,7 +866,7 @@ impl PowerFsFs {
                 .client
                 .write_blob_batch_with_lease(requests, lease_token);
 
-            for ((chunk_idx, _), result) in batch.iter().zip(results.iter()) {
+            for ((chunk_idx, req), result) in batch.iter().zip(results.iter()) {
                 if let Err(e) = result {
                     self.mark_dirty(inode, *chunk_idx);
                     error!(
@@ -871,6 +875,10 @@ impl PowerFsFs {
                     );
                     had_error = true;
                 } else {
+                    // Compute CRC32 of flushed data for read-path verification
+                    let crc = crc32fast::hash(&req.data);
+                    let chunk_offset = *chunk_idx * chunk_size;
+                    self.cache.update_chunk_crc32(inode, chunk_offset, crc);
                     // Track successfully flushed chunk INDICES (not offsets) to
                     // clear their dirty flag. The cache key is (inode,
                     // chunk_index), so clear_dirty_for_chunks expects indices.
@@ -2424,6 +2432,11 @@ impl FileSystem for PowerFsFs {
                     .iter()
                     .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                     .collect();
+                // Build crc_map for read-path data integrity verification
+                let crc_map: HashMap<u64, u32> = stripe_chunks
+                    .iter()
+                    .map(|c| (c.offset, c.crc32))
+                    .collect();
 
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
@@ -2453,6 +2466,19 @@ impl FileSystem for PowerFsFs {
                 {
                     match result {
                         Ok(data) => {
+                            // Verify CRC32 if chunk has a non-zero CRC
+                            if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                if expected_crc != 0 {
+                                    let actual_crc = crc32fast::hash(data);
+                                    if actual_crc != expected_crc {
+                                        error!(
+                                            "CRC32 mismatch (stripe): inode={} offset={} expected={:#x} actual={:#x}",
+                                            inode, chunk_offset, expected_crc, actual_crc
+                                        );
+                                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                    }
+                                }
+                            }
                             self.chunk_cache.put(
                                 inode,
                                 *chunk_offset,
@@ -2538,6 +2564,19 @@ impl FileSystem for PowerFsFs {
                                             &rep_addr, rep_vol, rep_needle, 0, *read_size,
                                         ) {
                                             Ok(data) => {
+                                                // Verify CRC32 on replica data too
+                                                if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                                    if expected_crc != 0 {
+                                                        let actual_crc = crc32fast::hash(&data);
+                                                        if actual_crc != expected_crc {
+                                                            error!(
+                                                                "CRC32 mismatch (stripe replica): inode={} offset={} expected={:#x} actual={:#x}",
+                                                                inode, chunk_offset, expected_crc, actual_crc
+                                                            );
+                                                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                                        }
+                                                    }
+                                                }
                                                 debug!(
                                                     "read stripe failover success: inode={} offset={} replica vol={}",
                                                     inode, chunk_offset, rep_vol
@@ -2745,6 +2784,12 @@ impl FileSystem for PowerFsFs {
                     .iter()
                     .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                     .collect();
+                // Build crc_map for read-path data integrity verification
+                let crc_map: HashMap<u64, u32> = entry
+                    .chunks
+                    .iter()
+                    .map(|c| (c.offset, c.crc32))
+                    .collect();
 
                 // Build batch read requests
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
@@ -2785,6 +2830,20 @@ impl FileSystem for PowerFsFs {
                                 chunk_offset,
                                 data.len()
                             );
+                            // Verify CRC32 if chunk has a non-zero CRC
+                            // (legacy chunks and inline files have crc32=0)
+                            if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                if expected_crc != 0 {
+                                    let actual_crc = crc32fast::hash(data);
+                                    if actual_crc != expected_crc {
+                                        error!(
+                                            "CRC32 mismatch: inode={} offset={} expected={:#x} actual={:#x}",
+                                            inode, chunk_offset, expected_crc, actual_crc
+                                        );
+                                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                    }
+                                }
+                            }
                             self.chunk_cache.put(
                                 inode,
                                 *chunk_offset,
@@ -2824,6 +2883,19 @@ impl FileSystem for PowerFsFs {
                                             &rep_addr, rep_vol, rep_needle, 0, *read_size,
                                         ) {
                                             Ok(data) => {
+                                                // Verify CRC32 on replica data too
+                                                if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                                    if expected_crc != 0 {
+                                                        let actual_crc = crc32fast::hash(&data);
+                                                        if actual_crc != expected_crc {
+                                                            error!(
+                                                                "CRC32 mismatch (flat replica): inode={} offset={} expected={:#x} actual={:#x}",
+                                                                inode, chunk_offset, expected_crc, actual_crc
+                                                            );
+                                                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                                        }
+                                                    }
+                                                }
                                                 debug!(
                                                     "read_blob failover success: inode={} offset={} replica vol={}",
                                                     inode, chunk_offset, rep_vol

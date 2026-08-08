@@ -730,6 +730,17 @@ impl MetadataCache {
         }
     }
 
+    /// Update CRC32 for a chunk at the given offset after flushing to Volume Server.
+    /// Called from flush_dirty_chunks_impl after successful write_blob.
+    pub fn update_chunk_crc32(&self, inode: u64, chunk_offset: u64, crc32: u32) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            if let Some(chunk) = entry.chunks.iter_mut().find(|c| c.offset == chunk_offset) {
+                chunk.crc32 = crc32;
+            }
+        }
+    }
+
     pub fn update_attr(&self, inode: u64, params: UpdateAttrParams) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
