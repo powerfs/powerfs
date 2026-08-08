@@ -329,10 +329,7 @@ impl EcEncoder {
     /// Returns the concatenated data shards (the original file data). The
     /// caller is responsible for truncating to the original file size if the
     /// last data shard was zero-padded during encoding.
-    pub fn decode_missing(
-        &self,
-        shards: &mut [Option<Vec<u8>>],
-    ) -> Result<Vec<u8>, String> {
+    pub fn decode_missing(&self, shards: &mut [Option<Vec<u8>>]) -> Result<Vec<u8>, String> {
         if shards.len() == 1 {
             return shards[0]
                 .clone()
@@ -517,7 +514,9 @@ mod tests {
     fn decode_missing_recovers_two_data_shards_with_parity() {
         // EC(4+2): drop 2 data shards (max tolerable failures), reconstruct.
         let encoder = make_encoder(4, 2);
-        let original = (0..2000u32).map(|i| (i * 7 % 251) as u8).collect::<Vec<_>>();
+        let original = (0..2000u32)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
         let shards = encoder.encode(&original);
 
         let mut opt_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();

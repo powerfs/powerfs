@@ -91,10 +91,7 @@ mod tests {
     #[test]
     fn overhead_factor() {
         assert_eq!(Reliability::SingleReplica.overhead_factor(), 1.0);
-        assert_eq!(
-            Reliability::Replicated { count: 3 }.overhead_factor(),
-            3.0
-        );
+        assert_eq!(Reliability::Replicated { count: 3 }.overhead_factor(), 3.0);
         assert_eq!(
             Reliability::EC { data: 4, parity: 2 }.overhead_factor(),
             1.5

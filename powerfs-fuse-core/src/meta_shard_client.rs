@@ -1532,12 +1532,9 @@ fn parse_replica_chunks_from_body(body: &[u8]) -> Vec<powerfs_layout::encoding::
             return Vec::new();
         }
         let field_id = body[pos];
-        let length = u32::from_be_bytes([
-            body[pos + 1],
-            body[pos + 2],
-            body[pos + 3],
-            body[pos + 4],
-        ]) as usize;
+        let length =
+            u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]])
+                as usize;
         pos += 5;
         if pos + length > body.len() {
             return Vec::new();

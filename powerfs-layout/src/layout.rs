@@ -52,7 +52,9 @@ impl FileLayout {
         if let Some(threshold) = dir_inline_threshold {
             if threshold > 0 && file_size < threshold as u64 {
                 return Self {
-                    placement: Placement::Inline { max_size: threshold },
+                    placement: Placement::Inline {
+                        max_size: threshold,
+                    },
                     reliability: Reliability::Replicated { count: 1 },
                     reliability_state: ReliabilityState::default(),
                     compression: CompressionState::default(),
@@ -78,9 +80,15 @@ impl FileLayout {
         };
 
         let (reliability, encoding) = if placement.is_inline() {
-            (Reliability::Replicated { count: 1 }, ChunkEncoding::InlineData { data: Vec::new() })
+            (
+                Reliability::Replicated { count: 1 },
+                ChunkEncoding::InlineData { data: Vec::new() },
+            )
         } else {
-            (Reliability::SingleReplica, ChunkEncoding::PerChunk { chunks: Vec::new() })
+            (
+                Reliability::SingleReplica,
+                ChunkEncoding::PerChunk { chunks: Vec::new() },
+            )
         };
 
         Self {
@@ -136,10 +144,7 @@ mod tests {
     fn new_file_inline_default() {
         let layout = FileLayout::for_new_file(100, None, None, &PlacementPolicy::default());
         assert!(layout.is_inline());
-        assert!(matches!(
-            layout.encoding,
-            ChunkEncoding::InlineData { .. }
-        ));
+        assert!(matches!(layout.encoding, ChunkEncoding::InlineData { .. }));
     }
 
     #[test]
@@ -147,20 +152,12 @@ mod tests {
         let layout = FileLayout::for_new_file(4096, None, None, &PlacementPolicy::default());
         assert!(!layout.is_inline());
         assert!(matches!(layout.placement, Placement::Flat));
-        assert!(matches!(
-            layout.encoding,
-            ChunkEncoding::PerChunk { .. }
-        ));
+        assert!(matches!(layout.encoding, ChunkEncoding::PerChunk { .. }));
     }
 
     #[test]
     fn new_file_with_dir_inline_threshold() {
-        let layout = FileLayout::for_new_file(
-            100,
-            None,
-            Some(8192),
-            &PlacementPolicy::default(),
-        );
+        let layout = FileLayout::for_new_file(100, None, Some(8192), &PlacementPolicy::default());
         assert!(layout.is_inline());
         match &layout.placement {
             Placement::Inline { max_size } => assert_eq!(*max_size, 8192),

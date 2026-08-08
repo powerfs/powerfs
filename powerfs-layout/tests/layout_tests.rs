@@ -9,16 +9,14 @@
 //! - StripeDescriptor 展开
 //! - Placement × Reliability × ChunkEncoding 笛卡尔积
 
-use powerfs_layout::codec::{
-    decode_file_layout, encode_file_layout, FEATURE_CHUNK_LAYOUT_V2,
-};
-use powerfs_layout::placement::auto_promote;
-use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_layout::anti_affinity::{select_volumes_with_anti_affinity, NodeId, VolumeInfo};
+use powerfs_layout::codec::{decode_file_layout, encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
 use powerfs_layout::encoding::{ChunkEncoding, ChunkRef};
 use powerfs_layout::layout::FileLayout;
+use powerfs_layout::placement::auto_promote;
 use powerfs_layout::placement::{Placement, PlacementSpec};
 use powerfs_layout::policy::PlacementPolicy;
+use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_layout::xattr::{parse_inline_xattr, parse_placement_xattr};
 use powerfs_net::{TlvDecoder, TlvEncoder};
 use std::collections::HashSet;
@@ -47,7 +45,11 @@ fn make_chunk(offset: u64, size: u64, needle: u64, vol: u64) -> ChunkRef {
     }
 }
 
-fn make_layout(placement: Placement, reliability: Reliability, encoding: ChunkEncoding) -> FileLayout {
+fn make_layout(
+    placement: Placement,
+    reliability: Reliability,
+    encoding: ChunkEncoding,
+) -> FileLayout {
     FileLayout {
         placement,
         reliability,
@@ -105,10 +107,7 @@ fn auto_promote_all_thresholds() {
     let policy = PlacementPolicy::default();
 
     // < inline_max_size → Inline
-    assert!(matches!(
-        auto_promote(0, &policy),
-        Placement::Inline { .. }
-    ));
+    assert!(matches!(auto_promote(0, &policy), Placement::Inline { .. }));
     assert!(matches!(
         auto_promote(4095, &policy),
         Placement::Inline { .. }
@@ -122,23 +121,53 @@ fn auto_promote_all_thresholds() {
 
     // == flat_max_size → Stripe(4)
     let p = auto_promote(64 * 1024 * 1024, &policy);
-    assert!(matches!(p, Placement::Stripe { stripe_count: 4, .. }));
+    assert!(matches!(
+        p,
+        Placement::Stripe {
+            stripe_count: 4,
+            ..
+        }
+    ));
 
     // < stripe4_max_size → Stripe(4)
     let p = auto_promote(1024 * 1024 * 1024 - 1, &policy);
-    assert!(matches!(p, Placement::Stripe { stripe_count: 4, .. }));
+    assert!(matches!(
+        p,
+        Placement::Stripe {
+            stripe_count: 4,
+            ..
+        }
+    ));
 
     // == stripe4_max_size → Stripe(16)
     let p = auto_promote(1024 * 1024 * 1024, &policy);
-    assert!(matches!(p, Placement::Stripe { stripe_count: 16, .. }));
+    assert!(matches!(
+        p,
+        Placement::Stripe {
+            stripe_count: 16,
+            ..
+        }
+    ));
 
     // < stripe16_max_size → Stripe(16)
     let p = auto_promote(99 * 1024 * 1024 * 1024, &policy);
-    assert!(matches!(p, Placement::Stripe { stripe_count: 16, .. }));
+    assert!(matches!(
+        p,
+        Placement::Stripe {
+            stripe_count: 16,
+            ..
+        }
+    ));
 
     // >= stripe16_max_size, no auto widestripe → Stripe(16)
     let p = auto_promote(200 * 1024 * 1024 * 1024, &policy);
-    assert!(matches!(p, Placement::Stripe { stripe_count: 16, .. }));
+    assert!(matches!(
+        p,
+        Placement::Stripe {
+            stripe_count: 16,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -239,10 +268,30 @@ fn xattr_inline_disabled() {
 #[test]
 fn anti_affinity_basic_selection() {
     let vols = vec![
-        VolumeInfo { volume_id: 1, node_id: NodeId(1), free_bytes: 100, total_bytes: 200 },
-        VolumeInfo { volume_id: 2, node_id: NodeId(2), free_bytes: 80, total_bytes: 200 },
-        VolumeInfo { volume_id: 3, node_id: NodeId(3), free_bytes: 60, total_bytes: 200 },
-        VolumeInfo { volume_id: 4, node_id: NodeId(1), free_bytes: 50, total_bytes: 200 },
+        VolumeInfo {
+            volume_id: 1,
+            node_id: NodeId(1),
+            free_bytes: 100,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 2,
+            node_id: NodeId(2),
+            free_bytes: 80,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 3,
+            node_id: NodeId(3),
+            free_bytes: 60,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 4,
+            node_id: NodeId(1),
+            free_bytes: 50,
+            total_bytes: 200,
+        },
     ];
     let selected = select_volumes_with_anti_affinity(&vols, 3, &HashSet::new()).unwrap();
     assert_eq!(selected.len(), 3);
@@ -259,8 +308,18 @@ fn anti_affinity_basic_selection() {
 #[test]
 fn anti_affinity_insufficient_nodes() {
     let vols = vec![
-        VolumeInfo { volume_id: 1, node_id: NodeId(1), free_bytes: 100, total_bytes: 200 },
-        VolumeInfo { volume_id: 2, node_id: NodeId(1), free_bytes: 80, total_bytes: 200 },
+        VolumeInfo {
+            volume_id: 1,
+            node_id: NodeId(1),
+            free_bytes: 100,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 2,
+            node_id: NodeId(1),
+            free_bytes: 80,
+            total_bytes: 200,
+        },
     ];
     let result = select_volumes_with_anti_affinity(&vols, 2, &HashSet::new());
     assert!(result.is_err());
@@ -269,9 +328,24 @@ fn anti_affinity_insufficient_nodes() {
 #[test]
 fn anti_affinity_with_excluded_nodes() {
     let vols = vec![
-        VolumeInfo { volume_id: 1, node_id: NodeId(1), free_bytes: 100, total_bytes: 200 },
-        VolumeInfo { volume_id: 2, node_id: NodeId(2), free_bytes: 80, total_bytes: 200 },
-        VolumeInfo { volume_id: 3, node_id: NodeId(3), free_bytes: 60, total_bytes: 200 },
+        VolumeInfo {
+            volume_id: 1,
+            node_id: NodeId(1),
+            free_bytes: 100,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 2,
+            node_id: NodeId(2),
+            free_bytes: 80,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 3,
+            node_id: NodeId(3),
+            free_bytes: 60,
+            total_bytes: 200,
+        },
     ];
     let mut exclude = HashSet::new();
     exclude.insert(NodeId(1));
@@ -284,8 +358,18 @@ fn anti_affinity_with_excluded_nodes() {
 #[test]
 fn anti_affinity_prefers_higher_free_ratio() {
     let vols = vec![
-        VolumeInfo { volume_id: 1, node_id: NodeId(1), free_bytes: 180, total_bytes: 200 },
-        VolumeInfo { volume_id: 2, node_id: NodeId(2), free_bytes: 20, total_bytes: 200 },
+        VolumeInfo {
+            volume_id: 1,
+            node_id: NodeId(1),
+            free_bytes: 180,
+            total_bytes: 200,
+        },
+        VolumeInfo {
+            volume_id: 2,
+            node_id: NodeId(2),
+            free_bytes: 20,
+            total_bytes: 200,
+        },
     ];
     let selected = select_volumes_with_anti_affinity(&vols, 2, &HashSet::new()).unwrap();
     // vol 1 空闲比更高, 应先选
@@ -315,7 +399,8 @@ fn locate_stripe_continuous_offset() {
         let expected_vol_offset = (i / 4) * 1024;
         assert_eq!(
             vol_offset, expected_vol_offset as u64,
-            "offset {} vol_offset mismatch", offset
+            "offset {} vol_offset mismatch",
+            offset
         );
 
         // 验证 volume 轮转: 10, 20, 30, 40, 10, 20, ...
@@ -326,7 +411,11 @@ fn locate_stripe_continuous_offset() {
             3 => 40,
             _ => unreachable!(),
         };
-        assert_eq!(vol_id, expected_vol, "offset {} should map to vol {}", offset, expected_vol);
+        assert_eq!(
+            vol_id, expected_vol,
+            "offset {} should map to vol {}",
+            offset, expected_vol
+        );
     }
 }
 
@@ -440,7 +529,9 @@ fn cartesian_product_all_combinations() {
     ];
 
     let encodings = vec![
-        ChunkEncoding::InlineData { data: vec![1, 2, 3] },
+        ChunkEncoding::InlineData {
+            data: vec![1, 2, 3],
+        },
         ChunkEncoding::PerChunk {
             chunks: vec![make_chunk(0, 1024, 42, 10)],
         },
@@ -463,11 +554,7 @@ fn cartesian_product_all_combinations() {
     for placement in &placements {
         for reliability in &reliabilities {
             for encoding in &encodings {
-                let layout = make_layout(
-                    placement.clone(),
-                    reliability.clone(),
-                    encoding.clone(),
-                );
+                let layout = make_layout(placement.clone(), reliability.clone(), encoding.clone());
                 let decoded = round_trip(&layout);
                 assert_eq!(decoded.placement, *placement, "placement mismatch");
                 assert_eq!(decoded.reliability, *reliability, "reliability mismatch");
@@ -550,7 +637,10 @@ fn per_chunk_expand_is_identity() {
 #[test]
 fn for_new_file_inline_takes_priority() {
     // 即使有 placement spec, inline 阈值优先
-    let spec = PlacementSpec::Stripe { count: 4, stripe_size: 64 * 1024 * 1024 };
+    let spec = PlacementSpec::Stripe {
+        count: 4,
+        stripe_size: 64 * 1024 * 1024,
+    };
     let policy = PlacementPolicy::default();
     let layout = FileLayout::for_new_file(100, Some(&spec), Some(4096), &policy);
     // 100 < 4096 → Inline
@@ -596,7 +686,9 @@ fn binary_vs_json_size_per_chunk() {
     let layout_bin = make_layout(
         Placement::Flat,
         Reliability::SingleReplica,
-        ChunkEncoding::PerChunk { chunks: chunks.clone() },
+        ChunkEncoding::PerChunk {
+            chunks: chunks.clone(),
+        },
     );
     let mut enc = TlvEncoder::new();
     encode_file_layout(&mut enc, &layout_bin, FEATURE_CHUNK_LAYOUT_V2).unwrap();
@@ -643,12 +735,14 @@ fn binary_vs_json_size_stripe_descriptor() {
 
     // JSON 等价: 512 chunks * ~80 bytes/chunk = ~40KB
     let json_equiv: Vec<ChunkRef> = (0..512usize)
-        .map(|i| make_chunk(
-            (i as u64) * 2 * 1024 * 1024,
-            2 * 1024 * 1024,
-            1000 + i as u64,
-            vol_ids[i % 4],
-        ))
+        .map(|i| {
+            make_chunk(
+                (i as u64) * 2 * 1024 * 1024,
+                2 * 1024 * 1024,
+                1000 + i as u64,
+                vol_ids[i % 4],
+            )
+        })
         .collect();
     let json_size = serde_json::to_vec(&json_equiv).unwrap().len();
 
@@ -669,14 +763,13 @@ fn binary_vs_json_size_stripe_descriptor() {
 
 #[test]
 fn chunk_encoding_total_size() {
-    let inline = ChunkEncoding::InlineData { data: vec![1, 2, 3, 4] };
+    let inline = ChunkEncoding::InlineData {
+        data: vec![1, 2, 3, 4],
+    };
     assert_eq!(inline.total_size(), 4);
 
     let perchunk = ChunkEncoding::PerChunk {
-        chunks: vec![
-            make_chunk(0, 1024, 1, 10),
-            make_chunk(1024, 2048, 2, 10),
-        ],
+        chunks: vec![make_chunk(0, 1024, 1, 10), make_chunk(1024, 2048, 2, 10)],
     };
     assert_eq!(perchunk.total_size(), 3072);
 

@@ -83,7 +83,10 @@ mod tests {
         assert!(e.to_string().contains("need 4"));
         assert!(e.to_string().contains("have 2"));
 
-        let e = LayoutError::InlineOversize { actual: 8192, max: 4096 };
+        let e = LayoutError::InlineOversize {
+            actual: 8192,
+            max: 4096,
+        };
         assert!(e.to_string().contains("8192"));
         assert!(e.to_string().contains("4096"));
     }

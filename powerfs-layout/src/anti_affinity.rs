@@ -111,19 +111,14 @@ mod tests {
         // 每个在不同 node
         let nodes: HashSet<u32> = result
             .iter()
-            .map(|vid| {
-                vols.iter().find(|v| v.volume_id == *vid).unwrap().node_id.0
-            })
+            .map(|vid| vols.iter().find(|v| v.volume_id == *vid).unwrap().node_id.0)
             .collect();
         assert_eq!(nodes.len(), 3);
     }
 
     #[test]
     fn select_prefers_higher_free() {
-        let vols = vec![
-            vol(1, 1, 100, 200),
-            vol(2, 2, 80, 200),
-        ];
+        let vols = vec![vol(1, 1, 100, 200), vol(2, 2, 80, 200)];
         let result = select_volumes_with_anti_affinity(&vols, 2, &HashSet::new()).unwrap();
         // vol 1 空闲更多, 应该先选
         assert_eq!(result[0], 1);
@@ -149,11 +144,7 @@ mod tests {
 
     #[test]
     fn select_with_exclude() {
-        let vols = vec![
-            vol(1, 1, 100, 200),
-            vol(2, 2, 80, 200),
-            vol(3, 3, 60, 200),
-        ];
+        let vols = vec![vol(1, 1, 100, 200), vol(2, 2, 80, 200), vol(3, 3, 60, 200)];
         let mut exclude = HashSet::new();
         exclude.insert(NodeId(1));
         let result = select_volumes_with_anti_affinity(&vols, 2, &exclude).unwrap();

@@ -49,12 +49,10 @@ lazy_static::lazy_static! {
 }
 
 pub async fn start_metrics_server(addr: &str) -> Result<(), String> {
-    let app = Router::new()
-        .route("/metrics", get(metrics_handler))
-        .route(
-            "/admin/log-level",
-            get(get_log_level_handler).put(set_log_level_handler),
-        );
+    let app = Router::new().route("/metrics", get(metrics_handler)).route(
+        "/admin/log-level",
+        get(get_log_level_handler).put(set_log_level_handler),
+    );
 
     let addr = addr
         .parse()
@@ -85,9 +83,7 @@ async fn get_log_level_handler() -> Json<serde_json::Value> {
     Json(json!({ "level": powerfs_common::dynamic_log::get_log_level() }))
 }
 
-async fn set_log_level_handler(
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+async fn set_log_level_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
     let level = match params.get("level") {
         Some(l) => l.as_str(),
         None => {

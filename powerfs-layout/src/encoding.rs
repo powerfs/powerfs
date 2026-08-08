@@ -198,8 +198,7 @@ impl ChunkEncoding {
                 let mut chunks = Vec::with_capacity(*chunk_count as usize);
                 for i in 0..*chunk_count as u64 {
                     let vol_rank = (i % volume_ids.len() as u64) as u32;
-                    let vol_idx =
-                        (*start_volume_idx + vol_rank) as usize % volume_ids.len();
+                    let vol_idx = (*start_volume_idx + vol_rank) as usize % volume_ids.len();
                     chunks.push(ChunkRef {
                         offset: i * *chunk_size as u64,
                         size: *chunk_size as u64,
@@ -309,7 +308,9 @@ mod tests {
 
     #[test]
     fn select_range_inline_returns_empty() {
-        let e = ChunkEncoding::InlineData { data: vec![1, 2, 3] };
+        let e = ChunkEncoding::InlineData {
+            data: vec![1, 2, 3],
+        };
         assert!(e.select_range(0, 3).is_empty());
     }
 
@@ -345,10 +346,7 @@ mod tests {
     #[test]
     fn select_range_perchunk_boundary() {
         let e = ChunkEncoding::PerChunk {
-            chunks: vec![
-                make_chunk(0, 1024, 1, 10),
-                make_chunk(1024, 1024, 2, 20),
-            ],
+            chunks: vec![make_chunk(0, 1024, 1, 10), make_chunk(1024, 1024, 2, 20)],
         };
         // 恰好 [0, 1024) → 只有 chunk 0
         let selected = e.select_range(0, 1024);
@@ -445,10 +443,7 @@ mod tests {
     #[test]
     fn select_range_paginated() {
         let e = ChunkEncoding::Paginated {
-            chunks: vec![
-                make_chunk(0, 1024, 1, 10),
-                make_chunk(1024, 1024, 2, 20),
-            ],
+            chunks: vec![make_chunk(0, 1024, 1, 10), make_chunk(1024, 1024, 2, 20)],
             total_count: 10,
             has_more: true,
             next_offset: 2048,

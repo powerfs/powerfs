@@ -13,6 +13,9 @@ volumes:
   volume-1-data:
   volume-2-data:
   volume-3-data:
+  volume-4-data:
+  volume-5-data:
+  volume-6-data:
   redis-data:
   s3-data:
   filer-1-data:
@@ -53,6 +56,8 @@ services:
       - "9333:9333"
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
@@ -81,6 +86,8 @@ services:
       - "9336:9333"
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
@@ -109,6 +116,8 @@ services:
       - "9337:9333"
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
     command: >
       /app/powerfs-master
       --config /app/config/master.toml
@@ -211,6 +220,97 @@ services:
       master-1:
         condition: service_healthy
 
+  # P6: EC 测试扩容 volume (EC(4+2) 需要 >=6 个 volume 节点)
+  volume-4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: volume-4
+    networks:
+      powerfs-network:
+        ipv4_address: 172.30.0.24
+    volumes:
+      - volume-4-data:/data
+      - ./config/volume-4.toml:/app/config/volume.toml:ro
+    ports:
+      - "8085:8080"    # gRPC端口
+      - "8094:8094"    # HTTP管理端口
+      - "8904:8901"    # powerfs-net端口 (容器内统一8901)
+    environment:
+      - REDIS_URL=redis://redis:6379
+    command: >
+      /app/powerfs-volume
+      --config /app/config/volume.toml
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.30.0.24 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-5:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: volume-5
+    networks:
+      powerfs-network:
+        ipv4_address: 172.30.0.25
+    volumes:
+      - volume-5-data:/data
+      - ./config/volume-5.toml:/app/config/volume.toml:ro
+    ports:
+      - "8086:8080"    # gRPC端口
+      - "8095:8095"    # HTTP管理端口
+      - "8905:8901"    # powerfs-net端口 (容器内统一8901)
+    environment:
+      - REDIS_URL=redis://redis:6379
+    command: >
+      /app/powerfs-volume
+      --config /app/config/volume.toml
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.30.0.25 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
+  volume-6:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: powerfs:latest
+    container_name: volume-6
+    networks:
+      powerfs-network:
+        ipv4_address: 172.30.0.26
+    volumes:
+      - volume-6-data:/data
+      - ./config/volume-6.toml:/app/config/volume.toml:ro
+    ports:
+      - "8087:8080"    # gRPC端口
+      - "8096:8096"    # HTTP管理端口
+      - "8906:8901"    # powerfs-net端口 (容器内统一8901)
+    environment:
+      - REDIS_URL=redis://redis:6379
+    command: >
+      /app/powerfs-volume
+      --config /app/config/volume.toml
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.30.0.26 8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      master-1:
+        condition: service_healthy
+
   filer-1:
     build:
       context: ..
@@ -232,6 +332,11 @@ services:
       --config /app/config/filer.toml
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_SCRUBBER_SCAN_INTERVAL=${POWERFS_SCRUBBER_SCAN_INTERVAL:-30}
+      - POWERFS_SCRUBBER_MAX_INODES=${POWERFS_SCRUBBER_MAX_INODES:-50}
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
+      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-0}
     healthcheck:
       test: ["CMD-SHELL", "nc -z filer-1 8888 && nc -z filer-1 8889 || exit 1"]
       interval: 10s
@@ -262,6 +367,11 @@ services:
       --config /app/config/filer.toml
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_SCRUBBER_SCAN_INTERVAL=${POWERFS_SCRUBBER_SCAN_INTERVAL:-30}
+      - POWERFS_SCRUBBER_MAX_INODES=${POWERFS_SCRUBBER_MAX_INODES:-50}
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
+      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-0}
     healthcheck:
       test: ["CMD-SHELL", "nc -z filer-2 8888 && nc -z filer-2 8889 || exit 1"]
       interval: 10s
@@ -292,6 +402,11 @@ services:
       --config /app/config/filer.toml
     environment:
       - REDIS_URL=redis://redis:6379
+      - POWERFS_SCRUBBER_SCAN_INTERVAL=${POWERFS_SCRUBBER_SCAN_INTERVAL:-30}
+      - POWERFS_SCRUBBER_MAX_INODES=${POWERFS_SCRUBBER_MAX_INODES:-50}
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
+      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-0}
     healthcheck:
       test: ["CMD-SHELL", "nc -z filer-3 8888 && nc -z filer-3 8889 || exit 1"]
       interval: 10s

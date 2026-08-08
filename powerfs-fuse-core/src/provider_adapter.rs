@@ -260,10 +260,12 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
     // Scan the saved bytes (before decode_file_layout consumed them) because
     // decode_file_layout's while-loop skips unknown fields including ReplicaChunks.
-    let replica_chunks: Vec<powerfs_common::traits::FileChunk> =
-        scan_tlv_for_field(&remaining_before_layout, powerfs_net::FieldId::ReplicaChunks)
-            .map(|bytes| parse_replica_chunks(&bytes))
-            .unwrap_or_default();
+    let replica_chunks: Vec<powerfs_common::traits::FileChunk> = scan_tlv_for_field(
+        &remaining_before_layout,
+        powerfs_net::FieldId::ReplicaChunks,
+    )
+    .map(|bytes| parse_replica_chunks(&bytes))
+    .unwrap_or_default();
 
     let entry_name = if name.is_empty() {
         let path_name = path.rsplit('/').next().unwrap_or(path);
@@ -319,12 +321,8 @@ fn scan_tlv_for_field(buf: &[u8], target: powerfs_net::FieldId) -> Option<Vec<u8
     let mut pos = 0;
     while pos + 5 <= buf.len() {
         let field_id = buf[pos];
-        let length = u32::from_be_bytes([
-            buf[pos + 1],
-            buf[pos + 2],
-            buf[pos + 3],
-            buf[pos + 4],
-        ]) as usize;
+        let length =
+            u32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
         pos += 5;
         if pos + length > buf.len() {
             break; // malformed

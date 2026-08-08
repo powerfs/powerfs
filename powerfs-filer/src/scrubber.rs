@@ -54,7 +54,15 @@ pub struct ScrubberWorker {
     volume_client: Arc<TlvVolumeClient>,
     net_handler: Arc<FilerNetHandler>,
     config: ScrubberConfig,
+    /// P6: EC 不可行标记 (volume 数 < data+parity 时置 true, 跳过 EC 转换).
+    /// 每 EC_RECHECK_CYCLES 轮重新检查一次, 支持扩容后自动恢复 EC.
+    ec_infeasible: std::sync::atomic::AtomicBool,
+    /// P6: EC 不可行后的扫描计数, 用于周期性重检
+    ec_skip_count: std::sync::atomic::AtomicU32,
 }
+
+/// P6: EC 不可行时, 每隔多少轮扫描重新检查一次 volume 数量
+const EC_RECHECK_CYCLES: u32 = 10;
 
 impl ScrubberWorker {
     pub fn new(
@@ -68,6 +76,8 @@ impl ScrubberWorker {
             volume_client,
             net_handler,
             config,
+            ec_infeasible: std::sync::atomic::AtomicBool::new(false),
+            ec_skip_count: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -290,6 +300,23 @@ impl ScrubberWorker {
         let parity_shards = self.config.ec_parity_shards as usize;
         let total_shards = data_shards + parity_shards;
 
+        // 快速跳过: 如果 EC 之前被判定为不可行, 只在周期性重检时重新检查
+        if self
+            .ec_infeasible
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let count = self
+                .ec_skip_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % EC_RECHECK_CYCLES != 0 {
+                return Ok(());
+            }
+            debug!(
+                "P6_SCRUBBER: EC was infeasible, re-checking (cycle {})",
+                count
+            );
+        }
+
         let pending = self
             .meta_shard_manager
             .list_pending_ec(self.config.ec_min_file_size);
@@ -297,22 +324,52 @@ impl ScrubberWorker {
             return Ok(());
         }
 
-        info!(
-            "P6_SCRUBBER: found {} Replicated inodes eligible for EC",
-            pending.len()
-        );
-
         let volume_addrs = self.net_handler.get_all_volume_addrs();
         if (volume_addrs.len() as usize) < total_shards {
-            warn!(
-                "P6_SCRUBBER: only {} volumes available, need >= {} for EC({}+{})",
-                volume_addrs.len(),
-                total_shards,
-                data_shards,
-                parity_shards
-            );
+            // EC 不可行: volume 数不足. 标记并跳过, 避免每轮重复日志.
+            if !self
+                .ec_infeasible
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                // 首次检测到不可行, 打印 warn 级别日志
+                warn!(
+                    "P6_SCRUBBER: EC disabled — only {} volumes available, need >= {} for EC({}+{}). \
+                     Files will stay in Replicated state. Will re-check every {} scans.",
+                    volume_addrs.len(),
+                    total_shards,
+                    data_shards,
+                    parity_shards,
+                    EC_RECHECK_CYCLES,
+                );
+            } else {
+                debug!(
+                    "P6_SCRUBBER: EC still infeasible ({} < {} volumes)",
+                    volume_addrs.len(),
+                    total_shards
+                );
+            }
             return Ok(());
         }
+
+        // EC 可行, 清除不可行标记
+        if self
+            .ec_infeasible
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                "P6_SCRUBBER: EC re-enabled — {} volumes available (need >= {})",
+                volume_addrs.len(),
+                total_shards
+            );
+        }
+        self.ec_skip_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        info!(
+            "P6_SCRUBBER: found {} Replicated inodes eligible for EC, {} volumes available",
+            pending.len(),
+            volume_addrs.len()
+        );
 
         let addr_map: std::collections::HashMap<u64, String> =
             volume_addrs.iter().cloned().collect();
@@ -329,7 +386,45 @@ impl ScrubberWorker {
 
             match self.ec_convert_inode(inode, &chunks, &addr_map).await {
                 Ok(ec_chunks) => {
+                    // P6 CAS: 提交前重新检查 chunks 是否变化 (防止转换期间被写).
+                    // 如果 chunks 变了, 说明文件被追加写/截断, Fix 1 已将状态
+                    // 回退到 PendingReplicated. 此时提交旧数据的 EC shards 会覆盖
+                    // 新数据, 必须放弃. 文件会在下次 scan 重新走完整管线.
+                    let current_info = self.meta_shard_manager.get_inode(inode);
+                    match current_info {
+                        Some(ref info) if info.chunks != chunks => {
+                            debug!(
+                                "P6_SCRUBBER: inode {} chunks changed during EC conversion, \
+                                 aborting (will retry next scan after re-replication)",
+                                inode
+                            );
+                            continue;
+                        }
+                        None => {
+                            debug!(
+                                "P6_SCRUBBER: inode {} disappeared during EC conversion, skipping",
+                                inode
+                            );
+                            continue;
+                        }
+                        _ => {} // chunks 未变, 安全提交
+                    }
+
                     let shard_size = ec_chunks.first().map(|c| c.size).unwrap_or(0);
+                    // 在 move 到 update_to_ec 之前, 先记录每个 shard 的位置
+                    // (volume_id, needle_id, addr), 便于降级读测试定位并删除特定分片.
+                    let shard_details: Vec<String> = ec_chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let addr = addr_map.get(&c.volume_id).cloned().unwrap_or_default();
+                            let kind = if i < data_shards { "D" } else { "P" };
+                            format!(
+                                "{}[{}]:vol={} needle={:#x}@{}",
+                                kind, i, c.volume_id, c.needle_id, addr
+                            )
+                        })
+                        .collect();
                     let reliability = Reliability::EC {
                         data: self.config.ec_data_shards,
                         parity: self.config.ec_parity_shards,
@@ -348,8 +443,8 @@ impl ScrubberWorker {
                     {
                         Ok(()) => {
                             info!(
-                                "P6_SCRUBBER: inode {} EC converted, {}+{} shards ({}B each), state -> EC",
-                                inode, data_shards, parity_shards, shard_size
+                                "P6_SCRUBBER: inode {} EC converted, {}+{} shards ({}B each), state -> EC | shards=[{}]",
+                                inode, data_shards, parity_shards, shard_size, shard_details.join(", ")
                             );
                             processed += 1;
                             // Only convert one file per scan to avoid overload
