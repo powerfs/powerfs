@@ -624,6 +624,7 @@ impl MsgType {
             0x0034 => Some(Self::UpdateInodeSizeChunks),
             0x0035 => Some(Self::OpenCountInc),
             0x0036 => Some(Self::OpenCountDec),
+            0x0037 => Some(Self::MigrateInlineAlloc),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),

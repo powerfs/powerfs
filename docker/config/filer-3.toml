@@ -34,6 +34,7 @@ data_dir = "/data/filer"
 shard_count = 2
 raft_id = 3
 raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
+inline_max_size = 4096           # P2.5: Inline 小文件优化 (4KB 阈值, 超过自动迁移 Flat)
 
 [s3]
 port = 9000

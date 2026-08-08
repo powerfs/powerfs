@@ -219,7 +219,7 @@ services:
     container_name: filer-1
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.35
+        ipv4_address: 172.30.0.31
     volumes:
       - filer-1-data:/data/filer
       - ./config/filer-1.toml:/app/config/filer.toml:ro
@@ -249,7 +249,7 @@ services:
     container_name: filer-2
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.36
+        ipv4_address: 172.30.0.32
     volumes:
       - filer-2-data:/data/filer
       - ./config/filer-2.toml:/app/config/filer.toml:ro
@@ -279,7 +279,7 @@ services:
     container_name: filer-3
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.37
+        ipv4_address: 172.30.0.33
     volumes:
       - filer-3-data:/data/filer
       - ./config/filer-3.toml:/app/config/filer.toml:ro
