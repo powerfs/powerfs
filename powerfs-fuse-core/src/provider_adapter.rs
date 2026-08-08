@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use powerfs_coherence::ChunkWire;
 use powerfs_common::{
     error::{PowerFsError, Result},
     traits::{
@@ -9,6 +8,11 @@ use powerfs_common::{
     },
     types::{Fid, NodeId, VolumeId, VolumeInfo},
 };
+use powerfs_layout::codec::{decode_file_layout, encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
+use powerfs_layout::encoding::ChunkEncoding;
+use powerfs_layout::layout::FileLayout;
+use powerfs_layout::placement::Placement;
+use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::FieldId;
 use std::sync::Arc;
@@ -81,22 +85,27 @@ fn build_create_tlv_with_chunks(
     let _ = enc.add_u64(FieldId::Uid, uid);
     let _ = enc.add_u64(FieldId::Gid, gid);
 
-    // Encode chunk info for persistence on Filer (JSON-serialized ChunkWire list)
-    let wire_list: Vec<ChunkWire> = chunks
-        .iter()
-        .map(|c| ChunkWire {
-            offset: c.offset,
-            size: c.size,
-            needle_id: c.needle_id,
-            volume_id: c.volume_id,
-            crc32: c.crc32,
-            mtime: c.mtime,
-        })
-        .collect();
-    if !wire_list.is_empty() {
-        if let Ok(json_bytes) = serde_json::to_vec(&wire_list) {
-            let _ = enc.add_bytes(FieldId::Chunks, &json_bytes);
-        }
+    // Encode chunk info as binary FileLayout TLV (replaces JSON Chunks).
+    if !chunks.is_empty() {
+        let chunk_refs: Vec<powerfs_layout::encoding::ChunkRef> = chunks
+            .iter()
+            .map(|c| powerfs_layout::encoding::ChunkRef {
+                offset: c.offset,
+                size: c.size,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
+                crc32: c.crc32,
+                mtime: c.mtime,
+            })
+            .collect();
+        let layout = FileLayout {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::default(),
+            compression: CompressionState::default(),
+            encoding: ChunkEncoding::PerChunk { chunks: chunk_refs },
+        };
+        let _ = encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2);
     }
 
     enc.into_bytes()
@@ -206,25 +215,43 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         name
     );
 
-    // Parse chunk info from FieldId::Chunks (JSON-serialized ChunkWire list).
-    // If Chunks field is absent, return an empty chunks list.
-    let chunks_bytes = dec.next_bytes(FieldId::Chunks).ok();
+    // Decode FileLayout from remaining TLV fields (binary TLV, replaces JSON Chunks).
+    // If no layout fields are present, decode_file_layout returns a default
+    // FileLayout with empty ChunkEncoding::PerChunk.
+    let layout = decode_file_layout(&mut dec).unwrap_or(FileLayout {
+        placement: Placement::Flat,
+        reliability: Reliability::SingleReplica,
+        reliability_state: ReliabilityState::default(),
+        compression: CompressionState::default(),
+        encoding: ChunkEncoding::PerChunk { chunks: Vec::new() },
+    });
 
-    let mut chunks: Vec<powerfs_common::traits::FileChunk> = Vec::new();
-    if let Some(json_bytes) = chunks_bytes {
-        if let Ok(wire_list) = serde_json::from_slice::<Vec<ChunkWire>>(&json_bytes) {
-            for w in wire_list {
-                chunks.push(powerfs_common::traits::FileChunk {
-                    offset: w.offset,
-                    size: w.size,
-                    needle_id: w.needle_id,
-                    volume_id: w.volume_id,
-                    crc32: w.crc32,
-                    mtime: w.mtime,
-                });
-            }
-        }
-    }
+    let chunks: Vec<powerfs_common::traits::FileChunk> = match &layout.encoding {
+        ChunkEncoding::PerChunk { chunks } => chunks
+            .iter()
+            .map(|c| powerfs_common::traits::FileChunk {
+                offset: c.offset,
+                size: c.size,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
+                crc32: c.crc32,
+                mtime: c.mtime,
+            })
+            .collect(),
+        ChunkEncoding::Paginated { chunks, .. } => chunks
+            .iter()
+            .map(|c| powerfs_common::traits::FileChunk {
+                offset: c.offset,
+                size: c.size,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
+                crc32: c.crc32,
+                mtime: c.mtime,
+            })
+            .collect(),
+        // InlineData / StripeDescriptor: no per-chunk list to extract
+        _ => Vec::new(),
+    };
 
     let entry_name = if name.is_empty() {
         let path_name = path.rsplit('/').next().unwrap_or(path);

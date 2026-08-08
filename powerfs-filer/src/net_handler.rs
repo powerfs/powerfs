@@ -11,7 +11,11 @@ use crate::raft_group_manager::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
-use powerfs_coherence::ChunkWire;
+use powerfs_layout::codec::{encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
+use powerfs_layout::encoding::{ChunkEncoding, ChunkRef};
+use powerfs_layout::layout::FileLayout;
+use powerfs_layout::placement::Placement;
+use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
@@ -297,53 +301,40 @@ impl FilerNetHandler {
         }
     }
 
-    /// 将 InodeInfo 的 chunks 列表 + fid/volume_id 序列化到 TLV encoder。
+    /// 将 InodeInfo 的 chunks 列表序列化为二进制 FileLayout TLV 字段。
     ///
-    /// 同时输出两套字段以保证兼容性：
-    /// 1. **完整列表**（新协议）：`FieldId::Chunks` = JSON 序列化的 `Vec<ChunkWire>`，
-    ///    fuse 端优先解析此字段，可获取多 chunk 文件的完整数据布局。
-    /// 2. **首 chunk 字段**（旧协议）：`Fid`/`VolumeId`/`Cookie`/`FileKey`/`Size`，
-    ///    仅包含首 chunk 信息，供旧客户端兼容读取单 chunk 文件。
+    /// 使用 `powerfs_layout::encode_file_layout` 编码 (FEATURE_CHUNK_LAYOUT_V2),
+    /// 输出 Placement + Reliability + ChunkEncoding 的二进制 TLV 字段,
+    /// 替代旧版 JSON `FieldId::Chunks` 编码 (已废弃, 不再向后兼容).
     ///
-    /// 修复历史 bug：`handle_getattr` 之前完全缺失 chunks 序列化，
-    /// 导致 `get_entry_by_inode` 拿到的 chunks 列表恒为空，跨客户端读文件时
-    /// 因 chunks 为空而触发 I/O error。
+    /// 构建 FileLayout 策略:
+    /// - Placement::Flat (常规文件, 单 volume)
+    /// - Reliability::SingleReplica (默认无冗余)
+    /// - ChunkEncoding::PerChunk (完整 chunk 列表)
     fn encode_chunks_fields(enc: &mut TlvEncoder, info: &InodeInfo) -> Result<(), NetError> {
-        // 完整 chunks 列表（JSON）
-        if !info.chunks.is_empty() {
-            let wire_list: Vec<ChunkWire> = info
-                .chunks
-                .iter()
-                .map(|c| ChunkWire {
-                    offset: c.offset,
-                    size: c.size,
-                    mtime: c.mtime,
-                    needle_id: c.needle_id,
-                    volume_id: c.volume_id,
-                    crc32: c.crc32,
-                })
-                .collect();
-            if let Ok(json) = serde_json::to_vec(&wire_list) {
-                enc.add_bytes(FieldId::Chunks, &json)?;
-            }
-        }
-        // 兼容旧字段：首 chunk + 全局 fid/volume_id
-        if let Some(ref fid) = info.fid {
-            enc.add_string(FieldId::Fid, fid)?;
-        }
-        if let Some(volume_id) = info.volume_id {
-            enc.add_u64(FieldId::VolumeId, volume_id);
-        }
-        // Note: Do NOT add FieldId::Size here — the caller already adds the
-        // correct total file size (entry_info.size) before calling us. Adding
-        // chunk.size (first chunk's size, e.g. 2MB) would create a duplicate
-        // Size field, and TLV decoders that pick the last occurrence would
-        // return the chunk size instead of the total file size, breaking
-        // cross-client visibility (e.g. stat shows 2MB for a 20MB file).
-        if let Some(chunk) = info.chunks.first() {
-            enc.add_u64(FieldId::Cookie, 0);
-            enc.add_u64(FieldId::FileKey, chunk.needle_id);
-        }
+        let chunks: Vec<ChunkRef> = info
+            .chunks
+            .iter()
+            .map(|c| ChunkRef {
+                offset: c.offset,
+                size: c.size,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
+                crc32: c.crc32,
+                mtime: c.mtime,
+            })
+            .collect();
+
+        let layout = FileLayout {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::default(),
+            compression: CompressionState::default(),
+            encoding: ChunkEncoding::PerChunk { chunks },
+        };
+
+        encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+            .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
         Ok(())
     }
 
