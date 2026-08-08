@@ -1644,12 +1644,17 @@ impl FileSystem for PowerFsFs {
                 create_ms,
                 t0.elapsed().as_millis()
             );
-            // 初始化空 inline buffer + 记录阈值
+            // 初始化空 inline buffer + 记录阈值.
+            // dirty=true: CREATE 时 Filer 仅返回 Placement::Inline 但未持久化
+            // inline_data (inline_data=None). 即使无 WRITE, release 也必须 sync
+            // inline_data=Some(empty) 让 Filer 记录 InlineData{vec![]}, 否则文件
+            // 在 Filer 端既无 chunks 又无 inline_data, 重开后 read 走 Flat 路径
+            // (fid=None) → EIO. 这也是 P2.5c 0 字节文件优化的基础.
             self.inline_buffers.insert(
                 inode,
                 InlineBuffer {
                     data: Vec::with_capacity(inline_max),
-                    dirty: false,
+                    dirty: true,
                 },
             );
             self.inline_max_sizes.insert(inode, inline_max as u32);
