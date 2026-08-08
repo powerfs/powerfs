@@ -397,11 +397,19 @@ fn build_write_tlv(
 }
 
 /// 构建写操作的 TLV 请求体（带 inode 用于 lease 校验）
+///
+/// P3 fix: chunk data is NOT included in the TLV body. It is sent in the
+/// frame's DATA segment (up to 2MB) via `send_write_needle_direct(data)`.
+/// The server's R5 protocol validation rejects bodies > 256KB (MAX_BODY_SIZE),
+/// so putting 1MB+ chunk data in the body causes "body_len exceeds
+/// MAX_BODY_SIZE" errors and connection drops. The server-side handler
+/// prefers `msg.data` and falls back to the DataLen TLV field for backward
+/// compatibility — since we always send data in the DATA segment now, the
+/// fallback path is never taken.
 fn build_write_tlv_with_inode(
     volume_id: u64,
     file_key: u64,
     inode: u64,
-    data: &[u8],
     lease_token: Option<&str>,
     client_id: Option<&str>,
 ) -> Vec<u8> {
@@ -409,7 +417,6 @@ fn build_write_tlv_with_inode(
     enc.add_u64(FieldId::Ino, volume_id);
     enc.add_u64(FieldId::FileKey, file_key);
     enc.add_u64(FieldId::Inode, inode); // inode for lease validation
-    let _ = enc.add_bytes(FieldId::DataLen, data);
     if let Some(token) = lease_token {
         if !token.is_empty() {
             let _ = enc.add_string(FieldId::LeaseToken, token);
@@ -1186,6 +1193,44 @@ impl FacadeStorageProvider {
             client_id
         );
 
+        // P3: If the volume is not in the local router (e.g., topology sync
+        // is incomplete or the Filer allocated a volume the FUSE client hasn't
+        // discovered yet), resolve it from the Master before submitting the
+        // lease request. Without this, process_lease_request_internal returns
+        // VolumeNotFound and the flush fails silently.
+        if self.facade.volume_client().get_volume(vid).is_none() {
+            log::debug!(
+                "ensure_lease: volume {} not in router, resolving from Master",
+                vid
+            );
+            let vol_provider = FacadeVolumeProvider::new(self.facade.clone());
+            use powerfs_common::traits::VolumeProvider;
+            match vol_provider.lookup_volume(VolumeId(vid)).await {
+                Ok(locations) if !locations.is_empty() => {
+                    self.facade
+                        .volume_client()
+                        .resolve_and_set_volume_route(vid, &locations);
+                    log::info!(
+                        "ensure_lease: resolved volume {} -> {} locations, added to router",
+                        vid,
+                        locations.len()
+                    );
+                }
+                Ok(_) => {
+                    return Err(PowerFsError::Internal(format!(
+                        "Volume {} not found in Master topology (empty locations)",
+                        vid
+                    )));
+                }
+                Err(e) => {
+                    return Err(PowerFsError::Internal(format!(
+                        "Failed to look up volume {} from Master: {}",
+                        vid, e
+                    )));
+                }
+            }
+        }
+
         let result = self
             .facade
             .submit_lease_request(vid, payload)
@@ -1335,11 +1380,13 @@ impl FacadeStorageProvider {
 
         let client_id = self.facade.client_id();
 
+        // P3 fix: chunk data goes in the frame's DATA segment, not the TLV
+        // body. The server's R5 check rejects bodies > 256KB; 1MB chunks in
+        // the body caused "body_len exceeds MAX_BODY_SIZE" + connection drops.
         let payload = build_write_tlv_with_inode(
             volume_id,
             file_key,
             inode,
-            data,
             Some(&token),
             Some(&client_id),
         );
@@ -1358,7 +1405,7 @@ impl FacadeStorageProvider {
         //       让 process_data_request_internal 直接返回结果给 submit_data_request_and_wait，
         //       然后恢复走 data_queue 以获得并发控制能力。
         self.facade
-            .send_write_needle_direct(volume_id, payload)
+            .send_write_needle_direct(volume_id, payload, data)
             .await
             .map_err(|e| {
                 PowerFsError::Internal(format!("Facade write_blob_with_lease failed: {}", e))

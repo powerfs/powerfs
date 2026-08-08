@@ -184,28 +184,46 @@ impl FilerNetHandler {
     }
 
     /// P3: 为 Stripe 文件分配多个 (volume_id, needle_id) 对.
-    /// 使用 round-robin 跨 Zone 分配, 实现 anti-affinity (不同 chunk 落不同 volume).
-    /// 返回 Vec<(volume_id, needle_id)>, 长度 == count.
-    /// 若可用 volume 不足, 返回 None.
+    /// anti-affinity: 尽量让每个 chunk 落在不同 volume, 实现跨磁盘并行 I/O.
+    /// 若可用 volume 数 >= count, 每个 chunk 落不同 volume.
+    /// 若可用 volume 数 < count, round-robin 复用 volume.
+    /// 返回 Vec<(volume_id, needle_id)>, 长度 == count. 若无可用 volume, 返回 None.
     fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
-        let mut result = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            match self.alloc_for_new_file() {
-                Some(v) => result.push(v),
-                None => {
-                    warn!(
-                        "FILER_P3: alloc_for_stripe_file failed after {}/{} allocations",
-                        result.len(),
-                        count
-                    );
-                    return None;
-                }
+        let zones = self.zones.read().unwrap();
+        if zones.is_empty() {
+            warn!("FILER_P3: no zones registered, cannot allocate stripe chunks");
+            return None;
+        }
+
+        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, zone_idx) 用于后续分配
+        let mut all_volumes: Vec<(u64, usize)> = Vec::new();
+        for (zidx, zone) in zones.iter().enumerate() {
+            for vol in &zone.volumes {
+                all_volumes.push((vol.volume_id, zidx));
             }
         }
+        if all_volumes.is_empty() {
+            warn!("FILER_P3: no volumes available for stripe allocation");
+            return None;
+        }
+
+        let num_volumes = all_volumes.len();
+        let mut result = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            // round-robin 选 volume, 实现 anti-affinity
+            let (volume_id, zidx) = all_volumes[i % num_volumes];
+            let zone = &zones[zidx];
+            let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+            result.push((volume_id, needle_id));
+        }
+
+        let unique_volumes: std::collections::HashSet<u64> =
+            result.iter().map(|(v, _)| *v).collect();
         info!(
-            "FILER_P3: allocated {} stripe chunks across {} volumes",
+            "FILER_P3: allocated {} stripe chunks across {} unique volumes ({} total available)",
             result.len(),
-            result.iter().map(|(v, _)| *v).collect::<std::collections::HashSet<_>>().len()
+            unique_volumes.len(),
+            num_volumes
         );
         Some(result)
     }
@@ -819,16 +837,20 @@ impl FilerNetHandler {
         }
 
         // === P2.5/P3: 决定 Inline vs Stripe vs Flat ===
-        // Inline: 数据直接存 Filer 元数据, 绕过 Volume Server (微小文件 < max_size).
-        // Stripe: 多 volume 并行 (父目录 powerfs.placement=stripe:N:size).
-        // Flat: 单 volume (默认).
-        let inline_max = self.resolve_inline_max_size(parent_ino);
+        // 优先级: 显式 Stripe/WideStripe > Inline > Flat
+        // - 若父目录设了 powerfs.placement=stripe:..., 使用 Stripe (忽略 Inline)
+        // - 否则 Inline (微小文件 < max_size) + Flat (大文件) 共存
+        let placement_spec = self.resolve_placement_spec(parent_ino);
+        let is_explicit_stripe = matches!(
+            placement_spec,
+            Some(PlacementSpec::Stripe { .. }) | Some(PlacementSpec::WideStripe { .. })
+        );
 
-        // P3: 解析父目录 placement xattr (仅在非 Inline 时生效)
-        let placement_spec = if inline_max.is_none() {
-            self.resolve_placement_spec(parent_ino)
-        } else {
+        // Inline 仅在未显式指定 Stripe 时生效
+        let inline_max = if is_explicit_stripe {
             None
+        } else {
+            self.resolve_inline_max_size(parent_ino)
         };
 
         // P3: Stripe 模式预分配 N 个 (volume_id, needle_id)

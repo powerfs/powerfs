@@ -873,9 +873,10 @@ impl FuseClientFacade {
         &self,
         volume_id: u64,
         payload: Vec<u8>,
+        data: &[u8],
     ) -> Result<Vec<u8>, String> {
         self.volume_client
-            .send_write_needle_direct(volume_id, payload)
+            .send_write_needle_direct(volume_id, payload, data)
             .await
             .map_err(|e| format!("Direct WriteNeedle failed: {}", e))
     }

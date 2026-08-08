@@ -1,0 +1,21 @@
+[global]
+ioengine=sync
+direct=1
+group_reporting=1
+time_based=0
+bs=1m
+size=128m
+
+[seq-write]
+description=Sequential write 1MB bs 128MB
+directory=/mnt/fuse/fio-stripe
+numjobs=1
+rw=write
+filename=fio-stripe-write
+
+[seq-read]
+description=Sequential read 1MB bs 128MB
+directory=/mnt/fuse/fio-stripe
+numjobs=1
+rw=read
+filename=fio-stripe-read

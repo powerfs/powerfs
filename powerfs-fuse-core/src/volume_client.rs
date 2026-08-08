@@ -1234,6 +1234,7 @@ impl VolumeClient {
         &self,
         volume_id: u64,
         payload: Vec<u8>,
+        data: &[u8],
     ) -> ClientResult<Vec<u8>> {
         let volume = self
             .volume_router
@@ -1242,16 +1243,18 @@ impl VolumeClient {
             .ok_or(ClientError::VolumeNotFound(volume_id))?;
 
         // write_needle 走 data 通路 (大帧, 与 lease 小请求物理隔离).
+        // P3 fix: chunk data is sent in the frame's DATA segment (up to 2MB),
+        // not in the TLV body. The server's R5 check rejects bodies > 256KB.
         log::debug!(
-            "send_write_needle_direct: channel=data addr={} volume={} payload_len={}",
-            volume.addr, volume_id, payload.len()
+            "send_write_needle_direct: channel=data addr={} volume={} payload_len={} data_len={}",
+            volume.addr, volume_id, payload.len(), data.len()
         );
         let vol_client = self
             .get_or_create_volume_client_channel(&volume.addr, CHANNEL_DATA)
             .await?;
 
         let result = vol_client
-            .send_request(powerfs_net::MsgType::WriteNeedle, &payload, &[])
+            .send_request(powerfs_net::MsgType::WriteNeedle, &payload, data)
             .await;
 
         match result {

@@ -3087,10 +3087,12 @@ impl FileSystem for PowerFsFs {
                 return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
             }
 
-            // Build chunk_map for O(1) needle_id lookup (read-before-write)
-            let chunk_map: HashMap<u64, (u64, u64)> = stripe_chunks
+            // Build chunk_map for O(1) needle_id lookup (read-before-write).
+            // Include chunk.size so we can skip read-before-write for pre-allocated
+            // chunks that have never been flushed (size==0 → needle not on volume).
+            let chunk_map: HashMap<u64, (u64, u64, u64)> = stripe_chunks
                 .iter()
-                .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                .map(|c| (c.offset, (c.needle_id, c.volume_id, c.size)))
                 .collect();
 
             drop(_meta_guard); // Drop metadata lock before per-chunk writes
@@ -3142,7 +3144,23 @@ impl FileSystem for PowerFsFs {
                         );
                         vec![0u8; in_chunk_start + bytes_to_write]
                     } else if content_size_before_write > chunk_start_offset {
-                        // Partial write within existing data — read back from volume
+                        // Partial write within existing data — check if chunk
+                        // has been flushed to volume. Pre-allocated Stripe chunks
+                        // have size==0 until flushed; reading them returns "needle
+                        // not found". Skip read for un-flushed chunks (use zeros).
+                        let chunk_flushed = chunk_map
+                            .get(&chunk_start_offset)
+                            .map(|(_, _, size)| *size > 0)
+                            .unwrap_or(false);
+                        if !chunk_flushed {
+                            debug!(
+                                "write stripe: skip read-before-write (un-flushed) \
+                                 inode={} chunk_offset={}",
+                                inode, chunk_start_offset
+                            );
+                            vec![0u8; in_chunk_start + bytes_to_write]
+                        } else {
+                        // Chunk has been flushed — read back from volume
                         let existing_len = std::cmp::min(
                             chunk_size,
                             content_size_before_write - chunk_start_offset,
@@ -3155,10 +3173,11 @@ impl FileSystem for PowerFsFs {
                         )
                         .unwrap_or_else(|| {
                             // Fallback: try chunk_map, then first chunk
-                            chunk_map
+                            let (vid, nid, _) = chunk_map
                                 .get(&chunk_start_offset)
                                 .copied()
-                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id))
+                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id, 0));
+                            (vid, nid)
                         });
                         let rbw_addr = self.client.get_volume_addr(rbw_vol_id).ok();
                         let mut base = if let Some(ref addr) = rbw_addr {
@@ -3186,6 +3205,7 @@ impl FileSystem for PowerFsFs {
                             base.resize(needed_len, 0);
                         }
                         base
+                        } // close `else` of chunk_flushed check
                     } else {
                         vec![0u8; in_chunk_start + bytes_to_write]
                     };
@@ -4325,20 +4345,36 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
-        // P3: Persist powerfs.* xattrs to Filer via Raft (for placement policy inheritance)
-        if name_str.starts_with("powerfs.") {
+        // P3: Persist powerfs.* xattrs to Filer via Raft (for placement policy inheritance).
+        // The `attr`/`setfattr` tool sends names in the "user." namespace, so
+        // "user.powerfs.placement" must be normalized to "powerfs.placement"
+        // before sending to the Filer (which stores keys without "user." prefix).
+        // The local cache keeps the ORIGINAL name so the kernel can find it.
+        let normalized_name = if name_str.starts_with("user.powerfs.") {
+            &name_str[5..] // strip "user." → "powerfs.*"
+        } else {
+            name_str
+        };
+
+        if normalized_name.starts_with("powerfs.") {
             let meta_client = self.client.facade().meta_shard_client().clone();
             let value_owned = value.to_vec();
-            let name_owned = name_str.to_string();
+            let name_for_rpc = normalized_name.to_string();
             match self.client.block_on(async move {
                 let shard_id = meta_client.calculate_shard_id(inode);
-                meta_client.set_xattr(shard_id, inode, &name_owned, &value_owned).await
+                meta_client.set_xattr(shard_id, inode, &name_for_rpc, &value_owned).await
             }) {
                 Ok(()) => {
-                    info!("setxattr: persisted {} on inode {} to Filer", name_str, inode);
+                    info!(
+                        "setxattr: persisted {} on inode {} to Filer (original={})",
+                        normalized_name, inode, name_str
+                    );
                 }
                 Err(e) => {
-                    warn!("setxattr: failed to persist {} on inode {}: {}", name_str, inode, e);
+                    warn!(
+                        "setxattr: failed to persist {} on inode {}: {}",
+                        normalized_name, inode, e
+                    );
                     return Err(std::io::Error::from_raw_os_error(libc::EIO));
                 }
             }
@@ -4375,7 +4411,52 @@ impl FileSystem for PowerFsFs {
                 Ok(GetxattrReply::Value(value))
             }
         } else {
-            Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+            // P3: Cache miss for powerfs.* xattr — fetch from Filer.
+            // Normalize "user.powerfs.*" → "powerfs.*" for the Filer lookup
+            // (Filer stores keys without the "user." namespace prefix).
+            // Cache the result with the ORIGINAL name so the kernel finds it.
+            let normalized_name = if name_str.starts_with("user.powerfs.") {
+                &name_str[5..]
+            } else {
+                name_str
+            };
+
+            if normalized_name.starts_with("powerfs.") {
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let name_for_rpc = normalized_name.to_string();
+                match self.client.block_on(async move {
+                    let shard_id = meta_client.calculate_shard_id(inode);
+                    meta_client.get_xattr(shard_id, inode, &name_for_rpc).await
+                }) {
+                    Ok(value) => {
+                        debug!(
+                            "getxattr: fetched {} from Filer for inode {} ({} bytes, original={})",
+                            normalized_name,
+                            inode,
+                            value.len(),
+                            name_str
+                        );
+                        // Cache with the ORIGINAL name (kernel uses "user.powerfs.*").
+                        self.cache.set_xattr(inode, name_str, &value);
+                        if size == 0 {
+                            Ok(GetxattrReply::Count(value.len() as u32))
+                        } else if value.len() > size as usize {
+                            Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+                        } else {
+                            Ok(GetxattrReply::Value(value))
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "getxattr: {} not found on Filer for inode {}: {}",
+                            normalized_name, inode, e
+                        );
+                        Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+                    }
+                }
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+            }
         }
     }
 
