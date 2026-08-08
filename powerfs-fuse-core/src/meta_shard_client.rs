@@ -1153,6 +1153,58 @@ impl MetaShardClient {
         Ok((volume_id, needle_id))
     }
 
+    /// P3: Set an extended attribute on an inode (persisted via Raft on Filer).
+    /// Used to set `powerfs.placement` xattr on directories for stripe policy.
+    pub async fn set_xattr(
+        &self,
+        shard_id: u64,
+        inode: u64,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), String> {
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, shard_id);
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_string(FieldId::XattrKey, key)
+            .map_err(|e| format!("encode xattr key: {:?}", e))?;
+        enc.add_bytes(FieldId::XattrValue, value)
+            .map_err(|e| format!("encode xattr value: {:?}", e))?;
+
+        let body = enc.into_bytes();
+        self.send_coherence_msg(powerfs_net::MsgType::SetXattr, shard_id, body)
+            .await?;
+        Ok(())
+    }
+
+    /// P3: Get an extended attribute from an inode.
+    pub async fn get_xattr(
+        &self,
+        shard_id: u64,
+        inode: u64,
+        key: &str,
+    ) -> Result<Vec<u8>, String> {
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, shard_id);
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_string(FieldId::XattrKey, key)
+            .map_err(|e| format!("encode xattr key: {:?}", e))?;
+
+        let body = enc.into_bytes();
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::GetXattr, shard_id, body)
+            .await?;
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        dec.next_bytes(FieldId::XattrValue)
+            .map_err(|e| format!("get_xattr: response missing XattrValue: {:?}", e))
+    }
+
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
     ///
     /// TLV 编码: Request = ShardId + Ino
@@ -1432,6 +1484,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         placement: None,
         inline_data: None,
         inline_max_size: None,
+        chunks: Vec::new(),
     }
 }
 
@@ -1455,6 +1508,11 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
         attr.inline_data = match &layout.encoding {
             powerfs_layout::encoding::ChunkEncoding::InlineData { data } => Some(data.clone()),
             _ => None,
+        };
+        // P3: Extract chunks from PerChunk encoding (for Stripe/Flat with explicit chunks)
+        attr.chunks = match &layout.encoding {
+            powerfs_layout::encoding::ChunkEncoding::PerChunk { chunks } => chunks.clone(),
+            _ => Vec::new(),
         };
         attr.placement = Some(layout.placement);
     }

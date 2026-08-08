@@ -3738,6 +3738,25 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
+        // P3: Persist powerfs.* xattrs to Filer via Raft (for placement policy inheritance)
+        if name_str.starts_with("powerfs.") {
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let value_owned = value.to_vec();
+            let name_owned = name_str.to_string();
+            match self.client.block_on(async move {
+                let shard_id = meta_client.calculate_shard_id(inode);
+                meta_client.set_xattr(shard_id, inode, &name_owned, &value_owned).await
+            }) {
+                Ok(()) => {
+                    info!("setxattr: persisted {} on inode {} to Filer", name_str, inode);
+                }
+                Err(e) => {
+                    warn!("setxattr: failed to persist {} on inode {}: {}", name_str, inode, e);
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+            }
+        }
+
         self.cache.set_xattr(inode, name_str, value);
         Ok(())
     }

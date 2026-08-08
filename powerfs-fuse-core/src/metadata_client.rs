@@ -43,6 +43,10 @@ pub struct MetadataAttr {
     /// P2.5: Inline 阈值 (来自 CREATE 响应 Placement::Inline.max_size).
     /// 客户端据此判断累计写入是否超阈值 (需迁移到 Flat).
     pub inline_max_size: Option<u32>,
+    /// P3: Chunk 列表 (来自 CREATE/GETATTR 响应的 ChunkEncoding::PerChunk).
+    /// Stripe 模式下, 每个 chunk 对应一个 stripe unit (volume_id + needle_id).
+    /// Flat 模式下, 通常为单个 chunk.
+    pub chunks: Vec<powerfs_layout::encoding::ChunkRef>,
 }
 
 impl MetadataAttr {
@@ -57,6 +61,14 @@ impl MetadataAttr {
         matches!(
             self.placement.as_ref(),
             Some(Placement::Inline { .. })
+        )
+    }
+
+    /// P3: 文件是否以 Stripe 模式存储 (多 volume 并行).
+    pub fn is_stripe(&self) -> bool {
+        matches!(
+            self.placement.as_ref(),
+            Some(Placement::Stripe { .. } | Placement::WideStripe { .. })
         )
     }
 }
