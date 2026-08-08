@@ -124,6 +124,7 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
     let mut stripe_count: Option<u32> = None;
     let mut start_volume_idx: Option<u32> = None;
     let mut volume_ids: Option<Vec<u64>> = None;
+    let mut volume_ids_range: Option<(u64, u32)> = None;
     let mut reliability: Option<Reliability> = None;
     let mut reliability_state = ReliabilityState::PendingReplicated;
     let mut compression = CompressionState::None;
@@ -151,6 +152,18 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
             FieldId::VolumeIds => {
                 volume_ids = Some(decode_volume_ids(dec.read_bytes(length)?)?);
             }
+            FieldId::VolumeIdsRange => {
+                let bytes = dec.read_bytes(length)?;
+                if bytes.len() != 12 {
+                    return Err(LayoutError::TlvDecode(format!(
+                        "VolumeIdsRange length {} != 12",
+                        bytes.len()
+                    )));
+                }
+                let start = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                volume_ids_range = Some((start, count));
+            }
             // --- Reliability ---
             FieldId::Reliability => {
                 reliability = Some(decode_reliability(dec.read_bytes(length)?)?);
@@ -172,6 +185,13 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
             _ => dec.skip(length)?,
         }
     }
+
+    // 展开 volume_ids_range (如果 volume_ids 未设置)
+    let volume_ids = volume_ids.or_else(|| {
+        volume_ids_range.map(|(start, count)| {
+            (0..count as u64).map(|i| start + i).collect()
+        })
+    });
 
     // 组装 Placement
     let placement = assemble_placement(
@@ -484,8 +504,27 @@ fn decode_encoding(bytes: &[u8]) -> LayoutResult<ChunkEncoding> {
 // 辅助函数: volume_ids / ChunkRef / 状态转换
 // =========================================================================
 
-/// 编码 volume_ids 为 bytes (FieldId::VolumeIds): u64 LE 数组
+/// 编码 volume_ids: 连续时用范围压缩 (VolumeIdsRange), 否则用完整列表 (VolumeIds).
+/// 范围压缩: [start: u64 LE] [count: u32 LE] = 12 bytes (+5 TLV overhead = 17 bytes)
+/// 完整列表: count × 8 bytes (+5 TLV overhead)
+/// 当 count ≥ 2 且连续时, 范围压缩更小 (17 < 5 + 2×8 = 21).
 fn encode_volume_ids(enc: &mut TlvEncoder, volume_ids: &[u64]) -> LayoutResult<()> {
+    // Check if volume_ids are contiguous (each = first + index)
+    if volume_ids.len() >= 2 {
+        let first = volume_ids[0];
+        let contiguous = volume_ids
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| v == first + i as u64);
+        if contiguous {
+            let mut buf = Vec::with_capacity(12);
+            buf.extend_from_slice(&first.to_le_bytes());
+            buf.extend_from_slice(&(volume_ids.len() as u32).to_le_bytes());
+            enc.add_bytes(FieldId::VolumeIdsRange, &buf)?;
+            return Ok(());
+        }
+    }
+    // Fallback: full list
     let mut buf = Vec::with_capacity(volume_ids.len() * 8);
     for vid in volume_ids {
         buf.extend_from_slice(&vid.to_le_bytes());
@@ -1243,6 +1282,80 @@ mod tests {
         assert_eq!(decoded.placement, layout.placement);
     }
 
+    #[test]
+    fn volume_ids_range_compression_contiguous() {
+        // 256 contiguous volume_ids should use VolumeIdsRange (12B) not VolumeIds (2048B)
+        let vol_ids: Vec<u64> = (1..=256).collect();
+        let layout = FileLayout {
+            placement: Placement::WideStripe {
+                stripe_size: 1024 * 1024,
+                stripe_count: 256,
+                start_volume_idx: 0,
+                volume_ids: vol_ids,
+            },
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::PendingReplicated,
+            compression: CompressionState::None,
+            encoding: ChunkEncoding::PerChunk { chunks: vec![] },
+        };
+        let mut enc = TlvEncoder::new();
+        encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).unwrap();
+        let bytes = enc.into_bytes();
+
+        // VolumeIdsRange field: 5 (TLV header) + 12 (payload) = 17 bytes
+        // VolumeIds field would be: 5 + 256*8 = 2053 bytes
+        // Total encoded size should be much smaller than 2053
+        assert!(
+            bytes.len() < 100,
+            "range-compressed encoding should be < 100 bytes, got {}",
+            bytes.len()
+        );
+
+        // Verify round-trip correctness
+        let mut dec = TlvDecoder::new(&bytes);
+        let decoded = decode_file_layout(&mut dec).unwrap();
+        assert_eq!(decoded.placement, layout.placement);
+    }
+
+    #[test]
+    fn volume_ids_range_compression_non_contiguous() {
+        // Non-contiguous volume_ids should fall back to full list
+        let vol_ids: Vec<u64> = vec![1, 3, 5, 7, 11]; // gaps
+        let layout = FileLayout {
+            placement: Placement::Stripe {
+                stripe_size: 1024 * 1024,
+                stripe_count: 5,
+                start_volume_idx: 0,
+                volume_ids: vol_ids,
+            },
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::PendingReplicated,
+            compression: CompressionState::None,
+            encoding: ChunkEncoding::PerChunk { chunks: vec![] },
+        };
+        let decoded = round_trip(&layout);
+        assert_eq!(decoded.placement, layout.placement);
+    }
+
+    #[test]
+    fn volume_ids_range_compression_single() {
+        // Single volume_id should use full list (range needs ≥ 2)
+        let layout = FileLayout {
+            placement: Placement::Stripe {
+                stripe_size: 1024 * 1024,
+                stripe_count: 1,
+                start_volume_idx: 0,
+                volume_ids: vec![42],
+            },
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::PendingReplicated,
+            compression: CompressionState::None,
+            encoding: ChunkEncoding::PerChunk { chunks: vec![] },
+        };
+        let decoded = round_trip(&layout);
+        assert_eq!(decoded.placement, layout.placement);
+    }
+
     // =================================================================
     // 二进制布局精确验证
     // =================================================================
@@ -1289,7 +1402,9 @@ mod tests {
 
     #[test]
     fn volume_ids_exact_byte_layout() {
-        let vol_ids = vec![1u64, 2, 3, 4];
+        // Use non-contiguous IDs to test full-list encoding path
+        // (contiguous IDs use VolumeIdsRange, tested separately)
+        let vol_ids = vec![1u64, 3, 5, 7];
         let mut enc = TlvEncoder::new();
         encode_volume_ids(&mut enc, &vol_ids).unwrap();
         let bytes = enc.into_bytes();
@@ -1300,9 +1415,9 @@ mod tests {
                 let data = dec.read_bytes(length).unwrap();
                 assert_eq!(data.len(), 32);
                 assert_eq!(&data[0..8], &1u64.to_le_bytes());
-                assert_eq!(&data[8..16], &2u64.to_le_bytes());
-                assert_eq!(&data[16..24], &3u64.to_le_bytes());
-                assert_eq!(&data[24..32], &4u64.to_le_bytes());
+                assert_eq!(&data[8..16], &3u64.to_le_bytes());
+                assert_eq!(&data[16..24], &5u64.to_le_bytes());
+                assert_eq!(&data[24..32], &7u64.to_le_bytes());
                 return;
             }
         }

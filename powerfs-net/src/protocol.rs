@@ -887,6 +887,11 @@ pub enum FieldId {
     /// GETATTR/LOOKUP 响应携带, 客户端读路径 failover 使用.
     /// 编码格式与 ChunkEncoding::PerChunk 的 chunk 列表相同 (每个 ChunkRef 44 字节).
     ReplicaChunks = 0xB5,
+
+    // ===== P5: WideStripe range compression (0xB6) =====
+    /// 范围压缩的 volume_ids: [start_volume_id: u64 LE] [count: u32 LE] = 12 bytes.
+    /// 当 volume_ids 连续时使用, 替代 VolumeIds (256卷 2KB→12B).
+    VolumeIdsRange = 0xB6,
 }
 
 impl FieldId {
@@ -983,6 +988,7 @@ impl FieldId {
             0xB3 => Some(Self::XattrKey),
             0xB4 => Some(Self::XattrValue),
             0xB5 => Some(Self::ReplicaChunks),
+            0xB6 => Some(Self::VolumeIdsRange),
             _ => None,
         }
     }
