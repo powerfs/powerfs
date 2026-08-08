@@ -45,7 +45,7 @@ secret_key = "powerfs123"
 [fuse]
 mount_point = "/mnt/powerfs"
 master_addresses = ["172.30.0.11"]
-filer_addresses = ["172.30.0.35"]
+filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
 volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23"]
 master_net_port = 9334
 master_grpc_port = 9333

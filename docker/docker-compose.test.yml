@@ -11,8 +11,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.21.0.0/16
-          gateway: 172.21.0.1
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
 
 volumes:
   master-1-data:
@@ -33,7 +33,7 @@ services:
     container_name: redis-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.50
+        ipv4_address: 172.30.0.50
     volumes:
       - redis-data:/data
     ports:
@@ -52,7 +52,7 @@ services:
     container_name: master-1-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.11
+        ipv4_address: 172.30.0.11
     volumes:
       - master-1-data:/data
       - ./config:/config:ro
@@ -76,7 +76,7 @@ services:
     container_name: master-2-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.12
+        ipv4_address: 172.30.0.12
     volumes:
       - master-2-data:/data
       - ./config:/config:ro
@@ -100,7 +100,7 @@ services:
     container_name: master-3-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.13
+        ipv4_address: 172.30.0.13
     volumes:
       - master-3-data:/data
       - ./config:/config:ro
@@ -125,7 +125,7 @@ services:
     container_name: volume-1-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.21
+        ipv4_address: 172.30.0.21
     volumes:
       - volume-1-data:/data
       - ./config:/config:ro
@@ -136,7 +136,7 @@ services:
       - RUST_LOG=info
     command: /app/powerfs-volume --config /config/volume-1.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.21.0.21 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.21 8080 || exit 1"]
       interval: 2s
       timeout: 2s
       retries: 3
@@ -150,7 +150,7 @@ services:
     container_name: volume-2-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.22
+        ipv4_address: 172.30.0.22
     volumes:
       - volume-2-data:/data
       - ./config:/config:ro
@@ -161,7 +161,7 @@ services:
       - RUST_LOG=info
     command: /app/powerfs-volume --config /config/volume-2.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.21.0.22 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.22 8080 || exit 1"]
       interval: 2s
       timeout: 2s
       retries: 3
@@ -175,7 +175,7 @@ services:
     container_name: volume-3-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.23
+        ipv4_address: 172.30.0.23
     volumes:
       - volume-3-data:/data
       - ./config:/config:ro
@@ -186,7 +186,7 @@ services:
       - RUST_LOG=info
     command: /app/powerfs-volume --config /config/volume-3.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.21.0.23 8080 || exit 1"]
+      test: ["CMD-SHELL", "nc -z 172.30.0.23 8080 || exit 1"]
       interval: 2s
       timeout: 2s
       retries: 3
@@ -201,8 +201,8 @@ services:
     container_name: init-filer-1-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.30
-    command: /app/powerfs-init --config /config/filer-1.toml
+        ipv4_address: 172.30.0.30
+    command: /app/powerfs-init --config /config/filer-1.toml --force
     volumes:
       - filer-1-data:/data/filer
       - ./config:/config:ro
@@ -216,8 +216,8 @@ services:
     container_name: init-filer-2-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.34
-    command: /app/powerfs-init --config /config/filer-2.toml
+        ipv4_address: 172.30.0.34
+    command: /app/powerfs-init --config /config/filer-2.toml --force
     volumes:
       - filer-2-data:/data/filer
       - ./config:/config:ro
@@ -231,8 +231,8 @@ services:
     container_name: init-filer-3-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.35
-    command: /app/powerfs-init --config /config/filer-3.toml
+        ipv4_address: 172.30.0.38
+    command: /app/powerfs-init --config /config/filer-3.toml --force
     volumes:
       - filer-3-data:/data/filer
       - ./config:/config:ro
@@ -247,11 +247,11 @@ services:
     container_name: filer-1-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.31
+        ipv4_address: 172.30.0.31
     ports:
       - "8988:8888"
       - "8989:8889"
-      - "8990:8890"
+      - "8990:9334"
     environment:
       - RUST_LOG=debug
     command: /app/powerfs-filer --config /config/filer-1.toml
@@ -259,7 +259,7 @@ services:
       - filer-1-data:/data/filer
       - ./config:/config:ro
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 3
@@ -277,11 +277,11 @@ services:
     container_name: filer-2-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.32
+        ipv4_address: 172.30.0.32
     ports:
       - "8991:8888"
       - "8992:8889"
-      - "8993:8890"
+      - "8993:9334"
     environment:
       - RUST_LOG=info
     command: /app/powerfs-filer --config /config/filer-2.toml
@@ -289,7 +289,7 @@ services:
       - filer-2-data:/data/filer
       - ./config:/config:ro
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 3
@@ -307,11 +307,11 @@ services:
     container_name: filer-3-test
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.33
+        ipv4_address: 172.30.0.33
     ports:
       - "8994:8888"
       - "8995:8889"
-      - "8996:8890"
+      - "8996:9334"
     environment:
       - RUST_LOG=info
     command: /app/powerfs-filer --config /config/filer-3.toml
@@ -319,7 +319,7 @@ services:
       - filer-3-data:/data/filer
       - ./config:/config:ro
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 8890 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 3
@@ -341,7 +341,7 @@ services:
     init: true
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.40
+        ipv4_address: 172.30.0.40
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -393,7 +393,7 @@ services:
     mem_limit: 1g
     networks:
       powerfs-network:
-        ipv4_address: 172.21.0.45
+        ipv4_address: 172.30.0.45
     volumes:
       - /tmp/powerfs/test:/mnt/powerfs
       - ./benchmark:/benchmark

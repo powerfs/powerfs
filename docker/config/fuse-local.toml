@@ -31,7 +31,7 @@ master_addresses = ["172.30.0.11:9333"]
 data_dir = "/data/filer"
 shard_count = 2
 raft_id = 1
-raft_peers = ["172.30.0.35:8889", "172.30.0.36:8889", "172.30.0.37:8889"]
+raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
 master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
 
 [s3]
@@ -44,7 +44,7 @@ secret_key = "powerfs123"
 [fuse]
 mount_point = "/tmp/mnt/fuse"
 master_addresses = ["172.30.0.11", "172.30.0.12", "172.30.0.13"]
-filer_addresses = ["172.30.0.35"]
+filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
 volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23"]
 master_net_port = 9334
 volume_net_port = 8901

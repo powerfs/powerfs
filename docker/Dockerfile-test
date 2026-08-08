@@ -1,16 +1,71 @@
+# =============================================================================
+# PowerFS Test Image — FUSE Client + Benchmark + Protocol Validation Tools
+#
+# Based on powerfs:latest, adds:
+#   - FUSE3 userspace libraries + fusermount3
+#   - fio (performance benchmarking)
+#   - Testing utilities (jq, strace, bc, iproute2, procps)
+#   - /etc/fuse.conf with allow_other + user_allow_other
+#   - Dedicated powerfs user for non-root FUSE mount tests
+#
+# Build context must be project root (parent of docker/).
+# =============================================================================
+
 FROM powerfs:latest
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---------- Testing tools ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    fio \
+        fio \
+        jq \
+        bc \
+        strace \
+        ltrace \
+        procps \
+        iproute2 \
+        iputils-ping \
+        dnsutils \
+        curl \
+        wget \
+        ca-certificates \
+        kmod \
+        util-linux \
+        file \
+        xz-utils \
+        gzip \
+        coreutils \
     && rm -rf /var/lib/apt/lists/*
 
+# ---------- FUSE configuration ----------
+# Allow non-root mounts and allow_other option (required for cross-container access)
+RUN mkdir -p /etc && \
+    printf 'user_allow_other\nallow_other\nmount_max = 1000\n' > /etc/fuse.conf && \
+    chmod 644 /etc/fuse.conf
+
+# Ensure /dev/fuse is accessible (actual device is passed via docker --device)
+RUN mkdir -p /dev && [ -c /dev/fuse ] || mknod /dev/fuse c 10 229 2>/dev/null || true
+RUN chmod 666 /dev/fuse 2>/dev/null || true
+
+# ---------- Directory layout ----------
 WORKDIR /app
 
-RUN mkdir -p /mnt/powerfs && chown root:root /mnt/powerfs && chmod 755 /mnt/powerfs
-RUN mkdir -p /var/log && chown root:root /var/log && chmod 755 /var/log
+RUN mkdir -p /mnt/fuse \
+    && chown root:root /mnt/fuse \
+    && chmod 777 /mnt/fuse
 
-COPY benchmark/ /benchmark/
+RUN mkdir -p /tmp/test-results \
+    && chmod 777 /tmp/test-results
 
-EXPOSE 9333 8080 8081
+RUN mkdir -p /var/log/powerfs \
+    && chmod 777 /var/log/powerfs
 
+# ---------- Test scripts (mounted at runtime, placeholder here) ----------
+# Benchmark configs and test scripts are bind-mounted via docker-compose volumes.
+# This placeholder ensures the path exists for COPY if needed.
+RUN mkdir -p /benchmark /scripts /config
+
+EXPOSE 9333 8080 8081 8888 8889 8890
+
+# Default: keep container alive for interactive testing
 CMD ["/bin/bash"]
