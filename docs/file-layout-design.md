@@ -2158,7 +2158,7 @@ if (req->error == -E2BIG) {
 | P1 | M1 | 已完成 | ✅ | ✅ | ✅ | 已合入 | 已合入 | 2026-07 |
 | P2 | M1 | 进行中 | ✅ TLV 编码落地 | 待开始 | 待 FUSE 容器测试 | 0e0ec5f2 | - | - |
 | P2.5 | M2 | 已完成 | ✅ Inline 存储+迁移+客户端路径 | 待开始 | ✅ mdtest 2.22x | a64c4247+199fded6+321217aa+cce28ec5+a1dc2542 | - | 2026-08-08 |
-| P3 | M3 | 待开始 | - | - | - | - | - | - |
+| P3 | M3 | 进行中 | ✅ Stripe alloc + xattr + write/read/flush | 待开始 | ✅ fio 962/4000 MiB/s | 098e13bb+92d078b2+628cddb1+a99465b9 | - | 2026-08-08 |
 | P4 | M4 | 待开始 | - | - | - | - | - | - |
 | P5 | M3 | 待开始 | - | - | - | - | - | - |
 | P6 | M4 | 待开始 | - | - | - | - | - | - |
@@ -2176,6 +2176,26 @@ if (req->error == -E2BIG) {
 |--------|------|-----------|-----------|---------|
 | M1 协议基础 | 进行中 | 1/2 (P1✅ P2进行中) | 待 FUSE 容器测试 | - |
 | M2 小文件优化 | 已完成 | 1/1 (P2.5✅) | ✅ mdtest create 2.22x | 2026-08-08 |
-| M3 数据分布 | 待开始 | 0/2 | - | - |
+| M3 数据分布 | 进行中 | 0.5/2 (P3 FUSE✅) | ✅ fio Stripe write 962 MiB/s | - |
 | M4 可靠性 | 待开始 | 0/3 | - | - |
 | M5 技术债务 | 部分完成 | 0.5/1 (JSON 路径已移除) | - | - |
+
+### P3 FUSE 性能评估 (2026-08-08)
+
+**测试环境**: Docker 容器集群 (3 Master + 3 Volume + 3 Filer + 1 FUSE), fio 3.16
+
+**配置**: `stripe:128:1MB` (128 个 1MB chunk, 跨 3 个 volume anti-affinity 分配)
+
+| 模式 | 顺序写 (MiB/s) | 顺序读 (MiB/s) | 说明 |
+|------|---------------|---------------|------|
+| Flat | 941 | 3879 | 基准 (单 volume) |
+| Stripe (修复前) | 76.2 | - | read-before-write 导致 "needle not found" |
+| Stripe (修复后) | 962 | 4000 | 跳过未 flush chunk 的读取, 性能恢复 |
+
+**关键修复**: Stripe 预分配 chunk 的 `size=0` (未 flush), 写路径通过 `chunk_map` 检测
+`size==0` 跳过 read-before-write, 避免 ~128 次无效 volume RPC (128MB 文件).
+
+**数据完整性**: MD5 校验通过 (write → direct IO read → cross-client read).
+
+**anti-affinity 验证**: 128 chunk round-robin 分布到 3 个 volume (43/43/42).
+
