@@ -47,7 +47,7 @@
 - `alloc_needle_id` 用原子计数器 fetch_add，**needle_id 严格连续递增**
 - FUSE/内核 writeback 按 offset 顺序刷盘，chunks 列表按 offset 排序
 - 单文件分配在同一 zone，volume 选择基于空闲比例（同文件倾向同 volume）
-- chunk_size 固定 2MB
+- chunk_size 固定 1MB（与 stripe_size 统一，确保每 chunk 一个 needle_id）
 
 **结论**：顺序写场景下 chunks 完全可预测，适合用几何描述替代 per-chunk 列表。
 
@@ -57,14 +57,14 @@
 
 ### 2.1 文件大小分类
 
-| 类别 | 大小范围 | 占比估计 | chunk 数 | 主要场景 |
+| 类别 | 大小范围 | 占比估计 | chunk 数 (1MB) | 主要场景 |
 |------|---------|---------|---------|---------|
-| 微小文件 | < 2MB | ~60% | 1 | 配置、日志、元数据 |
-| 小文件 | 2-10MB | ~30% | 1-5 | 文档、图片 |
-| 中文件 | 10-100MB | ~8% | 5-50 | 视频片段、压缩包 |
-| 大文件 | 100MB-1GB | ~1.5% | 50-512 | 数据集、虚拟磁盘 |
-| 超大文件 | 1-100GB | ~0.4% | 512-51200 | HPC 数据、备份镜像 |
-| 海量文件 | > 100GB | ~0.1% | 51200+ | 科学计算、AI 训练 |
+| 微小文件 | < 2MB | ~60% | 1-2 | 配置、日志、元数据 |
+| 小文件 | 2-10MB | ~30% | 2-10 | 文档、图片 |
+| 中文件 | 10-100MB | ~8% | 10-100 | 视频片段、压缩包 |
+| 大文件 | 100MB-1GB | ~1.5% | 100-1024 | 数据集、虚拟磁盘 |
+| 超大文件 | 1-100GB | ~0.4% | 1024-102400 | HPC 数据、备份镜像 |
+| 海量文件 | > 100GB | ~0.1% | 102400+ | 科学计算、AI 训练 |
 
 ### 2.2 典型场景
 
@@ -127,21 +127,28 @@ pub enum Placement {
     
     /// Stripe: 中等并行（4-16 volume）
     Stripe {
-        stripe_size: u64,         // 默认 64MB
+        stripe_size: u64,         // 默认 1MB（= chunk_size，确保每 chunk 一个 needle）
         stripe_count: u32,        // 默认 4
         start_volume_idx: u32,    // round-robin 错开
         volume_ids: Vec<u64>,     // 显式卷列表
     },
-    
+
     /// WideStripe: 全集群并行（128-256 volume）
     WideStripe {
-        stripe_size: u64,         // 默认 4MB（小 stripe 高并发）
+        stripe_size: u64,         // 默认 1MB（= chunk_size，确保每 chunk 一个 needle）
         stripe_count: u32,        // 128 或 256
         start_volume_idx: u32,
         volume_ids: Vec<u64>,     // 范围压缩编码
     },
 }
 ```
+
+> **关键约束**：`stripe_size` 必须等于 `chunk_size`（默认均为 1MB）。
+> 原因：chunk_cache 按 `chunk_size` 分块，flush 时每个 cache entry 作为一个 needle 写入 Volume Server。
+> 若 `stripe_size < chunk_size`，一个 cache entry 跨多个 stripe unit，flush 只写第一个 unit 的 volume，
+> 其余 unit 的 needle 永远不会写入（scrubber 读失败，数据丢失）。
+> 若 `stripe_size > chunk_size`，多个 chunk 共享同一 needle_id 会互相覆盖。
+> 统一为 1MB 后，每个 cache entry 天然对应一个 stripe unit / 一个 needle，无需 `min()` 补丁。
 
 ### 4.2 自动提升阈值
 
@@ -188,9 +195,9 @@ pub fn locate(&self, file_offset: u64) -> (usize, u64) {
 
 **xattr 接口**：
 ```bash
-# 设置目录 stripe 策略
-setfattr -n powerfs.placement -v "stripe:4:64MB" /hpc/dataset1
-setfattr -n powerfs.placement -v "wide_stripe:256:4MB" /hpc/training
+# 设置目录 stripe 策略 (stripe_size 必须等于 chunk_size=1MB)
+setfattr -n powerfs.placement -v "stripe:4:1MB" /hpc/dataset1
+setfattr -n powerfs.placement -v "wide_stripe:256:1MB" /hpc/training
 setfattr -n powerfs.placement -v "flat" /var/log
 
 # 设置目录 inline 阈值（独立于 placement，专门控制微小文件）
@@ -210,8 +217,8 @@ touch /io500/mdtest-hard/f1 # 自动 Inline(max_size=4096)
 **属性格式**：
 - `powerfs.placement`：
   - `flat`：单 volume
-  - `stripe:<count>:<size>`：N 卷条带，例如 `stripe:4:64MB`
-  - `wide_stripe:<count>:<size>`：宽条带，例如 `wide_stripe:256:4MB`
+  - `stripe:<count>:<size>`：N 卷条带，例如 `stripe:4:1MB`（size 必须等于 chunk_size=1MB）
+  - `wide_stripe:<count>:<size>`：宽条带，例如 `wide_stripe:256:1MB`（同上）
 - `powerfs.inline`：
   - `<size>`：inline 阈值（字节数），例如 `4096`、`8192`
   - `0`：禁用 inline（即使文件很小也走 Volume Server）
@@ -632,7 +639,7 @@ pub struct StripeLayout {
     pub stripe_count: u32,           // 4B
     pub start_volume_idx: u32,       // 4B
     pub start_needle_id: u64,        // 8B - 首 needle_id（连续递增）
-    pub chunk_size: u32,             // 4B - 单 chunk 2MB
+    pub chunk_size: u32,             // 4B - 单 chunk 1MB
     pub total_chunks: u32,           // 4B
     pub first_crc32: u32,            // 4B - 首 chunk CRC（其余读时校验）
     // 总计 ~40B + volume_ids 编码
@@ -827,7 +834,7 @@ POWERFS_NET_MSG_MIGRATE_INLINE = 0x001D,  // Inline -> Flat 迁移（文件超�
    - 返回 Flat + SingleReplica + PerChunk[]
 
 2. WRITE:
-   - 客户端直连 Volume Server 写单 chunk（2MB）
+   - 客户端直连 Volume Server 写单 chunk（1MB）
    - Volume Server 返回 CRC32
 
 3. CLOSE:
@@ -2115,9 +2122,9 @@ if (req->error == -E2BIG) {
 
 | 术语 | 含义 |
 |------|------|
-| Chunk | 文件数据分片，固定 2MB |
+| Chunk | 文件数据分片，固定 1MB（= stripe_size） |
 | Needle | Volume Server 上的物理存储单元，与 Chunk 1:1 |
-| Stripe | 跨多个 Volume 的条带单元，默认 64MB |
+| Stripe | 跨多个 Volume 的条带单元，默认 1MB（= chunk_size） |
 | Volume | 数据卷，单 Volume Server 上的逻辑存储空间 |
 | **Inline** | **数据直接存 Filer 元数据，绕过 Volume Server（< 4KB/8KB 微小文件）** |
 | **InlineData** | **Inline 模式下的数据编码，数据直接在 Filer Raft 日志中** |
@@ -2132,15 +2139,15 @@ if (req->error == -E2BIG) {
 
 | 参数 | 默认值 | 可调 |
 |------|--------|------|
-| chunk_size | 2MB | 否（协议常量） |
+| chunk_size | 1MB | 否（协议常量，= stripe_size） |
 | **DEFAULT_INLINE_THRESHOLD** | **4KB** | **是（目录 xattr `powerfs.inline`）** |
 | **INLINE_MAX_THRESHOLD** | **8KB** | **是（Filer 配置上限）** |
 | **INLINE_MIGRATE_RATIO** | **1.5** | **否（协议常量，滞后窗口）** |
-| DEFAULT_STRIPE_SIZE | 64MB | 是（目录 xattr） |
+| DEFAULT_STRIPE_SIZE | 1MB | 是（目录 xattr，必须 = chunk_size） |
 | DEFAULT_STRIPE_COUNT | 4 | 是（目录 xattr） |
 | PROMOTE_THRESHOLD | 64MB | 是（Filer 配置） |
 | WIDE_STRIPE_COUNT | 256 | 是（目录 xattr） |
-| WIDE_STRIPE_SIZE | 4MB | 是（目录 xattr） |
+| WIDE_STRIPE_SIZE | 1MB | 是（目录 xattr，必须 = chunk_size） |
 | SMALL_FILE_THRESHOLD | 10MB | 是（Filer 配置） |
 | EC_DATA_DEFAULT | 4 | 是（目录 xattr） |
 | EC_PARITY_DEFAULT | 2 | 是（目录 xattr） |
@@ -2220,7 +2227,7 @@ if (req->error == -E2BIG) {
 | 协议 | FieldId::ReplicaChunks (0xB5) TLV 编码 | ✅ |
 
 **关键修复**:
-1. **chunk cache 粒度**: `effective_chunk_size = min(chunk_size, stripe_size)`, 确保 Stripe 模式每个 cache entry 对应一个 stripe unit, 否则 scrubber 读取失败 ("needle not found")
+1. **chunk_size 与 stripe_size 统一为 1MB**: 原 chunk_size=2MB > stripe_size=1MB 导致单 cache entry 跨多个 stripe unit, flush 只写第一个 unit 的 volume, 其余 needle 未写入 (scrubber 读失败). 统一后每个 cache entry 天然对应一个 stripe unit / 一个 needle, 无需 `min()` 补丁
 2. **TLV 顺序解码限制**: `decode_file_layout` 消费 ReplicaChunks 字段后 `next_bytes` 找不到, 新增 raw TLV 字节扫描绕过
 3. **状态回退误触发**: getattr 比较 chunks 时不应回退状态, 仅 `chunks_changed` 时才 Replicated → PendingReplicated
 4. **Inline→Flat 迁移数据丢失**: 迁移后必须 `mark_dirty(inode, 0)`, 否则 flusher 不会将迁移数据写到 Volume Server

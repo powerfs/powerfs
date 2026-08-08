@@ -11,7 +11,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub const ROOT_INODE: u64 = 1;
-pub const DEFAULT_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2MB - balance performance and memory
+pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB - unified with stripe_size for Stripe/WideStripe
 
 pub fn chunk_from_proto(chunk: FileChunk) -> CachedFileChunk {
     CachedFileChunk {

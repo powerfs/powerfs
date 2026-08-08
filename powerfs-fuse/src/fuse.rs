@@ -710,18 +710,9 @@ impl PowerFsFs {
             let placement = entry.placement.as_ref().unwrap();
             let stripe_chunks = entry.chunks.clone();
 
-            // P4 fix: use min(chunk_size, stripe_size) as the cache granularity
-            // for Stripe files. When stripe_size < chunk_size, each chunk_cache
-            // entry must map to exactly one stripe unit; otherwise a single
-            // cache entry spanning multiple stripe units gets flushed to only
-            // the first unit's volume, leaving other units' needles unwritten
-            // (scrubber read fails, data not actually striped).
-            let stripe_size = match placement {
-                powerfs_layout::Placement::Stripe { stripe_size, .. }
-                | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
-                _ => self.chunk_cache.chunk_size(),
-            };
-            let chunk_size = std::cmp::min(self.chunk_cache.chunk_size(), stripe_size.max(1));
+            // chunk_size == stripe_size (both 1MB by default), so each cache
+            // entry maps to exactly one stripe unit / one needle_id.
+            let chunk_size = self.chunk_cache.chunk_size();
 
             let batch_size = 32;
             let mut had_error = false;
@@ -2375,14 +2366,8 @@ impl FileSystem for PowerFsFs {
                 );
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
-            // P4 fix: use min(chunk_size, stripe_size) as the cache granularity
-            // for Stripe reads (must match write/flush). See flush path for details.
-            let stripe_size = match placement {
-                powerfs_layout::Placement::Stripe { stripe_size, .. }
-                | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
-                _ => self.chunk_cache.chunk_size(),
-            };
-            let chunk_size = std::cmp::min(self.chunk_cache.chunk_size(), stripe_size.max(1));
+            // chunk_size == stripe_size (both 1MB by default).
+            let chunk_size = self.chunk_cache.chunk_size();
 
             let file_size = if entry.size > 0 {
                 entry.size
@@ -2402,14 +2387,12 @@ impl FileSystem for PowerFsFs {
             }
 
             let end_offset = std::cmp::min(offset + size as u64, file_size);
-            // Use chunk_size (effective) directly; get_chunk_index() uses the
-            // global chunk_size which mismatches when stripe_size < chunk_size.
-            let start_chunk = offset / chunk_size;
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let prefetch_end = std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
             let prefetch_end_chunk = if prefetch_end == 0 {
                 0
             } else {
-                (prefetch_end - 1) / chunk_size
+                self.chunk_cache.get_chunk_index(prefetch_end - 1)
             };
 
             // Collect missing chunks for remote read
@@ -3301,26 +3284,15 @@ impl FileSystem for PowerFsFs {
             let placement = entry.placement.as_ref().unwrap();
             let stripe_chunks = entry.chunks.clone();
 
-            // P4 fix: use min(chunk_size, stripe_size) as the cache granularity
-            // for Stripe writes (must match read/flush). When stripe_size <
-            // chunk_size, each chunk_cache entry must be one stripe unit so
-            // flush routes it to the correct volume/needle.
-            let stripe_size = match placement {
-                powerfs_layout::Placement::Stripe { stripe_size, .. }
-                | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
-                _ => chunk_size,
-            };
-            let chunk_size = std::cmp::min(chunk_size, stripe_size.max(1));
+            // chunk_size == stripe_size (both 1MB by default).
 
             let content_size_before_write = entry.content_size;
             let end_offset = offset + read_len as u64;
-            // Use chunk_size (effective) directly; get_chunk_index() uses the
-            // global chunk_size which mismatches when stripe_size < chunk_size.
-            let start_chunk = offset / chunk_size;
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let end_chunk = if end_offset == 0 {
                 0
             } else {
-                (end_offset - 1) / chunk_size
+                self.chunk_cache.get_chunk_index(end_offset - 1)
             };
 
             // Check that the write range is within the pre-allocated stripe range
