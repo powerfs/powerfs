@@ -927,6 +927,7 @@ impl FilerNetHandler {
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, info.inode);
                 enc.add_u32(FieldId::Mode, (mode | 0o040000) as u32);
+                enc.add_u8(FieldId::IsDir, 1);
                 enc.add_string(FieldId::Name, &name)?;
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
