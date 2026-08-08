@@ -106,8 +106,14 @@ pub fn encode_file_layout(
 ) -> LayoutResult<()> {
     encode_placement(enc, &layout.placement)?;
     encode_reliability(enc, &layout.reliability)?;
-    enc.add_u8(FieldId::ReliabilityState, reliability_state_to_u8(&layout.reliability_state));
-    enc.add_u8(FieldId::Compression, compression_state_to_u8(&layout.compression));
+    enc.add_u8(
+        FieldId::ReliabilityState,
+        reliability_state_to_u8(&layout.reliability_state),
+    );
+    enc.add_u8(
+        FieldId::Compression,
+        compression_state_to_u8(&layout.compression),
+    );
     encode_encoding(enc, &layout.encoding)?;
     Ok(())
 }
@@ -188,9 +194,7 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
 
     // 展开 volume_ids_range (如果 volume_ids 未设置)
     let volume_ids = volume_ids.or_else(|| {
-        volume_ids_range.map(|(start, count)| {
-            (0..count as u64).map(|i| start + i).collect()
-        })
+        volume_ids_range.map(|(start, count)| (0..count as u64).map(|i| start + i).collect())
     });
 
     // 组装 Placement
@@ -347,16 +351,16 @@ fn decode_reliability(bytes: &[u8]) -> LayoutResult<Reliability> {
     match tag {
         reliability_tag::SINGLE_REPLICA => Ok(Reliability::SingleReplica),
         reliability_tag::REPLICATED => {
-            let count = read_u32_at(bytes, 1)
-                .ok_or_else(|| LayoutError::InvalidReliability("Replicated missing count".into()))?;
+            let count = read_u32_at(bytes, 1).ok_or_else(|| {
+                LayoutError::InvalidReliability("Replicated missing count".into())
+            })?;
             Ok(Reliability::Replicated { count })
         }
         reliability_tag::EC => {
             let data = read_u32_at(bytes, 1)
                 .ok_or_else(|| LayoutError::InvalidReliability("EC missing data".into()))?;
-            let parity = read_u32_at(bytes, 5).ok_or_else(|| {
-                LayoutError::InvalidReliability("EC missing parity".into())
-            })?;
+            let parity = read_u32_at(bytes, 5)
+                .ok_or_else(|| LayoutError::InvalidReliability("EC missing parity".into()))?;
             Ok(Reliability::EC { data, parity })
         }
         other => Err(LayoutError::InvalidReliability(format!(
@@ -461,9 +465,9 @@ fn decode_encoding(bytes: &[u8]) -> LayoutResult<ChunkEncoding> {
             let start_volume_idx = read_u32_at(rest, 16).ok_or_else(|| {
                 LayoutError::InvalidEncoding("StripeDescriptor missing start_volume_idx".into())
             })?;
-            let vol_count = read_u32_at(rest, 20)
-                .ok_or_else(|| LayoutError::InvalidEncoding("StripeDescriptor missing vol_count".into()))?
-                as usize;
+            let vol_count = read_u32_at(rest, 20).ok_or_else(|| {
+                LayoutError::InvalidEncoding("StripeDescriptor missing vol_count".into())
+            })? as usize;
             let volume_ids = decode_volume_ids_from(rest, 24, vol_count)?;
             Ok(ChunkEncoding::StripeDescriptor {
                 start_needle_id,
@@ -474,17 +478,19 @@ fn decode_encoding(bytes: &[u8]) -> LayoutResult<ChunkEncoding> {
             })
         }
         encoding_tag::PAGINATED => {
-            let total_count = read_u32_at(rest, 0)
-                .ok_or_else(|| LayoutError::InvalidEncoding("Paginated missing total_count".into()))?;
+            let total_count = read_u32_at(rest, 0).ok_or_else(|| {
+                LayoutError::InvalidEncoding("Paginated missing total_count".into())
+            })?;
             let has_more = *rest
                 .get(4)
                 .ok_or_else(|| LayoutError::InvalidEncoding("Paginated missing has_more".into()))?
                 != 0;
-            let next_offset = read_u64_at(rest, 5)
-                .ok_or_else(|| LayoutError::InvalidEncoding("Paginated missing next_offset".into()))?;
-            let chunk_count = read_u32_at(rest, 13)
-                .ok_or_else(|| LayoutError::InvalidEncoding("Paginated missing chunk_count".into()))?
-                as usize;
+            let next_offset = read_u64_at(rest, 5).ok_or_else(|| {
+                LayoutError::InvalidEncoding("Paginated missing next_offset".into())
+            })?;
+            let chunk_count = read_u32_at(rest, 13).ok_or_else(|| {
+                LayoutError::InvalidEncoding("Paginated missing chunk_count".into())
+            })? as usize;
             let chunks = decode_chunk_list(rest, 17, chunk_count)?;
             Ok(ChunkEncoding::Paginated {
                 chunks,
@@ -1109,7 +1115,12 @@ mod tests {
     #[test]
     fn assemble_stripe_missing_count() {
         let result = assemble_placement(
-            Some(placement_tag::STRIPE), None, Some(64), None, None, None,
+            Some(placement_tag::STRIPE),
+            None,
+            Some(64),
+            None,
+            None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -1117,7 +1128,12 @@ mod tests {
     #[test]
     fn assemble_wide_stripe_missing_count() {
         let result = assemble_placement(
-            Some(placement_tag::WIDE_STRIPE), None, None, None, None, None,
+            Some(placement_tag::WIDE_STRIPE),
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -1133,7 +1149,7 @@ mod tests {
         // Flat 不需要额外字段, 即使提供了也应成功
         let result = assemble_placement(
             Some(placement_tag::FLAT),
-            Some(4096),  // 无意义但不应报错
+            Some(4096), // 无意义但不应报错
             None,
             None,
             None,
@@ -1146,11 +1162,20 @@ mod tests {
     fn assemble_stripe_uses_default_size() {
         // Stripe 有 count 但无 stripe_size → 使用默认 64MB
         let result = assemble_placement(
-            Some(placement_tag::STRIPE), None, None, Some(4), Some(0), Some(vec![1, 2, 3, 4]),
+            Some(placement_tag::STRIPE),
+            None,
+            None,
+            Some(4),
+            Some(0),
+            Some(vec![1, 2, 3, 4]),
         );
         let p = result.unwrap();
         match p {
-            Placement::Stripe { stripe_size, stripe_count, .. } => {
+            Placement::Stripe {
+                stripe_size,
+                stripe_count,
+                ..
+            } => {
                 assert_eq!(stripe_size, 64 * 1024 * 1024);
                 assert_eq!(stripe_count, 4);
             }
@@ -1162,11 +1187,20 @@ mod tests {
     fn assemble_wide_stripe_uses_default_size() {
         // WideStripe 有 count 但无 stripe_size → 使用默认 4MB
         let result = assemble_placement(
-            Some(placement_tag::WIDE_STRIPE), None, None, Some(256), None, None,
+            Some(placement_tag::WIDE_STRIPE),
+            None,
+            None,
+            Some(256),
+            None,
+            None,
         );
         let p = result.unwrap();
         match p {
-            Placement::WideStripe { stripe_size, stripe_count, .. } => {
+            Placement::WideStripe {
+                stripe_size,
+                stripe_count,
+                ..
+            } => {
                 assert_eq!(stripe_size, 4 * 1024 * 1024);
                 assert_eq!(stripe_count, 256);
             }
@@ -1193,7 +1227,10 @@ mod tests {
         let layout = decode_file_layout(&mut dec).unwrap();
         assert_eq!(layout.placement, Placement::Flat);
         assert_eq!(layout.reliability, Reliability::SingleReplica);
-        assert_eq!(layout.reliability_state, ReliabilityState::PendingReplicated);
+        assert_eq!(
+            layout.reliability_state,
+            ReliabilityState::PendingReplicated
+        );
         assert_eq!(layout.compression, CompressionState::None);
         match layout.encoding {
             ChunkEncoding::PerChunk { chunks } => assert!(chunks.is_empty()),
@@ -1228,7 +1265,13 @@ mod tests {
         let mut dec = TlvDecoder::new(&bytes);
         let layout = decode_file_layout(&mut dec).unwrap();
 
-        assert!(matches!(layout.placement, Placement::Stripe { stripe_count: 4, .. }));
+        assert!(matches!(
+            layout.placement,
+            Placement::Stripe {
+                stripe_count: 4,
+                ..
+            }
+        ));
         assert_eq!(layout.reliability, Reliability::Replicated { count: 3 });
         assert_eq!(layout.reliability_state, ReliabilityState::Replicated);
     }
@@ -1569,9 +1612,19 @@ mod tests {
                 assert_eq!(chunks.len(), 50);
                 for (i, chunk) in chunks.iter().enumerate() {
                     assert_eq!(chunk.offset, i as u64 * 4096, "offset mismatch at {}", i);
-                    assert_eq!(chunk.needle_id, 1000 + i as u64, "needle_id mismatch at {}", i);
+                    assert_eq!(
+                        chunk.needle_id,
+                        1000 + i as u64,
+                        "needle_id mismatch at {}",
+                        i
+                    );
                     assert_eq!(chunk.crc32, i as u32, "crc32 mismatch at {}", i);
-                    assert_eq!(chunk.mtime, 1700000000 + i as u64, "mtime mismatch at {}", i);
+                    assert_eq!(
+                        chunk.mtime,
+                        1700000000 + i as u64,
+                        "mtime mismatch at {}",
+                        i
+                    );
                 }
             }
             _ => panic!("expected PerChunk"),

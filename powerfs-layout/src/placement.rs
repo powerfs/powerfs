@@ -97,10 +97,9 @@ impl Placement {
                 let stripe_size = (*stripe_size).max(1);
                 let stripe_idx = file_offset / stripe_size;
                 let vol_rank = (stripe_idx % *stripe_count as u64) as u32;
-                let vol_array_idx =
-                    ((*start_volume_idx + vol_rank) as usize) % volume_ids.len();
-                let vol_offset = (stripe_idx / *stripe_count as u64) * stripe_size
-                    + (file_offset % stripe_size);
+                let vol_array_idx = ((*start_volume_idx + vol_rank) as usize) % volume_ids.len();
+                let vol_offset =
+                    (stripe_idx / *stripe_count as u64) * stripe_size + (file_offset % stripe_size);
                 Some((vol_array_idx, vol_offset))
             }
         }
@@ -116,8 +115,9 @@ impl Placement {
         match self {
             Placement::Inline { .. } => 0,
             Placement::Flat => 1,
-            Placement::Stripe { volume_ids, .. }
-            | Placement::WideStripe { volume_ids, .. } => volume_ids.len(),
+            Placement::Stripe { volume_ids, .. } | Placement::WideStripe { volume_ids, .. } => {
+                volume_ids.len()
+            }
         }
     }
 
@@ -126,8 +126,9 @@ impl Placement {
         match self {
             Placement::Inline { .. } => None,
             Placement::Flat => None,
-            Placement::Stripe { volume_ids, .. }
-            | Placement::WideStripe { volume_ids, .. } => volume_ids.get(idx).copied(),
+            Placement::Stripe { volume_ids, .. } | Placement::WideStripe { volume_ids, .. } => {
+                volume_ids.get(idx).copied()
+            }
         }
     }
 
@@ -265,10 +266,7 @@ mod tests {
         assert_eq!(p.locate(128 * 1024 * 1024), Some((2, 0)));
 
         // offset 256MB -> wraps to vol 0, vol_offset 64MB
-        assert_eq!(
-            p.locate(256 * 1024 * 1024),
-            Some((0, 64 * 1024 * 1024))
-        );
+        assert_eq!(p.locate(256 * 1024 * 1024), Some((0, 64 * 1024 * 1024)));
     }
 
     #[test]
@@ -339,24 +337,39 @@ mod tests {
 
         // < 1GB -> Stripe(4)
         let p = auto_promote(64 * 1024 * 1024, &policy);
-        assert!(matches!(p, Placement::Stripe { stripe_count: 4, .. }));
+        assert!(matches!(
+            p,
+            Placement::Stripe {
+                stripe_count: 4,
+                ..
+            }
+        ));
 
         // < 100GB -> Stripe(16)
         let p = auto_promote(2 * 1024 * 1024 * 1024, &policy);
-        assert!(matches!(p, Placement::Stripe { stripe_count: 16, .. }));
+        assert!(matches!(
+            p,
+            Placement::Stripe {
+                stripe_count: 16,
+                ..
+            }
+        ));
 
         // >= 100GB, no auto widestripe -> Stripe(16)
         let p = auto_promote(200 * 1024 * 1024 * 1024, &policy);
-        assert!(matches!(p, Placement::Stripe { stripe_count: 16, .. }));
+        assert!(matches!(
+            p,
+            Placement::Stripe {
+                stripe_count: 16,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn volume_count() {
         assert_eq!(Placement::Inline { max_size: 4096 }.volume_count(), 0);
         assert_eq!(Placement::Flat.volume_count(), 1);
-        assert_eq!(
-            stripe_placement(64, 4, 6).volume_count(),
-            6
-        );
+        assert_eq!(stripe_placement(64, 4, 6).volume_count(), 6);
     }
 }

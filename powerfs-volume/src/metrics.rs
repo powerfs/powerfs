@@ -272,9 +272,7 @@ async fn get_log_level_handler() -> Json<serde_json::Value> {
     Json(json!({ "level": powerfs_common::dynamic_log::get_log_level() }))
 }
 
-async fn set_log_level_handler(
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+async fn set_log_level_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
     let level = match params.get("level") {
         Some(l) => l.as_str(),
         None => {
@@ -287,10 +285,7 @@ async fn set_log_level_handler(
     let prev = powerfs_common::dynamic_log::get_log_level().to_string();
     match powerfs_common::dynamic_log::set_log_level(level) {
         Ok(()) => {
-            info!(
-                "log level changed via HTTP: {} -> {}",
-                prev, level
-            );
+            info!("log level changed via HTTP: {} -> {}", prev, level);
             (
                 axum::http::StatusCode::OK,
                 Json(json!({ "level": level, "prev": prev })),

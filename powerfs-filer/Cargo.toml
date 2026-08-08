@@ -29,6 +29,10 @@ redis-event = ["dep:redis", "powerfs-common/redis-event"]
 name = "powerfs-filer"
 path = "src/main.rs"
 
+[[bin]]
+name = "powerfs-testutil"
+path = "src/bin/testutil.rs"
+
 [dependencies]
 axum = "0.6"
 chrono = { version = "0.4", features = ["serde"] }

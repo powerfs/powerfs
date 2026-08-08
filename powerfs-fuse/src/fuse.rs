@@ -2387,8 +2387,7 @@ impl FileSystem for PowerFsFs {
             let end_offset = std::cmp::min(offset + size as u64, file_size);
 
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
-            let prefetch_end =
-                std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
+            let prefetch_end = std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
             let prefetch_end_chunk = if prefetch_end == 0 {
                 0
             } else {
@@ -2454,14 +2453,20 @@ impl FileSystem for PowerFsFs {
                         Err(e) => {
                             log::warn!(
                                 "read ec: inode={} shard {} get_volume_addr failed (vol={}): {}",
-                                inode, i, chunk.volume_id, e
+                                inode,
+                                i,
+                                chunk.volume_id,
+                                e
                             );
                         }
                     }
                 }
 
-                let data_available =
-                    shards.iter().take(data_shards).filter(|s| s.is_some()).count();
+                let data_available = shards
+                    .iter()
+                    .take(data_shards)
+                    .filter(|s| s.is_some())
+                    .count();
 
                 let file_data: Vec<u8> = if data_available == data_shards {
                     // Fast path: all data shards present — concatenate and
@@ -2504,7 +2509,8 @@ impl FileSystem for PowerFsFs {
                         Err(e) => {
                             log::error!(
                                 "read ec: inode={} decode_missing failed: {}, returning EIO",
-                                inode, e
+                                inode,
+                                e
                             );
                             return Err(std::io::Error::from_raw_os_error(libc::EIO));
                         }
@@ -2527,7 +2533,8 @@ impl FileSystem for PowerFsFs {
                 while off < file_data.len() as u64 {
                     let chunk_end = std::cmp::min(off + chunk_size, file_data.len() as u64);
                     let chunk_data = file_data[off as usize..chunk_end as usize].to_vec();
-                    self.chunk_cache.put(inode, off, chunk_data.into(), mtime, 0);
+                    self.chunk_cache
+                        .put(inode, off, chunk_data.into(), mtime, 0);
                     off = chunk_end;
                 }
             }
@@ -2632,10 +2639,8 @@ impl FileSystem for PowerFsFs {
                     .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
-                let crc_map: HashMap<u64, u32> = stripe_chunks
-                    .iter()
-                    .map(|c| (c.offset, c.crc32))
-                    .collect();
+                let crc_map: HashMap<u64, u32> =
+                    stripe_chunks.iter().map(|c| (c.offset, c.crc32)).collect();
 
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
@@ -2748,10 +2753,8 @@ impl FileSystem for PowerFsFs {
                                 .iter()
                                 .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                                 .collect();
-                            let primary_vol = chunk_map
-                                .get(chunk_offset)
-                                .map(|(_, v)| *v)
-                                .unwrap_or(0);
+                            let primary_vol =
+                                chunk_map.get(chunk_offset).map(|(_, v)| *v).unwrap_or(0);
                             if let Some(&(rep_needle, rep_vol)) = replica_map.get(chunk_offset) {
                                 warn!(
                                     "read stripe failover: inode={} offset={} primary vol={} failed: {}, trying replica vol={}",
@@ -2764,7 +2767,9 @@ impl FileSystem for PowerFsFs {
                                         ) {
                                             Ok(data) => {
                                                 // Verify CRC32 on replica data too
-                                                if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                                if let Some(&expected_crc) =
+                                                    crc_map.get(chunk_offset)
+                                                {
                                                     if expected_crc != 0 {
                                                         let actual_crc = crc32fast::hash(&data);
                                                         if actual_crc != expected_crc {
@@ -2772,7 +2777,11 @@ impl FileSystem for PowerFsFs {
                                                                 "CRC32 mismatch (stripe replica): inode={} offset={} expected={:#x} actual={:#x}",
                                                                 inode, chunk_offset, expected_crc, actual_crc
                                                             );
-                                                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                                            return Err(
+                                                                std::io::Error::from_raw_os_error(
+                                                                    libc::EIO,
+                                                                ),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -2984,11 +2993,8 @@ impl FileSystem for PowerFsFs {
                     .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
-                let crc_map: HashMap<u64, u32> = entry
-                    .chunks
-                    .iter()
-                    .map(|c| (c.offset, c.crc32))
-                    .collect();
+                let crc_map: HashMap<u64, u32> =
+                    entry.chunks.iter().map(|c| (c.offset, c.crc32)).collect();
 
                 // Build batch read requests
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
@@ -3060,7 +3066,10 @@ impl FileSystem for PowerFsFs {
                             // 从 replica_chunks 中查找同 offset 的副本 volume 读取.
                             debug!(
                                 "read_blob failover attempt: inode={} offset={} err={} replicas={}",
-                                inode, chunk_offset, e, entry.replica_chunks.len()
+                                inode,
+                                chunk_offset,
+                                e,
+                                entry.replica_chunks.len()
                             );
                             let replica_map: HashMap<u64, (u64, u64)> = entry
                                 .replica_chunks
@@ -3083,7 +3092,9 @@ impl FileSystem for PowerFsFs {
                                         ) {
                                             Ok(data) => {
                                                 // Verify CRC32 on replica data too
-                                                if let Some(&expected_crc) = crc_map.get(chunk_offset) {
+                                                if let Some(&expected_crc) =
+                                                    crc_map.get(chunk_offset)
+                                                {
                                                     if expected_crc != 0 {
                                                         let actual_crc = crc32fast::hash(&data);
                                                         if actual_crc != expected_crc {
@@ -3091,7 +3102,11 @@ impl FileSystem for PowerFsFs {
                                                                 "CRC32 mismatch (flat replica): inode={} offset={} expected={:#x} actual={:#x}",
                                                                 inode, chunk_offset, expected_crc, actual_crc
                                                             );
-                                                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                                                            return Err(
+                                                                std::io::Error::from_raw_os_error(
+                                                                    libc::EIO,
+                                                                ),
+                                                            );
                                                         }
                                                     }
                                                 }

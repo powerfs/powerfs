@@ -432,7 +432,9 @@ impl MasterNode {
                 }
             }
             let zone_count = master.zone_registry.read().unwrap().len();
-            let next_zid = master.next_zone_id.load(std::sync::atomic::Ordering::SeqCst);
+            let next_zid = master
+                .next_zone_id
+                .load(std::sync::atomic::Ordering::SeqCst);
             info!(
                 "P1.3: zone_registry restored: {} zones, next_zone_id={}",
                 zone_count, next_zid
@@ -864,10 +866,7 @@ impl MasterNode {
             }
             RaftCommand::RegisterZone { zone } => {
                 let zone_id = zone.zone_id;
-                self.zone_registry
-                    .write()
-                    .unwrap()
-                    .insert(zone_id, zone);
+                self.zone_registry.write().unwrap().insert(zone_id, zone);
                 // Recover next_zone_id to avoid reusing zone_id after restart
                 let current = self.next_zone_id.load(std::sync::atomic::Ordering::SeqCst);
                 if zone_id >= current {
@@ -878,10 +877,7 @@ impl MasterNode {
             }
             RaftCommand::UpdateZone { zone } => {
                 let zone_id = zone.zone_id;
-                self.zone_registry
-                    .write()
-                    .unwrap()
-                    .insert(zone_id, zone);
+                self.zone_registry.write().unwrap().insert(zone_id, zone);
                 debug!("Applied UpdateZone via Raft: zone_id={}", zone_id);
             }
         }
@@ -2244,7 +2240,23 @@ impl MasterNode {
                 .collect()
         };
 
-        // 选 N 个物理 volume (按空闲比例排序, 取前 3 个)
+        // 选 N 个物理 volume (按空闲比例排序, 取前 N 个)
+        // N 自动从 EC 配置推导: max(3, ec_data + ec_parity), 无需用户额外配置.
+        //   - EC(4+2) → N=6, 保证 anti-affinity 每个 shard 落不同 volume
+        //   - 无 EC   → N=3, 满足副本复制需求
+        // 用户仍可用 POWERFS_ZONE_VOLUME_COUNT 显式覆盖.
+        let ec_data = std::env::var("POWERFS_EC_DATA_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
+        let ec_parity = std::env::var("POWERFS_EC_PARITY_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        let zone_volume_count = std::env::var("POWERFS_ZONE_VOLUME_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| (ec_data + ec_parity).max(3));
         let routes = self.list_volume_routes();
         let mut sorted_routes: Vec<VolumeRoute> = routes.into_iter().collect();
         sorted_routes.sort_by(|a, b| {
@@ -2265,7 +2277,7 @@ impl MasterNode {
 
         let physical_volumes: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
             .iter()
-            .take(3)
+            .take(zone_volume_count)
             .map(|r| powerfs_common::types::ZoneVolume {
                 volume_id: r.volume_id,
                 addr: r.addr.clone(),
@@ -2279,10 +2291,8 @@ impl MasterNode {
             // 仅从当前 volume routes 更新 addr/size/used.
             // 不能重新选 top-3, 否则文件写入的 volume 可能不再属于 Zone,
             // 导致 scrubber 找不到 volume 地址 (P4 bug: addr not found).
-            let route_map: std::collections::HashMap<u64, &VolumeRoute> = sorted_routes
-                .iter()
-                .map(|r| (r.volume_id, r))
-                .collect();
+            let route_map: std::collections::HashMap<u64, &VolumeRoute> =
+                sorted_routes.iter().map(|r| (r.volume_id, r)).collect();
             let mut result = Vec::with_capacity(existing.len());
             for mut zone in existing {
                 // 更新已有 volume 的 addr/size/used, 保留 volume_id 不变
@@ -2290,28 +2300,54 @@ impl MasterNode {
                     .physical_volumes
                     .iter()
                     .filter_map(|zv| {
-                        route_map.get(&zv.volume_id).map(|r| {
-                            powerfs_common::types::ZoneVolume {
+                        route_map
+                            .get(&zv.volume_id)
+                            .map(|r| powerfs_common::types::ZoneVolume {
                                 volume_id: zv.volume_id,
                                 addr: r.addr.clone(),
                                 size: r.size,
                                 used: r.used,
-                            }
-                        })
+                            })
                     })
                     .collect();
-                // 如果原有 volume 全部下线 (route_map 中找不到), 补充 top-3 中的 volume
+                // 如果原有 volume 全部下线 (route_map 中找不到), 补充 top-N 中的 volume
                 if zone.physical_volumes.is_empty() && !physical_volumes.is_empty() {
                     warn!(
-                        "MASTER_ZONE: zone_id={} all original volumes offline, falling back to top-3",
-                        zone.zone_id
+                        "MASTER_ZONE: zone_id={} all original volumes offline, falling back to top-{}",
+                        zone.zone_id, zone_volume_count
                     );
                     zone.physical_volumes = physical_volumes.clone();
                 }
+                // Zone 扩容: 如果现有 volume 数少于配置值 (POWERFS_ZONE_VOLUME_COUNT),
+                // 从可用路由中补充新 volume (不替换已有 volume, 只追加).
+                // 这支持集群扩容后 EC 转换获取更多 volume.
+                if zone.physical_volumes.len() < zone_volume_count {
+                    let existing_ids: std::collections::HashSet<u64> =
+                        zone.physical_volumes.iter().map(|v| v.volume_id).collect();
+                    let added: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
+                        .iter()
+                        .filter(|r| !existing_ids.contains(&r.volume_id))
+                        .take(zone_volume_count - zone.physical_volumes.len())
+                        .map(|r| powerfs_common::types::ZoneVolume {
+                            volume_id: r.volume_id,
+                            addr: r.addr.clone(),
+                            size: r.size,
+                            used: r.used,
+                        })
+                        .collect();
+                    if !added.is_empty() {
+                        info!(
+                            "MASTER_ZONE: zone_id={} expanding {} -> {} volumes (added {})",
+                            zone.zone_id,
+                            zone.physical_volumes.len(),
+                            zone.physical_volumes.len() + added.len(),
+                            added.len()
+                        );
+                        zone.physical_volumes.extend(added);
+                    }
+                }
                 // P1.3: propose UpdateZone (apply 到内存 + Raft 日志持久化)
-                let cmd = crate::raft_storage::RaftCommand::UpdateZone {
-                    zone: zone.clone(),
-                };
+                let cmd = crate::raft_storage::RaftCommand::UpdateZone { zone: zone.clone() };
                 if let Err(e) = self.propose_command(cmd).await {
                     warn!(
                         "MASTER_ZONE: failed to persist UpdateZone for zone_id={}: {} \

@@ -24,6 +24,7 @@ COPY target/release/powerfs-monitor /app/
 COPY target/release/powerfs-fuse /app/
 COPY target/release/powerfs-init /app/
 COPY target/release/powerfs-cli /app/
+COPY target/release/powerfs-testutil /app/
 COPY config/ /etc/powerfs/
 
 EXPOSE 9333 8080 8081 8888 8889 9000

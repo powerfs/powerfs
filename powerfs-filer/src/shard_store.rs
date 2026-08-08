@@ -1116,6 +1116,10 @@ impl ShardStore {
             if info.delete_time > 0 {
                 continue;
             }
+            // P6: 跳过正在被写的文件, 避免复制不完整数据
+            if self.get_open_count(info.inode) > 0 {
+                continue;
+            }
             result.push((info.inode, info.chunks.clone()));
         }
         result
@@ -1138,6 +1142,10 @@ impl ShardStore {
                 continue;
             }
             if info.delete_time > 0 {
+                continue;
+            }
+            // P6: 跳过正在被写的文件, 避免对不完整数据做 EC 编码
+            if self.get_open_count(info.inode) > 0 {
                 continue;
             }
             // 文件大小检查
@@ -1819,19 +1827,25 @@ impl ShardStore {
         info.chunks = chunks;
         info.inline_data = inline_data;
         info.mtime = Self::current_time();
-        // P4: 如果文件已 Replicated 但数据更新了 (追加写), 重置为 PendingReplicated
-        // 让 scrubber 重新复制新 chunk. 同时清空旧的 replica_chunks.
-        if chunks_changed
-            && info.reliability_state == powerfs_layout::reliability::ReliabilityState::Replicated
-        {
-            log::info!(
-                "Shard {} P4: inode {} data changed, resetting Replicated -> PendingReplicated",
-                self.shard_id.0,
-                inode
-            );
-            info.reliability_state =
-                powerfs_layout::reliability::ReliabilityState::PendingReplicated;
-            info.replica_chunks.clear();
+        // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
+        // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
+        // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
+        if chunks_changed {
+            match info.reliability_state {
+                powerfs_layout::reliability::ReliabilityState::Replicated
+                | powerfs_layout::reliability::ReliabilityState::EC => {
+                    log::info!(
+                        "Shard {} P6: inode {} data changed, resetting {:?} -> PendingReplicated",
+                        self.shard_id.0,
+                        inode,
+                        info.reliability_state
+                    );
+                    info.reliability_state =
+                        powerfs_layout::reliability::ReliabilityState::PendingReplicated;
+                    info.replica_chunks.clear();
+                }
+                _ => {}
+            }
         }
         let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
         // sync 写保证 close sync 账本强持久化
