@@ -433,6 +433,33 @@ impl<'a> TlvDecoder<'a> {
         self.peek_field() == Some(field)
     }
 
+    /// Scan the entire buffer (from current position) for a specific field.
+    /// Does not consume any bytes; decoder position is unchanged.
+    ///
+    /// Unlike `has_field()` which only checks the next field, this scans
+    /// all remaining fields to find a match. Used by `check_required_fields()`.
+    pub fn contains_field(&self, field: FieldId) -> bool {
+        let mut scan_pos = self.pos;
+        while scan_pos + 5 <= self.buf.len() {
+            let field_id = self.buf[scan_pos];
+            let length = u32::from_be_bytes([
+                self.buf[scan_pos + 1],
+                self.buf[scan_pos + 2],
+                self.buf[scan_pos + 3],
+                self.buf[scan_pos + 4],
+            ]) as usize;
+            scan_pos += 5;
+            if scan_pos + length > self.buf.len() {
+                break;
+            }
+            if field_id == field as u8 {
+                return true;
+            }
+            scan_pos += length;
+        }
+        false
+    }
+
     /// Read a u64 value for the given field (consumes the field)
     pub fn next_u64(&mut self, field: FieldId) -> Result<u64, NetError> {
         match self.next_field() {
@@ -1170,6 +1197,12 @@ pub struct AttrResponse {
     pub ctime: u64,
     pub name: String,
     pub rdev: u64,
+    /// Filer 在 create 响应中返回的 volume_id（Zone 自分配）。
+    /// 客户端必须用此值构造 fid/chunks，避免与 Filer 元数据不一致。
+    pub volume_id: Option<u64>,
+    /// Filer 在 create 响应中返回的 needle_id（file_key）。
+    /// 客户端必须用此值写入 Volume Server，保证与 Filer 元数据一致。
+    pub file_key: Option<u64>,
 }
 
 /// Decode a common attr response (lookup/getattr return TLV)
@@ -1192,6 +1225,10 @@ pub fn decode_attr_resp(body: &[u8]) -> Result<AttrResponse, NetError> {
             FieldId::Ctime => resp.ctime = dec.read_u64(length)?,
             FieldId::Name => resp.name = dec.read_string(length)?.to_string(),
             FieldId::Rdev => resp.rdev = dec.read_u64(length)?,
+            // create 响应中 Filer 返回 Zone 自分配的 volume_id/needle_id，
+            // 客户端必须用这两个值构造 fid，保证与 Filer 元数据一致。
+            FieldId::VolumeId => resp.volume_id = Some(dec.read_u64(length)?),
+            FieldId::FileKey => resp.file_key = Some(dec.read_u64(length)?),
             _ => dec.skip(length)?,
         }
     }

@@ -23,7 +23,10 @@ use tokio::sync::mpsc;
 use crate::client_conn::{ClientConn, CloseHandle, ConnRegistry, ConnState};
 use crate::errors::{NetError, NetResult};
 use crate::flow_control::FlowController;
-use crate::protocol::{FrameFlags, FrameHeader, MsgType, NetMessage, PROTOCOL_VERSION, STATUS_OK};
+use crate::protocol::{
+    check_required_fields, check_resp_limits, check_resp_size, FrameFlags, FrameHeader, MsgType,
+    NetMessage, PROTOCOL_VERSION, STATUS_OK,
+};
 use crate::server_connection::{NetHandler, ServerConnectionManager};
 use crate::work::Work;
 
@@ -282,11 +285,27 @@ impl IoLoop {
             }
         })?;
 
-        let header = FrameHeader::decode(&hdr_buf)
-            .ok_or_else(|| NetError::Protocol("invalid frame header".into()))?;
+        let header = FrameHeader::decode_checked(&hdr_buf)
+            .map_err(|reason| {
+                // Layer 1: 帧头不变式违反
+                log::warn!(
+                    "{} io_loop: invalid frame header, reason={}",
+                    crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
+                );
+                NetError::Protocol(format!("invalid frame header: {}", reason))
+            })?;
 
         let total_len = header.data_len as usize;
         let body_len = header.body_len as usize;
+        let data_len = total_len.saturating_sub(body_len);
+
+        // Layer 3: per-msg_type 期望响应大小校验（仅告警）
+        check_resp_size(header.msg_type, body_len, data_len);
+
+        // Layer 2: 响应大小硬限制防御性校验
+        check_resp_limits(header.msg_type, header.seq, body_len, data_len).map_err(|reason| {
+            NetError::Protocol(format!("response size limit: {}", reason))
+        })?;
 
         let mut payload = Vec::with_capacity(total_len);
         if total_len > 0 {
@@ -296,6 +315,13 @@ impl IoLoop {
 
         let body = payload[..body_len].to_vec();
         let data = payload[body_len..].to_vec();
+
+        // Layer 4: TLV 必需字段校验（仅成功响应）
+        if header.status == STATUS_OK {
+            check_required_fields(header.msg_type, header.seq, &body).map_err(|reason| {
+                NetError::Protocol(format!("required field check: {}", reason))
+            })?;
+        }
 
         Ok(NetMessage::new(header).with_body(body).with_data(data))
     }

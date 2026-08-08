@@ -32,8 +32,8 @@ use tokio::net::TcpStream;
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::{
-    build_frame_with_route_hash, calc_route_hash, FrameFlags, FrameHeader, HandshakeRequest,
-    HandshakeResponse,
+    build_frame_with_route_hash, calc_route_hash, check_required_fields, check_resp_limits,
+    check_resp_size, FrameFlags, FrameHeader, HandshakeRequest, HandshakeResponse,
 };
 use crate::{ClientType, MsgType, STATUS_OK};
 
@@ -345,11 +345,28 @@ impl RpcConnection {
             .await
             .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::Connection(format!("read header: {e}")))?;
-        let hdr = FrameHeader::decode(&hdr_buf)
-            .ok_or_else(|| NetError::Protocol("invalid response header".into()))?;
+        let hdr = FrameHeader::decode_checked(&hdr_buf)
+            .map_err(|reason| {
+                // Layer 1: 帧头不变式违反
+                log::warn!(
+                    "{} rpc_client: invalid response header, reason={}",
+                    crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
+                );
+                NetError::Protocol(format!("invalid response header: {}", reason))
+            })?;
 
         // 5. Read response body (body + data combined; callers decode TLV).
         let total = hdr.data_len as usize;
+        let body_len = hdr.body_len as usize;
+        let data_len = total.saturating_sub(body_len);
+
+        // Layer 3: per-msg_type 期望响应大小校验（仅告警）
+        check_resp_size(hdr.msg_type, body_len, data_len);
+
+        // Layer 2: 响应大小硬限制防御性校验
+        check_resp_limits(hdr.msg_type, hdr.seq, body_len, data_len)
+            .map_err(|reason| NetError::Protocol(format!("response size limit: {}", reason)))?;
+
         let body = if total == 0 {
             Vec::new()
         } else {
@@ -360,6 +377,14 @@ impl RpcConnection {
                 .map_err(|e| NetError::Connection(format!("read body: {e}")))?;
             buf
         };
+
+        // Layer 4: TLV 必需字段校验（仅成功响应）
+        if hdr.status == STATUS_OK {
+            check_required_fields(hdr.msg_type, hdr.seq, &body[..body_len])
+                .map_err(|reason| {
+                    NetError::Protocol(format!("required field check: {}", reason))
+                })?;
+        }
 
         Ok(RpcReply {
             status: hdr.status,

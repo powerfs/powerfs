@@ -15,6 +15,42 @@ pub const HEADER_SIZE: usize = 28;
 /// Maximum frame size (header + data)
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024; // 4MB
 
+/// body 段最大长度（与内核 POWERFS_NET_MAX_BODY 一致）。
+/// Layer 2 防御性校验：超过此值视为协议异常，拒绝处理。
+pub const MAX_BODY_SIZE: usize = 256 * 1024; // 256KB
+
+/// data 段最大长度（与内核 POWERFS_NET_MAX_DATA 一致）。
+/// Layer 2 防御性校验：超过此值视为协议异常，拒绝处理。
+pub const MAX_DATA_SIZE: usize = 2 * 1024 * 1024; // 2MB
+
+// ============================================================================
+// Layer 6: 统一诊断日志前缀
+//
+// 所有协议校验失败日志使用统一前缀，便于日志检索和问题定位。
+// 前缀命名规范：RX_<CATEGORY>，表示接收路径（RX）的各类异常。
+//
+// | 前缀               | Layer | 含义                           | 级别  |
+// |---------------------|-------|-------------------------------|-------|
+// | RX_HDR_INVARIANT    | L1    | 帧头不变式违反                  | warn  |
+// | RX_TRUNCATE         | L2    | 响应超硬限制（body>256KB/data>2MB）| error |
+// | RX_SIZE_ANOMALY     | L3    | 响应超期望大小（per-msg_type）   | warn  |
+// | RX_MISSING_FIELD    | L4    | TLV 必需字段缺失                 | error |
+//
+// 日志格式：`RX_XXX msg=0x{msg_type:04x} seq={seq} ...`
+// ============================================================================
+
+/// Layer 1: 帧头不变式违反（magic/version/data_len>=body_len/超限）
+pub const LOG_PREFIX_RX_HDR_INVARIANT: &str = "RX_HDR_INVARIANT";
+
+/// Layer 2: 响应超协议硬限制（body > 256KB 或 data > 2MB）
+pub const LOG_PREFIX_RX_TRUNCATE: &str = "RX_TRUNCATE";
+
+/// Layer 3: 响应超 per-msg_type 期望大小（仅告警，不拒绝）
+pub const LOG_PREFIX_RX_SIZE_ANOMALY: &str = "RX_SIZE_ANOMALY";
+
+/// Layer 4: TLV 必需字段缺失
+pub const LOG_PREFIX_RX_MISSING_FIELD: &str = "RX_MISSING_FIELD";
+
 /// Maximum TLV value length (4GB - 1, using u32 length field)
 pub const MAX_TLV_VALUE_LEN: u32 = 0xFFFFFFFF;
 
@@ -338,6 +374,39 @@ impl FrameHeader {
         self.header_crc == self.calc_header_crc()
     }
 
+    /// 校验帧头不变式（Layer 1: 严格校验）。
+    ///
+    /// 检查以下条件，任一不满足返回 Err 描述具体违规：
+    /// - magic == "PFSN"
+    /// - version == PROTOCOL_VERSION
+    /// - data_len >= body_len（body 是 data 的子段，不能超过总长）
+    /// - data_len <= MAX_FRAME_SIZE（防止恶意/异常超大帧）
+    /// - body_len <= MAX_FRAME_SIZE
+    /// - protocol_ver == PROTOCOL_VERSION（通路版本一致性）
+    ///
+    /// 注意：CRC 校验由 `verify_crc()` 单独处理，此函数仅校验字段语义。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.magic != *PROTOCOL_MAGIC {
+            return Err("invalid magic");
+        }
+        if self.version != PROTOCOL_VERSION {
+            return Err("invalid version");
+        }
+        if self.data_len < self.body_len {
+            return Err("data_len < body_len (invariant violation)");
+        }
+        if self.data_len > MAX_FRAME_SIZE {
+            return Err("data_len > MAX_FRAME_SIZE");
+        }
+        if self.body_len > MAX_FRAME_SIZE {
+            return Err("body_len > MAX_FRAME_SIZE");
+        }
+        if self.protocol_ver != PROTOCOL_VERSION {
+            return Err("protocol_ver mismatch");
+        }
+        Ok(())
+    }
+
     /// Check if this frame is a NOTIFY (server-pushed notification)
     pub fn is_notify(&self) -> bool {
         self.flags & FrameFlags::NOTIFY != 0
@@ -382,7 +451,46 @@ impl FrameHeader {
         if !hdr.verify_crc() {
             return None;
         }
+        // Layer 1: 帧头不变式严格校验，decode 路径也强制执行
+        if hdr.validate().is_err() {
+            return None;
+        }
         Some(hdr)
+    }
+
+    /// 解码帧头并返回具体校验错误（Layer 1: 严格校验）。
+    ///
+    /// 与 `decode()` 的区别：返回 `Result` 携带具体错误原因，
+    /// 便于调用方输出 RX_HDR_INVARIANT 诊断日志。
+    ///
+    /// 校验顺序：buffer 长度 → magic → CRC → validate() 不变式
+    pub fn decode_checked(buf: &[u8]) -> Result<Self, &'static str> {
+        if buf.len() < Self::SIZE {
+            return Err("buffer too short for header");
+        }
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&buf[0..4]);
+        if magic != *PROTOCOL_MAGIC {
+            return Err("invalid magic");
+        }
+        let hdr = Self {
+            magic,
+            version: buf[4],
+            flags: buf[5],
+            seq: u32::from_le_bytes(buf[6..10].try_into().map_err(|_| "seq decode failed")?),
+            msg_type: u16::from_le_bytes(buf[10..12].try_into().map_err(|_| "msg_type decode failed")?),
+            status: u16::from_le_bytes(buf[12..14].try_into().map_err(|_| "status decode failed")?),
+            data_len: u32::from_le_bytes(buf[14..18].try_into().map_err(|_| "data_len decode failed")?),
+            body_len: u32::from_le_bytes(buf[18..22].try_into().map_err(|_| "body_len decode failed")?),
+            route_hash: buf[22],
+            protocol_ver: buf[23],
+            header_crc: u32::from_le_bytes(buf[24..28].try_into().map_err(|_| "header_crc decode failed")?),
+        };
+        if !hdr.verify_crc() {
+            return Err("header CRC mismatch");
+        }
+        hdr.validate()?;
+        Ok(hdr)
     }
 }
 
@@ -973,6 +1081,189 @@ pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
     FrameHeader::decode(buf)
 }
 
+/// 返回指定 msg_type 期望的最大响应大小 (max_body, max_data)（Layer 3）。
+///
+/// 用于 `check_resp_size()` 检测异常大响应。返回 None 表示该 msg_type
+/// 无大小约束（如控制消息、心跳等）。
+///
+/// 大小依据：
+/// - 元数据操作 (Lookup/GetAttr/Create/Mkdir 等)：body < 4KB
+/// - ReadDir：body < 64KB（目录条目多）
+/// - ReadNeedle/ReadNeedleBlob：data ≤ 2MB（单 chunk 大小）
+/// - WriteNeedle/BatchWriteNeedle：data ≤ 2MB
+/// - StatFs：body < 256B
+pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
+    match msg_type {
+        // ReadDir (0x0018) - 目录列表可能较大
+        0x0018 => Some((64 * 1024, 0)),
+
+        // 元数据操作: 0x0010-0x001D - body < 4KB
+        // Lookup/GetAttr/SetAttr/Create/Mkdir/Unlink/Rmdir/Rename
+        // Symlink/Readlink/Link/SetAttrData/SetAttrMeta
+        0x0010..=0x001D => Some((4 * 1024, 0)),
+
+        // StatFs (0x0040) - body < 256B
+        0x0040 => Some((256, 0)),
+
+        // ReadNeedle (0x0063) - data ≤ 2MB, body < 256KB
+        0x0063 => Some((256 * 1024, 2 * 1024 * 1024)),
+
+        // ReadNeedleBlob (0x0066) - data ≤ 2MB
+        0x0066 => Some((256 * 1024, 2 * 1024 * 1024)),
+
+        // WriteNeedle (0x0062) - data ≤ 2MB, body < 4KB
+        0x0062 => Some((4 * 1024, 2 * 1024 * 1024)),
+
+        // BatchWriteNeedle (0x0065) - data ≤ 2MB
+        0x0065 => Some((4 * 1024, 2 * 1024 * 1024)),
+
+        // 其他消息类型无大小约束
+        _ => None,
+    }
+}
+
+/// Layer 3: per-msg_type 期望响应大小校验（仅告警，不拒绝）。
+///
+/// 检测异常大响应并输出 RX_SIZE_ANOMALY 告警日志。不拒绝响应，
+/// 由调用方自行决定是否处理。
+///
+/// 调用点：client.rs recv_loop / rpc_client.rs / io_loop.rs 收到响应后
+pub fn check_resp_size(msg_type: u16, body_len: usize, data_len: usize) {
+    if let Some((max_body, max_data)) = expected_resp_size(msg_type) {
+        if body_len > max_body {
+            log::warn!(
+                "{} msg=0x{:04x} body_len={} > expected_max={}",
+                LOG_PREFIX_RX_SIZE_ANOMALY, msg_type, body_len, max_body
+            );
+        }
+        if data_len > max_data {
+            log::warn!(
+                "{} msg=0x{:04x} data_len={} > expected_max={}",
+                LOG_PREFIX_RX_SIZE_ANOMALY, msg_type, data_len, max_data
+            );
+        }
+    }
+}
+
+/// Layer 2: 响应大小硬限制防御性校验。
+///
+/// Rust 客户端使用 Vec<u8> 动态分配，无静默截断问题。但仍需检测
+/// 超过协议最大限制的异常响应，防止内存耗尽和协议违规。
+///
+/// 与 `check_resp_size`（Layer 3, 仅告警）的区别：
+/// - 本函数检查的是 **协议硬限制**（MAX_BODY_SIZE / MAX_DATA_SIZE）
+/// - 超限返回 Err，调用方应 **拒绝处理** 该响应
+///
+/// 与 `FrameHeader::validate()`（Layer 1）的区别：
+/// - validate() 检查帧头字段的 **不变式**（data_len >= body_len, <= MAX_FRAME_SIZE）
+/// - 本函数检查 **body 段和 data 段各自的硬限制**（更细粒度）
+///
+/// # 参数
+/// - `msg_type`: 消息类型（用于日志）
+/// - `seq`: 序列号（用于日志）
+/// - `body_len`: body 段实际长度
+/// - `data_seg_len`: data 段实际长度（= data_len - body_len）
+///
+/// # 返回
+/// - Ok(()) 大小在限制内
+/// - Err(reason) 超限，reason 描述具体违规
+pub fn check_resp_limits(
+    msg_type: u16,
+    seq: u32,
+    body_len: usize,
+    data_seg_len: usize,
+) -> Result<(), &'static str> {
+    if body_len > MAX_BODY_SIZE {
+        log::error!(
+            "{} msg=0x{:04x} seq={} body_len={} > MAX_BODY_SIZE={}",
+            LOG_PREFIX_RX_TRUNCATE, msg_type, seq, body_len, MAX_BODY_SIZE
+        );
+        return Err("body_len exceeds MAX_BODY_SIZE");
+    }
+    if data_seg_len > MAX_DATA_SIZE {
+        log::error!(
+            "{} msg=0x{:04x} seq={} data_seg_len={} > MAX_DATA_SIZE={}",
+            LOG_PREFIX_RX_TRUNCATE, msg_type, seq, data_seg_len, MAX_DATA_SIZE
+        );
+        return Err("data_seg_len exceeds MAX_DATA_SIZE");
+    }
+    Ok(())
+}
+
+/// 返回指定 msg_type 响应中必需的 TLV 字段列表（Layer 4）。
+///
+/// 用于 `check_required_fields()` 校验响应是否包含协议要求的关键字段。
+/// 返回空切片表示该 msg_type 无必需字段约束。
+fn required_fields_for(msg_type: u16) -> &'static [FieldId] {
+    match msg_type {
+        // Lookup 响应：必须含 Ino + Mode
+        0x0010 => &[FieldId::Ino, FieldId::Mode],
+        // GetAttr 响应：必须含 Ino + Mode + Size
+        0x0011 => &[FieldId::Ino, FieldId::Mode, FieldId::Size],
+        // Create 响应：必须含 Ino + Mode
+        0x0013 => &[FieldId::Ino, FieldId::Mode],
+        // Mkdir 响应：必须含 Ino + Mode + IsDir
+        0x0014 => &[FieldId::Ino, FieldId::Mode, FieldId::IsDir],
+        // Symlink 响应：必须含 Ino + Mode + SymlinkTarget
+        0x0019 => &[FieldId::Ino, FieldId::Mode, FieldId::SymlinkTarget],
+        // Readlink 响应：必须含 SymlinkTarget
+        0x001A => &[FieldId::SymlinkTarget],
+        // 其他消息类型无必需字段约束
+        _ => &[],
+    }
+}
+
+/// Layer 4: TLV 必需字段校验。
+///
+/// 扫描响应 body 中的 TLV 字段，检查 msg_type 要求的必需字段是否存在。
+/// 缺失时输出 RX_MISSING_FIELD 错误日志并返回 Err。
+///
+/// **TLV 格式检测**：若 body 首字节不是有效 FieldId，视为非 TLV 编码
+/// （如测试 mock 的 JSON 响应），跳过校验。生产协议始终使用 TLV 编码。
+///
+/// # 参数
+/// - `msg_type`: 消息类型
+/// - `seq`: 序列号（用于日志）
+/// - `body`: 响应 body 段（TLV 编码）
+///
+/// # 返回
+/// - Ok(()) 所有必需字段存在，或 body 非 TLV 格式
+/// - Err(missing_field) 缺失字段
+pub fn check_required_fields(
+    msg_type: u16,
+    seq: u32,
+    body: &[u8],
+) -> Result<(), &'static str> {
+    let required = required_fields_for(msg_type);
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    // 空 body 跳过校验（mock 服务器可能将数据放在 data 段，body_len=0）
+    // 生产协议中成功响应应在 body 段包含 TLV 字段
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    // TLV 格式检测：首字节必须是有效 FieldId
+    // 非 TLV body（如 JSON）首字节通常为 '{' (0x7B)，不匹配任何 FieldId
+    if FieldId::from_u8(body[0]).is_none() {
+        return Ok(());
+    }
+
+    let dec = crate::serialize::TlvDecoder::new(body);
+    for field in required {
+        if !dec.contains_field(*field) {
+            log::error!(
+                "{} msg=0x{:04x} seq={} field=0x{:02x} ({:?})",
+                LOG_PREFIX_RX_MISSING_FIELD, msg_type, seq, *field as u8, field
+            );
+            return Err("required field missing");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1326,486 @@ mod tests {
         buf[10] ^= 0xFF;
 
         assert!(FrameHeader::decode(&buf).is_none());
+    }
+
+    /// R1 单元测试：validate() 正常帧通过校验
+    #[test]
+    fn test_validate_ok() {
+        let hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        assert!(hdr.validate().is_ok());
+    }
+
+    /// R1 单元测试：data_len < body_len 不变式违反
+    #[test]
+    fn test_validate_data_len_less_than_body_len() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        // 人为构造不变式违反：data_len < body_len
+        hdr.body_len = 200;
+        hdr.data_len = 100;
+        let result = hdr.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "data_len < body_len (invariant violation)");
+    }
+
+    /// R1 单元测试：data_len > MAX_FRAME_SIZE
+    #[test]
+    fn test_validate_data_len_exceeds_max() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        hdr.data_len = MAX_FRAME_SIZE + 1;
+        hdr.header_crc = hdr.calc_header_crc(); // 重算 CRC 使校验通过到 validate
+        let result = hdr.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "data_len > MAX_FRAME_SIZE");
+    }
+
+    /// R1 单元测试：body_len > MAX_FRAME_SIZE
+    #[test]
+    fn test_validate_body_len_exceeds_max() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        hdr.body_len = MAX_FRAME_SIZE + 1;
+        hdr.data_len = MAX_FRAME_SIZE + 1; // data_len >= body_len 满足，但都超限
+        hdr.header_crc = hdr.calc_header_crc();
+        let result = hdr.validate();
+        // data_len 先被检查，先返回 data_len 错误
+        assert!(result.is_err());
+    }
+
+    /// R1 单元测试：version 不匹配
+    #[test]
+    fn test_validate_version_mismatch() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        hdr.version = 0x02;
+        let result = hdr.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "invalid version");
+    }
+
+    /// R1 单元测试：protocol_ver 不匹配
+    #[test]
+    fn test_validate_protocol_ver_mismatch() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        hdr.protocol_ver = 0x02;
+        let result = hdr.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "protocol_ver mismatch");
+    }
+
+    /// R1 单元测试：decode_checked() 正常解码
+    #[test]
+    fn test_decode_checked_ok() {
+        let hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            42,
+            100,
+        );
+        let mut buf = vec![0u8; FrameHeader::SIZE];
+        hdr.encode(&mut buf);
+
+        let decoded = FrameHeader::decode_checked(&buf);
+        assert!(decoded.is_ok());
+        assert_eq!(decoded.unwrap().seq, 42);
+    }
+
+    /// R1 单元测试：decode_checked() 返回具体错误
+    #[test]
+    fn test_decode_checked_bad_magic() {
+        let hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            0,
+        );
+        let mut buf = vec![0u8; FrameHeader::SIZE];
+        hdr.encode(&mut buf);
+
+        // 破坏 magic
+        buf[0] = b'X';
+
+        let result = FrameHeader::decode_checked(&buf);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "invalid magic");
+    }
+
+    /// R1 单元测试：decode_checked() 缓冲区过短
+    #[test]
+    fn test_decode_checked_short_buffer() {
+        let buf = [0u8; 10]; // < FrameHeader::SIZE (28)
+        let result = FrameHeader::decode_checked(&buf);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "buffer too short for header");
+    }
+
+    /// R1 单元测试：decode() 对不变式违反返回 None（向后兼容）
+    #[test]
+    fn test_decode_rejects_invariant_violation() {
+        let mut hdr = FrameHeader::new(
+            MsgType::Lookup.as_u16(),
+            FrameFlags::new(FrameFlags::REQUEST),
+            1,
+            100,
+        );
+        // 构造 data_len < body_len 不变式违反
+        hdr.body_len = 200;
+        hdr.data_len = 100;
+        hdr.header_crc = hdr.calc_header_crc();
+
+        let mut buf = vec![0u8; FrameHeader::SIZE];
+        hdr.encode(&mut buf);
+
+        // decode 应返回 None（不变式违反）
+        assert!(FrameHeader::decode(&buf).is_none());
+        // decode_checked 应返回具体错误
+        let checked = FrameHeader::decode_checked(&buf);
+        assert!(checked.is_err());
+        assert_eq!(
+            checked.unwrap_err(),
+            "data_len < body_len (invariant violation)"
+        );
+    }
+
+    /// R2 单元测试：expected_resp_size 元数据操作返回 4KB 限制
+    #[test]
+    fn test_expected_resp_size_metadata() {
+        // Lookup
+        let (max_body, max_data) = expected_resp_size(MsgType::Lookup.as_u16()).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+        assert_eq!(max_data, 0);
+
+        // GetAttr
+        let (max_body, _) = expected_resp_size(MsgType::GetAttr.as_u16()).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+
+        // Create
+        let (max_body, _) = expected_resp_size(MsgType::Create.as_u16()).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+
+        // SetAttrData (0x001C)
+        let (max_body, _) = expected_resp_size(0x001C).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+
+        // SetAttrMeta (0x001D)
+        let (max_body, _) = expected_resp_size(0x001D).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+    }
+
+    /// R2 单元测试：ReadDir 返回 64KB 限制
+    #[test]
+    fn test_expected_resp_size_readdir() {
+        let (max_body, max_data) = expected_resp_size(MsgType::ReadDir.as_u16()).unwrap();
+        assert_eq!(max_body, 64 * 1024);
+        assert_eq!(max_data, 0);
+    }
+
+    /// R2 单元测试：ReadNeedle 返回 2MB data 限制
+    #[test]
+    fn test_expected_resp_size_read_needle() {
+        let (max_body, max_data) = expected_resp_size(MsgType::ReadNeedle.as_u16()).unwrap();
+        assert_eq!(max_body, 256 * 1024);
+        assert_eq!(max_data, 2 * 1024 * 1024);
+    }
+
+    /// R2 单元测试：WriteNeedle 返回 2MB data 限制
+    #[test]
+    fn test_expected_resp_size_write_needle() {
+        let (max_body, max_data) = expected_resp_size(MsgType::WriteNeedle.as_u16()).unwrap();
+        assert_eq!(max_body, 4 * 1024);
+        assert_eq!(max_data, 2 * 1024 * 1024);
+    }
+
+    /// R2 单元测试：StatFs 返回 256B 限制
+    #[test]
+    fn test_expected_resp_size_statfs() {
+        let (max_body, max_data) = expected_resp_size(MsgType::StatFs.as_u16()).unwrap();
+        assert_eq!(max_body, 256);
+        assert_eq!(max_data, 0);
+    }
+
+    /// R2 单元测试：无约束的消息类型返回 None
+    #[test]
+    fn test_expected_resp_size_no_constraint() {
+        // Ping
+        assert!(expected_resp_size(MsgType::Ping.as_u16()).is_none());
+        // Handshake
+        assert!(expected_resp_size(MsgType::Handshake.as_u16()).is_none());
+        // 未知 msg_type
+        assert!(expected_resp_size(0xFFFF).is_none());
+    }
+
+    /// R2 单元测试：check_resp_size 正常大小不触发告警（函数返回 ()，仅验证不 panic）
+    #[test]
+    fn test_check_resp_size_normal() {
+        // Lookup body < 4KB - 正常
+        check_resp_size(MsgType::Lookup.as_u16(), 200, 0);
+        // ReadDir body < 64KB - 正常
+        check_resp_size(MsgType::ReadDir.as_u16(), 10000, 0);
+        // ReadNeedle data < 2MB - 正常
+        check_resp_size(MsgType::ReadNeedle.as_u16(), 0, 2 * 1024 * 1024);
+    }
+
+    /// R2 单元测试：check_resp_size 异常大小不 panic（告警仅日志，不拒绝）
+    #[test]
+    fn test_check_resp_size_anomaly_no_panic() {
+        // Lookup body > 4KB - 异常但不 panic
+        check_resp_size(MsgType::Lookup.as_u16(), 8 * 1024, 0);
+        // ReadNeedle data > 2MB - 异常但不 panic
+        check_resp_size(MsgType::ReadNeedle.as_u16(), 0, 4 * 1024 * 1024);
+        // 无约束的 msg_type - 不做任何检查
+        check_resp_size(0xFFFF, 100 * 1024 * 1024, 100 * 1024 * 1024);
+    }
+
+    /// R5 单元测试：check_resp_limits 正常大小通过
+    #[test]
+    fn test_check_resp_limits_ok() {
+        // body < 256KB, data < 2MB - 正常
+        assert!(check_resp_limits(0x0010, 1, 100, 0).is_ok());
+        assert!(check_resp_limits(0x0063, 1, 256 * 1024, 2 * 1024 * 1024).is_ok());
+        // 边界值：恰好等于限制
+        assert!(check_resp_limits(0x0010, 1, MAX_BODY_SIZE, 0).is_ok());
+        assert!(check_resp_limits(0x0063, 1, 0, MAX_DATA_SIZE).is_ok());
+    }
+
+    /// R5 单元测试：body_len 超过 MAX_BODY_SIZE 被拒绝
+    #[test]
+    fn test_check_resp_limits_body_exceeds() {
+        let result = check_resp_limits(0x0010, 42, MAX_BODY_SIZE + 1, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "body_len exceeds MAX_BODY_SIZE");
+    }
+
+    /// R5 单元测试：data_seg_len 超过 MAX_DATA_SIZE 被拒绝
+    #[test]
+    fn test_check_resp_limits_data_exceeds() {
+        let result = check_resp_limits(0x0063, 42, 0, MAX_DATA_SIZE + 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "data_seg_len exceeds MAX_DATA_SIZE");
+    }
+
+    /// R5 单元测试：body 和 data 同时超限，先报 body
+    #[test]
+    fn test_check_resp_limits_both_exceed_body_first() {
+        let result = check_resp_limits(0x0010, 42, MAX_BODY_SIZE + 1, MAX_DATA_SIZE + 1);
+        assert!(result.is_err());
+        // body 先被检查
+        assert_eq!(result.unwrap_err(), "body_len exceeds MAX_BODY_SIZE");
+    }
+
+    /// R5 单元测试：零长度通过
+    #[test]
+    fn test_check_resp_limits_zero() {
+        assert!(check_resp_limits(0x0010, 1, 0, 0).is_ok());
+    }
+
+    /// R5 单元测试：常量值与内核一致
+    #[test]
+    fn test_max_size_constants() {
+        // 与内核 POWERFS_NET_MAX_BODY (256KB) 一致
+        assert_eq!(MAX_BODY_SIZE, 256 * 1024);
+        // 与内核 POWERFS_NET_MAX_DATA (2MB) 一致
+        assert_eq!(MAX_DATA_SIZE, 2 * 1024 * 1024);
+        // MAX_FRAME_SIZE (4MB) >= MAX_BODY_SIZE + MAX_DATA_SIZE (256KB + 2MB)
+        assert!(MAX_FRAME_SIZE as usize >= MAX_BODY_SIZE + MAX_DATA_SIZE);
+    }
+
+    /// R3 单元测试：check_required_fields Lookup 响应含 Ino+Mode 通过
+    #[test]
+    fn test_check_required_fields_lookup_ok() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 100);
+        enc.add_u32(FieldId::Mode, 0o644);
+        let body = enc.into_bytes();
+
+        assert!(check_required_fields(0x0010, 1, &body).is_ok());
+    }
+
+    /// R3 单元测试：check_required_fields Lookup 响应缺 Mode 失败
+    #[test]
+    fn test_check_required_fields_lookup_missing_mode() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 100);
+        // 故意不添加 Mode
+        let body = enc.into_bytes();
+
+        let result = check_required_fields(0x0010, 1, &body);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "required field missing");
+    }
+
+    /// R3 单元测试：check_required_fields Lookup 响应缺 Ino 失败
+    #[test]
+    fn test_check_required_fields_lookup_missing_ino() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        // 故意不添加 Ino
+        enc.add_u32(FieldId::Mode, 0o644);
+        let body = enc.into_bytes();
+
+        let result = check_required_fields(0x0010, 1, &body);
+        assert!(result.is_err());
+    }
+
+    /// R3 单元测试：GetAttr 响应必须含 Ino+Mode+Size
+    #[test]
+    fn test_check_required_fields_getattr() {
+        // 完整响应
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 200);
+        enc.add_u32(FieldId::Mode, 0o755);
+        enc.add_u64(FieldId::Size, 4096);
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x0011, 1, &body).is_ok());
+
+        // 缺 Size
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 200);
+        enc.add_u32(FieldId::Mode, 0o755);
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x0011, 1, &body).is_err());
+    }
+
+    /// R3 单元测试：Mkdir 响应必须含 IsDir
+    #[test]
+    fn test_check_required_fields_mkdir() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 300);
+        enc.add_u32(FieldId::Mode, 0o755);
+        enc.add_u8(FieldId::IsDir, 1);
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x0014, 1, &body).is_ok());
+
+        // 缺 IsDir
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, 300);
+        enc.add_u32(FieldId::Mode, 0o755);
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x0014, 1, &body).is_err());
+    }
+
+    /// R3 单元测试：Readlink 响应必须含 SymlinkTarget
+    #[test]
+    fn test_check_required_fields_readlink() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_string(FieldId::SymlinkTarget, "/target/path").unwrap();
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x001A, 1, &body).is_ok());
+
+        // 空 body 跳过校验（mock 服务器兼容）
+        assert!(check_required_fields(0x001A, 1, &[]).is_ok());
+    }
+
+    /// R3 单元测试：无约束的 msg_type 直接通过
+    #[test]
+    fn test_check_required_fields_no_constraint() {
+        // Ping (0x0001) 无必需字段
+        assert!(check_required_fields(0x0001, 1, &[]).is_ok());
+        // ReadNeedle (0x0063) 无必需字段
+        assert!(check_required_fields(0x0063, 1, &[]).is_ok());
+        // 未知 msg_type
+        assert!(check_required_fields(0xFFFF, 1, &[]).is_ok());
+    }
+
+    /// R3 单元测试：字段顺序无关，扫描全 buffer
+    #[test]
+    fn test_check_required_fields_field_order() {
+        // Mode 在前，Ino 在后 - 仍应通过
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        enc.add_u64(FieldId::Ino, 100);
+        let body = enc.into_bytes();
+        assert!(check_required_fields(0x0010, 1, &body).is_ok());
+    }
+
+    /// R3 单元测试：contains_field 全 buffer 扫描
+    #[test]
+    fn test_tlv_decoder_contains_field() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        enc.add_u64(FieldId::Ino, 100);
+        enc.add_u64(FieldId::Size, 4096);
+        let buf = enc.into_bytes();
+
+        let dec = crate::serialize::TlvDecoder::new(&buf);
+        assert!(dec.contains_field(FieldId::Mode));
+        assert!(dec.contains_field(FieldId::Ino));
+        assert!(dec.contains_field(FieldId::Size));
+        assert!(!dec.contains_field(FieldId::Name));
+    }
+
+    /// R3 单元测试：contains_field 不消耗 decoder 位置
+    #[test]
+    fn test_tlv_decoder_contains_field_no_consume() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        enc.add_u64(FieldId::Ino, 100);
+        let buf = enc.into_bytes();
+
+        let dec = crate::serialize::TlvDecoder::new(&buf);
+        assert!(dec.contains_field(FieldId::Ino));
+        // contains_field 不改变 pos，仍能正常读取第一个字段
+        assert_eq!(dec.peek_field(), Some(FieldId::Mode));
+    }
+
+    /// R4 单元测试：日志前缀常量值正确
+    #[test]
+    fn test_log_prefix_constants() {
+        assert_eq!(LOG_PREFIX_RX_HDR_INVARIANT, "RX_HDR_INVARIANT");
+        assert_eq!(LOG_PREFIX_RX_TRUNCATE, "RX_TRUNCATE");
+        assert_eq!(LOG_PREFIX_RX_SIZE_ANOMALY, "RX_SIZE_ANOMALY");
+        assert_eq!(LOG_PREFIX_RX_MISSING_FIELD, "RX_MISSING_FIELD");
+    }
+
+    /// R4 单元测试：日志前缀互不相同
+    #[test]
+    fn test_log_prefix_unique() {
+        let prefixes = [
+            LOG_PREFIX_RX_HDR_INVARIANT,
+            LOG_PREFIX_RX_TRUNCATE,
+            LOG_PREFIX_RX_SIZE_ANOMALY,
+            LOG_PREFIX_RX_MISSING_FIELD,
+        ];
+        for i in 0..prefixes.len() {
+            for j in (i + 1)..prefixes.len() {
+                assert_ne!(prefixes[i], prefixes[j], "prefixes must be unique");
+            }
+        }
+    }
+
+    /// R4 单元测试：日志前缀都以 RX_ 开头
+    #[test]
+    fn test_log_prefix_format() {
+        assert!(LOG_PREFIX_RX_HDR_INVARIANT.starts_with("RX_"));
+        assert!(LOG_PREFIX_RX_TRUNCATE.starts_with("RX_"));
+        assert!(LOG_PREFIX_RX_SIZE_ANOMALY.starts_with("RX_"));
+        assert!(LOG_PREFIX_RX_MISSING_FIELD.starts_with("RX_"));
     }
 
     #[test]

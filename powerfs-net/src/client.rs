@@ -551,10 +551,14 @@ impl PowerFsNetClient {
                 let read_result = reader.read_exact(&mut hdr_buf).await;
 
                 let header = match read_result {
-                    Ok(_) => match FrameHeader::decode(&hdr_buf) {
-                        Some(h) => h,
-                        None => {
-                            warn!("recv_loop: invalid header, skipping");
+                    Ok(_) => match FrameHeader::decode_checked(&hdr_buf) {
+                        Ok(h) => h,
+                        Err(reason) => {
+                            // Layer 1: 帧头不变式违反，输出诊断日志
+                            warn!(
+                                "{} recv_loop: invalid header, reason={}, skipping",
+                                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
+                            );
                             continue;
                         }
                     },
@@ -585,6 +589,41 @@ impl PowerFsNetClient {
 
                 let body = payload[..body_len].to_vec();
                 let data = payload[body_len..].to_vec();
+
+                // Layer 3: per-msg_type 期望响应大小校验（仅告警）
+                check_resp_size(header.msg_type, body.len(), data.len());
+
+                // Layer 2: 响应大小硬限制防御性校验
+                // 超限时拒绝处理，防止内存耗尽和协议违规
+                if let Err(reason) =
+                    check_resp_limits(header.msg_type, header.seq, body.len(), data.len())
+                {
+                    warn!(
+                        "recv_loop: response rejected, reason={}, seq={}, msg=0x{:04x}",
+                        reason, header.seq, header.msg_type
+                    );
+                    // 通知等待该 seq 的请求失败
+                    if let Some((_, sender)) = pending_requests.remove(&header.seq) {
+                        let _ = sender.send(NetMessage::new(header));
+                    }
+                    continue;
+                }
+
+                // Layer 4: TLV 必需字段校验（仅成功响应）
+                if header.status == STATUS_OK {
+                    if let Err(reason) =
+                        check_required_fields(header.msg_type, header.seq, &body)
+                    {
+                        warn!(
+                            "recv_loop: response missing required field, reason={}, seq={}, msg=0x{:04x}",
+                            reason, header.seq, header.msg_type
+                        );
+                        if let Some((_, sender)) = pending_requests.remove(&header.seq) {
+                            let _ = sender.send(NetMessage::new(header));
+                        }
+                        continue;
+                    }
+                }
 
                 let message = NetMessage::new(header).with_body(body).with_data(data);
 
