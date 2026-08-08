@@ -1003,15 +1003,36 @@ impl MetaShardClient {
     }
 
     /// alloc_inode_batch：向 filer 申请 inode 预留段（leader only）。
+    ///
+    /// TLV 编码: Request = ShardId + Count + ClientId
+    ///           Response = StartInode + EndInode (成功) / Name=error (失败)
     pub async fn alloc_inode_batch(
         &self,
         req: &powerfs_coherence::AllocInodeBatchRequest,
     ) -> Result<powerfs_coherence::AllocInodeBatchResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, req.shard_id);
+        enc.add_u32(FieldId::Count, req.count);
+        let _ = enc.add_string(FieldId::ClientId, &req.client_id);
+
+        let body = enc.into_bytes();
         let resp_body = self
             .send_coherence_msg(powerfs_net::MsgType::AllocInodeBatch, req.shard_id, body)
             .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        let start_inode = dec.next_u64(FieldId::StartInode).unwrap_or(0);
+        let end_inode = dec.next_u64(FieldId::EndInode).unwrap_or(0);
+
+        Ok(powerfs_coherence::AllocInodeBatchResponse {
+            success: true,
+            error: String::new(),
+            start_inode,
+            end_inode,
+        })
     }
 
     /// update_inode_size_chunks：close 时强一致 sync 账本到 filer（leader only）。
@@ -1078,27 +1099,63 @@ impl MetaShardClient {
     }
 
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = OpenCount (成功) / Name=error (失败)
     pub async fn open_count_inc(
         &self,
         req: &powerfs_coherence::OpenCountRequest,
     ) -> Result<powerfs_coherence::OpenCountResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, req.shard_id);
+        enc.add_u64(FieldId::Ino, req.inode);
+
+        let body = enc.into_bytes();
         let resp_body = self
             .send_coherence_msg(powerfs_net::MsgType::OpenCountInc, req.shard_id, body)
             .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        let open_count = dec.next_u32(FieldId::OpenCount).unwrap_or(0);
+
+        Ok(powerfs_coherence::OpenCountResponse {
+            success: true,
+            open_count,
+            error: String::new(),
+        })
     }
 
     /// Phase 3.5.3: open_count 递减——fuse release/close 时通知 filer（leader only）。
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = OpenCount (成功) / Name=error (失败)
     pub async fn open_count_dec(
         &self,
         req: &powerfs_coherence::OpenCountRequest,
     ) -> Result<powerfs_coherence::OpenCountResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, req.shard_id);
+        enc.add_u64(FieldId::Ino, req.inode);
+
+        let body = enc.into_bytes();
         let resp_body = self
             .send_coherence_msg(powerfs_net::MsgType::OpenCountDec, req.shard_id, body)
             .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        let open_count = dec.next_u32(FieldId::OpenCount).unwrap_or(0);
+
+        Ok(powerfs_coherence::OpenCountResponse {
+            success: true,
+            open_count,
+            error: String::new(),
+        })
     }
 
     // =====================================================================

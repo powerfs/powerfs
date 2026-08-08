@@ -1147,54 +1147,40 @@ impl FilerNetHandler {
     }
 
     /// handle_alloc_inode_batch：批量授权 inode 预留段
+    ///
+    /// TLV 编码: Request = ShardId + Count + ClientId
+    ///           Response = StartInode + EndInode (成功) / Name=error (失败)
     async fn handle_alloc_inode_batch(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let req: powerfs_coherence::AllocInodeBatchRequest = match serde_json::from_slice(&msg.body)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("FILER_NET_ALLOC_INODE: decode failed: {}", e);
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ));
-            }
-        };
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let count = dec.next_u32(FieldId::Count).unwrap_or(0);
+        let _client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
 
         // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
-            .calculate_shard(req.shard_id);
+            .calculate_shard(shard_id_raw);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
 
         match self
             .meta_shard_manager
-            .alloc_inode_batch(shard_id, req.count)
+            .alloc_inode_batch(shard_id, count)
             .await
         {
             Ok((start, end)) => {
-                let resp = powerfs_coherence::AllocInodeBatchResponse {
-                    success: true,
-                    error: String::new(),
-                    start_inode: start,
-                    end_inode: end,
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_OK, body))
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::StartInode, start);
+                enc.add_u64(FieldId::EndInode, end);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
                 warn!("FILER_NET_ALLOC_INODE failed: {}", e);
-                let resp = powerfs_coherence::AllocInodeBatchResponse {
-                    success: false,
-                    error: e,
-                    start_inode: 0,
-                    end_inode: 0,
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
             }
         }
     }
@@ -1284,93 +1270,67 @@ impl FilerNetHandler {
     }
 
     /// Phase 3.5.3: 处理 fuse 端 open 时上报的 open_count 递增请求。
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_inc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let req: powerfs_coherence::OpenCountRequest = match serde_json::from_slice(&msg.body) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("FILER_NET_OPEN_COUNT_INC: decode failed: {}", e);
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ));
-            }
-        };
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
         // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
-            .calculate_shard(req.shard_id);
+            .calculate_shard(shard_id_raw);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
 
-        match self.meta_shard_manager.increment_open_count(req.inode) {
+        match self.meta_shard_manager.increment_open_count(inode) {
             Ok(count) => {
-                let resp = powerfs_coherence::OpenCountResponse {
-                    success: true,
-                    open_count: count,
-                    error: String::new(),
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_OK, body))
+                let mut enc = TlvEncoder::new();
+                enc.add_u32(FieldId::OpenCount, count);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
                 warn!("FILER_NET_OPEN_COUNT_INC failed: {}", e);
-                let resp = powerfs_coherence::OpenCountResponse {
-                    success: false,
-                    open_count: 0,
-                    error: e,
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
             }
         }
     }
 
     /// Phase 3.5.3: 处理 fuse 端 release/close 时上报的 open_count 递减请求。
+    ///
+    /// TLV 编码: Request = ShardId + Ino
+    ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_dec(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let req: powerfs_coherence::OpenCountRequest = match serde_json::from_slice(&msg.body) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("FILER_NET_OPEN_COUNT_DEC: decode failed: {}", e);
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ));
-            }
-        };
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
         // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
-            .calculate_shard(req.shard_id);
+            .calculate_shard(shard_id_raw);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
 
-        match self.meta_shard_manager.decrement_open_count(req.inode) {
+        match self.meta_shard_manager.decrement_open_count(inode) {
             Ok(count) => {
-                let resp = powerfs_coherence::OpenCountResponse {
-                    success: true,
-                    open_count: count,
-                    error: String::new(),
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_OK, body))
+                let mut enc = TlvEncoder::new();
+                enc.add_u32(FieldId::OpenCount, count);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
                 warn!("FILER_NET_OPEN_COUNT_DEC failed: {}", e);
-                let resp = powerfs_coherence::OpenCountResponse {
-                    success: false,
-                    open_count: 0,
-                    error: e,
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
             }
         }
     }

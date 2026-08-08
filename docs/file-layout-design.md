@@ -1101,11 +1101,12 @@ Response：
 **实现位置**：
 - Fuse 发送端：[meta_shard_client.rs](file:///home/portion/powerfs/powerfs-fuse-core/src/meta_shard_client.rs) `update_inode_size_chunks()`
 - Filer 接收端：[net_handler.rs](file:///home/portion/powerfs/powerfs-filer/src/net_handler.rs) `handle_update_inode_size_chunks()`
-- 共享错误解析：`send_coherence_msg()` 优先 TLV（`FieldId::Name`），回退 JSON（兼容 OpenCountInc/Dec 等未迁移协议）
+- 共享错误解析：`send_coherence_msg()` 优先 TLV（`FieldId::Name`），JSON 回退保留作为防御性兼容
 
-**未迁移的 coherence 协议**（仍用 JSON body）：
-- `AllocInodeBatch` — 后续可按相同模式迁移
-- `OpenCountInc` / `OpenCountDec` — 后续可按相同模式迁移
+**已迁移的 coherence 协议**（全部使用 TLV body）：
+- `AllocInodeBatch` — Request: ShardId + Count + ClientId; Response: StartInode + EndInode / Name=error
+- `OpenCountInc` / `OpenCountDec` — Request: ShardId + Ino; Response: OpenCount / Name=error
+- `UpdateInodeSizeChunks` — Request: ShardId + Ino + Size + ClientId + FileLayout; Response: 空 / Name=error
 
 ---
 

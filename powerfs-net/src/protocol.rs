@@ -829,6 +829,15 @@ pub enum FieldId {
     InlineData = 0xAE,
     /// Inline 阈值 (u32). Placement::Inline 的 max_size, CREATE 响应携带
     InlineMaxSize = 0xAF,
+
+    // ===== Coherence protocol fields (0xB0-0xBF) =====
+    // 用于 alloc_inode_batch / open_count 等 coherence 协议的 TLV 编码
+    /// 起始 inode (u64). AllocInodeBatch 响应
+    StartInode = 0xB0,
+    /// 结束 inode (u64). AllocInodeBatch 响应
+    EndInode = 0xB1,
+    /// open_count 值 (u32). OpenCountInc/Dec 响应
+    OpenCount = 0xB2,
 }
 
 impl FieldId {
@@ -919,6 +928,9 @@ impl FieldId {
             0xAD => Some(Self::ChunkSize),
             0xAE => Some(Self::InlineData),
             0xAF => Some(Self::InlineMaxSize),
+            0xB0 => Some(Self::StartInode),
+            0xB1 => Some(Self::EndInode),
+            0xB2 => Some(Self::OpenCount),
             _ => None,
         }
     }
