@@ -1264,13 +1264,45 @@ fn required_fields_for(msg_type: u16) -> &'static [FieldId] {
     }
 }
 
+/// 判断 body 是否为结构完整的 TLV 编码。
+///
+/// TLV 格式: 一个或多个 field, 每个 field = field_id(1B) + length(4B BE) + value(length B)。
+/// 本函数做**结构校验**: 遍历所有 field, 验证 length 不越界且恰好消费整个 body。
+/// 不校验 field_id 是否为已知 FieldId (前向兼容未知字段)。
+///
+/// 用途: `check_required_fields` 在校验必需字段前, 先确认 body 是 TLV。
+/// 非 TLV body (JSON、raw string 等) 首字节可能恰好是有效 FieldId,
+/// 仅靠首字节检测会产生误判。结构校验可可靠区分。
+fn looks_like_tlv(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let mut pos = 0;
+    while pos + 5 <= body.len() {
+        let length = u32::from_be_bytes([
+            body[pos + 1],
+            body[pos + 2],
+            body[pos + 3],
+            body[pos + 4],
+        ]) as usize;
+        pos += 5;
+        if pos + length > body.len() {
+            return false; // length 越界 → 不是 TLV
+        }
+        pos += length;
+    }
+    // 有效 TLV 必须恰好消费整个 body (无尾部残余)
+    pos == body.len()
+}
+
 /// Layer 4: TLV 必需字段校验。
 ///
 /// 扫描响应 body 中的 TLV 字段，检查 msg_type 要求的必需字段是否存在。
 /// 缺失时输出 RX_MISSING_FIELD 错误日志并返回 Err。
 ///
-/// **TLV 格式检测**：若 body 首字节不是有效 FieldId，视为非 TLV 编码
-/// （如测试 mock 的 JSON 响应），跳过校验。生产协议始终使用 TLV 编码。
+/// **TLV 格式检测**：使用 `looks_like_tlv()` 对 body 做完整结构校验。
+/// 非 TLV body (JSON、raw string、测试 mock 等) 会跳过校验。
+/// 生产协议成功响应始终使用 TLV 编码, 不会被跳过。
 ///
 /// # 参数
 /// - `msg_type`: 消息类型
@@ -1296,9 +1328,11 @@ pub fn check_required_fields(
         return Ok(());
     }
 
-    // TLV 格式检测：首字节必须是有效 FieldId
-    // 非 TLV body（如 JSON）首字节通常为 '{' (0x7B)，不匹配任何 FieldId
-    if FieldId::from_u8(body[0]).is_none() {
+    // TLV 结构校验: 遍历整个 body 验证 TLV 格式完整性。
+    // 非 TLV body (JSON、raw string 等) 即使首字节恰好是有效 FieldId,
+    // 其后续 length 字段也几乎不可能恰好消费整个 body, 因此结构校验
+    // 可可靠区分 TLV 与非 TLV。
+    if !looks_like_tlv(body) {
         return Ok(());
     }
 
@@ -1793,6 +1827,84 @@ mod tests {
         enc.add_u64(FieldId::Ino, 100);
         let body = enc.into_bytes();
         assert!(check_required_fields(0x0010, 1, &body).is_ok());
+    }
+
+    // ===== looks_like_tlv 单元测试 =====
+
+    #[test]
+    fn test_looks_like_tlv_empty() {
+        assert!(!looks_like_tlv(&[]));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_single_field() {
+        // field_id(1B) + length(4B BE = 0) → 空 value, 共 5 字节
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        assert!(looks_like_tlv(enc.as_bytes()));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_multiple_fields() {
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        enc.add_u64(FieldId::Ino, 100);
+        enc.add_u64(FieldId::Size, 4096);
+        assert!(looks_like_tlv(enc.as_bytes()));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_raw_string() {
+        // "attr_body" 首字节 0x61 ('a') 恰好是有效 FieldId,
+        // 但后续字节不构成合法 TLV length → 必须判为非 TLV
+        assert!(!looks_like_tlv(b"attr_body"));
+        assert!(!looks_like_tlv(b"test_body"));
+        assert!(!looks_like_tlv(b"hello world"));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_json() {
+        // JSON body 首字节 '{' (0x7B) 不是有效 FieldId
+        assert!(!looks_like_tlv(b"{\"key\":\"value\"}"));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_truncated() {
+        // 有效 TLV 截断后 → 不完整, 不是 TLV
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        enc.add_u64(FieldId::Ino, 100);
+        let full = enc.into_bytes();
+        // 截掉最后几个字节
+        assert!(!looks_like_tlv(&full[..full.len() - 3]));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_length_overflow() {
+        // 构造 field_id + 超大 length → 越界, 不是 TLV
+        let mut body = vec![0x01u8]; // 任意 field_id
+        body.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // 超大 length
+        body.extend_from_slice(b"short"); // value 远小于 length
+        assert!(!looks_like_tlv(&body));
+    }
+
+    #[test]
+    fn test_looks_like_tlv_trailing_garbage() {
+        // 有效 TLV + 尾部垃圾字节 → 不恰好消费整个 body, 不是 TLV
+        let mut enc = crate::serialize::TlvEncoder::new();
+        enc.add_u32(FieldId::Mode, 0o644);
+        let mut body = enc.into_bytes();
+        body.push(0x00); // 尾部多 1 字节
+        assert!(!looks_like_tlv(&body));
+    }
+
+    /// check_required_fields 对非 TLV body (首字节恰好是有效 FieldId) 不误判
+    #[test]
+    fn test_check_required_fields_non_tlv_body_with_valid_field_id_byte() {
+        // "attr_body" 首字节 0x61 是有效 FieldId, 但不是 TLV → 跳过校验
+        // Lookup (0x0010) 要求 Mode + Ino, 但 body 不是 TLV 所以不应报错
+        assert!(check_required_fields(0x0010, 1, b"attr_body").is_ok());
+        assert!(check_required_fields(0x0010, 1, b"test_body").is_ok());
     }
 
     /// R3 单元测试：contains_field 全 buffer 扫描
