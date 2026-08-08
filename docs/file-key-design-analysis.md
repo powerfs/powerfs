@@ -703,3 +703,146 @@ vol_info.next_file_key += powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
 两个修复协同工作：
 1. 块分配确保 needle ID 不冲突（写入路径）
 2. needle-not-found 零填充确保 hole 正确处理（读取路径）
+
+---
+
+## 11. 客户端 create 与 Filer 分配不一致修复（2026-08-07）
+
+### 11.1 问题现象
+
+用户反馈：**FUSE 客户端重新挂载（不重启服务）后，读取之前写入的文件失败**，报 `needle not found`（EREMOTEIO）。第一次挂载期间能正常读写，重新挂载后元数据 `stat` 正常但数据读不到。
+
+### 11.2 根因：双端 needle_id 分配冲突
+
+**FUSE 客户端 create 与 Filer handle_create 各自独立分配 needle_id，导致客户端写入用的 needle_id 与 Filer 元数据存储的 needle_id 不一致。**
+
+#### 完整 BUG 链条
+
+1. **客户端 create**（[fuse.rs:1480-1486](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L1480-L1486)，修复前）
+   ```rust
+   // 通过 assign_fid 从 Master 分配 needle_id_A
+   let (fid, ...) = self.client.assign_fid(&self.collection, &self.replication)?;
+   let needle_id = fid.file_key;  // needle_id_A
+   ```
+
+2. **Filer handle_create**（[net_handler.rs:663-704](file:///home/portion/powerfs/powerfs-filer/src/net_handler.rs#L663-L704)）
+   ```rust
+   // Filer 忽略客户端传入的 fid_info，自己通过 Zone 自分配 needle_id_B
+   let _ = dec.next_string(FieldId::Fid).ok();   // 丢弃客户端 fid
+   let _ = dec.next_u64(FieldId::FileKey).ok();   // 丢弃客户端 needle_id
+   ...
+   let (volume_id, needle_id) = self.alloc_for_new_file()?;  // needle_id_B
+   self.meta_shard_manager.set_chunks(ino, shard_id, fid_str, volume_id, ...);  // 存 needle_id_B
+   ```
+
+3. **Filer 响应返回 needle_id_B，但客户端不解析**
+   Filer 响应包含 `VolumeId` 和 `FileKey`（[net_handler.rs:747-748](file:///home/portion/powerfs/powerfs-filer/src/net_handler.rs#L747-L748)），但客户端 `decode_attr_resp` 把这两个字段当未知字段 `dec.skip(length)` 丢弃（[serialize.rs:1195](file:///home/portion/powerfs/powerfs-net/src/serialize.rs#L1195)）。`MetadataAttr` 结构体也没有这两个字段。
+
+4. **客户端用 needle_id_A 写数据**
+   客户端构造 `CachedEntry` 用 `assign_fid` 的 fid_A，write 路径用 **needle_id_A** 写到 Volume Server。
+
+5. **第一次挂载能读，重新挂载读不到**
+   - **第一次挂载**：客户端缓存有 fid_A，read 用 needle_id_A → 能读到 ✓
+   - **重新挂载**：缓存清空，从 Filer lookup/getattr 取到 needle_id_B → **needle not found** ✗
+
+6. **sync_size_chunks_on_close 能否救场？**
+   `update_inode_size_chunks_atomic` 是 `info.chunks = chunks` 直接覆盖（[shard_store.rs:1704](file:///home/portion/powerfs/powerfs-filer/src/shard_store.rs#L1704)）。
+   - **sync 成功**：Filer 的 needle_id_B 被覆盖为 needle_id_A，重新挂载能读到
+   - **sync 失败**（Filer 短暂不可用、leader 切换、网络抖动）：Filer 保留 needle_id_B，重新挂载读不到
+
+   **这完全解释了"客户端重新挂载就读不到，服务没重启"** —— 只要 sync 那一次失败过，元数据就永久错乱。
+
+### 11.3 create 流程与 volume fid 分配方案（修复后）
+
+#### 设计原则
+
+**needle_id 分配权威统一到 Filer 端**（Zone 自分配模型），客户端不自行分配。
+
+理由：
+- Filer 是元数据权威，由 Filer 分配避免双端冲突
+- Filer Zone 自分配是 P2.4 设计的核心（`alloc_for_new_file`）
+- 内核模块已经是这个模式（`powerfs_net_create` 解析 Filer 响应的 VolumeId/FileKey）
+- Master 分配是旧设计，与 Zone 模型冲突
+
+#### 修复后的 create 流程
+
+```
+┌─────────────┐                    ┌──────────────┐
+│ FUSE Client │                    │    Filer     │
+│  (fuse.rs)  │                    │(net_handler) │
+└──────┬──────┘                    └──────┬───────┘
+       │                                  │
+       │  1. create RPC (parent,name,mode,uid,gid)
+       │  ★ 不传 fid_info (None)          │
+       │─────────────────────────────────>│
+       │                                  │
+       │                  2. alloc_for_new_file()
+       │                     ├─ round-robin 选 Zone
+       │                     ├─ zone.counter++ → needle_id
+       │                     └─ select_volume() → volume_id
+       │                                  │
+       │                  3. create_file_with_shard()
+       │                     └─ Raft 提交 inode
+       │                                  │
+       │                  4. set_chunks(ino, fid_str, volume_id, needle_id)
+       │                     └─ Raft 提交 chunk mapping
+       │                                  │
+       │  5. 响应: Ino, Mode, Name, VolumeId, FileKey
+       │<─────────────────────────────────│
+       │                                  │
+       │  6. decode_attr_resp 解析        │
+       │     VolumeId → volume_id         │
+       │     FileKey  → needle_id         │
+       │                                  │
+       │  7. 构造 Fid {                    │
+       │       volume_id: VolumeId(volume_id),
+       │       cookie: 0,                 │
+       │       file_key: needle_id        │
+       │     }                             │
+       │                                  │
+       │  8. 构造 CachedEntry {            │
+       │       fid: Some(fid),            │
+       │       chunks: [{needle_id, volume_id, ...}]
+       │     }                             │
+       │                                  │
+```
+
+#### volume fid 分配的权威路径
+
+| 组件 | 分配方式 | 存储/使用 |
+|------|----------|-----------|
+| **Filer** `alloc_for_new_file()` | Zone round-robin + counter 自增 | 存入 InodeInfo.chunks[0].needle_id |
+| **FUSE 客户端** create | 从 Filer 响应解析 | 存入 CachedEntry.fid.file_key |
+| **内核模块** mknod | 从 Filer 响应解析 | 存入 powerfs_inode_info.file_key |
+| **Master** assign_fid | ~~旧设计，已废弃~~ | FUSE create 不再调用 |
+
+#### needle_id 到存储键的映射
+
+- **chunk 0**: `needle_id = file_key`（Filer 分配）
+- **chunk N**: `needle_id = file_key + N`（客户端 write 时计算，[fuse.rs flush_dirty_chunks_impl](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L612)）
+- **Filer 元数据**: `chunks[N].needle_id = file_key + N`（sync 时由客户端同步）
+
+### 11.4 修改文件清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| [powerfs-net/src/serialize.rs](file:///home/portion/powerfs/powerfs-net/src/serialize.rs) | `AttrResponse` 添加 `volume_id`/`file_key` 字段；`decode_attr_resp` 解析 `FieldId::VolumeId`/`FileKey` |
+| [powerfs-fuse-core/src/metadata_client.rs](file:///home/portion/powerfs/powerfs-fuse-core/src/metadata_client.rs) | `MetadataAttr` 添加 `volume_id`/`file_key` 字段 |
+| [powerfs-fuse-core/src/meta_shard_client.rs](file:///home/portion/powerfs/powerfs-fuse-core/src/meta_shard_client.rs) | `attr_from_resp` 传递 `volume_id`/`file_key` |
+| [powerfs-fuse/src/fuse.rs](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) create | 删除 `assign_fid` 调用，用 Filer 返回值构造 `Fid`/`chunks` |
+| [powerfs-fuse/src/fuse.rs](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) write 兜底 | `entry.fid` 为 None 时返回 EIO，不再隐式 `assign_fid` |
+| [powerfs-fuse/src/fuse.rs](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs) PowerFsFs | 删除不再使用的 `collection`/`replication` 字段 |
+
+### 11.5 内核模块验证
+
+内核模块 **无需修改**，已经是正确的 Filer 分配模式：
+- [powerfs_net_create:3738-3759](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_net.c#L3738-L3759)：不传 fid_info 给 Filer
+- [powerfs_net_create:3778-3781](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_net.c#L3778-L3781)：解析 Filer 响应的 `POWERFS_NET_FLD_VOLUME_ID`/`POWERFS_NET_FLD_FILE_KEY`
+- [powerfs_mknod:1691-1698](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_fs.c#L1691-L1698)：存入 `pi->volume_id`/`pi->file_key`
+
+### 11.6 验证计划
+
+1. **基础功能**：创建文件 → 写入数据 → 重新挂载 → 读取数据（核心场景）
+2. **多 chunk 文件**：>2MB 文件的跨挂载点读取
+3. **FIO 校验**：FIO 写入 → 重新挂载 → FIO 读取校验（md5 对比）
+4. **并发创建**：多线程高频创建文件，验证 needle_id 无冲突

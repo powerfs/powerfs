@@ -1,5 +1,9 @@
 # FileLayout 与 Stripe 设计文档
 
+> **已废弃（2026-08-07）**：本文档布局部分已被 [file-layout-design.md](file-layout-design.md) 第 4 章取代。
+> 新设计采用 Flat/Stripe/WideStripe 三态 + 目录属性继承 + 跨节点 anti-affinity。
+> 本文档保留作为历史参考，**新实现以 file-layout-design.md 为准**。
+
 ## 1. 设计背景
 
 高性能计算存储场景下，单文件可能达到数十 GB 甚至 TB 级别。为了充分利用多台存储节点的并行 I/O 能力，需要引入条带化（Stripe）机制，将大文件的数据分布到多个 Volume 上，实现读写并行化。

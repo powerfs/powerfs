@@ -1,5 +1,10 @@
 # PowerFS 高级存储功能实施计划
 
+> **部分废弃（2026-08-07）**：本文档的"Phase 5: 细纠删码"布局部分（EC 跨节点分布、Reliability 状态机）
+> 已被 [file-layout-design.md](file-layout-design.md) 第 5 章取代。
+> Bitrot 检测、回收站、WORM 锁定等非布局功能仍归本文档。
+> 新布局实现以 file-layout-design.md 为准。
+
 ## 概述
 
 根据 [advanced-storage-features.md](advanced-storage-features.md) 的设计方案，本实施计划详细拆分五个高级存储功能的开发任务：
