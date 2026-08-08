@@ -157,6 +157,15 @@ pub enum ShardCommand {
         key: String,
         value: Vec<u8>,
     },
+    /// P4: Update reliability state after scrubber completes replication.
+    /// Sets reliability = Replicated{count}, state = Replicated, and stores
+    /// replica_chunks (the secondary copy locations).
+    UpdateReliability {
+        inode: u64,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        replica_chunks: Vec<crate::shard_store::StoredFileChunk>,
+    },
 }
 
 impl ShardCommand {
@@ -826,7 +835,9 @@ pub struct RaftGroupManager {
     // Replaces call_once (which created a new TCP connection per message).
     // Key = peer net_address ("ip:net_port"). Each peer has its own Mutex
     // so messages to different peers can be sent concurrently.
-    peer_conns: tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<powerfs_net::NetRpcClient>>>>,
+    peer_conns: tokio::sync::Mutex<
+        HashMap<String, std::sync::Arc<tokio::sync::Mutex<powerfs_net::NetRpcClient>>>,
+    >,
 }
 
 impl RaftGroupManager {
@@ -946,10 +957,7 @@ impl RaftGroupManager {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "FILER_RAFT: failed to connect to {}: {}",
-                        peer_net_addr, e
-                    );
+                    warn!("FILER_RAFT: failed to connect to {}: {}", peer_net_addr, e);
                     return;
                 }
             }

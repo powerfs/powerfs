@@ -10,14 +10,13 @@ use powerfs_common::traits::EventProvider;
 use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventProvider};
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
-use powerfs_master::volume_client::VolumeClientPool;
 
 use powerfs_filer::{
     BucketManager, EntryManager, FilerMetaServiceImpl, FilerNetHandler, FilerServer,
     MetaShardManager, MetadataStore, RaftGroupManager, S3Handler, ShardId, ShardScheduler,
-    ShardStrategy, VolumeRouter,
+    ShardStrategy, TlvVolumeClient, VolumeRouter,
 };
-use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{ClientConnPool, ClientPoolConfig, PowerFsNetServer, ServerConnectionManager};
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -187,7 +186,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         metadata_store.clone(),
         bucket_manager.clone(),
     ));
-    let volume_client_pool = Arc::new(VolumeClientPool::new());
+    // TLV volume client — 所有 Filer→Volume 业务通信走 powerfs-net TLV 协议 (非 gRPC),
+    // 因为内核客户端没有 gRPC, 统一使用 TLV. 供 GC task, S3Handler, scrubber 共用.
+    let volume_client_pool = Arc::new(TlvVolumeClient::new(Arc::new(ClientConnPool::new(
+        filer_cfg.raft_id,
+        ClientPoolConfig::default(),
+        None,
+    ))));
 
     let shard_strategy = Arc::new(ShardStrategy::new(filer_cfg.shard_count as u64));
 
@@ -510,6 +515,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     }
                 }
             });
+        }
+
+        // P4: 启动 scrubber worker (后台副本复制)
+        // 使用 powerfs-net TLV 协议 (非 gRPC) 与 Volume Server 通信,
+        // 因为内核客户端没有 gRPC, 所有业务通信统一走 TLV.
+        {
+            let scrubber = powerfs_filer::scrubber::ScrubberWorker::new(
+                meta_shard_manager.clone(),
+                volume_client_pool.clone(),
+                net_handler.clone(),
+                powerfs_filer::scrubber::ScrubberConfig::default(),
+            );
+            tokio::spawn(async move {
+                scrubber.run().await;
+            });
+            info!("P4_SCRUBBER: scrubber worker started (TLV protocol)");
         }
 
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;

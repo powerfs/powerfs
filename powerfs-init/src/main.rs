@@ -170,6 +170,10 @@ fn main() {
                 nlink: 2,
                 version: 1,
                 delete_time: 0,
+                reliability: powerfs_layout::reliability::Reliability::default(),
+                reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+                compression_state: powerfs_layout::reliability::CompressionState::default(),
+                replica_chunks: Vec::new(),
             };
 
             match store.create_inode_sync(root_inode.clone()) {

@@ -11,8 +11,8 @@ use crate::crdt_orset::{
 use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
 use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
 use crate::shard_strategy::ShardStrategy;
+use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
-use powerfs_master::volume_client::VolumeClientPool;
 
 // POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
 pub const POSIX_ROOT_INODE: u64 = 1;
@@ -611,6 +611,22 @@ impl MetaShardManager {
         result
     }
 
+    /// P4: 扫描所有 shard 中 reliability_state == PendingReplicated 的文件.
+    /// 返回 (inode, chunks) 对, 供 scrubber worker 进行副本复制.
+    pub fn list_pending_replicated(&self) -> Vec<(u64, Vec<crate::shard_store::StoredFileChunk>)> {
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for shard_store in stores.values() {
+            result.extend(shard_store.list_pending_replicated());
+        }
+        result
+    }
+
+    /// P4: 计算 inode 所属的 shard ID (供 scrubber 使用)
+    pub fn calculate_shard_id(&self, inode: u64) -> ShardId {
+        self.shard_strategy.calculate_shard(inode)
+    }
+
     pub fn list_directory(&self, parent_inode: u64) -> Vec<InodeInfo> {
         let shard_id = self.shard_strategy.calculate_shard(parent_inode);
 
@@ -659,6 +675,10 @@ impl MetaShardManager {
                 nlink: 2,
                 version: 0,
                 delete_time: 0,
+                reliability: powerfs_layout::reliability::Reliability::default(),
+                reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+                compression_state: powerfs_layout::reliability::CompressionState::default(),
+                replica_chunks: Vec::new(),
             });
         }
 
@@ -1172,7 +1192,49 @@ impl MetaShardManager {
         Ok(())
     }
 
-    /// Create a symbolic link via Raft consensus
+    /// P4: Update reliability state via Raft consensus.
+    /// Called by scrubber worker after completing replica replication.
+    pub async fn update_reliability(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        replica_chunks: Vec<crate::shard_store::StoredFileChunk>,
+    ) -> Result<(), String> {
+        let target_state = reliability_state.clone();
+        let cmd = ShardCommand::UpdateReliability {
+            inode,
+            reliability,
+            reliability_state,
+            replica_chunks,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.reliability_state == target_state {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("update_reliability timeout waiting for apply".to_string());
+        }
+
+        Ok(())
+    }
     pub async fn create_symlink(
         &self,
         parent_inode: u64,
@@ -2140,6 +2202,10 @@ impl MetaShardManager {
                     nlink,
                     version: 0,
                     delete_time: 0,
+                    reliability: powerfs_layout::reliability::Reliability::default(),
+                    reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+                    compression_state: powerfs_layout::reliability::CompressionState::default(),
+                    replica_chunks: Vec::new(),
                 };
                 store.create_inode_atomic(inode_info, entry_orset.parent_ino, &entry_orset.name)?;
                 debug!(
@@ -2551,7 +2617,7 @@ impl MetaShardManager {
         &self,
         chunks_to_reclaim: Vec<(u64, Vec<StoredFileChunk>)>,
         volume_router: &VolumeRouter,
-        volume_client_pool: &VolumeClientPool,
+        volume_client_pool: &TlvVolumeClient,
     ) {
         for (inode, chunks) in chunks_to_reclaim {
             for chunk in chunks {
@@ -2611,7 +2677,7 @@ impl MetaShardManager {
     pub async fn retry_pending_reclaims(
         &self,
         volume_router: &VolumeRouter,
-        volume_client_pool: &VolumeClientPool,
+        volume_client_pool: &TlvVolumeClient,
     ) -> usize {
         // 先收集所有 pending reclaims，然后释放锁（避免跨 await 持有 RwLockReadGuard）
         let all_pending: Vec<(ShardId, Vec<(u64, StoredFileChunk)>)> = {
@@ -2701,7 +2767,7 @@ impl MetaShardManager {
         interval_secs: u64,
         grace_period_secs: u64,
         volume_router: Arc<VolumeRouter>,
-        volume_client_pool: Arc<VolumeClientPool>,
+        volume_client_pool: Arc<TlvVolumeClient>,
     ) -> tokio::task::JoinHandle<()> {
         let mgr = self.clone();
         tokio::spawn(async move {

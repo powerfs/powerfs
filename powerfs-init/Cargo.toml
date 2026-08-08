@@ -26,6 +26,7 @@ path = "src/main.rs"
 [dependencies]
 powerfs-filer = { path = "../powerfs-filer" }
 powerfs-common = { path = "../powerfs-common" }
+powerfs-layout = { path = "../powerfs-layout" }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

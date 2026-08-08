@@ -60,6 +60,20 @@ pub struct InodeInfo {
     // GC 任务扫描 delete_time > 0 且超过 grace_period 的条目进行物理删除
     #[serde(default)]
     pub delete_time: u64,
+    // P4: Reliability 策略 + 状态机 (scrubber 异步转换)
+    // reliability: 数据保护策略 (SingleReplica / Replicated / EC)
+    // reliability_state: 状态机当前状态 (PendingReplicated → Replicated → ...)
+    // compression_state: 压缩状态 (None / Pending / Compressed)
+    #[serde(default)]
+    pub reliability: powerfs_layout::reliability::Reliability,
+    #[serde(default)]
+    pub reliability_state: powerfs_layout::reliability::ReliabilityState,
+    #[serde(default)]
+    pub compression_state: powerfs_layout::reliability::CompressionState,
+    // P4: 副本位置信息 (Replicated 模式下, 记录副本所在的 volume_id + needle_id)
+    // 主副本在 chunks[].volume_id / chunks[].needle_id, 副本在 replica_chunks[]
+    #[serde(default)]
+    pub replica_chunks: Vec<StoredFileChunk>,
 }
 
 /// Stored file chunk (persisted in Filer InodeInfo)
@@ -530,7 +544,9 @@ impl ShardStore {
                 chunks,
                 inline_data,
             } => {
-                if let Err(e) = self.update_inode_size_chunks_atomic(inode, size, chunks, inline_data) {
+                if let Err(e) =
+                    self.update_inode_size_chunks_atomic(inode, size, chunks, inline_data)
+                {
                     log::error!(
                         "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
                         self.shard_id.0,
@@ -541,6 +557,14 @@ impl ShardStore {
             }
             ShardCommand::SetXattr { inode, key, value } => {
                 self.set_xattr(inode, key, value);
+            }
+            ShardCommand::UpdateReliability {
+                inode,
+                reliability,
+                reliability_state,
+                replica_chunks,
+            } => {
+                self.update_reliability(inode, reliability, reliability_state, replica_chunks);
             }
         }
     }
@@ -571,6 +595,10 @@ impl ShardStore {
             nlink: 1,
             version: 0,
             delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -648,6 +676,10 @@ impl ShardStore {
             nlink: 1,
             version: 0,
             delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -831,6 +863,10 @@ impl ShardStore {
             nlink: 2,
             version: 0,
             delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1048,6 +1084,31 @@ impl ShardStore {
             for chunk in &info.chunks {
                 result.push((chunk.needle_id, chunk.volume_id));
             }
+        }
+        result
+    }
+
+    /// P4: 扫描所有 reliability_state == PendingReplicated 的文件 inode.
+    /// 返回 (inode, chunks) 对, 供 scrubber worker 进行副本复制.
+    /// 跳过目录、空文件、Inline 文件 (无 chunks).
+    pub fn list_pending_replicated(&self) -> Vec<(u64, Vec<StoredFileChunk>)> {
+        use powerfs_layout::reliability::ReliabilityState;
+        let inodes = self.inodes.read().unwrap();
+        let mut result = Vec::new();
+        for info in inodes.values() {
+            if info.file_type != FileType::File {
+                continue;
+            }
+            if info.reliability_state != ReliabilityState::PendingReplicated {
+                continue;
+            }
+            if info.chunks.is_empty() {
+                continue;
+            }
+            if info.delete_time > 0 {
+                continue;
+            }
+            result.push((info.inode, info.chunks.clone()));
         }
         result
     }
@@ -1717,6 +1778,18 @@ impl ShardStore {
         info.chunks = chunks;
         info.inline_data = inline_data;
         info.mtime = Self::current_time();
+        // P4: 如果文件已 Replicated 但数据更新了 (追加写), 重置为 PendingReplicated
+        // 让 scrubber 重新复制新 chunk. 同时清空旧的 replica_chunks.
+        if info.reliability_state == powerfs_layout::reliability::ReliabilityState::Replicated {
+            log::info!(
+                "Shard {} P4: inode {} data changed, resetting Replicated -> PendingReplicated",
+                self.shard_id.0,
+                inode
+            );
+            info.reliability_state =
+                powerfs_layout::reliability::ReliabilityState::PendingReplicated;
+            info.replica_chunks.clear();
+        }
         let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
         // sync 写保证 close sync 账本强持久化
         let mut write_opts = rocksdb::WriteOptions::default();
@@ -1735,7 +1808,10 @@ impl ShardStore {
         let cf_inodes = match self.db.cf_handle(CF_INODES) {
             Some(cf) => cf,
             None => {
-                log::error!("Shard {}: CF_INODES not found for set_xattr", self.shard_id.0);
+                log::error!(
+                    "Shard {}: CF_INODES not found for set_xattr",
+                    self.shard_id.0
+                );
                 return;
             }
         };
@@ -1751,6 +1827,56 @@ impl ShardStore {
             }
         };
         info.extended.insert(key, value);
+        info.mtime = Self::current_time();
+        if let Ok(data) = serde_json::to_vec(&info) {
+            let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
+        }
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
+    }
+
+    /// P4: Update reliability state on an inode (persisted to RocksDB).
+    /// Called from apply_command when ShardCommand::UpdateReliability is committed.
+    /// Sets reliability, reliability_state, and replica_chunks atomically.
+    pub fn update_reliability(
+        &self,
+        inode: u64,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        replica_chunks: Vec<StoredFileChunk>,
+    ) {
+        let cf_inodes = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {}: CF_INODES not found for update_reliability",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        let mut info = match self.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "Shard {} update_reliability: inode {} not found",
+                    self.shard_id.0,
+                    inode
+                );
+                return;
+            }
+        };
+        log::info!(
+            "Shard {} P4 update_reliability: inode {} {:?} -> {:?}, replica_chunks={}",
+            self.shard_id.0,
+            inode,
+            info.reliability_state,
+            reliability_state,
+            replica_chunks.len()
+        );
+        info.reliability = reliability;
+        info.reliability_state = reliability_state;
+        info.replica_chunks = replica_chunks;
         info.mtime = Self::current_time();
         if let Ok(data) = serde_json::to_vec(&info) {
             let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
@@ -1883,6 +2009,10 @@ impl ShardStore {
             nlink: 1,
             version: 0,
             delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -2107,6 +2237,10 @@ mod tests {
             nlink: 1,
             version: 0,
             delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         }
     }
 

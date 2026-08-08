@@ -9,6 +9,7 @@ pub mod meta_shard_manager;
 pub mod metadata_store;
 pub mod net_handler;
 pub mod posix_service;
+pub mod scrubber;
 pub mod powerfs {
     tonic::include_proto!("powerfs");
 }
@@ -19,6 +20,7 @@ pub mod server;
 pub mod shard_scheduler;
 pub mod shard_store;
 pub mod shard_strategy;
+pub mod tlv_volume_client;
 pub mod volume_router;
 pub mod zone_client;
 
@@ -40,4 +42,5 @@ pub use server::FilerServer;
 pub use shard_scheduler::{NodeMetrics, SchedulerConfig, SchedulerStatus, ShardScheduler};
 pub use shard_store::ShardStore;
 pub use shard_strategy::ShardStrategy;
+pub use tlv_volume_client::TlvVolumeClient;
 pub use volume_router::VolumeRouter;

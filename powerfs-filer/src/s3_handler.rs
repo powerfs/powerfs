@@ -1,19 +1,19 @@
 use axum::{http::StatusCode, response::IntoResponse};
 use hex;
-use powerfs_master::volume_client::VolumeClientPool;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::bucket_manager::BucketManager;
 use crate::entry_manager::EntryManager;
 use crate::meta_shard_manager::MetaShardManager;
+use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
 
 pub struct S3Handler {
     bucket_manager: Arc<BucketManager>,
     entry_manager: Arc<EntryManager>,
     volume_router: Arc<VolumeRouter>,
-    volume_client_pool: Arc<VolumeClientPool>,
+    volume_client_pool: Arc<TlvVolumeClient>,
     // Optional sharded metadata backend (方案A: 客户端直连MetaNode).
     // When present, S3 object metadata is served from Raft+RocksDB shards
     // instead of the Redis-backed EntryManager.
@@ -25,7 +25,7 @@ impl S3Handler {
         bucket_manager: Arc<BucketManager>,
         entry_manager: Arc<EntryManager>,
         volume_router: Arc<VolumeRouter>,
-        volume_client_pool: Arc<VolumeClientPool>,
+        volume_client_pool: Arc<TlvVolumeClient>,
     ) -> Self {
         Self {
             bucket_manager,

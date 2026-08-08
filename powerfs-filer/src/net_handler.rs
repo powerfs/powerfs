@@ -283,6 +283,19 @@ impl FilerNetHandler {
         zones.iter().map(|z| z.zone_id).collect()
     }
 
+    /// P4: 返回所有可用 volume 的 (volume_id, addr) 列表.
+    /// 供 scrubber worker 选择副本目标 volume (anti-affinity).
+    pub fn get_all_volume_addrs(&self) -> Vec<(u64, String)> {
+        let zones = self.zones.read().unwrap();
+        let mut result = Vec::new();
+        for zone in zones.iter() {
+            for vol in &zone.volumes {
+                result.push((vol.volume_id, vol.addr.clone()));
+            }
+        }
+        result
+    }
+
     /// 为新文件分配 needle_id + 选 volume (多 Zone round-robin)
     /// 返回 (volume_id, needle_id)
     fn alloc_for_new_file(&self) -> Option<(u64, u64)> {
@@ -948,7 +961,9 @@ impl FilerNetHandler {
                     // 预分配 N 个 (volume_id, needle_id), 客户端按 Placement::locate()
                     // 决定每个 stripe unit 写入哪个 volume. CLOSE 时 sync chunks.
                     let (stripe_size, stripe_count) = match &placement_spec {
-                        Some(PlacementSpec::Stripe { count, stripe_size }) => (*stripe_size, *count),
+                        Some(PlacementSpec::Stripe { count, stripe_size }) => {
+                            (*stripe_size, *count)
+                        }
                         _ => unreachable!("stripe_alloc implies PlacementSpec::Stripe"),
                     };
                     let volume_ids: Vec<u64> = allocs.iter().map(|(v, _)| *v).collect();
@@ -1455,7 +1470,11 @@ impl FilerNetHandler {
                 warn!("FILER_NET_ALLOC_INODE failed: {}", e);
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ))
             }
         }
     }
@@ -1568,7 +1587,11 @@ impl FilerNetHandler {
                 // 失败: STATUS_ERR + FieldId::Name = error string
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ))
             }
         }
     }
@@ -1601,7 +1624,11 @@ impl FilerNetHandler {
                 warn!("FILER_NET_OPEN_COUNT_INC failed: {}", e);
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ))
             }
         }
     }
@@ -1634,7 +1661,11 @@ impl FilerNetHandler {
                 warn!("FILER_NET_OPEN_COUNT_DEC failed: {}", e);
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ))
             }
         }
     }
@@ -1697,9 +1728,7 @@ impl FilerNetHandler {
         let (volume_id, needle_id) = match self.alloc_for_new_file() {
             Some(v) => v,
             None => {
-                warn!(
-                    "FILER_NET_MIGRATE_INLINE_ALLOC: zone not registered, cannot allocate"
-                );
+                warn!("FILER_NET_MIGRATE_INLINE_ALLOC: zone not registered, cannot allocate");
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_string(FieldId::Name, "zone not registered");
                 return Ok(Self::build_response(
@@ -1757,7 +1786,11 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SETXATTR: failed for inode {}: {}", inode, e);
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, Vec::new()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
             }
         }
     }
