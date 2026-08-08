@@ -1200,33 +1200,52 @@ impl FilerNetHandler {
     }
 
     /// handle_update_inode_size_chunks：close 时强一致 sync 账本
+    ///
+    /// TLV 编码 (替代 JSON):
+    /// - Request body: ShardId + Ino + Size + ClientId + FileLayout (chunks 二进制 TLV)
+    /// - Response: STATUS_OK + 空 body (成功) / STATUS_ERR + FieldId::Name=error (失败)
     async fn handle_update_inode_size_chunks(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let req: powerfs_coherence::UpdateInodeSizeChunksRequest =
-            match serde_json::from_slice(&msg.body) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("FILER_NET_UPDATE_SIZE_CHUNKS: decode failed: {}", e);
-                    return Ok(Self::build_response(
-                        msg,
-                        STATUS_ERR_SERVER_ERROR,
-                        Vec::new(),
-                    ));
-                }
-            };
+        let mut dec = TlvDecoder::new(&msg.body);
+
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let size = dec.next_u64(FieldId::Size).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+
+        // 解码 FileLayout (chunks), 无 layout 字段时返回空 chunks
+        let layout = powerfs_layout::codec::decode_file_layout(&mut dec).unwrap_or(FileLayout {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::default(),
+            compression: CompressionState::default(),
+            encoding: ChunkEncoding::PerChunk { chunks: Vec::new() },
+        });
+
+        let chunks: Vec<crate::shard_store::StoredFileChunk> = match &layout.encoding {
+            ChunkEncoding::PerChunk { chunks } => chunks
+                .iter()
+                .map(|c| crate::shard_store::StoredFileChunk {
+                    offset: c.offset,
+                    size: c.size,
+                    mtime: c.mtime,
+                    needle_id: c.needle_id,
+                    volume_id: c.volume_id,
+                    crc32: c.crc32,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
 
         info!(
-            "FILER_NET_UPDATE_SIZE_CHUNKS: req.shard_id={}, inode={}, size={}, chunks={}",
-            req.shard_id,
-            req.inode,
-            req.size,
-            req.chunks.len()
+            "FILER_NET_UPDATE_SIZE_CHUNKS: shard_id={}, inode={}, size={}, chunks={}, client={}",
+            shard_id_raw, inode, size, chunks.len(), client_id
         );
 
         // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
-            .calculate_shard(req.shard_id);
+            .calculate_shard(shard_id_raw);
         info!(
             "FILER_NET_UPDATE_SIZE_CHUNKS: calculated shard_id={}, is_leader_check",
             shard_id.0
@@ -1235,22 +1254,9 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        let chunks: Vec<crate::shard_store::StoredFileChunk> = req
-            .chunks
-            .iter()
-            .map(|c| crate::shard_store::StoredFileChunk {
-                offset: c.offset,
-                size: c.size,
-                mtime: c.mtime,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-            })
-            .collect();
-
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks)
+            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks)
             .await
         {
             Ok(_) => {
@@ -1263,22 +1269,16 @@ impl FilerNetHandler {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                self.notify_inode_change(req.inode, now);
-                let resp = powerfs_coherence::UpdateInodeSizeChunksResponse {
-                    success: true,
-                    error: String::new(),
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_OK, body))
+                self.notify_inode_change(inode, now);
+                // 成功: STATUS_OK + 空 body
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
                 warn!("FILER_NET_UPDATE_SIZE_CHUNKS failed: {}", e);
-                let resp = powerfs_coherence::UpdateInodeSizeChunksResponse {
-                    success: false,
-                    error: e,
-                };
-                let body = serde_json::to_vec(&resp).unwrap_or_default();
-                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, body))
+                // 失败: STATUS_ERR + FieldId::Name = error string
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, enc.into_bytes()))
             }
         }
     }

@@ -976,11 +976,22 @@ impl MetaShardClient {
                     }
 
                     // 其他错误：尝试从 body 解析错误信息
+                    // 优先尝试 TLV (FieldId::Name = error string, 用于 UpdateInodeSizeChunks),
+                    // 回退到 JSON (用于 OpenCountInc/Dec, alloc_inode_batch 等仍用 JSON 的协议)
                     self.breakers.record_failure(&leader_addr);
-                    let err_msg = serde_json::from_slice::<serde_json::Value>(&resp.body)
-                        .ok()
-                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-                        .unwrap_or_else(|| format!("server status {}", status));
+                    let err_msg = {
+                        use powerfs_net::serialize::TlvDecoder;
+                        let mut dec = TlvDecoder::new(&resp.body);
+                        dec.next_string(powerfs_net::FieldId::Name)
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    }
+                    .or_else(|| {
+                        serde_json::from_slice::<serde_json::Value>(&resp.body)
+                            .ok()
+                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                    })
+                    .unwrap_or_else(|| format!("server status {}", status));
                     return Err(err_msg);
                 }
                 Err(e) => {
@@ -1004,19 +1015,66 @@ impl MetaShardClient {
     }
 
     /// update_inode_size_chunks：close 时强一致 sync 账本到 filer（leader only）。
+    ///
+    /// TLV 编码 (替代 JSON):
+    /// - Request: ShardId + Ino + Size + ClientId + FileLayout (chunks 二进制 TLV)
+    /// - Response: STATUS_OK + 空 body (成功) / STATUS_ERR + FieldId::Name=error (失败)
     pub async fn update_inode_size_chunks(
         &self,
         req: &powerfs_coherence::UpdateInodeSizeChunksRequest,
     ) -> Result<powerfs_coherence::UpdateInodeSizeChunksResponse, String> {
-        let body = serde_json::to_vec(req).map_err(|e| format!("encode request: {}", e))?;
-        let resp_body = self
-            .send_coherence_msg(
-                powerfs_net::MsgType::UpdateInodeSizeChunks,
-                req.shard_id,
-                body,
-            )
-            .await?;
-        serde_json::from_slice(&resp_body).map_err(|e| format!("decode response: {}", e))
+        use powerfs_layout::codec::{encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
+        use powerfs_layout::encoding::{ChunkEncoding, ChunkRef};
+        use powerfs_layout::layout::FileLayout;
+        use powerfs_layout::placement::Placement;
+        use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
+        use powerfs_net::serialize::TlvEncoder;
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, req.shard_id);
+        enc.add_u64(FieldId::Ino, req.inode);
+        enc.add_u64(FieldId::Size, req.size);
+        let _ = enc.add_string(FieldId::ClientId, &req.client_id);
+
+        // chunks → FileLayout binary TLV
+        if !req.chunks.is_empty() {
+            let chunks: Vec<ChunkRef> = req
+                .chunks
+                .iter()
+                .map(|c| ChunkRef {
+                    offset: c.offset,
+                    size: c.size,
+                    needle_id: c.needle_id,
+                    volume_id: c.volume_id,
+                    crc32: c.crc32,
+                    mtime: c.mtime,
+                })
+                .collect();
+            let layout = FileLayout {
+                placement: Placement::Flat,
+                reliability: Reliability::SingleReplica,
+                reliability_state: ReliabilityState::default(),
+                compression: CompressionState::default(),
+                encoding: ChunkEncoding::PerChunk { chunks },
+            };
+            encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| format!("encode_file_layout: {}", e))?;
+        }
+
+        let body = enc.into_bytes();
+        // send_coherence_msg returns Err on non-OK status (with error message),
+        // Ok(body) on success. Success body is empty for UpdateInodeSizeChunks.
+        self.send_coherence_msg(
+            powerfs_net::MsgType::UpdateInodeSizeChunks,
+            req.shard_id,
+            body,
+        )
+        .await?;
+        Ok(powerfs_coherence::UpdateInodeSizeChunksResponse {
+            success: true,
+            error: String::new(),
+        })
     }
 
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
