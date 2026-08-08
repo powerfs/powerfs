@@ -467,10 +467,7 @@ impl ConnRegistry {
         let entry = self.conns.get(&id)?;
         let inner = entry.value();
         // 优先返回 meta 通道 (通知推送通常走 meta)
-        inner
-            .get(&1)
-            .or_else(|| inner.values().next())
-            .cloned()
+        inner.get(&1).or_else(|| inner.values().next()).cloned()
     }
 
     /// 获取指定通道的连接

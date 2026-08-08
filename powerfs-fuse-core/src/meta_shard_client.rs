@@ -1065,10 +1065,7 @@ impl MetaShardClient {
         if let Some(data) = &req.inline_data {
             // 安全上限: 与 Filer 端 INLINE_HARD_LIMIT (8KB) 一致
             if data.len() > 8 * 1024 {
-                return Err(format!(
-                    "inline_data too large: {} bytes > 8KB",
-                    data.len()
-                ));
+                return Err(format!("inline_data too large: {} bytes > 8KB", data.len()));
             }
             let max_size = (8 * 1024u32).max(data.len() as u32);
             let layout = FileLayout {
@@ -1180,12 +1177,7 @@ impl MetaShardClient {
     }
 
     /// P3: Get an extended attribute from an inode.
-    pub async fn get_xattr(
-        &self,
-        shard_id: u64,
-        inode: u64,
-        key: &str,
-    ) -> Result<Vec<u8>, String> {
+    pub async fn get_xattr(&self, shard_id: u64, inode: u64, key: &str) -> Result<Vec<u8>, String> {
         use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
         use powerfs_net::FieldId;
 
@@ -1485,6 +1477,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         inline_data: None,
         inline_max_size: None,
         chunks: Vec::new(),
+        replica_chunks: Vec::new(),
     }
 }
 
@@ -1516,7 +1509,51 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
         };
         attr.placement = Some(layout.placement);
     }
+
+    // P4: 解析 FieldId::ReplicaChunks (副本 chunk 列表, 读路径 failover 使用).
+    // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
+    attr.replica_chunks = parse_replica_chunks_from_body(body);
+
     attr
+}
+
+/// P4: 从响应 body 解析 FieldId::ReplicaChunks.
+/// 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节, 与 codec 格式一致).
+fn parse_replica_chunks_from_body(body: &[u8]) -> Vec<powerfs_layout::encoding::ChunkRef> {
+    use powerfs_net::serialize::TlvDecoder;
+    let mut dec = TlvDecoder::new(body);
+    // 跳过已解析的 FileLayout 字段, 查找 ReplicaChunks
+    let bytes = match dec.next_bytes(powerfs_net::FieldId::ReplicaChunks) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+    const CHUNK_REF_SIZE: usize = 44;
+    let needed = count * CHUNK_REF_SIZE;
+    if bytes.len() < 4 + needed {
+        log::warn!(
+            "parse_replica_chunks: truncated, need {} bytes, have {}",
+            4 + needed,
+            bytes.len()
+        );
+        return Vec::new();
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = 4 + i * CHUNK_REF_SIZE;
+        chunks.push(powerfs_layout::encoding::ChunkRef {
+            offset: u64::from_le_bytes(bytes[base..base + 8].try_into().unwrap()),
+            size: u64::from_le_bytes(bytes[base + 8..base + 16].try_into().unwrap()),
+            needle_id: u64::from_le_bytes(bytes[base + 16..base + 24].try_into().unwrap()),
+            volume_id: u64::from_le_bytes(bytes[base + 24..base + 32].try_into().unwrap()),
+            crc32: u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap()),
+            mtime: u64::from_le_bytes(bytes[base + 36..base + 44].try_into().unwrap()),
+        });
+    }
+    chunks
 }
 
 impl MetadataClient for MetaShardClient {

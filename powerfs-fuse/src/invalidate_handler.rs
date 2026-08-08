@@ -241,6 +241,7 @@ mod tests {
             disk_size: 0,
             generation,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: std::time::Instant::now(),
         }
     }

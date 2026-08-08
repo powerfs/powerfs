@@ -343,8 +343,8 @@ impl FrameHeader {
     /// adapt its admission concurrency. Values >3 are clamped to 3.
     pub fn set_load_factor(&mut self, lf: u8) {
         let level = lf.min(3);
-        self.flags = (self.flags & !FrameFlags::LOAD_FACTOR_MASK)
-            | (level << FrameFlags::LOAD_FACTOR_SHIFT);
+        self.flags =
+            (self.flags & !FrameFlags::LOAD_FACTOR_MASK) | (level << FrameFlags::LOAD_FACTOR_SHIFT);
         self.header_crc = self.calc_header_crc();
     }
 
@@ -478,13 +478,29 @@ impl FrameHeader {
             version: buf[4],
             flags: buf[5],
             seq: u32::from_le_bytes(buf[6..10].try_into().map_err(|_| "seq decode failed")?),
-            msg_type: u16::from_le_bytes(buf[10..12].try_into().map_err(|_| "msg_type decode failed")?),
+            msg_type: u16::from_le_bytes(
+                buf[10..12]
+                    .try_into()
+                    .map_err(|_| "msg_type decode failed")?,
+            ),
             status: u16::from_le_bytes(buf[12..14].try_into().map_err(|_| "status decode failed")?),
-            data_len: u32::from_le_bytes(buf[14..18].try_into().map_err(|_| "data_len decode failed")?),
-            body_len: u32::from_le_bytes(buf[18..22].try_into().map_err(|_| "body_len decode failed")?),
+            data_len: u32::from_le_bytes(
+                buf[14..18]
+                    .try_into()
+                    .map_err(|_| "data_len decode failed")?,
+            ),
+            body_len: u32::from_le_bytes(
+                buf[18..22]
+                    .try_into()
+                    .map_err(|_| "body_len decode failed")?,
+            ),
             route_hash: buf[22],
             protocol_ver: buf[23],
-            header_crc: u32::from_le_bytes(buf[24..28].try_into().map_err(|_| "header_crc decode failed")?),
+            header_crc: u32::from_le_bytes(
+                buf[24..28]
+                    .try_into()
+                    .map_err(|_| "header_crc decode failed")?,
+            ),
         };
         if !hdr.verify_crc() {
             return Err("header CRC mismatch");
@@ -865,6 +881,12 @@ pub enum FieldId {
     XattrKey = 0xB3,
     /// xattr 值 (bytes). SetXattr 请求 / GetXattr 响应
     XattrValue = 0xB4,
+
+    // ===== Replica fields (0xB5) =====
+    /// 副本 chunk 列表 (bytes, ChunkRef 二进制数组).
+    /// GETATTR/LOOKUP 响应携带, 客户端读路径 failover 使用.
+    /// 编码格式与 ChunkEncoding::PerChunk 的 chunk 列表相同 (每个 ChunkRef 44 字节).
+    ReplicaChunks = 0xB5,
 }
 
 impl FieldId {
@@ -960,6 +982,7 @@ impl FieldId {
             0xB2 => Some(Self::OpenCount),
             0xB3 => Some(Self::XattrKey),
             0xB4 => Some(Self::XattrValue),
+            0xB5 => Some(Self::ReplicaChunks),
             _ => None,
         }
     }
@@ -1231,13 +1254,19 @@ pub fn check_resp_size(msg_type: u16, body_len: usize, data_len: usize) {
         if body_len > max_body {
             log::warn!(
                 "{} msg=0x{:04x} body_len={} > expected_max={}",
-                LOG_PREFIX_RX_SIZE_ANOMALY, msg_type, body_len, max_body
+                LOG_PREFIX_RX_SIZE_ANOMALY,
+                msg_type,
+                body_len,
+                max_body
             );
         }
         if data_len > max_data {
             log::warn!(
                 "{} msg=0x{:04x} data_len={} > expected_max={}",
-                LOG_PREFIX_RX_SIZE_ANOMALY, msg_type, data_len, max_data
+                LOG_PREFIX_RX_SIZE_ANOMALY,
+                msg_type,
+                data_len,
+                max_data
             );
         }
     }
@@ -1274,14 +1303,22 @@ pub fn check_resp_limits(
     if body_len > MAX_BODY_SIZE {
         log::error!(
             "{} msg=0x{:04x} seq={} body_len={} > MAX_BODY_SIZE={}",
-            LOG_PREFIX_RX_TRUNCATE, msg_type, seq, body_len, MAX_BODY_SIZE
+            LOG_PREFIX_RX_TRUNCATE,
+            msg_type,
+            seq,
+            body_len,
+            MAX_BODY_SIZE
         );
         return Err("body_len exceeds MAX_BODY_SIZE");
     }
     if data_seg_len > MAX_DATA_SIZE {
         log::error!(
             "{} msg=0x{:04x} seq={} data_seg_len={} > MAX_DATA_SIZE={}",
-            LOG_PREFIX_RX_TRUNCATE, msg_type, seq, data_seg_len, MAX_DATA_SIZE
+            LOG_PREFIX_RX_TRUNCATE,
+            msg_type,
+            seq,
+            data_seg_len,
+            MAX_DATA_SIZE
         );
         return Err("data_seg_len exceeds MAX_DATA_SIZE");
     }
@@ -1326,12 +1363,9 @@ fn looks_like_tlv(body: &[u8]) -> bool {
     }
     let mut pos = 0;
     while pos + 5 <= body.len() {
-        let length = u32::from_be_bytes([
-            body[pos + 1],
-            body[pos + 2],
-            body[pos + 3],
-            body[pos + 4],
-        ]) as usize;
+        let length =
+            u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]])
+                as usize;
         pos += 5;
         if pos + length > body.len() {
             return false; // length 越界 → 不是 TLV
@@ -1359,11 +1393,7 @@ fn looks_like_tlv(body: &[u8]) -> bool {
 /// # 返回
 /// - Ok(()) 所有必需字段存在，或 body 非 TLV 格式
 /// - Err(missing_field) 缺失字段
-pub fn check_required_fields(
-    msg_type: u16,
-    seq: u32,
-    body: &[u8],
-) -> Result<(), &'static str> {
+pub fn check_required_fields(msg_type: u16, seq: u32, body: &[u8]) -> Result<(), &'static str> {
     let required = required_fields_for(msg_type);
     if required.is_empty() {
         return Ok(());
@@ -1388,7 +1418,11 @@ pub fn check_required_fields(
         if !dec.contains_field(*field) {
             log::error!(
                 "{} msg=0x{:04x} seq={} field=0x{:02x} ({:?})",
-                LOG_PREFIX_RX_MISSING_FIELD, msg_type, seq, *field as u8, field
+                LOG_PREFIX_RX_MISSING_FIELD,
+                msg_type,
+                seq,
+                *field as u8,
+                field
             );
             return Err("required field missing");
         }
@@ -1486,7 +1520,10 @@ mod tests {
         hdr.data_len = 100;
         let result = hdr.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "data_len < body_len (invariant violation)");
+        assert_eq!(
+            result.unwrap_err(),
+            "data_len < body_len (invariant violation)"
+        );
     }
 
     /// R1 单元测试：data_len > MAX_FRAME_SIZE
@@ -1846,7 +1883,8 @@ mod tests {
     #[test]
     fn test_check_required_fields_readlink() {
         let mut enc = crate::serialize::TlvEncoder::new();
-        enc.add_string(FieldId::SymlinkTarget, "/target/path").unwrap();
+        enc.add_string(FieldId::SymlinkTarget, "/target/path")
+            .unwrap();
         let body = enc.into_bytes();
         assert!(check_required_fields(0x001A, 1, &body).is_ok());
 
@@ -2122,7 +2160,11 @@ mod tests {
         for lf in 0..=3 {
             hdr.set_load_factor(lf);
             assert_eq!(hdr.load_factor(), lf);
-            assert!(hdr.verify_crc(), "CRC must be valid after set_load_factor({})", lf);
+            assert!(
+                hdr.verify_crc(),
+                "CRC must be valid after set_load_factor({})",
+                lf
+            );
         }
     }
 

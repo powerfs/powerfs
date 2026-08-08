@@ -1383,13 +1383,8 @@ impl FacadeStorageProvider {
         // P3 fix: chunk data goes in the frame's DATA segment, not the TLV
         // body. The server's R5 check rejects bodies > 256KB; 1MB chunks in
         // the body caused "body_len exceeds MAX_BODY_SIZE" + connection drops.
-        let payload = build_write_tlv_with_inode(
-            volume_id,
-            file_key,
-            inode,
-            Some(&token),
-            Some(&client_id),
-        );
+        let payload =
+            build_write_tlv_with_inode(volume_id, file_key, inode, Some(&token), Some(&client_id));
 
         // 阶段1.5 临时方案：直接发送 WriteNeedle，绕过 data_queue。
         //

@@ -47,6 +47,9 @@ pub struct MetadataAttr {
     /// Stripe 模式下, 每个 chunk 对应一个 stripe unit (volume_id + needle_id).
     /// Flat 模式下, 通常为单个 chunk.
     pub chunks: Vec<powerfs_layout::encoding::ChunkRef>,
+    /// P4: 副本 chunk 列表 (来自 GETATTR/LOOKUP 响应的 FieldId::ReplicaChunks).
+    /// 读路径 failover: 主 volume 不可用时从副本 volume 读取相同 needle_id.
+    pub replica_chunks: Vec<powerfs_layout::encoding::ChunkRef>,
 }
 
 impl MetadataAttr {
@@ -58,10 +61,7 @@ impl MetadataAttr {
     /// create 响应携带 `Placement::Inline` 时为 true; lookup/getattr 响应
     /// 携带 `Placement::Inline` (已关闭的 inline 文件) 时也为 true.
     pub fn is_inline(&self) -> bool {
-        matches!(
-            self.placement.as_ref(),
-            Some(Placement::Inline { .. })
-        )
+        matches!(self.placement.as_ref(), Some(Placement::Inline { .. }))
     }
 
     /// P3: 文件是否以 Stripe 模式存储 (多 volume 并行).

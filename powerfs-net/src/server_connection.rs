@@ -603,7 +603,14 @@ mod tests {
         // Keep _rx alive so the outbound channel doesn't get dropped,
         // which would cause notify() to return false.
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, 0, 0, tx);
+        let conn = ClientConn::new(
+            1,
+            "127.0.0.1:12345".parse().unwrap(),
+            ClientType::Fuse,
+            0,
+            0,
+            tx,
+        );
         registry.register(conn).await;
         let mgr = ServerConnectionManager::new(registry);
 

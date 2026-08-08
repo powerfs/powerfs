@@ -106,7 +106,11 @@ impl Worker {
                 AdmissionDecision::Reject(reason) => {
                     warn!(
                         "Worker {}: admit reject conn={} seq={} type={:#x} reason={}",
-                        self.id, conn.id, seq, msg_type, reason.as_str()
+                        self.id,
+                        conn.id,
+                        seq,
+                        msg_type,
+                        reason.as_str()
                     );
                     let resp = Self::build_error_response(&work.msg);
                     self.send_with_flow(conn, resp);
@@ -261,12 +265,7 @@ mod tests {
     async fn test_worker_processes_request() {
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(
-            0,
-            handler,
-            None,
-            Arc::new(FlowController::with_defaults()),
-        );
+        let worker = Worker::new(0, handler, None, Arc::new(FlowController::with_defaults()));
 
         let conn = make_conn(42);
         let msg = make_request(1, b"hello");
@@ -285,12 +284,7 @@ mod tests {
     async fn test_worker_skips_closed_conn() {
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(
-            0,
-            handler,
-            None,
-            Arc::new(FlowController::with_defaults()),
-        );
+        let worker = Worker::new(0, handler, None, Arc::new(FlowController::with_defaults()));
 
         let conn = make_conn(42);
         *conn.state.write().await = ConnState::Closed;
@@ -322,12 +316,7 @@ mod tests {
 
         let (work_tx, work_rx) = mpsc::channel::<Work>(16);
         let handler = Arc::new(FailHandler) as Arc<dyn NetHandler>;
-        let worker = Worker::new(
-            0,
-            handler,
-            None,
-            Arc::new(FlowController::with_defaults()),
-        );
+        let worker = Worker::new(0, handler, None, Arc::new(FlowController::with_defaults()));
 
         let conn = make_conn(42);
         let msg = make_request(1, b"hello");

@@ -561,7 +561,11 @@ impl PowerFsNetServer {
             .ok_or_else(|| NetError::Protocol("unknown client type".into()))?;
 
         let channel = req.channel;
-        let ch_str = if channel == crate::protocol::CHANNEL_META { "meta" } else { "data" };
+        let ch_str = if channel == crate::protocol::CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
 
         info!(
             "Handshake: client_id={} client_type={:?} channel={} addr={}",

@@ -301,10 +301,12 @@ impl SlowConnTracker {
         // 更新 max (CAS)
         let mut cur_max = stats.lat_max_us.load(Ordering::Relaxed);
         while latency_us > cur_max {
-            match stats
-                .lat_max_us
-                .compare_exchange(cur_max, latency_us, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match stats.lat_max_us.compare_exchange(
+                cur_max,
+                latency_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(actual) => cur_max = actual,
             }
@@ -703,7 +705,11 @@ mod tests {
             tracker.update_ewma(&s, 100);
         }
         let ewma = s.lat_ewma_us.load(Ordering::Relaxed);
-        assert!(ewma > 90 && ewma <= 100, "ewma should converge to ~100, got {}", ewma);
+        assert!(
+            ewma > 90 && ewma <= 100,
+            "ewma should converge to ~100, got {}",
+            ewma
+        );
     }
 
     #[test]
@@ -720,7 +726,7 @@ mod tests {
     fn test_slow_marking_and_recovery() {
         let cfg = SlowConnTrackerConfig {
             slow_threshold_us: 100_000,    // 100ms
-            ewma_alpha_pct: 50,             // alpha=0.5 加速收敛
+            ewma_alpha_pct: 50,            // alpha=0.5 加速收敛
             recovery_threshold_us: 10_000, // 10ms
             recovery_count: 3,
         };

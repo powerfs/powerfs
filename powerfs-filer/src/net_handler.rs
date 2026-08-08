@@ -476,9 +476,9 @@ impl FilerNetHandler {
             let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
             let layout = FileLayout {
                 placement: Placement::Inline { max_size },
-                reliability: Reliability::SingleReplica,
-                reliability_state: ReliabilityState::default(),
-                compression: CompressionState::default(),
+                reliability: info.reliability.clone(),
+                reliability_state: info.reliability_state.clone(),
+                compression: info.compression_state.clone(),
                 encoding: ChunkEncoding::InlineData { data: data.clone() },
             };
             encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
@@ -502,14 +502,32 @@ impl FilerNetHandler {
 
         let layout = FileLayout {
             placement: Placement::Flat,
-            reliability: Reliability::SingleReplica,
-            reliability_state: ReliabilityState::default(),
-            compression: CompressionState::default(),
+            reliability: info.reliability.clone(),
+            reliability_state: info.reliability_state.clone(),
+            compression: info.compression_state.clone(),
             encoding: ChunkEncoding::PerChunk { chunks },
         };
 
         encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
             .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+        // P4: 副本 chunk 列表 — 编码到 FieldId::ReplicaChunks,
+        // 客户端读路径 failover 使用 (主 volume 不可用时从副本 volume 读取).
+        // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节, 与 codec 格式一致).
+        if !info.replica_chunks.is_empty() {
+            let mut buf = Vec::with_capacity(4 + info.replica_chunks.len() * 44);
+            buf.extend_from_slice(&(info.replica_chunks.len() as u32).to_le_bytes());
+            for rc in &info.replica_chunks {
+                buf.extend_from_slice(&rc.offset.to_le_bytes());
+                buf.extend_from_slice(&rc.size.to_le_bytes());
+                buf.extend_from_slice(&rc.needle_id.to_le_bytes());
+                buf.extend_from_slice(&rc.volume_id.to_le_bytes());
+                buf.extend_from_slice(&rc.crc32.to_le_bytes());
+                buf.extend_from_slice(&rc.mtime.to_le_bytes());
+            }
+            let _ = enc.add_bytes(FieldId::ReplicaChunks, &buf);
+        }
+
         Ok(())
     }
 

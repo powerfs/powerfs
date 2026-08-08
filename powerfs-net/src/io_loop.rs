@@ -132,7 +132,7 @@ impl IoLoop {
         flow_ctrl: Arc<FlowController>,
     ) {
         let _ = &manager; // 避免未使用变量警告
-        // write_task: 独占 write_half, 消费 outbound_rx (响应帧 + 通知帧)
+                          // write_task: 独占 write_half, 消费 outbound_rx (响应帧 + 通知帧)
         let write_task = tokio::spawn(async move {
             while let Some(frame) = outbound_rx.recv().await {
                 if let Err(e) = write_half.write_all(&frame).await {
@@ -285,15 +285,15 @@ impl IoLoop {
             }
         })?;
 
-        let header = FrameHeader::decode_checked(&hdr_buf)
-            .map_err(|reason| {
-                // Layer 1: 帧头不变式违反
-                log::warn!(
-                    "{} io_loop: invalid frame header, reason={}",
-                    crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
-                );
-                NetError::Protocol(format!("invalid frame header: {}", reason))
-            })?;
+        let header = FrameHeader::decode_checked(&hdr_buf).map_err(|reason| {
+            // Layer 1: 帧头不变式违反
+            log::warn!(
+                "{} io_loop: invalid frame header, reason={}",
+                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT,
+                reason
+            );
+            NetError::Protocol(format!("invalid frame header: {}", reason))
+        })?;
 
         let total_len = header.data_len as usize;
         let body_len = header.body_len as usize;
@@ -303,9 +303,8 @@ impl IoLoop {
         check_resp_size(header.msg_type, body_len, data_len);
 
         // Layer 2: 响应大小硬限制防御性校验
-        check_resp_limits(header.msg_type, header.seq, body_len, data_len).map_err(|reason| {
-            NetError::Protocol(format!("response size limit: {}", reason))
-        })?;
+        check_resp_limits(header.msg_type, header.seq, body_len, data_len)
+            .map_err(|reason| NetError::Protocol(format!("response size limit: {}", reason)))?;
 
         let mut payload = Vec::with_capacity(total_len);
         if total_len > 0 {
@@ -359,14 +358,7 @@ mod tests {
         let registry = Arc::new(ConnRegistry::new());
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
         let flow_ctrl = Arc::new(FlowController::with_defaults());
-        Arc::new(IoLoop::new(
-            0,
-            work_tx,
-            registry,
-            handler,
-            None,
-            flow_ctrl,
-        ))
+        Arc::new(IoLoop::new(0, work_tx, registry, handler, None, flow_ctrl))
     }
 
     #[tokio::test]

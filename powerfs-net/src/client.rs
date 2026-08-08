@@ -367,7 +367,11 @@ impl PowerFsNetClient {
         };
         info!(
             "Connecting to {}:{} (channel={}, client_id={}, client_type={:?})",
-            self.config.addr, self.config.port, ch_str, self.config.client_id, self.config.client_type
+            self.config.addr,
+            self.config.port,
+            ch_str,
+            self.config.client_id,
+            self.config.client_type
         );
 
         let connect_result =
@@ -557,7 +561,8 @@ impl PowerFsNetClient {
                             // Layer 1: 帧头不变式违反，输出诊断日志
                             warn!(
                                 "{} recv_loop: invalid header, reason={}, skipping",
-                                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
+                                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT,
+                                reason
                             );
                             continue;
                         }
@@ -614,9 +619,7 @@ impl PowerFsNetClient {
                 // 非 TLV body 会跳过, 不会误判。只有真正的 TLV 响应缺失
                 // 必需字段时才会失败, 此时截断 body 是安全措施 (响应不可信).
                 if header.status == STATUS_OK {
-                    if let Err(reason) =
-                        check_required_fields(header.msg_type, header.seq, &body)
-                    {
+                    if let Err(reason) = check_required_fields(header.msg_type, header.seq, &body) {
                         warn!(
                             "recv_loop: response missing required field, reason={}, seq={}, msg=0x{:04x}",
                             reason, header.seq, header.msg_type

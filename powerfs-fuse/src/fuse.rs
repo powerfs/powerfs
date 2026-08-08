@@ -538,6 +538,18 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         disk_size: 0,
         generation: 0,
         placement: attr.placement.clone(),
+        replica_chunks: attr
+            .replica_chunks
+            .iter()
+            .map(|c| CachedFileChunk {
+                offset: c.offset,
+                size: c.size,
+                mtime: c.mtime,
+                needle_id: c.needle_id,
+                volume_id: c.volume_id,
+                crc32: c.crc32,
+            })
+            .collect(),
         cached_at: Instant::now(),
     }
 }
@@ -635,7 +647,10 @@ impl PowerFsFs {
         let has_chunks_before = self.chunk_cache.has_chunks(inode);
         debug!(
             "flush_dirty_chunks_impl ENTER: inode={} is_pinned={} has_chunks={} thread={:?}",
-            inode, is_pinned_before, has_chunks_before, std::thread::current().id()
+            inode,
+            is_pinned_before,
+            has_chunks_before,
+            std::thread::current().id()
         );
 
         let dirty = self.drain_dirty_for_inode(inode);
@@ -671,9 +686,13 @@ impl PowerFsFs {
                      is_pinned_before={} is_pinned_now={} has_chunks_before={} has_chunks_now={} \
                      dirty_count={} thread={:?} \
                      — inode was evicted during drain window (check invalidate_inode logs)",
-                    inode, is_pinned_before, is_pinned_now,
-                    has_chunks_before, has_chunks_now,
-                    dirty.len(), std::thread::current().id()
+                    inode,
+                    is_pinned_before,
+                    is_pinned_now,
+                    has_chunks_before,
+                    has_chunks_now,
+                    dirty.len(),
+                    std::thread::current().id()
                 );
                 for (_, idx) in &dirty {
                     self.mark_dirty(inode, *idx);
@@ -709,12 +728,8 @@ impl PowerFsFs {
                     let chunk_offset = chunk_idx * chunk_size;
                     let chunk_data = self.chunk_cache.get(inode, chunk_offset)?;
                     let data_len = chunk_data.data.len();
-                    let (vol_id, needle_id) = resolve_stripe_chunk(
-                        placement,
-                        &stripe_chunks,
-                        chunk_offset,
-                        chunk_size,
-                    )?;
+                    let (vol_id, needle_id) =
+                        resolve_stripe_chunk(placement, &stripe_chunks, chunk_offset, chunk_size)?;
                     Some((
                         *chunk_idx,
                         powerfs_fuse_core::WriteBlobRequest {
@@ -1194,6 +1209,7 @@ impl PowerFsFs {
             disk_size: entry.disk_size,
             generation: entry.generation,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         }
     }
@@ -1439,9 +1455,7 @@ impl FileSystem for PowerFsFs {
         // 到 >8KB 是罕见场景 (通常文件通过 write 增长, 非 truncate), 暂保留
         // EFBIG 拒绝. 后续可扩展为 truncate 迁移 (resize buffer + migrate).
         if let Some(new_size) = size {
-            if self.inline_buffers.contains_key(&inode)
-                && new_size as usize > INLINE_HARD_LIMIT
-            {
+            if self.inline_buffers.contains_key(&inode) && new_size as usize > INLINE_HARD_LIMIT {
                 warn!(
                     "setattr inline: inode={} truncate to {} > INLINE_HARD_LIMIT={}, rejecting before RPC",
                     inode, new_size, INLINE_HARD_LIMIT
@@ -1791,9 +1805,7 @@ impl FileSystem for PowerFsFs {
         // 客户端初始化空 inline buffer, 后续 write 追加到 buffer,
         // release 时一次性发 Filer (inline_data), 完全绕过 Volume Server。
         if attr.is_inline() {
-            let inline_max = attr
-                .inline_max_size
-                .unwrap_or(INLINE_HARD_LIMIT as u32) as usize;
+            let inline_max = attr.inline_max_size.unwrap_or(INLINE_HARD_LIMIT as u32) as usize;
             info!(
                 "FUSE create inline: inode={}, max_size={}, create_rpc={}ms, total={}ms",
                 inode,
@@ -1840,6 +1852,7 @@ impl FileSystem for PowerFsFs {
                 disk_size: 0,
                 generation: 0,
                 placement: None,
+                replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             };
             // CRITICAL: 同 Flat 路径, pin 必须在 insert 之前, 防止 Filer
@@ -1907,6 +1920,7 @@ impl FileSystem for PowerFsFs {
                 disk_size: 0,
                 generation: 0,
                 placement: Some(placement),
+                replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             };
             self.open_inodes.write().unwrap().insert(inode);
@@ -1984,6 +1998,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
@@ -2218,22 +2233,14 @@ impl FileSystem for PowerFsFs {
                         inode,
                         data.len()
                     );
-                    self.inline_buffers.insert(
-                        inode,
-                        InlineBuffer {
-                            data,
-                            dirty: false,
-                        },
-                    );
+                    self.inline_buffers
+                        .insert(inode, InlineBuffer { data, dirty: false });
                 }
                 Ok(_) => {
                     // Flat 模式文件: 清理可能残留的 inline buffer (文件已被迁移)
                     if self.inline_buffers.remove(&inode).is_some() {
                         self.inline_max_sizes.remove(&inode);
-                        debug!(
-                            "open: inode={} is flat, removed stale inline buffer",
-                            inode
-                        );
+                        debug!("open: inode={} is flat, removed stale inline buffer", inode);
                     }
                 }
                 Err(e) => {
@@ -2343,8 +2350,7 @@ impl FileSystem for PowerFsFs {
 
             let end_offset = std::cmp::min(offset + size as u64, file_size);
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
-            let prefetch_end =
-                std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
+            let prefetch_end = std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
             let prefetch_end_chunk = if prefetch_end == 0 {
                 0
             } else {
@@ -2375,18 +2381,14 @@ impl FileSystem for PowerFsFs {
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
                     .map(|(_chunk_idx, offset, size)| {
-                        let (vol_id, needle_id) = resolve_stripe_chunk(
-                            placement,
-                            &stripe_chunks,
-                            *offset,
-                            chunk_size,
-                        )
-                        .unwrap_or_else(|| {
-                            chunk_map
-                                .get(offset)
-                                .copied()
-                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id))
-                        });
+                        let (vol_id, needle_id) =
+                            resolve_stripe_chunk(placement, &stripe_chunks, *offset, chunk_size)
+                                .unwrap_or_else(|| {
+                                    chunk_map.get(offset).copied().unwrap_or((
+                                        stripe_chunks[0].volume_id,
+                                        stripe_chunks[0].needle_id,
+                                    ))
+                                });
                         powerfs_fuse_core::ReadBlobRequest {
                             volume_id: vol_id,
                             file_key: needle_id,
@@ -2429,11 +2431,15 @@ impl FileSystem for PowerFsFs {
                                     *chunk_offset,
                                     chunk_size,
                                 )
-                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id));
+                                .unwrap_or((
+                                    stripe_chunks[0].volume_id,
+                                    stripe_chunks[0].needle_id,
+                                ));
                                 if let Ok(addr) = self.client.get_volume_addr(vol_id) {
-                                    if let Ok(data) = self.client.read_blob(
-                                        &addr, vol_id, needle_id, 0, *read_size,
-                                    ) {
+                                    if let Ok(data) = self
+                                        .client
+                                        .read_blob(&addr, vol_id, needle_id, 0, *read_size)
+                                    {
                                         self.chunk_cache.put(
                                             inode,
                                             *chunk_offset,
@@ -2463,7 +2469,61 @@ impl FileSystem for PowerFsFs {
                             }
                         }
                         Err(e) => {
-                            error!("read stripe: read_blob failed: {}", e);
+                            // P4: Stripe 读路径 failover — 主 volume 读取失败时,
+                            // 从 replica_chunks 中查找同 offset 的副本 volume 读取.
+                            let replica_map: HashMap<u64, (u64, u64)> = entry
+                                .replica_chunks
+                                .iter()
+                                .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                                .collect();
+                            let primary_vol = chunk_map
+                                .get(chunk_offset)
+                                .map(|(_, v)| *v)
+                                .unwrap_or(0);
+                            if let Some(&(rep_needle, rep_vol)) = replica_map.get(chunk_offset) {
+                                warn!(
+                                    "read stripe failover: inode={} offset={} primary vol={} failed: {}, trying replica vol={}",
+                                    inode, chunk_offset, primary_vol, e, rep_vol
+                                );
+                                match self.client.get_volume_addr(rep_vol) {
+                                    Ok(rep_addr) => {
+                                        match self.client.read_blob(
+                                            &rep_addr, rep_vol, rep_needle, 0, *read_size,
+                                        ) {
+                                            Ok(data) => {
+                                                debug!(
+                                                    "read stripe failover success: inode={} offset={} replica vol={}",
+                                                    inode, chunk_offset, rep_vol
+                                                );
+                                                self.chunk_cache.put(
+                                                    inode,
+                                                    *chunk_offset,
+                                                    data.into(),
+                                                    mtime,
+                                                    0,
+                                                );
+                                                continue;
+                                            }
+                                            Err(e2) => {
+                                                error!(
+                                                    "read stripe failover also failed: inode={} offset={} replica vol={} err={}",
+                                                    inode, chunk_offset, rep_vol, e2
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        error!(
+                                            "get_volume_addr for stripe replica vol={} failed: {}",
+                                            rep_vol, e2
+                                        );
+                                    }
+                                }
+                            }
+                            error!(
+                                "read stripe failed (no replica available): inode={} offset={} err={}",
+                                inode, chunk_offset, e
+                            );
                             return Err(std::io::Error::from_raw_os_error(libc::EIO));
                         }
                     }
@@ -2691,7 +2751,58 @@ impl FileSystem for PowerFsFs {
                             retry_chunks.push((*chunk_idx, *chunk_offset, *read_size));
                         }
                         Err(e) => {
-                            error!("read_blob failed: {}", e);
+                            // P4: 读路径 failover — 主 volume 读取失败时,
+                            // 从 replica_chunks 中查找同 offset 的副本 volume 读取.
+                            let replica_map: HashMap<u64, (u64, u64)> = entry
+                                .replica_chunks
+                                .iter()
+                                .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                                .collect();
+                            let primary_vol = chunk_map
+                                .get(chunk_offset)
+                                .map(|(_, v)| *v)
+                                .unwrap_or(fid.volume_id.0);
+                            if let Some(&(rep_needle, rep_vol)) = replica_map.get(chunk_offset) {
+                                warn!(
+                                    "read_blob failover: inode={} offset={} primary vol={} failed: {}, trying replica vol={}",
+                                    inode, chunk_offset, primary_vol, e, rep_vol
+                                );
+                                match self.client.get_volume_addr(rep_vol) {
+                                    Ok(rep_addr) => {
+                                        match self.client.read_blob(
+                                            &rep_addr, rep_vol, rep_needle, 0, *read_size,
+                                        ) {
+                                            Ok(data) => {
+                                                debug!(
+                                                    "read_blob failover success: inode={} offset={} replica vol={}",
+                                                    inode, chunk_offset, rep_vol
+                                                );
+                                                self.chunk_cache.put(
+                                                    inode,
+                                                    *chunk_offset,
+                                                    data.into(),
+                                                    mtime,
+                                                    0,
+                                                );
+                                                continue;
+                                            }
+                                            Err(e2) => {
+                                                error!(
+                                                    "read_blob failover also failed: inode={} offset={} replica vol={} err={}",
+                                                    inode, chunk_offset, rep_vol, e2
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        error!(
+                                            "get_volume_addr for replica vol={} failed: {}",
+                                            rep_vol, e2
+                                        );
+                                    }
+                                }
+                            }
+                            error!("read_blob failed (no replica available): {}", e);
                             return Err(std::io::Error::from_raw_os_error(libc::EIO));
                         }
                     }
@@ -2951,9 +3062,10 @@ impl FileSystem for PowerFsFs {
 
                 let parent = entry.parent;
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                match self.client.block_on(async move {
-                    meta_client.migrate_inline_alloc(parent, inode).await
-                }) {
+                match self
+                    .client
+                    .block_on(async move { meta_client.migrate_inline_alloc(parent, inode).await })
+                {
                     Ok((volume_id, needle_id)) => {
                         info!(
                             "write inline migrate: inode={} new_end={} > threshold={} → \
@@ -2963,9 +3075,12 @@ impl FileSystem for PowerFsFs {
                         // 数据放入 chunk_cache (dirty). 必须放入: 否则后续 append 走
                         // Flat 路径时 chunk 0 不在 cache → no_data_before 优化跳过
                         // read-before-write → 零填充覆盖迁移数据.
+                        // P4 fix: 必须调用 mark_dirty, 否则 release/flusher 不会将
+                        // 迁移数据 flush 到 Volume Server, 导致数据只在内存中.
                         let mtime = chrono::Utc::now().timestamp() as u64;
                         self.chunk_cache
                             .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                        self.mark_dirty(inode, 0);
 
                         // 切换 cache 到 Flat 模式
                         let fid = Fid {
@@ -3072,12 +3187,11 @@ impl FileSystem for PowerFsFs {
             };
 
             // Check that the write range is within the pre-allocated stripe range
-            let max_stripe_offset = (stripe_chunks.len() as u64)
-                .saturating_mul(match placement {
-                    powerfs_layout::Placement::Stripe { stripe_size, .. }
-                    | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
-                    _ => 0,
-                });
+            let max_stripe_offset = (stripe_chunks.len() as u64).saturating_mul(match placement {
+                powerfs_layout::Placement::Stripe { stripe_size, .. }
+                | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
+                _ => 0,
+            });
             if end_offset > max_stripe_offset {
                 error!(
                     "write stripe: inode={} end_offset={} > max_stripe_offset={} \
@@ -3160,51 +3274,53 @@ impl FileSystem for PowerFsFs {
                             );
                             vec![0u8; in_chunk_start + bytes_to_write]
                         } else {
-                        // Chunk has been flushed — read back from volume
-                        let existing_len = std::cmp::min(
-                            chunk_size,
-                            content_size_before_write - chunk_start_offset,
-                        ) as usize;
-                        let (rbw_vol_id, rbw_needle_id) = resolve_stripe_chunk(
-                            placement,
-                            &stripe_chunks,
-                            chunk_start_offset,
-                            chunk_size,
-                        )
-                        .unwrap_or_else(|| {
-                            // Fallback: try chunk_map, then first chunk
-                            let (vid, nid, _) = chunk_map
-                                .get(&chunk_start_offset)
-                                .copied()
-                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id, 0));
-                            (vid, nid)
-                        });
-                        let rbw_addr = self.client.get_volume_addr(rbw_vol_id).ok();
-                        let mut base = if let Some(ref addr) = rbw_addr {
-                            match self.client.read_blob(
-                                addr,
-                                rbw_vol_id,
-                                rbw_needle_id,
-                                0,
-                                existing_len as i32,
-                            ) {
-                                Ok(data) => data,
-                                Err(e) => {
-                                    warn!(
+                            // Chunk has been flushed — read back from volume
+                            let existing_len = std::cmp::min(
+                                chunk_size,
+                                content_size_before_write - chunk_start_offset,
+                            ) as usize;
+                            let (rbw_vol_id, rbw_needle_id) = resolve_stripe_chunk(
+                                placement,
+                                &stripe_chunks,
+                                chunk_start_offset,
+                                chunk_size,
+                            )
+                            .unwrap_or_else(|| {
+                                // Fallback: try chunk_map, then first chunk
+                                let (vid, nid, _) =
+                                    chunk_map.get(&chunk_start_offset).copied().unwrap_or((
+                                        stripe_chunks[0].volume_id,
+                                        stripe_chunks[0].needle_id,
+                                        0,
+                                    ));
+                                (vid, nid)
+                            });
+                            let rbw_addr = self.client.get_volume_addr(rbw_vol_id).ok();
+                            let mut base = if let Some(ref addr) = rbw_addr {
+                                match self.client.read_blob(
+                                    addr,
+                                    rbw_vol_id,
+                                    rbw_needle_id,
+                                    0,
+                                    existing_len as i32,
+                                ) {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        warn!(
                                         "write stripe: read-before-write failed inode={} chunk_offset={}: {} — using zeros",
                                         inode, chunk_start_offset, e
                                     );
-                                    vec![0u8; existing_len]
+                                        vec![0u8; existing_len]
+                                    }
                                 }
+                            } else {
+                                vec![0u8; existing_len]
+                            };
+                            let needed_len = in_chunk_start + bytes_to_write;
+                            if base.len() < needed_len {
+                                base.resize(needed_len, 0);
                             }
-                        } else {
-                            vec![0u8; existing_len]
-                        };
-                        let needed_len = in_chunk_start + bytes_to_write;
-                        if base.len() < needed_len {
-                            base.resize(needed_len, 0);
-                        }
-                        base
+                            base
                         } // close `else` of chunk_flushed check
                     } else {
                         vec![0u8; in_chunk_start + bytes_to_write]
@@ -3229,15 +3345,14 @@ impl FileSystem for PowerFsFs {
                 }
             }
             // Update chunk sizes for Stripe: each 1MB chunk gets its own entry
-            self.cache
-                .update_chunk_sizes_after_write_stripe(
-                    inode,
-                    offset,
-                    read_len as u64,
-                    chunk_size,
-                    placement,
-                    &stripe_chunks,
-                );
+            self.cache.update_chunk_sizes_after_write_stripe(
+                inode,
+                offset,
+                read_len as u64,
+                chunk_size,
+                placement,
+                &stripe_chunks,
+            );
             return Ok(read_len);
         }
 
@@ -3498,9 +3613,9 @@ impl FileSystem for PowerFsFs {
                 for attempt in 1..=max_retries {
                     let meta_client = self.client.facade().meta_shard_client().clone();
                     let req = req.clone();
-                    let result = self.client.block_on(async move {
-                        meta_client.update_inode_size_chunks(&req).await
-                    });
+                    let result = self
+                        .client
+                        .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
                     match result {
                         Ok(resp) if resp.success => {
                             info!(
@@ -3994,6 +4109,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         };
         self.cache.insert(cached_entry.clone());
@@ -4085,6 +4201,7 @@ impl FileSystem for PowerFsFs {
                     disk_size: entry.disk_size,
                     generation: 0,
                     placement: None,
+                    replica_chunks: Vec::new(),
                     cached_at: Instant::now(),
                 };
 
@@ -4186,7 +4303,10 @@ impl FileSystem for PowerFsFs {
         // fsync 为 no-op: 数据在 release 时一次性 Raft 提交到 Filer (持久化).
         // (Inline 文件 <8KB, 写入→关闭窗口极短; 中途 fsync 同步留作后续优化.)
         if self.inline_buffers.contains_key(&inode) {
-            debug!("fsync: inode={} is inline, no-op (data persisted on release)", inode);
+            debug!(
+                "fsync: inode={} is inline, no-op (data persisted on release)",
+                inode
+            );
             return Ok(());
         }
         match self.flush_dirty_chunks(inode, None) {
@@ -4362,7 +4482,9 @@ impl FileSystem for PowerFsFs {
             let name_for_rpc = normalized_name.to_string();
             match self.client.block_on(async move {
                 let shard_id = meta_client.calculate_shard_id(inode);
-                meta_client.set_xattr(shard_id, inode, &name_for_rpc, &value_owned).await
+                meta_client
+                    .set_xattr(shard_id, inode, &name_for_rpc, &value_owned)
+                    .await
             }) {
                 Ok(()) => {
                     info!(

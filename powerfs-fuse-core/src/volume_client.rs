@@ -13,8 +13,8 @@ use crate::meta_shard_client::{ChannelConfig, PendingRequest, RequestQueue, Tran
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
-use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::protocol::{CHANNEL_DATA, CHANNEL_META};
+use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND, STATUS_ERR_NO_SPACE};
 
 /// 请求等待者类型别名
@@ -373,10 +373,15 @@ impl VolumeClient {
         addr: &str,
         channel: u8,
     ) -> ClientResult<Arc<PowerFsNetClient>> {
-        let ch_str = if channel == CHANNEL_META { "meta" } else { "data" };
+        let ch_str = if channel == CHANNEL_META {
+            "meta"
+        } else {
+            "data"
+        };
         log::debug!(
             "VolumeClient: get_or_create_volume_client_channel addr={} channel={}",
-            addr, ch_str
+            addr,
+            ch_str
         );
         self.conn_pool
             .get_or_connect_addr_channel(addr, channel)
@@ -962,7 +967,8 @@ impl VolumeClient {
         let body = enc.into_bytes();
         log::debug!(
             "acquire_lease: sending AcquireLease to addr={} body_len={}",
-            volume.addr, body.len()
+            volume.addr,
+            body.len()
         );
         let result = vol_client
             .send_request(powerfs_net::MsgType::AcquireLease, &body, &[])
@@ -1172,7 +1178,10 @@ impl VolumeClient {
         // lease 释放走 meta 通路.
         log::debug!(
             "release_lease_remote: channel=meta addr={} volume={} inode={} stripe_start={}",
-            volume.addr, volume_id, inode, stripe_start
+            volume.addr,
+            volume_id,
+            inode,
+            stripe_start
         );
         let vol_client = self
             .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
@@ -1185,7 +1194,8 @@ impl VolumeClient {
         let body = enc.into_bytes();
         log::debug!(
             "release_lease_remote: sending ReleaseLease to addr={} body_len={}",
-            volume.addr, body.len()
+            volume.addr,
+            body.len()
         );
         let result = vol_client
             .send_request(powerfs_net::MsgType::ReleaseLease, &body, &[])
@@ -1247,7 +1257,10 @@ impl VolumeClient {
         // not in the TLV body. The server's R5 check rejects bodies > 256KB.
         log::debug!(
             "send_write_needle_direct: channel=data addr={} volume={} payload_len={} data_len={}",
-            volume.addr, volume_id, payload.len(), data.len()
+            volume.addr,
+            volume_id,
+            payload.len(),
+            data.len()
         );
         let vol_client = self
             .get_or_create_volume_client_channel(&volume.addr, CHANNEL_DATA)
@@ -1312,7 +1325,10 @@ impl VolumeClient {
         // lease 续租走 meta 通路.
         log::debug!(
             "renew_lease: channel=meta addr={} volume={} inode={} stripe_start={}",
-            volume.addr, volume_id, inode, stripe_start
+            volume.addr,
+            volume_id,
+            inode,
+            stripe_start
         );
         let vol_client = self
             .get_or_create_volume_client_channel(&volume.addr, CHANNEL_META)
@@ -1339,7 +1355,9 @@ impl VolumeClient {
         let body = enc.into_bytes();
         log::debug!(
             "renew_lease: sending RenewLease to addr={} body_len={} duration_ms={}",
-            volume.addr, body.len(), duration_ms
+            volume.addr,
+            body.len(),
+            duration_ms
         );
         let result = vol_client
             .send_request(powerfs_net::MsgType::RenewLease, &body, &[])
@@ -2434,30 +2452,28 @@ async fn process_data_request_internal(
 
     log::debug!(
         "process_data_request_internal: connecting to volume at {} (channel=data, kind={:?})",
-        volume_addr, kind
+        volume_addr,
+        kind
     );
 
     // data 请求 (read/write needle) 走 data 通路 (CHANNEL_DATA).
-    let vol_client = get_or_create_volume_client_from_pool_channel(
-        conn_pool,
-        &volume_addr,
-        CHANNEL_DATA,
-    )
-    .await
-    .map_err(|e| {
-        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-        log::error!(
-            "process_data_request_internal: failed to get volume client (data): {}",
-            e
-        );
-        deliver_result(
-            &mut response_tx,
-            &request_id,
-            Err(err.clone()),
-            response_waiters,
-        );
-        err
-    })?;
+    let vol_client =
+        get_or_create_volume_client_from_pool_channel(conn_pool, &volume_addr, CHANNEL_DATA)
+            .await
+            .map_err(|e| {
+                let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+                log::error!(
+                    "process_data_request_internal: failed to get volume client (data): {}",
+                    e
+                );
+                deliver_result(
+                    &mut response_tx,
+                    &request_id,
+                    Err(err.clone()),
+                    response_waiters,
+                );
+                err
+            })?;
 
     let resolved_msg_type = powerfs_net::MsgType::from_u16(msg_type).unwrap_or(match kind {
         RequestKind::Read => powerfs_net::MsgType::ReadNeedleBlob,
@@ -2668,26 +2684,23 @@ async fn process_lease_request_internal(
 
     // lease 请求 (acquire/renew/release) 走 meta 通路 (CHANNEL_META),
     // 与 write_needle 大帧物理隔离, 避免被大帧阻塞导致 -110 超时.
-    let vol_client = get_or_create_volume_client_from_pool_channel(
-        conn_pool,
-        &volume_addr,
-        CHANNEL_META,
-    )
-    .await
-    .map_err(|e| {
-        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-        log::error!(
-            "process_lease_request_internal: failed to get volume client (meta): {}",
-            e
-        );
-        deliver_result(
-            &mut response_tx,
-            &request_id,
-            Err(err.clone()),
-            response_waiters,
-        );
-        err
-    })?;
+    let vol_client =
+        get_or_create_volume_client_from_pool_channel(conn_pool, &volume_addr, CHANNEL_META)
+            .await
+            .map_err(|e| {
+                let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+                log::error!(
+                    "process_lease_request_internal: failed to get volume client (meta): {}",
+                    e
+                );
+                deliver_result(
+                    &mut response_tx,
+                    &request_id,
+                    Err(err.clone()),
+                    response_waiters,
+                );
+                err
+            })?;
 
     let msg_type = powerfs_net::MsgType::from_u16(req.context.msg_type)
         .unwrap_or(powerfs_net::MsgType::ReadNeedleBlob);
@@ -2779,22 +2792,19 @@ async fn process_mgmt_request_internal(
     }
 
     // 管理请求 (statfs 等) 走 data 通路 (量小, 与 data 共享, 不阻塞 lease).
-    let vol_client = get_or_create_volume_client_from_pool_channel(
-        conn_pool,
-        &volume_addr,
-        CHANNEL_DATA,
-    )
-    .await
-    .map_err(|e| {
-        let err = ClientError::Network(format!("Failed to get volume client: {}", e));
-        deliver_result(
-            &mut response_tx,
-            &request_id,
-            Err(err.clone()),
-            response_waiters,
-        );
-        err
-    })?;
+    let vol_client =
+        get_or_create_volume_client_from_pool_channel(conn_pool, &volume_addr, CHANNEL_DATA)
+            .await
+            .map_err(|e| {
+                let err = ClientError::Network(format!("Failed to get volume client: {}", e));
+                deliver_result(
+                    &mut response_tx,
+                    &request_id,
+                    Err(err.clone()),
+                    response_waiters,
+                );
+                err
+            })?;
 
     let msg_type = powerfs_net::MsgType::from_u16(req.context.msg_type)
         .unwrap_or(powerfs_net::MsgType::StatFs);

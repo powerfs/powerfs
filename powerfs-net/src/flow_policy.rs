@@ -182,10 +182,10 @@ impl FlowPolicy for AdaptiveConcurrencyPolicy {
         // 用乘法避免浮点: (global_active * 4) / max
         let scaled = (global_active as u64) * 4 / max as u64;
         match scaled {
-            0 => 0,          // 0-25%
-            1 => 1,          // 25-50%
-            2 => 2,          // 50-75%
-            _ => 3,          // 75-100%+
+            0 => 0, // 0-25%
+            1 => 1, // 25-50%
+            2 => 2, // 50-75%
+            _ => 3, // 75-100%+
         }
     }
 

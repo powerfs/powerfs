@@ -34,7 +34,7 @@ use tokio::time::interval;
 
 use crate::client::{ClientConfig, NotificationHandler, PowerFsNetClient};
 use crate::errors::NetResult;
-use crate::protocol::{ ClientType, NetMessage, CHANNEL_DATA, CHANNEL_META};
+use crate::protocol::{ClientType, NetMessage, CHANNEL_DATA, CHANNEL_META};
 
 /// Describes a server endpoint to connect to.
 ///
@@ -356,7 +356,11 @@ impl ClientConnPool {
     ) -> NetResult<Arc<PowerFsNetClient>> {
         debug!(
             "ClientConnPool: create_connection addr={}:{}, channel={}, client_id={}, key={}",
-            addr, port, channel_label(channel), self.client_id, key
+            addr,
+            port,
+            channel_label(channel),
+            self.client_id,
+            key
         );
         let config = ClientConfig {
             addr: addr.to_string(),

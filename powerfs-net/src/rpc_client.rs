@@ -183,9 +183,14 @@ impl NetRpcClient {
             self.channel,
             self.client_id
         );
-        self.conn =
-            RpcConnection::connect(&self.addr, self.client_type, self.client_id, self.channel, &self.opts)
-                .await?;
+        self.conn = RpcConnection::connect(
+            &self.addr,
+            self.client_type,
+            self.client_id,
+            self.channel,
+            &self.opts,
+        )
+        .await?;
         Ok(())
     }
 
@@ -254,7 +259,8 @@ impl RpcConnection {
         };
 
         // 2. powerfs-net handshake (carries channel for server-side validation).
-        conn.handshake(client_type, client_id, channel, opts).await?;
+        conn.handshake(client_type, client_id, channel, opts)
+            .await?;
 
         Ok(conn)
     }
@@ -345,15 +351,15 @@ impl RpcConnection {
             .await
             .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::Connection(format!("read header: {e}")))?;
-        let hdr = FrameHeader::decode_checked(&hdr_buf)
-            .map_err(|reason| {
-                // Layer 1: 帧头不变式违反
-                log::warn!(
-                    "{} rpc_client: invalid response header, reason={}",
-                    crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT, reason
-                );
-                NetError::Protocol(format!("invalid response header: {}", reason))
-            })?;
+        let hdr = FrameHeader::decode_checked(&hdr_buf).map_err(|reason| {
+            // Layer 1: 帧头不变式违反
+            log::warn!(
+                "{} rpc_client: invalid response header, reason={}",
+                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT,
+                reason
+            );
+            NetError::Protocol(format!("invalid response header: {}", reason))
+        })?;
 
         // 5. Read response body (body + data combined; callers decode TLV).
         let total = hdr.data_len as usize;
@@ -380,10 +386,9 @@ impl RpcConnection {
 
         // Layer 4: TLV 必需字段校验（仅成功响应）
         if hdr.status == STATUS_OK {
-            check_required_fields(hdr.msg_type, hdr.seq, &body[..body_len])
-                .map_err(|reason| {
-                    NetError::Protocol(format!("required field check: {}", reason))
-                })?;
+            check_required_fields(hdr.msg_type, hdr.seq, &body[..body_len]).map_err(|reason| {
+                NetError::Protocol(format!("required field check: {}", reason))
+            })?;
         }
 
         Ok(RpcReply {

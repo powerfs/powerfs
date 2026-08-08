@@ -52,6 +52,9 @@ pub struct CachedEntry {
     /// When Some(Stripe), write/read handlers use Placement::locate() to route I/O
     /// to the correct volume based on file offset.
     pub placement: Option<powerfs_layout::Placement>,
+    /// P4: 副本 chunk 列表 (scrubber 异步复制).
+    /// 读路径 failover: 主 volume 不可用时从副本 volume 读取相同 needle_id.
+    pub replica_chunks: Vec<CachedFileChunk>,
     /// When this cache entry was populated (used for TTL fallback)
     pub cached_at: Instant,
 }
@@ -157,6 +160,7 @@ impl MetadataCache {
             disk_size: 4096,
             generation: 1,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
         cache
@@ -203,7 +207,9 @@ impl MetadataCache {
         drop(pinned);
         debug!(
             "pin_inode: inode={} new_count={} thread={:?}",
-            inode, new_count, std::thread::current().id()
+            inode,
+            new_count,
+            std::thread::current().id()
         );
     }
 
@@ -226,7 +232,9 @@ impl MetadataCache {
         // InvalidateHandler to evict it mid-write.
         debug!(
             "unpin_inode: inode={} was_pinned={} thread={:?}",
-            inode, was_pinned, std::thread::current().id()
+            inode,
+            was_pinned,
+            std::thread::current().id()
         );
     }
 
@@ -1110,6 +1118,7 @@ impl MetadataCache {
                 disk_size: 4096,
                 generation: 1,
                 placement: None,
+                replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             },
         );
@@ -1250,6 +1259,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1289,6 +1299,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1328,6 +1339,7 @@ mod tests {
                 disk_size: 0,
                 generation: 0,
                 placement: None,
+                replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             });
         }
@@ -1365,6 +1377,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1402,6 +1415,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1442,6 +1456,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1483,6 +1498,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1526,6 +1542,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -1572,6 +1589,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -2161,6 +2179,7 @@ mod chunk_cache_tests {
             disk_size: 0,
             generation: 1,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
@@ -2210,6 +2229,7 @@ mod chunk_cache_tests {
             disk_size: 0,
             generation: 1,
             placement: None,
+            replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
 
