@@ -25,7 +25,6 @@
 
 pub mod anti_affinity;
 pub mod codec;
-pub mod compat;
 pub mod encoding;
 pub mod error;
 pub mod layout;

@@ -779,11 +779,11 @@ fn reliability_overhead_and_survival() {
 }
 
 // =========================================================================
-// 13. 旧客户端兼容 (features=0)
+// 13. 二进制 TLV 编码验证 (features 无关, 始终二进制)
 // =========================================================================
 
 #[test]
-fn old_client_encode_uses_json_chunks() {
+fn encode_always_uses_binary_tlv() {
     let layout = make_layout(
         Placement::Flat,
         Reliability::SingleReplica,
@@ -792,55 +792,32 @@ fn old_client_encode_uses_json_chunks() {
         },
     );
 
-    let mut enc = TlvEncoder::new();
-    encode_file_layout(&mut enc, &layout, 0).unwrap(); // features=0
-    let bytes = enc.into_bytes();
+    // 无论 features 为何值, 始终输出二进制 TLV
+    for features in [0u32, FEATURE_CHUNK_LAYOUT_V2] {
+        let mut enc = TlvEncoder::new();
+        encode_file_layout(&mut enc, &layout, features).unwrap();
+        let bytes = enc.into_bytes();
 
-    // 验证包含 FieldId::Chunks (JSON) 和兼容字段
-    let mut dec = TlvDecoder::new(&bytes);
-    let mut found_chunks = false;
-    let mut found_volume_id = false;
-    let mut found_file_key = false;
-    while let Some((field, length)) = dec.next_field() {
-        match field {
-            powerfs_net::FieldId::Chunks => found_chunks = true,
-            powerfs_net::FieldId::VolumeId => found_volume_id = true,
-            powerfs_net::FieldId::FileKey => found_file_key = true,
-            _ => {}
+        let mut dec = TlvDecoder::new(&bytes);
+        let mut found_chunk_layout = false;
+        let mut found_json_chunks = false;
+        while let Some((field, length)) = dec.next_field() {
+            match field {
+                powerfs_net::FieldId::ChunkLayout => found_chunk_layout = true,
+                powerfs_net::FieldId::Chunks => found_json_chunks = true,
+                _ => {}
+            }
+            dec.skip(length).unwrap();
         }
-        dec.skip(length).unwrap();
+        assert!(
+            found_chunk_layout,
+            "features={}: should have FieldId::ChunkLayout",
+            features
+        );
+        assert!(
+            !found_json_chunks,
+            "features={}: should NOT have FieldId::Chunks (JSON path removed)",
+            features
+        );
     }
-    assert!(found_chunks, "old format should have FieldId::Chunks");
-    assert!(found_volume_id, "old format should have FieldId::VolumeId");
-    assert!(found_file_key, "old format should have FieldId::FileKey");
-}
-
-#[test]
-fn new_client_encode_uses_binary() {
-    let layout = make_layout(
-        Placement::Flat,
-        Reliability::SingleReplica,
-        ChunkEncoding::PerChunk {
-            chunks: vec![make_chunk(0, 1024, 42, 10)],
-        },
-    );
-
-    let mut enc = TlvEncoder::new();
-    encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).unwrap();
-    let bytes = enc.into_bytes();
-
-    // 验证包含 FieldId::ChunkLayout (二进制) 而非 FieldId::Chunks (JSON)
-    let mut dec = TlvDecoder::new(&bytes);
-    let mut found_chunk_layout = false;
-    let mut found_json_chunks = false;
-    while let Some((field, length)) = dec.next_field() {
-        match field {
-            powerfs_net::FieldId::ChunkLayout => found_chunk_layout = true,
-            powerfs_net::FieldId::Chunks => found_json_chunks = true,
-            _ => {}
-        }
-        dec.skip(length).unwrap();
-    }
-    assert!(found_chunk_layout, "new format should have FieldId::ChunkLayout");
-    assert!(!found_json_chunks, "new format should NOT have FieldId::Chunks");
 }

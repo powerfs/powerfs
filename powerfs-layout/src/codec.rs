@@ -94,26 +94,21 @@ const CHUNK_REF_SIZE: usize = 44;
 // encode_file_layout / decode_file_layout (顶层入口)
 // =========================================================================
 
-/// 编码 FileLayout 到 TLV (根据客户端 features 决定新格式/旧格式).
+/// 编码 FileLayout 到 TLV (始终使用二进制 TLV 编码).
 ///
-/// - 新格式 (FEATURE_CHUNK_LAYOUT_V2): 二进制 Placement + Reliability + ChunkLayout
-/// - 旧格式: JSON Chunks + 首 chunk 兼容字段 (委托 compat.rs)
+/// `client_features` 参数保留用于前向兼容 (未来可根据 features 选择不同编码级别),
+/// 但当前始终输出二进制 Placement + Reliability + ChunkLayout.
+/// JSON 兼容路径已移除 (P2 决策: 不保留旧格式兼容).
 pub fn encode_file_layout(
     enc: &mut TlvEncoder,
     layout: &FileLayout,
-    client_features: u32,
+    _client_features: u32,
 ) -> LayoutResult<()> {
-    if client_features & FEATURE_CHUNK_LAYOUT_V2 != 0 {
-        // 新格式: 二进制
-        encode_placement(enc, &layout.placement)?;
-        encode_reliability(enc, &layout.reliability)?;
-        enc.add_u8(FieldId::ReliabilityState, reliability_state_to_u8(&layout.reliability_state));
-        enc.add_u8(FieldId::Compression, compression_state_to_u8(&layout.compression));
-        encode_encoding(enc, &layout.encoding)?;
-    } else {
-        // 旧格式: JSON 兼容 (P8 废弃后删除此分支)
-        crate::compat::encode_chunks_json_compat(enc, &layout.encoding)?;
-    }
+    encode_placement(enc, &layout.placement)?;
+    encode_reliability(enc, &layout.reliability)?;
+    enc.add_u8(FieldId::ReliabilityState, reliability_state_to_u8(&layout.reliability_state));
+    enc.add_u8(FieldId::Compression, compression_state_to_u8(&layout.compression));
+    encode_encoding(enc, &layout.encoding)?;
     Ok(())
 }
 
@@ -1428,43 +1423,6 @@ mod tests {
     #[test]
     fn unknown_compression_tag_errors() {
         assert!(u8_to_compression_state(0xFF).is_err());
-    }
-
-    // =================================================================
-    // 旧客户端 JSON 兼容路径
-    // =================================================================
-
-    #[test]
-    fn old_client_features_zero_uses_json() {
-        // features=0 时走 JSON 兼容路径, 应包含 FieldId::Chunks
-        let layout = FileLayout {
-            placement: Placement::Flat,
-            reliability: Reliability::SingleReplica,
-            reliability_state: ReliabilityState::PendingReplicated,
-            compression: CompressionState::None,
-            encoding: ChunkEncoding::PerChunk {
-                chunks: vec![make_chunk(0, 1024, 42, 10)],
-            },
-        };
-        let mut enc = TlvEncoder::new();
-        encode_file_layout(&mut enc, &layout, 0).unwrap();
-        let bytes = enc.into_bytes();
-
-        let mut dec = TlvDecoder::new(&bytes);
-        let mut found_chunks = false;
-        let mut found_volume_id = false;
-        while let Some((field, length)) = dec.next_field() {
-            if field == FieldId::Chunks {
-                found_chunks = true;
-            }
-            if field == FieldId::VolumeId {
-                found_volume_id = true;
-            }
-            // 消费 value 字节, 使 pos 前进到下一字段头部
-            dec.skip(length).unwrap();
-        }
-        assert!(found_chunks, "old format should contain FieldId::Chunks");
-        assert!(found_volume_id, "old format should contain FieldId::VolumeId");
     }
 
     // =================================================================
