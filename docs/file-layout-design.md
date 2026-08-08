@@ -2167,7 +2167,7 @@ if (req->error == -E2BIG) {
 | P2.5 | M2 | 已完成 | ✅ Inline 存储+迁移+客户端路径 | 待开始 | ✅ mdtest 2.22x | a64c4247+199fded6+321217aa+cce28ec5+a1dc2542 | - | 2026-08-08 |
 | P3 | M3 | 进行中 | ✅ Stripe alloc + xattr + write/read/flush | 待开始 | ✅ fio 962/4000 MiB/s | 098e13bb+92d078b2+628cddb1+a99465b9 | - | 2026-08-08 |
 | P4 | M4 | 进行中 | ✅ Reliability 状态机 + scrubber + 读路径 failover (Flat+Stripe) | 待开始 | ✅ 容器 failover 验证 | 72d2b4c7+d7c4c365+48bf4604+f80e3ba0+c120b683 | - | 2026-08-08 |
-| P5 | M3 | 待开始 | - | - | - | - | - | - |
+| P5 | M3 | 进行中 | ✅ volume_ids 范围压缩 (256卷 2KB→12B) | 待开始 | - | e0a96ded | - | 2026-08-08 |
 | P6 | M4 | 待开始 | - | - | - | - | - | - |
 | P7 | M4 | 待开始 | - | - | - | - | - | - |
 | P8 | M5 | 部分完成 | ✅ JSON 路径已移除 | - | - | 0e0ec5f2 | - | 2026-08-08 |
