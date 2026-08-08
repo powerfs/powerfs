@@ -2159,7 +2159,7 @@ if (req->error == -E2BIG) {
 | P2 | M1 | 进行中 | ✅ TLV 编码落地 | 待开始 | 待 FUSE 容器测试 | 0e0ec5f2 | - | - |
 | P2.5 | M2 | 已完成 | ✅ Inline 存储+迁移+客户端路径 | 待开始 | ✅ mdtest 2.22x | a64c4247+199fded6+321217aa+cce28ec5+a1dc2542 | - | 2026-08-08 |
 | P3 | M3 | 进行中 | ✅ Stripe alloc + xattr + write/read/flush | 待开始 | ✅ fio 962/4000 MiB/s | 098e13bb+92d078b2+628cddb1+a99465b9 | - | 2026-08-08 |
-| P4 | M4 | 待开始 | - | - | - | - | - | - |
+| P4 | M4 | 进行中 | ✅ Reliability 状态机 + scrubber + 读路径 failover (Flat+Stripe) | 待开始 | ✅ 容器 failover 验证 | 72d2b4c7+d7c4c365+48bf4604+f80e3ba0+c120b683 | - | 2026-08-08 |
 | P5 | M3 | 待开始 | - | - | - | - | - | - |
 | P6 | M4 | 待开始 | - | - | - | - | - | - |
 | P7 | M4 | 待开始 | - | - | - | - | - | - |
@@ -2177,7 +2177,7 @@ if (req->error == -E2BIG) {
 | M1 协议基础 | 进行中 | 1/2 (P1✅ P2进行中) | 待 FUSE 容器测试 | - |
 | M2 小文件优化 | 已完成 | 1/1 (P2.5✅) | ✅ mdtest create 2.22x | 2026-08-08 |
 | M3 数据分布 | 进行中 | 0.5/2 (P3 FUSE✅) | ✅ fio Stripe write 962 MiB/s | - |
-| M4 可靠性 | 待开始 | 0/3 | - | - |
+| M4 可靠性 | 进行中 | 1/3 (P4 FUSE✅) | ✅ 容器 failover 验证 | - |
 | M5 技术债务 | 部分完成 | 0.5/1 (JSON 路径已移除) | - | - |
 
 ### P3 FUSE 性能评估 (2026-08-08)
@@ -2198,4 +2198,36 @@ if (req->error == -E2BIG) {
 **数据完整性**: MD5 校验通过 (write → direct IO read → cross-client read).
 
 **anti-affinity 验证**: 128 chunk round-robin 分布到 3 个 volume (43/43/42).
+
+### P4 可靠性评估 (2026-08-08)
+
+**测试环境**: Docker 容器集群 (3 Master + 3 Volume + 3 Filer + 1 FUSE)
+
+**实现范围** (FUSE + 服务端, 内核待开始):
+
+| 组件 | 功能 | 状态 |
+|------|------|------|
+| Filer | ReliabilityState 状态机 (PendingReplicated → Replicated) | ✅ |
+| Filer | scrubber worker 异步副本复制 (TLV 协议) | ✅ |
+| Filer | 数据修改时状态回退 (Replicated → PendingReplicated) | ✅ |
+| Filer | anti-affinity 副本 volume 选择 | ✅ |
+| Volume | 副本复制接口 (scrubber 经 TLV read→write) | ✅ |
+| FUSE | GETATTR 返回 replica_chunks | ✅ |
+| FUSE | Flat 读路径 failover (主 volume 失败→副本 volume) | ✅ |
+| FUSE | Stripe 读路径 failover (同 offset 副本查找) | ✅ |
+| 协议 | FieldId::ReplicaChunks (0xB5) TLV 编码 | ✅ |
+
+**关键修复**:
+1. **chunk cache 粒度**: `effective_chunk_size = min(chunk_size, stripe_size)`, 确保 Stripe 模式每个 cache entry 对应一个 stripe unit, 否则 scrubber 读取失败 ("needle not found")
+2. **TLV 顺序解码限制**: `decode_file_layout` 消费 ReplicaChunks 字段后 `next_bytes` 找不到, 新增 raw TLV 字节扫描绕过
+3. **状态回退误触发**: getattr 比较 chunks 时不应回退状态, 仅 `chunks_changed` 时才 Replicated → PendingReplicated
+4. **Inline→Flat 迁移数据丢失**: 迁移后必须 `mark_dirty(inode, 0)`, 否则 flusher 不会将迁移数据写到 Volume Server
+5. **Stripe 空 chunks panic**: `placement=Some` + `chunks=[]` 时返回 EIO 而非 panic
+
+**failover 验证**: 杀掉主 volume 容器, FUSE 读路径自动切换到副本 volume, 文件可读且 MD5 一致.
+
+**遗留事项**:
+- 副本 CRC32 一致性校验 (scrubber 当前复制 CRC32 元数据但未校验读到的数据)
+- 多 zone 环境 volume 地址查找偶发失败
+- scrubber 大规模文件扫描性能优化
 
