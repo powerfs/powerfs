@@ -1,14 +1,15 @@
 //! 维度 2: Reliability — 数据如何保护 + 状态机
 //!
 //! 设计文档 S5:
-//! - [`Reliability`]: 可靠性策略 (SingleReplica/Replicated/EC)
-//! - [`ReliabilityState`]: 可靠性状态机 (scrubber 异步转换)
-//! - [`CompressionState`]: 压缩状态
+//! - `Reliability`: 可靠性策略 (SingleReplica/Replicated/EC)
+//! - `ReliabilityState`: 可靠性状态机 (scrubber 异步转换)
+//! - `CompressionState`: 压缩状态
 
 /// 可靠性策略
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum Reliability {
     /// 单副本 (临时态, 写入不等可靠性时用)
+    #[default]
     SingleReplica,
 
     /// N 副本
@@ -27,9 +28,10 @@ pub enum Reliability {
 }
 
 /// 可靠性状态机 (scrubber 异步转换用)
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum ReliabilityState {
     /// 刚写入, 等待后台转换为 Replicated
+    #[default]
     PendingReplicated,
 
     /// 已完成副本复制
@@ -46,9 +48,10 @@ pub enum ReliabilityState {
 }
 
 /// 压缩状态 (设计文档 S5)
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum CompressionState {
     /// 未压缩
+    #[default]
     None,
     /// 等待后台压缩
     Pending,
@@ -78,24 +81,6 @@ impl Reliability {
             Reliability::Replicated { count } => count.saturating_sub(1),
             Reliability::EC { parity, .. } => *parity,
         }
-    }
-}
-
-impl Default for Reliability {
-    fn default() -> Self {
-        Reliability::SingleReplica
-    }
-}
-
-impl Default for ReliabilityState {
-    fn default() -> Self {
-        ReliabilityState::PendingReplicated
-    }
-}
-
-impl Default for CompressionState {
-    fn default() -> Self {
-        CompressionState::None
     }
 }
 

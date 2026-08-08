@@ -501,7 +501,7 @@ fn encode_volume_ids(enc: &mut TlvEncoder, volume_ids: &[u64]) -> LayoutResult<(
 
 /// 从 bytes 解码 volume_ids (u64 LE 数组)
 fn decode_volume_ids(bytes: &[u8]) -> LayoutResult<Vec<u64>> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(LayoutError::TlvDecode(format!(
             "volume_ids length {} not multiple of 8",
             bytes.len()

@@ -1,10 +1,10 @@
 //! 维度 3: ChunkEncoding — 元数据如何序列化
 //!
 //! 设计文档 S6:
-//! - [`ChunkEncoding::InlineData`]: 数据直接存元数据 (<= 8KB, 与 Placement::Inline 绑定)
-//! - [`ChunkEncoding::PerChunk`]: per-chunk 列表 (随机写、小文件)
-//! - [`ChunkEncoding::StripeDescriptor`]: 几何描述符 (顺序写, 1GB 文件 100KB JSON -> 80B 二进制)
-//! - [`ChunkEncoding::Paginated`]: 分页 (超大文件, chunk 数 > 阈值时分批返回)
+//! - `ChunkEncoding::InlineData`: 数据直接存元数据 (<= 8KB, 与 Placement::Inline 绑定)
+//! - `ChunkEncoding::PerChunk`: per-chunk 列表 (随机写、小文件)
+//! - `ChunkEncoding::StripeDescriptor`: 几何描述符 (顺序写, 1GB 文件 100KB JSON -> 80B 二进制)
+//! - `ChunkEncoding::Paginated`: 分页 (超大文件, chunk 数 > 阈值时分批返回)
 
 use crate::error::LayoutError;
 

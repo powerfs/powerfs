@@ -1,10 +1,10 @@
 //! 维度 1: Placement — 数据如何分布到 volume
 //!
 //! 四态枚举 (设计文档 S4.1):
-//! - [`Placement::Inline`]: 数据直接存 Filer 元数据 (微小文件 < 4KB)
-//! - [`Placement::Flat`]: 单 volume (小文件默认)
-//! - [`Placement::Stripe`]: 中等并行 (4-16 volume)
-//! - [`Placement::WideStripe`]: 全集群并行 (128-256 volume)
+//! - `Placement::Inline`: 数据直接存 Filer 元数据 (微小文件 < 4KB)
+//! - `Placement::Flat`: 单 volume (小文件默认)
+//! - `Placement::Stripe`: 中等并行 (4-16 volume)
+//! - `Placement::WideStripe`: 全集群并行 (128-256 volume)
 //!
 //! 核心算法 [`Placement::locate()`]: 根据 file_offset 计算 (volume 数组下标, volume 内偏移)
 
