@@ -202,6 +202,19 @@ impl ScrubberWorker {
                     )
                 })?;
 
+            // 1b. CRC32 校验: 防止复制损坏数据到副本 volume
+            // (crc32==0 表示旧数据未计算 CRC, 跳过校验)
+            if chunk.crc32 != 0 {
+                let actual_crc = crc32fast::hash(&data);
+                if actual_crc != chunk.crc32 {
+                    return Err(format!(
+                        "CRC32 mismatch during replication: inode={} offset={} src vol={} needle={:#x} expected={:#x} actual={:#x}",
+                        inode, chunk.offset, chunk.volume_id, chunk.needle_id,
+                        chunk.crc32, actual_crc
+                    ));
+                }
+            }
+
             // 2. 写入目标 volume (TLV WriteNeedle, 数据放在 DATA 段)
             // 使用相同的 needle_id, 因为 needle_id 是全局唯一的
             self.volume_client
