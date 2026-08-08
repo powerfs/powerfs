@@ -166,6 +166,13 @@ pub enum ShardCommand {
         reliability_state: powerfs_layout::reliability::ReliabilityState,
         replica_chunks: Vec<crate::shard_store::StoredFileChunk>,
     },
+    /// P6: EC 转换 — 替换 chunks 为 data+parity shards, 更新可靠性状态
+    UpdateToEC {
+        inode: u64,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        ec_chunks: Vec<crate::shard_store::StoredFileChunk>,
+    },
 }
 
 impl ShardCommand {

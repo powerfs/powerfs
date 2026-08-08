@@ -52,6 +52,10 @@ pub struct CachedEntry {
     /// When Some(Stripe), write/read handlers use Placement::locate() to route I/O
     /// to the correct volume based on file offset.
     pub placement: Option<powerfs_layout::Placement>,
+    /// P6: 可靠性策略 (SingleReplica/Replicated/EC).
+    /// EC 模式下, chunks 前 data 个为数据 shard, 后 parity 个为校验 shard.
+    /// 读路径: 先读 data shard, 失败时读 parity + 剩余 data 重建.
+    pub reliability: powerfs_layout::reliability::Reliability,
     /// P4: 副本 chunk 列表 (scrubber 异步复制).
     /// 读路径 failover: 主 volume 不可用时从副本 volume 读取相同 needle_id.
     pub replica_chunks: Vec<CachedFileChunk>,
@@ -160,6 +164,7 @@ impl MetadataCache {
             disk_size: 4096,
             generation: 1,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1129,6 +1134,7 @@ impl MetadataCache {
                 disk_size: 4096,
                 generation: 1,
                 placement: None,
+                reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             },
@@ -1270,6 +1276,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1310,6 +1317,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1350,6 +1358,7 @@ mod tests {
                 disk_size: 0,
                 generation: 0,
                 placement: None,
+                reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             });
@@ -1388,6 +1397,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1426,6 +1436,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1467,6 +1478,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1509,6 +1521,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1553,6 +1566,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -1600,6 +1614,7 @@ mod tests {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -2190,6 +2205,7 @@ mod chunk_cache_tests {
             disk_size: 0,
             generation: 1,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });
@@ -2240,6 +2256,7 @@ mod chunk_cache_tests {
             disk_size: 0,
             generation: 1,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         });

@@ -566,6 +566,14 @@ impl ShardStore {
             } => {
                 self.update_reliability(inode, reliability, reliability_state, replica_chunks);
             }
+            ShardCommand::UpdateToEC {
+                inode,
+                reliability,
+                reliability_state,
+                ec_chunks,
+            } => {
+                self.update_to_ec(inode, reliability, reliability_state, ec_chunks);
+            }
         }
     }
 
@@ -1106,6 +1114,35 @@ impl ShardStore {
                 continue;
             }
             if info.delete_time > 0 {
+                continue;
+            }
+            result.push((info.inode, info.chunks.clone()));
+        }
+        result
+    }
+
+    /// P6: 列出可进行 EC 转换的文件 (state == Replicated, 非空 chunks)
+    pub fn list_pending_ec(&self, min_file_size: u64) -> Vec<(u64, Vec<StoredFileChunk>)> {
+        use powerfs_layout::reliability::ReliabilityState;
+        let inodes = self.inodes.read().unwrap();
+        let mut result = Vec::new();
+        for info in inodes.values() {
+            if info.file_type != FileType::File {
+                continue;
+            }
+            // 只转换已 Replicated 的文件 (PendingEC 是手动标记, 暂不支持)
+            if info.reliability_state != ReliabilityState::Replicated {
+                continue;
+            }
+            if info.chunks.is_empty() {
+                continue;
+            }
+            if info.delete_time > 0 {
+                continue;
+            }
+            // 文件大小检查
+            let total_size: u64 = info.chunks.iter().map(|c| c.size).sum();
+            if min_file_size > 0 && total_size < min_file_size {
                 continue;
             }
             result.push((info.inode, info.chunks.clone()));
@@ -1883,6 +1920,55 @@ impl ShardStore {
         info.reliability = reliability;
         info.reliability_state = reliability_state;
         info.replica_chunks = replica_chunks;
+        info.mtime = Self::current_time();
+        if let Ok(data) = serde_json::to_vec(&info) {
+            let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
+        }
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
+    }
+
+    /// P6: 更新 inode 为 EC 状态 (替换 chunks 为 data+parity shards, 清除 replica_chunks)
+    pub fn update_to_ec(
+        &self,
+        inode: u64,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        ec_chunks: Vec<StoredFileChunk>,
+    ) {
+        let cf_inodes = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {}: CF_INODES not found for update_to_ec",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        let mut info = match self.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "Shard {} update_to_ec: inode {} not found",
+                    self.shard_id.0,
+                    inode
+                );
+                return;
+            }
+        };
+        log::info!(
+            "Shard {} P6 update_to_ec: inode {} {:?} -> {:?}, ec_chunks={}",
+            self.shard_id.0,
+            inode,
+            info.reliability_state,
+            reliability_state,
+            ec_chunks.len()
+        );
+        info.reliability = reliability;
+        info.reliability_state = reliability_state;
+        info.chunks = ec_chunks;
+        info.replica_chunks = Vec::new(); // EC 不使用 replica_chunks
         info.mtime = Self::current_time();
         if let Ok(data) = serde_json::to_vec(&info) {
             let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);

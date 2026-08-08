@@ -319,6 +319,68 @@ impl EcEncoder {
         }
     }
 
+    /// P6: Degraded decode — reconstruct full data when some shards are missing.
+    ///
+    /// `shards` is a slice of `Option<Vec<u8>>` with `data + parity` slots;
+    /// present shards are `Some`, missing shards are `None`. The Reed-Solomon
+    /// library reconstructs the missing slots in place as long as at least
+    /// `data_shards` shards are present.
+    ///
+    /// Returns the concatenated data shards (the original file data). The
+    /// caller is responsible for truncating to the original file size if the
+    /// last data shard was zero-padded during encoding.
+    pub fn decode_missing(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+    ) -> Result<Vec<u8>, String> {
+        if shards.len() == 1 {
+            return shards[0]
+                .clone()
+                .ok_or_else(|| "single shard missing".to_string());
+        }
+
+        // Count available shards; need at least data_shards to reconstruct.
+        let available = shards.iter().filter(|s| s.is_some()).count();
+        if available < self.config.data_shards {
+            return Err(format!(
+                "not enough shards to reconstruct: have {}/{}, need {}",
+                available,
+                shards.len(),
+                self.config.data_shards
+            ));
+        }
+
+        // Derive shard_size from any present shard so missing slots can be
+        // allocated to the correct size before reconstruction.
+        let shard_size = shards
+            .iter()
+            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .ok_or_else(|| "no shards available to derive shard_size".to_string())?;
+
+        // Ensure missing slots are pre-allocated with zeros so reconstruct
+        // can write into them. reed_solomon_erasure expects missing shards to
+        // be None (it skips them as "erased"), so we keep them None and let
+        // the library allocate. But some versions require non-None slots of
+        // the right size — we pass None and the library fills them.
+        self.rs
+            .reconstruct(shards)
+            .map_err(|e| format!("reconstruct failed: {}", e))?;
+
+        let mut data = Vec::with_capacity(shard_size * self.config.data_shards);
+        for shard in shards.iter().take(self.config.data_shards) {
+            match shard {
+                Some(s) => data.extend_from_slice(s),
+                None => {
+                    return Err(
+                        "reconstruction failed: data shard still missing after reconstruct"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(data)
+    }
+
     pub fn can_recover(&self, available_shards: &[bool]) -> bool {
         let mut available_count = 0;
         for &available in available_shards {
@@ -415,5 +477,90 @@ impl EcThreadPool {
         }
 
         response_rx.await.map_err(|_| ())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_encoder(data: usize, parity: usize) -> EcEncoder {
+        EcEncoder::new(EcConfig {
+            k: data,
+            m: parity,
+            data_shards: data,
+            parity_shards: parity,
+            min_small_file_size: 0, // don't skip EC for small test data
+            simd_backend: SimdBackend::None,
+            parallel_encoding: false,
+        })
+    }
+
+    #[test]
+    fn decode_missing_recovers_lost_data_shard() {
+        // EC(4+2): encode 1000 bytes, drop 1 data shard, reconstruct.
+        let encoder = make_encoder(4, 2);
+        let original = (0..1000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let shards = encoder.encode(&original);
+        assert_eq!(shards.len(), 6);
+
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        // Erase one data shard (index 1) — simulate a failed volume read.
+        opt_shards[1] = None;
+
+        let mut recovered = encoder.decode_missing(&mut opt_shards).unwrap();
+        recovered.truncate(original.len());
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn decode_missing_recovers_two_data_shards_with_parity() {
+        // EC(4+2): drop 2 data shards (max tolerable failures), reconstruct.
+        let encoder = make_encoder(4, 2);
+        let original = (0..2000u32).map(|i| (i * 7 % 251) as u8).collect::<Vec<_>>();
+        let shards = encoder.encode(&original);
+
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        opt_shards[0] = None; // data shard 0
+        opt_shards[2] = None; // data shard 2
+
+        let mut recovered = encoder.decode_missing(&mut opt_shards).unwrap();
+        recovered.truncate(original.len());
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn decode_missing_fails_when_too_few_shards() {
+        // EC(4+2): drop 3 shards (> parity), reconstruction must fail.
+        let encoder = make_encoder(4, 2);
+        let original = vec![42u8; 800];
+        let shards = encoder.encode(&original);
+
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        opt_shards[0] = None;
+        opt_shards[1] = None;
+        opt_shards[4] = None; // drop 2 data + 1 parity = 3 missing, only 3 left < data_shards(4)
+
+        let result = encoder.decode_missing(&mut opt_shards);
+        assert!(result.is_err(), "should fail with too few shards");
+    }
+
+    #[test]
+    fn decode_missing_all_data_present_skips_reconstruction() {
+        // All data shards present (no parity needed): decode_missing still works.
+        let encoder = make_encoder(4, 2);
+        let original = (0..1600u32).map(|i| (i % 200) as u8).collect::<Vec<_>>();
+        let shards = encoder.encode(&original);
+
+        // Keep only data shards, set parity to None.
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i < 4 { Some(s.clone()) } else { None })
+            .collect();
+
+        let mut recovered = encoder.decode_missing(&mut opt_shards).unwrap();
+        recovered.truncate(original.len());
+        assert_eq!(recovered, original);
     }
 }

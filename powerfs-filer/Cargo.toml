@@ -44,6 +44,7 @@ powerfs-master = { path = "../powerfs-master" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-coherence = { path = "../powerfs-coherence" }
 powerfs-layout = { path = "../powerfs-layout" }
+powerfs-core = { path = "../powerfs-core" }
 hex = "0.4"
 sha2 = "0.10"
 raft = { workspace = true }

@@ -13,6 +13,7 @@
 
 use powerfs_common::error::Result;
 use powerfs_layout::placement::Placement;
+use powerfs_layout::reliability::Reliability;
 
 /// 元数据属性（FUSE 回调需要的字段子集）
 #[derive(Clone, Debug)]
@@ -24,7 +25,7 @@ pub struct MetadataAttr {
     pub size: u64,
     pub mtime: u64,
     pub atime: u64,
-    pub ctime: u64,
+    pub ctime: i64,
     pub nlink: u32,
     pub rdev: u64,
     pub file_type: u8, // FileType::to_d_type()
@@ -37,6 +38,9 @@ pub struct MetadataAttr {
     /// P2.5: 数据分布策略 (Inline/Flat/Stripe...), 来自 FileLayout TLV.
     /// None 表示响应未携带 FileLayout (如 mkdir).
     pub placement: Option<Placement>,
+    /// P6: 可靠性策略 (SingleReplica/Replicated/EC), 来自 FileLayout TLV.
+    /// EC 模式下, chunks 前 data 个为数据 shard, 后 parity 个为校验 shard.
+    pub reliability: Reliability,
     /// P2.5: Inline 数据 (来自 GETATTR/LOOKUP 响应的 ChunkEncoding::InlineData).
     /// 文件以 Inline 模式存储时, 数据直接在 Filer 元数据中, 客户端一次 RPC 拿全.
     pub inline_data: Option<Vec<u8>>,

@@ -188,7 +188,7 @@ impl FilerNetHandler {
     /// 若可用 volume 数 >= count, 每个 chunk 落不同 volume.
     /// 若可用 volume 数 < count, round-robin 复用 volume.
     /// 返回 Vec<(volume_id, needle_id)>, 长度 == count. 若无可用 volume, 返回 None.
-    fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
+    pub fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
         let zones = self.zones.read().unwrap();
         if zones.is_empty() {
             warn!("FILER_P3: no zones registered, cannot allocate stripe chunks");

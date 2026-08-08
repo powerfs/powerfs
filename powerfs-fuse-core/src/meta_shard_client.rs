@@ -1462,7 +1462,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         size: resp.size,
         mtime: resp.mtime,
         atime: resp.atime,
-        ctime: resp.ctime,
+        ctime: resp.ctime as i64,
         nlink: resp.nlink,
         rdev: resp.rdev,
         file_type: file_type_from_mode(resp.mode),
@@ -1477,6 +1477,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         inline_data: None,
         inline_max_size: None,
         chunks: Vec::new(),
+        reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
     }
 }
@@ -1508,6 +1509,7 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
             _ => Vec::new(),
         };
         attr.placement = Some(layout.placement);
+        attr.reliability = layout.reliability;
     }
 
     // P4: 解析 FieldId::ReplicaChunks (副本 chunk 列表, 读路径 failover 使用).

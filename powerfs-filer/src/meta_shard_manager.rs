@@ -622,6 +622,19 @@ impl MetaShardManager {
         result
     }
 
+    /// P6: 列出可进行 EC 转换的文件 (state == Replicated)
+    pub fn list_pending_ec(
+        &self,
+        min_file_size: u64,
+    ) -> Vec<(u64, Vec<crate::shard_store::StoredFileChunk>)> {
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for shard_store in stores.values() {
+            result.extend(shard_store.list_pending_ec(min_file_size));
+        }
+        result
+    }
+
     /// P4: 计算 inode 所属的 shard ID (供 scrubber 使用)
     pub fn calculate_shard_id(&self, inode: u64) -> ShardId {
         self.shard_strategy.calculate_shard(inode)
@@ -1231,6 +1244,50 @@ impl MetaShardManager {
                 retries += 1;
             }
             return Err("update_reliability timeout waiting for apply".to_string());
+        }
+
+        Ok(())
+    }
+
+    /// P6: Update inode to EC state via Raft consensus.
+    /// Replaces chunks with data+parity shards, clears replica_chunks.
+    pub async fn update_to_ec(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        reliability: powerfs_layout::reliability::Reliability,
+        reliability_state: powerfs_layout::reliability::ReliabilityState,
+        ec_chunks: Vec<crate::shard_store::StoredFileChunk>,
+    ) -> Result<(), String> {
+        let target_state = reliability_state.clone();
+        let cmd = ShardCommand::UpdateToEC {
+            inode,
+            reliability,
+            reliability_state,
+            ec_chunks,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.reliability_state == target_state {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("update_to_ec timeout waiting for apply".to_string());
         }
 
         Ok(())

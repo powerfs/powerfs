@@ -538,6 +538,7 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         disk_size: 0,
         generation: 0,
         placement: attr.placement.clone(),
+        reliability: attr.reliability.clone(),
         replica_chunks: attr
             .replica_chunks
             .iter()
@@ -1235,6 +1236,7 @@ impl PowerFsFs {
             disk_size: entry.disk_size,
             generation: entry.generation,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks,
             cached_at: Instant::now(),
         }
@@ -1878,6 +1880,7 @@ impl FileSystem for PowerFsFs {
                 disk_size: 0,
                 generation: 0,
                 placement: None,
+                reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             };
@@ -1946,6 +1949,7 @@ impl FileSystem for PowerFsFs {
                 disk_size: 0,
                 generation: 0,
                 placement: Some(placement),
+                reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
             };
@@ -2024,6 +2028,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         };
@@ -2346,6 +2351,217 @@ impl FileSystem for PowerFsFs {
                 inode, offset, size, n
             );
             return Ok(n);
+        }
+
+        // === P6: EC 降级读分支 ===
+        // entry.reliability == Reliability::EC { data, parity } → 文件以纠删码存储.
+        // entry.chunks 前 data 个为数据 shard, 后 parity 个为校验 shard.
+        // 读路径: 先读 data shard; 任一失败/缺失时读可用 data + parity, 用
+        // EcEncoder::decode_missing 重建完整文件数据, 再按 1MB chunk 填充
+        // chunk_cache. 后续读取命中 chunk_cache, 无需重复重建.
+        if let powerfs_layout::reliability::Reliability::EC { data, parity } = &entry.reliability {
+            let data_shards = *data as usize;
+            let parity_shards = *parity as usize;
+            let total_shards = data_shards + parity_shards;
+
+            let ec_chunks = entry.chunks.clone();
+            // Guard: EC path requires data+parity shards.
+            if ec_chunks.len() < total_shards {
+                log::warn!(
+                    "read ec: inode={} has {} chunks but need {} (data={}+parity={}), returning EIO",
+                    inode,
+                    ec_chunks.len(),
+                    total_shards,
+                    data_shards,
+                    parity_shards
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+
+            let chunk_size = self.chunk_cache.chunk_size();
+            let file_size = entry.size;
+
+            if offset >= file_size {
+                return Ok(0);
+            }
+            let end_offset = std::cmp::min(offset + size as u64, file_size);
+
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
+            let prefetch_end =
+                std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
+            let prefetch_end_chunk = if prefetch_end == 0 {
+                0
+            } else {
+                self.chunk_cache.get_chunk_index(prefetch_end - 1)
+            };
+
+            // Collect missing chunks for remote read/reconstruction
+            let missing_chunks: Vec<(u64, u64)> = (start_chunk..=prefetch_end_chunk)
+                .filter_map(|chunk_idx| {
+                    let chunk_offset = chunk_idx * chunk_size;
+                    if self.chunk_cache.get(inode, chunk_offset).is_none() {
+                        Some((chunk_idx, chunk_offset))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !missing_chunks.is_empty() {
+                // Reconstruct full file data from EC shards.
+                // Read each shard (data first, then parity) from its volume.
+                // Failed/missing shards become None for degraded reconstruction.
+                let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+                let mut read_ok = 0usize;
+                let mtime = entry.mtime as u64;
+
+                for (i, chunk) in ec_chunks.iter().enumerate().take(total_shards) {
+                    let read_size = chunk.size as i32;
+                    match self.client.get_volume_addr(chunk.volume_id) {
+                        Ok(addr) => {
+                            match self.client.read_blob(
+                                &addr,
+                                chunk.volume_id,
+                                chunk.needle_id,
+                                0,
+                                read_size,
+                            ) {
+                                Ok(shard_data) => {
+                                    // CRC32 verification: a CRC mismatch is
+                                    // treated as a missing shard so the EC
+                                    // decoder can reconstruct it from parity.
+                                    if chunk.crc32 != 0 {
+                                        let actual = crc32fast::hash(&shard_data);
+                                        if actual != chunk.crc32 {
+                                            log::warn!(
+                                                "read ec: inode={} shard {} CRC mismatch expected={:#x} actual={:#x}, will reconstruct",
+                                                inode, i, chunk.crc32, actual
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    shards[i] = Some(shard_data);
+                                    read_ok += 1;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "read ec: inode={} shard {} read failed (vol={} needle={:#x}): {}",
+                                        inode, i, chunk.volume_id, chunk.needle_id, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "read ec: inode={} shard {} get_volume_addr failed (vol={}): {}",
+                                inode, i, chunk.volume_id, e
+                            );
+                        }
+                    }
+                }
+
+                let data_available =
+                    shards.iter().take(data_shards).filter(|s| s.is_some()).count();
+
+                let file_data: Vec<u8> = if data_available == data_shards {
+                    // Fast path: all data shards present — concatenate and
+                    // truncate to original file size (last shard may be
+                    // zero-padded during encoding).
+                    let mut fdata = Vec::with_capacity(
+                        shards
+                            .iter()
+                            .take(data_shards)
+                            .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
+                            .sum(),
+                    );
+                    for s in shards.iter().take(data_shards) {
+                        fdata.extend_from_slice(s.as_ref().unwrap());
+                    }
+                    fdata.truncate(file_size as usize);
+                    fdata
+                } else if read_ok >= data_shards {
+                    // Degraded path: some data shards missing, but enough
+                    // total shards (data+parity) to reconstruct.
+                    log::info!(
+                        "read ec degraded: inode={} data_available={}/{} total_available={}/{}, reconstructing",
+                        inode,
+                        data_available,
+                        data_shards,
+                        read_ok,
+                        total_shards
+                    );
+                    let ec_config = powerfs_core::ec_thread::EcConfig {
+                        data_shards,
+                        parity_shards,
+                        ..Default::default()
+                    };
+                    let encoder = powerfs_core::ec_thread::EcEncoder::new(ec_config);
+                    match encoder.decode_missing(&mut shards) {
+                        Ok(mut fdata) => {
+                            fdata.truncate(file_size as usize);
+                            fdata
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "read ec: inode={} decode_missing failed: {}, returning EIO",
+                                inode, e
+                            );
+                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
+                    }
+                } else {
+                    // Not enough shards to reconstruct.
+                    log::error!(
+                        "read ec: inode={} only {}/{} shards available, need {} to reconstruct, returning EIO",
+                        inode,
+                        read_ok,
+                        total_shards,
+                        data_shards
+                    );
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                };
+
+                // Populate chunk_cache with 1MB chunks from reconstructed file
+                // data so subsequent reads hit the cache without re-decoding.
+                let mut off = 0u64;
+                while off < file_data.len() as u64 {
+                    let chunk_end = std::cmp::min(off + chunk_size, file_data.len() as u64);
+                    let chunk_data = file_data[off as usize..chunk_end as usize].to_vec();
+                    self.chunk_cache.put(inode, off, chunk_data.into(), mtime, 0);
+                    off = chunk_end;
+                }
+            }
+
+            // Copy from chunk_cache to writer (same as Flat/Stripe)
+            let mut total_written = 0usize;
+            let mut current_offset = offset;
+            let end = end_offset;
+
+            while current_offset < end {
+                let chunk_data = self
+                    .chunk_cache
+                    .get(inode, current_offset)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+
+                let chunk_start = (current_offset % self.chunk_cache.chunk_size()) as usize;
+                let available_in_chunk = chunk_data.data.len().saturating_sub(chunk_start);
+                let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
+
+                if bytes_left_in_chunk == 0 {
+                    break;
+                }
+
+                let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
+                w.write_all(slice)?;
+                total_written += bytes_left_in_chunk;
+                current_offset += bytes_left_in_chunk as u64;
+            }
+
+            debug!(
+                "read ec: inode={} offset={} size={} -> {} bytes",
+                inode, offset, size, total_written
+            );
+            return Ok(total_written);
         }
 
         // === P3: Stripe 模式读取分支 ===
@@ -4218,6 +4434,7 @@ impl FileSystem for PowerFsFs {
             disk_size: 0,
             generation: 0,
             placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
         };
@@ -4310,6 +4527,7 @@ impl FileSystem for PowerFsFs {
                     disk_size: entry.disk_size,
                     generation: 0,
                     placement: None,
+                    reliability: powerfs_layout::reliability::Reliability::default(),
                     replica_chunks: Vec::new(),
                     cached_at: Instant::now(),
                 };
