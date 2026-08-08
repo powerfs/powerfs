@@ -78,7 +78,7 @@ async fn setup_test_client(
     addr: std::net::SocketAddr,
 ) -> mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let conn = ClientConn::new(client_id, addr, ClientType::Fuse, 0, tx);
+    let conn = ClientConn::new(client_id, addr, ClientType::Fuse, 0, 0, tx);
     registry.register(conn).await;
     rx
 }

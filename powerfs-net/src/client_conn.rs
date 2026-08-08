@@ -186,6 +186,8 @@ pub struct ClientConn {
     pub client_type: ClientType,
     /// 通路类型: 0=data, 1=meta (握手登记, 收帧校验)
     pub channel: u8,
+    /// 客户端协议 features (握手时协商, 决定编码格式等)
+    pub features: u32,
     /// route_hash (握手时从 client_id 计算, 收帧校验防错乱)
     pub route_hash: u8,
 
@@ -222,6 +224,7 @@ impl ClientConn {
         addr: SocketAddr,
         client_type: ClientType,
         channel: u8,
+        features: u32,
         outbound_tx: OutboundTx,
     ) -> Arc<Self> {
         let now = Instant::now();
@@ -232,6 +235,7 @@ impl ClientConn {
             addr,
             client_type,
             channel,
+            features,
             route_hash,
             state: RwLock::new(ConnState::Active),
             policy: RwLock::new(ClientPolicy::default()),
@@ -658,6 +662,7 @@ mod tests {
             "127.0.0.1:1234".parse().unwrap(),
             ClientType::Kernel,
             0,
+            0,
             tx,
         )
     }
@@ -760,6 +765,7 @@ mod tests {
             "127.0.0.1:1234".parse().unwrap(),
             ClientType::Fuse,
             channel,
+            0,
             tx,
         )
     }

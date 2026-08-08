@@ -619,6 +619,7 @@ mod tests {
             client_id: 1,
             client_type: crate::protocol::ClientType::Fuse,
             address: "127.0.0.1:12345".parse().unwrap(),
+            features: 0,
         };
         let mut ctx = RequestContext::new(&info, &msg);
         let handler = TestHandler;
@@ -636,6 +637,7 @@ mod tests {
             client_id: 1,
             client_type: crate::protocol::ClientType::Fuse,
             address: "127.0.0.1:12345".parse().unwrap(),
+            features: 0,
         };
         let handler = TestHandler;
 
@@ -654,6 +656,7 @@ mod tests {
             client_id: 1,
             client_type: crate::protocol::ClientType::Fuse,
             address: "127.0.0.1:12345".parse().unwrap(),
+            features: 0,
         };
 
         // Fill up the limit

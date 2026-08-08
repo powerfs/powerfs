@@ -309,6 +309,7 @@ impl ServerConnectionManager {
             client_id: conn.id,
             client_type: conn.client_type,
             address: conn.addr,
+            features: conn.features,
         };
 
         // Rate limiting — only for external/unknown clients.
@@ -359,6 +360,7 @@ impl ServerConnectionManager {
             client_id: conn.id,
             client_type: conn.client_type,
             address: conn.addr,
+            features: conn.features,
         };
 
         let mut ctx = RequestContext::new(&client_info, msg);
@@ -484,6 +486,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             ClientType::Fuse,
             0,
+            0,
             tx,
         );
         registry.register(conn.clone()).await;
@@ -600,7 +603,7 @@ mod tests {
         // Keep _rx alive so the outbound channel doesn't get dropped,
         // which would cause notify() to return false.
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, 0, tx);
+        let conn = ClientConn::new(1, "127.0.0.1:12345".parse().unwrap(), ClientType::Fuse, 0, 0, tx);
         registry.register(conn).await;
         let mgr = ServerConnectionManager::new(registry);
 
@@ -621,6 +624,7 @@ mod tests {
                 i * 10,
                 "127.0.0.1:12345".parse().unwrap(),
                 ClientType::Fuse,
+                0,
                 0,
                 tx,
             );
@@ -644,6 +648,7 @@ mod tests {
                 i + 1,
                 "127.0.0.1:12345".parse().unwrap(),
                 ClientType::Fuse,
+                0,
                 0,
                 tx,
             );

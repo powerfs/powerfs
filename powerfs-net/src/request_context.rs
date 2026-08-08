@@ -46,6 +46,20 @@ pub struct ClientInfo {
     pub client_id: u64,
     pub client_type: ClientType,
     pub address: SocketAddr,
+    /// 客户端协议 features (握手时协商, 决定编码格式等)
+    ///
+    /// P2: 用于决定 chunk layout 编码格式 (二进制 TLV vs JSON).
+    /// 由 [`crate::client_conn::ClientConn::features`] 传播而来.
+    pub features: u32,
+}
+
+impl ClientInfo {
+    /// 检查客户端是否支持指定 feature 位.
+    ///
+    /// 示例: `ctx.client.has_feature(FEATURE_CHUNK_LAYOUT_V2)`
+    pub fn has_feature(&self, feature: u32) -> bool {
+        self.features & feature != 0
+    }
 }
 
 /// RequestContext - per-request context for server-side processing

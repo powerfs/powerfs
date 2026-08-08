@@ -349,6 +349,7 @@ mod tests {
             "127.0.0.1:19334".parse().unwrap(),
             crate::protocol::ClientType::Fuse,
             0,
+            0,
             tx,
         );
         registry.register(conn).await;

@@ -125,8 +125,9 @@ impl Worker {
         } else {
             let session_info = crate::request_context::ClientInfo {
                 client_id: conn.id,
-                client_type: crate::ClientType::Fuse,
-                address: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                client_type: conn.client_type,
+                address: conn.addr,
+                features: conn.features,
             };
             let mut ctx = crate::request_context::RequestContext::new(&session_info, &work.msg);
             self.handler.handle(&mut ctx, &work.msg).await
@@ -241,6 +242,7 @@ mod tests {
             "127.0.0.1:1234".parse().unwrap(),
             ClientType::Kernel,
             crate::protocol::CHANNEL_DATA,
+            0,
             tx,
         )
     }
