@@ -1656,13 +1656,19 @@ if (req->error == -E2BIG) {
 
 #### P2.5: Inline 模式
 
-**P2.5a - Filer 支持 inline 存储**：
-- InodeInfo 新增 `inline_data: Option<Vec<u8>>` 字段
-- Raft 日志条目支持携带 inline_data（≤8KB）
-- `handle_create`：检测父目录 `powerfs.inline` xattr，返回 Placement::Inline
-- `handle_close`：接收 inline_data，单次 Raft 提交
-- `handle_getattr`：响应携带 `FieldId::InlineData` 字段
-- 新增 `handle_migrate_inline`：迁移到 Flat + WriteNeedle
+**P2.5a - Filer 支持 inline 存储** ✅ 已完成：
+- ✅ InodeInfo 新增 `inline_data: Option<Vec<u8>>` 字段 (shard_store.rs)
+- ✅ Raft 日志条目支持携带 inline_data（≤8KB）(ShardCommand::UpdateInodeSizeChunks)
+- ✅ `handle_create`：检测父目录 `powerfs.inline` xattr + 全局 `inline_max_size` 配置，
+  返回 Placement::Inline + InlineMaxSize，跳过 Volume 分配 (net_handler.rs)
+- ✅ `handle_close` (handle_update_inode_size_chunks)：解码 InlineData，单次 Raft 提交，
+  含 8KB 硬上限校验 (net_handler.rs)
+- ✅ `handle_getattr`/`handle_lookup`：`encode_chunks_fields` 在 inline_data 存在时
+  输出 Placement::Inline + ChunkEncoding::InlineData (net_handler.rs)
+- ⏳ `handle_migrate_inline`：Inline → Flat 迁移（待 P2.5b 客户端写路径就绪后实现）
+- ✅ 配置：`FilerConfig.inline_max_size` (默认 0=禁用，opt-in)，`FilerNetHandler::set_inline_max_size`
+- ✅ 安全性：默认禁用（不改变现有 Flat 行为）；客户端 `decode_attr_resp` 跳过未知 TLV 字段，
+  未实现 inline 的客户端不受影响
 
 **P2.5b - 客户端 inline 写路径**：
 - FUSE [fuse.rs](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs)：

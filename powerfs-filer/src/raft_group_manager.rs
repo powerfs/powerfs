@@ -147,6 +147,8 @@ pub enum ShardCommand {
         inode: u64,
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
+        #[serde(default)]
+        inline_data: Option<Vec<u8>>,
     },
 }
 

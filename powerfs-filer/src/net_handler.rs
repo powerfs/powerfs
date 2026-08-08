@@ -46,7 +46,17 @@ pub struct FilerNetHandler {
     zones: std::sync::RwLock<Vec<ZoneState>>,
     /// round-robin 选 Zone 的索引 (fetch_add % zones.len())
     zone_rr: std::sync::atomic::AtomicU32,
+    /// P2.5: Inline 小文件全局阈值 (字节). 0 = 禁用 (默认, 保持 Flat 行为).
+    /// 大于 0 时, handle_create 对新文件返回 Placement::Inline + 该 max_size,
+    /// 跳过 Volume Server 分配. 父目录 `powerfs.inline` xattr 可覆盖此值.
+    /// 上限 8KB (Placement::Inline 硬上限).
+    inline_max_size: std::sync::atomic::AtomicU32,
 }
+
+/// P2.5: Inline 模式硬上限 (Placement::Inline 的 max_size 不可超过此值)
+pub const INLINE_HARD_LIMIT: u32 = 8 * 1024;
+/// P2.5: `powerfs.inline` xattr key (存于父目录 InodeInfo.extended)
+pub const INLINE_XATTR_KEY: &str = "powerfs.inline";
 
 impl FilerNetHandler {
     pub fn new(
@@ -62,6 +72,7 @@ impl FilerNetHandler {
             inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
             zone_rr: std::sync::atomic::AtomicU32::new(0),
+            inline_max_size: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -80,6 +91,67 @@ impl FilerNetHandler {
             inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
             zone_rr: std::sync::atomic::AtomicU32::new(0),
+            inline_max_size: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// P2.5: 设置 Inline 小文件全局阈值 (字节). 0 = 禁用.
+    /// 超过 INLINE_HARD_LIMIT (8KB) 的值会被截断到 8KB.
+    /// 启用后, handle_create 对新文件返回 Placement::Inline, 跳过 Volume 分配.
+    pub fn set_inline_max_size(&self, max_size: u32) {
+        let capped = max_size.min(INLINE_HARD_LIMIT);
+        self.inline_max_size
+            .store(capped, std::sync::atomic::Ordering::SeqCst);
+        info!(
+            "FILER_INLINE: set inline_max_size={} (requested={}, hard_limit={})",
+            capped, max_size, INLINE_HARD_LIMIT
+        );
+    }
+
+    /// P2.5: 读取当前 Inline 全局阈值
+    pub fn inline_max_size(&self) -> u32 {
+        self.inline_max_size
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// P2.5: 决定新文件是否使用 Inline 模式及阈值.
+    /// 优先级: 父目录 `powerfs.inline` xattr > 全局 inline_max_size 配置.
+    /// 返回 Some(max_size) 表示 Inline 模式; None 表示 Flat (当前默认行为).
+    ///
+    /// xattr 值解析:
+    /// - 4 字节 LE u32 → 该值作为 max_size (上限 8KB)
+    /// - 空值 → 使用全局 inline_max_size (若 >0), 否则禁用
+    /// - 其它长度 → 忽略 (容错)
+    fn resolve_inline_max_size(&self, parent_ino: u64) -> Option<u32> {
+        // 1. 父目录 xattr 覆盖
+        if let Some(parent) = self.meta_shard_manager.get_inode(parent_ino) {
+            if let Some(val) = parent.extended.get(INLINE_XATTR_KEY) {
+                let parsed = match val.len() {
+                    0 => self.inline_max_size(),
+                    4 => u32::from_le_bytes([val[0], val[1], val[2], val[3]]),
+                    _ => {
+                        warn!(
+                            "FILER_INLINE: parent {} xattr {} has unexpected len {}, ignoring",
+                            parent_ino,
+                            INLINE_XATTR_KEY,
+                            val.len()
+                        );
+                        return None;
+                    }
+                };
+                return if parsed == 0 {
+                    None // 显式禁用
+                } else {
+                    Some(parsed.min(INLINE_HARD_LIMIT))
+                };
+            }
+        }
+        // 2. 全局配置
+        let global = self.inline_max_size();
+        if global > 0 {
+            Some(global)
+        } else {
+            None
         }
     }
 
@@ -301,17 +373,34 @@ impl FilerNetHandler {
         }
     }
 
-    /// 将 InodeInfo 的 chunks 列表序列化为二进制 FileLayout TLV 字段。
+    /// 将 InodeInfo 的数据布局序列化为二进制 FileLayout TLV 字段。
     ///
     /// 使用 `powerfs_layout::encode_file_layout` 编码 (FEATURE_CHUNK_LAYOUT_V2),
     /// 输出 Placement + Reliability + ChunkEncoding 的二进制 TLV 字段,
     /// 替代旧版 JSON `FieldId::Chunks` 编码 (已废弃, 不再向后兼容).
     ///
-    /// 构建 FileLayout 策略:
-    /// - Placement::Flat (常规文件, 单 volume)
-    /// - Reliability::SingleReplica (默认无冗余)
-    /// - ChunkEncoding::PerChunk (完整 chunk 列表)
+    /// 构建 FileLayout 策略 (P2.5 Inline 支持):
+    /// - **Inline 模式** (info.inline_data = Some): Placement::Inline + ChunkEncoding::InlineData
+    ///   数据直接在响应中, 客户端一次 RPC 拿全 (GETATTR/LOOKUP), 无需 Volume Server.
+    /// - **Flat 模式** (info.inline_data = None): Placement::Flat + ChunkEncoding::PerChunk
+    ///   常规文件, 完整 chunk 列表, 客户端按 chunk 直连 Volume Server 读写.
     fn encode_chunks_fields(enc: &mut TlvEncoder, info: &InodeInfo) -> Result<(), NetError> {
+        // P2.5: Inline 模式 — 数据直接存 Filer 元数据, 响应携带 inline_data
+        if let Some(data) = &info.inline_data {
+            let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size },
+                reliability: Reliability::SingleReplica,
+                reliability_state: ReliabilityState::default(),
+                compression: CompressionState::default(),
+                encoding: ChunkEncoding::InlineData { data: data.clone() },
+            };
+            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+            return Ok(());
+        }
+
+        // Flat 模式 — chunk 列表
         let chunks: Vec<ChunkRef> = info
             .chunks
             .iter()
@@ -674,24 +763,35 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // === Zone 自分配 needle_id + volume_id (P2.4 核心) ===
+        // === P2.5: 决定 Inline vs Flat ===
+        // Inline: 数据直接存 Filer 元数据, 绕过 Volume Server (微小文件 < max_size).
+        // Flat: 走原 Volume 分配路径.
+        let inline_max = self.resolve_inline_max_size(parent_ino);
+
+        // === Flat 模式: Zone 自分配 needle_id + volume_id (P2.4 核心) ===
         // 在创建 inode 之前分配, 这样若分配失败 (zone 未注册) 可直接返回错误,
         // 不会留下空 inode. 若分配成功但后续 create_file 失败, needle_id 会被
         // "泄漏" (counter 已自增但无 chunk 映射), 这是可接受的:
         //   - needle_id 空间巨大 (40 bits/zone, 1 万亿个)
         //   - counter 单调递增, 不会重复
-        let (volume_id, needle_id) = match self.alloc_for_new_file() {
-            Some(v) => v,
-            None => {
-                warn!(
-                    "FILER_NET_CREATE: zone not registered (zone_id=0), cannot allocate needle_id"
-                );
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ));
+        //
+        // Inline 模式跳过分配 (无 Volume Server 参与).
+        let flat_alloc = if inline_max.is_none() {
+            match self.alloc_for_new_file() {
+                Some(v) => Some(v),
+                None => {
+                    warn!(
+                        "FILER_NET_CREATE: zone not registered (zone_id=0), cannot allocate needle_id"
+                    );
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        Vec::new(),
+                    ));
+                }
             }
+        } else {
+            None
         };
 
         match self
@@ -706,25 +806,6 @@ impl FilerNetHandler {
                     .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
                     .await;
 
-                // === 持久化 chunk 映射 (volume_id, needle_id) via Raft ===
-                // fid 格式 "volume_id,cookie,needle_id": set_chunks 从第 3 字段解析 needle_id
-                // offset=0: 新文件首 chunk 的字节偏移 (chunk.offset, 非 needle_id)
-                // size=0: 初始无数据, 后续 write 时更新
-                let fid_str = format!("{},0,{}", volume_id, needle_id);
-                if let Err(e) = self
-                    .meta_shard_manager
-                    .set_chunks(ino, shard_id, fid_str, volume_id, 0, 0, 0)
-                    .await
-                {
-                    warn!(
-                        "FILER_NET_CREATE: set_chunks failed for inode {} (needle_id={:#x}): {}",
-                        ino, needle_id, e
-                    );
-                    // set_chunks 失败不回滚 inode 创建 (inode 已 Raft 持久化).
-                    // needle_id 已分配但 chunk 映射缺失, 客户端写入会失败并重试.
-                    // 后续 GC 会清理无 chunk 的 inode.
-                }
-
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
                 let now = crate::shard_store::ShardStore::current_time();
                 self.notify_inode_change(parent_ino, now);
@@ -734,15 +815,61 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
                 enc.add_string(FieldId::Name, &name)?;
-                // === 返回 volume_id + needle_id 给客户端 (直连 volume 读写) ===
-                enc.add_u64(FieldId::VolumeId, volume_id);
-                enc.add_u64(FieldId::FileKey, needle_id);
+
+                if let Some(max_size) = inline_max {
+                    // === P2.5 Inline 模式 ===
+                    // 不分配 volume/needle, 不持久化 chunk 映射. 客户端 CLOSE 时
+                    // 把 inline_data 发 Filer (handle_update_inode_size_chunks),
+                    // 由 Filer 单次 Raft 提交 (数据 + 元数据).
+                    info!(
+                        "FILER_NET_CREATE: inline mode inode={} max_size={}",
+                        ino, max_size
+                    );
+                    let layout = FileLayout {
+                        placement: Placement::Inline { max_size },
+                        reliability: Reliability::SingleReplica,
+                        reliability_state: ReliabilityState::default(),
+                        compression: CompressionState::default(),
+                        // 创建时尚无数据, 客户端 CLOSE 时携带 inline_data
+                        encoding: ChunkEncoding::InlineData { data: Vec::new() },
+                    };
+                    encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
+                        |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
+                    )?;
+                } else {
+                    // === Flat 模式: 持久化 chunk 映射 (volume_id, needle_id) via Raft ===
+                    // fid 格式 "volume_id,cookie,needle_id": set_chunks 从第 3 字段解析 needle_id
+                    // offset=0: 新文件首 chunk 的字节偏移 (chunk.offset, 非 needle_id)
+                    // size=0: 初始无数据, 后续 write 时更新
+                    let (volume_id, needle_id) = flat_alloc.unwrap();
+                    let fid_str = format!("{},0,{}", volume_id, needle_id);
+                    if let Err(e) = self
+                        .meta_shard_manager
+                        .set_chunks(ino, shard_id, fid_str, volume_id, 0, 0, 0)
+                        .await
+                    {
+                        warn!(
+                            "FILER_NET_CREATE: set_chunks failed for inode {} (needle_id={:#x}): {}",
+                            ino, needle_id, e
+                        );
+                        // set_chunks 失败不回滚 inode 创建 (inode 已 Raft 持久化).
+                        // needle_id 已分配但 chunk 映射缺失, 客户端写入会失败并重试.
+                        // 后续 GC 会清理无 chunk 的 inode.
+                    }
+                    // === 返回 volume_id + needle_id 给客户端 (直连 volume 读写) ===
+                    enc.add_u64(FieldId::VolumeId, volume_id);
+                    enc.add_u64(FieldId::FileKey, needle_id);
+                }
+
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
                 warn!(
-                    "FILER_NET_CREATE failed: {} (needle_id={:#x} leaked, acceptable)",
-                    e, needle_id
+                    "FILER_NET_CREATE failed: {}{}",
+                    e,
+                    flat_alloc
+                        .map(|(_, n)| format!(" (needle_id={:#x} leaked, acceptable)", n))
+                        .unwrap_or_default()
                 );
                 Ok(Self::build_response(
                     msg,
@@ -1222,9 +1349,38 @@ impl FilerNetHandler {
             _ => Vec::new(),
         };
 
+        // P2.5: Inline 小文件 close 路径. 客户端在 CLOSE 时把 inline_data
+        // (≤ 8KB) 直接发 Filer, 由 Filer 单次 Raft 提交 (数据 + 元数据),
+        // 绕过 Volume Server. 当 layout.encoding 为 InlineData 时提取数据;
+        // 也兼容客户端把 InlineData 作为独立 FieldId::InlineData 字段发送.
+        let inline_data: Option<Vec<u8>> = match &layout.encoding {
+            ChunkEncoding::InlineData { data } => Some(data.clone()),
+            _ => dec.next_bytes(FieldId::InlineData).ok(),
+        };
+
+        // 安全检查: inline_data 不应超过 8KB (Placement::Inline 的硬上限)
+        if let Some(d) = &inline_data {
+            if d.len() > 8 * 1024 {
+                warn!(
+                    "FILER_NET_UPDATE_SIZE_CHUNKS: inline_data too large ({} bytes > 8KB) for inode {}, rejecting",
+                    d.len(), inode
+                );
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(
+                    FieldId::Name,
+                    &format!("inline_data too large: {} bytes", d.len()),
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ));
+            }
+        }
+
         info!(
-            "FILER_NET_UPDATE_SIZE_CHUNKS: shard_id={}, inode={}, size={}, chunks={}, client={}",
-            shard_id_raw, inode, size, chunks.len(), client_id
+            "FILER_NET_UPDATE_SIZE_CHUNKS: shard_id={}, inode={}, size={}, chunks={}, inline={}, client={}",
+            shard_id_raw, inode, size, chunks.len(), inline_data.as_ref().map(|d| d.len()).unwrap_or(0), client_id
         );
 
         // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
@@ -1242,7 +1398,7 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks)
+            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data)
             .await
         {
             Ok(_) => {

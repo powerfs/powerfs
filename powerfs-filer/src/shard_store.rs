@@ -39,6 +39,11 @@ pub struct InodeInfo {
     // File chunks for data layout (stored in Filer, not Master)
     #[serde(default)]
     pub chunks: Vec<StoredFileChunk>,
+    // P2.5: Inline data for small files (< 4KB/8KB).
+    // When Some, file is in Inline mode — data stored directly in Filer metadata,
+    // bypassing Volume Server. When None, file uses chunk-based storage.
+    #[serde(default)]
+    pub inline_data: Option<Vec<u8>>,
     // Extended attributes (e.g. file layout: stripe/flat)
     #[serde(default)]
     pub extended: HashMap<String, Vec<u8>>,
@@ -523,8 +528,9 @@ impl ShardStore {
                 inode,
                 size,
                 chunks,
+                inline_data,
             } => {
-                if let Err(e) = self.update_inode_size_chunks_atomic(inode, size, chunks) {
+                if let Err(e) = self.update_inode_size_chunks_atomic(inode, size, chunks, inline_data) {
                     log::error!(
                         "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
                         self.shard_id.0,
@@ -556,6 +562,7 @@ impl ShardStore {
             volume_id: None,
             etag: None,
             chunks: vec![],
+            inline_data: None,
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 1,
@@ -632,6 +639,7 @@ impl ShardStore {
             volume_id: Some(volume_id),
             etag: Some(etag),
             chunks: vec![],
+            inline_data: None,
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 1,
@@ -814,6 +822,7 @@ impl ShardStore {
             volume_id: None,
             etag: None,
             chunks: vec![],
+            inline_data: None,
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 2,
@@ -1691,6 +1700,7 @@ impl ShardStore {
         inode: u64,
         size: u64,
         chunks: Vec<StoredFileChunk>,
+        inline_data: Option<Vec<u8>>,
     ) -> Result<(), String> {
         let cf_inodes = self
             .db
@@ -1702,6 +1712,7 @@ impl ShardStore {
         info.size = size;
         info.blocks = size.div_ceil(512);
         info.chunks = chunks;
+        info.inline_data = inline_data;
         info.mtime = Self::current_time();
         let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
         // sync 写保证 close sync 账本强持久化
@@ -1833,6 +1844,7 @@ impl ShardStore {
             volume_id: None,
             etag: None,
             chunks: vec![],
+            inline_data: None,
             extended: HashMap::new(),
             symlink_target: Some(target),
             nlink: 1,
@@ -2056,6 +2068,7 @@ mod tests {
             volume_id: None,
             etag: None,
             chunks: vec![],
+            inline_data: None,
             extended: HashMap::new(),
             symlink_target: None,
             nlink: 1,

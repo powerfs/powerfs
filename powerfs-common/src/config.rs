@@ -103,6 +103,12 @@ pub struct FilerConfig {
     /// 所有 filer 节点必须配置相同的值，避免元数据不一致
     #[serde(default)]
     pub gc_grace_period_secs: Option<u64>,
+    /// P2.5: Inline 小文件全局阈值 (字节). 0 = 禁用 (默认, 保持 Flat 行为).
+    /// 大于 0 时, handle_create 对新文件返回 Placement::Inline, 跳过 Volume Server
+    /// 分配, 数据直接存 Filer 元数据 (Raft 复制). 上限 8KB.
+    /// 父目录 `powerfs.inline` xattr 可覆盖此值.
+    #[serde(default)]
+    pub inline_max_size: Option<u32>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

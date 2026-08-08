@@ -164,6 +164,7 @@ fn main() {
                 volume_id: None,
                 etag: None,
                 chunks: vec![],
+                inline_data: None,
                 extended: std::collections::HashMap::new(),
                 symlink_target: None,
                 nlink: 2,

@@ -692,6 +692,7 @@ fn build_config(
             crdt_maintenance_interval_secs: None,
             gc_interval_secs: None,
             gc_grace_period_secs: None,
+            inline_max_size: None,
         },
         s3: S3Config {
             port: cfg.s3_port,

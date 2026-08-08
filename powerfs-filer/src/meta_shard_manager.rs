@@ -653,6 +653,7 @@ impl MetaShardManager {
                 volume_id: None,
                 etag: None,
                 chunks: Vec::new(),
+                inline_data: None,
                 extended: std::collections::HashMap::new(),
                 symlink_target: None,
                 nlink: 2,
@@ -1694,12 +1695,14 @@ impl MetaShardManager {
         inode: u64,
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
+        inline_data: Option<Vec<u8>>,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
         let cmd = ShardCommand::UpdateInodeSizeChunks {
             inode,
             size,
             chunks,
+            inline_data,
         };
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
@@ -2090,6 +2093,7 @@ impl MetaShardManager {
                     volume_id: None,
                     etag: None,
                     chunks: vec![],
+                    inline_data: None,
                     extended: std::collections::HashMap::new(),
                     symlink_target: None,
                     nlink,

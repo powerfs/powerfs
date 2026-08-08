@@ -378,6 +378,15 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             inode_notifier,
         ));
 
+        // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).
+        // 启用后 handle_create 对新文件返回 Placement::Inline, 数据直接存 Filer
+        // 元数据 (Raft 复制), 绕过 Volume Server. 适合 IO500 mdtest 微小文件场景.
+        if let Some(max_size) = filer_cfg.inline_max_size {
+            if max_size > 0 {
+                net_handler.set_inline_max_size(max_size);
+            }
+        }
+
         // === P2.3 + Phase A1: Zone 注册 + Filer 节点发现 (异步, 不阻塞 Filer 启动) ===
         // 向 Master 发送 RegisterFiler TLV 请求, 同时完成:
         //   1. Zone 分配 (获取 needle_id 空间 + 物理 volume 列表)

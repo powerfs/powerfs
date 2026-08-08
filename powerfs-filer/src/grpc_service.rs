@@ -669,7 +669,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks)
+            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks, None)
             .await
         {
             Ok(_) => Ok(Response::new(UpdateInodeSizeChunksResponse {
