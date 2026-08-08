@@ -610,6 +610,9 @@ impl PowerFsNetClient {
                 }
 
                 // Layer 4: TLV 必需字段校验（仅成功响应）
+                // 校验失败时仅告警, 仍传递完整消息 (含 body) 给调用方.
+                // 原因: check_required_fields 是诊断工具而非安全门,
+                // body 已接收且调用方需要原始数据来排查问题.
                 if header.status == STATUS_OK {
                     if let Err(reason) =
                         check_required_fields(header.msg_type, header.seq, &body)
@@ -618,10 +621,6 @@ impl PowerFsNetClient {
                             "recv_loop: response missing required field, reason={}, seq={}, msg=0x{:04x}",
                             reason, header.seq, header.msg_type
                         );
-                        if let Some((_, sender)) = pending_requests.remove(&header.seq) {
-                            let _ = sender.send(NetMessage::new(header));
-                        }
-                        continue;
                     }
                 }
 

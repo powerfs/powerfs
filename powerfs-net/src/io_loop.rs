@@ -316,8 +316,9 @@ impl IoLoop {
         let body = payload[..body_len].to_vec();
         let data = payload[body_len..].to_vec();
 
-        // Layer 4: TLV 必需字段校验（仅成功响应）
-        if header.status == STATUS_OK {
+        // Layer 4: TLV 必需字段校验（仅成功响应帧, 不校验请求帧）
+        // 请求帧 status 默认为 0 (= STATUS_OK), 但不是响应, 不应校验
+        if (header.flags & FrameFlags::RESPONSE != 0) && header.status == STATUS_OK {
             check_required_fields(header.msg_type, header.seq, &body).map_err(|reason| {
                 NetError::Protocol(format!("required field check: {}", reason))
             })?;
