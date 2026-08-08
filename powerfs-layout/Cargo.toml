@@ -1,0 +1,17 @@
+[package]
+name = "powerfs-layout"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "File data layout: Placement x Reliability x ChunkEncoding (3D orthogonal model)"
+
+[dependencies]
+powerfs-net = { path = "../powerfs-net" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+powerfs-net = { path = "../powerfs-net" }
+serde_json = { workspace = true }

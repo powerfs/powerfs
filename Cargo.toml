@@ -8,6 +8,7 @@ members = [
     "powerfs-volume",
     "powerfs-fuse",
     "powerfs-fuse-core",
+    "powerfs-layout",
     "powerfs-common",
     "powerfs-s3",
     "powerfs-cli",

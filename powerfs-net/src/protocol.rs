@@ -794,6 +794,41 @@ pub enum FieldId {
     /// Serialized Raft protocol message (eraftpb::Message protobuf bytes).
     /// Used by MsgType::RaftMessage for Filer inter-node Raft transport.
     RaftPayload = 0x9E,
+
+    // ===== FileLayout fields (0xA0-0xAF) — powerfs-layout crate =====
+    // 设计文档 §9.1: 文件布局三维正交模型协议字段
+    /// Placement 编码 (u8 tag + 后续字段). powerfs-layout::Placement
+    Placement = 0xA0,
+    /// Reliability 编码 (u8 tag + count). powerfs-layout::Reliability
+    Reliability = 0xA1,
+    /// ReliabilityState (u8). powerfs-layout::ReliabilityState
+    ReliabilityState = 0xA2,
+    /// CompressionState (u8). powerfs-layout::CompressionState
+    Compression = 0xA3,
+    /// 二进制 ChunkEncoding (替代 JSON Chunks). powerfs-layout::ChunkEncoding
+    ChunkLayout = 0xA4,
+    /// Paginated 标志 (u8). ChunkEncoding::Paginated 的 has_more
+    HasMoreChunks = 0xA5,
+    /// 下次 LIST_CHUNKS 起始 (u64). ChunkEncoding::Paginated 的 next_offset
+    NextOffset = 0xA6,
+    /// 总 chunk 数 (u32). ChunkEncoding::Paginated 的 total_count
+    TotalCount = 0xA7,
+    /// Stripe size (u64). Placement::Stripe/WideStripe
+    StripeSize = 0xA8,
+    /// Stripe count (u32). Placement::Stripe/WideStripe
+    StripeCount = 0xA9,
+    /// 起始 volume 索引 (u32). Placement::Stripe/WideStripe 的 start_volume_idx
+    StartVolumeIdx = 0xAA,
+    /// volume_ids 列表 (bytes, u64 LE 数组). Placement::Stripe/WideStripe
+    VolumeIds = 0xAB,
+    /// 首 needle_id (u64). ChunkEncoding::StripeDescriptor
+    StartNeedleId = 0xAC,
+    /// 单 chunk 大小 (u32). ChunkEncoding::StripeDescriptor 的 chunk_size
+    ChunkSize = 0xAD,
+    /// Inline 数据 (bytes, <= 8KB). ChunkEncoding::InlineData
+    InlineData = 0xAE,
+    /// Inline 阈值 (u32). Placement::Inline 的 max_size, CREATE 响应携带
+    InlineMaxSize = 0xAF,
 }
 
 impl FieldId {
@@ -868,6 +903,22 @@ impl FieldId {
             0x9C => Some(Self::FilerAddress),
             0x9D => Some(Self::NetPort),
             0x9E => Some(Self::RaftPayload),
+            0xA0 => Some(Self::Placement),
+            0xA1 => Some(Self::Reliability),
+            0xA2 => Some(Self::ReliabilityState),
+            0xA3 => Some(Self::Compression),
+            0xA4 => Some(Self::ChunkLayout),
+            0xA5 => Some(Self::HasMoreChunks),
+            0xA6 => Some(Self::NextOffset),
+            0xA7 => Some(Self::TotalCount),
+            0xA8 => Some(Self::StripeSize),
+            0xA9 => Some(Self::StripeCount),
+            0xAA => Some(Self::StartVolumeIdx),
+            0xAB => Some(Self::VolumeIds),
+            0xAC => Some(Self::StartNeedleId),
+            0xAD => Some(Self::ChunkSize),
+            0xAE => Some(Self::InlineData),
+            0xAF => Some(Self::InlineMaxSize),
             _ => None,
         }
     }
