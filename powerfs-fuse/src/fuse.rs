@@ -206,8 +206,6 @@ impl FuseApp {
             client: sync_client.clone(),
             cache: cache.clone(),
             chunk_cache,
-            collection: self.collection.clone(),
-            replication: self.replication.clone(),
             locks: Arc::new(RwLock::new(HashMap::new())),
             dirty_shards: (0..NUM_DIRTY_SHARDS)
                 .map(|_| Arc::new(RwLock::new(HashSet::new())))
@@ -349,8 +347,6 @@ struct PowerFsFs {
     client: Arc<SyncFuseClientFacade>,
     cache: Arc<MetadataCache>,
     chunk_cache: Arc<ChunkCache>,
-    collection: String,
-    replication: String,
     locks: Arc<RwLock<FileLocks>>,
     dirty_shards: DirtyShards,
     has_dirty: Arc<std::sync::atomic::AtomicBool>,
@@ -523,16 +519,30 @@ impl PowerFsFs {
         inode: u64,
         lease_token: Option<&str>,
     ) -> std::io::Result<()> {
+        // RACE_TRACE: Log entry with full context to track the flusher's
+        // interaction with the write path and InvalidateHandler.
+        let is_pinned_before = self.cache.is_pinned(inode);
+        let has_chunks_before = self.chunk_cache.has_chunks(inode);
+        debug!(
+            "flush_dirty_chunks_impl ENTER: inode={} is_pinned={} has_chunks={} thread={:?}",
+            inode, is_pinned_before, has_chunks_before, std::thread::current().id()
+        );
+
         let dirty = self.drain_dirty_for_inode(inode);
 
         if dirty.is_empty() {
+            debug!(
+                "flush_dirty_chunks_impl: inode={} no dirty chunks after drain, exiting",
+                inode
+            );
             return Ok(());
         }
 
         debug!(
-            "flush_dirty_chunks_impl: inode={}, dirty_count={}",
+            "flush_dirty_chunks_impl: inode={}, dirty_count={} (drained, has_dirty_after={})",
             inode,
-            dirty.len()
+            dirty.len(),
+            self.chunk_cache.has_dirty_chunks(inode)
         );
 
         // Phase 1.7: 查找 entry/fid/addr 失败时，重新标记 dirty 以便后续重试，
@@ -540,10 +550,20 @@ impl PowerFsFs {
         let entry = match self.cache.get_inode(inode) {
             Some(e) => e,
             None => {
+                // RACE_TRACE: This is the drain race window — dirty markers were
+                // removed but the inode was evicted before we could use it.
+                // Log whether it was pinned/chunks existed to determine which
+                // path caused the eviction.
+                let is_pinned_now = self.cache.is_pinned(inode);
+                let has_chunks_now = self.chunk_cache.has_chunks(inode);
                 warn!(
-                    "flush_dirty_chunks_impl: inode {} not in cache, re-marking {} dirty chunks",
-                    inode,
-                    dirty.len()
+                    "flush_dirty_chunks_impl RACE: inode={} not in cache after drain! \
+                     is_pinned_before={} is_pinned_now={} has_chunks_before={} has_chunks_now={} \
+                     dirty_count={} thread={:?} \
+                     — inode was evicted during drain window (check invalidate_inode logs)",
+                    inode, is_pinned_before, is_pinned_now,
+                    has_chunks_before, has_chunks_now,
+                    dirty.len(), std::thread::current().id()
                 );
                 for (_, idx) in &dirty {
                     self.mark_dirty(inode, *idx);
@@ -670,6 +690,12 @@ impl PowerFsFs {
             return Ok(());
         }
 
+        debug!(
+            "flush_all_dirty_chunks: processing {} dirty inodes, thread={:?}",
+            inodes.len(),
+            std::thread::current().id()
+        );
+
         for inode in inodes {
             if let Err(e) = self.flush_dirty_chunks(inode, None) {
                 // Phase 1.7: 后台 flusher 错误需记录，避免静默丢数据。
@@ -681,10 +707,23 @@ impl PowerFsFs {
                 );
             } else if !self.has_dirty_for_inode(inode) {
                 // All dirty chunks for this inode have been successfully flushed.
-                // If release() left the inode pinned (because flush failed at
-                // close time), now is the time to sync metadata and unpin it.
-                // This prevents permanent pin leaks when the volume was
-                // temporarily unavailable during release().
+                // Sync metadata to the Filer so other clients see the latest
+                // size/chunks. This also clears dirty markers regardless of
+                // whether the inode is still open.
+                //
+                // CRITICAL: Only unpin if the inode is NOT still open. The
+                // background flusher must not unpin inodes that were pinned by
+                // open() — only release() should unpin those. Unpinning here
+                // creates a window where the InvalidateHandler (triggered by
+                // the sync_size_chunks_on_close above) can evict the inode
+                // mid-write, causing ENOENT in the write path.
+                //
+                // The unpin path is reserved for the case where release()
+                // failed to flush (and thus didn't unpin), leaving the inode
+                // pinned with no open file handle. In that case is_open=false
+                // and the flusher correctly cleans up.
+                let is_open = self.open_inodes.read().unwrap().contains(&inode);
+
                 if let Err(e) = self.sync_size_chunks_on_close(inode) {
                     warn!(
                         "flush_all_dirty_chunks: post-flush sync for inode {} failed: {}",
@@ -692,11 +731,26 @@ impl PowerFsFs {
                     );
                 } else {
                     self.chunk_cache.clear_dirty(inode);
-                    self.cache.unpin_inode(inode);
-                    debug!(
-                        "flush_all_dirty_chunks: post-flush sync + unpin for inode {} succeeded",
-                        inode
-                    );
+                    if is_open {
+                        // Inode is still open: keep it pinned so the write path
+                        // and InvalidateHandler continue to protect it. The
+                        // dirty markers are cleared (data was flushed), but
+                        // the pin stays until release() removes it.
+                        debug!(
+                            "flush_all_dirty_chunks: flushed inode={} still open, keeping pinned (release will unpin) thread={:?}",
+                            inode, std::thread::current().id()
+                        );
+                    } else {
+                        // Inode is not open: release() must have failed to
+                        // flush and left it pinned. Now that the flusher has
+                        // succeeded, sync metadata and unpin to prevent a
+                        // permanent pin leak.
+                        debug!(
+                            "flush_all_dirty_chunks: flushed inode={} not open, syncing + unpinning thread={:?}",
+                            inode, std::thread::current().id()
+                        );
+                        self.cache.unpin_inode(inode);
+                    }
                 }
             }
         }
@@ -1476,39 +1530,27 @@ impl FileSystem for PowerFsFs {
 
         let now = chrono::Utc::now().timestamp();
 
-        let t_assign = std::time::Instant::now();
-        let (fid, _location, _stripe_fids, _stripe_locations) = self
-            .client
-            .assign_fid(&self.collection, &self.replication)
-            .map_err(|e| {
-                error!("assign_fid failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
-            })?;
-        let assign_ms = t_assign.elapsed().as_millis();
-
-        let needle_id = fid.file_key;
-        let volume_id = fid.volume_id.0;
-
-        // Step 2: 通过 MetadataClient.create RPC 走 Filer Raft leader（强一致）
-        // Filer 端分配 inode 并创建目录条目，返回 MetadataAttr（含 inode）。
-        // 保留 S_IFREG 类型位（0o100000）—— 与 mkdir 同理，filer 端通过 mode & S_IFMT 判定 FileType。
+        // 通过 MetadataClient.create RPC 走 Filer Raft leader（强一致）。
+        // Filer 端通过 Zone 自分配 needle_id + volume_id（alloc_for_new_file），
+        // 在响应中返回给客户端。客户端必须用 Filer 返回的值构造 fid/chunks，
+        // 保证与 Filer 元数据一致。
         //
-        // CRITICAL: Pass fid_info so the Filer stores the chunk mapping at create
-        // time. Without this, the Filer entry has no fid/chunks, and a cache miss
-        // on the client (LRU eviction or Invalidate) leads to open/getattr fetching
-        // a fid=None entry → flush fails with "inode has no fid" (EIO).
+        // 历史 BUG：旧代码先调用 assign_fid 从 Master 分配 needle_id_A，再把
+        // fid_info 传给 Filer；但 Filer handle_create 忽略 fid_info，自己分配
+        // needle_id_B。客户端用 needle_id_A 写数据，Filer 元数据存 needle_id_B。
+        // sync 失败时元数据永久错乱，重新挂载后读 needle_id_B → needle not found。
+        // 修复：删除 assign_fid，完全依赖 Filer 返回的 volume_id/file_key。
         let file_mode = args.mode | 0o100000;
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
         let name_owned = name_str.to_string();
-        let fid_info = Some((volume_id, fid.cookie, fid.file_key)); // (volume_id, cookie, file_key) all u64
         let t_create = std::time::Instant::now();
         let attr = self
             .client
             .block_on(async move {
                 meta_client
-                    .create(parent, &name_owned, file_mode, uid, gid, parent, fid_info)
+                    .create(parent, &name_owned, file_mode, uid, gid, parent, None)
                     .await
             })
             .map_err(|e| {
@@ -1517,15 +1559,37 @@ impl FileSystem for PowerFsFs {
             })?;
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
+
+        // 从 Filer 响应提取自分配的 volume_id/needle_id（权威值）
+        let volume_id = attr.volume_id.ok_or_else(|| {
+            error!(
+                "create: Filer response missing volume_id for inode {} (Filer zone not registered?)",
+                inode
+            );
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })?;
+        let needle_id = attr.file_key.ok_or_else(|| {
+            error!(
+                "create: Filer response missing file_key for inode {} (Filer zone not registered?)",
+                inode
+            );
+            std::io::Error::from_raw_os_error(libc::EIO)
+        })?;
+        let fid = Fid {
+            volume_id: VolumeId(volume_id),
+            cookie: 0,
+            file_key: needle_id,
+        };
         info!(
-            "FUSE create timing: assign_fid={}ms, create_rpc={}ms, total={}ms, inode={}",
-            assign_ms,
+            "FUSE create timing: create_rpc={}ms, total={}ms, inode={}, volume_id={}, needle_id={:#x}",
             create_ms,
             t0.elapsed().as_millis(),
-            inode
+            inode,
+            volume_id,
+            needle_id
         );
 
-        // 构造 CachedEntry：fid/chunks 来自客户端 assign_fid，attr 来自 Filer RPC。
+        // 构造 CachedEntry：fid/chunks 来自 Filer 返回值（权威）。
         // size/chunks 在 close 时由 sync_size_chunks_on_close 强一致同步到 filer。
         let entry = CachedEntry {
             inode,
@@ -2143,9 +2207,13 @@ impl FileSystem for PowerFsFs {
                     // already reduced the cache below threshold.
                     let current = self.chunk_cache.current_bytes();
                     if current > threshold {
-                        debug!(
-                            "write: backpressure flush — cache {} > {} ({}% of max), flushing dirty chunks before write inode={}",
-                            current, threshold, BACKPRESSURE_THRESHOLD_PCT, inode
+                        // RACE_TRACE: Backpressure flush can trigger the unpin race
+                        // in flush_all_dirty_chunks. Log to correlate with ENOENT.
+                        warn!(
+                            "write BACKPRESSURE: inode={} cache={} > threshold={} ({}%) thread={:?} \
+                             — calling flush_all_dirty_chunks (may unpin still-open inodes)",
+                            inode, current, threshold, BACKPRESSURE_THRESHOLD_PCT,
+                            std::thread::current().id()
                         );
                         let _ = self.flush_all_dirty_chunks();
                     }
@@ -2163,7 +2231,22 @@ impl FileSystem for PowerFsFs {
         let entry = self
             .cache
             .get_inode(inode)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            .ok_or_else(|| {
+                // RACE_TRACE: get_inode returned None during write — this is the
+                // ENOENT that causes B1/B3 failures. Log full context to identify
+                // which concurrent operation evicted the inode.
+                let is_pinned = self.cache.is_pinned(inode);
+                let has_chunks = self.chunk_cache.has_chunks(inode);
+                let has_dirty = self.chunk_cache.has_dirty_chunks(inode);
+                let is_open = self.open_inodes.read().unwrap().contains(&inode);
+                error!(
+                    "write ENOENT: inode={} offset={} size={} is_pinned={} has_chunks={} has_dirty={} is_open={} thread={:?} \
+                     — inode was evicted mid-write (check invalidate_inode/unpin_inode logs for cause)",
+                    inode, offset, size, is_pinned, has_chunks, has_dirty, is_open,
+                    std::thread::current().id()
+                );
+                std::io::Error::from_raw_os_error(libc::ENOENT)
+            })?;
         debug!(
             "write: inode={}, entry.fid={:?}, entry.is_dir={}, entry.size={}, entry.content_size={}",
             inode,
@@ -2373,43 +2456,22 @@ impl FileSystem for PowerFsFs {
             // release(close)/fsync 时同步 flush 保证持久性。
             // 收益：64K 文件 16 次 4K write 从 16 次网络往返降到 1-2 次。
         } else {
-            // First write: assign FID under metadata lock
-            let (fid, _location, _stripe_fids, _stripe_locations) = self
-                .client
-                .assign_fid(&self.collection, &self.replication)
-                .map_err(|e| {
-                    error!("assign_fid failed: {}", e);
-                    std::io::Error::from_raw_os_error(libc::EIO)
-                })?;
-
-            self.cache.update_fid(inode, fid.clone());
-            let new_size = offset + read_len as u64;
-            self.cache.update_size(inode, new_size);
-
-            // 构建 chunk 信息并更新 cache（确保 close 时 sync 正确的 chunks 到 filer）
-            let chunk_info = powerfs_orset::CachedFileChunk {
-                offset: 0,
-                size: new_size,
-                mtime: entry.mtime as u64,
-                needle_id: fid.file_key,
-                volume_id: fid.volume_id.0,
-                crc32: 0,
-            };
-            self.cache.update_chunks(inode, vec![chunk_info]);
-
-            let mtime = entry.mtime as u64;
-            self.chunk_cache.put(inode, 0, buf.freeze(), mtime, 0);
-
-            self.mark_dirty(inode, 0);
-
-            // NOTE: 旧代码在此处同步调用 self.client.update_entry() 向 master 注册文件条目，
-            // 这会阻塞写入路径 10s+（gRPC 同步往返）。在新设计中：
-            //   - 目录条目由 MetadataClient.create RPC（create 时已完成）走 Raft 强一致提交
-            //   - size/chunks 由 release() 时 sync_size_chunks_on_close 强一致同步到 filer
-            // 因此 update_entry 调用是冗余的，移除以消除写入延迟根因。
-
-            // Phase 1.7: write合并/delayed flush — 首次 write 也不同步 flush，
-            // FID 已分配，chunk 已缓存，由后台 flusher 异步持久化。
+            // entry.fid 为 None：文件已存在但 Filer 元数据缺失 chunk mapping。
+            // 这属于元数据异常（create 时 set_chunks 失败，或 Filer 数据损坏）。
+            //
+            // 旧代码在此调用 assign_fid 从 Master 分配新 needle_id，但这与 Filer
+            // Zone 自分配模型冲突：客户端写入用的 needle_id 与 Filer 元数据不一致，
+            // 导致重新挂载后读不到数据（与 create 路径相同的 BUG）。
+            //
+            // 正确处理：返回 EIO，让应用层感知元数据异常并决定恢复策略
+            // （如删除文件重建，或由 fsck 工具修复）。不应在 write 路径隐式
+            // 分配新 needle_id，那会掩盖根因并造成数据/元数据分裂。
+            error!(
+                "write: inode {} has no fid (Filer metadata missing chunks), refusing to write. \
+                 File may be corrupted; use fsck to repair or recreate the file.",
+                inode
+            );
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
         Ok(read_len)

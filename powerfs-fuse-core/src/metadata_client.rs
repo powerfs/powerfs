@@ -28,6 +28,11 @@ pub struct MetadataAttr {
     pub rdev: u64,
     pub file_type: u8, // FileType::to_d_type()
     pub symlink_target: Option<String>,
+    /// Filer create 响应返回的 volume_id（Zone 自分配）。
+    /// 仅 create 响应填充，lookup/getattr 响应可能为 None（由 chunks 字段单独编码）。
+    pub volume_id: Option<u64>,
+    /// Filer create 响应返回的 needle_id（file_key）。
+    pub file_key: Option<u64>,
 }
 
 impl MetadataAttr {

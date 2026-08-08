@@ -1253,6 +1253,10 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         rdev: resp.rdev,
         file_type: file_type_from_mode(resp.mode),
         symlink_target: None,
+        // create 响应携带 Filer 自分配的 volume_id/needle_id；
+        // lookup/getattr 响应通常为 None（chunks 由单独字段编码）。
+        volume_id: resp.volume_id,
+        file_key: resp.file_key,
     }
 }
 

@@ -192,13 +192,21 @@ impl MetadataCache {
     /// prematurely unpinning an inode that is still open by another handle.
     pub fn pin_inode(&self, inode: u64) {
         let mut pinned = self.pinned_inodes.write().unwrap();
-        *pinned.entry(inode).or_insert(0) += 1;
+        let count = pinned.entry(inode).or_insert(0);
+        *count += 1;
+        let new_count = *count;
+        drop(pinned);
+        debug!(
+            "pin_inode: inode={} new_count={} thread={:?}",
+            inode, new_count, std::thread::current().id()
+        );
     }
 
     /// Unpin an inode (called on release/close).
     /// Decrements the reference count; only removes when count reaches 0.
     pub fn unpin_inode(&self, inode: u64) {
         let mut pinned = self.pinned_inodes.write().unwrap();
+        let was_pinned = pinned.contains_key(&inode);
         if let Some(count) = pinned.get_mut(&inode) {
             if *count > 0 {
                 *count -= 1;
@@ -207,6 +215,14 @@ impl MetadataCache {
                 pinned.remove(&inode);
             }
         }
+        drop(pinned);
+        // RACE_TRACE: Log unpin with caller context to detect the race where
+        // the background flusher unpins a still-open inode, allowing the
+        // InvalidateHandler to evict it mid-write.
+        debug!(
+            "unpin_inode: inode={} was_pinned={} thread={:?}",
+            inode, was_pinned, std::thread::current().id()
+        );
     }
 
     /// Check if an inode is pinned (open). Pinned inodes hold a data lease,
@@ -1039,6 +1055,13 @@ impl MetadataCache {
     /// This removes the inode entry and invalidates its parent directory listing.
     /// The next access will re-fetch fresh data from the server.
     pub fn invalidate_inode(&self, inode: u64) {
+        // RACE_TRACE: Capture full context before invalidation to diagnose
+        // the B1/B3 write ENOENT race. Log pinned state, chunk state, and
+        // thread ID to correlate with concurrent pin/unpin/flush operations.
+        let was_pinned = self.is_pinned(inode);
+        let has_chunks = self.chunk_cache_has_chunks_for_trace(inode);
+        let has_dirty = self.chunk_cache_has_dirty_for_trace(inode);
+
         // Get parent before removing
         let parent = {
             let cache = self.inode_cache.read().unwrap();
@@ -1053,7 +1076,27 @@ impl MetadataCache {
             self.invalidate_dir(p);
         }
 
-        debug!("Invalidated cache for inode: {}", inode);
+        warn!(
+            "invalidate_inode: inode={} parent={:?} was_pinned={} has_chunks={} has_dirty={} thread={:?}",
+            inode, parent, was_pinned, has_chunks, has_dirty, std::thread::current().id()
+        );
+    }
+
+    /// Trace helper: check if chunk cache has any chunks for this inode.
+    /// Used by invalidate_inode for RACE_TRACE logging only.
+    fn chunk_cache_has_chunks_for_trace(&self, inode: u64) -> bool {
+        // Access the chunk_cache reference if available; this is a best-effort
+        // trace. The MetadataCache doesn't own the ChunkCache, so we can only
+        // check the inode_cache for now. The InvalidateHandler has the real
+        // has_chunks check.
+        self.inode_cache.read().unwrap().contains(&inode)
+    }
+
+    /// Trace helper: check if chunk cache has dirty chunks for this inode.
+    fn chunk_cache_has_dirty_for_trace(&self, _inode: u64) -> bool {
+        // MetadataCache doesn't have access to ChunkCache's dirty state.
+        // The InvalidateHandler has the real has_dirty_chunks check.
+        false
     }
 
     /// Check if a cached inode's version is stale compared to the given version
