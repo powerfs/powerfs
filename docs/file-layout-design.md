@@ -2216,6 +2216,7 @@ if (req->error == -E2BIG) {
 | FUSE | Flat 读路径 failover (主 volume 失败→副本 volume) | ✅ |
 | FUSE | Stripe 读路径 failover (同 offset 副本查找) | ✅ |
 | FUSE | CRC32 数据完整性校验 (写时计算, 读时验证) | ✅ |
+| Filer | scrubber 副本复制 CRC32 校验 (防复制损坏数据) | ✅ |
 | 协议 | FieldId::ReplicaChunks (0xB5) TLV 编码 | ✅ |
 
 **关键修复**:
@@ -2228,7 +2229,6 @@ if (req->error == -E2BIG) {
 **failover 验证**: 杀掉主 volume 容器, FUSE 读路径自动切换到副本 volume, 文件可读且 MD5 一致.
 
 **遗留事项**:
-- scrubber 副本复制时 CRC32 一致性校验 (scrubber 当前复制 CRC32 元数据但未校验读到的数据, FUSE 读路径已校验)
 - 多 zone 环境 volume 地址查找偶发失败
 - scrubber 大规模文件扫描性能优化
 
