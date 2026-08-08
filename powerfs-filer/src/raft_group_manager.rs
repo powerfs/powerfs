@@ -150,6 +150,13 @@ pub enum ShardCommand {
         #[serde(default)]
         inline_data: Option<Vec<u8>>,
     },
+    /// P3: Set an extended attribute on an inode (persisted via Raft).
+    /// Used for `powerfs.placement` xattr on directories.
+    SetXattr {
+        inode: u64,
+        key: String,
+        value: Vec<u8>,
+    },
 }
 
 impl ShardCommand {

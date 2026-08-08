@@ -539,6 +539,9 @@ impl ShardStore {
                     );
                 }
             }
+            ShardCommand::SetXattr { inode, key, value } => {
+                self.set_xattr(inode, key, value);
+            }
         }
     }
 
@@ -1724,6 +1727,36 @@ impl ShardStore {
         let mut inodes = self.inodes.write().unwrap();
         inodes.insert(inode, info);
         Ok(())
+    }
+
+    /// P3: Set an extended attribute on an inode (persisted to RocksDB).
+    /// Called from apply_command when ShardCommand::SetXattr is committed.
+    pub fn set_xattr(&self, inode: u64, key: String, value: Vec<u8>) {
+        let cf_inodes = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => {
+                log::error!("Shard {}: CF_INODES not found for set_xattr", self.shard_id.0);
+                return;
+            }
+        };
+        let mut info = match self.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "Shard {} set_xattr: inode {} not found",
+                    self.shard_id.0,
+                    inode
+                );
+                return;
+            }
+        };
+        info.extended.insert(key, value);
+        info.mtime = Self::current_time();
+        if let Ok(data) = serde_json::to_vec(&info) {
+            let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
+        }
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
     }
 
     /// Set inode attributes

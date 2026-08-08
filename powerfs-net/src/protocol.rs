@@ -538,6 +538,17 @@ pub enum MsgType {
     /// Response: VolumeId + FileKey(needle_id)
     MigrateInlineAlloc = 0x0037,
 
+    /// P3: Set extended attribute on an inode (persisted via Raft).
+    /// Used to set `powerfs.placement` xattr on directories for placement
+    /// policy inheritance. Request: ShardId + Ino + XattrKey + XattrValue.
+    /// Response: status only.
+    SetXattr = 0x0038,
+
+    /// P3: Get extended attribute from an inode.
+    /// Request: ShardId + Ino + XattrKey.
+    /// Response: XattrValue (bytes) or STATUS_ERR_NOT_FOUND.
+    GetXattr = 0x0039,
+
     // Status
     StatFs = 0x0040,
 
@@ -625,6 +636,8 @@ impl MsgType {
             0x0035 => Some(Self::OpenCountInc),
             0x0036 => Some(Self::OpenCountDec),
             0x0037 => Some(Self::MigrateInlineAlloc),
+            0x0038 => Some(Self::SetXattr),
+            0x0039 => Some(Self::GetXattr),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -846,6 +859,12 @@ pub enum FieldId {
     EndInode = 0xB1,
     /// open_count 值 (u32). OpenCountInc/Dec 响应
     OpenCount = 0xB2,
+
+    // ===== Xattr fields (0xB3-0xB4) =====
+    /// xattr 键名 (string). SetXattr/GetXattr 请求
+    XattrKey = 0xB3,
+    /// xattr 值 (bytes). SetXattr 请求 / GetXattr 响应
+    XattrValue = 0xB4,
 }
 
 impl FieldId {
@@ -939,6 +958,8 @@ impl FieldId {
             0xB0 => Some(Self::StartInode),
             0xB1 => Some(Self::EndInode),
             0xB2 => Some(Self::OpenCount),
+            0xB3 => Some(Self::XattrKey),
+            0xB4 => Some(Self::XattrValue),
             _ => None,
         }
     }
@@ -1175,6 +1196,12 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
 
         // StatFs (0x0040) - body < 256B
         0x0040 => Some((256, 0)),
+
+        // SetXattr (0x0038) - body < 256B (status only)
+        0x0038 => Some((256, 0)),
+
+        // GetXattr (0x0039) - body < 4KB (xattr value)
+        0x0039 => Some((4 * 1024, 0)),
 
         // ReadNeedle (0x0063) - data ≤ 2MB, body < 256KB
         0x0063 => Some((256 * 1024, 2 * 1024 * 1024)),

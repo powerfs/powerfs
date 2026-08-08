@@ -14,7 +14,7 @@ use log::{debug, info, warn};
 use powerfs_layout::codec::{encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
 use powerfs_layout::encoding::{ChunkEncoding, ChunkRef};
 use powerfs_layout::layout::FileLayout;
-use powerfs_layout::placement::Placement;
+use powerfs_layout::placement::{Placement, PlacementSpec};
 use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
@@ -57,6 +57,9 @@ pub struct FilerNetHandler {
 pub const INLINE_HARD_LIMIT: u32 = 8 * 1024;
 /// P2.5: `powerfs.inline` xattr key (存于父目录 InodeInfo.extended)
 pub const INLINE_XATTR_KEY: &str = "powerfs.inline";
+/// P3: `powerfs.placement` xattr key (存于目录 InodeInfo.extended)
+/// 值格式: `flat` | `stripe:<count>:<size>` | `wide_stripe:<count>:<size>`
+pub const PLACEMENT_XATTR_KEY: &str = "powerfs.placement";
 
 impl FilerNetHandler {
     pub fn new(
@@ -153,6 +156,58 @@ impl FilerNetHandler {
         } else {
             None
         }
+    }
+
+    /// P3: 解析父目录的 `powerfs.placement` xattr, 返回 PlacementSpec.
+    /// 用于 handle_create 继承父目录的 placement 策略 (Flat/Stripe/WideStripe).
+    /// 返回 None 表示无显式策略, 使用默认 Flat.
+    fn resolve_placement_spec(&self, parent_ino: u64) -> Option<PlacementSpec> {
+        let parent = self.meta_shard_manager.get_inode(parent_ino)?;
+        let val = parent.extended.get(PLACEMENT_XATTR_KEY)?;
+        let s = std::str::from_utf8(val).ok()?;
+        match powerfs_layout::xattr::parse_placement_xattr(s) {
+            Ok(spec) => {
+                debug!(
+                    "FILER_P3: parent {} placement xattr = {:?}",
+                    parent_ino, spec
+                );
+                Some(spec)
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_P3: parent {} invalid placement xattr '{}': {}",
+                    parent_ino, s, e
+                );
+                None
+            }
+        }
+    }
+
+    /// P3: 为 Stripe 文件分配多个 (volume_id, needle_id) 对.
+    /// 使用 round-robin 跨 Zone 分配, 实现 anti-affinity (不同 chunk 落不同 volume).
+    /// 返回 Vec<(volume_id, needle_id)>, 长度 == count.
+    /// 若可用 volume 不足, 返回 None.
+    fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
+        let mut result = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            match self.alloc_for_new_file() {
+                Some(v) => result.push(v),
+                None => {
+                    warn!(
+                        "FILER_P3: alloc_for_stripe_file failed after {}/{} allocations",
+                        result.len(),
+                        count
+                    );
+                    return None;
+                }
+            }
+        }
+        info!(
+            "FILER_P3: allocated {} stripe chunks across {} volumes",
+            result.len(),
+            result.iter().map(|(v, _)| *v).collect::<std::collections::HashSet<_>>().len()
+        );
+        Some(result)
     }
 
     /// 设置 Zone 列表 (从 Master RegisterFiler 获取后调用)
@@ -763,10 +818,39 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // === P2.5: 决定 Inline vs Flat ===
+        // === P2.5/P3: 决定 Inline vs Stripe vs Flat ===
         // Inline: 数据直接存 Filer 元数据, 绕过 Volume Server (微小文件 < max_size).
-        // Flat: 走原 Volume 分配路径.
+        // Stripe: 多 volume 并行 (父目录 powerfs.placement=stripe:N:size).
+        // Flat: 单 volume (默认).
         let inline_max = self.resolve_inline_max_size(parent_ino);
+
+        // P3: 解析父目录 placement xattr (仅在非 Inline 时生效)
+        let placement_spec = if inline_max.is_none() {
+            self.resolve_placement_spec(parent_ino)
+        } else {
+            None
+        };
+
+        // P3: Stripe 模式预分配 N 个 (volume_id, needle_id)
+        let stripe_alloc: Option<Vec<(u64, u64)>> = if inline_max.is_none() {
+            if let Some(PlacementSpec::Stripe { count, .. }) = &placement_spec {
+                match self.alloc_for_stripe_file(*count) {
+                    Some(v) => Some(v),
+                    None => {
+                        warn!("FILER_NET_CREATE: cannot allocate {} stripe volumes", count);
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // === Flat 模式: Zone 自分配 needle_id + volume_id (P2.4 核心) ===
         // 在创建 inode 之前分配, 这样若分配失败 (zone 未注册) 可直接返回错误,
@@ -775,8 +859,8 @@ impl FilerNetHandler {
         //   - needle_id 空间巨大 (40 bits/zone, 1 万亿个)
         //   - counter 单调递增, 不会重复
         //
-        // Inline 模式跳过分配 (无 Volume Server 参与).
-        let flat_alloc = if inline_max.is_none() {
+        // Inline/Stripe 模式跳过单卷分配.
+        let flat_alloc = if inline_max.is_none() && stripe_alloc.is_none() {
             match self.alloc_for_new_file() {
                 Some(v) => Some(v),
                 None => {
@@ -832,6 +916,47 @@ impl FilerNetHandler {
                         compression: CompressionState::default(),
                         // 创建时尚无数据, 客户端 CLOSE 时携带 inline_data
                         encoding: ChunkEncoding::InlineData { data: Vec::new() },
+                    };
+                    encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
+                        |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
+                    )?;
+                } else if let Some(allocs) = stripe_alloc {
+                    // === P3 Stripe 模式: 多 volume 并行 ===
+                    // 父目录有 powerfs.placement=stripe:N:size xattr.
+                    // 预分配 N 个 (volume_id, needle_id), 客户端按 Placement::locate()
+                    // 决定每个 stripe unit 写入哪个 volume. CLOSE 时 sync chunks.
+                    let (stripe_size, stripe_count) = match &placement_spec {
+                        Some(PlacementSpec::Stripe { count, stripe_size }) => (*stripe_size, *count),
+                        _ => unreachable!("stripe_alloc implies PlacementSpec::Stripe"),
+                    };
+                    let volume_ids: Vec<u64> = allocs.iter().map(|(v, _)| *v).collect();
+                    let chunks: Vec<ChunkRef> = allocs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (vid, nid))| ChunkRef {
+                            offset: (i as u64) * stripe_size,
+                            size: 0,
+                            needle_id: *nid,
+                            volume_id: *vid,
+                            crc32: 0,
+                            mtime: 0,
+                        })
+                        .collect();
+                    info!(
+                        "FILER_NET_CREATE: stripe mode inode={} count={} stripe_size={} volumes={:?}",
+                        ino, stripe_count, stripe_size, volume_ids
+                    );
+                    let layout = FileLayout {
+                        placement: Placement::Stripe {
+                            stripe_size,
+                            stripe_count,
+                            start_volume_idx: 0,
+                            volume_ids: volume_ids.clone(),
+                        },
+                        reliability: Reliability::SingleReplica,
+                        reliability_state: ReliabilityState::default(),
+                        compression: CompressionState::default(),
+                        encoding: ChunkEncoding::PerChunk { chunks },
                     };
                     encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
                         |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
@@ -1575,6 +1700,80 @@ impl FilerNetHandler {
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
     }
 
+    /// P3: Handle SetXattr request — persist an extended attribute on an inode via Raft.
+    ///
+    /// Request TLV: ShardId + Ino + XattrKey (string) + XattrValue (bytes)
+    /// Response: status only (STATUS_OK or STATUS_ERR_*)
+    async fn handle_setxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
+        let value = dec.next_bytes(FieldId::XattrValue).unwrap_or_default();
+
+        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        info!(
+            "FILER_NET_SETXATTR: inode={} key={} value_len={}",
+            inode,
+            key,
+            value.len()
+        );
+
+        match self
+            .meta_shard_manager
+            .set_xattr(inode, shard_id, &key, value)
+            .await
+        {
+            Ok(()) => {
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(inode, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_SETXATTR: failed for inode {}: {}", inode, e);
+                Ok(Self::build_response(msg, STATUS_ERR_SERVER_ERROR, Vec::new()))
+            }
+        }
+    }
+
+    /// P3: Handle GetXattr request — read an extended attribute from an inode.
+    ///
+    /// Request TLV: ShardId + Ino + XattrKey (string)
+    /// Response TLV: XattrValue (bytes) or STATUS_ERR_NOT_FOUND
+    async fn handle_getxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
+
+        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.meta_shard_manager.get_inode(inode) {
+            Some(info) => match info.extended.get(&key) {
+                Some(val) => {
+                    let mut enc = TlvEncoder::new();
+                    enc.add_bytes(FieldId::XattrValue, val);
+                    Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+                }
+                None => {
+                    debug!("FILER_NET_GETXATTR: inode {} key {} not found", inode, key);
+                    Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+                }
+            },
+            None => {
+                warn!("FILER_NET_GETXATTR: inode {} not found", inode);
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
+        }
+    }
+
     /// Handle AcquireInodeLease request (方案 A, Phase 2).
     ///
     /// Request TLV: Ino, ClientId, LeaseDuration
@@ -1950,6 +2149,8 @@ impl NetHandler for FilerNetHandler {
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
             MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
             MsgType::MigrateInlineAlloc => self.handle_migrate_inline_alloc(msg).await,
+            MsgType::SetXattr => self.handle_setxattr(msg).await,
+            MsgType::GetXattr => self.handle_getxattr(msg).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,

@@ -1131,6 +1131,47 @@ impl MetaShardManager {
         Ok(())
     }
 
+    /// P3: Set an extended attribute on an inode via Raft consensus.
+    /// Used for `powerfs.placement` xattr on directories.
+    pub async fn set_xattr(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        key: &str,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::SetXattr {
+            inode,
+            key: key.to_string(),
+            value,
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.extended.contains_key(key) {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("set_xattr timeout waiting for apply".to_string());
+        }
+
+        Ok(())
+    }
+
     /// Create a symbolic link via Raft consensus
     pub async fn create_symlink(
         &self,
