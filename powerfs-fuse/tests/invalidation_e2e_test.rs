@@ -42,6 +42,7 @@ fn make_entry(inode: u64, parent: u64, name: &str, generation: u64) -> CachedEnt
         content_size: 0,
         disk_size: 0,
         generation,
+        placement: None,
         cached_at: Instant::now(),
     }
 }

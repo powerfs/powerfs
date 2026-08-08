@@ -431,6 +431,46 @@ fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
     })
 }
 
+/// P3: Resolve (volume_id, needle_id) for a 1MB chunk at `file_offset` in
+/// Stripe mode.
+///
+/// The Filer pre-allocates one needle per stripe unit at create time. Each
+/// stripe unit covers `stripe_size` bytes and is stored on one volume. Within
+/// a stripe unit, 1MB sub-chunks use consecutive needle IDs
+/// (`base_needle + chunk_idx_within_unit`), same as Flat mode's
+/// `file_key + chunk_idx`.
+///
+/// Algorithm:
+/// 1. `stripe_unit_idx = file_offset / stripe_size` (which stripe unit)
+/// 2. Look up `chunks[stripe_unit_idx]` for the base needle_id and volume_id
+/// 3. `chunk_idx_within_unit = (file_offset % stripe_size) / chunk_size`
+/// 4. `needle_id = base_needle + chunk_idx_within_unit`
+///
+/// Returns `None` if the stripe unit is beyond the pre-allocated range
+/// (file larger than `stripe_count × stripe_size`). On-demand allocation
+/// for larger files is a future extension.
+fn resolve_stripe_chunk(
+    placement: &powerfs_layout::Placement,
+    chunks: &[CachedFileChunk],
+    file_offset: u64,
+    chunk_size: u64,
+) -> Option<(u64, u64)> {
+    let stripe_size = match placement {
+        powerfs_layout::Placement::Stripe { stripe_size, .. }
+        | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
+        _ => return None,
+    };
+    let stripe_size = stripe_size.max(1);
+    let stripe_unit_idx = (file_offset / stripe_size) as usize;
+    if stripe_unit_idx >= chunks.len() {
+        return None; // beyond pre-allocated range
+    }
+    let base = &chunks[stripe_unit_idx];
+    let chunk_idx_within_unit = (file_offset % stripe_size) / chunk_size.max(1);
+    let needle_id = base.needle_id.saturating_add(chunk_idx_within_unit);
+    Some((base.volume_id, needle_id))
+}
+
 /// Step 2: 将 MetadataAttr（MetadataClient RPC 返回）转为 CachedEntry。
 ///
 /// 强一致方案下，所有元数据操作走 Filer Raft leader，返回 MetadataAttr。
@@ -439,6 +479,41 @@ fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
 fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedEntry {
     let is_dir = attr.file_type == libc::DT_DIR;
     let is_symlink = attr.file_type == libc::DT_LNK;
+    // P3: Convert ChunkRef from MetadataAttr to CachedFileChunk.
+    // For Stripe files, attr.chunks contains the pre-allocated stripe units.
+    let chunks: Vec<CachedFileChunk> = attr
+        .chunks
+        .iter()
+        .map(|c| CachedFileChunk {
+            offset: c.offset,
+            size: c.size,
+            mtime: c.mtime,
+            needle_id: c.needle_id,
+            volume_id: c.volume_id,
+            crc32: c.crc32,
+        })
+        .collect();
+    // P3: For Stripe files (placement is Some), fid must be None so write/read
+    // paths route to the Stripe branch. For Flat files, reconstruct fid from
+    // volume_id/file_key if available.
+    let fid = if attr.placement.is_some() {
+        None
+    } else if let (Some(vol), Some(key)) = (attr.volume_id, attr.file_key) {
+        Some(Fid {
+            volume_id: VolumeId(vol),
+            cookie: 0,
+            file_key: key,
+        })
+    } else if !chunks.is_empty() {
+        // Fallback: reconstruct from chunks[0]
+        Some(Fid {
+            volume_id: VolumeId(chunks[0].volume_id),
+            cookie: 0,
+            file_key: chunks[0].needle_id,
+        })
+    } else {
+        None
+    };
     CachedEntry {
         inode: attr.inode,
         parent,
@@ -447,7 +522,7 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         is_symlink,
         symlink_target: attr.symlink_target.clone(),
         nlink: attr.nlink,
-        fid: None,
+        fid,
         size: attr.size,
         mode: attr.mode,
         uid: attr.uid,
@@ -456,12 +531,13 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         mtime: attr.mtime as i64,
         ctime: attr.ctime as i64,
         xattrs: HashMap::new(),
-        chunks: Vec::new(),
+        chunks,
         hard_link_id: String::new(),
         hard_link_counter: 0,
         content_size: attr.size,
         disk_size: 0,
         generation: 0,
+        placement: attr.placement.clone(),
         cached_at: Instant::now(),
     }
 }
@@ -606,11 +682,90 @@ impl PowerFsFs {
             }
         };
 
+        let chunk_size = self.chunk_cache.chunk_size();
+
+        // === P3: Stripe 模式 flush 分支 ===
+        // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
+        // 每个 dirty chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
+        if entry.placement.is_some() && entry.fid.is_none() {
+            let placement = entry.placement.as_ref().unwrap();
+            let stripe_chunks = entry.chunks.clone();
+
+            let batch_size = 32;
+            let mut had_error = false;
+
+            let chunks_to_flush: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
+                .iter()
+                .filter_map(|(_, chunk_idx)| {
+                    if *chunk_idx >= powerfs_common::constants::FILE_KEY_BLOCK_SIZE {
+                        error!(
+                            "chunk_idx {} exceeds FILE_KEY_BLOCK_SIZE {} (file too large)",
+                            chunk_idx,
+                            powerfs_common::constants::FILE_KEY_BLOCK_SIZE
+                        );
+                        had_error = true;
+                        return None;
+                    }
+                    let chunk_offset = chunk_idx * chunk_size;
+                    let chunk_data = self.chunk_cache.get(inode, chunk_offset)?;
+                    let data_len = chunk_data.data.len();
+                    let (vol_id, needle_id) = resolve_stripe_chunk(
+                        placement,
+                        &stripe_chunks,
+                        chunk_offset,
+                        chunk_size,
+                    )?;
+                    Some((
+                        *chunk_idx,
+                        powerfs_fuse_core::WriteBlobRequest {
+                            volume_id: vol_id,
+                            file_key: needle_id,
+                            inode,
+                            offset: chunk_offset as i64,
+                            size: data_len as i32,
+                            data: chunk_data.data,
+                        },
+                    ))
+                })
+                .collect();
+
+            let mut flushed_indices: Vec<u64> = Vec::new();
+            for batch in chunks_to_flush.chunks(batch_size) {
+                let requests: Vec<_> = batch.iter().map(|(_, req)| req.clone()).collect();
+                let results = self
+                    .client
+                    .write_blob_batch_with_lease(requests, lease_token);
+
+                for ((chunk_idx, _), result) in batch.iter().zip(results.iter()) {
+                    if let Err(e) = result {
+                        self.mark_dirty(inode, *chunk_idx);
+                        error!(
+                            "write_blob stripe failed for inode {} chunk {}: {}",
+                            inode, chunk_idx, e
+                        );
+                        had_error = true;
+                    } else {
+                        flushed_indices.push(*chunk_idx);
+                    }
+                }
+            }
+
+            if !flushed_indices.is_empty() {
+                self.chunk_cache
+                    .clear_dirty_for_chunks(inode, &flushed_indices);
+            }
+
+            if had_error {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            return Ok(());
+        }
+
         let fid = match entry.fid {
             Some(ref f) => f.clone(),
             None => {
                 warn!(
-                    "flush_dirty_chunks_impl: inode {} has no fid, re-marking {} dirty chunks",
+                    "flush_dirty_chunks_impl: inode {} has no fid and no placement, re-marking {} dirty chunks",
                     inode,
                     dirty.len()
                 );
@@ -631,8 +786,6 @@ impl PowerFsFs {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         };
-
-        let chunk_size = self.chunk_cache.chunk_size();
 
         // P1-a: Collect dirty chunks and flush in parallel batches.
         // Previously this was a serial for-loop, each chunk doing a
@@ -1040,6 +1193,7 @@ impl PowerFsFs {
 
             disk_size: entry.disk_size,
             generation: entry.generation,
+            placement: None,
             cached_at: Instant::now(),
         }
     }
@@ -1685,6 +1839,7 @@ impl FileSystem for PowerFsFs {
                 content_size: 0,
                 disk_size: 0,
                 generation: 0,
+                placement: None,
                 cached_at: Instant::now(),
             };
             // CRITICAL: 同 Flat 路径, pin 必须在 insert 之前, 防止 Filer
@@ -1693,6 +1848,71 @@ impl FileSystem for PowerFsFs {
             self.cache.pin_inode(inode);
             self.cache.insert(entry.clone());
             debug!("create: inline mode, inode={}, dir={}", inode, parent);
+            return Ok((
+                self.create_fuse_entry(&entry),
+                Some(inode),
+                fuse_backend_rs::abi::fuse_abi::OpenOptions::empty(),
+                None,
+            ));
+        }
+
+        // === P3: Stripe 模式分支 ===
+        // Filer 在 CREATE 响应中返回 Placement::Stripe + PerChunk chunks.
+        // 客户端存储 placement + chunks, 后续 write/read 用 Placement::locate()
+        // 路由到正确的 volume.
+        if attr.is_stripe() {
+            let placement = attr.placement.clone().unwrap();
+            let stripe_chunks: Vec<CachedFileChunk> = attr
+                .chunks
+                .iter()
+                .map(|c| CachedFileChunk {
+                    offset: c.offset,
+                    size: c.size,
+                    mtime: c.mtime,
+                    needle_id: c.needle_id,
+                    volume_id: c.volume_id,
+                    crc32: c.crc32,
+                })
+                .collect();
+            info!(
+                "FUSE create stripe: inode={}, placement={:?}, chunks={}, create_rpc={}ms, total={}ms",
+                inode,
+                placement,
+                stripe_chunks.len(),
+                create_ms,
+                t0.elapsed().as_millis()
+            );
+
+            let entry = CachedEntry {
+                inode,
+                parent,
+                name: name_str.to_string(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                nlink: 1,
+                fid: None, // Stripe 模式不用单一 fid
+                size: 0,
+                mode: file_mode,
+                uid: ctx.uid,
+                gid: ctx.gid,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                xattrs: HashMap::new(),
+                chunks: stripe_chunks,
+                hard_link_id: String::new(),
+                hard_link_counter: 0,
+                content_size: 0,
+                disk_size: 0,
+                generation: 0,
+                placement: Some(placement),
+                cached_at: Instant::now(),
+            };
+            self.open_inodes.write().unwrap().insert(inode);
+            self.cache.pin_inode(inode);
+            self.cache.insert(entry.clone());
+            debug!("create: stripe mode, inode={}, dir={}", inode, parent);
             return Ok((
                 self.create_fuse_entry(&entry),
                 Some(inode),
@@ -1763,6 +1983,7 @@ impl FileSystem for PowerFsFs {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
@@ -1888,6 +2109,17 @@ impl FileSystem for PowerFsFs {
                     let chunks_changed =
                         !filer_stale_empty && !chunks_match(&entry.chunks, &fresh.chunks);
                     let filer_content_size = fresh.content_size;
+                    // P3: Preserve placement from existing entry. The FilerEntry
+                    // returned by get_entry_by_inode does not carry FileLayout,
+                    // so placement would be lost on refresh. Placement is set at
+                    // create time and never changes, so the cached value is
+                    // authoritative. Also clear fid for Stripe files to ensure
+                    // write/read paths route to the Stripe branch.
+                    let mut fresh = fresh;
+                    fresh.placement = entry.placement.clone();
+                    if fresh.placement.is_some() {
+                        fresh.fid = None;
+                    }
                     self.cache.insert(fresh);
                     // If no local chunk data exists (cache was invalidated by
                     // an Invalidate notification), force the Filer's
@@ -2081,6 +2313,193 @@ impl FileSystem for PowerFsFs {
                 inode, offset, size, n
             );
             return Ok(n);
+        }
+
+        // === P3: Stripe 模式读取分支 ===
+        // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
+        // chunk_cache 逻辑与 Flat 相同; 差异仅在 cache miss 时按
+        // resolve_stripe_chunk() 路由到正确的 volume/needle.
+        if entry.placement.is_some() && entry.fid.is_none() {
+            let placement = entry.placement.as_ref().unwrap();
+            let stripe_chunks = entry.chunks.clone();
+            let chunk_size = self.chunk_cache.chunk_size();
+
+            let file_size = if entry.size > 0 {
+                entry.size
+            } else if !entry.chunks.is_empty() {
+                entry
+                    .chunks
+                    .iter()
+                    .map(|c| c.offset + if c.size > 0 { c.size } else { chunk_size })
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            if offset >= file_size {
+                return Ok(0);
+            }
+
+            let end_offset = std::cmp::min(offset + size as u64, file_size);
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
+            let prefetch_end =
+                std::cmp::min(end_offset + PREFETCH_CHUNKS * chunk_size, file_size);
+            let prefetch_end_chunk = if prefetch_end == 0 {
+                0
+            } else {
+                self.chunk_cache.get_chunk_index(prefetch_end - 1)
+            };
+
+            // Collect missing chunks for remote read
+            let missing_chunks: Vec<(u64, u64, i32)> = (start_chunk..=prefetch_end_chunk)
+                .filter_map(|chunk_idx| {
+                    let chunk_offset = chunk_idx * chunk_size;
+                    if self.chunk_cache.get(inode, chunk_offset).is_none() {
+                        let remaining = file_size.saturating_sub(chunk_offset);
+                        let read_size = std::cmp::min(chunk_size, remaining);
+                        Some((chunk_idx, chunk_offset, read_size as i32))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !missing_chunks.is_empty() {
+                // Build chunk_map for O(1) needle_id lookup
+                let chunk_map: HashMap<u64, (u64, u64)> = stripe_chunks
+                    .iter()
+                    .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                    .collect();
+
+                let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
+                    .iter()
+                    .map(|(_chunk_idx, offset, size)| {
+                        let (vol_id, needle_id) = resolve_stripe_chunk(
+                            placement,
+                            &stripe_chunks,
+                            *offset,
+                            chunk_size,
+                        )
+                        .unwrap_or_else(|| {
+                            chunk_map
+                                .get(offset)
+                                .copied()
+                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id))
+                        });
+                        powerfs_fuse_core::ReadBlobRequest {
+                            volume_id: vol_id,
+                            file_key: needle_id,
+                            offset: 0,
+                            size: *size,
+                        }
+                    })
+                    .collect();
+
+                let results = self.client.read_blob_batch(requests);
+                let mtime = entry.mtime as u64;
+
+                for ((chunk_idx, chunk_offset, read_size), result) in
+                    missing_chunks.iter().zip(results.iter())
+                {
+                    match result {
+                        Ok(data) => {
+                            self.chunk_cache.put(
+                                inode,
+                                *chunk_offset,
+                                data.clone().into(),
+                                mtime,
+                                0,
+                            );
+                        }
+                        Err(e) if e.contains("needle not found") => {
+                            // Check if dirty (data in cache but not yet flushed)
+                            let is_dirty = {
+                                let key = (inode, *chunk_idx);
+                                let shard = &self.dirty_shards[Self::dirty_shard_idx(&key)];
+                                let dirty_set = shard.read().unwrap();
+                                dirty_set.contains(&key)
+                            };
+                            if is_dirty {
+                                let _ = self.flush_dirty_chunks(inode, None);
+                                // Retry read after flush
+                                let (vol_id, needle_id) = resolve_stripe_chunk(
+                                    placement,
+                                    &stripe_chunks,
+                                    *chunk_offset,
+                                    chunk_size,
+                                )
+                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id));
+                                if let Ok(addr) = self.client.get_volume_addr(vol_id) {
+                                    if let Ok(data) = self.client.read_blob(
+                                        &addr, vol_id, needle_id, 0, *read_size,
+                                    ) {
+                                        self.chunk_cache.put(
+                                            inode,
+                                            *chunk_offset,
+                                            data.into(),
+                                            mtime,
+                                            0,
+                                        );
+                                        continue;
+                                    }
+                                }
+                                // Fallback: fill with zeros
+                                self.chunk_cache.put(
+                                    inode,
+                                    *chunk_offset,
+                                    vec![0; *read_size as usize].into(),
+                                    mtime,
+                                    0,
+                                );
+                            } else {
+                                self.chunk_cache.put(
+                                    inode,
+                                    *chunk_offset,
+                                    vec![0; *read_size as usize].into(),
+                                    mtime,
+                                    0,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("read stripe: read_blob failed: {}", e);
+                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
+                    }
+                }
+            }
+
+            // Copy from chunk_cache to writer (same as Flat)
+            let mut total_written = 0usize;
+            let mut current_offset = offset;
+            let end = end_offset;
+
+            while current_offset < end {
+                let chunk_data = self
+                    .chunk_cache
+                    .get(inode, current_offset)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+
+                let chunk_start = (current_offset % self.chunk_cache.chunk_size()) as usize;
+                let available_in_chunk = chunk_data.data.len().saturating_sub(chunk_start);
+                let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
+
+                if bytes_left_in_chunk == 0 {
+                    break;
+                }
+
+                let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
+                w.write_all(slice)?;
+                total_written += bytes_left_in_chunk;
+                current_offset += bytes_left_in_chunk as u64;
+            }
+
+            debug!(
+                "read stripe: inode={} offset={} size={} -> {} bytes",
+                inode, offset, size, total_written
+            );
+            return Ok(total_written);
         }
 
         let fid = entry
@@ -2635,6 +3054,172 @@ impl FileSystem for PowerFsFs {
         // block_on 同步网络往返。首次 write 时 ensure_lease 获取 lease 并缓存，
         // 后续 write 复用缓存中的有效 lease。lease 在 release(close) 时释放。
         let chunk_size = self.chunk_cache.chunk_size();
+
+        // === P3: Stripe 模式写入分支 ===
+        // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
+        // 每个 1MB chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
+        // chunk_cache 逻辑与 Flat 相同 (按 file offset 缓存 1MB 数据).
+        if entry.placement.is_some() && entry.fid.is_none() {
+            let placement = entry.placement.as_ref().unwrap();
+            let stripe_chunks = entry.chunks.clone();
+            let content_size_before_write = entry.content_size;
+            let end_offset = offset + read_len as u64;
+            let start_chunk = self.chunk_cache.get_chunk_index(offset);
+            let end_chunk = if end_offset == 0 {
+                0
+            } else {
+                self.chunk_cache.get_chunk_index(end_offset - 1)
+            };
+
+            // Check that the write range is within the pre-allocated stripe range
+            let max_stripe_offset = (stripe_chunks.len() as u64)
+                .saturating_mul(match placement {
+                    powerfs_layout::Placement::Stripe { stripe_size, .. }
+                    | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
+                    _ => 0,
+                });
+            if end_offset > max_stripe_offset {
+                error!(
+                    "write stripe: inode={} end_offset={} > max_stripe_offset={} \
+                     (file exceeds pre-allocated stripe range, on-demand alloc not yet implemented)",
+                    inode, end_offset, max_stripe_offset
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+            }
+
+            // Build chunk_map for O(1) needle_id lookup (read-before-write)
+            let chunk_map: HashMap<u64, (u64, u64)> = stripe_chunks
+                .iter()
+                .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                .collect();
+
+            drop(_meta_guard); // Drop metadata lock before per-chunk writes
+
+            let new_size = offset + read_len as u64;
+            let mut data_offset = 0u64;
+            let mut current_offset = offset;
+
+            for chunk_idx in start_chunk..=end_chunk {
+                let lock = self.get_write_lock(inode, chunk_idx);
+                let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+                let chunk_start_offset = chunk_idx * chunk_size;
+                let in_chunk_start = current_offset.saturating_sub(chunk_start_offset) as usize;
+                let bytes_to_write = std::cmp::min(
+                    read_len as u64 - data_offset,
+                    chunk_size - in_chunk_start as u64,
+                ) as usize;
+
+                let mtime = entry.mtime as u64;
+                let modified = self.chunk_cache.modify(inode, chunk_start_offset, |chunk| {
+                    let needed_len = in_chunk_start + bytes_to_write;
+                    let mut mut_data = BytesMut::with_capacity(needed_len);
+                    mut_data.extend_from_slice(&chunk.data);
+                    if mut_data.len() < needed_len {
+                        mut_data.resize(needed_len, 0);
+                    }
+                    mut_data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                        &buf[data_offset as usize..data_offset as usize + bytes_to_write],
+                    );
+                    chunk.data = mut_data.freeze();
+                    chunk.mtime = mtime;
+                });
+
+                if !modified {
+                    // Chunk not in cache — determine if read-before-write is needed
+                    let existing_end_in_chunk =
+                        content_size_before_write.saturating_sub(chunk_start_offset);
+                    let write_end_in_chunk = (in_chunk_start + bytes_to_write) as u64;
+                    let no_data_before =
+                        in_chunk_start == 0 || existing_end_in_chunk <= in_chunk_start as u64;
+                    let no_data_after = write_end_in_chunk >= chunk_size
+                        || existing_end_in_chunk <= write_end_in_chunk;
+
+                    let mut new_data: Vec<u8> = if no_data_before && no_data_after {
+                        debug!(
+                            "write stripe: skip read-before-write inode={} chunk_offset={}",
+                            inode, chunk_start_offset
+                        );
+                        vec![0u8; in_chunk_start + bytes_to_write]
+                    } else if content_size_before_write > chunk_start_offset {
+                        // Partial write within existing data — read back from volume
+                        let existing_len = std::cmp::min(
+                            chunk_size,
+                            content_size_before_write - chunk_start_offset,
+                        ) as usize;
+                        let (rbw_vol_id, rbw_needle_id) = resolve_stripe_chunk(
+                            placement,
+                            &stripe_chunks,
+                            chunk_start_offset,
+                            chunk_size,
+                        )
+                        .unwrap_or_else(|| {
+                            // Fallback: try chunk_map, then first chunk
+                            chunk_map
+                                .get(&chunk_start_offset)
+                                .copied()
+                                .unwrap_or((stripe_chunks[0].volume_id, stripe_chunks[0].needle_id))
+                        });
+                        let rbw_addr = self.client.get_volume_addr(rbw_vol_id).ok();
+                        let mut base = if let Some(ref addr) = rbw_addr {
+                            match self.client.read_blob(
+                                addr,
+                                rbw_vol_id,
+                                rbw_needle_id,
+                                0,
+                                existing_len as i32,
+                            ) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    warn!(
+                                        "write stripe: read-before-write failed inode={} chunk_offset={}: {} — using zeros",
+                                        inode, chunk_start_offset, e
+                                    );
+                                    vec![0u8; existing_len]
+                                }
+                            }
+                        } else {
+                            vec![0u8; existing_len]
+                        };
+                        let needed_len = in_chunk_start + bytes_to_write;
+                        if base.len() < needed_len {
+                            base.resize(needed_len, 0);
+                        }
+                        base
+                    } else {
+                        vec![0u8; in_chunk_start + bytes_to_write]
+                    };
+                    new_data[in_chunk_start..in_chunk_start + bytes_to_write].copy_from_slice(
+                        &buf[data_offset as usize..data_offset as usize + bytes_to_write],
+                    );
+                    self.chunk_cache
+                        .put(inode, chunk_start_offset, new_data.into(), mtime, 0);
+                }
+
+                self.mark_dirty(inode, chunk_idx);
+                data_offset += bytes_to_write as u64;
+                current_offset += bytes_to_write as u64;
+            }
+
+            // Update size and chunk sizes
+            let _meta_guard = meta_lock.lock();
+            if let Some(current_entry) = self.cache.get_inode(inode) {
+                if new_size > current_entry.size {
+                    self.cache.update_size(inode, new_size);
+                }
+            }
+            // Update chunk sizes for Stripe: each 1MB chunk gets its own entry
+            self.cache
+                .update_chunk_sizes_after_write_stripe(
+                    inode,
+                    offset,
+                    read_len as u64,
+                    chunk_size,
+                    placement,
+                    &stripe_chunks,
+                );
+            return Ok(read_len);
+        }
 
         if let Some(ref fid) = entry.fid {
             let end_offset = offset + read_len as u64;
@@ -3388,6 +3973,7 @@ impl FileSystem for PowerFsFs {
             content_size: link_str.len() as u64,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         };
         self.cache.insert(cached_entry.clone());
@@ -3478,6 +4064,7 @@ impl FileSystem for PowerFsFs {
                     content_size: entry.content_size,
                     disk_size: entry.disk_size,
                     generation: 0,
+                    placement: None,
                     cached_at: Instant::now(),
                 };
 

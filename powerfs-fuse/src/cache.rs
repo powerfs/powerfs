@@ -48,6 +48,10 @@ pub struct CachedEntry {
     pub content_size: u64,
     pub disk_size: u64,
     pub generation: u64,
+    /// P3: Placement strategy (Stripe/WideStripe). None = Flat/Inline (use fid/chunks).
+    /// When Some(Stripe), write/read handlers use Placement::locate() to route I/O
+    /// to the correct volume based on file offset.
+    pub placement: Option<powerfs_layout::Placement>,
     /// When this cache entry was populated (used for TTL fallback)
     pub cached_at: Instant,
 }
@@ -152,6 +156,7 @@ impl MetadataCache {
             content_size: 4096,
             disk_size: 4096,
             generation: 1,
+            placement: None,
             cached_at: Instant::now(),
         });
         cache
@@ -653,6 +658,70 @@ impl MetadataCache {
         }
     }
 
+    /// P3: Update chunk sizes after a Stripe write.
+    ///
+    /// Unlike Flat mode (which uses a single fid for all chunks), Stripe mode
+    /// distributes chunks across multiple volumes. Each 1MB sub-chunk within a
+    /// stripe unit gets its own needle_id (`base_needle + chunk_idx_within_unit`).
+    /// The volume_id comes from the stripe unit's pre-allocated chunk.
+    pub fn update_chunk_sizes_after_write_stripe(
+        &self,
+        inode: u64,
+        offset: u64,
+        length: u64,
+        chunk_size: u64,
+        placement: &powerfs_layout::Placement,
+        stripe_chunks: &[CachedFileChunk],
+    ) {
+        if length == 0 {
+            return;
+        }
+        let write_end = offset + length;
+        let start_chunk_idx = offset / chunk_size;
+        let end_chunk_idx = (write_end - 1) / chunk_size;
+
+        let stripe_size = match placement {
+            powerfs_layout::Placement::Stripe { stripe_size, .. }
+            | powerfs_layout::Placement::WideStripe { stripe_size, .. } => *stripe_size,
+            _ => return,
+        };
+        let stripe_size = stripe_size.max(1);
+
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            let mtime = entry.mtime.max(0) as u64;
+
+            for chunk_idx in start_chunk_idx..=end_chunk_idx {
+                let chunk_offset = chunk_idx * chunk_size;
+                let chunk_data_end = write_end.min(chunk_offset + chunk_size);
+                let chunk_data_size = chunk_data_end - chunk_offset;
+
+                // Resolve (volume_id, needle_id) for this chunk via stripe mapping
+                let stripe_unit_idx = (chunk_offset / stripe_size) as usize;
+                if stripe_unit_idx >= stripe_chunks.len() {
+                    break; // beyond pre-allocated range
+                }
+                let base = &stripe_chunks[stripe_unit_idx];
+                let chunk_idx_within_unit = (chunk_offset % stripe_size) / chunk_size.max(1);
+                let needle_id = base.needle_id.saturating_add(chunk_idx_within_unit);
+                let volume_id = base.volume_id;
+
+                if let Some(chunk) = entry.chunks.iter_mut().find(|c| c.offset == chunk_offset) {
+                    chunk.size = chunk.size.max(chunk_data_size);
+                } else {
+                    entry.chunks.push(CachedFileChunk {
+                        offset: chunk_offset,
+                        size: chunk_data_size,
+                        mtime,
+                        needle_id,
+                        volume_id,
+                        crc32: 0,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn update_attr(&self, inode: u64, params: UpdateAttrParams) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
@@ -1040,6 +1109,7 @@ impl MetadataCache {
                 content_size: 4096,
                 disk_size: 4096,
                 generation: 1,
+                placement: None,
                 cached_at: Instant::now(),
             },
         );
@@ -1179,6 +1249,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1217,6 +1288,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1255,6 +1327,7 @@ mod tests {
                 content_size: 0,
                 disk_size: 0,
                 generation: 0,
+                placement: None,
                 cached_at: Instant::now(),
             });
         }
@@ -1291,6 +1364,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1327,6 +1401,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1366,6 +1441,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1406,6 +1482,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1448,6 +1525,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -1493,6 +1571,7 @@ mod tests {
             content_size: 0,
             disk_size: 0,
             generation: 0,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -2081,6 +2160,7 @@ mod chunk_cache_tests {
             content_size: 0,
             disk_size: 0,
             generation: 1,
+            placement: None,
             cached_at: Instant::now(),
         });
 
@@ -2129,6 +2209,7 @@ mod chunk_cache_tests {
             content_size: 0,
             disk_size: 0,
             generation: 1,
+            placement: None,
             cached_at: Instant::now(),
         });
 
