@@ -808,15 +808,43 @@ async fn resolve_filer_endpoint(
         .await
         .map_err(|e| format!("gRPC ListFilers 失败: {}", e))?;
     let resp = response.into_inner();
-    resp.filers
-        .into_iter()
-        .find(|f| f.node_id == node_id)
-        .map(|f| powerfs_monitor::filer_admin_client::FilerEndpoint {
+    if let Some(f) = resp.filers.into_iter().find(|f| f.node_id == node_id) {
+        return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
             node_id: f.node_id,
             address: f.address,
             http_port: f.http_port,
-        })
-        .ok_or_else(|| format!("filer 节点 {} 未在 master 注册", node_id))
+        });
+    }
+
+    // 回退: gRPC 未注册时从 metric_store 心跳数据查找
+    // (filer 可能因 powerfs-net 握手失败未注册到 master, 但心跳仍可达)
+    let heartbeat_nodes = state.metric_store.get_nodes().await;
+    if let Some(n) = heartbeat_nodes
+        .iter()
+        .find(|n| n.node_type == "filer" && n.id == node_id)
+    {
+        let address = if n.address.is_empty() || n.address == "0.0.0.0" {
+            n.id.clone()
+        } else {
+            n.address.clone()
+        };
+        let http_port = if n.address.is_empty() || n.address == "0.0.0.0" || n.http_port == 0 {
+            8888
+        } else {
+            n.http_port
+        };
+        warn!(
+            "resolve_filer_endpoint: gRPC 未注册 {}, 回退到心跳数据 (addr={}, port={})",
+            node_id, address, http_port
+        );
+        return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
+            node_id: n.id.clone(),
+            address,
+            http_port,
+        });
+    }
+
+    Err(format!("filer 节点 {} 未在 master 注册", node_id))
 }
 
 /// 列出所有 filer 节点 — 合并 gRPC ListFilers (注册视角) + metric_store (心跳视角)。
@@ -1281,7 +1309,7 @@ async fn list_filer_endpoints(
             return Vec::new();
         }
     };
-    response
+    let mut endpoints: Vec<powerfs_monitor::filer_admin_client::FilerEndpoint> = response
         .into_inner()
         .filers
         .into_iter()
@@ -1290,7 +1318,36 @@ async fn list_filer_endpoints(
             address: f.address,
             http_port: f.http_port,
         })
-        .collect()
+        .collect();
+
+    // 回退: gRPC 返回空时从 metric_store 心跳数据获取 filer 列表。
+    // 当 filer 未注册到 master (powerfs-net 握手失败等环境问题) 时,
+    // 心跳数据仍可用。心跳 address 可能为 "0.0.0.0" (不可达),
+    // 此时用 node_id 作为容器网络主机名 (docker compose 容器名即主机名)。
+    // 心跳 http_port 可能被错误上报为 grpc_port, address 不可达时强制用 8888。
+    if endpoints.is_empty() {
+        let heartbeat_nodes = state.metric_store.get_nodes().await;
+        for n in heartbeat_nodes.iter().filter(|n| n.node_type == "filer") {
+            let (address, http_port): (String, u32) = if n.address.is_empty() || n.address == "0.0.0.0" {
+                (n.id.clone(), 8888)
+            } else {
+                (n.address.clone(), if n.http_port == 0 { 8888 } else { n.http_port })
+            };
+            endpoints.push(powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: n.id.clone(),
+                address,
+                http_port,
+            });
+        }
+        if !endpoints.is_empty() {
+            warn!(
+                "list_filer_endpoints: gRPC ListFilers 为空, 回退到心跳数据 ({} 个 filer)",
+                endpoints.len()
+            );
+        }
+    }
+
+    endpoints
 }
 
 // ── cluster/status 聚合 ──
