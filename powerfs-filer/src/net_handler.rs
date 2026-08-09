@@ -78,6 +78,14 @@ pub const PLACEMENT_XATTR_KEY: &str = "powerfs.placement";
 /// stripe_size 推断: chunks[1].offset - chunks[0].offset.
 /// 若 chunks 未排序或 offset 不均匀, 兜底用 1MB (POWERFS_CHUNK_SIZE).
 fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
+    // K3-DBG: log chunks for stripe detection diagnosis
+    let vid_list: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+    let off_list: Vec<u64> = chunks.iter().map(|c| c.offset).collect();
+    info!(
+        "K3-DBG detect_placement: chunks={} volume_ids={:?} offsets={:?}",
+        chunks.len(), vid_list, off_list
+    );
+
     if chunks.len() < 2 {
         return Placement::Flat;
     }

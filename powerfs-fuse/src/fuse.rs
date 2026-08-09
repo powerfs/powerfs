@@ -1015,6 +1015,11 @@ impl PowerFsFs {
             entry.chunks.len(),
             entry.fid.as_ref().map(|f| f.to_string())
         );
+        info!(
+            "K3-DBG sync_close: inode={} chunks={:?}",
+            inode,
+            entry.chunks.iter().map(|c| (c.offset, c.volume_id, c.needle_id, c.size)).collect::<Vec<_>>()
+        );
 
         let parent = entry.parent;
         let chunks_wire: Vec<powerfs_coherence::ChunkWire> = entry
