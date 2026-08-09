@@ -115,6 +115,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       RUST_LOG: ${RUST_LOG:-info,powerfs_filer=info,powerfs_net=debug}
       REDIS_URL: redis://redis:6379
+      POWERFS_EC_MIN_FILE_SIZE: "1073741824"
     depends_on:
       master-1:
         condition: service_healthy
