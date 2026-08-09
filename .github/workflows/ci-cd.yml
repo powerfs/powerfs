@@ -137,7 +137,9 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+      with:
+        components: llvm-tools-preview
+
     - name: Install grcov
       run: cargo install grcov
     
@@ -153,8 +155,8 @@ jobs:
     - name: Run Tests with Coverage
       run: |
         cargo clean
-        RUSTFLAGS="-Z instrument-coverage" cargo build --all
-        RUSTFLAGS="-Z instrument-coverage" cargo test --all
+        RUSTFLAGS="-C instrument-coverage" cargo build --all
+        RUSTFLAGS="-C instrument-coverage" cargo test --all
       env:
         LLVM_PROFILE_FILE: "powerfs-%p-%m.profraw"
     
