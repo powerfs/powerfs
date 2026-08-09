@@ -729,7 +729,19 @@ impl FilerNetHandler {
 
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
-            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+            None => {
+                // 调试: LOOKUP 失败时打印 directory_entries 中的 key 用于对比
+                let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+                let entries = self.meta_shard_manager.list_directory(parent_ino);
+                let entry_names: Vec<String> = entries.iter()
+                    .map(|e| format!("'{}'(len={})", e.name, e.name.len()))
+                    .collect();
+                warn!(
+                    "FILER_NET_LOOKUP: NOT FOUND parent_ino={}, name='{}'(len={}), shard={}, dir_entries=[{}]",
+                    parent_ino, name, name.len(), shard_id.0, entry_names.join(", ")
+                );
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
         }
     }
 
