@@ -439,6 +439,26 @@ impl MetaShardManager {
         }
     }
 
+    /// Poll the shard store until the named entry under `parent_inode`
+    /// appears, or timeout (500 ms).  Same rationale as
+    /// `wait_for_entry_removed`: the spawned apply task runs asynchronously
+    /// so the entry may not be visible immediately after `propose()` returns.
+    async fn wait_for_entry_appeared(&self, shard_id: ShardId, parent_inode: u64, name: &str) {
+        for _ in 0..50 {
+            let exists = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .map(|s| s.lookup(parent_inode, name).is_some())
+                    .unwrap_or(false)
+            };
+            if exists {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn delete_file(&self, parent_inode: u64, name: &str) -> Result<(), String> {
         let shard_id = self.shard_strategy.calculate_shard(parent_inode);
 
@@ -613,6 +633,9 @@ impl MetaShardManager {
             self.raft_group_manager
                 .propose(old_shard, cmd.serialize())
                 .await?;
+
+            self.wait_for_entry_appeared(old_shard, new_parent_inode, new_name)
+                .await;
             Ok(())
         } else {
             Err("cross-shard rename not supported yet".to_string())
@@ -936,6 +959,9 @@ impl MetaShardManager {
             self.raft_group_manager
                 .propose(old_shard_id, cmd.serialize())
                 .await?;
+
+            self.wait_for_entry_appeared(old_shard_id, new_parent_ino, new_name)
+                .await;
             Ok(())
         } else {
             Err("cross-shard rename not supported yet".to_string())
@@ -1392,6 +1418,9 @@ impl MetaShardManager {
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+
+        self.wait_for_entry_appeared(shard_id, new_parent_inode, new_name)
+            .await;
         Ok(())
     }
 
@@ -1766,6 +1795,9 @@ impl MetaShardManager {
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+
+        self.wait_for_entry_removed(shard_id, bucket_root_inode, key)
+            .await;
         Ok(())
     }
 
