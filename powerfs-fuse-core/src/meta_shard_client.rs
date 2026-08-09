@@ -965,6 +965,7 @@ impl MetaShardClient {
         const MAX_ATTEMPTS: u32 = 10;
         let mut attempt: u32 = 0;
         // 记录最后一次错误信息，用于最终返回
+        #[allow(unused_assignments)]
         let mut last_err: String = String::new();
         // 轮换候选地址列表（仅在发生网络错误/熔断时使用）
         let rotation = self.rotation_candidates();
@@ -2095,6 +2096,9 @@ pub(crate) async fn process_request_internal(
     // 10 次尝试：覆盖 Raft 选举（~1-3s）+ 网络抖动恢复窗口
     const MAX_ATTEMPTS: u32 = 10;
     let mut attempt: u32 = 0;
+    // Initial value is never read: every retry path reassigns last_err
+    // before returning it.  Kept to satisfy the borrow checker.
+    #[allow(unused_assignments)]
     let mut last_err: ClientError = ClientError::Internal("no attempts made".to_string());
 
     // 获取默认 filer 地址作为回退

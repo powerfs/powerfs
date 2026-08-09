@@ -1891,7 +1891,14 @@ impl FilerNetHandler {
             Some(info) => match info.extended.get(&key) {
                 Some(val) => {
                     let mut enc = TlvEncoder::new();
-                    enc.add_bytes(FieldId::XattrValue, val);
+                    if let Err(e) = enc.add_bytes(FieldId::XattrValue, val) {
+                        warn!("FILER_NET_GETXATTR: encode error for inode {}: {}", inode, e);
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                        ));
+                    }
                     Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
                 }
                 None => {

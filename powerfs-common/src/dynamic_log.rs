@@ -32,16 +32,6 @@ fn parse_level(s: &str) -> Result<LevelFilter, String> {
     }
 }
 
-fn level_to_str(lf: LevelFilter) -> &'static str {
-    match lf {
-        LevelFilter::Off => "off",
-        LevelFilter::Error => "error",
-        LevelFilter::Warn => "warn",
-        LevelFilter::Info => "info",
-        LevelFilter::Debug => "debug",
-        LevelFilter::Trace => "trace",
-    }
-}
 
 /// Set the runtime log level.
 ///
