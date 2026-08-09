@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Card,
   Tree,
@@ -43,6 +43,7 @@ import { useTranslation } from 'react-i18next'
 import type { TopologyData, VolumeServerInfo, NodeInfo, FilerNodeInfo } from '@/types'
 import { getTopology } from '@/services/api'
 import { formatBytes } from '@/utils/format'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Title, Text } = Typography
 
@@ -80,10 +81,24 @@ function ClusterTopology() {
 
   useEffect(() => {
     loadTopology()
-    const interval = setInterval(loadTopology, 15000)
+    // Backoff polling to 30s — WS triggers immediate reload on change.
+    const interval = setInterval(loadTopology, 30000)
     return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Topology is an aggregate (masters+filers+volume_servers). Backend
+  // doesn't broadcast a topology event; instead, when any node/volume
+  // update arrives via WS, trigger a debounced reload.
+  const lastReloadRef = useRef(0)
+  useMetricStream({
+    onMetricUpdate: () => {
+      const now = Date.now()
+      if (now - lastReloadRef.current < 2000) return
+      lastReloadRef.current = now
+      void loadTopology()
+    },
+  })
 
   const buildTree = (data: TopologyData): TreeNode[] => {
     const root: TreeNode = {

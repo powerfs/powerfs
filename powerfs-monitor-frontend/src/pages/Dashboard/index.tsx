@@ -15,7 +15,7 @@ import type { EChartsOption } from 'echarts'
 import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData, FilerStatus } from '@/types'
 import type { SchedulerStatus } from '@/services/api'
 import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes, getFilerStatus, getBalancerStatus } from '@/services/api'
-import { connectWebSocket, disconnectWebSocket, type MetricUpdate } from '@/services/websocket'
+import { useMetricStream } from '@/hooks/useMetricStream'
 import { formatBytes, formatPercent, formatUptime, formatNumber } from '@/utils/format'
 import { KpiBar, MetricChart, EmptyState, RefreshControl, RealtimeChart, StatusTag } from '@/components/pro'
 
@@ -87,27 +87,34 @@ function Dashboard() {
   useEffect(() => {
     void loadData()
     void loadHistoryData()
-    connectWebSocket(onMetricUpdate)
+    // Backoff polling to 30s — real-time updates flow through WS.
     const interval = setInterval(() => {
       void loadData()
       void loadHistoryData()
-    }, 10000)
-    return () => {
-      clearInterval(interval)
-      disconnectWebSocket()
-    }
+    }, 30000)
+    return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const onMetricUpdate = (data: MetricUpdate) => {
-    if (data.type === 'metric_update') {
+  // Live updates: backend broadcasts 'cluster'/'kv'/'nodes'/'volumes' sources.
+  // cluster -> patch clusterMetrics; kv -> patch kvMetrics; nodes/volumes
+  // -> trigger reload (aggregates need recompute).
+  useMetricStream({
+    onMetricUpdate: (data) => {
+      const payload = data.payload
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+      const patch = payload as Record<string, unknown>
       if (data.source === 'cluster') {
-        setClusterMetrics(prev => ({ ...prev, ...data.payload } as ClusterMetrics))
+        setClusterMetrics(prev => ({ ...(prev ?? {} as ClusterMetrics), ...patch } as ClusterMetrics))
       } else if (data.source === 'kv') {
-        setKVMetrics(prev => ({ ...prev, ...data.payload } as KVMetrics))
+        setKVMetrics(prev => ({ ...(prev ?? {} as KVMetrics), ...patch } as KVMetrics))
       }
-    }
-  }
+    },
+    onAlertUpdate: () => {
+      // Refresh alert list when an alert triggers/resolves.
+      void getAlerts().then(setAlerts).catch(() => {})
+    },
+  })
 
   const storagePercent = clusterMetrics && clusterMetrics.total_storage > 0
     ? (clusterMetrics.used_storage / clusterMetrics.total_storage) * 100

@@ -43,6 +43,7 @@ import {
   type StatCardProps,
 } from '@/components/pro'
 import { resolveNodeStatus, raftRolePalette } from '@/styles/status'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Text, Title } = Typography
 
@@ -73,9 +74,31 @@ function Nodes() {
 
   useEffect(() => {
     void loadNodes()
-    const interval = setInterval(() => void loadNodes(), 10000)
+    // Backoff polling to 30s — real-time updates flow through WS.
+    const interval = setInterval(() => void loadNodes(), 30000)
     return () => clearInterval(interval)
   }, [loadNodes])
+
+  // Live merge: WS pushes either a single NodeInfo (event-driven) or the
+  // full list snapshot (on connect). Both update by node_id.
+  useMetricStream({
+    source: 'nodes',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      if (Array.isArray(payload)) {
+        setNodes(payload as NodeInfo[])
+      } else if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const node = payload as NodeInfo
+        setNodes((prev) => {
+          const idx = prev.findIndex((n) => n.id === node.id)
+          if (idx === -1) return [...prev, node]
+          const next = [...prev]
+          next[idx] = { ...next[idx], ...node }
+          return next
+        })
+      }
+    },
+  })
 
   const loadNodeDevices = useCallback(async (nodeId: string) => {
     try {

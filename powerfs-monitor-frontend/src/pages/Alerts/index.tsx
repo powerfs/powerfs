@@ -14,6 +14,7 @@ import {
 } from '@ant-design/icons'
 import type { AlertInfo, AlertRule } from '@/types'
 import { getAlerts, getAlertRules, acknowledgeAlert } from '@/services/api'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 function Alerts() {
   const [alerts, setAlerts] = useState<AlertInfo[]>([])
@@ -23,12 +24,6 @@ function Alerts() {
   const [showRuleForm, setShowRuleForm] = useState(false)
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null)
 
-  useEffect(() => {
-    loadData()
-    const interval = setInterval(loadData, 10000)
-    return () => clearInterval(interval)
-  }, [])
-
   const loadData = async () => {
     const [alertList, ruleList] = await Promise.all([
       getAlerts(),
@@ -37,6 +32,20 @@ function Alerts() {
     setAlerts(alertList)
     setRules(ruleList)
   }
+
+  useEffect(() => {
+    loadData()
+    // Backoff polling to 30s — alert events trigger immediate reload.
+    const interval = setInterval(loadData, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Refresh alerts the moment a trigger/resolve event arrives.
+  useMetricStream({
+    onAlertUpdate: () => {
+      void getAlerts().then(setAlerts).catch(() => {})
+    },
+  })
 
   const handleViewDetail = (alert: AlertInfo) => {
     setSelectedAlert(alert)
