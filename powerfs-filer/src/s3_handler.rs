@@ -406,12 +406,34 @@ impl S3Handler {
         }
     }
 
-    pub async fn list_objects(&self, bucket: &str) -> axum::response::Response {
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        params: &crate::server::ListObjectsParams,
+    ) -> axum::response::Response {
         struct ObjectSummary {
             key: String,
             mtime_rfc3339: String,
             etag: String,
             size: u64,
+        }
+
+        // XML-escape helper for S3 keys (keys may contain & < > and other chars).
+        fn xml_escape(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        }
+
+        // Hex-encode continuation token (opaque to client; round-trips the last key).
+        fn encode_token(key: &str) -> String {
+            hex::encode(key.as_bytes())
+        }
+        fn decode_token(tok: &str) -> Option<String> {
+            let bytes = hex::decode(tok).ok()?;
+            String::from_utf8(bytes).ok()
         }
 
         let entries: Vec<ObjectSummary> = if let Some(mgr) = &self.meta_shard_manager {
@@ -459,31 +481,126 @@ impl S3Handler {
             }
         };
 
+        // Stable order is required for deterministic pagination.
+        let mut entries = entries;
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Continuation token (v2) takes precedence over start-after (v2) which
+        // takes precedence over marker (v1, not supported here — we treat v1 as
+        // a one-shot list of everything).
+        let is_v2 = matches!(params.list_type, Some(2));
+        if is_v2 {
+            if let Some(ct) = &params.continuation_token {
+                if let Some(last_key) = decode_token(ct) {
+                    entries.retain(|e| e.key.as_str() > last_key.as_str());
+                }
+            } else if let Some(sa) = &params.start_after {
+                entries.retain(|e| e.key.as_str() > sa.as_str());
+            }
+        }
+
+        // Prefix filtering (applied before delimiter grouping).
+        let prefix = params.prefix.clone().unwrap_or_default();
+        if !prefix.is_empty() {
+            entries.retain(|e| e.key.starts_with(&prefix));
+        }
+
+        // Delimiter → roll matching entries into <CommonPrefixes>.
+        let mut common_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(delim) = &params.delimiter {
+            if !delim.is_empty() {
+                let mut kept = Vec::with_capacity(entries.len());
+                for e in entries.drain(..) {
+                    if let Some(rest) = e.key.strip_prefix(&prefix) {
+                        if let Some(idx) = rest.find(delim) {
+                            let cp = format!("{}{}", &prefix, &rest[..idx + delim.len()]);
+                            common_prefixes.insert(cp);
+                            continue;
+                        }
+                    }
+                    kept.push(e);
+                }
+                entries = kept;
+            }
+        }
+
+        // max-keys: S3 default 1000, server caps to [0, 1000].
+        let max_keys = params.max_keys.unwrap_or(1000).clamp(0, 1000) as usize;
+        let total_after_filter = entries.len();
+        let truncated = total_after_filter > max_keys;
+        if truncated {
+            entries.truncate(max_keys);
+        }
+        let key_count = entries.len();
+
+        // NextContinuationToken: opaque hex of the last key returned, only when truncated.
+        let next_ct = if truncated {
+            entries.last().map(|e| encode_token(&e.key))
+        } else {
+            None
+        };
+
+        let contents_xml = entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "  <Contents>\n    <Key>{}</Key>\n    <LastModified>{}</LastModified>\n    <ETag>{}</ETag>\n    <Size>{}</Size>\n    <StorageClass>STANDARD</StorageClass>\n  </Contents>",
+                    xml_escape(&e.key),
+                    e.mtime_rfc3339,
+                    xml_escape(&e.etag),
+                    e.size
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let cp_xml = common_prefixes
+            .iter()
+            .map(|cp| format!("  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>", xml_escape(cp)))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        // Build response. Include v2-only fields (KeyCount, ContinuationToken,
+        // NextContinuationToken, StartAfter) only when list-type=2 was requested.
+        let v2_fields = if is_v2 {
+            let mut s = format!("\n  <KeyCount>{}</KeyCount>", key_count);
+            if let Some(ct) = &params.continuation_token {
+                s.push_str(&format!("\n  <ContinuationToken>{}</ContinuationToken>", xml_escape(ct)));
+            }
+            if let Some(sa) = &params.start_after {
+                s.push_str(&format!("\n  <StartAfter>{}</StartAfter>", xml_escape(sa)));
+            }
+            if let Some(nct) = &next_ct {
+                s.push_str(&format!("\n  <NextContinuationToken>{}</NextContinuationToken>", xml_escape(nct)));
+            }
+            s
+        } else {
+            String::new()
+        };
+
+        let delim_xml = if params.delimiter.is_some() {
+            format!("\n  <Delimiter>{}</Delimiter>", xml_escape(params.delimiter.as_deref().unwrap_or("")))
+        } else {
+            String::new()
+        };
+
+        let enc_xml = if params.encoding_type.as_deref() == Some("url") {
+            "\n  <EncodingType>url</EncodingType>".to_string()
+        } else {
+            String::new()
+        };
+
         let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<ListBucketResult>
-  <Name>{}</Name>
-  <Prefix></Prefix>
-  <Marker></Marker>
-  <MaxKeys>1000</MaxKeys>
-  <IsTruncated>false</IsTruncated>
-{}
-</ListBucketResult>",
-            bucket,
-            entries
-                .into_iter()
-                .map(|e| format!(
-                    "  <Contents>
-    <Key>{}</Key>
-    <LastModified>{}</LastModified>
-    <ETag>{}</ETag>
-    <Size>{}</Size>
-    <StorageClass>STANDARD</StorageClass>
-  </Contents>",
-                    e.key, e.mtime_rfc3339, e.etag, e.size
-                ))
-                .collect::<Vec<String>>()
-                .join("\n")
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult>\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>{}{}{}\n{}\n{}\n</ListBucketResult>",
+            xml_escape(bucket),
+            xml_escape(&prefix),
+            max_keys,
+            truncated,
+            v2_fields,
+            delim_xml,
+            enc_xml,
+            contents_xml,
+            cp_xml,
         );
         (StatusCode::OK, body).into_response()
     }

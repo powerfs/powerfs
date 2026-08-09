@@ -1,11 +1,38 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Json},
     routing::{delete, get, head, post, put},
     Router, Server,
 };
+
+/// S3 ListObjects (v1) / ListObjectsV2 query parameters.
+/// Implements the subset of S3 semantics needed by PowerFS clients:
+/// prefix filtering, max-keys truncation, delimiter-based common prefixes,
+/// and v2 continuation-token pagination.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ListObjectsParams {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// Echoed back; actual cap is [0, 1000].
+    #[serde(default, rename = "max-keys")]
+    pub max_keys: Option<i64>,
+    /// v2: opaque token returned as NextContinuationToken.
+    #[serde(default, rename = "continuation-token")]
+    pub continuation_token: Option<String>,
+    /// v2: exclusive lower bound on key (skips entries <= start_after).
+    #[serde(default, rename = "start-after")]
+    pub start_after: Option<String>,
+    /// v2: "url" (only value S3 supports); controls key encoding in response.
+    #[serde(default, rename = "encoding-type")]
+    pub encoding_type: Option<String>,
+    /// v2: presence with value "2" selects ListObjectsV2 response shape.
+    #[serde(default, rename = "list-type")]
+    pub list_type: Option<u8>,
+}
 use log::info;
 use powerfs_common::error::PowerFsError;
 use serde::Deserialize;
@@ -151,8 +178,9 @@ async fn head_bucket(
 async fn bucket_handler(
     State(state): State<Arc<FilerState>>,
     Path(bucket): Path<String>,
+    Query(params): Query<ListObjectsParams>,
 ) -> axum::response::Response {
-    state.s3_handler.list_objects(&bucket).await
+    state.s3_handler.list_objects(&bucket, &params).await
 }
 
 async fn object_put_handler(
