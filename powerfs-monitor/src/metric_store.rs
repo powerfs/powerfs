@@ -24,6 +24,12 @@ pub struct NodeInfo {
     pub volume_count: u32,
     pub is_leader: bool,
     pub raft_term: u64,
+    /// Wall-clock instant of the last NodeStatusEvent received from this
+    /// node. Used by `mark_stale_nodes_offline` to flip nodes that have
+    /// stopped heartbeating to `offline`. Not serialized — internal only,
+    /// the API consumer never sees this (and historically never did).
+    #[serde(skip)]
+    pub last_seen: Instant,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,10 +212,51 @@ impl MetricStore {
                     volume_count: event.volume_count,
                     is_leader: event.is_leader,
                     raft_term: event.raft_term,
+                    last_seen: Instant::now(),
                 },
             );
         }
         self.update_cluster_metrics().await;
+        self.derive_storage_devices().await;
+    }
+
+    /// Mark nodes that haven't sent a NodeStatusEvent within `timeout_secs` as
+    /// `offline`. This is the heartbeat-timeout mechanism — without it, a
+    /// crashed volume/filer/master process would stay "healthy" in memory
+    /// forever, masking real outages from every downstream view (Nodes page,
+    /// ClusterTopology, Dashboard KPIs, StorageDevices derive, Master Raft
+    /// quorum count).
+    ///
+    /// Preserves the original `status` string of master nodes (leader /
+    /// follower) because Raft role is orthogonal to process liveness and
+    /// the MasterRaft page reads role off the status field. Volume/filer
+    /// nodes (which always publish "healthy" when alive) are simply
+    /// rewritten to "offline".
+    pub async fn mark_stale_nodes_offline(&self, timeout_secs: u64) {
+        let now = Instant::now();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let mut changed = false;
+        {
+            let mut nodes = self.nodes.write().await;
+            for n in nodes.values_mut() {
+                if now.duration_since(n.last_seen) > timeout {
+                    // Master role is encoded in the status field (leader /
+                    // follower) and is NOT liveness — don't clobber it. The
+                    // MasterRaft page derives "healthy" from role + last_seen.
+                    if n.node_type == "master" {
+                        continue;
+                    }
+                    if n.status != "offline" {
+                        n.status = "offline".to_string();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.update_cluster_metrics().await;
+            self.derive_storage_devices().await;
+        }
     }
 
     pub async fn update_volume(&self, event: VolumeStatusEvent) {
@@ -462,17 +509,24 @@ impl MetricStore {
                 }
             }
 
-            let default_status = if cap == 0 {
+            // Status: derive from the node's liveness status. Producers
+            // publish different status strings per node type (master ->
+            // leader/follower, volume/filer -> healthy, watchdog ->
+            // offline), so we treat any "alive" status as Online. cap == 0
+            // also forces Offline (no capacity advertised).
+            let node_alive = node
+                .as_ref()
+                .map(|n| matches!(n.status.as_str(), "online" | "healthy" | "leader" | "follower"))
+                .unwrap_or(false);
+            let default_status = if cap == 0 || !node_alive {
                 DeviceStatus::Offline
-            } else if node.map(|n| n.status.as_str() == "online").unwrap_or(false) {
-                DeviceStatus::Online
             } else {
-                DeviceStatus::Offline
+                DeviceStatus::Online
             };
             let status = overrides.get(&nid).copied().unwrap_or(default_status);
 
             let used_ratio = if cap == 0 { 0.0 } else { used as f64 / cap as f64 };
-            let default_health = if node.map(|n| n.status.as_str() != "online").unwrap_or(true) {
+            let default_health = if !node_alive {
                 DeviceHealth::Unknown
             } else if used_ratio > 0.95 || node.map(|n| n.disk_usage > 95.0).unwrap_or(false) {
                 DeviceHealth::Critical
