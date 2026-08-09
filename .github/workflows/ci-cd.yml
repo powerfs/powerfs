@@ -3,9 +3,9 @@ name: PowerFS CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize" ]
   pull_request:
-    branches: [ main, develop, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize" ]
   workflow_dispatch:
 
 env:
@@ -93,7 +93,7 @@ jobs:
   # 基准测试
   benchmark:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/fronted' && github.event_name == 'push')
     steps:
     - uses: actions/checkout@v4
       with:
@@ -173,7 +173,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     needs: [quality, build, test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
@@ -224,7 +224,7 @@ jobs:
   deploy-test:
     runs-on: ubuntu-latest
     needs: [docker]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
