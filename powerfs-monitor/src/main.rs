@@ -1352,10 +1352,15 @@ async fn list_filer_endpoints(
         .into_inner()
         .filers
         .into_iter()
-        .map(|f| powerfs_monitor::filer_admin_client::FilerEndpoint {
-            node_id: f.node_id,
-            address: f.address,
-            http_port: f.http_port,
+        .map(|f| {
+            // gRPC address 是 "IP:net_port" 格式, 需剥离端口; http_port 常报 0, 默认 8888
+            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+            powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: f.node_id,
+                address,
+                http_port,
+            }
         })
         .collect();
 
