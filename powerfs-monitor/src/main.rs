@@ -123,6 +123,13 @@ struct WsAlertUpdate {
     payload: serde_json::Value,
 }
 
+/// Heartbeat timeout: a node that hasn't published a NodeStatusEvent within
+/// this window is considered offline. Producers publish every 5s (see
+/// powerfs-master/src/master.rs:2790, powerfs-volume/src/server.rs:286,
+/// powerfs-filer/src/main.rs:152), so 30s = 6 missed heartbeats — well past
+/// transient jitter, low enough to surface a real outage in <1 minute.
+const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+
 struct AppState {
     metric_store: Arc<MetricStore>,
     alert_engine: Arc<AlertEngine>,
@@ -558,6 +565,7 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
                         volume_count: 0,
                         is_leader: false,
                         raft_term: 0,
+                        last_seen: std::time::Instant::now(),
                     },
                     volumes: vec![vol.clone()],
                 });
@@ -802,10 +810,25 @@ struct MasterStatus {
 
 async fn get_master_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<MasterStatus>> {
     let nodes = state.metric_store.get_nodes().await;
+    // Heartbeat staleness check: a master that hasn't published a
+    // NodeStatusEvent within NODE_HEARTBEAT_TIMEOUT_SECS is treated as
+    // offline for quorum purposes, even though its last published status
+    // string (leader/follower) is preserved for role display. We do the
+    // staleness flip here rather than in metric_store because master role
+    // lives on the status field — metric_store.mark_stale_nodes_offline
+    // deliberately skips masters to avoid clobbering role.
+    let now = std::time::Instant::now();
+    let master_timeout = std::time::Duration::from_secs(NODE_HEARTBEAT_TIMEOUT_SECS);
     let master_nodes: Vec<NodeInfo> = nodes
         .iter()
         .filter(|n| n.node_type == "master")
-        .cloned()
+        .map(|n| {
+            let mut m = n.clone();
+            if now.duration_since(n.last_seen) > master_timeout && m.status != "offline" {
+                m.status = "offline".to_string();
+            }
+            m
+        })
         .collect();
 
     let leader = master_nodes.iter().find(|n| n.is_leader).cloned();
@@ -815,6 +838,7 @@ async fn get_master_status(State(state): State<Arc<AppState>>) -> Json<ApiRespon
     // status field published by master.rs is exactly "leader" or "follower"
     // (see powerfs-master/src/master.rs:2804). Legacy "online"/"healthy"
     // strings are kept for backwards compatibility with older node agents.
+    // A master flipped to "offline" by the staleness check above is excluded.
     let healthy_masters = master_nodes
         .iter()
         .filter(|n| {
@@ -5105,6 +5129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(start_storage_migration_ticker(metric_store.clone()));
 
+    tokio::spawn(start_node_heartbeat_watchdog(metric_store.clone()));
+
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -5483,6 +5509,23 @@ async fn start_storage_migration_ticker(metric_store: Arc<MetricStore>) {
     loop {
         metric_store.tick_migrations().await;
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Heartbeat watchdog: every 5s, flips volume/filer nodes that haven't
+/// heartbeated within NODE_HEARTBEAT_TIMEOUT_SECS to "offline". Master
+/// nodes are handled separately in `get_master_status` (role-preserving).
+/// See metric_store::mark_stale_nodes_offline for details.
+async fn start_node_heartbeat_watchdog(metric_store: Arc<MetricStore>) {
+    info!(
+        "Node heartbeat watchdog started (5s tick, {}s timeout)",
+        NODE_HEARTBEAT_TIMEOUT_SECS
+    );
+    loop {
+        metric_store
+            .mark_stale_nodes_offline(NODE_HEARTBEAT_TIMEOUT_SECS)
+            .await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 

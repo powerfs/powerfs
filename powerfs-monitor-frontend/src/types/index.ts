@@ -35,9 +35,26 @@ export interface DeviceLocation {
   data_center?: string
 }
 
-export type DeviceType = 'local_file' | 'spdk' | 'nvmeof'
-export type DeviceStatus = 'online' | 'offline' | 'excluded' | 'draining' | 'faulty'
-export type DeviceHealth = 'healthy' | 'warning' | 'critical'
+// Backend DeviceType enum (serde rename_all = "snake_case"):
+// Ssd / Nvme / Hdd / Logical. Legacy values kept for backwards compat.
+export type DeviceType =
+  | 'ssd'
+  | 'nvme'
+  | 'hdd'
+  | 'logical'
+  | 'local_file'
+  | 'spdk'
+  | 'nvmeof'
+// Backend DeviceStatus enum (serde rename_all = "snake_case"):
+// Online / Offline / Draining / Excluded / ReadOnly. `faulty` is legacy.
+export type DeviceStatus =
+  | 'online'
+  | 'offline'
+  | 'excluded'
+  | 'draining'
+  | 'readonly'
+  | 'faulty'
+export type DeviceHealth = 'healthy' | 'warning' | 'critical' | 'unknown'
 
 export interface StorageDevice {
   device_id: string
