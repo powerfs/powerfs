@@ -560,11 +560,20 @@ impl FilerNetHandler {
             reliability: info.reliability.clone(),
             reliability_state: info.reliability_state.clone(),
             compression: info.compression_state.clone(),
-            encoding: ChunkEncoding::PerChunk { chunks },
+            encoding: ChunkEncoding::PerChunk { chunks: chunks.clone() },
         };
 
         encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
             .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+        // 兼容字段: 直接添加 VolumeId (0x92) + FileKey (0x94), 与 CREATE 响应一致.
+        // 内核 powerfs_net_lookup/getattr 用 find_u64(0x92/0x94) 解析,
+        // 不解析 Chunks TLV. 从第一个 chunk 提取 (Flat 单卷模型).
+        // 多 chunk 场景 (Stripe) 由内核 K1-5 chunk_map 支持, 此处仅兼容 Flat.
+        if let Some(first) = chunks.first() {
+            enc.add_u64(FieldId::VolumeId, first.volume_id);
+            enc.add_u64(FieldId::FileKey, first.needle_id);
+        }
 
         // P4: 副本 chunk 列表 — 编码到 FieldId::ReplicaChunks,
         // 客户端读路径 failover 使用 (主 volume 不可用时从副本 volume 读取).
