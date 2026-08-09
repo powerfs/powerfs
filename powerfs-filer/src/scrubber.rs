@@ -411,10 +411,13 @@ impl ScrubberWorker {
                     }
 
                     let shard_size = ec_chunks.first().map(|c| c.size).unwrap_or(0);
-                    // 在 move 到 update_to_ec 之前, 先记录每个 shard 的位置
-                    // (volume_id, needle_id, addr), 便于降级读测试定位并删除特定分片.
-                    let shard_details: Vec<String> = ec_chunks
+                    let total_needles = ec_chunks.len();
+                    let num_groups = total_needles / total_shards;
+                    // 仅记录 group 0 的 shard 位置 (避免大文件日志过长),
+                    // 便于降级读测试定位并删除特定分片.
+                    let g0_details: Vec<String> = ec_chunks
                         .iter()
+                        .take(total_shards)
                         .enumerate()
                         .map(|(i, c)| {
                             let addr = addr_map.get(&c.volume_id).cloned().unwrap_or_default();
@@ -443,8 +446,8 @@ impl ScrubberWorker {
                     {
                         Ok(()) => {
                             info!(
-                                "P6_SCRUBBER: inode {} EC converted, {}+{} shards ({}B each), state -> EC | shards=[{}]",
-                                inode, data_shards, parity_shards, shard_size, shard_details.join(", ")
+                                "P6_SCRUBBER: inode {} EC converted, {}+{} per group, {} groups, {}B shard_size, {} needles total, state -> EC | G0=[{}]",
+                                inode, data_shards, parity_shards, num_groups, shard_size, total_needles, g0_details.join(", ")
                             );
                             processed += 1;
                             // Only convert one file per scan to avoid overload
@@ -523,7 +526,12 @@ impl ScrubberWorker {
             chunks.len()
         );
 
-        // 2. EC 编码
+        // EC shard 固定 1MB (= chunk_size), 确保每个 shard 不超过 TLV 2MB MAX_DATA_SIZE 限制.
+        // 整个文件按 stripe group 切分, 每个 group = data_shards × 1MB, 独立 EC 编码.
+        const EC_SHARD_SIZE: usize = 1024 * 1024; // 1MB = chunk_size
+        let group_data_size = data_shards * EC_SHARD_SIZE;
+
+        // 2. EC 编码器
         let ec_config = powerfs_core::ec_thread::EcConfig {
             data_shards,
             parity_shards,
@@ -541,64 +549,97 @@ impl ScrubberWorker {
             ));
         }
 
-        let shards = encoder.encode(&file_data);
-        if shards.len() != total_shards {
-            return Err(format!(
-                "EC encode returned {} shards, expected {}",
-                shards.len(),
-                total_shards
-            ));
-        }
-
-        let shard_size = shards[0].len();
-
-        // 3. 分配 volumes + needle_ids (anti-affinity)
-        let alloc = self
-            .net_handler
-            .alloc_for_stripe_file(total_shards as u32)
-            .ok_or_else(|| "no volumes available for EC shard allocation".to_string())?;
-
-        // 4. 写入每个 shard 到对应 volume
+        let num_groups = file_data.len().div_ceil(group_data_size);
         let now = chrono::Utc::now().timestamp() as u64;
-        let mut ec_chunks = Vec::with_capacity(total_shards);
-        for (i, shard_data) in shards.iter().enumerate() {
-            let (volume_id, needle_id) = alloc[i];
-            let addr = addr_map
-                .get(&volume_id)
-                .ok_or_else(|| format!("EC shard vol {} addr not found", volume_id))?
-                .clone();
+        let mut ec_chunks = Vec::with_capacity(num_groups * total_shards);
 
-            self.volume_client
-                .write_needle(&addr, volume_id, needle_id, shard_data)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "write_needle EC shard {} vol={} needle={:#x} failed: {}",
-                        i, volume_id, needle_id, e
-                    )
-                })?;
+        // 3. 按 stripe group 编码: 每个 group = data_shards × 1MB, 独立编码为
+        // total_shards × 1MB, 每个 shard 写入独立 needle (不超过 TLV 2MB 限制).
+        for group_idx in 0..num_groups {
+            let group_start = group_idx * group_data_size;
+            let group_end = std::cmp::min(group_start + group_data_size, file_data.len());
+            let group_data = &file_data[group_start..group_end];
 
-            let crc = crc32fast::hash(shard_data);
-            ec_chunks.push(StoredFileChunk {
-                offset: (i as u64) * (shard_size as u64),
-                size: shard_data.len() as u64,
-                needle_id,
-                volume_id,
-                crc32: crc,
-                mtime: now,
-            });
+            // 最后一个 group 可能不足 group_data_size, 用零填充至完整 stripe.
+            let mut padded_group = Vec::with_capacity(group_data_size);
+            padded_group.extend_from_slice(group_data);
+            while padded_group.len() < group_data_size {
+                padded_group.push(0);
+            }
 
-            debug!(
-                "P6_SCRUBBER: inode {} EC shard {}/{} written: vol={} needle={:#x} {}B crc={:#x}",
-                inode,
-                i + 1,
-                total_shards,
-                volume_id,
-                needle_id,
-                shard_data.len(),
-                crc
-            );
+            let shards = encoder.encode(&padded_group);
+            if shards.len() != total_shards {
+                return Err(format!(
+                    "EC encode group {} returned {} shards, expected {}",
+                    group_idx,
+                    shards.len(),
+                    total_shards
+                ));
+            }
+
+            // 每个 group 独立分配 (volume_id, needle_id) 对 (anti-affinity)
+            let alloc = self
+                .net_handler
+                .alloc_for_stripe_file(total_shards as u32)
+                .ok_or_else(|| "no volumes available for EC shard allocation".to_string())?;
+
+            // 写入每个 shard 到对应 volume
+            for (i, shard_data) in shards.iter().enumerate() {
+                let (volume_id, needle_id) = alloc[i];
+                let addr = addr_map
+                    .get(&volume_id)
+                    .ok_or_else(|| format!("EC shard vol {} addr not found", volume_id))?
+                    .clone();
+
+                self.volume_client
+                    .write_needle(&addr, volume_id, needle_id, shard_data)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "write_needle EC shard g{}[{}/{}] vol={} needle={:#x} failed: {}",
+                            group_idx, i, total_shards, volume_id, needle_id, e
+                        )
+                    })?;
+
+                let crc = crc32fast::hash(shard_data);
+                // data shard offset = group_start + i*EC_SHARD_SIZE;
+                // parity shard offset = group_start (group base)
+                let offset = if i < data_shards {
+                    (group_start + i * EC_SHARD_SIZE) as u64
+                } else {
+                    group_start as u64
+                };
+                ec_chunks.push(StoredFileChunk {
+                    offset,
+                    size: shard_data.len() as u64,
+                    needle_id,
+                    volume_id,
+                    crc32: crc,
+                    mtime: now,
+                });
+
+                debug!(
+                    "P6_SCRUBBER: inode {} EC shard g{}[{}/{}] written: vol={} needle={:#x} {}B crc={:#x}",
+                    inode,
+                    group_idx,
+                    i,
+                    total_shards,
+                    volume_id,
+                    needle_id,
+                    shard_data.len(),
+                    crc
+                );
+            }
         }
+
+        info!(
+            "P6_SCRUBBER: inode {} EC encoded: {} groups × {} shards = {} needles ({}B shard_size)",
+            inode,
+            num_groups,
+            total_shards,
+            ec_chunks.len(),
+            EC_SHARD_SIZE
+        );
 
         Ok(ec_chunks)
     }

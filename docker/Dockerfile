@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     netcat-openbsd \
     libssl1.1 \
+    fio \
+    python3 \
+    bc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

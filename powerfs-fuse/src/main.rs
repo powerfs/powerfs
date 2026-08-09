@@ -130,12 +130,23 @@ fn main() {
         lease_mode, lease_duration_ms, lease_renew_interval_ms
     );
 
-    // 从配置获取filer地址（取第一个）
-    let (filer_addr, filer_net_port) = if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
-        // 解析 host:port 或 仅host
+    // 从配置获取filer地址列表（取第一个作为主地址，全部用于轮换重试）
+    let (filer_addr, filer_addrs, filer_net_port) = if let Some(first_filer) =
+        fuse_cfg.filer_addresses.first()
+    {
+        // 解析 host:port 或 仅host（主地址取 host 部分）
         let parts: Vec<&str> = first_filer.split(':').collect();
         let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        (host, fuse_cfg.filer_net_port)
+        // 所有 Filer 地址取 host 部分，端口统一用 filer_net_port
+        let all_hosts: Vec<String> = fuse_cfg
+            .filer_addresses
+            .iter()
+            .map(|addr| {
+                let p: Vec<&str> = addr.split(':').collect();
+                p.first().unwrap_or(&"127.0.0.1").to_string()
+            })
+            .collect();
+        (host, all_hosts, fuse_cfg.filer_net_port)
     } else {
         // 这个分支不会执行，因为validate已经检查了filer_addresses非空
         eprintln!("ERROR: filer_addresses is empty in configuration");
@@ -210,6 +221,7 @@ fn main() {
     info!("  Masters: {}", master_addrs.join(", "));
     info!("  Master net port: {}", master_net_port);
     info!("  Filer: {}:{}", filer_addr, filer_net_port);
+    info!("  Filer addresses (rotation): {:?}", filer_addrs);
     info!("  Volume addresses: {:?}", volume_addrs);
     info!("  Volume net port: {}", volume_net_port);
     info!("  Mount point: {}", mount_point);
@@ -246,6 +258,7 @@ fn main() {
             volume_net_port,
             volume_addrs,
             filer_addr,
+            filer_addrs,
             filer_net_port,
             &lease_mode,
             lease_duration_ms,

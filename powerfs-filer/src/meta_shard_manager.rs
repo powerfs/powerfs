@@ -532,15 +532,28 @@ impl MetaShardManager {
     pub async fn delete_directory(&self, parent_inode: u64, name: &str) -> Result<(), String> {
         let shard_id = self.shard_strategy.calculate_shard(parent_inode);
 
-        {
+        // Resolve the target directory's inode so we can check emptiness.
+        // The lookup runs under a read lock; the emptiness check below uses
+        // list_directory which resolves the shard from the child inode, so it
+        // works even when the child's contents live in a different shard.
+        let child_inode = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
                 .get(&shard_id)
                 .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-            if shard_store.lookup(parent_inode, name).is_none() {
-                return Err("directory not found".to_string());
-            }
+            let info = shard_store
+                .lookup(parent_inode, name)
+                .ok_or_else(|| "directory not found".to_string())?;
+
+            info.inode
+        };
+
+        // POSIX: rmdir on a non-empty directory must fail with ENOTEMPTY.
+        // Reject before proposing the Raft command so the client gets a
+        // clear error (the FUSE layer maps "not empty" to libc::ENOTEMPTY).
+        if !self.list_directory(child_inode).is_empty() {
+            return Err("directory not empty".to_string());
         }
 
         let cmd = ShardCommand::DeleteDirectory {

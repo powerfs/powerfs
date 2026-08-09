@@ -27,6 +27,19 @@ pub(crate) fn default_msg_type_for_kind(kind: RequestKind) -> powerfs_net::MsgTy
     }
 }
 
+/// 网络错误重试的指数退避延迟（毫秒）。
+///
+/// 用于 `send_coherence_msg` 在遇到网络错误/熔断时的退避。
+/// 序列: 50, 100, 200, 400, 800, 1000, 1000, 1000, 1000
+/// (attempt 从 1 开始；10 次尝试总退避约 ~6.5s，覆盖 Raft 选举窗口)
+fn net_backoff_ms(attempt: u32) -> u64 {
+    // attempt=1 -> 50ms, attempt=2 -> 100ms, ..., attempt>=5 -> 1000ms
+    let base = 50u64;
+    let shift = (attempt - 1).min(4); // 0..4
+    let ms = base << shift;
+    ms.min(1000)
+}
+
 /// 请求结果 - 统一的请求响应类型
 #[derive(Debug, Clone)]
 pub struct RequestResult {
@@ -261,6 +274,9 @@ pub struct MetaShardClient {
     notify: Arc<tokio::sync::Notify>,
     /// 默认 Filer 地址（当 shard_id 不在路由表中时回退使用，例如 inode 作为 shard_id 时）
     default_filer_addr: Arc<Mutex<String>>,
+    /// 所有 Filer 地址列表（用于网络错误时轮换重试，应对 Leader 选举期间的瞬时故障）
+    /// 为空时回退到 default_filer_addr 单地址模式。
+    filer_addresses: Arc<Mutex<Vec<String>>>,
     /// Sharded RPC Pool — 并发派发元数据请求，消除全局 response_waiters 锁。
     /// 在 init() 中创建（需要 shard_router 已填充）。
     rpc_pool: Arc<Mutex<Option<Arc<ShardedRpcPool>>>>,
@@ -301,6 +317,7 @@ impl MetaShardClient {
             background_running: Arc::new(Mutex::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
             default_filer_addr: Arc::new(Mutex::new(String::new())),
+            filer_addresses: Arc::new(Mutex::new(Vec::new())),
             rpc_pool: Arc::new(Mutex::new(None)),
             notification_handler: Arc::new(std::sync::RwLock::new(None)),
             client_id,
@@ -441,12 +458,52 @@ impl MetaShardClient {
 
     /// 设置默认 filer 地址（用于初始化连接池和路由）
     pub fn set_default_filer_addr(&self, addr: String) {
-        *self.default_filer_addr.lock().unwrap() = addr;
+        *self.default_filer_addr.lock().unwrap() = addr.clone();
+        // 同时确保 filer_addresses 列表包含该地址，保证轮换重试可用
+        let mut addrs = self.filer_addresses.lock().unwrap();
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+
+    /// 设置所有 Filer 地址列表（用于网络错误时轮换重试）
+    /// 同时将第一个地址设为 default_filer_addr 以兼容旧逻辑。
+    pub fn set_filer_addresses(&self, addrs: Vec<String>) {
+        let mut filtered: Vec<String> = addrs.into_iter().filter(|a| !a.is_empty()).collect();
+        // 去重保序
+        let mut seen = std::collections::HashSet::new();
+        filtered.retain(|a| seen.insert(a.clone()));
+        if filtered.is_empty() {
+            log::warn!("MetaShardClient: set_filer_addresses called with empty list, ignored");
+            return;
+        }
+        *self.default_filer_addr.lock().unwrap() = filtered[0].clone();
+        *self.filer_addresses.lock().unwrap() = filtered.clone();
+        log::info!(
+            "MetaShardClient: set {} filer addresses for rotation: {:?}",
+            filtered.len(),
+            filtered
+        );
     }
 
     /// 获取默认 filer 地址
     pub fn default_filer_addr(&self) -> String {
         self.default_filer_addr.lock().unwrap().clone()
+    }
+
+    /// 获取用于轮换重试的 Filer 地址候选列表。
+    /// 优先返回 filer_addresses（去重保序），为空时回退到 default_filer_addr。
+    fn rotation_candidates(&self) -> Vec<String> {
+        let addrs = self.filer_addresses.lock().unwrap().clone();
+        if !addrs.is_empty() {
+            return addrs;
+        }
+        let default = self.default_filer_addr();
+        if default.is_empty() {
+            Vec::new()
+        } else {
+            vec![default]
+        }
     }
 
     /// 初始化客户端
@@ -484,6 +541,7 @@ impl MetaShardClient {
                 self.default_filer_addr.clone(),
                 self.breakers.clone(),
                 self.shard_router.clone(),
+                self.filer_addresses.clone(),
             );
             *guard = Some(Arc::new(pool));
         }
@@ -887,18 +945,29 @@ impl MetaShardClient {
     // Phase 2: CRDT delta sync 方法（fuse→filer 走 net 层）
     // -----------------------------------------------------------------------
 
-    /// 通用 coherence 请求发送：处理 leader 解析、连接、redirect 重试。
+    /// 通用 coherence 请求发送：处理 leader 解析、连接、redirect 重试、
+    /// 网络错误重试 + Filer 轮换。
     ///
     /// 成功返回 STATUS_OK 响应的 body 字节；失败返回错误字符串。
-    /// redirect 重试最多 5 次（与 process_request_internal 一致）。
+    ///
+    /// 重试策略（覆盖 Leader 选举窗口 ~6-10s）：
+    /// - redirect: 服务器告知新 Leader 地址，更新路由后立即重试（短退避 5ms→40ms）
+    /// - 网络错误: 记录失败，轮换到下一个 Filer 候选地址，指数退避重试（50ms→1s）
+    /// - 熔断打开: 轮换到下一个 Filer 候选地址重试
+    /// 最多 MAX_ATTEMPTS 次尝试。
     async fn send_coherence_msg(
         &self,
         msg_type: powerfs_net::MsgType,
         shard_id: u64,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
-        const MAX_ATTEMPTS: u32 = 5;
+        // 10 次尝试：覆盖 Raft 选举（~1-3s）+ 网络抖动恢复窗口
+        const MAX_ATTEMPTS: u32 = 10;
         let mut attempt: u32 = 0;
+        // 记录最后一次错误信息，用于最终返回
+        let mut last_err: String = String::new();
+        // 轮换候选地址列表（仅在发生网络错误/熔断时使用）
+        let rotation = self.rotation_candidates();
 
         loop {
             attempt += 1;
@@ -910,19 +979,66 @@ impl MetaShardClient {
                 .map(|s| s.leader_addr.clone())
                 .unwrap_or_else(|| self.default_filer_addr());
 
-            if leader_addr.is_empty() {
+            if leader_addr.is_empty() && rotation.is_empty() {
+                return Err(format!("no leader for shard {}", shard_id));
+            }
+
+            // 选择本次尝试的目标地址：首次用 leader_addr，后续重试轮换候选
+            let target_addr = if attempt == 1 || rotation.len() <= 1 {
+                leader_addr.clone()
+            } else {
+                // 轮换：attempt=2 -> rotation[1], attempt=3 -> rotation[2], ...
+                // 跳过 rotation[0]（已是 leader_addr 或 default），从第二个开始
+                let idx = ((attempt - 1) as usize) % rotation.len();
+                rotation[idx].clone()
+            };
+
+            if target_addr.is_empty() {
                 return Err(format!("no leader for shard {}", shard_id));
             }
 
             // 2) 获取或创建连接
-            let filer_client = self
-                .get_or_create_filer_client(&leader_addr)
-                .await
-                .map_err(|e| format!("connect filer {}: {:?}", leader_addr, e))?;
+            let filer_client = match self.get_or_create_filer_client(&target_addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    // 连接失败视为网络错误，记录并轮换重试
+                    last_err = format!("connect filer {}: {:?}", target_addr, e);
+                    log::warn!(
+                        "send_coherence_msg: {:?} shard={} attempt {}/{} connect failed {}: {}",
+                        msg_type,
+                        shard_id,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        target_addr,
+                        last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        let delay_ms = net_backoff_ms(attempt);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            };
 
             // 3) circuit breaker 检查
-            if !self.breakers.check(&leader_addr) {
-                return Err(format!("circuit open for {}", leader_addr));
+            if !self.breakers.check(&target_addr) {
+                last_err = format!("circuit open for {}", target_addr);
+                log::warn!(
+                    "send_coherence_msg: {:?} shard={} attempt {}/{} circuit open for {}",
+                    msg_type,
+                    shard_id,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    target_addr
+                );
+                if attempt < MAX_ATTEMPTS {
+                    // 熔断打开：轮换到下一个地址，短暂退避后重试
+                    let delay_ms = net_backoff_ms(attempt);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(last_err);
             }
 
             // 4) 发送请求
@@ -936,13 +1052,18 @@ impl MetaShardClient {
                         msg_type,
                         shard_id,
                         attempt,
-                        leader_addr,
+                        target_addr,
                         status,
                         resp.body.len()
                     );
 
                     if status == powerfs_net::STATUS_OK {
-                        self.breakers.record_success(&leader_addr);
+                        self.breakers.record_success(&target_addr);
+                        // 成功后更新 shard_router 指向该地址，加速后续请求
+                        if target_addr != leader_addr {
+                            self.shard_router
+                                .insert(shard_id, ShardInfo::new(shard_id, target_addr.clone()));
+                        }
                         return Ok(resp.body);
                     }
 
@@ -961,7 +1082,7 @@ impl MetaShardClient {
                             log::info!(
                                 "send_coherence_msg: shard={} redirect {} -> {} (attempt {}/{})",
                                 shard_id,
-                                leader_addr,
+                                target_addr,
                                 new_addr,
                                 attempt,
                                 MAX_ATTEMPTS
@@ -978,7 +1099,7 @@ impl MetaShardClient {
                     // 其他错误：尝试从 body 解析错误信息
                     // 优先尝试 TLV (FieldId::Name = error string, 用于 UpdateInodeSizeChunks),
                     // 回退到 JSON (用于 OpenCountInc/Dec, alloc_inode_batch 等仍用 JSON 的协议)
-                    self.breakers.record_failure(&leader_addr);
+                    self.breakers.record_failure(&target_addr);
                     let err_msg = {
                         use powerfs_net::serialize::TlvDecoder;
                         let mut dec = TlvDecoder::new(&resp.body);
@@ -995,8 +1116,24 @@ impl MetaShardClient {
                     return Err(err_msg);
                 }
                 Err(e) => {
-                    self.breakers.record_failure(&leader_addr);
-                    return Err(format!("net error: {:?}", e));
+                    // 网络错误：记录失败，轮换到下一个 Filer 地址，指数退避重试
+                    self.breakers.record_failure(&target_addr);
+                    last_err = format!("net error: {:?}", e);
+                    log::warn!(
+                        "send_coherence_msg: {:?} shard={} attempt {}/{} net error on {}: {:?}",
+                        msg_type,
+                        shard_id,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        target_addr,
+                        e
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        let delay_ms = net_backoff_ms(attempt);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    return Err(last_err);
                 }
             }
         }
@@ -1854,6 +1991,7 @@ async fn process_available_requests(
     conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_filer_addr: &Arc<Mutex<String>>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
+    filer_addresses: &Arc<Mutex<Vec<String>>>,
     _topology_manager: &Arc<ClusterTopologyManager>,
     listeners: &Arc<Mutex<Vec<Arc<dyn RequestCompletionListener>>>>,
     response_waiters: &Arc<Mutex<ResponseWaiters>>,
@@ -1871,6 +2009,7 @@ async fn process_available_requests(
                 default_filer_addr,
                 breakers,
                 shard_router,
+                filer_addresses,
             )
             .await;
 
@@ -1903,6 +2042,7 @@ async fn process_available_requests(
                 default_filer_addr,
                 breakers,
                 shard_router,
+                filer_addresses,
             )
             .await;
 
@@ -1927,13 +2067,14 @@ async fn process_available_requests(
 
 /// 内部请求处理逻辑（供 ShardedRpcPool 和后台处理器使用）
 ///
-/// 包含 redirect 重试逻辑（最多 5 次，指数退避）。
+/// 包含 redirect 重试、网络错误重试 + Filer 轮换逻辑（最多 10 次，指数退避）。
 pub(crate) async fn process_request_internal(
     req: PendingRequest,
     conn_pool: &Arc<powerfs_net::ClientConnPool>,
     default_filer_addr: &Arc<Mutex<String>>,
     breakers: &Arc<CircuitBreakerPool>,
     shard_router: &Arc<DashMap<u64, ShardInfo>>,
+    filer_addresses: &Arc<Mutex<Vec<String>>>,
 ) -> ClientResult<RequestResult> {
     let request_id = req.context.request_id.clone();
     let kind = req.context.kind;
@@ -1951,12 +2092,24 @@ pub(crate) async fn process_request_internal(
         return Err(ClientError::UnsupportedRequest(format!("{:?}", kind)));
     }
 
-    // 尝试最多5次（重定向重试），避免 Leader 切换期间误报失败
-    const MAX_ATTEMPTS: u32 = 5;
+    // 10 次尝试：覆盖 Raft 选举（~1-3s）+ 网络抖动恢复窗口
+    const MAX_ATTEMPTS: u32 = 10;
     let mut attempt: u32 = 0;
+    let mut last_err: ClientError = ClientError::Internal("no attempts made".to_string());
 
     // 获取默认 filer 地址作为回退
     let fallback_addr = default_filer_addr.lock().unwrap().clone();
+    // 轮换候选地址列表（去重保序）
+    let rotation: Vec<String> = {
+        let addrs = filer_addresses.lock().unwrap().clone();
+        if !addrs.is_empty() {
+            addrs
+        } else if !fallback_addr.is_empty() {
+            vec![fallback_addr.clone()]
+        } else {
+            Vec::new()
+        }
+    };
 
     loop {
         attempt += 1;
@@ -1967,16 +2120,61 @@ pub(crate) async fn process_request_internal(
             .map(|s| s.leader_addr.clone())
             .unwrap_or_else(|| fallback_addr.clone());
 
-        if leader_addr.is_empty() {
+        if leader_addr.is_empty() && rotation.is_empty() {
+            return Err(ClientError::NoShardLeader(shard_id));
+        }
+
+        // 选择本次尝试的目标地址：首次用 leader_addr，后续重试轮换候选
+        let target_addr = if attempt == 1 || rotation.len() <= 1 {
+            leader_addr.clone()
+        } else {
+            let idx = ((attempt - 1) as usize) % rotation.len();
+            rotation[idx].clone()
+        };
+
+        if target_addr.is_empty() {
             return Err(ClientError::NoShardLeader(shard_id));
         }
 
         // 2) 获取或创建到该 leader 的连接（client_id / 通知处理器由连接池统一安装）
-        let filer_client = get_or_create_filer_client(conn_pool, &leader_addr).await?;
+        let filer_client = match get_or_create_filer_client(conn_pool, &target_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                // 连接失败视为网络错误，记录并轮换重试
+                last_err = e.clone();
+                log::warn!(
+                    "process_request_internal: shard={} attempt {}/{} connect failed {}: {:?}",
+                    shard_id,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    target_addr,
+                    last_err
+                );
+                if attempt < MAX_ATTEMPTS {
+                    let delay_ms = net_backoff_ms(attempt);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        };
 
         // 3) Per-server circuit breaker check
-        if !breakers.check(&leader_addr) {
-            return Err(ClientError::CircuitOpen);
+        if !breakers.check(&target_addr) {
+            last_err = ClientError::CircuitOpen;
+            log::warn!(
+                "process_request_internal: shard={} attempt {}/{} circuit open for {}",
+                shard_id,
+                attempt,
+                MAX_ATTEMPTS,
+                target_addr
+            );
+            if attempt < MAX_ATTEMPTS {
+                let delay_ms = net_backoff_ms(attempt);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            return Err(last_err);
         }
 
         // 4) 发送请求
@@ -1988,11 +2186,16 @@ pub(crate) async fn process_request_internal(
             Ok(resp) => {
                 log::debug!(
                     "process_request_internal: attempt={} shard={} leader={} kind={:?} status={} body_len={} data_len={}",
-                    attempt, shard_id, leader_addr, kind, resp.header.status, resp.body.len(), resp.data.len()
+                    attempt, shard_id, target_addr, kind, resp.header.status, resp.body.len(), resp.data.len()
                 );
 
                 if resp.is_ok() {
-                    breakers.record_success(&leader_addr);
+                    breakers.record_success(&target_addr);
+                    // 成功后更新 shard_router 指向该地址，加速后续请求
+                    if target_addr != leader_addr {
+                        shard_router
+                            .insert(shard_id, ShardInfo::new(shard_id, target_addr.clone()));
+                    }
                     return Ok(RequestResult::success_with_payload(
                         request_id, resp.body, resp.data,
                     ));
@@ -2018,7 +2221,7 @@ pub(crate) async fn process_request_internal(
                     if let Some(new_addr) = new_leader {
                         log::info!(
                             "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying (attempt {}/{})",
-                            shard_id, leader_addr, new_addr, attempt, MAX_ATTEMPTS
+                            shard_id, target_addr, new_addr, attempt, MAX_ATTEMPTS
                         );
 
                         // 更新分片路由表
@@ -2043,17 +2246,32 @@ pub(crate) async fn process_request_internal(
                 // interpret it as `Ok(None)` instead of a hard error.
                 const STATUS_ERR_NOT_FOUND: u16 = 1;
                 if status == STATUS_ERR_NOT_FOUND {
-                    breakers.record_success(&leader_addr);
+                    breakers.record_success(&target_addr);
                     return Ok(RequestResult::empty(request_id));
                 }
 
                 // 其他错误或超过重试次数
-                breakers.record_failure(&leader_addr);
+                breakers.record_failure(&target_addr);
                 return Err(ClientError::Server(format!("Server error: {}", status)));
             }
             Err(e) => {
-                breakers.record_failure(&leader_addr);
-                return Err(ClientError::from_net_error(e));
+                // 网络错误：记录失败，轮换到下一个 Filer 地址，指数退避重试
+                breakers.record_failure(&target_addr);
+                log::warn!(
+                    "process_request_internal: shard={} attempt {}/{} net error on {}: {:?}",
+                    shard_id,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    target_addr,
+                    e
+                );
+                last_err = ClientError::from_net_error(e);
+                if attempt < MAX_ATTEMPTS {
+                    let delay_ms = net_backoff_ms(attempt);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(last_err);
             }
         }
     }

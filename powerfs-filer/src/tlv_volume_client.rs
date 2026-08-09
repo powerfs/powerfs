@@ -39,6 +39,19 @@ impl TlvVolumeClient {
         file_key: u64,
         data: &[u8],
     ) -> Result<(), String> {
+        // Bug 2 fix: 检查数据大小, 防止发送超限帧被 volume server 拒绝后静默失败
+        // (TCP 缓冲让 send 看似成功, 但 server 拒绝帧并断连)
+        const MAX_DATA_SIZE: usize = 2 * 1024 * 1024; // 2MB, 与 powerfs-net MAX_DATA_SIZE 一致
+        if data.len() > MAX_DATA_SIZE {
+            return Err(format!(
+                "write_needle data {} bytes > MAX_DATA_SIZE {} bytes (vol={} needle={:#x})",
+                data.len(),
+                MAX_DATA_SIZE,
+                volume_id,
+                file_key
+            ));
+        }
+
         let body = build_needle_body(volume_id, file_key);
 
         let client = self
