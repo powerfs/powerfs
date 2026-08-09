@@ -6,7 +6,7 @@ import Dashboard from './pages/Dashboard'
 import Nodes from './pages/Nodes'
 import Volumes from './pages/Volumes'
 import Collections from './pages/Collections'
-import StorageDevices from './pages/StorageDevices'
+// import StorageDevices from './pages/StorageDevices'  // hidden pending backend supplement
 import BitrotScrub from './pages/BitrotScrub'
 import KV from './pages/KV'
 import Alerts from './pages/Alerts'
@@ -22,7 +22,9 @@ import AccessKeys from './pages/AccessKeys'
 import Benchmark from './pages/Benchmark'
 import ClusterTopology from './pages/ClusterTopology'
 import CapacityPlanning from './pages/CapacityPlanning'
-import Optimizations from './pages/Optimizations'
+import MasterRaft from './pages/MasterRaft'
+import RuntimeConfig from './pages/RuntimeConfig'
+// import Optimizations from './pages/Optimizations'  // merging into Runtime Config; hidden for now
 
 function App() {
   return (
@@ -61,6 +63,14 @@ function App() {
           }
         />
         <Route
+          path="master-raft"
+          element={
+            <ProtectedRoute requireAdmin>
+              <MasterRaft />
+            </ProtectedRoute>
+          }
+        />
+        <Route
           path="capacity-planning"
           element={
             <ProtectedRoute requireAdmin>
@@ -68,6 +78,7 @@ function App() {
             </ProtectedRoute>
           }
         />
+        {/* TODO: restore StorageDevices route after backend supplement (decision 1)
         <Route
           path="storage-devices"
           element={
@@ -76,6 +87,7 @@ function App() {
             </ProtectedRoute>
           }
         />
+        */}
         <Route
           path="volumes"
           element={
@@ -152,6 +164,15 @@ function App() {
         />
         <Route path="alerts" element={<Alerts />} />
         <Route
+          path="runtime-config"
+          element={
+            <ProtectedRoute requireAdmin>
+              <RuntimeConfig />
+            </ProtectedRoute>
+          }
+        />
+        {/* TODO: Optimizations will be merged into Runtime Config page; unhide after
+        <Route
           path="optimizations"
           element={
             <ProtectedRoute requireAdmin>
@@ -159,6 +180,7 @@ function App() {
             </ProtectedRoute>
           }
         />
+        */}
         <Route path="access-keys" element={<AccessKeys />} />
         <Route
           path="users"

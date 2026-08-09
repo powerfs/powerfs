@@ -282,6 +282,18 @@ impl MetricStore {
         self.kv_sessions.read().await.get(id).cloned()
     }
 
+    pub async fn delete_node(&self, id: &str) -> bool {
+        self.nodes.write().await.remove(id).is_some()
+    }
+
+    pub async fn delete_volume(&self, id: u64) -> bool {
+        self.volumes.write().await.remove(&id).is_some()
+    }
+
+    pub async fn delete_kv_session(&self, id: &str) -> bool {
+        self.kv_sessions.write().await.remove(id).is_some()
+    }
+
     pub async fn get_cluster_metrics(&self) -> ClusterMetrics {
         self.cluster_metrics.read().await.clone()
     }

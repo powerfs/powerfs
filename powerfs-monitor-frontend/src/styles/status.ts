@@ -27,7 +27,7 @@ export type DeviceStatus =
   | 'draining'
   | 'faulty'
 
-export type VolumeStatus = 'available' | 'full' | 'readonly' | 'creating'
+export type VolumeStatus = 'available' | 'full' | 'read_only' | 'creating' | 'deleting'
 
 export type CircuitBreakerStatus = 'closed' | 'open' | 'half_open'
 
@@ -215,7 +215,7 @@ export const volumeStatusPalette: Record<VolumeStatus, StatusPalette> = {
     tag: 'red',
     label: '已满',
   },
-  readonly: {
+  read_only: {
     bg: '#E6F7FF',
     border: '#91D5FF',
     text: '#096DD9',
@@ -230,6 +230,14 @@ export const volumeStatusPalette: Record<VolumeStatus, StatusPalette> = {
     dot: '#FAAD14',
     tag: 'orange',
     label: '创建中',
+  },
+  deleting: {
+    bg: '#FFF1F0',
+    border: '#FFCCC7',
+    text: '#A8071A',
+    dot: '#FF4D4F',
+    tag: 'red',
+    label: '删除中',
   },
 }
 

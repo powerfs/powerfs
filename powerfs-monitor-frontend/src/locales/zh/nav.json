@@ -1,0 +1,37 @@
+{
+  "groups": {
+    "overview": "总览",
+    "infrastructure": "基础设施",
+    "storage": "存储",
+    "metadata": "元数据",
+    "clientsAndPerformance": "客户端 & 性能",
+    "operations": "运维",
+    "security": "安全"
+  },
+  "items": {
+    "dashboard": "仪表盘",
+    "nodes": "节点管理",
+    "masterRaft": "Master Raft",
+    "alerts": "告警中心",
+    "clusterTopology": "集群拓扑",
+    "capacityPlanning": "容量规划",
+    "storageDevices": "存储设备",
+    "volumes": "Volume 管理",
+    "collections": "Collection 管理",
+    "bitrotScrub": "Bitrot 扫描",
+    "filerManagement": "Filer 管理",
+    "filerOverview": "状态总览",
+    "conflicts": "冲突检测",
+    "shards": "分片管理",
+    "shardBalancing": "分片均衡",
+    "fsManagement": "FS 管理",
+    "benchmark": "性能测试",
+    "runtimeConfig": "运行时配置",
+    "optimizations": "调优建议",
+    "s3": "S3 管理",
+    "kv": "KV 管理",
+    "myAccessKeys": "我的密钥",
+    "users": "用户管理",
+    "roles": "角色管理"
+  }
+}

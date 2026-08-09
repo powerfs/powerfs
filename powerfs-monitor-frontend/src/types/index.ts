@@ -9,8 +9,6 @@ export type NodeStatus =
   | 'leader'
   | 'follower'
 
-export type RaftRole = 'leader' | 'follower'
-
 export interface NodeInfo {
   id: string
   node_type: 'master' | 'volume' | 'filer'
@@ -25,9 +23,8 @@ export interface NodeInfo {
   network_tx: number
   uptime: number
   volume_count: number
-  device_count?: number
   is_leader?: boolean
-  raft_role?: RaftRole
+  raft_term?: number
 }
 
 export interface DeviceLocation {
@@ -87,7 +84,7 @@ export interface VolumeInfo {
   size: number
   used: number
   file_count: number
-  status: 'available' | 'full' | 'readonly' | 'creating' | 'read_only' | 'deleting'
+  status: 'available' | 'full' | 'read_only' | 'creating' | 'deleting'
   collection: string
   created_at: string
   read_only?: boolean
@@ -337,7 +334,6 @@ export interface FuseMount {
   mounted_at: string
   pid?: number
   host?: string
-  client_type?: string
   dirty_chunks?: number
   dirty_bytes?: number
   last_heartbeat?: string
@@ -553,4 +549,28 @@ export interface ShardDetail {
   dir_count: number
   write_qps: number
   read_qps: number
+}
+
+// ===== Master Raft =====
+export interface MasterStatus {
+  nodes: NodeInfo[]
+  leader: NodeInfo | null
+  raft_term: number
+  total_masters: number
+  healthy_masters: number
+}
+
+// ===== Runtime config (hot-modify via PUT) =====
+export interface CircuitBreakerConfig {
+  failure_threshold: number
+  recovery_timeout_ms: number
+  half_open_max_requests: number
+}
+
+export interface CoalescerConfig {
+  deadline_ms: number
+  min_pending_writes: number
+  max_dirty_bytes_per_entry: number
+  max_dirty_bytes_total: number
+  disabled: boolean
 }

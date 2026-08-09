@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -1032,4 +1032,59 @@ export async function deleteCollection(name: string): Promise<void> {
 export async function getCollectionStats(name: string): Promise<CollectionStats> {
   const response = await api.get(`/collections/${name}/stats`)
   return response.data.data
+}
+
+// ===== Master Raft =====
+export async function getMasterStatus(): Promise<MasterStatus> {
+  if (useMock) {
+    const masters = mockNodes.filter(n => n.node_type === 'master')
+    const leader = masters.find(m => m.is_leader) || null
+    return {
+      nodes: masters,
+      leader,
+      raft_term: leader?.raft_term ?? 0,
+      total_masters: masters.length,
+      healthy_masters: masters.filter(m => ['online', 'healthy', 'leader'].includes(m.status)).length,
+    }
+  }
+  const response = await api.get('/master/status')
+  return response.data.data
+}
+
+export async function transferLeader(targetNodeId: number): Promise<void> {
+  if (useMock) return
+  await api.post('/master/transfer-leader', { target_node_id: targetNodeId })
+}
+
+// ===== Runtime Config (hot-modify) =====
+export async function getCircuitBreakerConfig(): Promise<CircuitBreakerConfig> {
+  if (useMock) {
+    return { failure_threshold: 50, recovery_timeout_ms: 5000, half_open_max_requests: 10 }
+  }
+  const response = await api.get('/config/circuit-breaker')
+  return response.data
+}
+
+export async function putCircuitBreakerConfig(cfg: CircuitBreakerConfig): Promise<void> {
+  if (useMock) return
+  await api.put('/config/circuit-breaker', cfg)
+}
+
+export async function getCoalescerConfig(): Promise<CoalescerConfig> {
+  if (useMock) {
+    return {
+      deadline_ms: 2000,
+      min_pending_writes: 4,
+      max_dirty_bytes_per_entry: 1048576,
+      max_dirty_bytes_total: 67108864,
+      disabled: false,
+    }
+  }
+  const response = await api.get('/config/coalescer')
+  return response.data
+}
+
+export async function putCoalescerConfig(cfg: CoalescerConfig): Promise<void> {
+  if (useMock) return
+  await api.put('/config/coalescer', cfg)
 }

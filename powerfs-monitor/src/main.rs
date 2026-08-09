@@ -17,7 +17,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 use powerfs_common::config::PowerFsConfig;
@@ -148,6 +148,51 @@ struct AppState {
     master_client: resilient_master_client::SharedMasterClient,
     /// Time-series store for capacity planning
     time_series: Arc<TimeSeriesStore>,
+    /// Runtime-mutable monitor configuration (hot-modify via PUT endpoints).
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+}
+
+/// Mutable runtime configuration snapshot. Mirrors the defaults exposed via GET
+/// endpoints; PUT updates are kept in-memory and survive until monitor restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeConfig {
+    circuit_breaker: CircuitBreakerConfig,
+    coalescer: CoalescerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CircuitBreakerConfig {
+    failure_threshold: u32,
+    recovery_timeout_ms: u64,
+    half_open_max_requests: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoalescerConfig {
+    deadline_ms: u64,
+    min_pending_writes: u32,
+    max_dirty_bytes_per_entry: u64,
+    max_dirty_bytes_total: u64,
+    disabled: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 50,
+                recovery_timeout_ms: 5000,
+                half_open_max_requests: 10,
+            },
+            coalescer: CoalescerConfig {
+                deadline_ms: 2000,
+                min_pending_writes: 4,
+                max_dirty_bytes_per_entry: 1048576,
+                max_dirty_bytes_total: 67108864,
+                disabled: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -604,6 +649,21 @@ async fn get_node(
     match state.metric_store.get_node(&id).await {
         Some(node) => Json(ApiResponse::success(node)),
         None => Json(ApiResponse::error("Node not found")),
+    }
+}
+
+async fn delete_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    if state.metric_store.delete_node(&id).await {
+        Json(ApiResponse::success(serde_json::json!({
+            "id": id,
+            "deleted": true,
+            "note": "Removed from monitor view; next heartbeat from node will re-add unless master drain is invoked separately.",
+        })))
+    } else {
+        Json(ApiResponse::error("Node not found"))
     }
 }
 
@@ -1243,6 +1303,26 @@ async fn get_volume(
     }
 }
 
+async fn delete_volume(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match id.parse::<u64>() {
+        Ok(id) => {
+            if state.metric_store.delete_volume(id).await {
+                Json(ApiResponse::success(serde_json::json!({
+                    "volume_id": id,
+                    "deleted": true,
+                    "note": "Removed from monitor view; volume creation on the master cluster is required to fully destroy the volume.",
+                })))
+            } else {
+                Json(ApiResponse::error("Volume not found"))
+            }
+        }
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct VolumeIoMetricsResponse {
     volume_id: u64,
@@ -1294,6 +1374,20 @@ async fn get_kv_session(
     match state.metric_store.get_kv_session(&id).await {
         Some(session) => Json(ApiResponse::success(session)),
         None => Json(ApiResponse::error("Session not found")),
+    }
+}
+
+async fn delete_kv_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    if state.metric_store.delete_kv_session(&id).await {
+        Json(ApiResponse::success(serde_json::json!({
+            "session_id": id,
+            "deleted": true,
+        })))
+    } else {
+        Json(ApiResponse::error("Session not found"))
     }
 }
 
@@ -2076,22 +2170,51 @@ async fn get_fuse_client_stats(
 /// These values mirror the defaults compiled into the FUSE client
 /// (`CircuitBreakerConfig::default()`). They are read-only for now; PUT
 /// support will be added once the master can push config updates to clients.
-async fn get_circuit_breaker_config() -> Json<serde_json::Value> {
+/// GET /api/config/circuit-breaker — current in-memory CircuitBreaker config snapshot.
+async fn get_circuit_breaker_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let cfg = state.runtime_config.read().await.circuit_breaker.clone();
+    Json(serde_json::to_value(&cfg).expect("serialize cb config"))
+}
+
+/// PUT /api/config/circuit-breaker — hot-modify CircuitBreaker config (in-memory, survives until restart).
+async fn put_circuit_breaker_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CircuitBreakerConfig>,
+) -> Json<serde_json::Value> {
+    {
+        let mut cfg = state.runtime_config.write().await;
+        cfg.circuit_breaker = payload;
+    }
+    let snapshot = state.runtime_config.read().await.circuit_breaker.clone();
     Json(serde_json::json!({
-        "failure_threshold": 50,
-        "recovery_timeout_ms": 5000,
-        "half_open_max_requests": 10,
+        "updated": true,
+        "config": snapshot,
     }))
 }
 
 /// GET /api/config/coalescer — current default WriteCoalescer config.
-async fn get_coalescer_config() -> Json<serde_json::Value> {
+async fn get_coalescer_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let cfg = state.runtime_config.read().await.coalescer.clone();
+    Json(serde_json::to_value(&cfg).expect("serialize coalescer config"))
+}
+
+/// PUT /api/config/coalescer — hot-modify WriteCoalescer config (in-memory, survives until restart).
+async fn put_coalescer_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CoalescerConfig>,
+) -> Json<serde_json::Value> {
+    {
+        let mut cfg = state.runtime_config.write().await;
+        cfg.coalescer = payload;
+    }
+    let snapshot = state.runtime_config.read().await.coalescer.clone();
     Json(serde_json::json!({
-        "deadline_ms": 2000,
-        "min_pending_writes": 4,
-        "max_dirty_bytes_per_entry": 1048576,
-        "max_dirty_bytes_total": 67108864,
-        "disabled": false,
+        "updated": true,
+        "config": snapshot,
     }))
 }
 
@@ -4607,6 +4730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_client,
         master_client,
         time_series: Arc::new(TimeSeriesStore::with_redis(&redis_url)),
+        runtime_config: Arc::new(RwLock::new(RuntimeConfig::default())),
     });
 
     // Load time-series history from Redis on startup (if available)
@@ -4666,8 +4790,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/cluster", get(get_cluster_metrics))
         .route("/api/metrics/nodes", get(get_nodes))
         .route("/api/metrics/nodes/:id", get(get_node))
+        .route("/api/metrics/nodes/:id", delete(delete_node))
         .route("/api/metrics/volumes", get(get_volumes))
         .route("/api/metrics/volumes/:id", get(get_volume))
+        .route("/api/metrics/volumes/:id", delete(delete_volume))
         .route("/api/metrics/volumes/:id/io", get(get_volume_io))
         .route(
             "/api/metrics/volumes/:id/capacity-history",
@@ -4680,6 +4806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
+        .route("/api/metrics/kv/sessions/:id", delete(delete_kv_session))
         .route("/api/kv/namespaces", get(list_kv_namespaces))
         .route("/api/kv/namespaces", post(create_kv_namespace))
         .route("/api/kv/namespaces/:name", delete(delete_kv_namespace))
@@ -4716,9 +4843,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/clients/:id/stats", get(get_fuse_client_stats))
         .route(
             "/api/config/circuit-breaker",
-            get(get_circuit_breaker_config),
+            get(get_circuit_breaker_config).put(put_circuit_breaker_config),
         )
-        .route("/api/config/coalescer", get(get_coalescer_config))
+        .route(
+            "/api/config/coalescer",
+            get(get_coalescer_config).put(put_coalescer_config),
+        )
         .route("/api/conflicts", get(list_conflicts))
         .route("/api/conflicts/resolve", post(resolve_conflict_handler))
         .route(
