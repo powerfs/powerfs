@@ -2,9 +2,9 @@ name: Rust CI
 
 on:
   push:
-    branches: [ "master", "main" ]
+    branches: [ "master", "main", "fs-lease-optimize" ]
   pull_request:
-    branches: [ "master", "main" ]
+    branches: [ "master", "main", "fs-lease-optimize" ]
 
 env:
   CARGO_TERM_COLOR: always
