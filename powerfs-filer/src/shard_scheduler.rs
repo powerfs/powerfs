@@ -281,6 +281,14 @@ impl ShardScheduler {
         let distribution = self.collect_shard_leader_distribution().await;
         let mut metrics = self.node_metrics.write().unwrap();
 
+        // 先重置所有节点 leader_count 为 0，确保没有 Leader 的节点
+        // （不在 distribution 中）也被正确清零。否则一旦节点失去 Leader，
+        // 其 leader_count 会保留旧值，导致均衡判定失真。
+        for node_metrics in metrics.values_mut() {
+            node_metrics.leader_count = 0;
+        }
+
+        // 再根据实际分布更新有 Leader 的节点
         for (addr, shards) in distribution {
             for node_metrics in metrics.values_mut() {
                 if node_metrics.address == addr {
@@ -298,8 +306,26 @@ impl ShardScheduler {
             return plans;
         }
 
+        // 构建所有已注册节点的 Leader 计数映射 (address -> count)。
+        // 关键修复：包含 leader_count=0 的节点。原实现仅从 distribution
+        // （当前持有 Leader 的节点）中筛选 low_load 候选，导致没有任何
+        // Leader 的节点永远不会被选为转移目标，Leader 无法均匀分布。
+        let mut node_leader_counts: HashMap<String, u64> = {
+            let metrics = self.node_metrics.read().unwrap();
+            metrics
+                .values()
+                .map(|m| (m.address.clone(), 0u64))
+                .collect()
+        };
+        for (addr, shards) in &distribution {
+            *node_leader_counts.entry(addr.clone()).or_insert(0) = shards.len() as u64;
+        }
+
         let total_leaders: usize = distribution.values().map(|v| v.len()).sum();
-        let node_count = distribution.len();
+        let node_count = node_leader_counts.len();
+        if node_count == 0 {
+            return plans;
+        }
         let avg_leaders = total_leaders as f64 / node_count as f64;
 
         let (leader_imbalance_threshold, max_transfers_per_round) = {
@@ -317,54 +343,72 @@ impl ShardScheduler {
             total_leaders, node_count, avg_leaders, threshold
         );
 
-        let mut high_load_nodes: Vec<(f64, &String, &Vec<ShardId>)> = distribution
-            .iter()
-            .filter(|(_, shards)| shards.len() as f64 > threshold)
-            .map(|(addr, shards)| {
-                let score = self.calculate_node_score_by_address(addr);
-                (score, addr, shards)
-            })
-            .collect();
+        // 迭代式均衡：每轮选取当前 Leader 数最多（超过 threshold）的源节点
+        // 和最少（低于 avg）的目标节点，转移一个 shard 后更新模拟计数。
+        // 这样既能把 Leader 转给 0-Leader 节点，又避免一次性过度转移
+        // 导致目标节点超载（原实现会把多个 shard 全转到同一节点）。
+        let mut plans_made = 0usize;
+        loop {
+            if plans_made >= max_transfers_per_round {
+                break;
+            }
 
-        let mut low_load_nodes: Vec<(f64, &String, &Vec<ShardId>)> = distribution
-            .iter()
-            .filter(|(_, shards)| (shards.len() as f64) < avg_leaders * 0.7)
-            .map(|(addr, shards)| {
-                let score = self.calculate_node_score_by_address(addr);
-                (score, addr, shards)
-            })
-            .collect();
+            // 源节点：Leader 数超过 threshold 中最多的
+            let high_addr = node_leader_counts
+                .iter()
+                .filter(|(_, &c)| c as f64 > threshold)
+                .max_by_key(|(_, &c)| c)
+                .map(|(a, _)| a.clone());
 
-        high_load_nodes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        low_load_nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            // 目标节点：Leader 数低于 avg 中最少的
+            let low_addr = node_leader_counts
+                .iter()
+                .filter(|(_, &c)| (c as f64) < avg_leaders)
+                .min_by_key(|(_, &c)| c)
+                .map(|(a, _)| a.clone());
 
-        for (_high_score, high_addr, high_shards) in high_load_nodes {
-            for &shard_id in high_shards {
-                if plans.len() >= max_transfers_per_round {
-                    return plans;
+            let (high_addr, low_addr) = match (high_addr, low_addr) {
+                (Some(h), Some(l)) if h != l => (h, l),
+                _ => break,
+            };
+
+            // 在源节点的 shard 列表中找一个可转移到目标节点的 shard
+            let high_shards = distribution.get(&high_addr).cloned().unwrap_or_default();
+            let mut transferred = false;
+            for &shard_id in &high_shards {
+                // 跳过已计划迁移的 shard
+                if plans.iter().any(|p| p.shard_id == shard_id) {
+                    continue;
                 }
-
-                for (_low_score, low_addr, _) in &low_load_nodes {
-                    if self.can_transfer_leader(shard_id, low_addr).await {
-                        let from_node_id = self.get_node_id_by_address(high_addr);
-                        let to_node_id = self.get_node_id_by_address(low_addr);
-
-                        plans.push(MigrationPlan {
-                            shard_id,
-                            from_node_id,
-                            from_node_address: high_addr.clone(),
-                            to_node_id,
-                            to_node_address: low_addr.to_string(),
-                            reason: format!(
-                                "leader imbalance: {} has {} leaders (threshold {:.2})",
-                                high_addr,
-                                high_shards.len(),
-                                threshold
-                            ),
-                        });
-                        break;
-                    }
+                if self.can_transfer_leader(shard_id, &low_addr).await {
+                    let from_node_id = self.get_node_id_by_address(&high_addr);
+                    let to_node_id = self.get_node_id_by_address(&low_addr);
+                    plans.push(MigrationPlan {
+                        shard_id,
+                        from_node_id,
+                        from_node_address: high_addr.clone(),
+                        to_node_id,
+                        to_node_address: low_addr.clone(),
+                        reason: format!(
+                            "leader imbalance: {} has {} leaders (threshold {:.2}), target {} has {}",
+                            high_addr,
+                            node_leader_counts[&high_addr],
+                            threshold,
+                            low_addr,
+                            node_leader_counts[&low_addr]
+                        ),
+                    });
+                    // 模拟转移：源 -1, 目标 +1
+                    *node_leader_counts.get_mut(&high_addr).unwrap() -= 1;
+                    *node_leader_counts.get_mut(&low_addr).unwrap() += 1;
+                    plans_made += 1;
+                    transferred = true;
+                    break;
                 }
+            }
+
+            if !transferred {
+                break;
             }
         }
 
