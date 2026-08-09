@@ -28,6 +28,8 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         disk_size: 0,
         generation: 0,
         placement: None,
+        reliability: powerfs_layout::reliability::Reliability::default(),
+        replica_chunks: Vec::new(),
         cached_at: Instant::now(),
     }
 }
@@ -57,6 +59,8 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         disk_size: 0,
         generation: 0,
         placement: None,
+        reliability: powerfs_layout::reliability::Reliability::default(),
+        replica_chunks: Vec::new(),
         cached_at: Instant::now(),
     }
 }
