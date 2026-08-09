@@ -400,10 +400,7 @@ impl TimeSeriesStore {
     /// Per-node disk usage series (used for the cluster multi-line chart in
     /// Capacity Planning). Returns one entry per tracked node, with the
     /// node_id and its filtered points.
-    pub async fn get_per_node_disk_usage(
-        &self,
-        minutes: i64,
-    ) -> Vec<(String, Vec<DataPoint>)> {
+    pub async fn get_per_node_disk_usage(&self, minutes: i64) -> Vec<(String, Vec<DataPoint>)> {
         let store = self.disk_usage.read().await;
         let now = chrono::Utc::now().timestamp();
         let start = now - minutes * 60;

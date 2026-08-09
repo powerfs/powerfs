@@ -568,6 +568,61 @@ export interface ShardDetail {
   read_qps: number
 }
 
+// ===== Filer admin bridge types (Monitor 代理 filer /admin/*) =====
+// 设计原则: 前端只跟 Monitor 交互, filer admin 由 Monitor 透传。
+// 详见 docs/filer-redesign-plan.md。
+
+/**
+ * Filer 节点 — 合并 master 注册视角 (gRPC ListFilers) + 心跳视角 (metric_store)。
+ * heartbeat_status 是真实健康状态 (受 NODE_HEARTBEAT_TIMEOUT_SECS 控制),
+ * registered_healthy 只是 master 静态注册值。
+ */
+export interface FilerNode {
+  node_id: string
+  address: string
+  http_port: number
+  grpc_port: number
+  /** master 注册视角的静态健康 (gRPC ListFilers.is_healthy) */
+  is_registered: boolean
+  registered_healthy: boolean
+  leader_count: number
+  total_shards: number
+  /** 心跳视角的真实健康 ('online' | 'offline') */
+  heartbeat_status: string
+  /** 距离上次心跳的秒数 */
+  last_seen_ago_secs: number
+  cpu_usage: number
+  mem_usage: number
+  disk_usage: number
+  uptime: number
+}
+
+/**
+ * 集群级 shard 视图 — 按 shard_id 聚合多 filer 副本。
+ * Phase C 的 /api/filer/cluster/shards 返回此类型。
+ */
+export interface ClusterShardReplica {
+  node_id: string
+  is_leader: boolean
+  term: number
+  commit_index: number
+  applied_index: number
+  inode_count: number
+  write_qps: number
+  read_qps: number
+}
+
+export interface ClusterShard {
+  shard_id: number
+  inode_range_start: number
+  inode_range_end: number
+  replicas: ClusterShardReplica[]
+  /** 集群级健康判定 (term 一致 + commit_index 落后 < 阈值) */
+  is_healthy: boolean
+  /** 不健康时的原因 */
+  lag_reason?: string
+}
+
 // ===== Master Raft =====
 export interface MasterStatus {
   nodes: NodeInfo[]
