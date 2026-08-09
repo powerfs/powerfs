@@ -325,13 +325,12 @@ impl ServerConnectionManager {
                 | ClientType::Filer
                 | ClientType::Master
                 | ClientType::Admin
-        ) {
-            if !conn.check_rate_limit().await {
-                return Err(NetError::ServerError(format!(
-                    "Rate limit exceeded for client {}",
-                    client_id
-                )));
-            }
+        ) && !conn.check_rate_limit().await
+        {
+            return Err(NetError::ServerError(format!(
+                "Rate limit exceeded for client {}",
+                client_id
+            )));
         }
 
         let mut ctx = RequestContext::new(&client_info, msg);

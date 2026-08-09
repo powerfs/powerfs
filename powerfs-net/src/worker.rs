@@ -98,8 +98,8 @@ impl Worker {
         let proc_start = Instant::now();
         let est_bytes = work.msg.body.len();
         let flow_stats = self.flow_ctrl.get_conn(conn.id);
-        match &flow_stats {
-            Some(stats) => match self.flow_ctrl.admit(conn.id, msg_type, est_bytes) {
+        if let Some(stats) = &flow_stats {
+            match self.flow_ctrl.admit(conn.id, msg_type, est_bytes) {
                 AdmissionDecision::Admit => {
                     self.flow_ctrl.on_request_start(stats);
                 }
@@ -116,9 +116,9 @@ impl Worker {
                     self.send_with_flow(conn, resp);
                     return; // 未处理, 不调 on_request_complete
                 }
-            },
-            None => {} // 连接未注册到 flow_ctrl, 跳过流控 (兼容性)
+            }
         }
+        // else: 连接未注册到 flow_ctrl, 跳过流控 (兼容性)
 
         // 调用业务处理器
         // - 若存在会话管理器, 通过 pipeline 处理 (含中间件、metrics、session 校验)

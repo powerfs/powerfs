@@ -380,7 +380,7 @@ impl ConnRegistry {
             self.by_holder.insert(holder.clone(), id);
         }
         // 按 (client_id, channel) 存储, 两个通道互不干扰
-        let mut entry = self.conns.entry(id).or_insert_with(HashMap::new);
+        let mut entry = self.conns.entry(id).or_default();
         if entry.insert(channel, conn.clone()).is_some() {
             log::debug!(
                 "ConnRegistry: register replaced old conn for client_id={} channel={} (reconnect)",
