@@ -9,7 +9,7 @@ import {
   InfoCircleOutlined,
 } from '@ant-design/icons'
 import type { VolumeInfo } from '@/types'
-import { getVolumes, deleteVolume } from '@/services/api'
+import { getVolumes } from '@/services/api'
 import { formatBytes } from '@/utils/format'
 
 const { Text } = Typography
@@ -40,10 +40,11 @@ function Volumes() {
     setShowDetail(true)
   }
 
-  const handleDelete = (volume: VolumeInfo) => {
-    setSelectedVolume(volume)
-    setShowDeleteConfirm(true)
-  }
+  // TODO: restore delete handler after DELETE /metrics/volumes/:id endpoint is added (decision 3)
+  // const handleDelete = (volume: VolumeInfo) => {
+  //   setSelectedVolume(volume)
+  //   setShowDeleteConfirm(true)
+  // }
 
   const handleMigrate = (volume: VolumeInfo) => {
     setSelectedVolume(volume)
@@ -51,11 +52,10 @@ function Volumes() {
   }
 
   const confirmDelete = async () => {
+    // TODO: restore after DELETE /metrics/volumes/:id endpoint is added (decision 3)
     if (selectedVolume) {
-      await deleteVolume(selectedVolume.id)
-      message.success('Volume删除成功')
+      message.warning('Volume 删除暂不可用（后端 DELETE 接口待补充）')
       setShowDeleteConfirm(false)
-      loadVolumes()
     }
   }
 
@@ -168,15 +168,16 @@ function Volumes() {
           >
             迁移
           </Button>
-          <Button
-            type="text"
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDelete(record)}
-            disabled={record.file_count > 0}
-          >
-            删除
-          </Button>
+          <Tooltip title="后端 DELETE 路由待补充，暂不可用">
+            <Button
+              type="text"
+              danger
+              icon={<DeleteOutlined />}
+              disabled
+            >
+              删除
+            </Button>
+          </Tooltip>
         </Space>
       ),
     },
@@ -213,7 +214,7 @@ function Volumes() {
               { value: '', label: '全部' },
               { value: 'available', label: '可用' },
               { value: 'full', label: '已满' },
-              { value: 'readonly', label: '只读' },
+              { value: 'read_only', label: '只读' },
               { value: 'creating', label: '创建中' },
             ]}
           />
@@ -282,8 +283,8 @@ function Volumes() {
                 <div>
                   <span style={{ color: '#8c8c8c', fontSize: 12 }}>状态</span>
                   <div>
-                    <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? 'orange' : 'blue'}>
-                      {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? '只读' : selectedVolume.status === 'deleting' ? '删除中' : '创建中'}
+                    <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : selectedVolume.status === 'read_only' ? 'orange' : 'blue'}>
+                      {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : selectedVolume.status === 'read_only' ? '只读' : selectedVolume.status === 'deleting' ? '删除中' : '创建中'}
                     </Tag>
                   </div>
                 </div>
