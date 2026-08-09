@@ -920,6 +920,33 @@ async fn list_filer_nodes(
         })
         .collect();
 
+    // 3.5. 并行获取各 filer /admin/status, 用真实 leader_count 覆盖 Master gRPC 值
+    // (Master gRPC ListFilers 的 leader_count 不可靠, 经常报 0)
+    let filer_admin = state.filer_admin.clone();
+    let admin_futures: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let ep = powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: n.node_id.clone(),
+                address: n.address.clone(),
+                http_port: n.http_port,
+            };
+            let client = filer_admin.clone();
+            async move { client.get_json(&ep, "/admin/status").await.ok() }
+        })
+        .collect();
+    let admin_results = futures::future::join_all(admin_futures).await;
+    for (node, result) in nodes.iter_mut().zip(admin_results.iter()) {
+        if let Some(json) = result {
+            if let Some(lc) = json.get("leader_count").and_then(|v| v.as_u64()) {
+                node.leader_count = lc;
+            }
+            if let Some(ts) = json.get("shard_count").and_then(|v| v.as_u64()) {
+                node.total_shards = ts;
+            }
+        }
+    }
+
     // 4. 补充: 心跳有但 gRPC 没注册的 filer (master 未感知, 可能注册延迟)
     let registered_ids: HashSet<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
     for n in &heartbeat_nodes {
