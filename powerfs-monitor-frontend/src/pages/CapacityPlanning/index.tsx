@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react'
-import { Card, Select, Space, Typography, Empty, Spin, Row, Col, Statistic, Tag } from 'antd'
+import { useEffect, useState, useMemo } from 'react'
+import { Card, Select, Space, Typography, Empty, Spin, Row, Col, Statistic, Tag, Tooltip } from 'antd'
 import ReactECharts from 'echarts-for-react'
-import { getVolumes, getCapacityHistory, getCapacityProjection, type CapacityHistoryResponse, type CapacityProjectionResponse } from '@/services/api'
+import { getVolumes, getCapacityHistory, getCapacityProjection, getClusterDiskUsageBreakdown, getMetricHistory, type CapacityHistoryResponse, type CapacityProjectionResponse, type NodeDiskUsageSeries } from '@/services/api'
 import type { VolumeInfo } from '@/types'
 import dayjs from 'dayjs'
 
-const { Title } = Typography
+const { Title, Text } = Typography
 const { Option } = Select
 
 function formatBytes(bytes: number): string {
@@ -24,6 +24,12 @@ export default function CapacityPlanning() {
   const [projection, setProjection] = useState<CapacityProjectionResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [projectHours, setProjectHours] = useState<number>(24)
+  // Cluster-wide disk usage trend (P3: GET /api/metrics/cluster-disk-usage)
+  const [clusterSeries, setClusterSeries] = useState<NodeDiskUsageSeries[]>([])
+  const [clusterAvgTrend, setClusterAvgTrend] = useState<{ time: string; value: number }[]>([])
+  const [clusterTrendLoading, setClusterTrendLoading] = useState(false)
+  // Reuse rangeMinutes for cluster trend lookback, but clamp to 7d max (matches backend limit).
+  const clusterLookback = Math.min(rangeMinutes, 10080)
 
   useEffect(() => {
     loadVolumes()
@@ -47,6 +53,11 @@ export default function CapacityPlanning() {
     }
   }, [selectedVolume, rangeMinutes, projectHours])
 
+  // Cluster-wide trend is independent of selected volume — only depends on the lookback window.
+  useEffect(() => {
+    loadClusterTrend()
+  }, [clusterLookback])
+
   const loadData = async () => {
     if (selectedVolume === null) return
     setLoading(true)
@@ -61,6 +72,24 @@ export default function CapacityPlanning() {
       console.error('Failed to load capacity data', e)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadClusterTrend = async () => {
+    setClusterTrendLoading(true)
+    try {
+      const [series, avg] = await Promise.all([
+        getClusterDiskUsageBreakdown(clusterLookback),
+        getMetricHistory('cluster_disk_usage', clusterLookback),
+      ])
+      setClusterSeries(series)
+      setClusterAvgTrend(avg)
+    } catch (e) {
+      console.error('Failed to load cluster disk usage trend', e)
+      setClusterSeries([])
+      setClusterAvgTrend([])
+    } finally {
+      setClusterTrendLoading(false)
     }
   }
 
@@ -107,6 +136,121 @@ export default function CapacityPlanning() {
     }
 
     return <ReactECharts option={option} style={{ height: 350 }} />
+  }
+
+  // ─── Cluster-wide disk usage trend chart (multi-series + avg line) ───
+  // Builds a single ECharts option combining:
+  //   * one line per node (from clusterSeries, each series is its own color)
+  //   * a bold black avg line (from clusterAvgTrend)
+  const clusterChartOption = useMemo(() => {
+    if (clusterSeries.length === 0 && clusterAvgTrend.length === 0) {
+      return null
+    }
+    // Color palette (10 distinct colors, will cycle if >10 nodes).
+    const palette = [
+      '#1677ff', '#52c41a', '#faad14', '#eb2f96', '#722ed1',
+      '#13c2c2', '#fa541c', '#a0d911', '#2f54eb', '#f5222d',
+    ]
+    const nodeSeries = clusterSeries.map((s, idx) => ({
+      name: s.node_id,
+      type: 'line' as const,
+      smooth: true,
+      symbol: 'circle',
+      symbolSize: 4,
+      showSymbol: false,
+      lineStyle: { width: 1.5, color: palette[idx % palette.length], opacity: 0.7 },
+      itemStyle: { color: palette[idx % palette.length] },
+      data: s.points.map((p) => [dayjs(p.time).valueOf(), Number(p.value.toFixed(2))]),
+    }))
+    const avgSeries = {
+      name: '集群平均',
+      type: 'line' as const,
+      smooth: true,
+      symbol: 'none',
+      showSymbol: false,
+      lineStyle: { width: 3, color: '#000', type: 'dashed' as const },
+      itemStyle: { color: '#000' },
+      z: 10,
+      data: clusterAvgTrend.map((p) => [dayjs(p.time).valueOf(), Number(p.value.toFixed(2))]),
+    }
+    return {
+      tooltip: {
+        trigger: 'axis',
+        formatter: (params: any) => {
+          if (!Array.isArray(params) || params.length === 0) return ''
+          const ts = dayjs(params[0].value[0]).format('YYYY-MM-DD HH:mm')
+          const lines = params
+            .map((p: any) => `${p.marker} ${p.seriesName}: ${Number(p.value[1]).toFixed(2)}%`)
+            .join('<br/>')
+          return `${ts}<br/>${lines}`
+        },
+      },
+      legend: {
+        type: 'scroll' as const,
+        bottom: 0,
+        textStyle: { fontSize: 11 },
+      },
+      grid: { left: 50, right: 30, top: 20, bottom: 50 },
+      xAxis: {
+        type: 'time',
+        axisLabel: {
+          formatter: (value: number) => dayjs(value).format('MM-DD HH:mm'),
+        },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: 100,
+        axisLabel: { formatter: '{value}%' },
+      },
+      series: [...nodeSeries, avgSeries],
+    }
+  }, [clusterSeries, clusterAvgTrend])
+
+  // Cluster-level KPIs derived from latest points.
+  const clusterKpis = useMemo(() => {
+    if (clusterAvgTrend.length === 0) {
+      return { latestAvg: null, maxAvg: null, nodeCount: 0, hottestNode: null, hottestNodeValue: null }
+    }
+    const latestAvg = clusterAvgTrend[clusterAvgTrend.length - 1].value
+    const maxAvg = Math.max(...clusterAvgTrend.map((p) => p.value))
+    const nodeLatest = clusterSeries
+      .map((s) => {
+        const last = s.points[s.points.length - 1]
+        return last ? { node_id: s.node_id, value: last.value } : null
+      })
+      .filter(Boolean) as { node_id: string; value: number }[]
+    const hottest = nodeLatest.reduce(
+      (acc, n) => (n.value > acc.value ? n : acc),
+      nodeLatest[0] ?? { node_id: '-', value: 0 },
+    )
+    return {
+      latestAvg,
+      maxAvg,
+      nodeCount: nodeLatest.length,
+      hottestNode: hottest.node_id,
+      hottestNodeValue: hottest.value,
+    }
+  }, [clusterSeries, clusterAvgTrend])
+
+  const renderClusterChart = () => {
+    if (clusterSeries.length === 0 && clusterAvgTrend.length === 0) {
+      return (
+        <Empty
+          description={
+            <span>
+              暂无集群磁盘使用率数据
+              <br />
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                采样器每 60 秒记录一次各节点 disk_usage；新部署需要几分钟积累数据。
+              </Text>
+            </span>
+          }
+        />
+      )
+    }
+    if (!clusterChartOption) return <Empty description="数据解析中..." />
+    return <ReactECharts option={clusterChartOption} style={{ height: 380 }} />
   }
 
   return (
@@ -221,6 +365,109 @@ export default function CapacityPlanning() {
                 </div>
               ) : (
                 <Empty description="选择一个 Volume 以查看预测" />
+              )}
+            </Card>
+          </Col>
+        </Row>
+      </Spin>
+
+      {/* ═══════════ P3: Cluster-wide disk usage trend (multi-node) ═══════════ */}
+      <Spin spinning={clusterTrendLoading}>
+        <Row gutter={16} style={{ marginTop: 16 }}>
+          <Col span={18}>
+            <Card
+              title={
+                <Space>
+                  <span>集群磁盘使用率趋势</span>
+                  <Tag color="blue" style={{ fontSize: 11 }}>
+                    {clusterSeries.length} 个节点 · {clusterLookback >= 1440 ? `${Math.round(clusterLookback / 1440)} 天` : `${Math.round(clusterLookback / 60)} 小时`}
+                  </Tag>
+                  <Tooltip title="数据来源: TimeSeriesStore.get_per_node_disk_usage (60s 采样)，曲线为各节点 disk_usage 百分比，黑色虚线为集群平均值">
+                    <Text type="secondary" style={{ fontSize: 11 }}>?</Text>
+                  </Tooltip>
+                </Space>
+              }
+              extra={
+                <Tooltip title="刷新">
+                  <Text
+                    onClick={loadClusterTrend}
+                    style={{ cursor: 'pointer', color: 'var(--pf-color-primary)', fontSize: 13 }}
+                  >
+                    刷新
+                  </Text>
+                </Tooltip>
+              }
+            >
+              {renderClusterChart()}
+            </Card>
+          </Col>
+
+          <Col span={6}>
+            <Card title="集群 KPI" style={{ height: '100%' }}>
+              {clusterKpis.latestAvg === null ? (
+                <Empty description="暂无数据" />
+              ) : (
+                <div>
+                  <Row gutter={16} style={{ marginBottom: 16 }}>
+                    <Col span={24}>
+                      <Statistic
+                        title="集群平均磁盘使用率"
+                        value={clusterKpis.latestAvg}
+                        precision={2}
+                        suffix="%"
+                        valueStyle={{
+                          color:
+                            clusterKpis.latestAvg > 90 ? '#ff4d4f'
+                              : clusterKpis.latestAvg > 80 ? '#faad14'
+                              : '#52c41a',
+                        }}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} style={{ marginBottom: 16 }}>
+                    <Col span={24}>
+                      <Statistic
+                        title="区间峰值平均"
+                        value={clusterKpis.maxAvg ?? 0}
+                        precision={2}
+                        suffix="%"
+                        valueStyle={{ color: '#722ed1' }}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} style={{ marginBottom: 16 }}>
+                    <Col span={12}>
+                      <Statistic
+                        title="采样节点数"
+                        value={clusterKpis.nodeCount}
+                        suffix="个"
+                      />
+                    </Col>
+                    <Col span={12}>
+                      <Statistic
+                        title="热点节点"
+                        value={clusterKpis.hottestNode ?? '-'}
+                        valueStyle={{ fontSize: 14 }}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16}>
+                    <Col span={24}>
+                      <Statistic
+                        title="热点节点使用率"
+                        value={clusterKpis.hottestNodeValue ?? 0}
+                        precision={2}
+                        suffix="%"
+                        valueStyle={{
+                          color:
+                            (clusterKpis.hottestNodeValue ?? 0) > 90 ? '#ff4d4f'
+                              : (clusterKpis.hottestNodeValue ?? 0) > 80 ? '#faad14'
+                              : '#52c41a',
+                        }}
+                      />
+                    </Col>
+                  </Row>
+                </div>
               )}
             </Card>
           </Col>
