@@ -1100,7 +1100,9 @@ async function pickFirstFilerNodeId(): Promise<string | null> {
   const nodes = await getFilerNodes()
   if (nodes.length === 0) return null
   // 优先选心跳在线的节点; 都离线时退而取第一个
-  const online = nodes.find(n => n.heartbeat_status === 'online')
+  // 存活状态匹配: online/healthy/leader/follower (项目硬约束)
+  const ALIVE_STATES = ['online', 'healthy', 'leader', 'follower']
+  const online = nodes.find(n => ALIVE_STATES.includes(n.heartbeat_status))
   return (online ?? nodes[0]).node_id
 }
 

@@ -9,6 +9,7 @@ import {
 } from '@ant-design/icons'
 import type { ShardDetail, FilerNode, ClusterShard } from '@/types'
 import { getFilerNodeShards, getFilerNodes, getFilerClusterShards } from '@/services/api'
+import { isNodeAlive } from '@/utils/format'
 import ReactECharts from 'echarts-for-react'
 
 const { Text, Title } = Typography
@@ -52,7 +53,7 @@ function Shards() {
       const data = await getFilerNodes()
       setNodes(data)
       if (data.length > 0 && !data.some(n => n.node_id === selectedNodeId)) {
-        const online = data.find(n => n.heartbeat_status === 'online')
+        const online = data.find(n => isNodeAlive(n.heartbeat_status))
         setSelectedNodeId((online ?? data[0]).node_id)
       }
     } catch (error) {
@@ -143,7 +144,7 @@ function Shards() {
   )
 
   const selectedNode = nodes.find(n => n.node_id === selectedNodeId)
-  const nodeOffline = selectedNode && selectedNode.heartbeat_status !== 'online'
+  const nodeOffline = selectedNode && !isNodeAlive(selectedNode.heartbeat_status)
 
   const inodePieOption = {
     tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
@@ -304,14 +305,14 @@ function Shards() {
               label: <Space>
                 <Text>{n.node_id}</Text>
                 <Text type="secondary" style={{ fontSize: 12 }}>{n.address}:{n.http_port}</Text>
-                <Tag color={n.heartbeat_status === 'online' ? 'success' : 'error'} style={{ margin: 0, fontSize: 11 }}>{n.heartbeat_status === 'online' ? '在线' : '离线'}</Tag>
+                <Tag color={isNodeAlive(n.heartbeat_status) ? 'success' : 'error'} style={{ margin: 0, fontSize: 11 }}>{isNodeAlive(n.heartbeat_status) ? '在线' : '离线'}</Tag>
               </Space>,
             }))}
             notFoundContent={nodesLoading ? '加载节点中...' : '集群暂无 Filer 节点'}
           />
           {selectedNode && (
-            <Tag color={selectedNode.heartbeat_status === 'online' ? 'success' : 'error'} icon={<HeartOutlined />}>
-              {selectedNode.heartbeat_status === 'online' ? '心跳在线' : '心跳离线'}
+            <Tag color={isNodeAlive(selectedNode.heartbeat_status) ? 'success' : 'error'} icon={<HeartOutlined />}>
+              {isNodeAlive(selectedNode.heartbeat_status) ? '心跳在线' : '心跳离线'}
             </Tag>
           )}
         </div>

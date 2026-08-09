@@ -36,3 +36,13 @@ export function formatTime(timestamp: string): string {
 export function formatNumber(value: number): string {
   return value.toLocaleString()
 }
+
+/**
+ * 节点存活判定 — 统一状态匹配 (项目硬约束)
+ * 匹配 'online'、'healthy'、'leader' 或 'follower' 视为存活
+ * 其余状态 (含 'offline'、'unhealthy' 等) 视为离线
+ */
+export function isNodeAlive(status: string | undefined | null): boolean {
+  if (!status) return false
+  return ['online', 'healthy', 'leader', 'follower'].includes(status)
+}

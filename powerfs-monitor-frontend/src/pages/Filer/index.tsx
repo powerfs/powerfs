@@ -27,6 +27,7 @@ import {
   getFilerNodes, getFilerNodeStatus, getConflictStats, getConflicts,
   triggerFilerNodeBalancer,
 } from '@/services/api'
+import { isNodeAlive } from '@/utils/format'
 
 const { Text, Link: TypographyLink } = Typography
 
@@ -64,7 +65,7 @@ function Filer() {
       setNodes(data)
       // 自动选中第一个在线节点 (或首个节点)
       if (data.length > 0 && !data.some(n => n.node_id === selectedNodeId)) {
-        const online = data.find(n => n.heartbeat_status === 'online')
+        const online = data.find(n => isNodeAlive(n.heartbeat_status))
         setSelectedNodeId((online ?? data[0]).node_id)
       }
     } catch (error) {
@@ -151,7 +152,7 @@ function Filer() {
   }
 
   // ── KPI 统计 ──
-  const onlineCount = nodes.filter(n => n.heartbeat_status === 'online').length
+  const onlineCount = nodes.filter(n => isNodeAlive(n.heartbeat_status)).length
   const offlineCount = nodes.length - onlineCount
   const totalLeaders = nodes.reduce((sum, n) => sum + n.leader_count, 0)
 
@@ -183,7 +184,7 @@ function Filer() {
       key: 'heartbeat_status',
       width: 110,
       render: (status: string, r: FilerNode) => {
-        const online = status === 'online'
+        const online = isNodeAlive(status)
         return (
           <Tooltip title={online ? `${r.last_seen_ago_secs}s 前心跳` : '心跳超时 (>30s)'}>
             <Tag color={online ? 'success' : 'error'} icon={<HeartOutlined />}>
@@ -255,14 +256,14 @@ function Filer() {
           <Popconfirm
             title={`触发节点 ${r.node_id} 的 rebalance 检查?`}
             onConfirm={() => handleTriggerBalance(r.node_id)}
-            disabled={r.heartbeat_status !== 'online'}
+            disabled={!isNodeAlive(r.heartbeat_status)}
           >
             <Button
               type="link"
               size="small"
               icon={<ThunderboltOutlined />}
               loading={actionLoading[`trigger-${r.node_id}`]}
-              disabled={r.heartbeat_status !== 'online'}
+              disabled={!isNodeAlive(r.heartbeat_status)}
             >
               Rebalance
             </Button>
@@ -313,7 +314,7 @@ function Filer() {
             rowKey="node_id"
             pagination={false}
             size="middle"
-            rowClassName={(r) => r.heartbeat_status !== 'online' ? 'pf-row-warning' : ''}
+            rowClassName={(r) => !isNodeAlive(r.heartbeat_status) ? 'pf-row-warning' : ''}
           />
         ) : (
           <Empty description={nodesLoading ? '加载中...' : '集群暂无 Filer 节点'} />
@@ -352,8 +353,8 @@ function Filer() {
             notFoundContent="暂无节点"
           />
           {selectedNodeId && (
-            <Tag color={nodes.find(n => n.node_id === selectedNodeId)?.heartbeat_status === 'online' ? 'success' : 'error'}>
-              {nodes.find(n => n.node_id === selectedNodeId)?.heartbeat_status === 'online' ? '在线' : '离线'}
+            <Tag color={isNodeAlive(nodes.find(n => n.node_id === selectedNodeId)?.heartbeat_status) ? 'success' : 'error'}>
+              {isNodeAlive(nodes.find(n => n.node_id === selectedNodeId)?.heartbeat_status) ? '在线' : '离线'}
             </Tag>
           )}
         </Space>
