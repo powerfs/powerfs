@@ -424,7 +424,10 @@ services:
     container_name: s3
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.32
+        # Was 172.30.0.32, but cce28ec5 assigned that to filer-2, colliding
+        # with s3 and preventing both s3 and monitor (depends_on s3) from
+        # starting. Moved to 172.30.0.40 (free in the current layout).
+        ipv4_address: 172.30.0.40
     volumes:
       - s3-data:/data
       - ./config/s3.toml:/app/config/s3.toml:ro
