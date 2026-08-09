@@ -26,6 +26,12 @@ jobs:
       with:
         components: rustfmt, clippy
     
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo chmod 666 /dev/fuse
+
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
     
@@ -46,6 +52,12 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo chmod 666 /dev/fuse
+
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
     
@@ -63,6 +75,12 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo chmod 666 /dev/fuse
+
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
     
@@ -84,6 +102,12 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo chmod 666 /dev/fuse
+
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
     
@@ -117,6 +141,12 @@ jobs:
     - name: Install grcov
       run: cargo install grcov
     
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo chmod 666 /dev/fuse
+
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
     
