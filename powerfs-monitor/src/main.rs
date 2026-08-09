@@ -2289,6 +2289,92 @@ async fn get_fuse_client_stats(
     Json(ApiResponse::error("FUSE client not found"))
 }
 
+/// GET /api/fuse/clients — list all FUSE clients currently registered at Master.
+///
+/// Unlike `/api/fuse/mounts` this endpoint returns only the master registry
+/// view (no monitor-managed fallback); returns 500 when the master is
+/// unreachable so the UI can clearly distinguish "empty cluster" from
+/// "control plane unreachable".
+async fn list_fuse_clients(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<FuseMount>>> {
+    let clients = match state
+        .master_client
+        .call(|client| async move {
+            let mut client = client;
+            client
+                .get_fuse_clients(tonic::Request::new(
+                    powerfs_master::proto::powerfs::FuseClientsRequest {},
+                ))
+                .await
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().clients,
+        Err(e) => {
+            return Json(ApiResponse::<Vec<FuseMount>>::error(&format!(
+                "Failed to query master fuse clients: {}",
+                e
+            )));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let mut result: Vec<FuseMount> = clients
+        .into_iter()
+        .map(|client| {
+            let mut mount = FuseMount {
+                id: client.client_id,
+                mount_point: client.mount_point,
+                collection: client.collection,
+                replication: client.replication,
+                filer_address: String::new(),
+                threads: 0,
+                status: "mounted".to_string(),
+                mounted_at: if client.connected_at > 0 {
+                    chrono::DateTime::from_timestamp(client.connected_at as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                pid: Some(client.pid),
+                host: Some(client.host),
+                client_type: Some(client.client_type),
+                dirty_chunks: Some(client.dirty_chunks),
+                dirty_bytes: Some(client.dirty_bytes),
+                last_heartbeat: if client.last_heartbeat > 0 {
+                    chrono::DateTime::from_timestamp(client.last_heartbeat as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                } else {
+                    None
+                },
+                stats: client.stats.map(ClientStatsResponse::from),
+            };
+            if let Some(last_hb) = mount
+                .last_heartbeat
+                .as_ref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp() as u64)
+            {
+                mount.status = if now.saturating_sub(last_hb) <= 60 {
+                    "mounted".to_string()
+                } else {
+                    "unmounted".to_string()
+                };
+            }
+            mount
+        })
+        .collect();
+    result.sort_by(|a, b| {
+        b.last_heartbeat
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.last_heartbeat.as_deref().unwrap_or(""))
+    });
+    Json(ApiResponse::success(result))
+}
+
 /// GET /api/config/circuit-breaker — current default CircuitBreaker config.
 ///
 /// These values mirror the defaults compiled into the FUSE client
@@ -5003,6 +5089,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/mounts", get(get_fuse_mounts))
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
+        .route("/api/fuse/clients", get(list_fuse_clients))
         .route("/api/fuse/clients/:id/stats", get(get_fuse_client_stats))
         .route(
             "/api/config/circuit-breaker",

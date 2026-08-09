@@ -393,6 +393,14 @@ export async function getFuseMounts(): Promise<FuseMount[]> {
   return response.data.data
 }
 
+export async function getFuseClients(): Promise<FuseMount[]> {
+  if (useMock) {
+    return mockFuseMounts
+  }
+  const response = await api.get('/fuse/clients')
+  return response.data.data
+}
+
 export async function getFuseClientStats(clientId: string): Promise<ClientStats | null> {
   if (useMock) {
     return null

@@ -11,7 +11,7 @@ import {
   RocketOutlined,
 } from '@ant-design/icons'
 import type { FuseMount, ClientStats } from '@/types'
-import { getFuseMounts, createFuseMount, deleteFuseMount, getFuseClientStats } from '@/services/api'
+import { getFuseMounts, createFuseMount, deleteFuseMount, getFuseClientStats, getFuseClients } from '@/services/api'
 
 const { Text } = Typography
 
@@ -31,6 +31,8 @@ function formatLatency(us: number | undefined): string {
 
 function Fuse() {
   const [mounts, setMounts] = useState<FuseMount[]>([])
+  const [clients, setClients] = useState<FuseMount[]>([])
+  const [clientsLoading, setClientsLoading] = useState(false)
   const [createModalVisible, setCreateModalVisible] = useState(false)
   const [form] = Form.useForm()
   const [statsDrawerVisible, setStatsDrawerVisible] = useState(false)
@@ -40,6 +42,7 @@ function Fuse() {
 
   useEffect(() => {
     loadMounts()
+    loadClients()
   }, [])
 
   const loadMounts = async () => {
@@ -49,6 +52,19 @@ function Fuse() {
     } catch (error) {
       console.error('Failed to load FUSE mounts:', error)
       message.error('加载FUSE挂载列表失败')
+    }
+  }
+
+  const loadClients = async () => {
+    setClientsLoading(true)
+    try {
+      const clientList = await getFuseClients()
+      setClients(clientList)
+    } catch (error) {
+      console.warn('Failed to load FUSE clients from master registry:', error)
+      setClients([])
+    } finally {
+      setClientsLoading(false)
     }
   }
 
@@ -287,29 +303,80 @@ function Fuse() {
               </span>
             ),
             children: (
-              <Card
-                title="FUSE（用户态）挂载管理"
-                style={{ borderRadius: 12 }}
-                bodyStyle={{ padding: '20px' }}
-                extra={
-                  <Space>
-                    <Tooltip title="刷新">
-                      <Button icon={<ReloadOutlined />} onClick={loadMounts}>刷新</Button>
-                    </Tooltip>
-                    <Button type="primary" onClick={() => setCreateModalVisible(true)}>
-                      <PlusOutlined /> 新建挂载
-                    </Button>
-                  </Space>
-                }
-              >
-                <Table
-                  columns={columns}
-                  dataSource={mounts}
-                  rowKey="id"
-                  pagination={{ pageSize: 10 }}
-                  size="small"
-                />
-              </Card>
+              <Tabs
+                defaultActiveKey="managed"
+                size="small"
+                items={[
+                  {
+                    key: 'managed',
+                    label: 'Monitor 管理挂载',
+                    children: (
+                      <Card
+                        title="FUSE（用户态）挂载管理"
+                        style={{ borderRadius: 12 }}
+                        bodyStyle={{ padding: '20px' }}
+                        extra={
+                          <Space>
+                            <Tooltip title="刷新">
+                              <Button icon={<ReloadOutlined />} onClick={loadMounts}>刷新</Button>
+                            </Tooltip>
+                            <Button type="primary" onClick={() => setCreateModalVisible(true)}>
+                              <PlusOutlined /> 新建挂载
+                            </Button>
+                          </Space>
+                        }
+                      >
+                        <Table
+                          columns={columns}
+                          dataSource={mounts}
+                          rowKey="id"
+                          pagination={{ pageSize: 10 }}
+                          size="small"
+                        />
+                      </Card>
+                    ),
+                  },
+                  {
+                    key: 'registry',
+                    label: `Master 注册客户端 (${clients.length})`,
+                    children: (
+                      <Card
+                        title="Master 注册视角 - 所有 FUSE 客户端"
+                        style={{ borderRadius: 12 }}
+                        bodyStyle={{ padding: '20px' }}
+                        extra={
+                          <Tooltip title="从 Master 重新拉取">
+                            <Button icon={<ReloadOutlined />} onClick={loadClients}>刷新</Button>
+                          </Tooltip>
+                        }
+                      >
+                        <Table
+                          columns={columns.map(col => {
+                            // Hide the "卸载" button for registry view
+                            if (col.key === 'actions') {
+                              return {
+                                ...col,
+                                width: 110,
+                                render: (_: unknown, record: FuseMount) => (
+                                  <Button size="small" onClick={() => handleViewStats(record)}>
+                                    <BarChartOutlined /> 统计
+                                  </Button>
+                                ),
+                              }
+                            }
+                            return col
+                          })}
+                          dataSource={clients}
+                          rowKey="id"
+                          loading={clientsLoading}
+                          pagination={{ pageSize: 10 }}
+                          size="small"
+                        />
+                      </Card>
+                    ),
+                  },
+                ]}
+              />
             ),
           },
           {
