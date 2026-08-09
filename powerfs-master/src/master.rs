@@ -2253,11 +2253,10 @@ impl MasterNode {
         let mut result = Vec::with_capacity(count);
         loop {
             let mut picked = false;
-            for i in 0..num_nodes {
+            for (_, group) in node_groups.iter_mut().take(num_nodes) {
                 if result.len() >= count {
                     break;
                 }
-                let (_, group) = &mut node_groups[i];
                 if let Some(r) = group.first().copied() {
                     result.push(powerfs_common::types::ZoneVolume {
                         volume_id: r.volume_id,
@@ -2289,6 +2288,7 @@ impl MasterNode {
     ///   - 首次注册: 创建 1 个新 Zone, 返回 Vec(1)
     ///   - 重启再注册: 返回该 filer_id 的所有已有 Zone, 不自动创建新 Zone
     ///   - 扩容 (未来): 返回旧 Zone + 创建新 Zone
+    ///
     /// P1.3: Zone 注册/更新通过 Raft 持久化, Master 重启后从 Raft 日志重放恢复.
     pub async fn register_filer_zone(
         &self,
