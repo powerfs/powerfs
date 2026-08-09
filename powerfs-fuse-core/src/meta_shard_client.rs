@@ -954,7 +954,7 @@ impl MetaShardClient {
     /// - redirect: 服务器告知新 Leader 地址，更新路由后立即重试（短退避 5ms→40ms）
     /// - 网络错误: 记录失败，轮换到下一个 Filer 候选地址，指数退避重试（50ms→1s）
     /// - 熔断打开: 轮换到下一个 Filer 候选地址重试
-    /// 最多 MAX_ATTEMPTS 次尝试。
+    ///   最多 MAX_ATTEMPTS 次尝试。
     async fn send_coherence_msg(
         &self,
         msg_type: powerfs_net::MsgType,
