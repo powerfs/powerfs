@@ -1,13 +1,39 @@
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use hex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+use crate::metadata_store::BucketInfo;
 
 use crate::bucket_manager::BucketManager;
 use crate::entry_manager::EntryManager;
 use crate::meta_shard_manager::MetaShardManager;
 use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
+
+/// Admin bucket create request body (JSON, proxied via Monitor).
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateBucketRequest {
+    pub name: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub size_limit: Option<u64>,
+}
+
+/// Admin bucket quota update request body.
+#[derive(Debug, Deserialize)]
+pub struct AdminSetQuotaRequest {
+    pub size_limit: u64,
+}
+
+/// Admin bucket list response (JSON, not S3 XML).
+#[derive(Debug, Serialize)]
+pub struct AdminBucketListResponse {
+    pub buckets: Vec<BucketInfo>,
+    pub total: usize,
+}
 
 pub struct S3Handler {
     bucket_manager: Arc<BucketManager>,
@@ -460,6 +486,95 @@ impl S3Handler {
                 .join("\n")
         );
         (StatusCode::OK, body).into_response()
+    }
+
+    // ── Admin bucket management (JSON API, proxied via Monitor) ──
+
+    /// Admin: list all buckets as JSON (not S3 XML).
+    pub async fn admin_list_buckets(&self) -> axum::response::Response {
+        let buckets = self.bucket_manager.list_buckets().await;
+        let total = buckets.len();
+        Json(AdminBucketListResponse { buckets, total }).into_response()
+    }
+
+    /// Admin: create a bucket via JSON body.
+    pub async fn admin_create_bucket(
+        &self,
+        req: AdminCreateBucketRequest,
+    ) -> axum::response::Response {
+        let collection = req.collection.as_deref().unwrap_or("default");
+        match self
+            .bucket_manager
+            .create_bucket(&req.name, "001", collection)
+            .await
+        {
+            Ok(mut info) => {
+                if let Some(limit) = req.size_limit {
+                    if let Ok(updated) =
+                        self.bucket_manager.set_bucket_quota(&req.name, limit).await
+                    {
+                        info = updated;
+                    }
+                }
+                (StatusCode::CREATED, Json(info)).into_response()
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("exist") || msg.contains("FileExists") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
+    }
+
+    /// Admin: delete a bucket by name.
+    pub async fn admin_delete_bucket(&self, bucket: &str) -> axum::response::Response {
+        match self.bucket_manager.delete_bucket(bucket).await {
+            Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "bucket not found" })),
+            )
+                .into_response(),
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("not empty") {
+                    StatusCode::CONFLICT
+                } else if msg.contains("not exist") || msg.contains("DirectoryNotFound") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
+    }
+
+    /// Admin: set bucket quota (size_limit = 0 means unlimited).
+    pub async fn admin_set_quota(
+        &self,
+        bucket: &str,
+        req: AdminSetQuotaRequest,
+    ) -> axum::response::Response {
+        match self
+            .bucket_manager
+            .set_bucket_quota(bucket, req.size_limit)
+            .await
+        {
+            Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("not exist") || msg.contains("DirectoryNotFound") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
     }
 }
 
