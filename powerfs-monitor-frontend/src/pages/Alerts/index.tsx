@@ -248,7 +248,7 @@ function Alerts() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -267,7 +267,7 @@ function Alerts() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -286,7 +286,7 @@ function Alerts() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -305,7 +305,7 @@ function Alerts() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

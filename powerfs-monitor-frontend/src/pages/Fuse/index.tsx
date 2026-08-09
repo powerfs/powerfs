@@ -314,7 +314,7 @@ function Fuse() {
                       <Card
                         title="FUSE（用户态）挂载管理"
                         style={{ borderRadius: 12 }}
-                        bodyStyle={{ padding: '20px' }}
+                        styles={{ body: { padding: '20px' } }}
                         extra={
                           <Space>
                             <Tooltip title="刷新">
@@ -343,7 +343,7 @@ function Fuse() {
                       <Card
                         title="Master 注册视角 - 所有 FUSE 客户端"
                         style={{ borderRadius: 12 }}
-                        bodyStyle={{ padding: '20px' }}
+                        styles={{ body: { padding: '20px' } }}
                         extra={
                           <Tooltip title="从 Master 重新拉取">
                             <Button icon={<ReloadOutlined />} onClick={loadClients}>刷新</Button>
@@ -391,7 +391,7 @@ function Fuse() {
             children: (
               <Card
                 style={{ borderRadius: 12 }}
-                bodyStyle={{ padding: '20px' }}
+                styles={{ body: { padding: '20px' } }}
                 title="内核 VFS 挂载管理"
               >
                 <Result
@@ -434,7 +434,7 @@ function Fuse() {
 
       <Modal
         title="新建 FUSE 挂载"
-        visible={createModalVisible}
+        open={createModalVisible}
         onCancel={() => { setCreateModalVisible(false); form.resetFields(); }}
         footer={null}
       >

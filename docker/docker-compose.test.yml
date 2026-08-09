@@ -259,7 +259,8 @@ services:
       - "8989:8889"
       - "8990:9334"
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
+      - REDIS_URL=redis://172.30.0.50:6379
     command: /app/powerfs-filer --config /config/filer-1.toml
     volumes:
       - filer-1-data:/data/filer

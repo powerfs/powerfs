@@ -1,7 +1,6 @@
 {
   "groups": {
     "overview": "Overview",
-    "infrastructure": "Infrastructure",
     "storage": "Storage",
     "metadata": "Metadata",
     "clientsAndPerformance": "Clients & Performance",
@@ -15,12 +14,11 @@
     "alerts": "Alerts",
     "clusterTopology": "Cluster Topology",
     "capacityPlanning": "Capacity Planning",
-    "storageDevices": "Storage Devices",
+    "volumeServers": "Volume Servers",
     "volumes": "Volumes",
     "collections": "Collections",
     "bitrotScrub": "Bitrot Scrub",
-    "filerManagement": "Filer Status",
-    "filerOverview": "Overview",
+    "filerStatus": "Filer Status",
     "conflicts": "Conflict Detection",
     "shards": "Shards",
     "shardBalancing": "Shard Balancing",

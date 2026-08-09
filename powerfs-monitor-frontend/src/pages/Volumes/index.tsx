@@ -291,7 +291,7 @@ function Volumes() {
       <Card
         title={t('common:volumeManagement')}
         style={{ borderRadius: 12, marginBottom: 16 }}
-        bodyStyle={{ paddingBottom: 16 }}
+        styles={{ body: { paddingBottom: 16 } }}
         extra={
           <Tooltip title={t('common:refresh')}>
             <Button icon={<ReloadOutlined />} onClick={loadVolumes}>{t('common:refresh')}</Button>

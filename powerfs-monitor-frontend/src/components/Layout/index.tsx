@@ -95,18 +95,6 @@ function AppLayout() {
         { key: '/master-raft', icon: <CloudServerOutlined />, label: t('nav:items.masterRaft') },
       ],
     },
-    // ── Infrastructure ──
-    ...(isAdmin
-      ? [{
-          key: 'grp-infra',
-          type: 'group' as const,
-          label: t('nav:groups.infrastructure'),
-          children: [
-            { key: '/capacity-planning', icon: <LineChartOutlined />, label: t('nav:items.capacityPlanning') },
-            { key: '/storage-devices', icon: <AppstoreOutlined />, label: t('nav:items.storageDevices') },
-          ],
-        }]
-      : []),
     // ── Storage ──
     ...(isAdmin
       ? [{
@@ -114,6 +102,8 @@ function AppLayout() {
           type: 'group' as const,
           label: t('nav:groups.storage'),
           children: [
+            { key: '/capacity-planning', icon: <LineChartOutlined />, label: t('nav:items.capacityPlanning') },
+            { key: '/storage-devices', icon: <AppstoreOutlined />, label: t('nav:items.volumeServers') },
             { key: '/volumes', icon: <DatabaseOutlined />, label: t('nav:items.volumes') },
             { key: '/collections', icon: <DatabaseOutlined />, label: t('nav:items.collections') },
             { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: t('nav:items.bitrotScrub') },
@@ -127,16 +117,7 @@ function AppLayout() {
           type: 'group' as const,
           label: t('nav:groups.metadata'),
           children: [
-            {
-              key: 'filer-submenu',
-              icon: <CloudServerOutlined />,
-              label: t('nav:items.filerManagement'),
-              children: [
-                { key: '/filer', label: t('nav:items.filerOverview') },
-                // Conflicts 已降级为 Filer 子页面健康指示器 (P2), 顶级入口移除;
-                // /conflicts 路由保留, 通过 Filer > Bucket & Health tab 的链接访问.
-              ],
-            },
+            { key: '/filer', icon: <CloudServerOutlined />, label: t('nav:items.filerStatus') },
             { key: '/shards', icon: <ClusterOutlined />, label: t('nav:items.shards') },
             { key: '/shard-balancing', icon: <DatabaseOutlined />, label: t('nav:items.shardBalancing') },
           ],

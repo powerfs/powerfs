@@ -269,7 +269,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -288,7 +288,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -307,7 +307,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -326,7 +326,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -348,7 +348,7 @@ function KV() {
           <Card
             title="命中率趋势"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <ReactECharts
               option={{
@@ -412,7 +412,7 @@ function KV() {
           <Card
             title="缓存统计"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
