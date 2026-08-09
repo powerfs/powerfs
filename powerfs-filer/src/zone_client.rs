@@ -155,12 +155,15 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
                 let addr = dec.next_string(FieldId::Owner).unwrap_or_default();
                 let size = dec.next_u64(FieldId::Size).unwrap_or(0);
                 let used = dec.next_u64(FieldId::UsedSpace).unwrap_or(0);
+                // node_id (FieldId::Backend) — 旧版 Master 可能不发送，默认空字符串
+                let node_id = dec.next_string(FieldId::Backend).unwrap_or_default();
                 if !addr.is_empty() {
                     physical_volumes.push(ZoneVolume {
                         volume_id,
                         addr,
                         size,
                         used,
+                        node_id,
                     });
                 }
             }

@@ -74,6 +74,8 @@ pub struct FuseApp {
     volume_net_port: u16,
     volume_addrs: Vec<String>,
     filer_addr: String,
+    /// 所有 Filer 节点地址列表（用于网络错误时轮换重试）
+    filer_addrs: Vec<String>,
     filer_net_port: u16,
     /// Lease mode: "range" (方案 D) or "inode" (方案 A)
     lease_mode: String,
@@ -93,6 +95,7 @@ impl FuseApp {
         volume_net_port: u16,
         volume_addrs: Vec<String>,
         filer_addr: String,
+        filer_addrs: Vec<String>,
         filer_net_port: u16,
         lease_mode: &str,
         lease_duration_ms: u64,
@@ -107,7 +110,13 @@ impl FuseApp {
             master_net_port,
             volume_net_port,
             volume_addrs,
-            filer_addr,
+            filer_addr: filer_addr.clone(),
+            // 确保 filer_addrs 至少包含主地址
+            filer_addrs: if filer_addrs.is_empty() {
+                vec![filer_addr]
+            } else {
+                filer_addrs
+            },
             filer_net_port,
             lease_mode: lease_mode.to_string(),
             lease_duration_ms,
@@ -160,6 +169,7 @@ impl FuseApp {
             volume_net_port: self.volume_net_port,
             volume_addrs: self.volume_addrs.clone(),
             filer_addr: self.filer_addr.clone(),
+            filer_addrs: self.filer_addrs.clone(),
             filer_port: self.filer_net_port,
             request_timeout: Duration::from_secs(10),
             client_identity,
@@ -2365,10 +2375,10 @@ impl FileSystem for PowerFsFs {
             let total_shards = data_shards + parity_shards;
 
             let ec_chunks = entry.chunks.clone();
-            // Guard: EC path requires data+parity shards.
-            if ec_chunks.len() < total_shards {
+            // Guard: EC path requires complete stripe groups (multiples of total_shards).
+            if ec_chunks.is_empty() || ec_chunks.len() % total_shards != 0 {
                 log::warn!(
-                    "read ec: inode={} has {} chunks but need {} (data={}+parity={}), returning EIO",
+                    "read ec: inode={} has {} chunks, need non-empty multiple of {} (data={}+parity={}), returning EIO",
                     inode,
                     ec_chunks.len(),
                     total_shards,
@@ -2377,6 +2387,9 @@ impl FileSystem for PowerFsFs {
                 );
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
+            let num_groups = ec_chunks.len() / total_shards;
+            const EC_SHARD_SIZE: u64 = 1024 * 1024; // 1MB = chunk_size
+            let group_data_size = data_shards as u64 * EC_SHARD_SIZE;
 
             let chunk_size = self.chunk_cache.chunk_size();
             let file_size = entry.size;
@@ -2407,135 +2420,170 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
-                // Reconstruct full file data from EC shards.
-                // Read each shard (data first, then parity) from its volume.
-                // Failed/missing shards become None for degraded reconstruction.
-                let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
-                let mut read_ok = 0usize;
+                // 按 stripe group 重建缺失的 chunk. 每个 group 独立编码/解码,
+                // group 数据 = data_shards × 1MB, 只重建缺失的 group.
+                let start_group = (missing_chunks[0].1 / group_data_size) as usize;
+                let end_group = (missing_chunks.last().unwrap().1 / group_data_size) as usize;
                 let mtime = entry.mtime as u64;
 
-                for (i, chunk) in ec_chunks.iter().enumerate().take(total_shards) {
-                    let read_size = chunk.size as i32;
-                    match self.client.get_volume_addr(chunk.volume_id) {
-                        Ok(addr) => {
-                            match self.client.read_blob(
-                                &addr,
-                                chunk.volume_id,
-                                chunk.needle_id,
-                                0,
-                                read_size,
-                            ) {
-                                Ok(shard_data) => {
-                                    // CRC32 verification: a CRC mismatch is
-                                    // treated as a missing shard so the EC
-                                    // decoder can reconstruct it from parity.
-                                    if chunk.crc32 != 0 {
-                                        let actual = crc32fast::hash(&shard_data);
-                                        if actual != chunk.crc32 {
-                                            log::warn!(
-                                                "read ec: inode={} shard {} CRC mismatch expected={:#x} actual={:#x}, will reconstruct",
-                                                inode, i, chunk.crc32, actual
-                                            );
-                                            continue;
+                // EC 编码器在 group 循环外创建一次, 复用.
+                let ec_config = powerfs_core::ec_thread::EcConfig {
+                    data_shards,
+                    parity_shards,
+                    ..Default::default()
+                };
+                let encoder = powerfs_core::ec_thread::EcEncoder::new(ec_config);
+
+                for group_idx in start_group..=end_group {
+                    if group_idx >= num_groups {
+                        continue;
+                    }
+                    let group_start = group_idx as u64 * group_data_size;
+                    let group_end = std::cmp::min(group_start + group_data_size, file_size);
+
+                    // 跳过该 group 所有 1MB chunk 都已在 chunk_cache 中的情况.
+                    let mut all_cached = true;
+                    let mut co = 0u64;
+                    while co < group_end - group_start {
+                        let cache_offset = group_start + co;
+                        if cache_offset >= file_size {
+                            break;
+                        }
+                        if self.chunk_cache.get(inode, cache_offset).is_none() {
+                            all_cached = false;
+                            break;
+                        }
+                        co += chunk_size;
+                    }
+                    if all_cached {
+                        continue;
+                    }
+
+                    let group_base = group_idx * total_shards;
+
+                    // 读取该 group 的所有 shards (data + parity).
+                    // 失败/缺失的 shard 置 None, 由 parity 降级重建.
+                    let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+                    let mut read_ok = 0usize;
+
+                    for i in 0..total_shards {
+                        let chunk = &ec_chunks[group_base + i];
+                        let read_size = chunk.size as i32;
+                        match self.client.get_volume_addr(chunk.volume_id) {
+                            Ok(addr) => {
+                                match self.client.read_blob(
+                                    &addr,
+                                    chunk.volume_id,
+                                    chunk.needle_id,
+                                    0,
+                                    read_size,
+                                ) {
+                                    Ok(shard_data) => {
+                                        // CRC32 校验: 不匹配视为缺失, 由 parity 重建.
+                                        if chunk.crc32 != 0 {
+                                            let actual = crc32fast::hash(&shard_data);
+                                            if actual != chunk.crc32 {
+                                                log::warn!(
+                                                    "read ec: inode={} group {} shard {} CRC mismatch expected={:#x} actual={:#x}, will reconstruct",
+                                                    inode, group_idx, i, chunk.crc32, actual
+                                                );
+                                                continue;
+                                            }
                                         }
+                                        shards[i] = Some(shard_data);
+                                        read_ok += 1;
                                     }
-                                    shards[i] = Some(shard_data);
-                                    read_ok += 1;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "read ec: inode={} shard {} read failed (vol={} needle={:#x}): {}",
-                                        inode, i, chunk.volume_id, chunk.needle_id, e
-                                    );
+                                    Err(e) => {
+                                        log::warn!(
+                                            "read ec: inode={} group {} shard {} read failed (vol={} needle={:#x}): {}",
+                                            inode, group_idx, i, chunk.volume_id, chunk.needle_id, e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "read ec: inode={} shard {} get_volume_addr failed (vol={}): {}",
-                                inode,
-                                i,
-                                chunk.volume_id,
-                                e
-                            );
+                            Err(e) => {
+                                log::warn!(
+                                    "read ec: inode={} group {} shard {} get_volume_addr failed (vol={}): {}",
+                                    inode,
+                                    group_idx,
+                                    i,
+                                    chunk.volume_id,
+                                    e
+                                );
+                            }
                         }
                     }
-                }
 
-                let data_available = shards
-                    .iter()
-                    .take(data_shards)
-                    .filter(|s| s.is_some())
-                    .count();
+                    let data_available = shards
+                        .iter()
+                        .take(data_shards)
+                        .filter(|s| s.is_some())
+                        .count();
 
-                let file_data: Vec<u8> = if data_available == data_shards {
-                    // Fast path: all data shards present — concatenate and
-                    // truncate to original file size (last shard may be
-                    // zero-padded during encoding).
-                    let mut fdata = Vec::with_capacity(
-                        shards
-                            .iter()
-                            .take(data_shards)
-                            .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
-                            .sum(),
-                    );
-                    for s in shards.iter().take(data_shards) {
-                        fdata.extend_from_slice(s.as_ref().unwrap());
-                    }
-                    fdata.truncate(file_size as usize);
-                    fdata
-                } else if read_ok >= data_shards {
-                    // Degraded path: some data shards missing, but enough
-                    // total shards (data+parity) to reconstruct.
-                    log::info!(
-                        "read ec degraded: inode={} data_available={}/{} total_available={}/{}, reconstructing",
-                        inode,
-                        data_available,
-                        data_shards,
-                        read_ok,
-                        total_shards
-                    );
-                    let ec_config = powerfs_core::ec_thread::EcConfig {
-                        data_shards,
-                        parity_shards,
-                        ..Default::default()
+                    // 重建该 group 的完整数据 (data_shards × 1MB, 末尾可能含零填充).
+                    let group_data: Vec<u8> = if data_available == data_shards {
+                        // Fast path: all data shards present — concatenate.
+                        let mut gdata = Vec::with_capacity(
+                            shards
+                                .iter()
+                                .take(data_shards)
+                                .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
+                                .sum(),
+                        );
+                        for s in shards.iter().take(data_shards) {
+                            gdata.extend_from_slice(s.as_ref().unwrap());
+                        }
+                        gdata
+                    } else if read_ok >= data_shards {
+                        // Degraded path: 部分数据 shard 缺失, 但 data+parity 足够重建.
+                        log::info!(
+                            "read ec degraded: inode={} group {} data_available={}/{} total_available={}/{}, reconstructing",
+                            inode,
+                            group_idx,
+                            data_available,
+                            data_shards,
+                            read_ok,
+                            total_shards
+                        );
+                        match encoder.decode_missing(&mut shards) {
+                            Ok(gdata) => gdata,
+                            Err(e) => {
+                                log::error!(
+                                    "read ec: inode={} group {} decode_missing failed: {}, returning EIO",
+                                    inode,
+                                    group_idx,
+                                    e
+                                );
+                                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                            }
+                        }
+                    } else {
+                        // Not enough shards to reconstruct.
+                        log::error!(
+                            "read ec: inode={} group {} only {}/{} shards available, need {} to reconstruct, returning EIO",
+                            inode,
+                            group_idx,
+                            read_ok,
+                            total_shards,
+                            data_shards
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
                     };
-                    let encoder = powerfs_core::ec_thread::EcEncoder::new(ec_config);
-                    match encoder.decode_missing(&mut shards) {
-                        Ok(mut fdata) => {
-                            fdata.truncate(file_size as usize);
-                            fdata
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "read ec: inode={} decode_missing failed: {}, returning EIO",
-                                inode,
-                                e
-                            );
-                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                        }
-                    }
-                } else {
-                    // Not enough shards to reconstruct.
-                    log::error!(
-                        "read ec: inode={} only {}/{} shards available, need {} to reconstruct, returning EIO",
-                        inode,
-                        read_ok,
-                        total_shards,
-                        data_shards
-                    );
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                };
 
-                // Populate chunk_cache with 1MB chunks from reconstructed file
-                // data so subsequent reads hit the cache without re-decoding.
-                let mut off = 0u64;
-                while off < file_data.len() as u64 {
-                    let chunk_end = std::cmp::min(off + chunk_size, file_data.len() as u64);
-                    let chunk_data = file_data[off as usize..chunk_end as usize].to_vec();
-                    self.chunk_cache
-                        .put(inode, off, chunk_data.into(), mtime, 0);
-                    off = chunk_end;
+                    // 用 1MB chunk 填充 chunk_cache, 末尾按 file_size 截断
+                    // (最后一个 group 的零填充不写入缓存).
+                    let mut off = 0u64;
+                    while off < group_data.len() as u64 {
+                        let cache_offset = group_start + off;
+                        if cache_offset >= file_size {
+                            break;
+                        }
+                        let actual_end = std::cmp::min(off + chunk_size, file_size - group_start);
+                        let chunk_data = group_data[off as usize..actual_end as usize].to_vec();
+                        self.chunk_cache
+                            .put(inode, cache_offset, chunk_data.into(), mtime, 0);
+                        off += chunk_size;
+                    }
                 }
             }
 
@@ -2633,10 +2681,18 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
-                // Build chunk_map for O(1) needle_id lookup
+                // Pre-resolve volume addresses to populate volume_router cache.
+                // After FUSE restart, the router only has volumes from the initial
+                // topology fetch. Chunks written to other volumes (assigned by Filer
+                // during create/migrate) need on-demand lookup from Master.
+                for chunk in &stripe_chunks {
+                    let _ = self.client.get_volume_addr(chunk.volume_id);
+                }
+                // Build chunk_map for O(1) (volume_id, needle_id) lookup.
+                // Tuple order MUST match resolve_stripe_chunk's return: (volume_id, needle_id).
                 let chunk_map: HashMap<u64, (u64, u64)> = stripe_chunks
                     .iter()
-                    .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                    .map(|c| (c.offset, (c.volume_id, c.needle_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
                 let crc_map: HashMap<u64, u32> =
@@ -2986,6 +3042,12 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
+                // Pre-resolve volume addresses to populate volume_router cache.
+                // After FUSE restart, the router only has volumes from the initial
+                // topology fetch. Chunks may reference volumes not in the cache.
+                for chunk in &entry.chunks {
+                    let _ = self.client.get_volume_addr(chunk.volume_id);
+                }
                 // Build chunk_map for O(1) needle_id lookup
                 let chunk_map: HashMap<u64, (u64, u64)> = entry
                     .chunks
@@ -4651,8 +4713,37 @@ impl FileSystem for PowerFsFs {
             );
             return Ok(());
         }
+        // Flat/Stripe: flush 数据到 Volume Server, 然后 sync 元数据到 Filer.
+        // fsync 必须保证元数据持久化, 否则 FUSE RELEASE (异步) 可能晚于
+        // 进程退出/重启, 导致元数据丢失 (P2-2 修复).
         match self.flush_dirty_chunks(inode, None) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 数据已持久化到 Volume Server, 现在 sync 元数据到 Filer (Raft).
+                // 仅当有 dirty chunks 被 flush 时才需要 sync.
+                if !self.has_dirty_for_inode(inode) {
+                    match self.sync_size_chunks_on_close(inode) {
+                        Ok(()) => {
+                            debug!("fsync: inode={} data + metadata synced", inode);
+                            self.chunk_cache.clear_dirty(inode);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!(
+                                "fsync: sync_size_chunks_on_close failed for inode={}: {}",
+                                inode, e
+                            );
+                            Err(e)
+                        }
+                    }
+                } else {
+                    // 仍有 dirty chunks (flush 未完全成功), 不 sync 元数据
+                    debug!(
+                        "fsync: inode={} still has dirty chunks after flush, skipping metadata sync",
+                        inode
+                    );
+                    Ok(())
+                }
+            }
             Err(e) => {
                 error!(
                     "fsync: flush_dirty_chunks failed for inode={}: {} (raw_os_error={:?})",

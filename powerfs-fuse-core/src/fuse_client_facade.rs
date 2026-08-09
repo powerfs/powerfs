@@ -184,8 +184,11 @@ pub struct FuseClientFacadeConfig {
     pub volume_net_port: u16,
     /// Volume 地址列表（如 ["172.20.0.21", "172.20.0.22"]）
     pub volume_addrs: Vec<String>,
-    /// Filer 节点地址（如 "172.20.0.35"）
+    /// Filer 节点地址（如 "172.20.0.35"）— 主地址，兼容旧字段
     pub filer_addr: String,
+    /// 所有 Filer 节点地址列表（用于网络错误时轮换重试）
+    /// 为空时回退到 filer_addr 单地址模式。
+    pub filer_addrs: Vec<String>,
     /// Filer powerfs-net 端口（如 9334）
     pub filer_port: u16,
     /// 请求超时
@@ -244,7 +247,9 @@ impl FuseClientFacadeConfig {
             master_port,
             volume_net_port,
             volume_addrs,
-            filer_addr,
+            filer_addr: filer_addr.clone(),
+            // 默认 filer_addrs 只包含主地址，调用方可通过 with_filer_addrs 扩展
+            filer_addrs: vec![filer_addr],
             filer_port,
             request_timeout: Duration::from_secs(5),
             client_identity: ClientIdentity::new(),
@@ -255,6 +260,17 @@ impl FuseClientFacadeConfig {
             lease_duration_ms: 30_000,
             lease_renew_interval_ms: 10_000,
         })
+    }
+
+    /// 设置所有 Filer 地址列表（用于网络错误时轮换重试）
+    /// 第一个地址会同步更新到 filer_addr 字段。
+    pub fn with_filer_addrs(mut self, addrs: Vec<String>) -> Self {
+        let filtered: Vec<String> = addrs.into_iter().filter(|a| !a.is_empty()).collect();
+        if !filtered.is_empty() {
+            self.filer_addr = filtered[0].clone();
+            self.filer_addrs = filtered;
+        }
+        self
     }
 
     /// 设置自定义超时
@@ -477,8 +493,18 @@ impl FuseClientFacade {
             config.client_identity.client_id,
             conn_pool.clone(),
         );
-        meta_shard_client
-            .set_default_filer_addr(format!("{}:{}", config.filer_addr, config.filer_port));
+        // 设置 Filer 地址：优先使用 filer_addrs（完整列表，支持轮换重试），
+        // 回退到 filer_addr 单地址。每个地址拼接 host:port 格式。
+        let filer_endpoints: Vec<String> = if !config.filer_addrs.is_empty() {
+            config
+                .filer_addrs
+                .iter()
+                .map(|h| format!("{}:{}", h, config.filer_port))
+                .collect()
+        } else {
+            vec![format!("{}:{}", config.filer_addr, config.filer_port)]
+        };
+        meta_shard_client.set_filer_addresses(filer_endpoints);
         meta_shard_client.init();
 
         // 创建 Volume 客户端（共享连接池）

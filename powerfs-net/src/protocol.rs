@@ -1306,6 +1306,14 @@ pub fn check_resp_limits(
     body_len: usize,
     data_seg_len: usize,
 ) -> Result<(), &'static str> {
+    // Raft inter-node messages (MsgType::RaftMessage = 0x0090) legitimately
+    // carry large payloads (snapshots, log batches) up to MAX_FRAME_SIZE.
+    // They are already validated by FrameHeader::validate() against
+    // MAX_FRAME_SIZE, so exempt them from the tighter MAX_BODY_SIZE /
+    // MAX_DATA_SIZE limits that apply to regular metadata/data operations.
+    if msg_type == MsgType::RaftMessage as u16 {
+        return Ok(());
+    }
     if body_len > MAX_BODY_SIZE {
         log::error!(
             "{} msg=0x{:04x} seq={} body_len={} > MAX_BODY_SIZE={}",
@@ -1799,6 +1807,20 @@ mod tests {
     #[test]
     fn test_check_resp_limits_zero() {
         assert!(check_resp_limits(0x0010, 1, 0, 0).is_ok());
+    }
+
+    /// R5 单元测试：Raft 消息 (0x0090) 豁免 body/data 大小限制
+    /// Raft 消息（快照、日志批）可合法达到 MAX_FRAME_SIZE (4MB)
+    #[test]
+    fn test_check_resp_limits_raft_exempt() {
+        let raft = MsgType::RaftMessage as u16;
+        // body 远超 MAX_BODY_SIZE 但在 MAX_FRAME_SIZE 内 → 通过
+        assert!(check_resp_limits(raft, 1, 1024 * 1024, 0).is_ok());
+        assert!(check_resp_limits(raft, 1, 3 * 1024 * 1024, 0).is_ok());
+        // data 段超 MAX_DATA_SIZE 也通过（Raft 不分 body/data）
+        assert!(check_resp_limits(raft, 1, 0, 3 * 1024 * 1024).is_ok());
+        // 零长度也通过
+        assert!(check_resp_limits(raft, 1, 0, 0).is_ok());
     }
 
     /// R5 单元测试：常量值与内核一致

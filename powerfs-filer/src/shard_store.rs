@@ -925,35 +925,68 @@ impl ShardStore {
             let mut inodes = self.inodes.write().unwrap();
             let mut dir_entries = self.directory_entries.write().unwrap();
 
+            // Resolve the child inode via an immutable borrow first, so the
+            // emptiness check below doesn't conflict with the later mutable
+            // borrow of the parent's entry map.
+            let child_inode = dir_entries
+                .get(&parent_inode)
+                .and_then(|dir| dir.get(&name).copied());
+
             let mut removed = None;
-            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-                if let Some(&inode) = dir.get(&name) {
-                    let dir_entry_key = format!("{}:{}", parent_inode, name);
-                    let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
+            if let Some(inode) = child_inode {
+                // Defensive: refuse to delete a non-empty directory. The
+                // Filer pre-checks emptiness before proposing the Raft
+                // command, but a race could add entries between the check
+                // and the apply. Skipping here (rather than recursively
+                // deleting child entries) prevents orphaned inodes. All
+                // replicas apply the same command, so they skip
+                // consistently. (Cross-shard child contents are guarded by
+                // the Filer's list_directory pre-check.)
+                let has_live = dir_entries
+                    .get(&inode)
+                    .map(|child| {
+                        child
+                            .values()
+                            .any(|&ci| inodes.get(&ci).map_or(false, |i| i.delete_time == 0))
+                    })
+                    .unwrap_or(false);
+                if has_live {
+                    warn!(
+                        "Shard {} refusing to delete non-empty directory: parent={}, name={}, inode={}",
+                        self.shard_id.0, parent_inode, name, inode
+                    );
+                    return;
+                }
 
-                    let inode_key = inode.to_be_bytes();
-                    let _ = self.db.delete_cf(cf_inodes, inode_key);
+                if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                    if dir.get(&name).copied() == Some(inode) {
+                        let dir_entry_key = format!("{}:{}", parent_inode, name);
+                        let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
 
-                    let prefix = format!("{}:", inode);
-                    let mut it = self.db.raw_iterator_cf(cf_dir_entries);
-                    it.seek(prefix.as_bytes());
-                    while it.valid() {
-                        if let Some(key) = it.key() {
-                            let key_str = String::from_utf8_lossy(key);
-                            if key_str.starts_with(&prefix) {
-                                let _ = self.db.delete_cf(cf_dir_entries, key);
-                            } else {
-                                break;
+                        let inode_key = inode.to_be_bytes();
+                        let _ = self.db.delete_cf(cf_inodes, inode_key);
+
+                        let prefix = format!("{}:", inode);
+                        let mut it = self.db.raw_iterator_cf(cf_dir_entries);
+                        it.seek(prefix.as_bytes());
+                        while it.valid() {
+                            if let Some(key) = it.key() {
+                                let key_str = String::from_utf8_lossy(key);
+                                if key_str.starts_with(&prefix) {
+                                    let _ = self.db.delete_cf(cf_dir_entries, key);
+                                } else {
+                                    break;
+                                }
                             }
+                            it.next();
                         }
-                        it.next();
-                    }
 
-                    dir.remove(&name);
-                    if let Some(info) = inodes.remove(&inode) {
-                        dir_entries.remove(&inode);
-                        let is_dir = matches!(info.file_type, FileType::Directory);
-                        removed = Some(is_dir);
+                        dir.remove(&name);
+                        if let Some(info) = inodes.remove(&inode) {
+                            dir_entries.remove(&inode);
+                            let is_dir = matches!(info.file_type, FileType::Directory);
+                            removed = Some(is_dir);
+                        }
                     }
                 }
             }
@@ -2475,5 +2508,72 @@ mod tests {
         // 删除 pending reclaim
         store.remove_pending_reclaim(1, 200);
         assert!(store.list_pending_reclaims().is_empty());
+    }
+
+    fn make_dir_inode(inode: u64, parent: u64, name: &str) -> InodeInfo {
+        let mut info = make_inode(inode, parent, name);
+        info.file_type = FileType::Directory;
+        info.mode = 0o040755;
+        info
+    }
+
+    #[test]
+    fn test_delete_directory_nonempty_is_rejected() {
+        // POSIX: rmdir on a non-empty directory must not delete it.
+        // The defensive check in delete_directory refuses to remove a
+        // directory that still has live (non-tombstoned) entries, preventing
+        // orphaned child inodes.
+        let store = make_store();
+
+        // parent dir (inode 1500) under root (1)
+        store
+            .create_inode_atomic(make_dir_inode(1500, 1, "parent"), 1, "parent")
+            .unwrap();
+        // child file (inode 1501) inside parent
+        store
+            .create_inode_atomic(make_inode(1501, 1500, "child.txt"), 1500, "child.txt")
+            .unwrap();
+
+        // parent is non-empty → delete_directory must NOT remove it
+        store.delete_directory(1, "parent".to_string());
+
+        assert!(
+            store.lookup(1, "parent").is_some(),
+            "non-empty directory should still exist after rejected rmdir"
+        );
+        assert!(
+            store.get_inode(1500).is_some(),
+            "non-empty directory inode should still exist"
+        );
+        assert!(
+            store.lookup(1500, "child.txt").is_some(),
+            "child entry should still exist (no orphaning)"
+        );
+        assert!(
+            store.get_inode(1501).is_some(),
+            "child inode should still exist (no orphaning)"
+        );
+    }
+
+    #[test]
+    fn test_delete_directory_empty_succeeds() {
+        // rmdir on an empty directory should remove it cleanly.
+        let store = make_store();
+
+        store
+            .create_inode_atomic(make_dir_inode(1500, 1, "empty"), 1, "empty")
+            .unwrap();
+        assert!(store.lookup(1, "empty").is_some());
+
+        store.delete_directory(1, "empty".to_string());
+
+        assert!(
+            store.lookup(1, "empty").is_none(),
+            "empty directory should be removed"
+        );
+        assert!(
+            store.get_inode(1500).is_none(),
+            "empty directory inode should be removed"
+        );
     }
 }

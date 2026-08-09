@@ -184,9 +184,10 @@ impl FilerNetHandler {
     }
 
     /// P3: 为 Stripe 文件分配多个 (volume_id, needle_id) 对.
-    /// anti-affinity: 尽量让每个 chunk 落在不同 volume, 实现跨磁盘并行 I/O.
-    /// 若可用 volume 数 >= count, 每个 chunk 落不同 volume.
-    /// 若可用 volume 数 < count, round-robin 复用 volume.
+    /// 节点级 anti-affinity: 尽量让每个 chunk 落在不同物理节点, 实现跨节点容错.
+    /// 算法: 按 node_id 分组, round-robin 跨节点选取 volume.
+    ///   - 节点数 >= count: 每个 shard 落不同节点 (完美反亲和, 停 1 节点最多丢 1 shard)
+    ///   - 节点数 < count: 先每节点取 1 个, 剩余按节点 round-robin 补充
     /// 返回 Vec<(volume_id, needle_id)>, 长度 == count. 若无可用 volume, 返回 None.
     pub fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
         let zones = self.zones.read().unwrap();
@@ -195,11 +196,21 @@ impl FilerNetHandler {
             return None;
         }
 
-        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, zone_idx) 用于后续分配
-        let mut all_volumes: Vec<(u64, usize)> = Vec::new();
+        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, node_id, zone_idx)
+        #[derive(Clone)]
+        struct VolEntry {
+            volume_id: u64,
+            node_id: String,
+            zone_idx: usize,
+        }
+        let mut all_volumes: Vec<VolEntry> = Vec::new();
         for (zidx, zone) in zones.iter().enumerate() {
             for vol in &zone.volumes {
-                all_volumes.push((vol.volume_id, zidx));
+                all_volumes.push(VolEntry {
+                    volume_id: vol.volume_id,
+                    node_id: vol.node_id.clone(),
+                    zone_idx: zidx,
+                });
             }
         }
         if all_volumes.is_empty() {
@@ -207,23 +218,67 @@ impl FilerNetHandler {
             return None;
         }
 
-        let num_volumes = all_volumes.len();
-        let mut result = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            // round-robin 选 volume, 实现 anti-affinity
-            let (volume_id, zidx) = all_volumes[i % num_volumes];
-            let zone = &zones[zidx];
-            let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
-            result.push((volume_id, needle_id));
+        let count = count as usize;
+
+        // 按 node_id 分组，组内保持原始顺序（zone 遍历顺序）
+        use std::collections::HashMap;
+        let mut node_groups: Vec<(String, Vec<VolEntry>)> = Vec::new();
+        let mut node_map: HashMap<String, usize> = HashMap::new();
+        for vol in &all_volumes {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                node_map.entry(vol.node_id.clone())
+            {
+                e.insert(node_groups.len());
+                node_groups.push((vol.node_id.clone(), Vec::new()));
+            }
+            let idx = node_map[&vol.node_id];
+            node_groups[idx].1.push(vol.clone());
+        }
+
+        let num_nodes = node_groups.len();
+        let total_volumes = all_volumes.len();
+
+        // Round-robin 跨节点选取 volume，保证 shard 尽量落不同节点
+        let mut result = Vec::with_capacity(count);
+        loop {
+            let mut picked = false;
+            for i in 0..num_nodes {
+                if result.len() >= count {
+                    break;
+                }
+                let (_, group) = &mut node_groups[i];
+                if let Some(vol) = group.first().cloned() {
+                    let zone = &zones[vol.zone_idx];
+                    let needle_id =
+                        crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                    result.push((vol.volume_id, needle_id));
+                    group.remove(0);
+                    picked = true;
+                }
+            }
+            if !picked || result.len() >= count {
+                break;
+            }
         }
 
         let unique_volumes: std::collections::HashSet<u64> =
             result.iter().map(|(v, _)| *v).collect();
+        let unique_nodes: std::collections::HashSet<&str> = result
+            .iter()
+            .filter_map(|(vid, _)| {
+                all_volumes
+                    .iter()
+                    .find(|v| v.volume_id == *vid)
+                    .map(|v| v.node_id.as_str())
+            })
+            .collect();
         info!(
-            "FILER_P3: allocated {} stripe chunks across {} unique volumes ({} total available)",
+            "FILER_P3: allocated {} stripe chunks across {} unique volumes / {} unique nodes ({} vols / {} nodes available)",
             result.len(),
             unique_volumes.len(),
-            num_volumes
+            unique_nodes.len(),
+            total_volumes,
+            num_nodes
         );
         Some(result)
     }
@@ -1203,10 +1258,14 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_RMDIR failed: {}", e);
+                // Encode the error string in the body (FieldId::Name) so the
+                // FUSE client can map "not empty" -> libc::ENOTEMPTY.
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
+                    enc.into_bytes(),
                 ))
             }
         }

@@ -637,6 +637,7 @@ impl MasterNetHandler {
 
         let mut enc = TlvEncoder::new();
         // 多 Zone 编码: Entries=zone_count, 每个 Zone 含 ZoneId + Limit=vol_count + vol 条目
+        // 每个 vol 条目: VolumeId + Owner(addr) + Size + UsedSpace + Backend(node_id)
         enc.add_u64(FieldId::Entries, zones.len() as u64);
         for zone in &zones {
             enc.add_u32(FieldId::ZoneId, zone.zone_id);
@@ -646,17 +647,24 @@ impl MasterNetHandler {
                 enc.add_string(FieldId::Owner, &vol.addr)?;
                 enc.add_u64(FieldId::Size, vol.size);
                 enc.add_u64(FieldId::UsedSpace, vol.used);
+                enc.add_string(FieldId::Backend, &vol.node_id)?;
             }
         }
 
+        // 统计节点多样性用于日志
+        let node_count: std::collections::HashSet<&str> = zones
+            .iter()
+            .flat_map(|z| z.physical_volumes.iter().map(|v| v.node_id.as_str()))
+            .collect();
         info!(
-            "NET_REGISTER_FILER: filer_id={}, zones={}, total_volumes={}",
+            "NET_REGISTER_FILER: filer_id={}, zones={}, total_volumes={}, unique_nodes={}",
             filer_id,
             zones.len(),
             zones
                 .iter()
                 .map(|z| z.physical_volumes.len())
-                .sum::<usize>()
+                .sum::<usize>(),
+            node_count.len()
         );
 
         Ok(Self::build_response(
