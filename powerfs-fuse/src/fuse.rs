@@ -539,7 +539,7 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         gid: attr.gid,
         atime: attr.atime as i64,
         mtime: attr.mtime as i64,
-        ctime: attr.ctime as i64,
+        ctime: attr.ctime,
         xattrs: HashMap::new(),
         chunks,
         hard_link_id: String::new(),
@@ -717,8 +717,7 @@ impl PowerFsFs {
         // === P3: Stripe 模式 flush 分支 ===
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // 每个 dirty chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default), so each cache
@@ -2623,8 +2622,7 @@ impl FileSystem for PowerFsFs {
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // chunk_cache 逻辑与 Flat 相同; 差异仅在 cache miss 时按
         // resolve_stripe_chunk() 路由到正确的 volume/needle.
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
             // Guard: Stripe path requires at least one chunk to route reads.
             // Empty chunks + placement=Some can happen if metadata is incomplete
@@ -3573,8 +3571,7 @@ impl FileSystem for PowerFsFs {
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // 每个 1MB chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
         // chunk_cache 逻辑与 Flat 相同 (按 file offset 缓存 1MB 数据).
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default).

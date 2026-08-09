@@ -421,7 +421,7 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
     }
 
     // 2. Soft warning: prefer odd master count
-    if cfg.masters.len() % 2 == 0 {
+    if cfg.masters.len().is_multiple_of(2) {
         eprintln!(
             "WARNING: {} masters is even; Raft prefers odd counts (3, 5, 7) \
              to avoid split-brain ties. Consider adding or removing one master.",
