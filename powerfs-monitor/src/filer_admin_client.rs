@@ -170,6 +170,29 @@ impl FilerAdminClient {
             .await
             .or(Ok(serde_json::json!({})))
     }
+
+    /// DELETE 透传 — admin/buckets/:name (删除 bucket)
+    pub async fn delete_json(
+        &self,
+        ep: &FilerEndpoint,
+        path: &str,
+    ) -> Result<serde_json::Value, FilerAdminError> {
+        let url = self.url(ep, path)?;
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| FilerAdminError::Unreachable(ep.node_id.clone(), e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FilerAdminError::HttpStatus(status, body));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .or(Ok(serde_json::json!({})))
+    }
 }
 
 impl Default for FilerAdminClient {

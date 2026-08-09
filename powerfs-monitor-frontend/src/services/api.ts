@@ -1312,3 +1312,57 @@ export async function putCoalescerConfig(cfg: CoalescerConfig): Promise<void> {
   if (useMock) return
   await api.put('/config/coalescer', cfg)
 }
+
+// ===== Filer Bucket management (决策 2: 透传到 Monitor /api/filer/buckets*) =====
+export interface FilerBucketInfo {
+  name: string
+  volume_ids: number[]
+  size_limit: number
+  used_size: number
+  creation_time: string
+  replication: string
+  collection: string
+}
+
+export interface FilerBucketListResponse {
+  buckets: FilerBucketInfo[]
+  total: number
+}
+
+export interface CreateFilerBucketParams {
+  name: string
+  collection?: string
+  size_limit?: number
+}
+
+export async function listFilerBuckets(): Promise<FilerBucketListResponse> {
+  if (useMock) {
+    return { buckets: [], total: 0 }
+  }
+  const response = await api.get('/filer/buckets')
+  // 后端 ApiResponse 包装: { success, data, error }
+  return response.data.data
+}
+
+export async function createFilerBucket(params: CreateFilerBucketParams): Promise<FilerBucketInfo> {
+  if (useMock) {
+    throw new Error('mock mode does not support creating bucket')
+  }
+  const response = await api.post('/filer/buckets', params)
+  return response.data.data
+}
+
+export async function deleteFilerBucket(name: string): Promise<void> {
+  if (useMock) return
+  await api.delete(`/filer/buckets/${encodeURIComponent(name)}`)
+}
+
+export async function setFilerBucketQuota(name: string, sizeLimit: number): Promise<FilerBucketInfo> {
+  if (useMock) {
+    throw new Error('mock mode does not support setting quota')
+  }
+  const response = await api.put(`/filer/buckets/${encodeURIComponent(name)}/quota`, {
+    size_limit: sizeLimit,
+  })
+  return response.data.data
+}

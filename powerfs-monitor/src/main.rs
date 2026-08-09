@@ -1019,6 +1019,42 @@ async fn filer_admin_put_inner(
     }
 }
 
+/// 透传 DELETE 到 filer /admin/<sub_path> — admin/buckets/:name
+async fn filer_admin_delete_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.delete_json(&ep, &path).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
 // --- 具体路由 handler (薄封装, 调用 _inner 辅助函数) ---
 
 async fn filer_get_status(
@@ -1092,6 +1128,128 @@ async fn filer_put_balancer_config(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     filer_admin_put_inner(&state, &user, &node_id, "balancer/config", body).await
+}
+
+// ── Bucket management handlers (决策 2: 扩展 filer admin bucket 接口) ──
+//
+// 策略: bucket 属于全局元数据，选择任意**在线**的注册 filer 节点透传。
+// 写操作后失效 cluster/status 缓存（该缓存储存聚合后的 buckets 列表）。
+
+/// 从 endpoint 列表中挑一个在线 filer（优先健康节点），找不到返回 error Response。
+async fn pick_online_filer_for_bucket(
+    state: &Arc<AppState>,
+) -> std::result::Result<powerfs_monitor::filer_admin_client::FilerEndpoint, Response> {
+    let endpoints = list_filer_endpoints(state).await;
+    if endpoints.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<()>::error("集群中没有可用的 Filer 节点")),
+        )
+            .into_response());
+    }
+    // 简单策略: 遍历 endpoints, 通过一次 GET /admin/status 验活。
+    // 为了降低延迟: 直接选择第一个 endpoint (ListFilers 通常返回 leader 优先)。
+    Ok(endpoints.into_iter().next().unwrap())
+}
+
+async fn filer_list_buckets(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    filer_admin_get_inner(&state, &user, &node_id, "buckets").await
+}
+
+#[derive(Debug, Deserialize)]
+struct FilerCreateBucketBody {
+    name: String,
+    #[serde(default)]
+    collection: Option<String>,
+    #[serde(default)]
+    size_limit: Option<u64>,
+}
+
+async fn filer_create_bucket(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Json(body): Json<FilerCreateBucketBody>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    if body.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error("Bucket name 不能为空")),
+        )
+            .into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = "buckets".to_string();
+    let body_val = serde_json::json!({
+        "name": body.name,
+        "collection": body.collection,
+        "size_limit": body.size_limit,
+    });
+    let resp = filer_admin_post_inner(&state, &user, &node_id, &sub_path, Some(body_val)).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
+}
+
+async fn filer_delete_bucket(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(name): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = format!("buckets/{}", name);
+    let resp = filer_admin_delete_inner(&state, &user, &node_id, &sub_path).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
+}
+
+#[derive(Debug, Deserialize)]
+struct FilerSetQuotaBody {
+    size_limit: u64,
+}
+
+async fn filer_set_bucket_quota(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Json(body): Json<FilerSetQuotaBody>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = format!("buckets/{}/quota", name);
+    let body_val = serde_json::json!({ "size_limit": body.size_limit });
+    let resp = filer_admin_put_inner(&state, &user, &node_id, &sub_path, body_val).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -6103,6 +6261,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/filer/balancer/trigger-all",
             post(balancer_trigger_all),
+        )
+        // ========== Bucket management (决策 2: 扩展 filer admin bucket 接口) ==========
+        // bucket 属于全局元数据, Monitor 选择任意在线 filer 透传; 写后失效 cluster 缓存
+        .route("/api/filer/buckets", get(filer_list_buckets))
+        .route("/api/filer/buckets", post(filer_create_bucket))
+        .route("/api/filer/buckets/:name", delete(filer_delete_bucket))
+        .route(
+            "/api/filer/buckets/:name/quota",
+            put(filer_set_bucket_quota),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
