@@ -363,47 +363,124 @@ impl MetaShardManager {
 
     pub async fn create_file(&self, parent_inode: u64, name: &str) -> Result<InodeInfo, String> {
         let t0 = std::time::Instant::now();
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
-
-        let shard_store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
-                .clone()
-        };
 
         let inode = self.generate_inode();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let info = InodeInfo {
+            inode,
+            name: name.to_string(),
+            parent_inode,
+            file_type: FileType::File,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
+        };
 
-        let cmd = ShardCommand::CreateFile {
+        self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
+            .await?;
+
+        log::info!(
+            "create_file latency: total={}ms, inode={}",
+            t0.elapsed().as_millis(),
+            inode
+        );
+        Ok(info)
+    }
+
+    /// Two-phase create used by `create_file`, `create_directory`,
+    /// `create_file_with_shard`, `put_object_entry`, and `create_symlink`.
+    ///
+    /// Phase A: propose `CreateInode { info }` to
+    /// `shard_ino = calculate_shard(info.inode)`. On success the inode
+    /// record exists but is unreachable from any directory (orphan until B).
+    ///
+    /// Phase B: propose `AddDirEntry { parent_inode, name, info.inode }` to
+    /// `shard_dir = calculate_shard(parent_inode)`. On success the file is
+    /// fully visible.
+    ///
+    /// If B fails after A succeeded, the inode is orphaned and the GC scan
+    /// (`collect_orphan_inodes`) reclaims it. The caller surfaces the error.
+    ///
+    /// We poll `shard_ino` for the inode's appearance because subsequent
+    /// getattr (route by `calculate_shard(inode)`) needs the record there;
+    /// waiting on the dir entry's shard would not help.
+    async fn propose_create_inode_and_direntry(
+        &self,
+        info: InodeInfo,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
+        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
+
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if stores.get(&shard_ino).is_none() {
+                return Err(format!("shard {} not found", shard_ino.0));
+            }
+            if stores.get(&shard_dir).is_none() {
+                return Err(format!("shard {} not found", shard_dir.0));
+            }
+        }
+
+        // Phase A: inode record on its own hash-derived shard.
+        let cmd_ino = ShardCommand::CreateInode {
+            info: info.clone(),
+        };
+        self.raft_group_manager
+            .propose(shard_ino, cmd_ino.serialize())
+            .await?;
+
+        // Phase B: dir entry on the parent's shard.
+        let cmd_dir = ShardCommand::AddDirEntry {
             parent_inode,
             name: name.to_string(),
             inode,
         };
-
-        let t_propose = std::time::Instant::now();
         self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+            .propose(shard_dir, cmd_dir.serialize())
             .await?;
-        let propose_ms = t_propose.elapsed().as_millis();
 
-        let t_poll = std::time::Instant::now();
+        // Wait for the inode record to be visible on shard_ino (its
+        // authoritative location). Subsequent getattr/setattr/update_size
+        // route by calculate_shard(inode), so this is the only store we
+        // need to poll. Poll up to 5s to absorb propose-forwarding latency.
+        let shard_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_ino)
+                .ok_or_else(|| format!("shard {} not found", shard_ino.0))?
+                .clone()
+        };
         let mut retries = 0;
-        while retries < 50 {
-            if let Some(info) = shard_store.get_inode(inode) {
-                let poll_ms = t_poll.elapsed().as_millis();
-                let total_ms = t0.elapsed().as_millis();
-                log::info!(
-                    "create_file latency: propose={}ms, poll={}ms (retries={}), total={}ms, inode={}",
-                    propose_ms, poll_ms, retries, total_ms, inode
-                );
-                return Ok(info);
+        while retries < 100 {
+            if shard_store.get_inode(inode).is_some() {
+                return Ok(());
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             retries += 1;
         }
-
-        Err("failed to create file: timeout waiting for apply".to_string())
+        Err("create: timeout waiting for inode apply".to_string())
     }
 
     pub async fn update_file(&self, inode: u64, size: u64, mtime: u64) -> Result<(), String> {
@@ -462,30 +539,78 @@ impl MetaShardManager {
     }
 
     pub async fn delete_file(&self, parent_inode: u64, name: &str) -> Result<(), String> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
+        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
 
-        {
+        // Resolve inode via dir entry on parent's shard.
+        let inode = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+                .get(&shard_dir)
+                .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
 
-            if shard_store.lookup(parent_inode, name).is_none() {
-                return Err("file not found".to_string());
-            }
-        }
+            let info = shard_store
+                .lookup(parent_inode, name)
+                .ok_or_else(|| "file not found".to_string())?;
+            info.inode
+        };
 
-        let cmd = ShardCommand::DeleteFile {
+        self.propose_remove_direntry_and_inode(parent_inode, name, inode)
+            .await
+    }
+
+    /// Two-phase delete used by `delete_file`, `delete_directory`,
+    /// `delete_file_by_inode`, `delete_directory_by_inode`, and
+    /// `delete_object_entry`.
+    ///
+    /// Phase A: propose `RemoveDirEntry { parent_inode, name }` to
+    /// `shard_dir = calculate_shard(parent_inode)`. The file becomes
+    /// invisible to subsequent lookups immediately.
+    ///
+    /// Phase B: propose `DeleteInode { inode }` to
+    /// `shard_ino = calculate_shard(inode)`. The inode record is removed
+    /// from its authoritative location.
+    ///
+    /// If B fails after A succeeded, the inode is orphaned (no dir entry
+    /// pointing to it); the GC scan reclaims it. The caller still surfaces
+    /// success because the user-visible effect (file gone) is achieved.
+    async fn propose_remove_direntry_and_inode(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
+
+        // Phase A: remove dir entry on the parent's shard.
+        let cmd_dir = ShardCommand::RemoveDirEntry {
             parent_inode,
             name: name.to_string(),
         };
-
         self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+            .propose(shard_dir, cmd_dir.serialize())
             .await?;
 
-        self.wait_for_entry_removed(shard_id, parent_inode, name)
+        self.wait_for_entry_removed(shard_dir, parent_inode, name)
             .await;
+
+        // Phase B: delete the inode record on its own shard. Best-effort:
+        // if this fails, GC will collect the orphan inode later.
+        let cmd_ino = ShardCommand::DeleteInode { inode };
+        if let Err(e) = self
+            .raft_group_manager
+            .propose(shard_ino, cmd_ino.serialize())
+            .await
+        {
+            log::warn!(
+                "DeleteInode propose failed for inode {} on shard {}: {}. \
+                 Dir entry already removed; inode will be GC'd.",
+                inode,
+                shard_ino.0,
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -494,38 +619,41 @@ impl MetaShardManager {
         parent_inode: u64,
         name: &str,
     ) -> Result<InodeInfo, String> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
-
-        let shard_store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
-                .clone()
-        };
-
         let inode = self.generate_inode();
-
-        let cmd = ShardCommand::CreateDirectory {
-            parent_inode,
-            name: name.to_string(),
+        let now = chrono::Utc::now().timestamp() as u64;
+        let info = InodeInfo {
             inode,
+            name: name.to_string(),
+            parent_inode,
+            file_type: FileType::Directory,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o040755,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 2,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+        self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
-        let mut retries = 0;
-        while retries < 50 {
-            if let Some(info) = shard_store.get_inode(inode) {
-                return Ok(info);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            retries += 1;
-        }
-
-        Err("failed to create directory: timeout waiting for apply".to_string())
+        Ok(info)
     }
 
     /// Create directory for a given path, auto-creating parent directories (mkdir -p behavior)
@@ -576,17 +704,14 @@ impl MetaShardManager {
     }
 
     pub async fn delete_directory(&self, parent_inode: u64, name: &str) -> Result<(), String> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
+        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
 
         // Resolve the target directory's inode so we can check emptiness.
-        // The lookup runs under a read lock; the emptiness check below uses
-        // list_directory which resolves the shard from the child inode, so it
-        // works even when the child's contents live in a different shard.
         let child_inode = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+                .get(&shard_dir)
+                .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
 
             let info = shard_store
                 .lookup(parent_inode, name)
@@ -602,18 +727,8 @@ impl MetaShardManager {
             return Err("directory not empty".to_string());
         }
 
-        let cmd = ShardCommand::DeleteDirectory {
-            parent_inode,
-            name: name.to_string(),
-        };
-
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
-
-        self.wait_for_entry_removed(shard_id, parent_inode, name)
-            .await;
-        Ok(())
+        self.propose_remove_direntry_and_inode(parent_inode, name, child_inode)
+            .await
     }
 
     pub async fn rename(
@@ -656,6 +771,10 @@ impl MetaShardManager {
     }
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
+        // Inode records are stored on the shard derived from the inode itself
+        // (calculate_shard(inode)). create_file() and create_directory() now
+        // propose the inode record separately from the dir entry, so each
+        // lands on its correct shard. No multi-shard scan is needed.
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
         let stores = self.shard_stores.read().unwrap();
@@ -827,59 +946,71 @@ impl MetaShardManager {
         &self,
         parent_inode: u64,
         name: &str,
-        shard_id: ShardId,
+        // Legacy client-supplied shard hint. Ignored — the inode is now
+        // written to `calculate_shard(inode)` and the dir entry to
+        // `calculate_shard(parent_inode)`. Kept in the signature so FUSE
+        // clients that still pass `ShardId(parent)` do not break.
+        _shard_id: ShardId,
     ) -> Result<u64, String> {
         let t0 = std::time::Instant::now();
-        {
-            let stores = self.shard_stores.read().unwrap();
-            if stores.get(&shard_id).is_none() {
-                return Err(format!("shard {} not found", shard_id.0));
-            }
-        }
 
         let inode = self.generate_inode();
-
-        let cmd = ShardCommand::CreateFile {
-            parent_inode,
-            name: name.to_string(),
+        let now = chrono::Utc::now().timestamp() as u64;
+        let info = InodeInfo {
             inode,
+            name: name.to_string(),
+            parent_inode,
+            file_type: FileType::File,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
-        let t_propose = std::time::Instant::now();
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+        self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
-        let propose_ms = t_propose.elapsed().as_millis();
 
-        let t_poll = std::time::Instant::now();
-        let mut retries = 0;
-        while retries < 50 {
-            if let Ok(stores) = self.shard_stores.read() {
-                if let Some(shard_store) = stores.get(&shard_id) {
-                    if shard_store.get_inode(inode).is_some() {
-                        let poll_ms = t_poll.elapsed().as_millis();
-                        let total_ms = t0.elapsed().as_millis();
-                        log::info!(
-                            "create_file_with_shard latency: propose={}ms, poll={}ms (retries={}), total={}ms, inode={}",
-                            propose_ms, poll_ms, retries, total_ms, inode
-                        );
-                        return Ok(inode);
-                    }
-                }
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            retries += 1;
-        }
-
-        Err("failed to create file: timeout waiting for apply".to_string())
+        log::info!(
+            "create_file_with_shard latency: total={}ms, inode={}",
+            t0.elapsed().as_millis(),
+            inode
+        );
+        Ok(inode)
     }
 
-    pub async fn delete_file_by_inode(&self, inode: u64, shard_id: ShardId) -> Result<(), String> {
+    pub async fn delete_file_by_inode(
+        &self,
+        inode: u64,
+        // Legacy client-supplied shard hint. Ignored: we route dir-entry
+        // removal by parent_inode and inode deletion by inode.
+        _shard_id: ShardId,
+    ) -> Result<(), String> {
+        // Look up the inode record on its own hash-derived shard to recover
+        // (parent_inode, name) so we can also remove the dir entry.
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
         let (parent_inode, name) = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+                .get(&shard_ino)
+                .ok_or_else(|| format!("shard {} not found", shard_ino.0))?;
 
             let inode_info = shard_store
                 .get_inode(inode)
@@ -888,30 +1019,21 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteFile {
-            parent_inode,
-            name: name.clone(),
-        };
-
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
-
-        self.wait_for_entry_removed(shard_id, parent_inode, &name)
-            .await;
-        Ok(())
+        self.propose_remove_direntry_and_inode(parent_inode, &name, inode)
+            .await
     }
 
     pub async fn delete_directory_by_inode(
         &self,
         inode: u64,
-        shard_id: ShardId,
+        _shard_id: ShardId,
     ) -> Result<(), String> {
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
         let (parent_inode, name) = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+                .get(&shard_ino)
+                .ok_or_else(|| format!("shard {} not found", shard_ino.0))?;
 
             let inode_info = shard_store
                 .get_inode(inode)
@@ -920,18 +1042,8 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteDirectory {
-            parent_inode,
-            name: name.clone(),
-        };
-
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
-
-        self.wait_for_entry_removed(shard_id, parent_inode, &name)
-            .await;
-        Ok(())
+        self.propose_remove_direntry_and_inode(parent_inode, &name, inode)
+            .await
     }
 
     pub async fn update_entry(
@@ -1377,39 +1489,41 @@ impl MetaShardManager {
         name: &str,
         target: &str,
     ) -> Result<InodeInfo, String> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
-
-        let shard_store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
-                .clone()
-        };
-
         let inode = self.generate_inode();
-
-        let cmd = ShardCommand::CreateSymlink {
-            parent_inode,
-            name: name.to_string(),
+        let now = chrono::Utc::now().timestamp() as u64;
+        let info = InodeInfo {
             inode,
-            target: target.to_string(),
+            name: name.to_string(),
+            parent_inode,
+            file_type: FileType::Symlink,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o120777,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: Some(target.to_string()),
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+        self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
-        let mut retries = 0;
-        while retries < 50 {
-            if let Some(info) = shard_store.get_inode(inode) {
-                return Ok(info);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            retries += 1;
-        }
-
-        Err("failed to create symlink: timeout waiting for apply".to_string())
+        Ok(info)
     }
 
     /// Create a hard link via Raft consensus
@@ -1419,19 +1533,30 @@ impl MetaShardManager {
         new_parent_inode: u64,
         new_name: &str,
     ) -> Result<(), String> {
-        let shard_id = self.shard_strategy.calculate_shard(new_parent_inode);
+        // Hard link = bump nlink on the existing inode (on its own shard) +
+        // add a new dir entry pointing to it (on the new parent's shard).
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
+        let shard_dir = self.shard_strategy.calculate_shard(new_parent_inode);
 
-        let cmd = ShardCommand::CreateHardLink {
-            inode,
-            new_parent_inode,
-            new_name: new_name.to_string(),
-        };
-
+        // Phase A: bump nlink on the inode's own shard.
+        let cmd_nlink = ShardCommand::IncrementNlink { inode };
         self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+            .propose(shard_ino, cmd_nlink.serialize())
             .await?;
 
-        self.wait_for_entry_appeared(shard_id, new_parent_inode, new_name)
+        // Phase B: add dir entry on the new parent's shard. If this fails
+        // after A succeeded, nlink is over-counted by 1 — the next unlink
+        // will decrement it back. Acceptable; no orphan inode is created.
+        let cmd_dir = ShardCommand::AddDirEntry {
+            parent_inode: new_parent_inode,
+            name: new_name.to_string(),
+            inode,
+        };
+        self.raft_group_manager
+            .propose(shard_dir, cmd_dir.serialize())
+            .await?;
+
+        self.wait_for_entry_appeared(shard_dir, new_parent_inode, new_name)
             .await;
         Ok(())
     }
@@ -1747,48 +1872,41 @@ impl MetaShardManager {
         volume_id: u64,
         etag: &str,
     ) -> Result<u64, String> {
-        let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);
-
-        {
-            let stores = self.shard_stores.read().unwrap();
-            if stores.get(&shard_id).is_none() {
-                return Err(format!("shard {} not found", shard_id.0));
-            }
-        }
-
         let inode = self.generate_inode();
-        let cmd = ShardCommand::PutObject {
-            parent_inode: bucket_root_inode,
-            name: key.to_string(),
+        let now = chrono::Utc::now().timestamp() as u64;
+        let info = InodeInfo {
             inode,
+            name: key.to_string(),
+            parent_inode: bucket_root_inode,
+            file_type: FileType::File,
             size,
-            fid: fid.to_string(),
-            volume_id,
-            etag: etag.to_string(),
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: Some(fid.to_string()),
+            volume_id: Some(volume_id),
+            etag: Some(etag.to_string()),
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
+        self.propose_create_inode_and_direntry(info, bucket_root_inode, key, inode)
             .await?;
 
-        // Wait for apply (increased timeout for propose forwarding latency)
-        let mut retries = 0;
-        while retries < 100 {
-            let applied = {
-                let stores = self.shard_stores.read().unwrap();
-                stores
-                    .get(&shard_id)
-                    .map(|s| s.get_inode(inode).is_some())
-                    .unwrap_or(false)
-            };
-            if applied {
-                return Ok(inode);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            retries += 1;
-        }
-
-        Err("failed to put object: timeout waiting for apply".to_string())
+        Ok(inode)
     }
 
     /// Look up an S3 object entry by bucket root inode and key.
@@ -1805,31 +1923,21 @@ impl MetaShardManager {
         bucket_root_inode: u64,
         key: &str,
     ) -> Result<(), String> {
-        let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);
+        let shard_dir = self.shard_strategy.calculate_shard(bucket_root_inode);
 
-        let exists = {
+        let inode = {
             let stores = self.shard_stores.read().unwrap();
             let store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
-            store.lookup(bucket_root_inode, key).is_some()
+                .get(&shard_dir)
+                .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
+            let info = store
+                .lookup(bucket_root_inode, key)
+                .ok_or_else(|| "object not found".to_string())?;
+            info.inode
         };
 
-        if !exists {
-            return Err("object not found".to_string());
-        }
-
-        let cmd = ShardCommand::DeleteFile {
-            parent_inode: bucket_root_inode,
-            name: key.to_string(),
-        };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
-
-        self.wait_for_entry_removed(shard_id, bucket_root_inode, key)
-            .await;
-        Ok(())
+        self.propose_remove_direntry_and_inode(bucket_root_inode, key, inode)
+            .await
     }
 
     /// List S3 object entries under a bucket root inode.
@@ -2637,15 +2745,23 @@ impl MetaShardManager {
     /// Phase 3.5.3: 递增 inode 的 open 计数（fuse open 时上报）。
     /// 返回递增后的 open_count。
     pub fn increment_open_count(&self, inode: u64) -> Result<u32, String> {
+        // open_count is an in-memory per-ShardStore counter keyed by inode.
+        // The inode record lives on calculate_shard(inode); we route the
+        // counter to the same shard so the increment is co-located with the
+        // inode (and survives the in-memory scan shortcut below if other
+        // shards happen to have cached lookups).
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         let stores = self.shard_stores.read().unwrap();
+        if let Some(store) = stores.get(&shard_id) {
+            return Ok(store.increment_open_count(inode));
+        }
+        // Fallback: if the nominal shard store is missing (shouldn't happen
+        // in normal operation), scan all stores for a recorded count.
         for store in stores.values() {
-            // inode 可能落在任意 shard，逐个尝试
-            if store.get_inode(inode).is_some() {
+            if store.get_open_count(inode) > 0 || store.get_inode(inode).is_some() {
                 return Ok(store.increment_open_count(inode));
             }
         }
-        // inode 不在任意 shard 中，仍记录（可能在创建途中）
-        // 取第一个 store 记录
         if let Some(store) = stores.values().next() {
             Ok(store.increment_open_count(inode))
         } else {
@@ -2656,7 +2772,16 @@ impl MetaShardManager {
     /// Phase 3.5.3: 递减 inode 的 open 计数（fuse release/close 时上报）。
     /// 返回递减后的 open_count。
     pub fn decrement_open_count(&self, inode: u64) -> Result<u32, String> {
+        // Mirror of increment_open_count: route to calculate_shard(inode)
+        // first; fall back to scanning if the inode is not yet visible there.
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         let stores = self.shard_stores.read().unwrap();
+        if let Some(store) = stores.get(&shard_id) {
+            let count = store.get_open_count(inode);
+            if count > 0 {
+                return Ok(store.decrement_open_count(inode));
+            }
+        }
         for store in stores.values() {
             let count = store.get_open_count(inode);
             if count > 0 {
@@ -2665,6 +2790,80 @@ impl MetaShardManager {
         }
         // open_count 已为 0 或未记录，幂等返回 0
         Ok(0)
+    }
+
+    /// Scan all shards for orphan inode records and remove them.
+    ///
+    /// An orphan inode is an inode record (in `CF_INODES` on
+    /// `calculate_shard(inode)`) whose `(parent_inode, name)` dir entry
+    /// does not exist on the parent's shard (`calculate_shard(parent_inode)`).
+    /// Orphans arise when a split-create's Phase B (`AddDirEntry`) fails
+    /// after Phase A (`CreateInode`) succeeded, or when a split-delete's
+    /// Phase B (`DeleteInode`) is skipped after Phase A (`RemoveDirEntry`)
+    /// succeeded.
+    ///
+    /// This is a best-effort sweep. We skip:
+    /// - directories with `nlink >= 2` (real directories have nlink=2+;
+    ///   an orphaned directory would still have nlink=2 from creation,
+    ///   so we can't distinguish from a live one — but live dirs always
+    ///   have a dir entry, so the lookup below filters them correctly)
+    /// - inodes with active leases or open_count > 0 (still in use)
+    ///
+    /// Returns the count of orphan inodes removed.
+    pub fn collect_orphan_inodes(&self) -> usize {
+        let stores = self.shard_stores.read().unwrap();
+        let mut removed = 0usize;
+
+        for (shard_id, store) in stores.iter() {
+            let inodes = store.list_all_inodes();
+            for info in inodes {
+                // Skip inodes that are clearly in use.
+                if self.has_active_lease(info.inode) {
+                    continue;
+                }
+                if store.get_open_count(info.inode) > 0 {
+                    continue;
+                }
+
+                // Look up the dir entry on the parent's shard.
+                let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
+                let has_dir_entry = stores
+                    .get(&parent_shard)
+                    .map(|s| s.lookup(info.parent_inode, &info.name).is_some())
+                    .unwrap_or(false);
+
+                if has_dir_entry {
+                    continue;
+                }
+
+                // Orphan: dir entry does not exist on parent's shard.
+                // Remove the inode record from its own shard.
+                log::info!(
+                    "GC orphan: inode={} (name={:?}, parent={}) on shard {} has no dir entry \
+                     on parent shard {} — removing",
+                    info.inode,
+                    info.name,
+                    info.parent_inode,
+                    shard_id.0,
+                    parent_shard.0
+                );
+                if let Err(e) = store.delete_inode(info.inode) {
+                    log::warn!(
+                        "GC orphan: failed to delete inode {} from shard {}: {}",
+                        info.inode,
+                        shard_id.0,
+                        e
+                    );
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+
+        if removed > 0 {
+            log::info!("GC orphan pass: removed {} orphan inodes", removed);
+        }
+        removed
     }
 
     /// Phase 3.5: 执行一次 GC 扫描与物理删除。
@@ -2941,13 +3140,17 @@ impl MetaShardManager {
                 let retried = mgr
                     .retry_pending_reclaims(&volume_router, &volume_client_pool)
                     .await;
+                // Reclaim orphan inodes left by split-create/delete failures
+                // (CreateInode without AddDirEntry, or RemoveDirEntry without
+                // DeleteInode).
+                let orphans_removed = mgr.collect_orphan_inodes();
                 // 正常 GC 扫描
                 let (scanned, deleted, skipped, chunks_to_reclaim) =
                     mgr.run_gc_pass(grace_period_secs);
-                if scanned > 0 || retried > 0 {
+                if scanned > 0 || retried > 0 || orphans_removed > 0 {
                     debug!(
-                        "GC task heartbeat: retried={}, scanned={}, deleted={}, skipped={}, chunks_to_reclaim={}",
-                        retried, scanned, deleted, skipped, chunks_to_reclaim.len()
+                        "GC task heartbeat: retried={}, orphans_removed={}, scanned={}, deleted={}, skipped={}, chunks_to_reclaim={}",
+                        retried, orphans_removed, scanned, deleted, skipped, chunks_to_reclaim.len()
                     );
                 }
                 // 异步回收 volume server 数据块（best-effort）

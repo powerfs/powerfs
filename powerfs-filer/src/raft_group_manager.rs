@@ -173,6 +173,61 @@ pub enum ShardCommand {
         reliability_state: powerfs_layout::reliability::ReliabilityState,
         ec_chunks: Vec<crate::shard_store::StoredFileChunk>,
     },
+
+    // ----- Decomposed inode + dir-entry commands (P? inode-sharding fix) -----
+    //
+    // The legacy commands above (CreateFile, CreateDirectory, PutObject,
+    // CreateSymlink, CreateHardLink, DeleteFile, DeleteDirectory, Rename)
+    // store the inode record (`CF_INODES`) and the parent's dir entry
+    // (`CF_DIR_ENTRIES`) atomically on the *parent's* shard. That forces
+    // inode-level ops (getattr/setattr/update_size_chunks/...) to scan every
+    // shard because `calculate_shard(inode)` != `calculate_shard(parent_inode)`
+    // for most files. The decomposed commands below split the two writes so
+    // each lands on its correct hash-derived shard; inode-level ops then
+    // become O(1) `calculate_shard(inode)` lookups. The legacy variants are
+    // kept so old Raft log entries still apply on restart.
+    //
+    // Failure model: writes are no longer atomic across the two shards. If
+    // `CreateInode` succeeds but `AddDirEntry` fails (or vice versa on
+    // delete), a tombstone-style orphan is left; the GC scan
+    // (`collect_orphan_inodes`) reclaims it.
+
+    /// Write an inode record to `CF_INODES` on `calculate_shard(info.inode)`.
+    /// Idempotent: re-apply overwrites with same content. Pairs with
+    /// `AddDirEntry` to form a complete create.
+    CreateInode {
+        info: crate::shard_store::InodeInfo,
+    },
+    /// Write a dir entry `parent_inode:name -> inode` to `CF_DIR_ENTRIES`
+    /// on `calculate_shard(parent_inode)`. Pairs with `CreateInode`.
+    AddDirEntry {
+        parent_inode: u64,
+        name: String,
+        inode: u64,
+    },
+    /// Remove the inode record from `CF_INODES` on `calculate_shard(inode)`.
+    /// Pairs with `RemoveDirEntry`. Order on delete: `RemoveDirEntry` first
+    /// (so subsequent lookups fail fast), then `DeleteInode`.
+    DeleteInode {
+        inode: u64,
+    },
+    /// Remove a dir entry from `CF_DIR_ENTRIES` on
+    /// `calculate_shard(parent_inode)`.
+    RemoveDirEntry {
+        parent_inode: u64,
+        name: String,
+    },
+    /// Bump `nlink` on an existing inode (hard link creation). Routed via
+    /// `calculate_shard(inode)`. Pairs with `AddDirEntry` on the new parent.
+    IncrementNlink {
+        inode: u64,
+    },
+    /// Decrement `nlink` on an inode (hard link removal). When `nlink`
+    /// reaches 0 the inode should also be removed via `DeleteInode`.
+    /// Routed via `calculate_shard(inode)`. Pairs with `RemoveDirEntry`.
+    DecrementNlink {
+        inode: u64,
+    },
 }
 
 impl ShardCommand {

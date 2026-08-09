@@ -548,7 +548,16 @@ impl MetaShardClient {
         guard.as_ref().unwrap().clone()
     }
 
-    /// 设置默认分片路由 - 将 filer leader 地址设为所有分片的默认目标
+    /// 设置默认分片路由 — 仅在拓扑完全为空时作为兜底。
+    ///
+    /// 历史实现预填 256 个分片，这是错误的：Filer 实际按 `shard_count`（例如 3）
+    /// 切分元数据空间，而 `calculate_shard_id(inode)` 用 `shard_router.len()` 作模数 →
+    /// 客户端计算 `% 256`，Filer 实际存储在 `% 3` 的分片 → inode not found / EIO。
+    ///
+    /// 正确做法是只用 `1` 个默认路由（覆盖所有 shard_id 都映射到该 filer），
+    /// 真正的 shard_count 来自 master 的 `GetTopology.total_shards`，由 `sync_shard_router`
+    /// 在拓扑就绪后填充。这保证了启动期到拓扑就绪期间的请求也能被某个 filer 接住
+    /// （filer 会按自身 shard_count 处理或返回 redirect 到正确 leader）。
     fn setup_default_routes(&self) {
         // 使用默认 filer 地址
         let default_addr = self.default_filer_addr();
@@ -559,23 +568,22 @@ impl MetaShardClient {
         }
 
         log::info!(
-            "MetaShardClient: setting default shard routes to filer leader: {}",
+            "MetaShardClient: setting default shard route to filer: {} (single-route fallback; \
+             real shard_count will arrive via topology)",
             default_addr
         );
 
-        // 预填 256 个分片的默认路由（覆盖常用分片范围）
-        for shard_id in 0..256 {
-            self.shard_router
-                .insert(shard_id, ShardInfo::new(shard_id, default_addr.clone()));
-        }
-        // Store default address for fallback when shard_id > 255 (e.g. inode numbers)
+        // 只填 shard_id=0 作为单路由兜底；calculate_shard_id 在拓扑未就绪时返回 0，
+        // 这样所有请求被路由到默认 filer，由 filer 处理或返回 REDIRECT 指向真正的 leader。
+        self.shard_router
+            .insert(0, ShardInfo::new(0, default_addr.clone()));
+        // Store default address for fallback when shard_id is not in the router.
         self.default_filer_addr
             .lock()
             .unwrap()
             .clone_from(&default_addr);
         log::info!(
-            "MetaShardClient: default routes configured for {} shards, fallback={}",
-            self.shard_router.len(),
+            "MetaShardClient: default route configured (1 fallback entry), fallback={}",
             default_addr
         );
     }
@@ -600,8 +608,13 @@ impl MetaShardClient {
     /// avoiding redirects on every request.
     /// Formula: (inode / inode_per_shard) % shard_count
     /// inode_per_shard = 1_000_000 (must match filer's ShardStrategy::calculate_inode_per_shard)
+    ///
+    /// 模数来源优先级：
+    ///   1. master 下发的 `topology.shard_count`（权威值，与 filer 一致同意）；
+    ///   2. `shard_router.len()`（拓扑已填充 shard→leader 但 master 未下发 total_shards）；
+    ///   3. `1`（拓扑完全未就绪 → 返回 0，由 default_filer_addr 兜底）。
     pub fn calculate_shard_id(&self, inode: u64) -> u64 {
-        let shard_count = self.shard_router.len().max(1) as u64;
+        let shard_count = self.topology_manager.shard_count().max(1) as u64;
         if shard_count <= 1 {
             return 0;
         }

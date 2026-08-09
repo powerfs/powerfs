@@ -81,6 +81,8 @@ pub struct FuseApp {
     lease_mode: String,
     lease_duration_ms: u64,
     lease_renew_interval_ms: u64,
+    /// 强制挂载：跳过拓扑健康检查。仅用于运维场景。
+    force_mount: bool,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -100,8 +102,20 @@ impl FuseApp {
         lease_mode: &str,
         lease_duration_ms: u64,
         lease_renew_interval_ms: u64,
+        force_mount: bool,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
+        // filer_addrs 为空且 filer_addr 也为空时，由 facade 从 master 拓扑发现。
+        // 旧逻辑 `vec![filer_addr]` 在 filer_addr="" 时会插入一个空字符串，污染轮换列表。
+        let filer_addrs = if filer_addrs.is_empty() {
+            if filer_addr.is_empty() {
+                Vec::new()
+            } else {
+                vec![filer_addr.clone()]
+            }
+        } else {
+            filer_addrs
+        };
         Ok(FuseApp {
             mount_point: mount_point.to_string(),
             master_addresses: master_addrs.to_vec(),
@@ -110,17 +124,13 @@ impl FuseApp {
             master_net_port,
             volume_net_port,
             volume_addrs,
-            filer_addr: filer_addr.clone(),
-            // 确保 filer_addrs 至少包含主地址
-            filer_addrs: if filer_addrs.is_empty() {
-                vec![filer_addr]
-            } else {
-                filer_addrs
-            },
+            filer_addr,
+            filer_addrs,
             filer_net_port,
             lease_mode: lease_mode.to_string(),
             lease_duration_ms,
             lease_renew_interval_ms,
+            force_mount,
             runtime,
         })
     }
@@ -179,6 +189,7 @@ impl FuseApp {
             lease_mode: self.lease_mode.clone(),
             lease_duration_ms: self.lease_duration_ms,
             lease_renew_interval_ms: self.lease_renew_interval_ms,
+            force_mount: self.force_mount,
         };
 
         let facade = Arc::new(
@@ -2254,11 +2265,16 @@ impl FileSystem for PowerFsFs {
         // 并发 open 第二次进入) — 此时本地 buffer 权威, 无需刷新.
         if !self.inline_buffers.contains_key(&inode) {
             let meta_client = self.client.facade().meta_shard_client().clone();
-            let parent_for_getattr = parent;
+            // Route getattr via the inode's own shard. After the split-create
+            // refactor the inode record lives on calculate_shard(inode);
+            // any other shard returns "ino not found" → inline_buffers not
+            // populated → read falls through to the stripe/Flat path →
+            // "placement Inline but no chunks" EIO.
+            let routing_shard = meta_client.calculate_shard_id(inode);
             let ino = inode;
             let attr_result = self
                 .client
-                .block_on(async move { meta_client.getattr(ino, parent_for_getattr).await });
+                .block_on(async move { meta_client.getattr(ino, routing_shard).await });
             match attr_result {
                 Ok(attr) if attr.is_inline() => {
                     // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
@@ -3455,14 +3471,18 @@ impl FileSystem for PowerFsFs {
                     data[start..end].copy_from_slice(&buf[..]);
                     data
                 };
-                drop(inline_buf); // 释放 DashMap 写锁后再做 RPC (block_on)
-
-                let parent = entry.parent;
+                let _ = inline_buf; // release DashMap ref after clone above; dropped by scope
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                match self
-                    .client
-                    .block_on(async move { meta_client.migrate_inline_alloc(parent, inode).await })
-                {
+                // Route migrate_inline_alloc via the inode's own shard
+                // (calculate_shard(inode) on the client == calculate_shard(inode)
+                // on the filer, since both use (inode / 1_000_000) % shard_count).
+                // The inode record lives on this shard after the split-create
+                // refactor; routing to any other shard returns "inode not found"
+                // → EFBIG → buffer discarded → 0-byte file on release.
+                let routing_shard = meta_client.calculate_shard_id(inode);
+                match self.client.block_on(async move {
+                    meta_client.migrate_inline_alloc(routing_shard, inode).await
+                }) {
                     Ok((volume_id, needle_id)) => {
                         info!(
                             "write inline migrate: inode={} new_end={} > threshold={} → \
@@ -4312,9 +4332,11 @@ impl FileSystem for PowerFsFs {
             }
             None => {
                 let meta_client = self.client.facade().meta_shard_client().clone();
+                let routing_shard = meta_client.calculate_shard_id(inode);
+                let ino = inode;
                 let attr = self
                     .client
-                    .block_on(async move { meta_client.getattr(inode, inode).await })
+                    .block_on(async move { meta_client.getattr(ino, routing_shard).await })
                     .map_err(|e| {
                         debug!("readdir: getattr RPC failed for inode {}: {}", inode, e);
                         std::io::Error::from_raw_os_error(libc::ENOENT)

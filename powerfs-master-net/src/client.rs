@@ -12,7 +12,7 @@ use powerfs_net::{
 };
 
 use crate::error::{MasterNetError, MasterNetResult};
-use crate::types::{AssignResult, TopologyInfo, VolumeLocation, VolumeRoute};
+use crate::types::{AssignResult, FilerRoute, TopologyInfo, VolumeLocation, VolumeRoute};
 
 /// Wrapper that turns an `Arc<dyn NotificationHandler>` into a `Box<dyn
 /// NotificationHandler>` so it can be re-installed on every new
@@ -276,7 +276,50 @@ impl TlvMasterClient {
             });
         }
 
-        Ok(TopologyInfo { leader, volumes })
+        // ---- Topology extension: filer list + global total_shards ----
+        //
+        // Older masters stop after the volume section; treat the filer
+        // extension as optional so the client keeps working against a
+        // pre-extension master (returning empty `filers` and `total_shards=0`).
+        let mut filers = Vec::new();
+        let mut total_shards: u64 = 0;
+        if dec.has_field(FieldId::FilerListEntries) {
+            let filer_count = dec.next_u64(FieldId::FilerListEntries).unwrap_or(0) as usize;
+            filers.reserve(filer_count);
+            for _ in 0..filer_count {
+                let address = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
+                let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
+                let healthy = dec.next_u8(FieldId::IsDir).unwrap_or(0) != 0;
+                let shard_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
+                // shard_blob is a packed little-endian u64 array.
+                let shard_ids = shard_blob
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                    .collect();
+                filers.push(FilerRoute {
+                    address,
+                    net_port,
+                    is_healthy: healthy,
+                    shard_ids,
+                });
+            }
+            total_shards = dec.next_u64(FieldId::TotalShards).unwrap_or(0);
+        }
+
+        info!(
+            "TlvMasterClient: get_topology leader={}, volumes={}, filers={}, total_shards={}",
+            leader,
+            volumes.len(),
+            filers.len(),
+            total_shards
+        );
+
+        Ok(TopologyInfo {
+            leader,
+            volumes,
+            filers,
+            total_shards,
+        })
     }
 
     /// Assign a new volume/file on Master.
