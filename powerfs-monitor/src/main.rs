@@ -809,10 +809,17 @@ async fn resolve_filer_endpoint(
         .map_err(|e| format!("gRPC ListFilers 失败: {}", e))?;
     let resp = response.into_inner();
     if let Some(f) = resp.filers.into_iter().find(|f| f.node_id == node_id) {
+        // Master's ListFilers may report http_port=0 (old binary or unregistered
+        // admin port). Default to 8888 — the heartbeat data's http_port is
+        // unreliable (it sometimes reports the gRPC port 8889 instead).
+        let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+        // Strip port from address if present (gRPC ListFilers returns
+        // "host:net_port" but the admin client needs just the host IP).
+        let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
         return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
             node_id: f.node_id,
-            address: f.address,
-            http_port: f.http_port,
+            address,
+            http_port,
         });
     }
 
@@ -881,10 +888,15 @@ async fn list_filer_nodes(
         .into_iter()
         .map(|f| {
             let hb = heartbeat_map.get(&f.node_id);
+            // Strip port from address for display (gRPC returns "host:net_port")
+            let display_address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            // Default to 8888 when master reports http_port=0 (heartbeat
+            // http_port is unreliable — sometimes reports gRPC port 8889).
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
             powerfs_monitor::filer_admin_client::FilerNode {
                 node_id: f.node_id.clone(),
-                address: f.address,
-                http_port: f.http_port,
+                address: display_address,
+                http_port,
                 grpc_port: f.grpc_port,
                 is_registered: true,
                 registered_healthy: f.is_healthy,
