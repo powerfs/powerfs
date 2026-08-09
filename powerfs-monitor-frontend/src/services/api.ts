@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -139,6 +139,22 @@ export async function getVolume(id: number): Promise<VolumeInfo> {
     return mockVolumes.find(v => v.id === id) || mockVolumes[0]
   }
   const response = await api.get(`/metrics/volumes/${id}`)
+  return response.data.data
+}
+
+export async function getVolumeIo(id: number): Promise<VolumeIoStats> {
+  if (useMock) {
+    return {
+      volume_id: id,
+      read_ops: Math.floor(Math.random() * 5000),
+      write_ops: Math.floor(Math.random() * 3000),
+      read_bytes: Math.floor(Math.random() * 1024 * 1024 * 1024),
+      write_bytes: Math.floor(Math.random() * 512 * 1024 * 1024),
+      read_avg_latency_us: Math.floor(50 + Math.random() * 200),
+      write_avg_latency_us: Math.floor(100 + Math.random() * 400),
+    }
+  }
+  const response = await api.get(`/metrics/volumes/${id}/io`)
   return response.data.data
 }
 
