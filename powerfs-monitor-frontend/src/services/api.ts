@@ -1109,39 +1109,56 @@ async function pickFirstFilerNodeId(): Promise<string | null> {
 /** @deprecated 使用 getFilerNodeStatus(nodeId) */
 export async function getFilerStatus(): Promise<FilerStatus> {
   if (useMock) return getFilerNodeStatus('')
-  const nodeId = await pickFirstFilerNodeId()
-  if (!nodeId) {
-    return { shard_count: 0, leader_count: 0, total_inodes: 0, total_files: 0, total_dirs: 0, buckets: [] }
+  const EMPTY: FilerStatus = { shard_count: 0, leader_count: 0, total_inodes: 0, total_files: 0, total_dirs: 0, buckets: [] }
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeStatus(nodeId)
+  } catch (e) {
+    console.warn('getFilerStatus fallback (filer unreachable):', e)
+    return EMPTY
   }
-  return getFilerNodeStatus(nodeId)
 }
 
 /** @deprecated 使用 getFilerNodeShards(nodeId) */
 export async function getShards(): Promise<ShardDetail[]> {
   if (useMock) return getFilerNodeShards('')
-  const nodeId = await pickFirstFilerNodeId()
-  if (!nodeId) return []
-  return getFilerNodeShards(nodeId)
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return []
+    return await getFilerNodeShards(nodeId)
+  } catch (e) {
+    console.warn('getShards fallback (filer unreachable):', e)
+    return []
+  }
 }
 
 /** @deprecated 使用 getFilerNodeShard(nodeId, shardId) */
 export async function getShardDetail(id: number): Promise<ShardDetail> {
+  const EMPTY: ShardDetail = { shard_id: id, inode_range_start: 0, inode_range_end: 0, is_leader: false, term: 0, commit_index: 0, applied_index: 0, inode_count: 0, file_count: 0, dir_count: 0, write_qps: 0, read_qps: 0 }
   if (useMock) return getFilerNodeShard('', id)
-  const nodeId = await pickFirstFilerNodeId()
-  if (!nodeId) {
-    return { shard_id: id, inode_range_start: 0, inode_range_end: 0, is_leader: false, term: 0, commit_index: 0, applied_index: 0, inode_count: 0, file_count: 0, dir_count: 0, write_qps: 0, read_qps: 0 }
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeShard(nodeId, id)
+  } catch (e) {
+    console.warn('getShardDetail fallback (filer unreachable):', e)
+    return EMPTY
   }
-  return getFilerNodeShard(nodeId, id)
 }
 
 /** @deprecated 使用 getFilerNodeBalancerStatus(nodeId) */
 export async function getBalancerStatus(): Promise<SchedulerStatus> {
+  const EMPTY: SchedulerStatus = { is_running: false, last_check_time: 0, total_migrations: 0, successful_migrations: 0, failed_migrations: 0, node_count: 0, shard_count: 0, leader_distribution: {} }
   if (useMock) return getFilerNodeBalancerStatus('')
-  const nodeId = await pickFirstFilerNodeId()
-  if (!nodeId) {
-    return { is_running: false, last_check_time: 0, total_migrations: 0, successful_migrations: 0, failed_migrations: 0, node_count: 0, shard_count: 0, leader_distribution: {} }
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeBalancerStatus(nodeId)
+  } catch (e) {
+    console.warn('getBalancerStatus fallback (filer unreachable):', e)
+    return EMPTY
   }
-  return getFilerNodeBalancerStatus(nodeId)
 }
 
 /** @deprecated 使用 startFilerNodeBalancer(nodeId) */
@@ -1167,12 +1184,16 @@ export async function triggerBalance(): Promise<void> {
 
 /** @deprecated 使用 getFilerNodeBalancerConfig(nodeId) */
 export async function getBalancerConfig(): Promise<SchedulerConfig> {
+  const DEFAULT_CFG: SchedulerConfig = { check_interval: 60, max_transfers_per_round: 2, transfer_interval: 10, cooldown_periods: 5, leader_imbalance_threshold: 1.5, cpu_threshold: 0.8, memory_threshold: 0.85, disk_threshold: 0.1 }
   if (useMock) return getFilerNodeBalancerConfig('')
-  const nodeId = await pickFirstFilerNodeId()
-  if (!nodeId) {
-    return { check_interval: 60, max_transfers_per_round: 2, transfer_interval: 10, cooldown_periods: 5, leader_imbalance_threshold: 1.5, cpu_threshold: 0.8, memory_threshold: 0.85, disk_threshold: 0.1 }
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return DEFAULT_CFG
+    return await getFilerNodeBalancerConfig(nodeId)
+  } catch (e) {
+    console.warn('getBalancerConfig fallback (filer unreachable):', e)
+    return DEFAULT_CFG
   }
-  return getFilerNodeBalancerConfig(nodeId)
 }
 
 /** @deprecated 使用 updateFilerNodeBalancerConfig(nodeId, config) */

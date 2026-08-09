@@ -34,53 +34,54 @@ function Dashboard() {
 
   const loadData = useCallback(async () => {
     setLoading(true)
-    try {
-      const [cluster, kv, alertList, filer, balancer] = await Promise.all([
-        getClusterMetrics(),
-        getKVMetrics(),
-        getAlerts(),
-        getFilerStatus(),
-        getBalancerStatus(),
-      ])
-      setClusterMetrics(cluster)
-      setKVMetrics(kv)
-      setFilerStatus(filer)
-      setBalancerStatus(balancer)
-      setAlerts(alertList)
-    } catch (e) {
-      console.error('Failed to load dashboard data:', e)
-    } finally {
-      setLoading(false)
-    }
+    // 各请求独立容错: filer/balancer 不可达不应阻塞 cluster/kv/alerts 加载
+    const results = await Promise.allSettled([
+      getClusterMetrics(),
+      getKVMetrics(),
+      getAlerts(),
+      getFilerStatus(),
+      getBalancerStatus(),
+    ])
+    if (results[0].status === 'fulfilled') setClusterMetrics(results[0].value)
+    if (results[1].status === 'fulfilled') setKVMetrics(results[1].value)
+    if (results[2].status === 'fulfilled') setAlerts(results[2].value)
+    if (results[3].status === 'fulfilled') setFilerStatus(results[3].value)
+    if (results[4].status === 'fulfilled') setBalancerStatus(results[4].value)
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        console.warn(`Dashboard loadData [${i}] rejected:`, r.reason)
+      }
+    })
+    setLoading(false)
   }, [])
 
   const loadHistoryData = useCallback(async () => {
-    try {
-      const [storageData, cpuData] = await Promise.all([
-        getMetricHistory('powerfs_node_disk_usage'),
-        getMetricHistory('powerfs_node_cpu_usage'),
-      ])
-      setStorageTrend(storageData)
-      setCpuTrend(cpuData)
-    } catch (e) {
-      console.error('Failed to load history data:', e)
-    }
+    const [storageRes, cpuRes] = await Promise.allSettled([
+      getMetricHistory('powerfs_node_disk_usage'),
+      getMetricHistory('powerfs_node_cpu_usage'),
+    ])
+    if (storageRes.status === 'fulfilled') setStorageTrend(storageRes.value)
+    if (cpuRes.status === 'fulfilled') setCpuTrend(cpuRes.value)
   }, [])
 
   const realtimeFetcher = useCallback(async () => {
-    const nodes = await getNodes()
-    const online = nodes.filter(n => n.status !== 'offline')
-    if (online.length === 0) return { cpu: 0, memory: 0 }
-    const sum = online.reduce(
-      (acc, n) => ({
-        cpu: acc.cpu + (n.cpu_usage || 0),
-        memory: acc.memory + (n.mem_usage || 0),
-      }),
-      { cpu: 0, memory: 0 },
-    )
-    return {
-      cpu: Number((sum.cpu / online.length).toFixed(1)),
-      memory: Number((sum.memory / online.length).toFixed(1)),
+    try {
+      const nodes = await getNodes()
+      const online = nodes.filter(n => n.status !== 'offline')
+      if (online.length === 0) return { cpu: 0, memory: 0 }
+      const sum = online.reduce(
+        (acc, n) => ({
+          cpu: acc.cpu + (n.cpu_usage || 0),
+          memory: acc.memory + (n.mem_usage || 0),
+        }),
+        { cpu: 0, memory: 0 },
+      )
+      return {
+        cpu: Number((sum.cpu / online.length).toFixed(1)),
+        memory: Number((sum.memory / online.length).toFixed(1)),
+      }
+    } catch {
+      return { cpu: 0, memory: 0 }
     }
   }, [])
 
