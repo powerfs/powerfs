@@ -6,7 +6,7 @@ import Dashboard from './pages/Dashboard'
 import Nodes from './pages/Nodes'
 import Volumes from './pages/Volumes'
 import Collections from './pages/Collections'
-// import StorageDevices from './pages/StorageDevices'  // hidden pending backend supplement
+import StorageDevices from './pages/StorageDevices'
 import BitrotScrub from './pages/BitrotScrub'
 import KV from './pages/KV'
 import Alerts from './pages/Alerts'
@@ -78,7 +78,6 @@ function App() {
             </ProtectedRoute>
           }
         />
-        {/* TODO: restore StorageDevices route after backend supplement (decision 1)
         <Route
           path="storage-devices"
           element={
@@ -87,7 +86,6 @@ function App() {
             </ProtectedRoute>
           }
         />
-        */}
         <Route
           path="volumes"
           element={
