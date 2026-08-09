@@ -235,22 +235,23 @@ Security
 
 Integrates the three user requirements + Section 2 gaps.
 
-| Priority | Task | Rationale |
-|---|---|---|
-| **P0** | i18n framework + default English + EN/ZH resources | User explicit requirement; foundational change, cheaper the earlier |
-| **P0** | Node type cleanup: remove device_count/raft_role, add raft_term | Align types with backend; basis for all node pages |
-| **P0** | Hide Storage Devices entry + remove delete* dead calls (interim) | Avoid click-errors until backend DELETE/device routes land (decisions 1,3) |
-| **P1** | Cluster Topology upgrade (reactflow 3-layer graph + node detail drawer) | Storage expert core entry |
-| **P1** | Nodes page → 3 role Tabs (Master/Filer/Volume) | Node mgmt redesign core |
-| **P1** | Master Raft Health page + Transfer Leader (decision 5) | Wire already-200 `/api/master/status`; high-risk op with double-confirm |
-| **P1** | Optimizations/Runtime Config → editable form via PUT (decision 2) | Wire real GET + add PUT hot-modify; remove hardcoded constants |
-| **P1** | WebSocket `/ws/metrics` integration (decision 4, promoted from P2) | Real-time push, in-scope this round |
-| **P1** | StorageDevices backend supplement (decision 1) | Implement Master device mgmt gRPC + `/storage/devices` + `/storage/migrations`; restore frontend entry |
-| **P1** | Volume IO Performance tab (wire `/metrics/volumes/:id/io`) | C2, backend already 200 |
-| **P2** | FUSE Clients list wire `/fuse/clients` (currently 404, backend must add) | B3 residual |
-| **P2** | Conflicts fully downgrade to Filer sub-page health indicator | CRDT deprecated |
-| **P2** | Backend DELETE routes for nodes/volumes/kv-sessions (decision 3) | Unblocks frontend delete buttons |
-| **P3** | Capacity Planning data authenticity verify (possibly mock) | Needs backend time-series storage |
+| Priority | Task | Status | Rationale |
+|---|---|---|---|
+| **P0** | i18n framework + default English + EN/ZH resources | ✅ done (commit 62a1938c) | User explicit requirement; foundational change, cheaper the earlier |
+| **P0** | Node type cleanup: remove device_count/raft_role, add raft_term | ✅ done (commit 62a1938c) | Align types with backend; basis for all node pages |
+| **P0** | Hide Storage Devices entry + remove delete* dead calls (interim) | ✅ done (commit 62a1938c) | Avoid click-errors until backend DELETE/device routes land (decisions 1,3) |
+| **P1** | Cluster Topology upgrade (reactflow 3-layer graph + node detail drawer) | ✅ done (commit 62a1938c) | Storage expert core entry |
+| **P1** | Nodes page → 3 role Tabs (Master/Filer/Volume) | ✅ done (commit 62a1938c) | Node mgmt redesign core |
+| **P1** | Master Raft Health page + Transfer Leader (decision 5) | ✅ done (commit 62a1938c) | Wire already-200 `/api/master/status`; high-risk op with double-confirm |
+| **P1** | Optimizations/Runtime Config → editable form via PUT (decision 2) | ✅ done (commit 62a1938c) | Wire real GET + add PUT hot-modify; remove hardcoded constants |
+| **P1** | WebSocket `/ws/metrics` integration (decision 4, promoted from P2) | ✅ done (commit a9387206) | Real-time push, in-scope this round; backend snapshot-on-connect added |
+| **P1** | StorageDevices backend supplement (decision 1) | ⏳ pending | Implement Master device mgmt gRPC + `/storage/devices` + `/storage/migrations`; restore frontend entry |
+| **P1** | Volume IO Performance tab (wire `/metrics/volumes/:id/io`) | ✅ done (commit 4470d2c9) | C2, backend already 200 |
+| **P1** | Header WS status badge | ✅ done (commit 38d61691) | Bonus: visibility into real-time stream health |
+| **P2** | FUSE Clients list wire `/fuse/clients` (currently 404, backend must add) | ⏳ pending | B3 residual; Master already keeps fuse_clients map, needs proto RPC + monitor bridge |
+| **P2** | Conflicts fully downgrade to Filer sub-page health indicator | ⏳ pending | CRDT deprecated |
+| **P2** | Backend DELETE routes for nodes/volumes/kv-sessions (decision 3) | ✅ done (commit 62a1938c) | Unblocks frontend delete buttons |
+| **P3** | Capacity Planning data authenticity verify (possibly mock) | ⏳ pending | Needs backend time-series storage |
 
 ---
 
