@@ -21,6 +21,7 @@ import {
 } from '@/services/api'
 import { formatBytes, formatPercent, formatNumber } from '@/utils/format'
 import { generateTimeSeriesData } from '@/utils/mockData'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 function KV() {
   const [sessions, setSessions] = useState<KVSessionInfo[]>([])
@@ -34,12 +35,6 @@ function KV() {
   const [showCreateNamespace, setShowCreateNamespace] = useState(false)
   const [namespaceForm] = Form.useForm()
 
-  useEffect(() => {
-    loadKVData()
-    const interval = setInterval(loadKVData, 10000)
-    return () => clearInterval(interval)
-  }, [])
-
   const loadKVData = async () => {
     const [sessionList, kvMetrics] = await Promise.all([
       getKVSessions(),
@@ -48,6 +43,25 @@ function KV() {
     setSessions(sessionList)
     setMetrics(kvMetrics)
   }
+
+  useEffect(() => {
+    loadKVData()
+    // Backoff polling to 30s — real-time updates flow through WS.
+    const interval = setInterval(loadKVData, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // WS pushes KVMetrics as the kv source. Update metrics live; sessions
+  // still come from axios (backend only broadcasts metrics aggregate).
+  useMetricStream({
+    source: 'kv',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        setMetrics(payload as KVMetrics)
+      }
+    },
+  })
 
   useEffect(() => {
     loadNamespaces()

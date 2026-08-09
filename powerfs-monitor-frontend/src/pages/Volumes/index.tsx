@@ -11,6 +11,7 @@ import {
 import type { VolumeInfo } from '@/types'
 import { getVolumes } from '@/services/api'
 import { formatBytes } from '@/utils/format'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Text } = Typography
 
@@ -23,17 +24,39 @@ function Volumes() {
   const [filterStatus, setFilterStatus] = useState<string>('')
   const [filterCollection, setFilterCollection] = useState<string>('')
 
-  useEffect(() => {
-    loadVolumes()
-    const interval = setInterval(loadVolumes, 10000)
-    return () => clearInterval(interval)
-  }, [])
-
   const loadVolumes = async () => {
     const data = await getVolumes()
     console.log('Loaded volumes:', data.length, 'unique:', new Set(data.map(v => v.id)).size)
     setVolumes(data)
   }
+
+  useEffect(() => {
+    loadVolumes()
+    // Backoff polling to 30s — real-time updates flow through WS.
+    const interval = setInterval(loadVolumes, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Live merge: WS pushes either a single VolumeInfo (event-driven) or the
+  // full list snapshot (on connect). Both update by volume id.
+  useMetricStream({
+    source: 'volumes',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      if (Array.isArray(payload)) {
+        setVolumes(payload as VolumeInfo[])
+      } else if (payload && typeof payload === 'object') {
+        const vol = payload as VolumeInfo
+        setVolumes((prev) => {
+          const idx = prev.findIndex((v) => v.id === vol.id)
+          if (idx === -1) return [...prev, vol]
+          const next = [...prev]
+          next[idx] = { ...next[idx], ...vol }
+          return next
+        })
+      }
+    },
+  })
 
   const handleViewDetail = (volume: VolumeInfo) => {
     setSelectedVolume(volume)

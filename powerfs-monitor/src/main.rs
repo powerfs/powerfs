@@ -4309,7 +4309,44 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-    state.ws_clients.lock().await.push(tx);
+    state.ws_clients.lock().await.push(tx.clone());
+
+    // Push an initial snapshot so newly-connected clients see current state
+    // immediately, instead of waiting for the next event_bus tick.
+    let snapshot_state = state.clone();
+    tokio::spawn(async move {
+        // Tiny delay to let the client finish its onopen handler. Harmless
+        // if the client isn't ready yet; messages are buffered in the mpsc.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let nodes = snapshot_state.metric_store.get_nodes().await;
+        if !nodes.is_empty() {
+            let msg = WsMetricUpdate {
+                message_type: "metric_update".to_string(),
+                source: "nodes".to_string(),
+                payload: serde_json::to_value(&nodes).unwrap_or(serde_json::Value::Null),
+            };
+            let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+        }
+
+        let volumes = snapshot_state.metric_store.get_volumes().await;
+        if !volumes.is_empty() {
+            let msg = WsMetricUpdate {
+                message_type: "metric_update".to_string(),
+                source: "volumes".to_string(),
+                payload: serde_json::to_value(&volumes).unwrap_or(serde_json::Value::Null),
+            };
+            let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+        }
+
+        let kv = snapshot_state.metric_store.get_kv_metrics().await;
+        let msg = WsMetricUpdate {
+            message_type: "metric_update".to_string(),
+            source: "kv".to_string(),
+            payload: serde_json::to_value(&kv).unwrap_or(serde_json::Value::Null),
+        };
+        let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+    });
 
     let (mut sender, mut receiver) = socket.split();
 

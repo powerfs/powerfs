@@ -30,6 +30,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import type { MasterStatus, NodeInfo } from '@/types'
 import { getMasterStatus, transferLeader } from '@/services/api'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Title, Text } = Typography
 
@@ -53,9 +54,43 @@ function MasterRaft() {
 
   useEffect(() => {
     void load()
-    const iv = setInterval(() => void load(), 5000)
+    // Backoff polling to 15s — WS delivers live node status; refresh here
+    // only recomputes leader/raft_term aggregate.
+    const iv = setInterval(() => void load(), 15000)
     return () => clearInterval(iv)
   }, [load])
+
+  // Live patch: when WS pushes a master node update, merge it into the
+  // status.nodes list and recompute leader/term if needed.
+  useMetricStream({
+    source: 'nodes',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      const patchOne = (node: NodeInfo) => {
+        setStatus((prev) => {
+          if (!prev) return prev
+          const nodes = prev.nodes.map((n) =>
+            n.id === node.id ? { ...n, ...node } : n,
+          )
+          const leader = nodes.find((n) => n.is_leader) ?? null
+          return {
+            ...prev,
+            nodes,
+            leader,
+            raft_term: leader?.raft_term ?? prev.raft_term,
+            healthy_masters: nodes.filter((n) =>
+              ['online', 'healthy', 'leader'].includes(n.status),
+            ).length,
+          }
+        })
+      }
+      if (Array.isArray(payload)) {
+        ;(payload as NodeInfo[]).forEach(patchOne)
+      } else if (payload && typeof payload === 'object') {
+        patchOne(payload as NodeInfo)
+      }
+    },
+  })
 
   const doTransferLeader = async (node: NodeInfo) => {
     // node.id 可能是 "1" / "master-1" 等，只要 parse 得到数字；否则尝试直接用纯数字部分
