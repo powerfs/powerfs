@@ -1,18 +1,19 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   Card, Spin, Typography, Space, Row, Col, Button, Tag, Progress, Slider,
-  Divider, Descriptions, Empty, message, Select, Tooltip, Alert, Popconfirm,
+  Divider, Descriptions, Empty, message, Select, Tooltip, Alert, Popconfirm, Modal, List, Statistic,
 } from 'antd'
 import {
   DatabaseOutlined, PlayCircleOutlined, StopOutlined,
   InfoCircleOutlined, CheckCircleOutlined, AlertOutlined, ThunderboltOutlined,
-  CloudServerOutlined, HeartOutlined,
+  CloudServerOutlined, HeartOutlined, GlobalOutlined,
 } from '@ant-design/icons'
-import type { FilerNode } from '@/types'
+import type { FilerNode, BatchResult } from '@/types'
 import {
   getFilerNodes, getFilerNodeBalancerStatus, startFilerNodeBalancer,
   stopFilerNodeBalancer, triggerFilerNodeBalancer, getFilerNodeBalancerConfig,
   updateFilerNodeBalancerConfig,
+  startAllBalancers, stopAllBalancers, triggerAllBalancers,
   type SchedulerStatus, type SchedulerConfig,
 } from '@/services/api'
 
@@ -31,6 +32,11 @@ function ShardBalancing() {
   const [configLoading, setConfigLoading] = useState(false)
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({})
 
+  // ── 批量操作 (Phase C: start/stop/trigger all) ──
+  const [batchLoading, setBatchLoading] = useState<Record<string, boolean>>({})
+  const [batchResult, setBatchResult] = useState<BatchResult | null>(null)
+  const [batchModalOpen, setBatchModalOpen] = useState(false)
+  const [batchAction, setBatchAction] = useState('')
   const loadNodes = useCallback(async () => {
     setNodesLoading(true)
     try {
@@ -157,6 +163,28 @@ function ShardBalancing() {
     }
   }
 
+  // ── 批量操作 (Phase C: 并发调所有 filer) ──
+  const handleBatchAction = async (action: 'start' | 'stop' | 'trigger') => {
+    const key = `batch-${action}`
+    setBatchLoading(prev => ({ ...prev, [key]: true }))
+    try {
+      const result = action === 'start'
+        ? await startAllBalancers()
+        : action === 'stop'
+        ? await stopAllBalancers()
+        : await triggerAllBalancers()
+      setBatchResult(result)
+      setBatchAction(action)
+      setBatchModalOpen(true)
+      // 刷新当前选中节点状态
+      if (selectedNodeId) loadStatus(selectedNodeId)
+    } catch (error) {
+      message.error(`批量${action === 'start' ? '启动' : action === 'stop' ? '停止' : '触发'}失败`)
+    } finally {
+      setBatchLoading(prev => ({ ...prev, [key]: false }))
+    }
+  }
+
   const getBalanceScore = () => {
     if (!status || status.node_count === 0) return 100
     const leaders = Object.values(status.leader_distribution)
@@ -189,6 +217,50 @@ function ShardBalancing() {
           <Title level={4} style={{ margin: 0 }}>分片均衡</Title>
         </Space>
         <Space>
+          {/* 批量操作 (Phase C: 并发调所有 filer) */}
+          <Tooltip title="对所有 Filer 节点批量操作">
+            <Space>
+              <Popconfirm
+                title="启动所有 Filer 节点的均衡器?"
+                onConfirm={() => handleBatchAction('start')}
+              >
+                <Button
+                  icon={<GlobalOutlined />}
+                  loading={batchLoading['batch-start']}
+                  disabled={nodes.length === 0}
+                >
+                  全部启动
+                </Button>
+              </Popconfirm>
+              <Popconfirm
+                title="停止所有 Filer 节点的均衡器?"
+                onConfirm={() => handleBatchAction('stop')}
+              >
+                <Button
+                  icon={<GlobalOutlined />}
+                  danger
+                  loading={batchLoading['batch-stop']}
+                  disabled={nodes.length === 0}
+                >
+                  全部停止
+                </Button>
+              </Popconfirm>
+              <Popconfirm
+                title="对所有 Filer 节点触发均衡检查?"
+                onConfirm={() => handleBatchAction('trigger')}
+              >
+                <Button
+                  icon={<ThunderboltOutlined />}
+                  loading={batchLoading['batch-trigger']}
+                  disabled={nodes.length === 0}
+                >
+                  全部触发
+                </Button>
+              </Popconfirm>
+            </Space>
+          </Tooltip>
+          <Divider type="vertical" />
+          {/* 单节点操作 */}
           <Tooltip title="手动触发均衡检查">
             <Popconfirm
               title={`触发节点 ${selectedNodeId} 的均衡检查?`}
@@ -557,6 +629,80 @@ function ShardBalancing() {
           </Descriptions.Item>
         </Descriptions>
       </Card>
+
+      {/* ── 批量操作结果 Modal (Phase C) ── */}
+      <Modal
+        title={
+          <Space>
+            <GlobalOutlined />
+            <span>批量{batchAction === 'start' ? '启动' : batchAction === 'stop' ? '停止' : '触发'}结果</span>
+          </Space>
+        }
+        open={batchModalOpen}
+        onCancel={() => setBatchModalOpen(false)}
+        footer={<Button type="primary" onClick={() => setBatchModalOpen(false)}>关闭</Button>}
+      >
+        {batchResult && (
+          <div>
+            <Row gutter={16} style={{ marginBottom: 16, textAlign: 'center' }}>
+              <Col span={8}>
+                <Statistic
+                  title="总节点数"
+                  value={batchResult.total}
+                  valueStyle={{ fontSize: 20 }}
+                />
+              </Col>
+              <Col span={8}>
+                <Statistic
+                  title="成功"
+                  value={batchResult.success.length}
+                  valueStyle={{ fontSize: 20, color: '#52c41a' }}
+                  prefix={<CheckCircleOutlined />}
+                />
+              </Col>
+              <Col span={8}>
+                <Statistic
+                  title="失败"
+                  value={batchResult.failed.length}
+                  valueStyle={{ fontSize: 20, color: batchResult.failed.length > 0 ? '#ff4d4f' : undefined }}
+                  prefix={batchResult.failed.length > 0 ? <AlertOutlined /> : undefined}
+                />
+              </Col>
+            </Row>
+            {batchResult.failed.length > 0 && (
+              <>
+                <Divider style={{ margin: '12px 0' }} />
+                <Text strong style={{ color: '#ff4d4f' }}>失败节点:</Text>
+                <List
+                  size="small"
+                  bordered
+                  style={{ marginTop: 8 }}
+                  dataSource={batchResult.failed}
+                  renderItem={(item) => (
+                    <List.Item>
+                      <Space>
+                        <Tag color="error">{item.node_id}</Tag>
+                        <Text type="secondary" style={{ fontSize: 12 }}>{item.error}</Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              </>
+            )}
+            {batchResult.success.length > 0 && (
+              <>
+                <Divider style={{ margin: '12px 0' }} />
+                <Text strong style={{ color: '#52c41a' }}>成功节点:</Text>
+                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {batchResult.success.map(id => (
+                    <Tag color="success" key={id}>{id}</Tag>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </Modal>
     </Spin>
   )
 }

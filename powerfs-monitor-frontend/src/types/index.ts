@@ -623,6 +623,45 @@ export interface ClusterShard {
   lag_reason?: string
 }
 
+/** cluster/status 单节点条目 (status 为 filer /admin/status 原始透传) */
+export interface ClusterStatusNode {
+  node_id: string
+  status: FilerStatus | null
+  error: string | null
+}
+
+/** cluster/status 聚合汇总 */
+export interface ClusterStatusTotals {
+  node_count: number
+  reachable: number
+  unreachable: number
+  total_shards: number
+  total_leaders: number
+  total_inodes: number
+  total_files: number
+  total_dirs: number
+  all_buckets: string[]
+}
+
+/** cluster/status 响应体 */
+export interface ClusterStatusResponse {
+  nodes: ClusterStatusNode[]
+  totals: ClusterStatusTotals
+}
+
+/** Balancer 批量操作单个失败条目 */
+export interface BatchFailure {
+  node_id: string
+  error: string
+}
+
+/** Balancer 批量操作结果 (start/stop/trigger all) */
+export interface BatchResult {
+  success: string[]
+  failed: BatchFailure[]
+  total: number
+}
+
 // ===== Master Raft =====
 export interface MasterStatus {
   nodes: NodeInfo[]

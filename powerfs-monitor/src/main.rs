@@ -130,6 +130,22 @@ struct WsAlertUpdate {
 /// transient jitter, low enough to surface a real outage in <1 minute.
 const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 
+/// Filer cluster 聚合查询缓存 — TTL 5s, 内存 RwLock, 不引入 Redis
+/// (见 docs/filer-redesign-plan.md 决策 3)。集群聚合查询 (cluster/status,
+/// cluster/shards) 缓存 5s 避免前端轮询打爆 filer; 单节点查询不缓存。
+/// 所有写操作 (balancer start/stop/trigger all) 后立即失效缓存。
+#[derive(Default)]
+struct FilerClusterCache {
+    status: Option<(Instant, serde_json::Value)>,
+    shards: Option<(Instant, serde_json::Value)>,
+}
+
+/// 集群聚合查询缓存 TTL (秒)
+const FILER_CLUSTER_CACHE_TTL_SECS: u64 = 5;
+
+/// Shard commit_index 落后阈值 — 超过此值判定 shard 不健康
+const CLUSTER_SHARD_COMMIT_LAG_THRESHOLD: u64 = 100;
+
 struct AppState {
     metric_store: Arc<MetricStore>,
     alert_engine: Arc<AlertEngine>,
@@ -162,6 +178,8 @@ struct AppState {
     /// Filer admin HTTP client — Monitor 作为 filer /admin/* 的唯一入口
     /// (前端不直连 filer，见 docs/filer-redesign-plan.md)。
     filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient,
+    /// Filer cluster 聚合查询缓存 (cluster/status, cluster/shards, TTL 5s)
+    filer_cluster_cache: Arc<RwLock<FilerClusterCache>>,
 }
 
 /// Mutable runtime configuration snapshot. Mirrors the defaults exposed via GET
@@ -1074,6 +1092,431 @@ async fn filer_put_balancer_config(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     filer_admin_put_inner(&state, &user, &node_id, "balancer/config", body).await
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Filer cluster aggregation (Phase C)
+// 见 docs/filer-redesign-plan.md: /api/filer/cluster/* 聚合端点 +
+// Balancer 批量操作。集群聚合查询缓存 5s (决策 3), 写操作后立即失效缓存。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有 filer endpoints (从 gRPC ListFilers 获取)。
+/// 用于 cluster 聚合查询的并发调用。
+async fn list_filer_endpoints(
+    state: &Arc<AppState>,
+) -> Vec<powerfs_monitor::filer_admin_client::FilerEndpoint> {
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let response = match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("list_filer_endpoints: gRPC ListFilers 失败: {}", e);
+            return Vec::new();
+        }
+    };
+    response
+        .into_inner()
+        .filers
+        .into_iter()
+        .map(|f| powerfs_monitor::filer_admin_client::FilerEndpoint {
+            node_id: f.node_id,
+            address: f.address,
+            http_port: f.http_port,
+        })
+        .collect()
+}
+
+// ── cluster/status 聚合 ──
+
+/// filer /admin/status 返回结构的反序列化镜像 (仅取聚合需要的字段)。
+/// 保持与 powerfs_filer::meta_shard_manager::FilerStatus 同步。
+#[derive(Deserialize)]
+struct FilerStatusRaw {
+    shard_count: u64,
+    leader_count: u64,
+    total_inodes: u64,
+    total_files: u64,
+    total_dirs: u64,
+    #[serde(default)]
+    buckets: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusNode {
+    node_id: String,
+    status: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusTotals {
+    node_count: usize,
+    reachable: usize,
+    unreachable: usize,
+    total_shards: u64,
+    total_leaders: u64,
+    total_inodes: u64,
+    total_files: u64,
+    total_dirs: u64,
+    all_buckets: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusResponse {
+    nodes: Vec<ClusterStatusNode>,
+    totals: ClusterStatusTotals,
+}
+
+/// 并发调用所有 filer /admin/status, 聚合为集群级状态。
+/// 单节点失败不影响其他节点 (partial success 语义)。
+async fn fetch_cluster_status(state: &Arc<AppState>) -> ClusterStatusResponse {
+    let endpoints = list_filer_endpoints(state).await;
+
+    // 并发调用所有 filer (futures::future::join_all)
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            async move {
+                let result = client.get_json(&ep, "/admin/status").await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    let mut nodes = Vec::new();
+    let mut totals = ClusterStatusTotals {
+        node_count: endpoints.len(),
+        reachable: 0,
+        unreachable: 0,
+        total_shards: 0,
+        total_leaders: 0,
+        total_inodes: 0,
+        total_files: 0,
+        total_dirs: 0,
+        all_buckets: Vec::new(),
+    };
+
+    for (node_id, result) in results {
+        match result {
+            Ok(val) => {
+                totals.reachable += 1;
+                // 解析关键字段做聚合 (透传原始 val 给前端)
+                if let Ok(raw) = serde_json::from_value::<FilerStatusRaw>(val.clone()) {
+                    totals.total_shards += raw.shard_count;
+                    totals.total_leaders += raw.leader_count;
+                    totals.total_inodes += raw.total_inodes;
+                    totals.total_files += raw.total_files;
+                    totals.total_dirs += raw.total_dirs;
+                    for b in &raw.buckets {
+                        if !totals.all_buckets.contains(b) {
+                            totals.all_buckets.push(b.clone());
+                        }
+                    }
+                }
+                nodes.push(ClusterStatusNode {
+                    node_id,
+                    status: Some(val),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                totals.unreachable += 1;
+                nodes.push(ClusterStatusNode {
+                    node_id,
+                    status: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    totals.all_buckets.sort();
+    ClusterStatusResponse { nodes, totals }
+}
+
+async fn get_filer_cluster_status(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    // 检查缓存 (TTL 5s)
+    {
+        let cache = state.filer_cluster_cache.read().await;
+        if let Some((t, v)) = &cache.status {
+            if t.elapsed().as_secs() < FILER_CLUSTER_CACHE_TTL_SECS {
+                return Json(ApiResponse::success(v.clone())).into_response();
+            }
+        }
+    }
+    // 未命中, 重新获取并更新缓存
+    let resp = fetch_cluster_status(&state).await;
+    let val = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    {
+        let mut cache = state.filer_cluster_cache.write().await;
+        cache.status = Some((Instant::now(), val.clone()));
+    }
+    Json(ApiResponse::success(val)).into_response()
+}
+
+// ── cluster/shards 聚合 ──
+
+/// filer /admin/shards 返回的单个 shard 反序列化镜像。
+/// 保持与 powerfs_filer::meta_shard_manager::ShardDetail 同步。
+#[derive(Deserialize)]
+struct FilerShardRaw {
+    shard_id: u64,
+    inode_range_start: u64,
+    inode_range_end: u64,
+    is_leader: bool,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
+    inode_count: u64,
+    #[allow(dead_code)]
+    file_count: u64,
+    #[allow(dead_code)]
+    dir_count: u64,
+    write_qps: u64,
+    read_qps: u64,
+}
+
+#[derive(Serialize)]
+struct ClusterShardReplica {
+    node_id: String,
+    is_leader: bool,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
+    inode_count: u64,
+    write_qps: u64,
+    read_qps: u64,
+}
+
+#[derive(Serialize)]
+struct ClusterShardEntry {
+    shard_id: u64,
+    inode_range_start: u64,
+    inode_range_end: u64,
+    replicas: Vec<ClusterShardReplica>,
+    is_healthy: bool,
+    lag_reason: Option<String>,
+}
+
+/// 并发调用所有 filer /admin/shards, 按 shard_id 聚合多副本, 判定健康度。
+/// 健康判定: term 一致 + commit_index 滞后 < 阈值。
+async fn fetch_cluster_shards(state: &Arc<AppState>) -> Vec<ClusterShardEntry> {
+    let endpoints = list_filer_endpoints(state).await;
+
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            async move {
+                let result = client.get_json(&ep, "/admin/shards").await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    // 按 shard_id 聚合多 filer 副本
+    let mut shard_map: HashMap<u64, ClusterShardEntry> = HashMap::new();
+
+    for (node_id, result) in results {
+        match result {
+            Ok(val) => {
+                if let Ok(shards) = serde_json::from_value::<Vec<FilerShardRaw>>(val) {
+                    for s in shards {
+                        let entry =
+                            shard_map
+                                .entry(s.shard_id)
+                                .or_insert_with(|| ClusterShardEntry {
+                                    shard_id: s.shard_id,
+                                    inode_range_start: s.inode_range_start,
+                                    inode_range_end: s.inode_range_end,
+                                    replicas: Vec::new(),
+                                    is_healthy: true,
+                                    lag_reason: None,
+                                });
+                        entry.replicas.push(ClusterShardReplica {
+                            node_id: node_id.clone(),
+                            is_leader: s.is_leader,
+                            term: s.term,
+                            commit_index: s.commit_index,
+                            applied_index: s.applied_index,
+                            inode_count: s.inode_count,
+                            write_qps: s.write_qps,
+                            read_qps: s.read_qps,
+                        });
+                    }
+                }
+            }
+            Err(_) => { /* 单节点失败不影响聚合 */ }
+        }
+    }
+
+    // 健康判定: term 一致性 + commit_index 滞后
+    for entry in shard_map.values_mut() {
+        if entry.replicas.is_empty() {
+            continue;
+        }
+        let terms: Vec<u64> = entry.replicas.iter().map(|r| r.term).collect();
+        let commits: Vec<u64> = entry.replicas.iter().map(|r| r.commit_index).collect();
+
+        let term_consistent = terms.iter().all(|&t| t == terms[0]);
+        let commit_max = *commits.iter().max().unwrap_or(&0);
+        let commit_min = *commits.iter().min().unwrap_or(&0);
+        let commit_lag = commit_max - commit_min;
+        let commit_ok = commit_lag < CLUSTER_SHARD_COMMIT_LAG_THRESHOLD;
+
+        if !term_consistent {
+            entry.is_healthy = false;
+            entry.lag_reason = Some(format!("term 不一致: {:?}", terms));
+        } else if !commit_ok {
+            entry.is_healthy = false;
+            entry.lag_reason = Some(format!("commit_index 滞后 {} 条", commit_lag));
+        }
+    }
+
+    let mut shards: Vec<_> = shard_map.into_values().collect();
+    shards.sort_by_key(|s| s.shard_id);
+    shards
+}
+
+async fn get_filer_cluster_shards(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    // 检查缓存 (TTL 5s)
+    {
+        let cache = state.filer_cluster_cache.read().await;
+        if let Some((t, v)) = &cache.shards {
+            if t.elapsed().as_secs() < FILER_CLUSTER_CACHE_TTL_SECS {
+                return Json(ApiResponse::success(v.clone())).into_response();
+            }
+        }
+    }
+    let resp = fetch_cluster_shards(&state).await;
+    let val = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    {
+        let mut cache = state.filer_cluster_cache.write().await;
+        cache.shards = Some((Instant::now(), val.clone()));
+    }
+    Json(ApiResponse::success(val)).into_response()
+}
+
+// ── Balancer 批量操作 (start/stop/trigger all) ──
+
+#[derive(Serialize)]
+struct BatchFailure {
+    node_id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct BatchResult {
+    success: Vec<String>,
+    failed: Vec<BatchFailure>,
+    total: usize,
+}
+
+/// 失效 cluster 聚合缓存 (写操作后调用, 见决策 3)
+async fn invalidate_filer_cluster_cache(state: &Arc<AppState>) {
+    let mut cache = state.filer_cluster_cache.write().await;
+    cache.status = None;
+    cache.shards = None;
+}
+
+/// 并发调用所有 filer 的 balancer 子路径 (start/stop/trigger)
+async fn balancer_all_inner(state: &Arc<AppState>, sub_path: &str) -> BatchResult {
+    let endpoints = list_filer_endpoints(state).await;
+    let total = endpoints.len();
+
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            let path = format!("/admin/balancer/{}", sub_path);
+            async move {
+                let result = client.post_json(&ep, &path, None).await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    let mut success = Vec::new();
+    let mut failed = Vec::new();
+    for (node_id, result) in results {
+        match result {
+            Ok(_) => success.push(node_id),
+            Err(e) => failed.push(BatchFailure {
+                node_id,
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    BatchResult {
+        success,
+        failed,
+        total,
+    }
+}
+
+async fn balancer_start_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "start").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
+}
+
+async fn balancer_stop_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "stop").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
+}
+
+async fn balancer_trigger_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "trigger").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
 }
 
 async fn get_cluster_metrics(
@@ -5416,6 +5859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         time_series: Arc::new(TimeSeriesStore::with_redis(&redis_url)),
         runtime_config: Arc::new(RwLock::new(RuntimeConfig::default())),
         filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient::new(),
+        filer_cluster_cache: Arc::new(RwLock::new(FilerClusterCache::default())),
     });
 
     // Load time-series history from Redis on startup (if available)
@@ -5648,6 +6092,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/filer/nodes/:node_id/balancer/config",
             put(filer_put_balancer_config),
+        )
+        // ========== Filer cluster aggregation (Phase C) ==========
+        // 集群聚合端点: 并发调所有 filer, 缓存 5s (见 docs/filer-redesign-plan.md 决策 3)
+        .route("/api/filer/cluster/status", get(get_filer_cluster_status))
+        .route("/api/filer/cluster/shards", get(get_filer_cluster_shards))
+        // Balancer 批量操作: 并发调所有 filer, 返回 BatchResult, 写后失效缓存
+        .route("/api/filer/balancer/start-all", post(balancer_start_all))
+        .route("/api/filer/balancer/stop-all", post(balancer_stop_all))
+        .route(
+            "/api/filer/balancer/trigger-all",
+            post(balancer_trigger_all),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
