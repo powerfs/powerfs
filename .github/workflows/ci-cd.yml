@@ -270,17 +270,22 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-    
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 9
+
     - name: Install Dependencies
-      run: npm ci
+      run: pnpm install --frozen-lockfile
       working-directory: ./powerfs-monitor-frontend
-    
+
     - name: Build Frontend
-      run: npm run build
+      run: pnpm build
       working-directory: ./powerfs-monitor-frontend
     
     - name: Upload Frontend Build
       uses: actions/upload-artifact@v4
       with:
         name: frontend-build
-        path: ./powerfs-monitor-frontend/build
+        path: ./powerfs-monitor-frontend/dist
