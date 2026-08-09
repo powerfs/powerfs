@@ -266,9 +266,20 @@ impl TlvMasterClient {
 
         let mut volumes = Vec::with_capacity(volume_count);
         for _ in 0..volume_count {
+            // Master encodes 5 fields per volume route:
+            // VolumeId, Owner, Size, UsedSpace, FileCount.
+            // All 5 must be consumed in order — skipping any of them leaves
+            // the decoder misaligned (header consumed but value not), and
+            // every subsequent read (including the filer section below)
+            // returns garbage. This was the root cause of the old
+            // "filers=0, total_shards=0" bug: the client stopped reading
+            // after Size, so has_field(FilerListEntries) peeked into the
+            // middle of a UsedSpace value and returned false.
             let volume_id = dec.next_u64(FieldId::VolumeId).unwrap_or(0);
             let addr = dec.next_string(FieldId::Owner).unwrap_or_default();
             let size = dec.next_u64(FieldId::Size).unwrap_or(0);
+            let _ = dec.next_u64(FieldId::UsedSpace).unwrap_or(0);
+            let _ = dec.next_u64(FieldId::FileCount).unwrap_or(0);
             volumes.push(VolumeRoute {
                 volume_id,
                 addr,
@@ -281,27 +292,43 @@ impl TlvMasterClient {
         // Older masters stop after the volume section; treat the filer
         // extension as optional so the client keeps working against a
         // pre-extension master (returning empty `filers` and `total_shards=0`).
+        //
+        // Use contains_field() (scans forward) rather than has_field() (peeks
+        // only the next field) for resilience: if a future master adds extra
+        // trailing fields after the volume section, the decoder won't be at
+        // FilerListEntries immediately but it will still be found.
         let mut filers = Vec::new();
         let mut total_shards: u64 = 0;
-        if dec.has_field(FieldId::FilerListEntries) {
-            let filer_count = dec.next_u64(FieldId::FilerListEntries).unwrap_or(0) as usize;
-            filers.reserve(filer_count);
-            for _ in 0..filer_count {
-                let address = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
-                let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
-                let healthy = dec.next_u8(FieldId::IsDir).unwrap_or(0) != 0;
-                let shard_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
-                // shard_blob is a packed little-endian u64 array.
-                let shard_ids = shard_blob
-                    .chunks_exact(8)
-                    .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
-                    .collect();
-                filers.push(FilerRoute {
-                    address,
-                    net_port,
-                    is_healthy: healthy,
-                    shard_ids,
-                });
+        if dec.contains_field(FieldId::FilerListEntries) {
+            // Advance past any unexpected fields until we reach FilerListEntries.
+            // next_field() returns (FieldId, length) and consumes the 5-byte
+            // header; the caller must read or skip the value.
+            while let Some((f, len)) = dec.next_field() {
+                if f == FieldId::FilerListEntries {
+                    // Read the value — next_field consumed the header but not the value.
+                    let filer_count = dec.read_u64(len).unwrap_or(0) as usize;
+                    filers.reserve(filer_count);
+                    for _ in 0..filer_count {
+                        let address = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
+                        let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
+                        let healthy = dec.next_u8(FieldId::IsDir).unwrap_or(0) != 0;
+                        let shard_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
+                        // shard_blob is a packed little-endian u64 array.
+                        let shard_ids = shard_blob
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                            .collect();
+                        filers.push(FilerRoute {
+                            address,
+                            net_port,
+                            is_healthy: healthy,
+                            shard_ids,
+                        });
+                    }
+                    break;
+                }
+                // Unexpected field between volumes and filer section — skip its value.
+                let _ = dec.skip(len);
             }
             total_shards = dec.next_u64(FieldId::TotalShards).unwrap_or(0);
         }
