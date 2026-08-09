@@ -416,15 +416,14 @@ impl ShardScheduler {
     }
 
     async fn can_transfer_leader(&self, shard_id: ShardId, target_addr: &str) -> bool {
-        let group_arc = match self.raft_group_manager.get_group(shard_id).await {
-            Some(g) => g,
-            None => return false,
-        };
-
-        let group = group_arc.read().await;
-        let peers = group.get_peers();
-
-        peers.iter().any(|p| p.address == target_addr)
+        // MUST NOT acquire the group RwLock — `run()` holds its write lock for
+        // the entire Raft event-loop lifetime, so a read lock here would
+        // deadlock and freeze the scheduler's balancing tick forever. Instead,
+        // read the peer snapshot from `shard_status_arcs` (lock-free).
+        match self.raft_group_manager.get_shard_peers(shard_id).await {
+            Some(peers) => peers.iter().any(|p| p.address == target_addr),
+            None => false,
+        }
     }
 
     fn get_node_id_by_address(&self, address: &str) -> u64 {
