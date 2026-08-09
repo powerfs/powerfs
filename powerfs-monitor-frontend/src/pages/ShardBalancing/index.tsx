@@ -198,6 +198,13 @@ function ShardBalancing() {
     return Math.max(0, 100 - imbalance * 50)
   }
 
+  // Map raw Raft address (e.g. "172.30.0.32:8889") to node_id (e.g. "filer-2")
+  const addrToNodeId = (addr: string): string => {
+    const ip = addr.split(':')[0]
+    const match = nodes.find(n => n.address === ip)
+    return match ? match.node_id : addr
+  }
+
   const balanceScore = getBalanceScore()
   const balanceColor = balanceScore >= 80 ? '#52c41a' : balanceScore >= 50 ? '#faad14' : '#ff4d4f'
 
@@ -433,25 +440,28 @@ function ShardBalancing() {
           <Card title={`Leader 分布 (节点 ${selectedNodeId})`} size="small" style={{ marginBottom: 24 }}>
             {status?.leader_distribution && Object.keys(status.leader_distribution).length > 0 ? (
               <Row gutter={16}>
-                {Object.entries(status.leader_distribution).map(([node, count]) => (
-                  <Col xs={12} md={6} key={node}>
-                    <div style={{
-                      padding: 16, borderRadius: 8,
-                      background: 'var(--pf-color-bg-container)',
-                      border: '1px solid var(--pf-color-border)',
-                    }}>
-                      <div style={{ fontSize: 12, color: 'var(--pf-color-secondary)', marginBottom: 8 }}>
-                        {node}
+                {Object.entries(status.leader_distribution).map(([addr, count]) => {
+                  const nodeId = addrToNodeId(addr)
+                  return (
+                    <Col xs={12} md={6} key={addr}>
+                      <div style={{
+                        padding: 16, borderRadius: 8,
+                        background: 'var(--pf-color-bg-container)',
+                        border: '1px solid var(--pf-color-border)',
+                      }}>
+                        <div style={{ fontSize: 12, color: 'var(--pf-color-secondary)', marginBottom: 8 }}>
+                          {nodeId}
+                        </div>
+                        <div style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>{count}</div>
+                        <Progress
+                          percent={(count / (status.shard_count || 1)) * 100}
+                          showInfo={false}
+                          size="small"
+                        />
                       </div>
-                      <div style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>{count}</div>
-                      <Progress
-                        percent={(count / (status.shard_count || 1)) * 100}
-                        showInfo={false}
-                        size="small"
-                      />
-                    </div>
-                  </Col>
-                ))}
+                    </Col>
+                  )
+                })}
               </Row>
             ) : (
               <Empty description="暂无分布数据" />
