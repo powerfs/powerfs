@@ -29,7 +29,6 @@ import {
   TeamOutlined,
   SafetyCertificateOutlined,
   LockOutlined,
-  WarningOutlined,
   SafetyOutlined,
   BulbOutlined,
   BulbFilled,
@@ -134,7 +133,8 @@ function AppLayout() {
               label: t('nav:items.filerManagement'),
               children: [
                 { key: '/filer', label: t('nav:items.filerOverview') },
-                { key: '/conflicts', icon: <WarningOutlined />, label: t('nav:items.conflicts') },
+                // Conflicts 已降级为 Filer 子页面健康指示器 (P2), 顶级入口移除;
+                // /conflicts 路由保留, 通过 Filer > Bucket & Health tab 的链接访问.
               ],
             },
             { key: '/shards', icon: <ClusterOutlined />, label: t('nav:items.shards') },
