@@ -584,10 +584,17 @@ impl RaftGroup {
             return;
         }
 
+        // Capture the proposed entry's index immediately after propose()
+        // appends it to the log.  Returning raft_log.committed is wrong for
+        // multi-node clusters: after one process_ready() the entry is not yet
+        // committed (followers have not acked), so committed still holds the
+        // pre-propose value.  last_index() is the newly appended entry's
+        // index regardless of commit status.
+        let entry_index = self.node.raft.raft_log.last_index();
+
         self.process_ready();
 
-        let index = self.node.raft.raft_log.committed;
-        let _ = req.response_tx.send(Ok(index));
+        let _ = req.response_tx.send(Ok(entry_index));
     }
 
     pub fn get_propose_tx(&self) -> mpsc::Sender<ProposeRequest> {
