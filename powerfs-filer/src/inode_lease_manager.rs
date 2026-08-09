@@ -37,6 +37,7 @@ struct InodeLeaseEntry {
     /// Client ID of the lease holder.
     holder: String,
     /// When the lease was acquired (for monitoring).
+    #[allow(dead_code)]
     acquired_at: Instant,
     /// When the lease expires (TTL).
     expire_at: Instant,
