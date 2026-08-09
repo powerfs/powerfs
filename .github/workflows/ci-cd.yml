@@ -3,9 +3,9 @@ name: PowerFS CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, develop, "fs-lease-optimize" ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, develop, "fs-lease-optimize" ]
   workflow_dispatch:
 
 env:
