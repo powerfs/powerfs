@@ -159,6 +159,9 @@ struct AppState {
     time_series: Arc<TimeSeriesStore>,
     /// Runtime-mutable monitor configuration (hot-modify via PUT endpoints).
     runtime_config: Arc<RwLock<RuntimeConfig>>,
+    /// Filer admin HTTP client — Monitor 作为 filer /admin/* 的唯一入口
+    /// (前端不直连 filer，见 docs/filer-redesign-plan.md)。
+    filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient,
 }
 
 /// Mutable runtime configuration snapshot. Mirrors the defaults exposed via GET
@@ -664,7 +667,10 @@ async fn get_storage_device(
 ) -> Json<ApiResponse<StorageDevice>> {
     match state.metric_store.get_storage_device(&device_id).await {
         Some(d) => Json(ApiResponse::success(d)),
-        None => Json(ApiResponse::error(&format!("device {} not found", device_id))),
+        None => Json(ApiResponse::error(&format!(
+            "device {} not found",
+            device_id
+        ))),
     }
 }
 
@@ -715,9 +721,7 @@ async fn list_migration_tasks(
 ) -> Json<ApiResponse<Vec<DataMigrationTask>>> {
     let mut tasks = state.metric_store.get_migration_tasks().await;
     if let Some(did) = q.device_id {
-        tasks.retain(|t| {
-            t.source_device_id == did || t.target_device_id.as_deref() == Some(&did)
-        });
+        tasks.retain(|t| t.source_device_id == did || t.target_device_id.as_deref() == Some(&did));
     }
     tasks.sort_by(|a, b| b.start_time.cmp(&a.start_time));
     Json(ApiResponse::success(tasks))
@@ -760,6 +764,316 @@ async fn resume_migration_task(
         }))),
         Err(e) => Json(ApiResponse::error(&e)),
     }
+}
+
+// ========== Filer admin bridge handlers ==========
+//
+// 设计原则 (见 docs/filer-redesign-plan.md): 前端只跟 Monitor 交互。
+// 所有 filer /admin/* 调用由 Monitor 通过 filer_admin_client 代理,
+// 绝不让前端直连 filer 进程。所有操作要求 admin 权限。
+
+/// 通过 gRPC ListFilers 解析指定 node_id 的 filer endpoint。
+async fn resolve_filer_endpoint(
+    state: &Arc<AppState>,
+    node_id: &str,
+) -> Result<powerfs_monitor::filer_admin_client::FilerEndpoint, String> {
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let response = state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+        .map_err(|e| format!("gRPC ListFilers 失败: {}", e))?;
+    let resp = response.into_inner();
+    resp.filers
+        .into_iter()
+        .find(|f| f.node_id == node_id)
+        .map(|f| powerfs_monitor::filer_admin_client::FilerEndpoint {
+            node_id: f.node_id,
+            address: f.address,
+            http_port: f.http_port,
+        })
+        .ok_or_else(|| format!("filer 节点 {} 未在 master 注册", node_id))
+}
+
+/// 列出所有 filer 节点 — 合并 gRPC ListFilers (注册视角) + metric_store (心跳视角)。
+async fn list_filer_nodes(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<powerfs_monitor::filer_admin_client::FilerNode>>> {
+    // 1. gRPC ListFilers 拿注册信息
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let grpc_filers: Vec<powerfs_master::proto::powerfs::FilerInfo> = match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().filers,
+        Err(e) => return Json(ApiResponse::error(&format!("gRPC ListFilers 失败: {}", e))),
+    };
+
+    // 2. metric_store 拿心跳信息 (受 NODE_HEARTBEAT_TIMEOUT_SECS 控制, 已标 offline)
+    let heartbeat_nodes = state.metric_store.get_nodes().await;
+    let heartbeat_map: HashMap<String, NodeInfo> = heartbeat_nodes
+        .iter()
+        .filter(|n| n.node_type == "filer")
+        .map(|n| (n.id.clone(), n.clone()))
+        .collect();
+
+    // 3. 合并: 以 gRPC 注册为准, 心跳补充实时状态
+    let mut nodes: Vec<powerfs_monitor::filer_admin_client::FilerNode> = grpc_filers
+        .into_iter()
+        .map(|f| {
+            let hb = heartbeat_map.get(&f.node_id);
+            powerfs_monitor::filer_admin_client::FilerNode {
+                node_id: f.node_id.clone(),
+                address: f.address,
+                http_port: f.http_port,
+                grpc_port: f.grpc_port,
+                is_registered: true,
+                registered_healthy: f.is_healthy,
+                leader_count: f.leader_count,
+                total_shards: f.total_shards,
+                heartbeat_status: hb
+                    .map(|h| h.status.clone())
+                    .unwrap_or_else(|| "offline".to_string()),
+                last_seen_ago_secs: hb
+                    .map(|h| {
+                        // last_seen 是 #[serde(skip)] 不出 API, 这里用 uptime 近似
+                        // (uptime 是进程启动后秒数, 心跳断后 uptime 不再增长)
+                        h.uptime
+                    })
+                    .unwrap_or(0),
+                cpu_usage: hb.map(|h| h.cpu_usage).unwrap_or(0.0),
+                mem_usage: hb.map(|h| h.mem_usage).unwrap_or(0.0),
+                disk_usage: hb.map(|h| h.disk_usage).unwrap_or(0.0),
+                uptime: hb.map(|h| h.uptime).unwrap_or(0),
+            }
+        })
+        .collect();
+
+    // 4. 补充: 心跳有但 gRPC 没注册的 filer (master 未感知, 可能注册延迟)
+    let registered_ids: HashSet<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    for n in &heartbeat_nodes {
+        if n.node_type == "filer" && !registered_ids.contains(&n.id) {
+            nodes.push(powerfs_monitor::filer_admin_client::FilerNode {
+                node_id: n.id.clone(),
+                address: n.address.clone(),
+                http_port: n.http_port,
+                grpc_port: n.grpc_port,
+                is_registered: false,
+                registered_healthy: false,
+                leader_count: 0,
+                total_shards: 0,
+                heartbeat_status: n.status.clone(),
+                last_seen_ago_secs: n.uptime,
+                cpu_usage: n.cpu_usage,
+                mem_usage: n.mem_usage,
+                disk_usage: n.disk_usage,
+                uptime: n.uptime,
+            });
+        }
+    }
+
+    // 5. 按 node_id 排序保证稳定顺序
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Json(ApiResponse::success(nodes))
+}
+
+/// 透传 GET 到 filer /admin/<sub_path> — 内部辅助, 由具体 handler 调用。
+async fn filer_admin_get_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+) -> Response {
+    // 所有 filer admin 操作都要求 admin 权限 (见 docs/filer-redesign-plan.md 决策 4)
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.get_json(&ep, &path).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+/// 透传 POST 到 filer /admin/<sub_path> — balancer/start, balancer/stop, balancer/trigger
+async fn filer_admin_post_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+    body: Option<serde_json::Value>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.post_json(&ep, &path, body).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+/// 透传 PUT 到 filer /admin/<sub_path> — balancer/config
+async fn filer_admin_put_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+    body: serde_json::Value,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.put_json(&ep, &path, body).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+// --- 具体路由 handler (薄封装, 调用 _inner 辅助函数) ---
+
+async fn filer_get_status(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "status").await
+}
+
+async fn filer_get_shards(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "shards").await
+}
+
+async fn filer_get_shard(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path((node_id, shard_id)): Path<(String, String)>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, &format!("shards/{}", shard_id)).await
+}
+
+async fn filer_get_balancer_status(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "balancer/status").await
+}
+
+async fn filer_get_balancer_config(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "balancer/config").await
+}
+
+async fn filer_balancer_start(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/start", None).await
+}
+
+async fn filer_balancer_stop(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/stop", None).await
+}
+
+async fn filer_balancer_trigger(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/trigger", None).await
+}
+
+async fn filer_put_balancer_config(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    filer_admin_put_inner(&state, &user, &node_id, "balancer/config", body).await
 }
 
 async fn get_cluster_metrics(
@@ -2415,9 +2729,7 @@ async fn list_fuse_clients(
 /// (`CircuitBreakerConfig::default()`). They are read-only for now; PUT
 /// support will be added once the master can push config updates to clients.
 /// GET /api/config/circuit-breaker — current in-memory CircuitBreaker config snapshot.
-async fn get_circuit_breaker_config(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn get_circuit_breaker_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let cfg = state.runtime_config.read().await.circuit_breaker.clone();
     Json(serde_json::to_value(&cfg).expect("serialize cb config"))
 }
@@ -2439,9 +2751,7 @@ async fn put_circuit_breaker_config(
 }
 
 /// GET /api/config/coalescer — current default WriteCoalescer config.
-async fn get_coalescer_config(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn get_coalescer_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let cfg = state.runtime_config.read().await.coalescer.clone();
     Json(serde_json::to_value(&cfg).expect("serialize coalescer config"))
 }
@@ -2846,18 +3156,24 @@ async fn get_metric_history(
 
     let points = match metric.as_str() {
         "powerfs_node_disk_usage" | "cluster_disk_usage" => {
-            state.time_series.get_cluster_disk_usage_history(minutes).await
+            state
+                .time_series
+                .get_cluster_disk_usage_history(minutes)
+                .await
         }
         m if m.starts_with("disk_usage:") => {
             let node_id = &m["disk_usage:".len()..];
             state.time_series.get_disk_history(node_id, minutes).await
         }
-        m if m.starts_with("volume_size:") => {
-            match m["volume_size:".len()..].parse::<u64>() {
-                Ok(vid) => state.time_series.get_volume_size_history(vid, minutes).await,
-                Err(_) => Vec::new(),
+        m if m.starts_with("volume_size:") => match m["volume_size:".len()..].parse::<u64>() {
+            Ok(vid) => {
+                state
+                    .time_series
+                    .get_volume_size_history(vid, minutes)
+                    .await
             }
-        }
+            Err(_) => Vec::new(),
+        },
         // Metrics not sampled by TimeSeriesStore return empty (no mock).
         _ => Vec::new(),
     };
@@ -4651,7 +4967,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 source: "nodes".to_string(),
                 payload: serde_json::to_value(&nodes).unwrap_or(serde_json::Value::Null),
             };
-            let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+            let _ = tx
+                .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+                .await;
         }
 
         let volumes = snapshot_state.metric_store.get_volumes().await;
@@ -4661,7 +4979,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 source: "volumes".to_string(),
                 payload: serde_json::to_value(&volumes).unwrap_or(serde_json::Value::Null),
             };
-            let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+            let _ = tx
+                .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+                .await;
         }
 
         let kv = snapshot_state.metric_store.get_kv_metrics().await;
@@ -4670,7 +4990,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             source: "kv".to_string(),
             payload: serde_json::to_value(&kv).unwrap_or(serde_json::Value::Null),
         };
-        let _ = tx.send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null)).await;
+        let _ = tx
+            .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+            .await;
     });
 
     let (mut sender, mut receiver) = socket.split();
@@ -5093,6 +5415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         master_client,
         time_series: Arc::new(TimeSeriesStore::with_redis(&redis_url)),
         runtime_config: Arc::new(RwLock::new(RuntimeConfig::default())),
+        filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient::new(),
     });
 
     // Load time-series history from Redis on startup (if available)
@@ -5291,6 +5614,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/storage/migrations/:task_id/resume",
             post(resume_migration_task),
+        )
+        // ========== Filer admin bridge ==========
+        // 设计原则: 前端只跟 Monitor 交互, filer /admin/* 由 Monitor 代理。
+        // 所有操作要求 admin 权限 (见 docs/filer-redesign-plan.md 决策 4)。
+        .route("/api/filer/nodes", get(list_filer_nodes))
+        .route("/api/filer/nodes/:node_id/status", get(filer_get_status))
+        .route("/api/filer/nodes/:node_id/shards", get(filer_get_shards))
+        .route(
+            "/api/filer/nodes/:node_id/shards/:shard_id",
+            get(filer_get_shard),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/status",
+            get(filer_get_balancer_status),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/config",
+            get(filer_get_balancer_config),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/start",
+            post(filer_balancer_start),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/stop",
+            post(filer_balancer_stop),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/trigger",
+            post(filer_balancer_trigger),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/config",
+            put(filer_put_balancer_config),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),

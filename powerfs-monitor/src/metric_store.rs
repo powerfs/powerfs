@@ -516,7 +516,12 @@ impl MetricStore {
             // also forces Offline (no capacity advertised).
             let node_alive = node
                 .as_ref()
-                .map(|n| matches!(n.status.as_str(), "online" | "healthy" | "leader" | "follower"))
+                .map(|n| {
+                    matches!(
+                        n.status.as_str(),
+                        "online" | "healthy" | "leader" | "follower"
+                    )
+                })
                 .unwrap_or(false);
             let default_status = if cap == 0 || !node_alive {
                 DeviceStatus::Offline
@@ -525,7 +530,11 @@ impl MetricStore {
             };
             let status = overrides.get(&nid).copied().unwrap_or(default_status);
 
-            let used_ratio = if cap == 0 { 0.0 } else { used as f64 / cap as f64 };
+            let used_ratio = if cap == 0 {
+                0.0
+            } else {
+                used as f64 / cap as f64
+            };
             let default_health = if !node_alive {
                 DeviceHealth::Unknown
             } else if used_ratio > 0.95 || node.map(|n| n.disk_usage > 95.0).unwrap_or(false) {
@@ -535,7 +544,10 @@ impl MetricStore {
             } else {
                 DeviceHealth::Healthy
             };
-            let health = health_overrides.get(&nid).copied().unwrap_or(default_health);
+            let health = health_overrides
+                .get(&nid)
+                .copied()
+                .unwrap_or(default_health);
 
             let device_id = format!("dev:{}", nid);
             let rack = node
@@ -630,21 +642,23 @@ impl MetricStore {
         self.derive_storage_devices().await;
         let source = {
             let devs = self.storage_devices.read().await;
-            devs.get(&nid).cloned().ok_or_else(|| format!("device {} not found", device_id))?
+            devs.get(&nid)
+                .cloned()
+                .ok_or_else(|| format!("device {} not found", device_id))?
         };
         // Pick target: any other online device with space.
         let target_id: Option<String> = {
             let devs = self.storage_devices.read().await;
             devs.values()
-                .filter(|d| d.device_id != source.device_id && d.status == DeviceStatus::Online && d.free_space >= source.used_space)
+                .filter(|d| {
+                    d.device_id != source.device_id
+                        && d.status == DeviceStatus::Online
+                        && d.free_space >= source.used_space
+                })
                 .max_by_key(|d| d.free_space)
                 .map(|d| d.device_id.clone())
         };
-        let task_id = format!(
-            "mig-{}-{}",
-            nid,
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
-        );
+        let task_id = format!("mig-{}-{}", nid, chrono::Utc::now().format("%Y%m%d%H%M%S"));
         let total_bytes = source.used_space;
         let task = DataMigrationTask {
             task_id: task_id.clone(),
@@ -671,14 +685,29 @@ impl MetricStore {
     }
 
     pub async fn get_migration_tasks(&self) -> Vec<DataMigrationTask> {
-        self.migration_tasks.read().await.values().cloned().collect()
+        self.migration_tasks
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn cancel_migration(&self, task_id: &str) -> Result<(), String> {
         let mut tasks = self.migration_tasks.write().await;
-        let task = tasks.get_mut(task_id).ok_or_else(|| format!("task {} not found", task_id))?;
-        if matches!(task.status, MigrationTaskStatus::Completed | MigrationTaskStatus::Failed | MigrationTaskStatus::Cancelled) {
-            return Err(format!("task {} already in terminal state {:?}", task_id, task.status));
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task {} not found", task_id))?;
+        if matches!(
+            task.status,
+            MigrationTaskStatus::Completed
+                | MigrationTaskStatus::Failed
+                | MigrationTaskStatus::Cancelled
+        ) {
+            return Err(format!(
+                "task {} already in terminal state {:?}",
+                task_id, task.status
+            ));
         }
         task.status = MigrationTaskStatus::Cancelled;
         task.end_time = Some(chrono::Utc::now().to_rfc3339());
@@ -688,7 +717,10 @@ impl MetricStore {
         if let Some(nid) = src_node {
             let still_draining = self.migration_tasks.read().await.values().any(|t| {
                 Self::device_node_id(&t.source_device_id).as_deref() == Some(&nid)
-                    && matches!(t.status, MigrationTaskStatus::Running | MigrationTaskStatus::Paused)
+                    && matches!(
+                        t.status,
+                        MigrationTaskStatus::Running | MigrationTaskStatus::Paused
+                    )
             });
             if !still_draining {
                 let mut overrides = self.device_status_overrides.write().await;
@@ -703,9 +735,14 @@ impl MetricStore {
 
     pub async fn pause_migration(&self, task_id: &str) -> Result<(), String> {
         let mut tasks = self.migration_tasks.write().await;
-        let task = tasks.get_mut(task_id).ok_or_else(|| format!("task {} not found", task_id))?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task {} not found", task_id))?;
         if task.status != MigrationTaskStatus::Running {
-            return Err(format!("task {} is not running (status={:?})", task_id, task.status));
+            return Err(format!(
+                "task {} is not running (status={:?})",
+                task_id, task.status
+            ));
         }
         task.status = MigrationTaskStatus::Paused;
         Ok(())
@@ -713,9 +750,14 @@ impl MetricStore {
 
     pub async fn resume_migration(&self, task_id: &str) -> Result<(), String> {
         let mut tasks = self.migration_tasks.write().await;
-        let task = tasks.get_mut(task_id).ok_or_else(|| format!("task {} not found", task_id))?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task {} not found", task_id))?;
         if task.status != MigrationTaskStatus::Paused {
-            return Err(format!("task {} is not paused (status={:?})", task_id, task.status));
+            return Err(format!(
+                "task {} is not paused (status={:?})",
+                task_id, task.status
+            ));
         }
         task.status = MigrationTaskStatus::Running;
         Ok(())
@@ -747,9 +789,13 @@ impl MetricStore {
                     // Clear draining override when all draining tasks for this node finish.
                     let other_active = self.migration_tasks.read().await.values().any(|t| {
                         Self::device_node_id(&t.source_device_id).as_deref() == Some(&nid)
-                            && matches!(t.status, MigrationTaskStatus::Running | MigrationTaskStatus::Paused)
+                            && matches!(
+                                t.status,
+                                MigrationTaskStatus::Running | MigrationTaskStatus::Paused
+                            )
                     });
-                    if !other_active && matches!(overrides.get(&nid), Some(DeviceStatus::Draining)) {
+                    if !other_active && matches!(overrides.get(&nid), Some(DeviceStatus::Draining))
+                    {
                         overrides.remove(&nid);
                     }
                 }

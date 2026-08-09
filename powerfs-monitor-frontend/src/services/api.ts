@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, FilerNode, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -873,11 +873,35 @@ export async function getBenchmarkReportById(id: string): Promise<BenchmarkResul
   return response.data.data
 }
 
-// ===== Filer & Shard management =====
-// Note: Filer admin APIs are proxied via nginx (/api/filer/* -> filer:8888/admin/*)
-// and return data directly (no { data: ... } wrapper), so we access response.data directly.
+// ===== Filer admin bridge (Monitor 代理 filer /admin/*) =====
+// 设计原则 (见 docs/filer-redesign-plan.md): 前端只跟 Monitor 交互。
+// 所有 filer /admin/* 调用由 Monitor 通过 filer_admin_client 透传,
+// Monitor 统一返回 { code, message, data } ApiResponse 包装,
+// 因此前端读取 response.data.data (而非旧 nginx 反代的 response.data)。
+// 所有 /api/filer/* 接口 (含读操作) 都要求 admin 权限。
 
-export async function getFilerStatus(): Promise<FilerStatus> {
+/**
+ * 集群 filer 节点列表 — 合并 gRPC ListFilers (注册视角) + metric_store (心跳视角)。
+ * 推荐轮询间隔: 10s。
+ */
+export async function getFilerNodes(): Promise<FilerNode[]> {
+  if (useMock) {
+    return [
+      {
+        node_id: 'filer-1', address: '127.0.0.1', http_port: 8888, grpc_port: 8889,
+        is_registered: true, registered_healthy: true,
+        leader_count: 4, total_shards: 4,
+        heartbeat_status: 'online', last_seen_ago_secs: 1,
+        cpu_usage: 12.5, mem_usage: 34.2, disk_usage: 45.0, uptime: 86400,
+      },
+    ]
+  }
+  const response = await api.get('/filer/nodes')
+  return response.data.data
+}
+
+/** 单节点详细状态 (filer /admin/status 透传)。推荐轮询: 不缓存, 要实时。 */
+export async function getFilerNodeStatus(nodeId: string): Promise<FilerStatus> {
   if (useMock) {
     return {
       shard_count: 4,
@@ -888,33 +912,35 @@ export async function getFilerStatus(): Promise<FilerStatus> {
       buckets: ['test-bucket', 'prod-data'],
     }
   }
-  const response = await api.get('/filer/status')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/status`)
+  return response.data.data
 }
 
-export async function getShards(): Promise<ShardDetail[]> {
+/** 单节点 shard 列表 (filer /admin/shards 透传)。 */
+export async function getFilerNodeShards(nodeId: string): Promise<ShardDetail[]> {
   if (useMock) {
     return [
       { shard_id: 0, inode_range_start: 0, inode_range_end: 1000000, is_leader: true, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, file_count: 24, dir_count: 8, write_qps: 120, read_qps: 480 },
       { shard_id: 1, inode_range_start: 1000000, inode_range_end: 2000000, is_leader: true, term: 2, commit_index: 12, applied_index: 12, inode_count: 48, file_count: 36, dir_count: 12, write_qps: 90, read_qps: 360 },
       { shard_id: 2, inode_range_start: 2000000, inode_range_end: 3000000, is_leader: true, term: 2, commit_index: 8, applied_index: 8, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 60, read_qps: 240 },
-      { shard_id: 3, inode_range_start: 3000000, inode_range_end: 18446744073709551615, is_leader: true, term: 2, commit_index: 5, applied_index: 5, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 30, read_qps: 120 },
+      { shard_id: 3, inode_range_start: 3000000, inode_range_end: Number.MAX_SAFE_INTEGER, is_leader: true, term: 2, commit_index: 5, applied_index: 5, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 30, read_qps: 120 },
     ]
   }
-  const response = await api.get('/filer/shards')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/shards`)
+  return response.data.data
 }
 
-export async function getShardDetail(id: number): Promise<ShardDetail> {
+/** 单 shard 详情 (filer /admin/shards/:id 透传)。 */
+export async function getFilerNodeShard(nodeId: string, shardId: number | string): Promise<ShardDetail> {
   if (useMock) {
-    const shards = await getShards()
-    return shards.find(s => s.shard_id === id) || shards[0]
+    const shards = await getFilerNodeShards(nodeId)
+    return shards.find(s => s.shard_id === Number(shardId)) || shards[0]
   }
-  const response = await api.get(`/filer/shards/${id}`)
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/shards/${shardId}`)
+  return response.data.data
 }
 
-// ===== Shard Balancer API =====
+// ===== Shard Balancer API (per-node, Monitor 透传) =====
 
 export interface SchedulerStatus {
   is_running: boolean
@@ -938,7 +964,8 @@ export interface SchedulerConfig {
   disk_threshold: number
 }
 
-export async function getBalancerStatus(): Promise<SchedulerStatus> {
+/** 单节点 balancer 状态 (filer /admin/balancer/status 透传)。推荐轮询: 5s。 */
+export async function getFilerNodeBalancerStatus(nodeId: string): Promise<SchedulerStatus> {
   if (useMock) {
     return {
       is_running: true,
@@ -955,26 +982,26 @@ export async function getBalancerStatus(): Promise<SchedulerStatus> {
       },
     }
   }
-  const response = await api.get('/filer/balancer/status')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/balancer/status`)
+  return response.data.data
 }
 
-export async function startBalancer(): Promise<void> {
+export async function startFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/start')
+  await api.post(`/filer/nodes/${nodeId}/balancer/start`)
 }
 
-export async function stopBalancer(): Promise<void> {
+export async function stopFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/stop')
+  await api.post(`/filer/nodes/${nodeId}/balancer/stop`)
 }
 
-export async function triggerBalance(): Promise<void> {
+export async function triggerFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/trigger')
+  await api.post(`/filer/nodes/${nodeId}/balancer/trigger`)
 }
 
-export async function getBalancerConfig(): Promise<SchedulerConfig> {
+export async function getFilerNodeBalancerConfig(nodeId: string): Promise<SchedulerConfig> {
   if (useMock) {
     return {
       check_interval: 60,
@@ -987,13 +1014,105 @@ export async function getBalancerConfig(): Promise<SchedulerConfig> {
       disk_threshold: 0.1,
     }
   }
-  const response = await api.get('/filer/balancer/config')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/balancer/config`)
+  return response.data.data
 }
 
+export async function updateFilerNodeBalancerConfig(nodeId: string, config: SchedulerConfig): Promise<void> {
+  if (useMock) return
+  await api.put(`/filer/nodes/${nodeId}/balancer/config`, config)
+}
+
+// ===== 向后兼容封装 (过渡期, 调用第一个 filer 节点) =====
+// 这些函数保留旧签名, 内部 fetch 节点列表后取第一个节点调用新 per-node 函数。
+// 新代码应直接使用上面的 per-node 函数并显式传 nodeId。
+
+/**
+ * 取第一个在线 filer 节点 ID; 没有节点时返回 null。
+ * 用于向后兼容封装。
+ */
+async function pickFirstFilerNodeId(): Promise<string | null> {
+  const nodes = await getFilerNodes()
+  if (nodes.length === 0) return null
+  // 优先选心跳在线的节点; 都离线时退而取第一个
+  const online = nodes.find(n => n.heartbeat_status === 'online')
+  return (online ?? nodes[0]).node_id
+}
+
+/** @deprecated 使用 getFilerNodeStatus(nodeId) */
+export async function getFilerStatus(): Promise<FilerStatus> {
+  if (useMock) return getFilerNodeStatus('')
+  const nodeId = await pickFirstFilerNodeId()
+  if (!nodeId) {
+    return { shard_count: 0, leader_count: 0, total_inodes: 0, total_files: 0, total_dirs: 0, buckets: [] }
+  }
+  return getFilerNodeStatus(nodeId)
+}
+
+/** @deprecated 使用 getFilerNodeShards(nodeId) */
+export async function getShards(): Promise<ShardDetail[]> {
+  if (useMock) return getFilerNodeShards('')
+  const nodeId = await pickFirstFilerNodeId()
+  if (!nodeId) return []
+  return getFilerNodeShards(nodeId)
+}
+
+/** @deprecated 使用 getFilerNodeShard(nodeId, shardId) */
+export async function getShardDetail(id: number): Promise<ShardDetail> {
+  if (useMock) return getFilerNodeShard('', id)
+  const nodeId = await pickFirstFilerNodeId()
+  if (!nodeId) {
+    return { shard_id: id, inode_range_start: 0, inode_range_end: 0, is_leader: false, term: 0, commit_index: 0, applied_index: 0, inode_count: 0, file_count: 0, dir_count: 0, write_qps: 0, read_qps: 0 }
+  }
+  return getFilerNodeShard(nodeId, id)
+}
+
+/** @deprecated 使用 getFilerNodeBalancerStatus(nodeId) */
+export async function getBalancerStatus(): Promise<SchedulerStatus> {
+  if (useMock) return getFilerNodeBalancerStatus('')
+  const nodeId = await pickFirstFilerNodeId()
+  if (!nodeId) {
+    return { is_running: false, last_check_time: 0, total_migrations: 0, successful_migrations: 0, failed_migrations: 0, node_count: 0, shard_count: 0, leader_distribution: {} }
+  }
+  return getFilerNodeBalancerStatus(nodeId)
+}
+
+/** @deprecated 使用 startFilerNodeBalancer(nodeId) */
+export async function startBalancer(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await startFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 stopFilerNodeBalancer(nodeId) */
+export async function stopBalancer(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await stopFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 triggerFilerNodeBalancer(nodeId) */
+export async function triggerBalance(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await triggerFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 getFilerNodeBalancerConfig(nodeId) */
+export async function getBalancerConfig(): Promise<SchedulerConfig> {
+  if (useMock) return getFilerNodeBalancerConfig('')
+  const nodeId = await pickFirstFilerNodeId()
+  if (!nodeId) {
+    return { check_interval: 60, max_transfers_per_round: 2, transfer_interval: 10, cooldown_periods: 5, leader_imbalance_threshold: 1.5, cpu_threshold: 0.8, memory_threshold: 0.85, disk_threshold: 0.1 }
+  }
+  return getFilerNodeBalancerConfig(nodeId)
+}
+
+/** @deprecated 使用 updateFilerNodeBalancerConfig(nodeId, config) */
 export async function setBalancerConfig(config: SchedulerConfig): Promise<void> {
   if (useMock) return
-  await api.put('/filer/balancer/config', config)
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await updateFilerNodeBalancerConfig(nodeId, config)
 }
 
 // ===== Collection management =====
