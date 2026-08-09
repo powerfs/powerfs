@@ -760,7 +760,7 @@ impl ShardStore {
         // Action enum: None = not found; Decrement(info) = hardlink, update
         // nlink; DeleteData(inode, is_file) = nlink==0, delete inode+data.
         enum PostAction {
-            Decrement(InodeInfo),
+            Decrement(Box<InodeInfo>),
             DeleteData(u64, bool),
         }
         let action = {
@@ -778,7 +778,7 @@ impl ShardStore {
                         // Hardlink: decrement nlink in memory, persist outside lock
                         if let Some(info) = inodes.get_mut(&inode) {
                             info.nlink -= 1;
-                            PostAction::Decrement(info.clone())
+                            PostAction::Decrement(Box::new(info.clone()))
                         } else {
                             // Inode not in memory (shouldn't happen) - dir entry
                             // already removed, skip nlink persistence
@@ -815,7 +815,7 @@ impl ShardStore {
             PostAction::Decrement(info) => {
                 inode_val = info.inode;
                 let new_nlink = info.nlink;
-                let _ = self.update_inode(info.clone());
+                let _ = self.update_inode((*info).clone());
                 info!(
                     "Shard {} unlinked hardlink: parent={}, name={}, inode={}, nlink -> {}",
                     self.shard_id.0, parent_inode, name, inode_val, new_nlink
@@ -947,7 +947,7 @@ impl ShardStore {
                     .map(|child| {
                         child
                             .values()
-                            .any(|&ci| inodes.get(&ci).map_or(false, |i| i.delete_time == 0))
+                            .any(|&ci| inodes.get(&ci).is_some_and(|i| i.delete_time == 0))
                     })
                     .unwrap_or(false);
                 if has_live {
@@ -1777,25 +1777,23 @@ impl ShardStore {
         };
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::End);
-        for item in iter {
-            if let Ok((key, _)) = item {
-                if key.len() != 8 {
-                    continue;
-                }
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&key);
-                let inode = u64::from_be_bytes(arr);
-                if inode < range_start {
-                    // Gone below our range; no more candidates
-                    break;
-                }
-                if inode < range_end {
-                    // Found the max inode in our range
-                    return inode + 1;
-                }
-                // inode >= range_end: from a higher-numbered filer node,
-                // keep scanning backwards
+        for (key, _) in iter.flatten() {
+            if key.len() != 8 {
+                continue;
             }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&key);
+            let inode = u64::from_be_bytes(arr);
+            if inode < range_start {
+                // Gone below our range; no more candidates
+                break;
+            }
+            if inode < range_end {
+                // Found the max inode in our range
+                return inode + 1;
+            }
+            // inode >= range_end: from a higher-numbered filer node,
+            // keep scanning backwards
         }
         range_start
     }

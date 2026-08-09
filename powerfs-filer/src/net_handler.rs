@@ -188,6 +188,7 @@ impl FilerNetHandler {
     /// 算法: 按 node_id 分组, round-robin 跨节点选取 volume.
     ///   - 节点数 >= count: 每个 shard 落不同节点 (完美反亲和, 停 1 节点最多丢 1 shard)
     ///   - 节点数 < count: 先每节点取 1 个, 剩余按节点 round-robin 补充
+    ///
     /// 返回 Vec<(volume_id, needle_id)>, 长度 == count. 若无可用 volume, 返回 None.
     pub fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
         let zones = self.zones.read().unwrap();
@@ -242,11 +243,10 @@ impl FilerNetHandler {
         let mut result = Vec::with_capacity(count);
         loop {
             let mut picked = false;
-            for i in 0..num_nodes {
+            for (_, group) in node_groups.iter_mut() {
                 if result.len() >= count {
                     break;
                 }
-                let (_, group) = &mut node_groups[i];
                 if let Some(vol) = group.first().cloned() {
                     let zone = &zones[vol.zone_idx];
                     let needle_id =

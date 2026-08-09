@@ -1004,10 +1004,10 @@ impl MetaShardManager {
                 while retries < 50 {
                     if let Some(info) = store.get_inode(inode) {
                         let mode_ok =
-                            mode.map_or(true, |m| (info.mode & 0o7777) == (m as u32 & 0o7777));
-                        let uid_ok = uid.map_or(true, |u| info.uid == u as u32);
-                        let gid_ok = gid.map_or(true, |g| info.gid == g as u32);
-                        let size_ok = size.map_or(true, |s| info.size == s);
+                            mode.is_none_or(|m| (info.mode & 0o7777) == (m as u32 & 0o7777));
+                        let uid_ok = uid.is_none_or(|u| info.uid == u as u32);
+                        let gid_ok = gid.is_none_or(|g| info.gid == g as u32);
+                        let size_ok = size.is_none_or(|s| info.size == s);
                         if mode_ok && uid_ok && gid_ok && size_ok {
                             return Ok(());
                         }

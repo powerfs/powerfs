@@ -282,12 +282,7 @@ impl ScrubberWorker {
         addr_map: &std::collections::HashMap<u64, String>,
     ) -> Option<u64> {
         // 选择第一个与源 volume 不同的 volume
-        for &vol_id in addr_map.keys() {
-            if vol_id != src_volume_id {
-                return Some(vol_id);
-            }
-        }
-        None
+        addr_map.keys().find(|&&vol_id| vol_id != src_volume_id).copied()
     }
 
     // ========================================================================
@@ -308,7 +303,7 @@ impl ScrubberWorker {
             let count = self
                 .ec_skip_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % EC_RECHECK_CYCLES != 0 {
+            if !count.is_multiple_of(EC_RECHECK_CYCLES) {
                 return Ok(());
             }
             debug!(
@@ -325,7 +320,7 @@ impl ScrubberWorker {
         }
 
         let volume_addrs = self.net_handler.get_all_volume_addrs();
-        if (volume_addrs.len() as usize) < total_shards {
+        if volume_addrs.len() < total_shards {
             // EC 不可行: volume 数不足. 标记并跳过, 避免每轮重复日志.
             if !self
                 .ec_infeasible
