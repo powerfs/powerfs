@@ -407,6 +407,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let master_net_port = filer_cfg.master_net_port;
             let filer_raft_id = filer_cfg.raft_id;
             let shard_count = filer_cfg.shard_count as u64;
+            let force_register = filer_cfg.force_register;
             let net_port_for_reg = net_port;
             // Filer 的可到达地址 (供 kernel 通过 ListFilers 发现本 Filer)
             let advertise_addr_for_reg = format!("{}:{}", advertise_ip, net_port);
@@ -421,6 +422,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     net_port: net_port_for_reg as u32,
                     shard_count,
                     shard_ids,
+                    force: force_register,
                 };
 
                 // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
@@ -492,10 +494,40 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                                 break; // 注册成功, 跳出 master 循环
                             }
                             Err(e) => {
-                                warn!(
-                                    "FILER_ZONE: register_filer failed on {} (attempt={}): {}",
-                                    master_addr, attempt, e
-                                );
+                                // BAD_REQUEST 表示 master 拒绝本 filer 加入集群
+                                // （通常是 shard_count 与集群现有 filer 不一致）。
+                                // 重试无意义——配置不变，结果不变。
+                                //
+                                // 启动门禁策略：
+                                //   - 非 force 模式（force_register=false）：立即退出进程，
+                                //     避免错误配置的节点进入集群导致 inode 路由错位。
+                                //   - force 模式：理论上不应走到这里（已传 force=1，master
+                                //     应放行）；若仍 BAD_REQUEST，说明 master 是旧版本不
+                                //     识别 Force 字段——降级为 warn 并继续重试，让运维
+                                //     有机会升级 master。
+                                if e.contains("(BAD_REQUEST)") {
+                                    if !force_register {
+                                        log::error!(
+                                            "FILER_ZONE: master rejected registration (shard_count \
+                                             mismatch likely): {}. Exiting (set filer.force_register=true \
+                                             to override).",
+                                            e
+                                        );
+                                        std::process::exit(1);
+                                    } else {
+                                        log::warn!(
+                                            "FILER_ZONE: master returned BAD_REQUEST despite \
+                                             force_register=true (old master ignores Force field?): \
+                                             {}. Will keep retrying.",
+                                            e
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        "FILER_ZONE: register_filer failed on {} (attempt={}): {}",
+                                        master_addr, attempt, e
+                                    );
+                                }
                             }
                         }
                     }

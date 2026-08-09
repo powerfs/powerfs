@@ -245,13 +245,13 @@ Integrates the three user requirements + Section 2 gaps.
 | **P1** | Master Raft Health page + Transfer Leader (decision 5) | ✅ done (commit 62a1938c) | Wire already-200 `/api/master/status`; high-risk op with double-confirm |
 | **P1** | Optimizations/Runtime Config → editable form via PUT (decision 2) | ✅ done (commit 62a1938c) | Wire real GET + add PUT hot-modify; remove hardcoded constants |
 | **P1** | WebSocket `/ws/metrics` integration (decision 4, promoted from P2) | ✅ done (commit a9387206) | Real-time push, in-scope this round; backend snapshot-on-connect added |
-| **P1** | StorageDevices backend supplement (decision 1) | ⏳ pending | Implement Master device mgmt gRPC + `/storage/devices` + `/storage/migrations`; restore frontend entry |
+| **P1** | StorageDevices backend supplement (decision 1) | ✅ done | Master device mgmt gRPC + `/storage/devices` + `/storage/migrations` routes; frontend entry restored |
 | **P1** | Volume IO Performance tab (wire `/metrics/volumes/:id/io`) | ✅ done (commit 4470d2c9) | C2, backend already 200 |
 | **P1** | Header WS status badge | ✅ done (commit 38d61691) | Bonus: visibility into real-time stream health |
-| **P2** | FUSE Clients list wire `/fuse/clients` (currently 404, backend must add) | ⏳ pending | B3 residual; Master already keeps fuse_clients map, needs proto RPC + monitor bridge |
-| **P2** | Conflicts fully downgrade to Filer sub-page health indicator | ⏳ pending | CRDT deprecated |
+| **P2** | FUSE Clients list wire `/fuse/clients` (currently 404, backend must add) | ✅ done | `/api/fuse/clients` route + frontend wired with real data |
+| **P2** | Conflicts fully downgrade to Filer sub-page health indicator | ✅ done | CRDT deprecated; 顶级导航入口移除, /conflicts 路由保留通过 Filer Tab 链接访问 |
 | **P2** | Backend DELETE routes for nodes/volumes/kv-sessions (decision 3) | ✅ done (commit 62a1938c) | Unblocks frontend delete buttons |
-| **P3** | Capacity Planning data authenticity verify (possibly mock) | ⏳ pending | Needs backend time-series storage |
+| **P3** | Capacity Planning data authenticity verify (possibly mock) | ✅ done | Backend `/api/metrics/history/:metric` + frontend ECharts real time-series |
 
 ---
 

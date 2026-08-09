@@ -131,6 +131,9 @@ fn main() {
     );
 
     // 从配置获取filer地址列表（取第一个作为主地址，全部用于轮换重试）
+    //
+    // filer_addresses 现在可选：为空时由 facade 从 master 拓扑发现 filer 列表。
+    // 这里仅提取配置中的兜底地址；topology 就绪后会覆盖。
     let (filer_addr, filer_addrs, filer_net_port) =
         if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
             // 解析 host:port 或 仅host（主地址取 host 部分）
@@ -147,10 +150,12 @@ fn main() {
                 .collect();
             (host, all_hosts, fuse_cfg.filer_net_port)
         } else {
-            // 这个分支不会执行，因为validate已经检查了filer_addresses非空
-            eprintln!("ERROR: filer_addresses is empty in configuration");
-            process::exit(1);
+            // filer_addresses 为空：由 facade 从 master 拓扑发现 filer 列表。
+            // 这里给一个空字符串作为占位（facade 检测到空会用 topology 列表）。
+            info!("fuse.filer_addresses is empty — will discover filers from master topology");
+            (String::new(), Vec::new(), fuse_cfg.filer_net_port)
         };
+    let force_mount = fuse_cfg.force_mount;
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
@@ -262,6 +267,7 @@ fn main() {
             &lease_mode,
             lease_duration_ms,
             lease_renew_interval_ms,
+            force_mount,
             runtime_arc.clone(),
         )
         .await
