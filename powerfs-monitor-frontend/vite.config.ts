@@ -10,6 +10,23 @@ export default defineConfig({
     },
   },
   assetsInclude: ['**/*.svg'],
+  build: {
+    // Vendor chunks (antd ~1.2MB, echarts ~1MB) are large but cached
+    // independently and loaded on demand. Suppress the 500KB warning noise.
+    chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('echarts')) return 'echarts'
+            if (id.includes('@ant-design') || id.includes('antd/')) return 'antd'
+            if (id.includes('reactflow')) return 'reactflow'
+            if (id.includes('framer-motion')) return 'motion'
+          }
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {
