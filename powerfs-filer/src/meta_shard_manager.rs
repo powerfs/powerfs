@@ -482,7 +482,8 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        self.wait_for_entry_removed(shard_id, parent_inode, name).await;
+        self.wait_for_entry_removed(shard_id, parent_inode, name)
+            .await;
         Ok(())
     }
 
@@ -608,7 +609,8 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        self.wait_for_entry_removed(shard_id, parent_inode, name).await;
+        self.wait_for_entry_removed(shard_id, parent_inode, name)
+            .await;
         Ok(())
     }
 
@@ -884,13 +886,17 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteFile { parent_inode, name: name.clone() };
+        let cmd = ShardCommand::DeleteFile {
+            parent_inode,
+            name: name.clone(),
+        };
 
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        self.wait_for_entry_removed(shard_id, parent_inode, &name).await;
+        self.wait_for_entry_removed(shard_id, parent_inode, &name)
+            .await;
         Ok(())
     }
 
@@ -912,13 +918,17 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteDirectory { parent_inode, name: name.clone() };
+        let cmd = ShardCommand::DeleteDirectory {
+            parent_inode,
+            name: name.clone(),
+        };
 
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        self.wait_for_entry_removed(shard_id, parent_inode, &name).await;
+        self.wait_for_entry_removed(shard_id, parent_inode, &name)
+            .await;
         Ok(())
     }
 

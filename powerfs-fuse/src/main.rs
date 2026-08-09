@@ -131,27 +131,26 @@ fn main() {
     );
 
     // 从配置获取filer地址列表（取第一个作为主地址，全部用于轮换重试）
-    let (filer_addr, filer_addrs, filer_net_port) = if let Some(first_filer) =
-        fuse_cfg.filer_addresses.first()
-    {
-        // 解析 host:port 或 仅host（主地址取 host 部分）
-        let parts: Vec<&str> = first_filer.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        // 所有 Filer 地址取 host 部分，端口统一用 filer_net_port
-        let all_hosts: Vec<String> = fuse_cfg
-            .filer_addresses
-            .iter()
-            .map(|addr| {
-                let p: Vec<&str> = addr.split(':').collect();
-                p.first().unwrap_or(&"127.0.0.1").to_string()
-            })
-            .collect();
-        (host, all_hosts, fuse_cfg.filer_net_port)
-    } else {
-        // 这个分支不会执行，因为validate已经检查了filer_addresses非空
-        eprintln!("ERROR: filer_addresses is empty in configuration");
-        process::exit(1);
-    };
+    let (filer_addr, filer_addrs, filer_net_port) =
+        if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
+            // 解析 host:port 或 仅host（主地址取 host 部分）
+            let parts: Vec<&str> = first_filer.split(':').collect();
+            let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+            // 所有 Filer 地址取 host 部分，端口统一用 filer_net_port
+            let all_hosts: Vec<String> = fuse_cfg
+                .filer_addresses
+                .iter()
+                .map(|addr| {
+                    let p: Vec<&str> = addr.split(':').collect();
+                    p.first().unwrap_or(&"127.0.0.1").to_string()
+                })
+                .collect();
+            (host, all_hosts, fuse_cfg.filer_net_port)
+        } else {
+            // 这个分支不会执行，因为validate已经检查了filer_addresses非空
+            eprintln!("ERROR: filer_addresses is empty in configuration");
+            process::exit(1);
+        };
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
