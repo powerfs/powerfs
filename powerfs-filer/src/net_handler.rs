@@ -61,6 +61,53 @@ pub const INLINE_XATTR_KEY: &str = "powerfs.inline";
 /// 值格式: `flat` | `stripe:<count>:<size>` | `wide_stripe:<count>:<size>`
 pub const PLACEMENT_XATTR_KEY: &str = "powerfs.placement";
 
+/// K3: 从 chunks 列表推断 Placement (用于 GETATTR/LOOKUP 响应编码).
+///
+/// InodeInfo 不持久化 placement 字段 (CREATE 时由父目录 xattr 决定,
+/// 但不存入文件自身元数据). GETATTR 时需从 chunks 结构反推:
+///
+/// - **Flat**: 所有 chunk 同一 volume_id (单卷模型, chunk_size=1MB)
+/// - **Stripe**: chunks 跨多个 volume_id (anti-affinity 分配,
+///   每个 stripe unit 一个 chunk, stripe_size 从 offset 差值推断)
+///
+/// 边界情况:
+/// - 0 chunks: Flat (新创建未写入的文件)
+/// - 1 chunk: Flat (单 chunk 无法判断是否 Stripe)
+/// - 所有 chunk 同 volume: Flat (即使 offset 间隔大, 也按 Flat 处理)
+///
+/// stripe_size 推断: chunks[1].offset - chunks[0].offset.
+/// 若 chunks 未排序或 offset 不均匀, 兜底用 1MB (POWERFS_CHUNK_SIZE).
+fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
+    if chunks.len() < 2 {
+        return Placement::Flat;
+    }
+
+    // 检查是否跨多个 volume (Stripe 的必要条件)
+    let first_vid = chunks[0].volume_id;
+    let multi_volume = chunks.iter().any(|c| c.volume_id != first_vid);
+    if !multi_volume {
+        return Placement::Flat;
+    }
+
+    // Stripe: 推断 stripe_size 从前两个 chunk 的 offset 差值
+    let stripe_size = if chunks.len() >= 2 && chunks[0].offset < chunks[1].offset {
+        chunks[1].offset - chunks[0].offset
+    } else {
+        // 兜底: 1MB (对齐 POWERFS_CHUNK_SIZE)
+        1 * 1024 * 1024
+    };
+
+    // 收集 volume_ids (按 chunk 顺序, 每个 chunk 代表一个 stripe unit)
+    let volume_ids: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+
+    Placement::Stripe {
+        stripe_size,
+        stripe_count: volume_ids.len() as u32,
+        start_volume_idx: 0,
+        volume_ids,
+    }
+}
+
 impl FilerNetHandler {
     pub fn new(
         meta_shard_manager: Arc<MetaShardManager>,
@@ -541,7 +588,7 @@ impl FilerNetHandler {
             return Ok(());
         }
 
-        // Flat 模式 — chunk 列表
+        // Flat / Stripe 模式 — chunk 列表
         let chunks: Vec<ChunkRef> = info
             .chunks
             .iter()
@@ -555,8 +602,13 @@ impl FilerNetHandler {
             })
             .collect();
 
+        // K3: 检测 Stripe 模式 — chunks 跨多个 volume (anti-affinity 分配).
+        // Flat: 所有 chunk 同一 volume_id; Stripe: 每个 stripe unit 不同 volume_id.
+        // stripe_size 从 chunk offset 差值推断 (chunks[1].offset - chunks[0].offset).
+        let placement = detect_placement_from_chunks(&chunks);
+
         let layout = FileLayout {
-            placement: Placement::Flat,
+            placement: placement.clone(),
             reliability: info.reliability.clone(),
             reliability_state: info.reliability_state.clone(),
             compression: info.compression_state.clone(),
@@ -567,9 +619,10 @@ impl FilerNetHandler {
             .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
 
         // 兼容字段: 直接添加 VolumeId (0x92) + FileKey (0x94), 与 CREATE 响应一致.
-        // 内核 powerfs_net_lookup/getattr 用 find_u64(0x92/0x94) 解析,
-        // 不解析 Chunks TLV. 从第一个 chunk 提取 (Flat 单卷模型).
-        // 多 chunk 场景 (Stripe) 由内核 K1-5 chunk_map 支持, 此处仅兼容 Flat.
+        // 内核 powerfs_net_lookup/getattr 用 find_u64(0x92/0x94) 解析.
+        // Flat: 从第一个 chunk 提取 (单卷模型).
+        // Stripe: 内核 K3 通过 volume_ids[] 数组定位, VolumeId/FileKey 仅作为
+        //         base needle_id 的兜底 (file_key = chunks[0].needle_id).
         if let Some(first) = chunks.first() {
             enc.add_u64(FieldId::VolumeId, first.volume_id);
             enc.add_u64(FieldId::FileKey, first.needle_id);
