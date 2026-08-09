@@ -417,6 +417,28 @@ impl MetaShardManager {
         Ok(())
     }
 
+    /// Poll the shard store until the named entry under `parent_inode` is
+    /// gone, or timeout (500 ms).  Raft `propose()` returns after the entry
+    /// is committed and `applied_index` is advanced, but the spawned apply
+    /// task that actually mutates `ShardStore` runs asynchronously.  Without
+    /// this wait a subsequent operation (e.g. `rmdir` after `unlink`) can
+    /// read stale state and fail with a spurious POSIX ENOTEMPTY.
+    async fn wait_for_entry_removed(&self, shard_id: ShardId, parent_inode: u64, name: &str) {
+        for _ in 0..50 {
+            let still_exists = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .map(|s| s.lookup(parent_inode, name).is_some())
+                    .unwrap_or(false)
+            };
+            if !still_exists {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn delete_file(&self, parent_inode: u64, name: &str) -> Result<(), String> {
         let shard_id = self.shard_strategy.calculate_shard(parent_inode);
 
@@ -440,6 +462,7 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
+        self.wait_for_entry_removed(shard_id, parent_inode, name).await;
         Ok(())
     }
 
@@ -565,6 +588,7 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
+        self.wait_for_entry_removed(shard_id, parent_inode, name).await;
         Ok(())
     }
 
@@ -837,11 +861,13 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteFile { parent_inode, name };
+        let cmd = ShardCommand::DeleteFile { parent_inode, name: name.clone() };
 
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+
+        self.wait_for_entry_removed(shard_id, parent_inode, &name).await;
         Ok(())
     }
 
@@ -863,11 +889,13 @@ impl MetaShardManager {
             (inode_info.parent_inode, inode_info.name.clone())
         };
 
-        let cmd = ShardCommand::DeleteDirectory { parent_inode, name };
+        let cmd = ShardCommand::DeleteDirectory { parent_inode, name: name.clone() };
 
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
             .await?;
+
+        self.wait_for_entry_removed(shard_id, parent_inode, &name).await;
         Ok(())
     }
 
