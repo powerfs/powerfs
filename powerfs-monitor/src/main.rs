@@ -2783,28 +2783,109 @@ fn parse_list_objects_xml(xml: &str) -> Vec<ObjectInfo> {
     objects
 }
 
+/// GET /api/metrics/history/:metric — real time-series data.
+///
+/// Metric name conventions (P3 — wired to TimeSeriesStore):
+///   * `powerfs_node_disk_usage`         — cluster-wide avg disk usage (%)
+///   * `cluster_disk_usage`              — alias of the above
+///   * `disk_usage:<node_id>`            — single node disk usage (%)
+///   * `volume_size:<volume_id>`         — single volume used bytes
+///   * `powerfs_kv_hit_ratio` / `powerfs_node_cpu_usage` / others
+///     — not sampled by TimeSeriesStore; returns empty array (UI shows
+///     "no data" rather than fabricated mock data).
+///
+/// Query params:
+///   * `minutes` — lookback window in minutes (default 1440 = 24h, max 10080 = 7d)
+///
+/// Returned timestamps are RFC3339 strings (UTC), matching the existing
+/// `TimeSeriesPoint` shape.
 async fn get_metric_history(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(metric): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Json<ApiResponse<Vec<TimeSeriesPoint>>> {
-    let mut data = Vec::new();
-    let now = chrono::Utc::now();
-    for i in (0..24).rev() {
-        let time = now - chrono::Duration::hours(i);
-        let base_value = match metric.as_str() {
-            "powerfs_node_disk_usage" => 65.0,
-            "powerfs_node_cpu_usage" => 45.0,
-            "powerfs_kv_hit_ratio" => 90.0,
-            "powerfs_kv_memory_used" => 50.0,
-            _ => 50.0,
-        };
-        let value = base_value + (rand::random::<f64>() - 0.5) * 20.0;
-        data.push(TimeSeriesPoint {
-            time: time.to_rfc3339(),
-            value,
-        });
-    }
+    let minutes: i64 = params
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1440)
+        .clamp(1, 10080);
+
+    let points = match metric.as_str() {
+        "powerfs_node_disk_usage" | "cluster_disk_usage" => {
+            state.time_series.get_cluster_disk_usage_history(minutes).await
+        }
+        m if m.starts_with("disk_usage:") => {
+            let node_id = &m["disk_usage:".len()..];
+            state.time_series.get_disk_history(node_id, minutes).await
+        }
+        m if m.starts_with("volume_size:") => {
+            match m["volume_size:".len()..].parse::<u64>() {
+                Ok(vid) => state.time_series.get_volume_size_history(vid, minutes).await,
+                Err(_) => Vec::new(),
+            }
+        }
+        // Metrics not sampled by TimeSeriesStore return empty (no mock).
+        _ => Vec::new(),
+    };
+
+    let data: Vec<TimeSeriesPoint> = points
+        .into_iter()
+        .map(|p| {
+            let time = chrono::DateTime::from_timestamp(p.timestamp, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
+            TimeSeriesPoint {
+                time,
+                value: p.value,
+            }
+        })
+        .collect();
+
     Json(ApiResponse::success(data))
+}
+
+/// GET /api/metrics/cluster-disk-usage — per-node disk usage breakdown.
+///
+/// Returns a multi-series payload (one entry per node) suitable for the
+/// Capacity Planning cluster-wide trend chart. Each series is filtered to
+/// the requested `minutes` lookback (default 1440).
+#[derive(Debug, Serialize)]
+struct NodeDiskUsageSeries {
+    node_id: String,
+    points: Vec<TimeSeriesPoint>,
+}
+
+async fn get_cluster_disk_usage_breakdown(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<Vec<NodeDiskUsageSeries>>> {
+    let minutes: i64 = params
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1440)
+        .clamp(1, 10080);
+
+    let per_node = state.time_series.get_per_node_disk_usage(minutes).await;
+    let series: Vec<NodeDiskUsageSeries> = per_node
+        .into_iter()
+        .map(|(node_id, pts)| NodeDiskUsageSeries {
+            node_id,
+            points: pts
+                .into_iter()
+                .map(|p| {
+                    let time = chrono::DateTime::from_timestamp(p.timestamp, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default();
+                    TimeSeriesPoint {
+                        time,
+                        value: p.value,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    Json(ApiResponse::success(series))
 }
 
 async fn get_alerts(
@@ -5067,6 +5148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/kv/keys", post(create_kv_access_key))
         .route("/api/kv/keys/:id", delete(delete_kv_access_key))
         .route("/api/metrics/history/:metric", get(get_metric_history))
+        .route(
+            "/api/metrics/cluster-disk-usage",
+            get(get_cluster_disk_usage_breakdown),
+        )
         .route("/api/metrics/s3", get(get_s3_metrics))
         .route("/api/s3/buckets", get(get_buckets))
         .route("/api/s3/buckets/:name", get(get_bucket))

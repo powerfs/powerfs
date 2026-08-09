@@ -246,7 +246,7 @@ export async function deleteVolume(id: number): Promise<void> {
   await api.delete(`/metrics/volumes/${id}`)
 }
 
-export async function getMetricHistory(metric: string): Promise<TimeSeriesData[]> {
+export async function getMetricHistory(metric: string, minutes?: number): Promise<TimeSeriesData[]> {
   if (useMock) {
     const baseValues: Record<string, number> = {
       'powerfs_node_disk_usage': 65,
@@ -256,7 +256,23 @@ export async function getMetricHistory(metric: string): Promise<TimeSeriesData[]
     }
     return generateTimeSeriesData(24, baseValues[metric] || 100, 20)
   }
-  const response = await api.get(`/metrics/history/${metric}`)
+  const url = minutes
+    ? `/metrics/history/${metric}?minutes=${minutes}`
+    : `/metrics/history/${metric}`
+  const response = await api.get(url)
+  return response.data.data
+}
+
+export interface NodeDiskUsageSeries {
+  node_id: string
+  points: TimeSeriesData[]
+}
+
+export async function getClusterDiskUsageBreakdown(minutes: number = 1440): Promise<NodeDiskUsageSeries[]> {
+  if (useMock) {
+    return []
+  }
+  const response = await api.get('/metrics/cluster-disk-usage', { params: { minutes } })
   return response.data.data
 }
 
