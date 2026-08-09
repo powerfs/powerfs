@@ -1,6 +1,7 @@
 ./powerfs-fuse/Cargo.toml
 .trae/
 linux*
+xfstests-dev/
 docs/
 kernel/
 dynalock/
