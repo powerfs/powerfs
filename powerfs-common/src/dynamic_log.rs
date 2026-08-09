@@ -32,7 +32,6 @@ fn parse_level(s: &str) -> Result<LevelFilter, String> {
     }
 }
 
-
 /// Set the runtime log level.
 ///
 /// Called during init (after `env_logger::init()`) and from HTTP endpoints.

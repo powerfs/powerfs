@@ -282,7 +282,10 @@ impl ScrubberWorker {
         addr_map: &std::collections::HashMap<u64, String>,
     ) -> Option<u64> {
         // 选择第一个与源 volume 不同的 volume
-        addr_map.keys().find(|&&vol_id| vol_id != src_volume_id).copied()
+        addr_map
+            .keys()
+            .find(|&&vol_id| vol_id != src_volume_id)
+            .copied()
     }
 
     // ========================================================================
