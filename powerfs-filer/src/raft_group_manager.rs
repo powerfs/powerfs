@@ -4,7 +4,7 @@ use powerfs_common::raft::RocksDbRaftStorage;
 use powerfs_net::serialize::TlvEncoder;
 use powerfs_net::FieldId;
 use protobuf::Message;
-use raft::eraftpb::{ConfChange, ConfChangeType, Message as RaftMessage};
+use raft::eraftpb::{ConfChange, ConfChangeType, Entry, EntryType, Message as RaftMessage, MessageType};
 use raft::storage::Storage;
 use raft::{Config, RawNode, StateRole};
 use slog::{Discard, Logger};
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::interval;
 
 const SNAPSHOT_THRESHOLD: u64 = 10000;
@@ -198,6 +198,13 @@ pub struct RaftGroup {
     step_rx: mpsc::Receiver<RaftMessage>,
     apply_tx: mpsc::Sender<ApplyEntry>,
     _apply_rx: mpsc::Receiver<ApplyEntry>,
+    /// Leader-transfer request channel. `run()` polls this in its `select!`
+    /// loop and calls `self.node.transfer_leader(target)` in-loop — because
+    /// `run()` permanently holds the group's write lock, external callers
+    /// CANNOT acquire it. The sender is cached in RaftGroupManager so
+    /// `transfer_shard_leader` can queue a transfer without locking.
+    transfer_tx: mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>,
+    transfer_rx: mpsc::Receiver<(u64, oneshot::Sender<Result<(), String>>)>,
     running: Arc<RwLock<bool>>,
     applied_index: Arc<StdRwLock<u64>>,
     leader_state: Arc<AtomicBool>,
@@ -280,6 +287,8 @@ impl RaftGroup {
             peer_map.insert(peer.id, peer.clone());
         }
 
+        let (transfer_tx, transfer_rx) = mpsc::channel::<(u64, oneshot::Sender<Result<(), String>>)>(16);
+
         // Don't pre-set leader_state - let Raft election happen naturally
         // This ensures that the actual Raft state is consistent with leader_state
 
@@ -304,6 +313,8 @@ impl RaftGroup {
             step_rx,
             apply_tx,
             _apply_rx: mpsc::channel(1).1, // Dummy, not used
+            transfer_tx,
+            transfer_rx,
             running: Arc::new(RwLock::new(true)),
             applied_index: Arc::new(StdRwLock::new(0)),
             leader_state,
@@ -345,6 +356,28 @@ impl RaftGroup {
                 msg = self.step_rx.recv() => {
                     if let Some(msg) = msg {
                         self.handle_step(msg);
+                    }
+                }
+
+                // Leader transfer requests arrive via channel (not the group
+                // RwLock) because run() permanently holds the write lock.
+                transfer = self.transfer_rx.recv() => {
+                    if let Some((target_id, reply_tx)) = transfer {
+                        let result = if self.node.raft.state == StateRole::Leader {
+                            self.node.transfer_leader(target_id);
+                            // Drive a ready cycle so the transfer takes effect
+                            // promptly (MsgTimeoutNow is queued by transfer_leader).
+                            while self.node.has_ready() {
+                                self.process_ready();
+                            }
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "not leader of shard {} (state={:?}), cannot transfer",
+                                self.shard_id.0, self.node.raft.state
+                            ))
+                        };
+                        let _ = reply_tx.send(result);
                     }
                 }
             }
@@ -396,6 +429,37 @@ impl RaftGroup {
                     "Shard {} role changed: node {} is now {:?}",
                     self.shard_id.0, self.id, ss.raft_state
                 );
+            }
+        }
+
+        // Always sync leader_address from current raft leader_id.
+        // ready.ss() only fires on role changes (Leader<->Follower),
+        // but leader_id can change without a role change (e.g., leader
+        // transfer or re-election where this node stays Follower).
+        // Without this, redirect responses carry stale leader addresses,
+        // sending clients to the wrong node and breaking cross-shard ops.
+        {
+            let leader_id = self.node.raft.leader_id;
+            if leader_id > 0 {
+                let new_addr = if leader_id == self.id {
+                    self.address.clone()
+                } else {
+                    self.peers
+                        .get(&leader_id)
+                        .map(|p| p.address.clone())
+                        .unwrap_or_default()
+                };
+                let mut addr = self.leader_address.write().unwrap();
+                if *addr != new_addr && !new_addr.is_empty() {
+                    debug!(
+                        "Shard {} leader_address updated: {} -> {} (leader_id={})",
+                        self.shard_id.0,
+                        if addr.is_empty() { "(empty)" } else { &*addr },
+                        new_addr,
+                        leader_id
+                    );
+                    *addr = new_addr;
+                }
             }
         }
 
@@ -573,7 +637,57 @@ impl RaftGroup {
 
     async fn handle_propose(&mut self, req: ProposeRequest) {
         if !self.is_leader() {
-            let _ = req.response_tx.send(Err("not the leader".to_string()));
+            // Not the leader — forward the propose to the shard leader via a
+            // MsgProp Raft message. This lets S3 / FUSE clients send requests
+            // to any Filer node; the propose is transparently forwarded to the
+            // leader, which appends it to the Raft log and replicates it back
+            // to followers. The caller polls the local ShardStore for the
+            // entry to appear after replication.
+            let leader_id = self.node.raft.leader_id;
+            if leader_id == 0 {
+                let _ = req.response_tx.send(Err(
+                    "not the leader and leader unknown (election in progress)".to_string(),
+                ));
+                return;
+            }
+
+            let mut entry = Entry::new();
+            entry.set_entry_type(EntryType::EntryNormal);
+            entry.set_data(bytes::Bytes::from(req.data));
+
+            let mut msg = RaftMessage::new();
+            msg.set_msg_type(MessageType::MsgPropose);
+            msg.set_to(leader_id);
+            msg.set_from(self.id);
+            msg.set_term(self.node.raft.term);
+            msg.mut_entries().push(entry);
+
+            match msg.write_to_bytes() {
+                Ok(data) => {
+                    let outgoing = OutgoingMessage {
+                        shard_id: self.shard_id,
+                        to_id: leader_id,
+                        message: bytes::Bytes::from(data),
+                    };
+                    if self.message_tx.send(outgoing).is_err() {
+                        let _ = req.response_tx.send(Err(
+                            "not the leader: failed to queue forward message".to_string(),
+                        ));
+                        return;
+                    }
+                    // Return Ok with a dummy index — the caller does not use
+                    // the returned index; it polls the local ShardStore for
+                    // the inode to appear after the leader commits and
+                    // replicates the entry via AppendEntries.
+                    let _ = req.response_tx.send(Ok(0));
+                }
+                Err(e) => {
+                    let _ = req.response_tx.send(Err(format!(
+                        "not the leader: failed to serialize forward message: {}",
+                        e
+                    )));
+                }
+            }
             return;
         }
 
@@ -620,6 +734,12 @@ impl RaftGroup {
 
     pub fn get_step_tx(&self) -> mpsc::Sender<RaftMessage> {
         self.step_tx.clone()
+    }
+
+    /// Expose the transfer request sender so RaftGroupManager can cache it
+    /// and `transfer_shard_leader` can queue transfers without the group lock.
+    pub fn get_transfer_tx(&self) -> mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)> {
+        self.transfer_tx.clone()
     }
 
     fn handle_step(&mut self, msg: RaftMessage) {
@@ -823,6 +943,12 @@ pub struct ShardStatusArcs {
     pub leader_state: Arc<AtomicBool>,
     pub applied_index: Arc<StdRwLock<u64>>,
     pub leader_address: Arc<StdRwLock<String>>,
+    /// Snapshot of the shard's peer list, captured at group creation time.
+    /// Lets `can_transfer_leader` check peer membership WITHOUT acquiring
+    /// the group RwLock — which is permanently held by `run()` for the
+    /// entire Raft event-loop lifetime. Locking it from the scheduler would
+    /// deadlock (the scheduler's balancing tick would hang forever).
+    pub peers: Arc<Vec<Peer>>,
 }
 
 pub struct RaftGroupManager {
@@ -836,6 +962,10 @@ pub struct RaftGroupManager {
     shard_propose_txs: RwLock<HashMap<ShardId, mpsc::Sender<ProposeRequest>>>,
     // Per-shard step senders, cached at group creation for the same reason.
     shard_step_txs: RwLock<HashMap<ShardId, mpsc::Sender<RaftMessage>>>,
+    // Per-shard leader-transfer senders, cached so `transfer_shard_leader`
+    // can queue a transfer through the run() select! loop WITHOUT acquiring
+    // the group RwLock (which is permanently held by run()).
+    shard_transfer_txs: RwLock<HashMap<ShardId, mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>>>,
     // Per-shard apply receivers, stored before event loop starts to avoid
     // needing the group RwLock (which is permanently held by run()).
     shard_apply_rxs: RwLock<HashMap<ShardId, mpsc::Receiver<ApplyEntry>>>,
@@ -864,6 +994,7 @@ impl RaftGroupManager {
             shard_status_arcs: RwLock::new(HashMap::new()),
             shard_propose_txs: RwLock::new(HashMap::new()),
             shard_step_txs: RwLock::new(HashMap::new()),
+            shard_transfer_txs: RwLock::new(HashMap::new()),
             shard_apply_rxs: RwLock::new(HashMap::new()),
             node_id,
             node_address,
@@ -1063,6 +1194,10 @@ impl RaftGroupManager {
         let leader_state = Arc::new(AtomicBool::new(false));
         let leader_address = Arc::new(StdRwLock::new(String::new()));
 
+        // Snapshot peers before they are moved into RaftGroup, so we can
+        // expose them via ShardStatusArcs without the group lock.
+        let peers_snapshot = Arc::new(peers.clone());
+
         // Create apply channel pair before creating the group
         let (apply_tx, apply_rx) = mpsc::channel(1000);
 
@@ -1084,12 +1219,14 @@ impl RaftGroupManager {
             leader_state,
             applied_index: group.applied_index_handle(),
             leader_address,
+            peers: peers_snapshot,
         };
 
         // Cache propose_tx and step_tx so we can use them without acquiring
         // the group RwLock (which is permanently held by run()).
         let propose_tx = group.get_propose_tx();
         let step_tx = group.get_step_tx();
+        let transfer_tx = group.get_transfer_tx();
 
         let group_ref = Arc::new(RwLock::new(group));
         let group_clone = group_ref.clone();
@@ -1115,6 +1252,10 @@ impl RaftGroupManager {
             .await
             .insert(shard_id, propose_tx);
         self.shard_step_txs.write().await.insert(shard_id, step_tx);
+        self.shard_transfer_txs
+            .write()
+            .await
+            .insert(shard_id, transfer_tx);
         self.shard_apply_rxs
             .write()
             .await
@@ -1240,6 +1381,15 @@ impl RaftGroupManager {
         self.groups.read().await.keys().cloned().collect()
     }
 
+    /// Return the peer list for a shard WITHOUT acquiring the group RwLock
+    /// (which is permanently held by `run()`). Reads from the snapshot stored
+    /// in `shard_status_arcs` at group creation time. Used by the scheduler's
+    /// `can_transfer_leader` to avoid deadlocking on the group write lock.
+    pub async fn get_shard_peers(&self, shard_id: ShardId) -> Option<Vec<Peer>> {
+        let arcs = self.shard_status_arcs.read().await;
+        arcs.get(&shard_id).map(|h| (*h.peers).clone())
+    }
+
     pub async fn get_shard_count(&self) -> usize {
         self.groups.read().await.len()
     }
@@ -1257,16 +1407,37 @@ impl RaftGroupManager {
         shard_id: ShardId,
         target_id: u64,
     ) -> Result<(), String> {
-        let group_arc = {
-            let groups = self.groups.read().await;
-            groups
-                .get(&shard_id)
+        // MUST NOT acquire the group RwLock — run() holds its write lock for
+        // the entire Raft event-loop lifetime, so write().await would deadlock.
+        // Instead, send the transfer request through the cached channel; the
+        // run() select! loop picks it up and calls node.transfer_leader()
+        // in-loop, then replies via the oneshot.
+        let transfer_tx = {
+            let txs = self.shard_transfer_txs.read().await;
+            txs.get(&shard_id)
+                .cloned()
                 .ok_or_else(|| format!("shard {} not found", shard_id.0))?
-                .clone()
         };
 
-        let mut group = group_arc.write().await;
-        group.transfer_leader(target_id)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        transfer_tx
+            .send((target_id, reply_tx))
+            .await
+            .map_err(|_| format!("shard {} run loop dropped transfer channel", shard_id.0))?;
+
+        // Wait for the run loop to process the transfer (or reject it).
+        // 5s timeout: leader transfer should complete within a few Raft ticks.
+        match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(format!(
+                "shard {} run loop dropped transfer response",
+                shard_id.0
+            )),
+            Err(_) => Err(format!(
+                "shard {} leader transfer timed out (5s)",
+                shard_id.0
+            )),
+        }
     }
 
     pub async fn broadcast_message(&self, msg: OutgoingMessage) {

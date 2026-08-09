@@ -351,6 +351,14 @@ impl MasterNetHandler {
             }
         }
 
+        // DataNodeInfo.grpc_port is used by callers (S3 PutObject/Get/Delete,
+        // apply_assign_volume, kv_cache_service) to build the needle-write
+        // address "ip:grpc_port". It must hold the powerfs-net DATA port
+        // (net_port, e.g. 8901), NOT the HTTP metrics port (http_port, e.g.
+        // 8093). Falling back to http_port only when the volume is a legacy
+        // node that doesn't report net_port.
+        let data_port = if net_port > 0 { net_port } else { port };
+
         let add_result = self
             .master
             .add_node(crate::master::AddNodeParams {
@@ -359,7 +367,7 @@ impl MasterNetHandler {
                 rack: "rack1".to_string(),
                 data_center: "dc1".to_string(),
                 http_port: port,
-                grpc_port: port,
+                grpc_port: data_port,
                 public_url: format!("http://{}:{}", ip, port),
             })
             .await;
@@ -378,7 +386,7 @@ impl MasterNetHandler {
                     new_volumes: Vec::new(),
                     deleted_volumes: Vec::new(),
                     ip: ip.clone(),
-                    grpc_port: port,
+                    grpc_port: data_port,
                     http_port: port,
                     net_port,
                 })

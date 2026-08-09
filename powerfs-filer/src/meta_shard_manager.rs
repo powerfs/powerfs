@@ -424,7 +424,7 @@ impl MetaShardManager {
     /// this wait a subsequent operation (e.g. `rmdir` after `unlink`) can
     /// read stale state and fail with a spurious POSIX ENOTEMPTY.
     async fn wait_for_entry_removed(&self, shard_id: ShardId, parent_inode: u64, name: &str) {
-        for _ in 0..50 {
+        for _ in 0..100 {
             let still_exists = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -435,16 +435,18 @@ impl MetaShardManager {
             if !still_exists {
                 return;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 
     /// Poll the shard store until the named entry under `parent_inode`
-    /// appears, or timeout (500 ms).  Same rationale as
+    /// appears, or timeout (5 s).  Same rationale as
     /// `wait_for_entry_removed`: the spawned apply task runs asynchronously
     /// so the entry may not be visible immediately after `propose()` returns.
+    /// Increased from 500 ms to 5 s to accommodate propose forwarding latency
+    /// when the current node is not the shard leader.
     async fn wait_for_entry_appeared(&self, shard_id: ShardId, parent_inode: u64, name: &str) {
-        for _ in 0..50 {
+        for _ in 0..100 {
             let exists = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -455,7 +457,7 @@ impl MetaShardManager {
             if exists {
                 return;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -1671,7 +1673,7 @@ impl MetaShardManager {
     /// Format: Create a root directory inode for the bucket at parent inode 0 and persist it.
     /// This is the "mkfs" operation - should be called once during initial setup.
     pub async fn format_bucket_root(&self, bucket: &str) -> Result<u64, String> {
-        // Check if already exists
+        // 1. Check in-memory cache
         {
             let roots = self.root_inodes.read().unwrap();
             if let Some(&inode) = roots.get(bucket) {
@@ -1679,9 +1681,26 @@ impl MetaShardManager {
             }
         }
 
-        // Create a root directory inode for the bucket at parent inode 0.
-        let inode = self.generate_inode();
+        // 2. Check ShardStore — the bucket root may have been created by the
+        //    shard-0 leader and replicated to us via Raft AppendEntries, even
+        //    though our local root_inodes cache hasn't been populated.
         let shard_id = self.shard_strategy.calculate_shard(0);
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if let Some(store) = stores.get(&shard_id) {
+                if let Some(info) = store.lookup(0, bucket) {
+                    // Found in store — cache and return
+                    drop(stores);
+                    self.register_root_inode(bucket, info.inode);
+                    return Ok(info.inode);
+                }
+            }
+        }
+
+        // 3. Not found anywhere — need to propose CreateDirectory. The propose
+        //    will be forwarded to the shard-0 leader via MsgProp if this node
+        //    is not the leader (see handle_propose).
+        let inode = self.generate_inode();
         let cmd = ShardCommand::CreateDirectory {
             parent_inode: 0,
             name: bucket.to_string(),
@@ -1691,9 +1710,10 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
-        // Wait for apply
+        // Wait for apply (increased timeout to accommodate propose forwarding
+        // latency: follower → leader → commit → AppendEntries → follower apply)
         let mut retries = 0;
-        while retries < 20 {
+        while retries < 100 {
             let applied = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -1705,7 +1725,7 @@ impl MetaShardManager {
                 self.register_root_inode(bucket, inode);
                 return Ok(inode);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             retries += 1;
         }
         Err("failed to create bucket root: timeout waiting for apply".to_string())
@@ -1751,8 +1771,9 @@ impl MetaShardManager {
             .propose(shard_id, cmd.serialize())
             .await?;
 
+        // Wait for apply (increased timeout for propose forwarding latency)
         let mut retries = 0;
-        while retries < 50 {
+        while retries < 100 {
             let applied = {
                 let stores = self.shard_stores.read().unwrap();
                 stores
@@ -1763,7 +1784,7 @@ impl MetaShardManager {
             if applied {
                 return Ok(inode);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             retries += 1;
         }
 
