@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, FilerNode, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, FilerNode, ClusterShard, ClusterStatusResponse, BatchResult, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -1021,6 +1021,71 @@ export async function getFilerNodeBalancerConfig(nodeId: string): Promise<Schedu
 export async function updateFilerNodeBalancerConfig(nodeId: string, config: SchedulerConfig): Promise<void> {
   if (useMock) return
   await api.put(`/filer/nodes/${nodeId}/balancer/config`, config)
+}
+
+// ===== Filer cluster aggregation (Phase C) =====
+// 集群聚合端点: Monitor 并发调所有 filer, 缓存 5s (见 docs/filer-redesign-plan.md 决策 3)。
+// 推荐轮询: cluster/status 5s, cluster/shards 15s。
+
+/** 集群级状态聚合 (并发调所有 filer /admin/status)。推荐轮询: 5s。 */
+export async function getFilerClusterStatus(): Promise<ClusterStatusResponse> {
+  if (useMock) {
+    return {
+      nodes: [
+        {
+          node_id: 'filer-1',
+          status: { shard_count: 4, leader_count: 4, total_inodes: 128, total_files: 96, total_dirs: 32, buckets: ['test-bucket'] },
+          error: null,
+        },
+      ],
+      totals: {
+        node_count: 1, reachable: 1, unreachable: 0,
+        total_shards: 4, total_leaders: 4, total_inodes: 128, total_files: 96, total_dirs: 32,
+        all_buckets: ['test-bucket'],
+      },
+    }
+  }
+  const response = await api.get('/filer/cluster/status')
+  return response.data.data
+}
+
+/** 集群级 shard 聚合 (按 shard_id 聚合多副本 + 健康判定)。推荐轮询: 15s。 */
+export async function getFilerClusterShards(): Promise<ClusterShard[]> {
+  if (useMock) {
+    return [
+      {
+        shard_id: 0, inode_range_start: 0, inode_range_end: 1000000,
+        replicas: [
+          { node_id: 'filer-1', is_leader: true, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, write_qps: 120, read_qps: 480 },
+          { node_id: 'filer-2', is_leader: false, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, write_qps: 0, read_qps: 30 },
+        ],
+        is_healthy: true,
+      },
+    ]
+  }
+  const response = await api.get('/filer/cluster/shards')
+  return response.data.data
+}
+
+/** Balancer 批量启动 (并发调所有 filer /admin/balancer/start)。写后失效缓存。 */
+export async function startAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/start-all')
+  return response.data.data
+}
+
+/** Balancer 批量停止 (并发调所有 filer /admin/balancer/stop)。写后失效缓存。 */
+export async function stopAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/stop-all')
+  return response.data.data
+}
+
+/** Balancer 批量触发 (并发调所有 filer /admin/balancer/trigger)。写后失效缓存。 */
+export async function triggerAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/trigger-all')
+  return response.data.data
 }
 
 // ===== 向后兼容封装 (过渡期, 调用第一个 filer 节点) =====
