@@ -41,6 +41,7 @@ import {
   ClusterOutlined,
   LineChartOutlined,
   TranslationOutlined,
+  ApiOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -52,6 +53,7 @@ import { useTheme, type ThemeMode } from '@/styles/ThemeContext'
 import GlobalSearch, { type GlobalSearchHandle } from '@/components/GlobalSearch'
 import Logo from '@/components/Logo'
 import { LANGUAGES, type LangCode } from '@/i18n'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
@@ -76,6 +78,10 @@ function AppLayout() {
   }, [])
 
   const isAdmin = user?.role === 'admin'
+
+  // Global WebSocket status indicator (no source filter — just track
+  // connection health for the header badge).
+  const { status: wsStatus } = useMetricStream()
 
   // Group menu items into logical categories
   const menuItems: MenuItem[] = [
@@ -350,6 +356,36 @@ function AppLayout() {
                   }}
                 />
                 {t('common:header.healthy')}
+              </Tag>
+            </Tooltip>
+
+            {/* WebSocket connection status badge */}
+            <Tooltip
+              title={
+                wsStatus === 'open'
+                  ? t('common:realtimeStream') + ' · ' + t('common:connected')
+                  : wsStatus === 'connecting'
+                    ? t('common:reconnecting')
+                    : t('common:disconnected')
+              }
+            >
+              <Tag
+                color={wsStatus === 'open' ? 'processing' : wsStatus === 'connecting' ? 'warning' : 'error'}
+                style={{
+                  margin: 0,
+                  padding: '2px 10px',
+                  borderRadius: 12,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <ApiOutlined style={{ fontSize: 11 }} />
+                {wsStatus === 'open'
+                  ? t('common:connected')
+                  : wsStatus === 'connecting'
+                    ? t('common:reconnecting')
+                    : t('common:disconnected')}
               </Tag>
             </Tooltip>
 
