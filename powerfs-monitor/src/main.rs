@@ -810,9 +810,19 @@ async fn get_master_status(State(state): State<Arc<AppState>>) -> Json<ApiRespon
 
     let leader = master_nodes.iter().find(|n| n.is_leader).cloned();
     let raft_term = leader.as_ref().map(|n| n.raft_term).unwrap_or(0);
+    // A master is "healthy" from the quorum perspective if it is participating
+    // in the Raft group — i.e. it is the leader OR an active follower. The
+    // status field published by master.rs is exactly "leader" or "follower"
+    // (see powerfs-master/src/master.rs:2804). Legacy "online"/"healthy"
+    // strings are kept for backwards compatibility with older node agents.
     let healthy_masters = master_nodes
         .iter()
-        .filter(|n| n.status == "online" || n.status == "healthy" || n.status == "leader")
+        .filter(|n| {
+            n.status == "leader"
+                || n.status == "follower"
+                || n.status == "online"
+                || n.status == "healthy"
+        })
         .count();
     let total_masters = master_nodes.len();
 

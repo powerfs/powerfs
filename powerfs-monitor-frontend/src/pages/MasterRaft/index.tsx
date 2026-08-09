@@ -78,8 +78,10 @@ function MasterRaft() {
             nodes,
             leader,
             raft_term: leader?.raft_term ?? prev.raft_term,
+            // A follower is a healthy Raft participant — see backend
+            // get_master_status in powerfs-monitor/src/main.rs.
             healthy_masters: nodes.filter((n) =>
-              ['online', 'healthy', 'leader'].includes(n.status),
+              ['online', 'healthy', 'leader', 'follower'].includes(n.status),
             ).length,
           }
         })
