@@ -35,7 +35,7 @@ import {
   BulbFilled,
   DesktopOutlined,
   SettingOutlined,
-  // AppstoreOutlined,  // used by StorageDevices entry; hidden pending backend supplement
+  AppstoreOutlined,
   RocketOutlined,
   CloudServerOutlined,
   ClusterOutlined,
@@ -104,8 +104,7 @@ function AppLayout() {
           label: t('nav:groups.infrastructure'),
           children: [
             { key: '/capacity-planning', icon: <LineChartOutlined />, label: t('nav:items.capacityPlanning') },
-            // TODO: restore StorageDevices entry after backend supplement (decision 1)
-            // { key: '/storage-devices', icon: <AppstoreOutlined />, label: t('nav:items.storageDevices') },
+            { key: '/storage-devices', icon: <AppstoreOutlined />, label: t('nav:items.storageDevices') },
           ],
         }]
       : []),

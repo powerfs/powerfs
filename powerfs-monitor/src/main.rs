@@ -35,7 +35,9 @@ use powerfs_monitor::auth::{
 };
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
-use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, VolumeInfo};
+use powerfs_monitor::metric_store::{
+    DataMigrationTask, KVSessionInfo, MetricStore, NodeInfo, StorageDevice, VolumeInfo,
+};
 use powerfs_monitor::resilient_master_client;
 use powerfs_monitor::time_series::{DataPoint, TimeSeriesStore};
 
@@ -627,6 +629,128 @@ async fn get_filers_via_grpc(state: &Arc<AppState>) -> Result<Vec<FilerNodeInfo>
                 .collect())
         }
         Err(e) => Err(format!("gRPC error: {}", e)),
+    }
+}
+
+// ========== Storage devices & migration handlers ==========
+
+#[derive(Debug, Deserialize)]
+struct DeviceListQuery {
+    node_id: Option<String>,
+}
+
+async fn list_storage_devices(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceListQuery>,
+) -> Json<ApiResponse<Vec<StorageDevice>>> {
+    let devs = state
+        .metric_store
+        .get_storage_devices(q.node_id.as_deref())
+        .await;
+    Json(ApiResponse::success(devs))
+}
+
+async fn get_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<StorageDevice>> {
+    match state.metric_store.get_storage_device(&device_id).await {
+        Some(d) => Json(ApiResponse::success(d)),
+        None => Json(ApiResponse::error(&format!("device {} not found", device_id))),
+    }
+}
+
+async fn exclude_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.exclude_device(&device_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "device_id": device_id,
+            "status": "excluded",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn restore_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.restore_device(&device_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "device_id": device_id,
+            "status": "restored",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn drain_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<DataMigrationTask>> {
+    match state.metric_store.drain_device(&device_id).await {
+        Ok(task) => Json(ApiResponse::success(task)),
+        Err(e) => Json(ApiResponse::<DataMigrationTask>::error(&e)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationListQuery {
+    device_id: Option<String>,
+}
+
+async fn list_migration_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MigrationListQuery>,
+) -> Json<ApiResponse<Vec<DataMigrationTask>>> {
+    let mut tasks = state.metric_store.get_migration_tasks().await;
+    if let Some(did) = q.device_id {
+        tasks.retain(|t| {
+            t.source_device_id == did || t.target_device_id.as_deref() == Some(&did)
+        });
+    }
+    tasks.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+    Json(ApiResponse::success(tasks))
+}
+
+async fn cancel_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.cancel_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "cancelled",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn pause_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.pause_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "paused",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn resume_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.resume_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "running",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
     }
 }
 
@@ -4802,6 +4926,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.clone(),
     ));
 
+    tokio::spawn(start_storage_migration_ticker(metric_store.clone()));
+
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -4930,6 +5056,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/benchmarks/:type", get(get_benchmark_report))
         .route("/api/benchmarks/:type/run", post(run_benchmark_handler))
+        // Storage devices & migration
+        .route("/api/storage/devices", get(list_storage_devices))
+        .route("/api/storage/devices/:device_id", get(get_storage_device))
+        .route(
+            "/api/storage/devices/:device_id/exclude",
+            post(exclude_storage_device),
+        )
+        .route(
+            "/api/storage/devices/:device_id/restore",
+            post(restore_storage_device),
+        )
+        .route(
+            "/api/storage/devices/:device_id/drain",
+            post(drain_storage_device),
+        )
+        .route("/api/storage/migrations", get(list_migration_tasks))
+        .route(
+            "/api/storage/migrations/:task_id/cancel",
+            post(cancel_migration_task),
+        )
+        .route(
+            "/api/storage/migrations/:task_id/pause",
+            post(pause_migration_task),
+        )
+        .route(
+            "/api/storage/migrations/:task_id/resume",
+            post(resume_migration_task),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -5139,6 +5293,14 @@ async fn start_time_series_sampler(metric_store: Arc<MetricStore>, app_state: Ar
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+async fn start_storage_migration_ticker(metric_store: Arc<MetricStore>) {
+    info!("Storage migration ticker started (2s interval)");
+    loop {
+        metric_store.tick_migrations().await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 }
 
