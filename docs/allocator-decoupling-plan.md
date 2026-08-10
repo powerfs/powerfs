@@ -906,7 +906,7 @@ pub struct ShardSplitPlan {
 1. **快照一致性**：已确认不需要回退机制。已满返回 ENOSPACE，接近满（> near_full_exclude_ratio）不分配。
 2. **元数据迁移**：已确认暂不支持，仅做数据迁移。
 3. **管理接口鉴权**：已确认需要 dry-run 模式。完整鉴权方案待定（可能复用 RBAC）。
-4. **needle_id 所有权**：分配器给 `suggested_needle_id`，服务侧原子 CAS 确认。并发冲突时用 `alternatives` 重试。
+4. **needle_id 所有权**：~~分配器给 `suggested_needle_id`，服务侧原子 CAS 确认。并发冲突时用 `alternatives` 重试。~~ → **已解决**：实际实现采用更简洁的方案——Filer 持有 per-zone `AtomicU64` 计数器，`alloc_needle_id` 使用 `fetch_add(SeqCst)` 原子递增，天然无冲突，无需 CAS 或重试。`SingleFileDecision` 中的 `suggested_needle_id` 和 `alternatives` 字段保留为预留位（当前未使用），未来若将 needle_id 分配上移到 allocator 可启用。
 5. **策略热更新**：~~是否支持运行时切换策略（不重启），还是需要重启服务。待定。~~ → **已解决**：通过 `SetPlacementStrategy` Raft 命令实现运行时热切换，无需重启服务。
 6. **Shard 减容**：当前 defer，依赖元数据迁移能力。加 shard 可通过 ShardMap range 分裂实现，无需迁移。
 7. **ShardMap 初始迁移**：从取模改为映射表需要一次性切换。可启动时根据 `shard_count` 生成初始映射表，行为与取模一致，后续分裂时才产生差异。

@@ -57,11 +57,20 @@ pub struct SingleFileDecision {
     pub volume_id: u64,
     pub zone_id: u32,
     pub node_id: String,
-    /// Suggested needle_id; service confirms atomically.
+    /// Reserved: suggested needle_id for allocator-driven allocation.
+    ///
+    /// Currently unused — the filer allocates needle_ids from a per-zone
+    /// `AtomicU64` counter (`zone_client::alloc_needle_id`), which is
+    /// inherently conflict-free via `fetch_add(SeqCst)`. This field is
+    /// kept for a future design where needle_id allocation moves into
+    /// the allocator itself.
     pub suggested_needle_id: u64,
     /// Score (for debugging/monitoring).
     pub score: f64,
-    /// Backup volume_ids (retry on CAS failure).
+    /// Reserved: backup volume_ids for retry on CAS failure.
+    ///
+    /// Currently unused — see `suggested_needle_id` note. Kept for
+    /// symmetry with the future allocator-driven needle_id design.
     pub alternatives: Vec<u64>,
 }
 
@@ -88,8 +97,13 @@ pub struct VolumeAssignDecision {
 /// Stateless allocator: input snapshot + request, output decision.
 ///
 /// Implementations should be cheap to clone (Arc-wrapped internally if needed).
-/// Services confirm the suggested needle_id via atomic CAS after receiving
-/// a decision; on conflict they retry with `alternatives`.
+///
+/// **Needle_id ownership**: the current design has the filer own a per-zone
+/// `AtomicU64` counter (`zone_client::alloc_needle_id`), so needle_id
+/// allocation is conflict-free via `fetch_add(SeqCst)` and no CAS or retry
+/// is needed. The `SingleFileDecision::suggested_needle_id` and
+/// `alternatives` fields are reserved for a future design where needle_id
+/// allocation moves into the allocator.
 pub trait Allocator: Send + Sync {
     fn allocate(
         &self,
