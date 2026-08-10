@@ -1467,20 +1467,25 @@ impl FilerNetHandler {
                 .join(",")
         );
 
-        // Filter by last_name for pagination
+        // Sort entries by name before pagination. list_directory() returns
+        // entries in HashMap iteration order (non-deterministic). Without
+        // sorting, the last_name cursor (string comparison) can permanently
+        // skip entries that are alphabetically before the cursor, causing
+        // readdir to miss files after remount (T3b/T3c/T9a/T9b failures).
+        let mut sorted_entries = entries;
+        sorted_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Filter by last_name for pagination (string comparison on sorted names)
         let filtered: Vec<&InodeInfo> = if last_name.is_empty() {
-            entries.iter().collect()
+            sorted_entries.iter().collect()
         } else {
-            entries
+            sorted_entries
                 .iter()
                 .filter(|e| e.name.as_str() > last_name.as_str())
                 .collect()
         };
 
         // has_more is true only when there are entries beyond the `limit` window.
-        // Previous logic `(limited.len() < limit) && !entries.is_empty()` was always
-        // true for non-empty dirs (since limited.len() <= limit always), causing the
-        // kernel to loop forever sending READDIR with the same last_name cursor.
         let has_more = filtered.len() > limit as usize;
         let limited: Vec<&InodeInfo> = filtered.into_iter().take(limit as usize).collect();
 
@@ -1493,13 +1498,13 @@ impl FilerNetHandler {
             entry_enc.add_u64(FieldId::Ino, entry.inode);
             entry_enc.add_string(FieldId::Name, &entry.name)?;
             entry_enc.add_u32(FieldId::Mode, entry.mode);
-            entry_enc.add_u64(FieldId::Uid, entry.uid as u64);
-            entry_enc.add_u64(FieldId::Gid, entry.gid as u64);
+            entry_enc.add_u32(FieldId::Uid, entry.uid);
+            entry_enc.add_u32(FieldId::Gid, entry.gid);
             entry_enc.add_u64(FieldId::Size, entry.size);
             entry_enc.add_u64(FieldId::Atime, entry.atime);
             entry_enc.add_u64(FieldId::Mtime, entry.mtime);
             entry_enc.add_u64(FieldId::Ctime, entry.ctime);
-            entry_enc.add_u64(FieldId::Nlink, entry.nlink as u64);
+            entry_enc.add_u32(FieldId::Nlink, entry.nlink);
             // 完整 chunks 列表 + 兼容旧单 chunk 字段
             Self::encode_chunks_fields(&mut entry_enc, entry)?;
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
