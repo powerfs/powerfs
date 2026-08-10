@@ -1012,7 +1012,25 @@ pub struct ShardSplitPlan {
 - 测试：allocator 79（+2 pin 行为测试），master 99，clippy 0 警告，fmt clean。
 
 **待完成**：
-- `set_placement_strategy`：需要运行时策略注册表（低优先级）。
+- ~~`set_placement_strategy`：需要运行时策略注册表（低优先级）。~~ → **已完成**
+
+**已完成：set_placement_strategy（运行时策略热切换）**
+
+- `RaftCommand::SetPlacementStrategy { strategy: String }`：新增 Raft 命令变体，所有 master 副本一致。
+- `MasterNode::placement_strategy: RwLock<String>`：Raft 复制的策略注册表，默认 `"least_loaded"`。
+- `apply_set_placement_strategy`：apply_command match 新增分支，更新内存策略名。
+- `MasterNode::set_placement_strategy`：leader-only async 方法，propose 前校验策略名（`round_robin`/`least_loaded`/`anti_affinity`），非法名返回 `InvalidRequest`。
+- `MasterNode::current_placement_strategy`：读取当前策略名。
+- `create_new_volume`：从硬编码 `RoundRobinAssigner` 改为按策略选择：
+  - `"round_robin"` → `RoundRobinAssigner`
+  - `"least_loaded"` / `"anti_affinity"` → `SmartVolumeAssigner`（容量/负载评分 + rack/DC 隔离）
+  - `create_new_volume_with_preference` 保持 `SmartVolumeAssigner`不变（preferred_node 是显式 override，始终用 smart assigner）。
+- `MasterManagementApi::set_placement_strategy`：从 NYI stub 改为 `block_in_place`+`Handle::block_on` 桥接；删除已无用的 `nyi()` 辅助函数。
+- gRPC：`SetPlacementStrategy` RPC + handler（master.proto + server.rs）。
+- 效果：解答待定问题 5（策略热更新）——支持运行时切换策略，无需重启服务。
+- 测试：master 99、allocator 79 PASS，clippy 0 警告，fmt clean。
+
+**ManagementApi trait 全部 15 个方法已实现，无 NYI stub 残留。**
 
 **已完成：set_node_maintenance Raft 命令**
 

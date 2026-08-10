@@ -97,6 +97,10 @@ pub struct MasterNode {
     /// source. Raft-replicated via `PinVolume`/`UnpinVolume` commands so all
     /// master replicas agree.
     volume_pins: RwLock<HashMap<VolumeId, String>>,
+    /// Global placement strategy name: "round_robin" | "least_loaded" |
+    /// "anti_affinity". Controls which `VolumeAssigner` is used for new volume
+    /// allocation. Raft-replicated via `SetPlacementStrategy` command.
+    placement_strategy: RwLock<String>,
 }
 
 #[derive(Clone)]
@@ -426,6 +430,7 @@ impl MasterNode {
             rebalance_engine: RwLock::new(None),
             management_api: RwLock::new(None),
             volume_pins: RwLock::new(HashMap::new()),
+            placement_strategy: RwLock::new("least_loaded".to_string()),
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -905,6 +910,9 @@ impl MasterNode {
             RaftCommand::UnpinVolume { volume_id } => {
                 self.apply_unpin_volume(volume_id)?;
             }
+            RaftCommand::SetPlacementStrategy { strategy } => {
+                self.apply_set_placement_strategy(&strategy)?;
+            }
         }
 
         Ok(())
@@ -1159,6 +1167,18 @@ impl MasterNode {
             .unwrap()
             .remove(&VolumeId(volume_id));
         debug!("Applied UnpinVolume via Raft: volume={}", volume_id);
+        Ok(())
+    }
+
+    /// Apply `SetPlacementStrategy` Raft command: update the global placement
+    /// strategy name. The next `create_new_volume` call will use the
+    /// corresponding `VolumeAssigner`.
+    fn apply_set_placement_strategy(&self, strategy: &str) -> Result<()> {
+        *self.placement_strategy.write().unwrap() = strategy.to_string();
+        info!(
+            "Applied SetPlacementStrategy via Raft: strategy={}",
+            strategy
+        );
         Ok(())
     }
 
@@ -1671,6 +1691,39 @@ impl MasterNode {
         Ok(())
     }
 
+    /// Set the global placement strategy via Raft replication.
+    ///
+    /// Valid strategy names: `"round_robin"`, `"least_loaded"`,
+    /// `"anti_affinity"`. Only the Raft leader can propose this command.
+    pub async fn set_placement_strategy(&self, strategy: &str) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        // Validate strategy name before proposing.
+        match strategy {
+            "round_robin" | "least_loaded" | "anti_affinity" => {}
+            _ => {
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "unknown placement strategy '{}': expected one of round_robin, least_loaded, anti_affinity",
+                    strategy
+                )));
+            }
+        }
+
+        let cmd = RaftCommand::SetPlacementStrategy {
+            strategy: strategy.to_string(),
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Read the current placement strategy name.
+    pub fn current_placement_strategy(&self) -> String {
+        self.placement_strategy.read().unwrap().clone()
+    }
+
     pub async fn list_volumes(&self) -> Vec<VolumeInfo> {
         self.volumes.read().unwrap().values().cloned().collect()
     }
@@ -2107,8 +2160,23 @@ impl MasterNode {
             vid
         };
 
-        let assigner = RoundRobinAssigner;
-        let assigned_nodes = assigner.assign(volume_id.0, &nodes, replica_count as usize);
+        // Select assigner based on the current placement strategy (Raft-replicated).
+        // "round_robin" → RoundRobinAssigner; "least_loaded"/"anti_affinity" → SmartVolumeAssigner.
+        let assigned_nodes = {
+            let strategy = self.placement_strategy.read().unwrap().clone();
+            match strategy.as_str() {
+                "round_robin" => {
+                    let assigner = RoundRobinAssigner;
+                    assigner.assign(volume_id.0, &nodes, replica_count as usize)
+                }
+                // "least_loaded" and "anti_affinity" both use the smart
+                // assigner (capacity/load scoring + rack/DC isolation).
+                _ => {
+                    let assigner = SmartVolumeAssigner;
+                    assigner.assign(volume_id.0, &nodes, replica_count as usize)
+                }
+            }
+        };
 
         if assigned_nodes.is_empty() {
             return Err(PowerFsError::InvalidRequest(
@@ -3499,6 +3567,7 @@ impl Clone for MasterNode {
             rebalance_engine: RwLock::new(self.rebalance_engine.read().unwrap().clone()),
             management_api: RwLock::new(self.management_api.read().unwrap().clone()),
             volume_pins: RwLock::new(self.volume_pins.read().unwrap().clone()),
+            placement_strategy: RwLock::new(self.placement_strategy.read().unwrap().clone()),
         }
     }
 }
