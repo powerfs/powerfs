@@ -576,6 +576,97 @@ impl ShardStore {
             } => {
                 self.update_to_ec(inode, reliability, reliability_state, ec_chunks);
             }
+            // ----- Decomposed inode + dir-entry commands -----
+            // See `ShardCommand` doc for the rationale. Each handler calls
+            // an existing primitive that mutates only one CF, so the two
+            // halves can land on different shards without losing per-CF
+            // atomicity.
+            ShardCommand::CreateInode { info } => {
+                if let Err(e) = self.create_inode(info.clone()) {
+                    log::error!(
+                        "Shard {} apply CreateInode failed for inode {}: {}",
+                        self.shard_id.0,
+                        info.inode,
+                        e
+                    );
+                }
+            }
+            ShardCommand::AddDirEntry {
+                parent_inode,
+                name,
+                inode,
+            } => {
+                if let Err(e) = self.add_dir_entry(parent_inode, &name, inode) {
+                    log::error!(
+                        "Shard {} apply AddDirEntry failed (parent={}, name={}): {}",
+                        self.shard_id.0,
+                        parent_inode,
+                        name,
+                        e
+                    );
+                }
+            }
+            ShardCommand::DeleteInode { inode } => {
+                if let Err(e) = self.delete_inode(inode) {
+                    log::error!(
+                        "Shard {} apply DeleteInode failed for inode {}: {}",
+                        self.shard_id.0,
+                        inode,
+                        e
+                    );
+                }
+            }
+            ShardCommand::RemoveDirEntry { parent_inode, name } => {
+                if let Err(e) = self.remove_dir_entry(parent_inode, &name) {
+                    log::error!(
+                        "Shard {} apply RemoveDirEntry failed (parent={}, name={}): {}",
+                        self.shard_id.0,
+                        parent_inode,
+                        name,
+                        e
+                    );
+                }
+            }
+            ShardCommand::IncrementNlink { inode } => {
+                if let Some(mut info) = self.get_inode(inode) {
+                    info.nlink = info.nlink.saturating_add(1);
+                    if let Err(e) = self.update_inode(info) {
+                        log::error!(
+                            "Shard {} apply IncrementNlink failed for inode {}: {}",
+                            self.shard_id.0,
+                            inode,
+                            e
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Shard {} apply IncrementNlink: inode {} not found",
+                        self.shard_id.0,
+                        inode
+                    );
+                }
+            }
+            ShardCommand::DecrementNlink { inode } => {
+                if let Some(mut info) = self.get_inode(inode) {
+                    if info.nlink > 0 {
+                        info.nlink -= 1;
+                    }
+                    if let Err(e) = self.update_inode(info) {
+                        log::error!(
+                            "Shard {} apply DecrementNlink failed for inode {}: {}",
+                            self.shard_id.0,
+                            inode,
+                            e
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Shard {} apply DecrementNlink: inode {} not found",
+                        self.shard_id.0,
+                        inode
+                    );
+                }
+            }
         }
     }
 
@@ -1129,6 +1220,16 @@ impl ShardStore {
             }
         }
         result
+    }
+
+    /// Return a snapshot of every inode currently in this shard's in-memory
+    /// cache. Used by `MetaShardManager::collect_orphan_inodes` to find
+    /// inode records that have no corresponding dir entry on any shard
+    /// (left behind by a split-create that succeeded Phase A but failed
+    /// Phase B, or a split-delete that succeeded Phase A but failed Phase B).
+    pub fn list_all_inodes(&self) -> Vec<InodeInfo> {
+        let inodes = self.inodes.read().unwrap();
+        inodes.values().cloned().collect()
     }
 
     /// P4: 扫描所有 reliability_state == PendingReplicated 的文件 inode.

@@ -923,16 +923,29 @@ impl MasterNode {
         let _grpc_port = params.grpc_port;
 
         let mut topology = self.topology.write().unwrap();
-        let node = DataNodeInfo::new(
-            params.node_id,
-            params.address,
-            rack_id,
-            dc_id,
-            params.http_port,
-            params.grpc_port,
-            params.public_url,
-        );
-        topology.get_or_create_node(node);
+        // Refresh mutable fields on existing nodes (every heartbeat), instead
+        // of only inserting when absent. get_or_create_node uses or_insert_with
+        // which never updates an existing entry, so stale persisted ports
+        // (e.g. grpc_port from a previous run) would linger forever. Callers
+        // build needle-write addresses from grpc_port, so it must stay fresh.
+        let existed = topology.get_node_mut(&params.node_id).map(|existing| {
+            existing.address = params.address.clone();
+            existing.grpc_port = params.grpc_port;
+            existing.http_port = params.http_port;
+            existing.public_url = params.public_url.clone();
+        }).is_some();
+        if !existed {
+            let node = DataNodeInfo::new(
+                params.node_id,
+                params.address,
+                rack_id,
+                dc_id,
+                params.http_port,
+                params.grpc_port,
+                params.public_url,
+            );
+            topology.get_or_create_node(node);
+        }
 
         info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
 
@@ -1715,12 +1728,35 @@ impl MasterNode {
                 file_key,
             };
 
-            let host_node = nodes
+            let mut host_node = nodes
                 .iter()
                 .find(|n| n.id == host_node_id)
                 .cloned()
                 .into_iter()
                 .collect::<Vec<_>>();
+
+            // Authoritative net address fix: DataNodeInfo.grpc_port may be stale
+            // (the heartbeat handler historically stored http_port there, and
+            // get_or_create_node does not refresh fields on existing nodes).
+            // VolumeRoute.addr is always "ip:net_port" from the latest heartbeat,
+            // so use its port to override grpc_port. Callers (S3 PutObject/Get/
+            // Delete in both Master and Filer) build the needle-write address as
+            // "ip:grpc_port"; without this they hit the HTTP metrics port
+            // (e.g. :8093) instead of the powerfs-net data port (e.g. :8901),
+            // causing "Protocol error: invalid handshake response".
+            if let Some(route) = self.volume_routes.read().unwrap().get(&volume_id.0) {
+                if let Some(net_port) = route
+                    .addr
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u32>().ok())
+                {
+                    if net_port > 0 {
+                        for n in host_node.iter_mut() {
+                            n.grpc_port = net_port;
+                        }
+                    }
+                }
+            }
 
             info!(
                 "Reused existing volume: {} for collection {:?}, fid: {},{},{}",

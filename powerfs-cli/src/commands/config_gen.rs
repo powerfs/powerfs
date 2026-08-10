@@ -693,6 +693,7 @@ fn build_config(
             gc_interval_secs: None,
             gc_grace_period_secs: None,
             inline_max_size: None,
+            force_register: false,
         },
         s3: S3Config {
             port: cfg.s3_port,
@@ -718,6 +719,7 @@ fn build_config(
             container: false,
             log_file: None,
             lease: powerfs_common::config::LeaseConfig::default(),
+            force_mount: false,
         },
         monitor: MonitorConfig {
             addr: format!("0.0.0.0:{}", cfg.monitor_port),

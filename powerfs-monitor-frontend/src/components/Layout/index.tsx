@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import {
   Layout,
   Menu,
@@ -28,16 +29,18 @@ import {
   TeamOutlined,
   SafetyCertificateOutlined,
   LockOutlined,
-  WarningOutlined,
   SafetyOutlined,
   BulbOutlined,
   BulbFilled,
   DesktopOutlined,
+  SettingOutlined,
   AppstoreOutlined,
   RocketOutlined,
   CloudServerOutlined,
   ClusterOutlined,
   LineChartOutlined,
+  TranslationOutlined,
+  ApiOutlined,
 } from '@ant-design/icons'
 import {
   subscribe,
@@ -48,6 +51,8 @@ import {
 import { useTheme, type ThemeMode } from '@/styles/ThemeContext'
 import GlobalSearch, { type GlobalSearchHandle } from '@/components/GlobalSearch'
 import Logo from '@/components/Logo'
+import { LANGUAGES, type LangCode } from '@/i18n'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
@@ -55,6 +60,7 @@ const { Text } = Typography
 type MenuItem = Required<MenuProps>['items'][number]
 
 function AppLayout() {
+  const { t, i18n } = useTranslation(['common', 'nav'])
   const [collapsed, setCollapsed] = useState(false)
   const location = useLocation()
   const navigate = useNavigate()
@@ -72,92 +78,92 @@ function AppLayout() {
 
   const isAdmin = user?.role === 'admin'
 
+  // Global WebSocket status indicator (no source filter — just track
+  // connection health for the header badge).
+  const { status: wsStatus } = useMetricStream()
+
   // Group menu items into logical categories
   const menuItems: MenuItem[] = [
-    // ── 总览 ──
+    // ── Overview ──
     {
       key: 'grp-overview',
       type: 'group',
-      label: '总览',
+      label: t('nav:groups.overview'),
       children: [
-        { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
-        { key: '/alerts', icon: <BellOutlined />, label: '告警中心' },
+        { key: '/', icon: <DashboardOutlined />, label: t('nav:items.dashboard') },
+        { key: '/cluster-topology', icon: <ClusterOutlined />, label: t('nav:items.clusterTopology') },
+        { key: '/master-raft', icon: <CloudServerOutlined />, label: t('nav:items.masterRaft') },
       ],
     },
-    // ── 基础设施 ──
-    ...(isAdmin
-      ? [{
-          key: 'grp-infra',
-          type: 'group' as const,
-          label: '基础设施',
-          children: [
-            { key: '/cluster-topology', icon: <ClusterOutlined />, label: '集群拓扑' },
-            { key: '/capacity-planning', icon: <LineChartOutlined />, label: '容量规划' },
-            { key: '/storage-devices', icon: <AppstoreOutlined />, label: '存储设备' },
-          ],
-        }]
-      : []),
-    // ── 存储 ──
+    // ── Storage ──
     ...(isAdmin
       ? [{
           key: 'grp-storage',
           type: 'group' as const,
-          label: '存储',
+          label: t('nav:groups.storage'),
           children: [
-            { key: '/volumes', icon: <DatabaseOutlined />, label: 'Volume 管理' },
-            { key: '/collections', icon: <DatabaseOutlined />, label: 'Collection 管理' },
-            { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: 'Bitrot 扫描' },
+            { key: '/capacity-planning', icon: <LineChartOutlined />, label: t('nav:items.capacityPlanning') },
+            { key: '/storage-devices', icon: <AppstoreOutlined />, label: t('nav:items.volumeServers') },
+            { key: '/volumes', icon: <DatabaseOutlined />, label: t('nav:items.volumes') },
+            { key: '/collections', icon: <DatabaseOutlined />, label: t('nav:items.collections') },
+            { key: '/bitrot-scrub', icon: <SafetyOutlined />, label: t('nav:items.bitrotScrub') },
           ],
         }]
       : []),
-    // ── 元数据 ──
+    // ── Metadata ──
     ...(isAdmin
       ? [{
           key: 'grp-meta',
           type: 'group' as const,
-          label: '元数据',
+          label: t('nav:groups.metadata'),
           children: [
-            {
-              key: 'filer-submenu',
-              icon: <CloudServerOutlined />,
-              label: 'Filer 管理',
-              children: [
-                { key: '/filer', label: '状态总览' },
-                { key: '/conflicts', icon: <WarningOutlined />, label: '冲突检测' },
-              ],
-            },
-            { key: '/shards', icon: <ClusterOutlined />, label: '分片管理' },
-            { key: '/shard-balancing', icon: <DatabaseOutlined />, label: '分片均衡' },
+            { key: '/filer', icon: <CloudServerOutlined />, label: t('nav:items.filerStatus') },
+            { key: '/shards', icon: <ClusterOutlined />, label: t('nav:items.shards') },
+            { key: '/shard-balancing', icon: <DatabaseOutlined />, label: t('nav:items.shardBalancing') },
           ],
         }]
       : []),
-    // ── 客户端 & 性能 ──
+    // ── Clients & Performance ──
     {
       key: 'grp-clients',
       type: 'group',
-      label: '客户端 & 性能',
+      label: t('nav:groups.clientsAndPerformance'),
       children: [
         ...(isAdmin
           ? [
-              { key: '/fuse', icon: <FolderOpenOutlined />, label: 'FS 管理' },
-              { key: '/benchmark', icon: <RocketOutlined />, label: '性能测试' },
+              { key: '/fuse', icon: <FolderOpenOutlined />, label: t('nav:items.fsManagement') },
+              { key: '/benchmark', icon: <RocketOutlined />, label: t('nav:items.benchmark') },
             ]
           : []),
-        { key: '/s3', icon: <CloudOutlined />, label: 'S3 管理' },
-        { key: '/kv', icon: <KeyOutlined />, label: 'KV 管理' },
+        { key: '/s3', icon: <CloudOutlined />, label: t('nav:items.s3') },
+        { key: '/kv', icon: <KeyOutlined />, label: t('nav:items.kv') },
       ],
     },
-    // ── 安全 ──
+    // ── Operations ──
+    {
+      key: 'grp-operations',
+      type: 'group',
+      label: t('nav:groups.operations'),
+      children: [
+        { key: '/alerts', icon: <BellOutlined />, label: t('nav:items.alerts') },
+        ...(isAdmin
+          ? [
+              { key: '/runtime-config', icon: <SettingOutlined />, label: t('nav:items.runtimeConfig') },
+            ]
+          : []),
+      ],
+    },
+    // ── Security ──
     {
       key: 'grp-security',
       type: 'group',
-      label: '安全',
+      label: t('nav:groups.security'),
       children: [
-        { key: '/access-keys', icon: <LockOutlined />, label: '我的密钥' },
+        { key: '/access-keys', icon: <LockOutlined />, label: t('nav:items.myAccessKeys') },
         ...(isAdmin
           ? [
-              { key: '/users', icon: <TeamOutlined />, label: '用户管理' },
-              { key: '/roles', icon: <SafetyCertificateOutlined />, label: '角色管理' },
+              { key: '/users', icon: <TeamOutlined />, label: t('nav:items.users') },
+              { key: '/roles', icon: <SafetyCertificateOutlined />, label: t('nav:items.roles') },
             ]
           : []),
       ],
@@ -166,7 +172,7 @@ function AppLayout() {
 
   const handleLogout = () => {
     authLogout()
-    message.success('已退出登录')
+    message.success(t('common:header.loggedOut'))
     navigate('/login', { replace: true })
   }
 
@@ -177,7 +183,7 @@ function AppLayout() {
         <div style={{ padding: '4px 8px' }}>
           <div style={{ fontWeight: 500 }}>{user?.username ?? '-'}</div>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {user?.role === 'admin' ? '管理员' : '普通用户'}
+            {user?.role === 'admin' ? t('common:header.roleAdmin') : t('common:header.roleUser')}
           </Text>
         </div>
       ),
@@ -187,7 +193,7 @@ function AppLayout() {
     {
       key: 'logout',
       icon: <LogoutOutlined />,
-      label: '退出登录',
+      label: t('common:header.logout'),
       onClick: handleLogout,
     },
   ]
@@ -196,24 +202,42 @@ function AppLayout() {
     {
       key: 'light',
       icon: <BulbOutlined />,
-      label: '明亮',
+      label: t('common:theme.light'),
       onClick: () => setMode('light' as ThemeMode),
     },
     {
       key: 'dark',
       icon: <BulbFilled />,
-      label: '暗黑',
+      label: t('common:theme.dark'),
       onClick: () => setMode('dark' as ThemeMode),
     },
     {
       key: 'auto',
       icon: <DesktopOutlined />,
-      label: '跟随系统',
+      label: t('common:theme.auto'),
       onClick: () => setMode('auto' as ThemeMode),
     },
   ]
 
-  const themeLabel = mode === 'light' ? '明亮' : mode === 'dark' ? '暗黑' : '自动'
+  const themeLabel = mode === 'light'
+    ? t('common:theme.light')
+    : mode === 'dark'
+      ? t('common:theme.dark')
+      : t('common:theme.auto')
+
+  const currentLang = (LANGUAGES.find(l => l.code === i18n.language as LangCode) ?? LANGUAGES[0])
+
+  const languageMenuItems: MenuProps['items'] = LANGUAGES.map(l => ({
+    key: l.code,
+    label: (
+      <Space size={8}>
+        <span>{l.flag}</span>
+        <span>{l.label}</span>
+        {l.code === currentLang.code && <Tag color="blue" style={{ marginLeft: 'auto' }}>✓</Tag>}
+      </Space>
+    ),
+    onClick: () => void i18n.changeLanguage(l.code),
+  }))
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -284,12 +308,12 @@ function AppLayout() {
               icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
               onClick={() => setCollapsed(!collapsed)}
             />
-            <Text strong style={{ fontSize: 16 }}>监控管理平台</Text>
+            <Text strong style={{ fontSize: 16 }}>{t('common:header.title')}</Text>
           </Space>
 
           <Space size={16}>
             {/* Cluster health badge */}
-            <Tooltip title="集群当前健康状态">
+            <Tooltip title={t('common:header.clusterHealth')}>
               <Tag
                 color="success"
                 style={{
@@ -311,12 +335,42 @@ function AppLayout() {
                     display: 'inline-block',
                   }}
                 />
-                系统运行正常
+                {t('common:header.healthy')}
+              </Tag>
+            </Tooltip>
+
+            {/* WebSocket connection status badge */}
+            <Tooltip
+              title={
+                wsStatus === 'open'
+                  ? t('common:realtimeStream') + ' · ' + t('common:connected')
+                  : wsStatus === 'connecting'
+                    ? t('common:reconnecting')
+                    : t('common:disconnected')
+              }
+            >
+              <Tag
+                color={wsStatus === 'open' ? 'processing' : wsStatus === 'connecting' ? 'warning' : 'error'}
+                style={{
+                  margin: 0,
+                  padding: '2px 10px',
+                  borderRadius: 12,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <ApiOutlined style={{ fontSize: 11 }} />
+                {wsStatus === 'open'
+                  ? t('common:connected')
+                  : wsStatus === 'connecting'
+                    ? t('common:reconnecting')
+                    : t('common:disconnected')}
               </Tag>
             </Tooltip>
 
             {/* Global search trigger */}
-            <Tooltip title="全局搜索 (Ctrl+K)">
+            <Tooltip title={t('common:header.globalSearch')}>
               <Button
                 type="text"
                 icon={<SearchOutlined />}
@@ -324,9 +378,22 @@ function AppLayout() {
               />
             </Tooltip>
 
+            {/* Language switcher */}
+            <Dropdown menu={{ items: languageMenuItems }} placement="bottomRight">
+              <Tooltip title={t('common:language.switchTo')}>
+                <Button type="text">
+                  <Space size={4}>
+                    <TranslationOutlined />
+                    <span>{currentLang.flag}</span>
+                    {currentLang.label}
+                  </Space>
+                </Button>
+              </Tooltip>
+            </Dropdown>
+
             {/* Theme switcher */}
             <Dropdown menu={{ items: themeMenuItems }} placement="bottomRight">
-              <Tooltip title={`主题: ${themeLabel}`}>
+              <Tooltip title={t('common:header.theme', { theme: themeLabel })}>
                 <Button type="text">
                   <Space size={4}>
                     {mode === 'dark' ? <BulbFilled /> : <BulbOutlined />}
@@ -340,7 +407,7 @@ function AppLayout() {
             <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
               <Space style={{ cursor: 'pointer', padding: '0 8px' }}>
                 <Avatar size="small" icon={<UserOutlined />} />
-                <span>{user?.username ?? '未登录'}</span>
+                <span>{user?.username ?? t('common:header.notLoggedIn')}</span>
               </Space>
             </Dropdown>
           </Space>

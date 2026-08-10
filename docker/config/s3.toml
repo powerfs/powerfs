@@ -60,6 +60,6 @@ container = false
 [monitor]
 addr = "0.0.0.0:8081"
 redis_url = "redis://172.30.0.50:6379"
-s3_endpoint = "http://172.30.0.32:9000"
-s3_backend_endpoint = "http://172.30.0.32:9000"
+s3_endpoint = "http://172.30.0.40:9000"
+s3_backend_endpoint = "http://172.30.0.40:9000"
 master_endpoint = "http://172.30.0.11:9333"

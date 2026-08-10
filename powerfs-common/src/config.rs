@@ -109,6 +109,16 @@ pub struct FilerConfig {
     /// 父目录 `powerfs.inline` xattr 可覆盖此值.
     #[serde(default)]
     pub inline_max_size: Option<u32>,
+    /// 强制注册到 master，跳过 shard_count 一致性校验。
+    ///
+    /// 默认 false：master 拒绝 shard_count 与集群现有 filer 不一致的注册请求，
+    /// filer 收到 BAD_REQUEST 后立即退出（exit 1），避免错误配置的节点进入集群
+    /// 导致 inode 路由错位（% shard_count 模数不同 → inode not found / EIO）。
+    ///
+    /// 设为 true 仅用于运维场景：集群升级、临时调试 shard_count 不一致。
+    /// 即使 force=true，master 仍会下发告警日志，便于事后审计。
+    #[serde(default)]
+    pub force_register: bool,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
@@ -134,7 +144,14 @@ pub struct FuseConfig {
     pub mount_point: String,
     /// Master地址列表 - 必须配置
     pub master_addresses: Vec<String>,
-    /// Filer地址列表 - 必须配置
+    /// Filer地址列表 - 可选；为空时由 FUSE 客户端从 master 拓扑发现。
+    ///
+    /// 历史上必填；现在 master 通过 GetTopology 下发 filer 列表 + 全局
+    /// shard_count，所以新部署只需 master_addresses。保留此字段作为：
+    ///   1. 旧配置兼容；
+    ///   2. force_mount=true 时的兜底地址；
+    ///   3. 启动期到拓扑就绪之前的临时路由。
+    #[serde(default)]
     pub filer_addresses: Vec<String>,
     /// Volume地址列表 - 必须配置
     pub volume_addresses: Vec<String>,
@@ -153,6 +170,13 @@ pub struct FuseConfig {
     /// Lease 模式配置 (可选，缺省为 range 模式)
     #[serde(default)]
     pub lease: LeaseConfig,
+    /// 强制挂载：跳过拓扑健康检查（total_shards > 0 + 至少 1 个 healthy filer）。
+    ///
+    /// 默认 false：若 master 未下发 total_shards 或无 healthy filer，拒绝挂载
+    /// 并退出。设为 true 时降级使用 filer_addresses 作为单分片兜底。
+    /// 仅用于运维场景（master 临时不可达但需挂载）。
+    #[serde(default)]
+    pub force_mount: bool,
 }
 
 /// Lease 模式配置
@@ -393,9 +417,14 @@ impl PowerFsConfig {
                 "fuse.master_addresses must not be empty".to_string(),
             ));
         }
-        if self.fuse.filer_addresses.is_empty() {
+        // filer_addresses 现在可选：为空时由 FUSE 客户端从 master 拓扑发现。
+        // 但若 force_mount=true 且 filer_addresses 也为空，则无兜底地址，
+        // 启动后会立即无法路由——此时仍需报错。
+        if self.fuse.filer_addresses.is_empty() && self.fuse.force_mount {
             return Err(ConfigError::ValidationError(
-                "fuse.filer_addresses must not be empty".to_string(),
+                "fuse.filer_addresses must not be empty when force_mount=true \
+                 (no fallback address available)"
+                    .to_string(),
             ));
         }
         if self.fuse.volume_addresses.is_empty() {
