@@ -32,9 +32,11 @@ use log::{debug, info, warn};
 
 use powerfs_allocator::{
     config::{MigrationPolicy, RebalancePolicy},
-    error::ManageError,
+    error::{ManageError, ShardId},
+    management::{ManagementApi, MigrationExecutionResult, RebalanceAction},
     migration_scheduler::MigrationExecutor,
-    LoadBalancer, MigrationScheduler, MigrationState, RebalanceAction, VolumeControl,
+    shard_map::ShardSplitPlan,
+    LoadBalancer, MigrationScheduler, MigrationState, VolumeControl, VolumeManager,
 };
 use powerfs_common::error::PowerFsError;
 use powerfs_common::types::{VolumeId, VolumeState};
@@ -177,6 +179,162 @@ fn map_powerfs_error(err: PowerFsError) -> ManageError {
     }
 }
 
+/// Master-backed `ManagementApi`: ties the allocator's management interface to
+/// the master's runtime state.
+///
+/// Implements the full [`ManagementApi`] trait. Methods that can work today
+/// (policy updates, migration control, volume scaling) delegate to the
+/// [`RebalanceEngine`] / [`VolumeManager`] / [`MasterVolumeControl`]. Methods
+/// that need additional service-side work (shard scaling via filer, volume
+/// pinning, node maintenance via Raft) return `InvalidState` with a clear
+/// "not yet implemented" message so callers can distinguish missing features
+/// from transient errors.
+pub struct MasterManagementApi {
+    master: Arc<MasterNode>,
+    engine: Arc<RebalanceEngine>,
+    volume_manager: VolumeManager,
+}
+
+impl MasterManagementApi {
+    /// Construct from the master and its rebalance engine. Creates a
+    /// [`MasterVolumeControl`] internally and wraps it in a [`VolumeManager`].
+    pub fn new(master: Arc<MasterNode>, engine: Arc<RebalanceEngine>) -> Self {
+        let volume_control: Arc<dyn VolumeControl> =
+            Arc::new(MasterVolumeControl::new(Arc::clone(&master)));
+        let volume_manager = VolumeManager::new(volume_control);
+        Self {
+            master,
+            engine,
+            volume_manager,
+        }
+    }
+
+    /// Build a fresh cluster snapshot from the master's heartbeat-aggregated
+    /// state. All decision methods call this to get a consistent view.
+    fn snapshot(&self) -> powerfs_allocator::ClusterSnapshot {
+        self.master.build_cluster_snapshot()
+    }
+}
+
+fn nyi(what: &str) -> ManageError {
+    ManageError::InvalidState(format!("not yet implemented: {what}"))
+}
+
+impl ManagementApi for MasterManagementApi {
+    // ===== Configuration management =====
+
+    fn set_placement_strategy(&self, _strategy: &str) -> Result<(), ManageError> {
+        Err(nyi(
+            "placement strategy switching requires a runtime strategy registry",
+        ))
+    }
+
+    fn update_migration_policy(&self, policy: MigrationPolicy) -> Result<(), ManageError> {
+        *self.engine.migration_policy().write().unwrap() = policy;
+        Ok(())
+    }
+
+    fn update_rebalance_policy(&self, policy: RebalancePolicy) -> Result<(), ManageError> {
+        *self.engine.rebalance_policy().write().unwrap() = policy;
+        Ok(())
+    }
+
+    fn set_node_maintenance(&self, _node_id: &str, _enabled: bool) -> Result<(), ManageError> {
+        Err(nyi(
+            "node maintenance requires a Raft command for replication",
+        ))
+    }
+
+    // ===== Migration control =====
+
+    fn trigger_rebalance_check(&self, dry_run: bool) -> Result<Vec<RebalanceAction>, ManageError> {
+        let snapshot = self.snapshot();
+        let actions = self.engine.load_balancer.analyze(&snapshot);
+        if !dry_run {
+            // Feed actions to the scheduler for execution.
+            let _ = self
+                .engine
+                .scheduler
+                .execute_migrations(actions.clone(), &snapshot, false)?;
+        }
+        Ok(actions)
+    }
+
+    fn execute_migrations(
+        &self,
+        actions: Vec<RebalanceAction>,
+        dry_run: bool,
+    ) -> Result<MigrationExecutionResult, ManageError> {
+        let snapshot = self.snapshot();
+        self.engine
+            .scheduler
+            .execute_migrations(actions, &snapshot, dry_run)
+    }
+
+    fn pause_all_migrations(&self) -> Result<(), ManageError> {
+        self.engine.scheduler.pause_all()
+    }
+
+    fn resume_migrations(&self) -> Result<(), ManageError> {
+        self.engine.scheduler.resume_all()
+    }
+
+    fn cancel_migration(&self, task_id: &str) -> Result<(), ManageError> {
+        self.engine.scheduler.cancel(task_id)
+    }
+
+    // ===== Override operations =====
+
+    fn pin_volume_to_node(&self, _volume_id: u64, _node_id: &str) -> Result<(), ManageError> {
+        Err(nyi("volume pinning"))
+    }
+
+    fn unpin_volume(&self, _volume_id: u64) -> Result<(), ManageError> {
+        Err(nyi("volume pinning"))
+    }
+
+    // ===== Shard scaling =====
+
+    fn add_shard(
+        &self,
+        _split_from: Option<ShardId>,
+        _dry_run: bool,
+    ) -> Result<ShardSplitPlan, ManageError> {
+        Err(nyi("shard scaling requires filer connection"))
+    }
+
+    fn drain_shard(&self, _shard_id: ShardId) -> Result<(), ManageError> {
+        Err(nyi("shard scaling requires filer connection"))
+    }
+
+    fn remove_shard(&self, _shard_id: ShardId) -> Result<(), ManageError> {
+        Err(nyi("shard scaling requires filer connection"))
+    }
+
+    // ===== Volume scaling =====
+
+    fn create_volume(
+        &self,
+        zone_id: u32,
+        node_id: Option<String>,
+        size: u64,
+    ) -> Result<u64, ManageError> {
+        let snapshot = self.snapshot();
+        self.volume_manager
+            .create_volume(zone_id, node_id, size, &snapshot)
+    }
+
+    fn drain_volume(&self, volume_id: u64) -> Result<(), ManageError> {
+        let snapshot = self.snapshot();
+        self.volume_manager.drain_volume(volume_id, &snapshot)
+    }
+
+    fn remove_volume(&self, volume_id: u64) -> Result<(), ManageError> {
+        let snapshot = self.snapshot();
+        self.volume_manager.remove_volume(volume_id, &snapshot)
+    }
+}
+
 /// Rebalance engine: owns the LoadBalancer + MigrationScheduler + executor
 /// and drives each periodic tick.
 ///
@@ -187,6 +345,7 @@ pub struct RebalanceEngine {
     pub load_balancer: LoadBalancer,
     pub scheduler: MigrationScheduler,
     migration_policy: Arc<RwLock<MigrationPolicy>>,
+    rebalance_policy: Arc<RwLock<RebalancePolicy>>,
     /// Completion queue drained at the end of each tick. Wrapped in a Mutex
     /// because `MigrationExecutor::start_migration` is called synchronously
     /// from within `scheduler.tick` (on the same thread), so contention is
@@ -211,13 +370,24 @@ impl RebalanceEngine {
             Arc::clone(&rebalance_policy),
             executor,
         );
-        let load_balancer = LoadBalancer::new(rebalance_policy, volume_default_size);
+        let load_balancer = LoadBalancer::new(Arc::clone(&rebalance_policy), volume_default_size);
         Arc::new(Self {
             load_balancer,
             scheduler,
             migration_policy,
+            rebalance_policy,
             completion_rx: Mutex::new(completion_rx),
         })
+    }
+
+    /// Shared migration-policy handle (for ManagementApi updates).
+    pub fn migration_policy(&self) -> Arc<RwLock<MigrationPolicy>> {
+        Arc::clone(&self.migration_policy)
+    }
+
+    /// Shared rebalance-policy handle (for ManagementApi updates).
+    pub fn rebalance_policy(&self) -> Arc<RwLock<RebalancePolicy>> {
+        Arc::clone(&self.rebalance_policy)
     }
 
     /// Scan interval (seconds) used by the background loop.
