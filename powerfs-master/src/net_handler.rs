@@ -8,8 +8,8 @@ use crate::proto::powerfs::VolumeShortInfo;
 use log::{debug, error, info, warn};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_NOT_FOUND,
-    STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_BAD_REQUEST,
+    STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use protobuf::Message as ProtoMessage;
 use std::sync::Arc;
@@ -351,6 +351,14 @@ impl MasterNetHandler {
             }
         }
 
+        // DataNodeInfo.grpc_port is used by callers (S3 PutObject/Get/Delete,
+        // apply_assign_volume, kv_cache_service) to build the needle-write
+        // address "ip:grpc_port". It must hold the powerfs-net DATA port
+        // (net_port, e.g. 8901), NOT the HTTP metrics port (http_port, e.g.
+        // 8093). Falling back to http_port only when the volume is a legacy
+        // node that doesn't report net_port.
+        let data_port = if net_port > 0 { net_port } else { port };
+
         let add_result = self
             .master
             .add_node(crate::master::AddNodeParams {
@@ -359,7 +367,7 @@ impl MasterNetHandler {
                 rack: "rack1".to_string(),
                 data_center: "dc1".to_string(),
                 http_port: port,
-                grpc_port: port,
+                grpc_port: data_port,
                 public_url: format!("http://{}:{}", ip, port),
             })
             .await;
@@ -378,7 +386,7 @@ impl MasterNetHandler {
                     new_volumes: Vec::new(),
                     deleted_volumes: Vec::new(),
                     ip: ip.clone(),
-                    grpc_port: port,
+                    grpc_port: data_port,
                     http_port: port,
                     net_port,
                 })
@@ -545,6 +553,78 @@ impl MasterNetHandler {
             leader, volume_count
         );
 
+        // ---- Topology extension: filer list + global total_shards ----
+        //
+        // Fuse clients must compute `calculate_shard(inode)` using the same
+        // shard_count the filer cluster uses. Before this extension the
+        // client hardcoded 256, which mismatched the filer's configured
+        // value (e.g. 3) and routed migrate_inline_alloc / setattr to the
+        // wrong shard. We now ship:
+        //   * FilerListEntries = N (followed by N filer records)
+        //   * Per filer: FilerAddress + NetPort + IsDir(healthy) + ShardIdList
+        //   * TotalShards = global shard_count (the value every filer agrees on)
+        //
+        // Old clients that don't know these fields simply ignore them; the
+        // volume section above is unchanged so the response is backward
+        // compatible.
+        let filers = self.master.list_filers();
+        let filer_count = filers.len() as u64;
+        enc.add_u64(FieldId::FilerListEntries, filer_count);
+        for f in &filers {
+            let _ = enc.add_string(FieldId::FilerAddress, &f.address);
+            enc.add_u64(FieldId::NetPort, f.net_port as u64);
+            enc.add_u8(FieldId::IsDir, if f.is_healthy { 1 } else { 0 });
+            // Pack shard_ids as little-endian u64 array.
+            let mut blob = Vec::with_capacity(f.shard_ids.len() * 8);
+            for sid in &f.shard_ids {
+                blob.extend_from_slice(&sid.to_le_bytes());
+            }
+            let _ = enc.add_bytes(FieldId::ShardIdList, &blob);
+            info!(
+                "NET_GET_TOPOLOGY: filer addr={}, net_port={}, healthy={}, shards={:?}",
+                f.address, f.net_port, f.is_healthy, f.shard_ids
+            );
+        }
+
+        // Determine the cluster-wide total_shards: every healthy filer must
+        // report the same value; if they disagree we log a warning and fall
+        // back to the max so clients over-approximate (a too-large modulus
+        // routes to a non-existent shard → redirect → recovery, vs. a
+        // too-small modulus that collapses two shards into one and silently
+        // corrupts). The cleaner fix (master-owned shard_count in Raft
+        // state) is deferred to a later PR.
+        let mut total_shards: u64 = 0;
+        let mut disagreement = false;
+        for f in &filers {
+            if !f.is_healthy || f.total_shards == 0 {
+                continue;
+            }
+            if total_shards == 0 {
+                total_shards = f.total_shards;
+            } else if f.total_shards != total_shards {
+                disagreement = true;
+                if f.total_shards > total_shards {
+                    total_shards = f.total_shards;
+                }
+            }
+        }
+        if disagreement {
+            warn!(
+                "NET_GET_TOPOLOGY: filers disagree on total_shards; using max={}. \
+                 Filer shard_counts: {:?}",
+                total_shards,
+                filers
+                    .iter()
+                    .map(|f| (f.address.clone(), f.total_shards))
+                    .collect::<Vec<_>>()
+            );
+        }
+        enc.add_u64(FieldId::TotalShards, total_shards);
+        info!(
+            "NET_GET_TOPOLOGY: filers={}, total_shards={}",
+            filer_count, total_shards
+        );
+
         Ok(Self::build_response(
             msg,
             STATUS_OK,
@@ -561,6 +641,21 @@ impl MasterNetHandler {
     ///   Blksize     = net_port (u64) — for ListFilers discovery
     ///   Limit       = shard_count (u64)
     ///   ShardIdList = packed u64 LE array of shard ids (bytes)
+    ///   Force       = force flag (u8, 0/1) — bypass shard_count consistency check
+    ///
+    /// shard_count consistency:
+    ///   The first filer to register establishes the cluster-wide shard_count.
+    ///   Subsequent filers MUST report the same value. A mismatch means the
+    ///   new filer was started with a different config and including it in
+    ///   the cluster would cause inconsistent routing (some filers route
+    ///   `inode / 1M % N`, others `inode / 1M % M`, N != M).
+    ///
+    ///   Without `Force=1`, the master rejects the registration with
+    ///   STATUS_ERR_BAD_REQUEST and a descriptive error string; the filer
+    ///   should exit (or fix its config and retry).
+    ///
+    ///   With `Force=1`, the master logs a warning and registers the filer
+    ///   with the reported value anyway. This is for emergency repair only.
     ///
     /// Response TLV (多 Zone):
     ///   Entries(zone_count) + [ZoneId + Limit(vol_count) + [VolumeId + Owner(addr) + Size + UsedSpace] × N] × M
@@ -576,6 +671,7 @@ impl MasterNetHandler {
         let net_port = dec.next_u64(FieldId::Blksize).unwrap_or(0) as u32;
         let shard_count = dec.next_u64(FieldId::Limit).unwrap_or(0);
         let shard_ids_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
+        let force = dec.next_u8(FieldId::Force).unwrap_or(0) != 0;
 
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
@@ -610,6 +706,53 @@ impl MasterNetHandler {
                 .chunks_exact(8)
                 .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
                 .collect();
+
+            // ---- shard_count consistency check ----
+            //
+            // Look at every already-registered healthy filer. If any has a
+            // different shard_count, refuse the new registration (unless the
+            // caller passes Force=1). This protects the cluster against
+            // accidental config drift: a filer started with the wrong
+            // shard_count would compute `calculate_shard(inode)` differently
+            // from its peers and silently corrupt routing.
+            //
+            // The very first filer to register (or the first after a clean
+            // cluster restart) seeds the value — there is nothing to
+            // compare against yet, so it always passes.
+            let existing = self.master.list_filers();
+            let mut conflict_addr: Option<String> = None;
+            let mut existing_count: u64 = 0;
+            for f in &existing {
+                if !f.is_healthy || f.total_shards == 0 {
+                    continue;
+                }
+                if f.total_shards != shard_count {
+                    conflict_addr = Some(f.address.clone());
+                    existing_count = f.total_shards;
+                    break;
+                }
+            }
+            if let Some(addr) = conflict_addr {
+                let err_msg = format!(
+                    "shard_count mismatch: new filer {} reports shard_count={}, but \
+                     registered filer {} already uses shard_count={}. \
+                     Refusing registration to prevent routing corruption. \
+                     Fix the config and restart, or pass --force to override.",
+                    filer_addr, shard_count, addr, existing_count
+                );
+                if force {
+                    warn!("NET_REGISTER_FILER: {}", err_msg);
+                } else {
+                    error!("NET_REGISTER_FILER: {}", err_msg);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        err_msg.into_bytes(),
+                        Vec::new(),
+                    ));
+                }
+            }
+
             let filer_info = crate::master::FilerNodeInfo {
                 node_id: filer_id.clone(),
                 address: filer_addr.clone(),
@@ -623,8 +766,8 @@ impl MasterNetHandler {
             };
             self.master.register_filer(filer_info);
             info!(
-                "NET_REGISTER_FILER: registered filer node id={}, addr={}, net_port={}",
-                filer_id, filer_addr, net_port
+                "NET_REGISTER_FILER: registered filer node id={}, addr={}, net_port={}, shard_count={}",
+                filer_id, filer_addr, net_port, shard_count
             );
         }
 

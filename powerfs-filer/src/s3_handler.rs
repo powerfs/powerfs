@@ -1,13 +1,39 @@
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use hex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+use crate::metadata_store::BucketInfo;
 
 use crate::bucket_manager::BucketManager;
 use crate::entry_manager::EntryManager;
 use crate::meta_shard_manager::MetaShardManager;
 use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
+
+/// Admin bucket create request body (JSON, proxied via Monitor).
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateBucketRequest {
+    pub name: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub size_limit: Option<u64>,
+}
+
+/// Admin bucket quota update request body.
+#[derive(Debug, Deserialize)]
+pub struct AdminSetQuotaRequest {
+    pub size_limit: u64,
+}
+
+/// Admin bucket list response (JSON, not S3 XML).
+#[derive(Debug, Serialize)]
+pub struct AdminBucketListResponse {
+    pub buckets: Vec<BucketInfo>,
+    pub total: usize,
+}
 
 pub struct S3Handler {
     bucket_manager: Arc<BucketManager>,
@@ -380,12 +406,34 @@ impl S3Handler {
         }
     }
 
-    pub async fn list_objects(&self, bucket: &str) -> axum::response::Response {
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        params: &crate::server::ListObjectsParams,
+    ) -> axum::response::Response {
         struct ObjectSummary {
             key: String,
             mtime_rfc3339: String,
             etag: String,
             size: u64,
+        }
+
+        // XML-escape helper for S3 keys (keys may contain & < > and other chars).
+        fn xml_escape(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        }
+
+        // Hex-encode continuation token (opaque to client; round-trips the last key).
+        fn encode_token(key: &str) -> String {
+            hex::encode(key.as_bytes())
+        }
+        fn decode_token(tok: &str) -> Option<String> {
+            let bytes = hex::decode(tok).ok()?;
+            String::from_utf8(bytes).ok()
         }
 
         let entries: Vec<ObjectSummary> = if let Some(mgr) = &self.meta_shard_manager {
@@ -433,33 +481,217 @@ impl S3Handler {
             }
         };
 
+        // Stable order is required for deterministic pagination.
+        let mut entries = entries;
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Continuation token (v2) takes precedence over start-after (v2) which
+        // takes precedence over marker (v1, not supported here — we treat v1 as
+        // a one-shot list of everything).
+        let is_v2 = matches!(params.list_type, Some(2));
+        if is_v2 {
+            if let Some(ct) = &params.continuation_token {
+                if let Some(last_key) = decode_token(ct) {
+                    entries.retain(|e| e.key.as_str() > last_key.as_str());
+                }
+            } else if let Some(sa) = &params.start_after {
+                entries.retain(|e| e.key.as_str() > sa.as_str());
+            }
+        }
+
+        // Prefix filtering (applied before delimiter grouping).
+        let prefix = params.prefix.clone().unwrap_or_default();
+        if !prefix.is_empty() {
+            entries.retain(|e| e.key.starts_with(&prefix));
+        }
+
+        // Delimiter → roll matching entries into <CommonPrefixes>.
+        let mut common_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(delim) = &params.delimiter {
+            if !delim.is_empty() {
+                let mut kept = Vec::with_capacity(entries.len());
+                for e in entries.drain(..) {
+                    if let Some(rest) = e.key.strip_prefix(&prefix) {
+                        if let Some(idx) = rest.find(delim) {
+                            let cp = format!("{}{}", &prefix, &rest[..idx + delim.len()]);
+                            common_prefixes.insert(cp);
+                            continue;
+                        }
+                    }
+                    kept.push(e);
+                }
+                entries = kept;
+            }
+        }
+
+        // max-keys: S3 default 1000, server caps to [0, 1000].
+        let max_keys = params.max_keys.unwrap_or(1000).clamp(0, 1000) as usize;
+        let total_after_filter = entries.len();
+        let truncated = total_after_filter > max_keys;
+        if truncated {
+            entries.truncate(max_keys);
+        }
+        let key_count = entries.len();
+
+        // NextContinuationToken: opaque hex of the last key returned, only when truncated.
+        let next_ct = if truncated {
+            entries.last().map(|e| encode_token(&e.key))
+        } else {
+            None
+        };
+
+        let contents_xml = entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "  <Contents>\n    <Key>{}</Key>\n    <LastModified>{}</LastModified>\n    <ETag>{}</ETag>\n    <Size>{}</Size>\n    <StorageClass>STANDARD</StorageClass>\n  </Contents>",
+                    xml_escape(&e.key),
+                    e.mtime_rfc3339,
+                    xml_escape(&e.etag),
+                    e.size
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let cp_xml = common_prefixes
+            .iter()
+            .map(|cp| format!("  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>", xml_escape(cp)))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        // Build response. Include v2-only fields (KeyCount, ContinuationToken,
+        // NextContinuationToken, StartAfter) only when list-type=2 was requested.
+        let v2_fields = if is_v2 {
+            let mut s = format!("\n  <KeyCount>{}</KeyCount>", key_count);
+            if let Some(ct) = &params.continuation_token {
+                s.push_str(&format!("\n  <ContinuationToken>{}</ContinuationToken>", xml_escape(ct)));
+            }
+            if let Some(sa) = &params.start_after {
+                s.push_str(&format!("\n  <StartAfter>{}</StartAfter>", xml_escape(sa)));
+            }
+            if let Some(nct) = &next_ct {
+                s.push_str(&format!("\n  <NextContinuationToken>{}</NextContinuationToken>", xml_escape(nct)));
+            }
+            s
+        } else {
+            String::new()
+        };
+
+        let delim_xml = if params.delimiter.is_some() {
+            format!("\n  <Delimiter>{}</Delimiter>", xml_escape(params.delimiter.as_deref().unwrap_or("")))
+        } else {
+            String::new()
+        };
+
+        let enc_xml = if params.encoding_type.as_deref() == Some("url") {
+            "\n  <EncodingType>url</EncodingType>".to_string()
+        } else {
+            String::new()
+        };
+
         let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<ListBucketResult>
-  <Name>{}</Name>
-  <Prefix></Prefix>
-  <Marker></Marker>
-  <MaxKeys>1000</MaxKeys>
-  <IsTruncated>false</IsTruncated>
-{}
-</ListBucketResult>",
-            bucket,
-            entries
-                .into_iter()
-                .map(|e| format!(
-                    "  <Contents>
-    <Key>{}</Key>
-    <LastModified>{}</LastModified>
-    <ETag>{}</ETag>
-    <Size>{}</Size>
-    <StorageClass>STANDARD</StorageClass>
-  </Contents>",
-                    e.key, e.mtime_rfc3339, e.etag, e.size
-                ))
-                .collect::<Vec<String>>()
-                .join("\n")
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult>\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>{}{}{}\n{}\n{}\n</ListBucketResult>",
+            xml_escape(bucket),
+            xml_escape(&prefix),
+            max_keys,
+            truncated,
+            v2_fields,
+            delim_xml,
+            enc_xml,
+            contents_xml,
+            cp_xml,
         );
         (StatusCode::OK, body).into_response()
+    }
+
+    // ── Admin bucket management (JSON API, proxied via Monitor) ──
+
+    /// Admin: list all buckets as JSON (not S3 XML).
+    pub async fn admin_list_buckets(&self) -> axum::response::Response {
+        let buckets = self.bucket_manager.list_buckets().await;
+        let total = buckets.len();
+        Json(AdminBucketListResponse { buckets, total }).into_response()
+    }
+
+    /// Admin: create a bucket via JSON body.
+    pub async fn admin_create_bucket(
+        &self,
+        req: AdminCreateBucketRequest,
+    ) -> axum::response::Response {
+        let collection = req.collection.as_deref().unwrap_or("default");
+        match self
+            .bucket_manager
+            .create_bucket(&req.name, "001", collection)
+            .await
+        {
+            Ok(mut info) => {
+                if let Some(limit) = req.size_limit {
+                    if let Ok(updated) =
+                        self.bucket_manager.set_bucket_quota(&req.name, limit).await
+                    {
+                        info = updated;
+                    }
+                }
+                (StatusCode::CREATED, Json(info)).into_response()
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("exist") || msg.contains("FileExists") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
+    }
+
+    /// Admin: delete a bucket by name.
+    pub async fn admin_delete_bucket(&self, bucket: &str) -> axum::response::Response {
+        match self.bucket_manager.delete_bucket(bucket).await {
+            Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "bucket not found" })),
+            )
+                .into_response(),
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("not empty") {
+                    StatusCode::CONFLICT
+                } else if msg.contains("not exist") || msg.contains("DirectoryNotFound") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
+    }
+
+    /// Admin: set bucket quota (size_limit = 0 means unlimited).
+    pub async fn admin_set_quota(
+        &self,
+        bucket: &str,
+        req: AdminSetQuotaRequest,
+    ) -> axum::response::Response {
+        match self
+            .bucket_manager
+            .set_bucket_quota(bucket, req.size_limit)
+            .await
+        {
+            Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("not exist") || msg.contains("DirectoryNotFound") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        }
     }
 }
 

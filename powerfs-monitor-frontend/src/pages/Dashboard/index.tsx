@@ -15,7 +15,7 @@ import type { EChartsOption } from 'echarts'
 import type { ClusterMetrics, KVMetrics, AlertInfo, TimeSeriesData, FilerStatus } from '@/types'
 import type { SchedulerStatus } from '@/services/api'
 import { getClusterMetrics, getKVMetrics, getAlerts, getMetricHistory, getNodes, getFilerStatus, getBalancerStatus } from '@/services/api'
-import { connectWebSocket, disconnectWebSocket, type MetricUpdate } from '@/services/websocket'
+import { useMetricStream } from '@/hooks/useMetricStream'
 import { formatBytes, formatPercent, formatUptime, formatNumber } from '@/utils/format'
 import { KpiBar, MetricChart, EmptyState, RefreshControl, RealtimeChart, StatusTag } from '@/components/pro'
 
@@ -34,80 +34,88 @@ function Dashboard() {
 
   const loadData = useCallback(async () => {
     setLoading(true)
-    try {
-      const [cluster, kv, alertList, filer, balancer] = await Promise.all([
-        getClusterMetrics(),
-        getKVMetrics(),
-        getAlerts(),
-        getFilerStatus(),
-        getBalancerStatus(),
-      ])
-      setClusterMetrics(cluster)
-      setKVMetrics(kv)
-      setFilerStatus(filer)
-      setBalancerStatus(balancer)
-      setAlerts(alertList)
-    } catch (e) {
-      console.error('Failed to load dashboard data:', e)
-    } finally {
-      setLoading(false)
-    }
+    // 各请求独立容错: filer/balancer 不可达不应阻塞 cluster/kv/alerts 加载
+    const results = await Promise.allSettled([
+      getClusterMetrics(),
+      getKVMetrics(),
+      getAlerts(),
+      getFilerStatus(),
+      getBalancerStatus(),
+    ])
+    if (results[0].status === 'fulfilled') setClusterMetrics(results[0].value)
+    if (results[1].status === 'fulfilled') setKVMetrics(results[1].value)
+    if (results[2].status === 'fulfilled') setAlerts(results[2].value)
+    if (results[3].status === 'fulfilled') setFilerStatus(results[3].value)
+    if (results[4].status === 'fulfilled') setBalancerStatus(results[4].value)
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        console.warn(`Dashboard loadData [${i}] rejected:`, r.reason)
+      }
+    })
+    setLoading(false)
   }, [])
 
   const loadHistoryData = useCallback(async () => {
-    try {
-      const [storageData, cpuData] = await Promise.all([
-        getMetricHistory('powerfs_node_disk_usage'),
-        getMetricHistory('powerfs_node_cpu_usage'),
-      ])
-      setStorageTrend(storageData)
-      setCpuTrend(cpuData)
-    } catch (e) {
-      console.error('Failed to load history data:', e)
-    }
+    const [storageRes, cpuRes] = await Promise.allSettled([
+      getMetricHistory('powerfs_node_disk_usage'),
+      getMetricHistory('powerfs_node_cpu_usage'),
+    ])
+    if (storageRes.status === 'fulfilled') setStorageTrend(storageRes.value)
+    if (cpuRes.status === 'fulfilled') setCpuTrend(cpuRes.value)
   }, [])
 
   const realtimeFetcher = useCallback(async () => {
-    const nodes = await getNodes()
-    const online = nodes.filter(n => n.status !== 'offline')
-    if (online.length === 0) return { cpu: 0, memory: 0 }
-    const sum = online.reduce(
-      (acc, n) => ({
-        cpu: acc.cpu + (n.cpu_usage || 0),
-        memory: acc.memory + (n.mem_usage || 0),
-      }),
-      { cpu: 0, memory: 0 },
-    )
-    return {
-      cpu: Number((sum.cpu / online.length).toFixed(1)),
-      memory: Number((sum.memory / online.length).toFixed(1)),
+    try {
+      const nodes = await getNodes()
+      const online = nodes.filter(n => n.status !== 'offline')
+      if (online.length === 0) return { cpu: 0, memory: 0 }
+      const sum = online.reduce(
+        (acc, n) => ({
+          cpu: acc.cpu + (n.cpu_usage || 0),
+          memory: acc.memory + (n.mem_usage || 0),
+        }),
+        { cpu: 0, memory: 0 },
+      )
+      return {
+        cpu: Number((sum.cpu / online.length).toFixed(1)),
+        memory: Number((sum.memory / online.length).toFixed(1)),
+      }
+    } catch {
+      return { cpu: 0, memory: 0 }
     }
   }, [])
 
   useEffect(() => {
     void loadData()
     void loadHistoryData()
-    connectWebSocket(onMetricUpdate)
+    // Backoff polling to 30s — real-time updates flow through WS.
     const interval = setInterval(() => {
       void loadData()
       void loadHistoryData()
-    }, 10000)
-    return () => {
-      clearInterval(interval)
-      disconnectWebSocket()
-    }
+    }, 30000)
+    return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const onMetricUpdate = (data: MetricUpdate) => {
-    if (data.type === 'metric_update') {
+  // Live updates: backend broadcasts 'cluster'/'kv'/'nodes'/'volumes' sources.
+  // cluster -> patch clusterMetrics; kv -> patch kvMetrics; nodes/volumes
+  // -> trigger reload (aggregates need recompute).
+  useMetricStream({
+    onMetricUpdate: (data) => {
+      const payload = data.payload
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+      const patch = payload as Record<string, unknown>
       if (data.source === 'cluster') {
-        setClusterMetrics(prev => ({ ...prev, ...data.payload } as ClusterMetrics))
+        setClusterMetrics(prev => ({ ...(prev ?? {} as ClusterMetrics), ...patch } as ClusterMetrics))
       } else if (data.source === 'kv') {
-        setKVMetrics(prev => ({ ...prev, ...data.payload } as KVMetrics))
+        setKVMetrics(prev => ({ ...(prev ?? {} as KVMetrics), ...patch } as KVMetrics))
       }
-    }
-  }
+    },
+    onAlertUpdate: () => {
+      // Refresh alert list when an alert triggers/resolves.
+      void getAlerts().then(setAlerts).catch(() => {})
+    },
+  })
 
   const storagePercent = clusterMetrics && clusterMetrics.total_storage > 0
     ? (clusterMetrics.used_storage / clusterMetrics.total_storage) * 100

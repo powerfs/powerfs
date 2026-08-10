@@ -788,7 +788,7 @@ impl FilerNetHandler {
 
         info!("FILER_NET_GETATTR: ino={}", ino);
 
-        // Check leadership for the correct shard before reading
+        // inode-level read → route by calculate_shard(inode)
         let shard_id = self.shard_strategy.calculate_shard(ino);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
@@ -1110,10 +1110,15 @@ impl FilerNetHandler {
             .await
         {
             Ok(ino) => {
-                // Apply mode/uid/gid via setattr
+                // Apply mode/uid/gid via setattr. Route by inode's own shard:
+                // after the split create, the inode record lives on
+                // calculate_shard(ino), not on parent's shard. Using the
+                // outer `shard_id` (parent's) here would route to the wrong
+                // shard and the apply would never see the inode.
+                let setattr_shard = self.shard_strategy.calculate_shard(ino);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid), None, None)
+                    .setattr(ino, setattr_shard, None, Some(mode), Some(uid), Some(gid), None, None)
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
@@ -1196,9 +1201,12 @@ impl FilerNetHandler {
                     // size=0: 初始无数据, 后续 write 时更新
                     let (volume_id, needle_id) = flat_alloc.unwrap();
                     let fid_str = format!("{},0,{}", volume_id, needle_id);
+                    // Route by inode's own shard: set_chunks mutates the inode
+                    // record on calculate_shard(ino), not the parent's shard.
+                    let setchunks_shard = self.shard_strategy.calculate_shard(ino);
                     if let Err(e) = self
                         .meta_shard_manager
-                        .set_chunks(ino, shard_id, fid_str, volume_id, 0, 0, 0)
+                        .set_chunks(ino, setchunks_shard, fid_str, volume_id, 0, 0, 0)
                         .await
                     {
                         warn!(
@@ -1750,11 +1758,10 @@ impl FilerNetHandler {
             shard_id_raw, inode, size, chunks.len(), inline_data.as_ref().map(|d| d.len()).unwrap_or(0), client_id
         );
 
-        // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // Inode-level write: route by calculate_shard(inode). Inode records
+        // are now stored on their own hash-derived shard (independent of the
+        // parent dir entry's shard), so this is the authoritative location.
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         info!(
             "FILER_NET_UPDATE_SIZE_CHUNKS: calculated shard_id={}, is_leader_check",
             shard_id.0
@@ -1802,14 +1809,11 @@ impl FilerNetHandler {
     ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_inc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
-        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level state → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1839,14 +1843,11 @@ impl FilerNetHandler {
     ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_dec(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
-        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level state → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1884,18 +1885,16 @@ impl FilerNetHandler {
     ///           Response = VolumeId + FileKey(needle_id) / Name=error
     async fn handle_migrate_inline_alloc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id={}, inode={}",
-            shard_id_raw, inode
+            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}",
+            _shard_id_raw, inode
         );
 
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level write → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1957,12 +1956,13 @@ impl FilerNetHandler {
     /// Response: status only (STATUS_OK or STATUS_ERR_*)
     async fn handle_setxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
         let value = dec.next_bytes(FieldId::XattrValue).unwrap_or_default();
 
-        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        // inode-level write → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -2001,11 +2001,12 @@ impl FilerNetHandler {
     /// Response TLV: XattrValue (bytes) or STATUS_ERR_NOT_FOUND
     async fn handle_getxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
 
-        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        // inode-level read → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
