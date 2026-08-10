@@ -248,6 +248,7 @@ async fn create_facade_with_inode_lease(filer_port: u16) -> FuseClientFacade {
         volume_net_port: 19998,
         volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
+        filer_addrs: vec!["127.0.0.1".to_string()],
         filer_port: filer_port,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
@@ -257,6 +258,7 @@ async fn create_facade_with_inode_lease(filer_port: u16) -> FuseClientFacade {
         lease_mode: "inode".to_string(),
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
+        force_mount: false,
     };
 
     let facade = FuseClientFacade::new(config)

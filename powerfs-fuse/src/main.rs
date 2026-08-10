@@ -130,17 +130,32 @@ fn main() {
         lease_mode, lease_duration_ms, lease_renew_interval_ms
     );
 
-    // 从配置获取filer地址（取第一个）
-    let (filer_addr, filer_net_port) = if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
-        // 解析 host:port 或 仅host
-        let parts: Vec<&str> = first_filer.split(':').collect();
-        let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
-        (host, fuse_cfg.filer_net_port)
-    } else {
-        // 这个分支不会执行，因为validate已经检查了filer_addresses非空
-        eprintln!("ERROR: filer_addresses is empty in configuration");
-        process::exit(1);
-    };
+    // 从配置获取filer地址列表（取第一个作为主地址，全部用于轮换重试）
+    //
+    // filer_addresses 现在可选：为空时由 facade 从 master 拓扑发现 filer 列表。
+    // 这里仅提取配置中的兜底地址；topology 就绪后会覆盖。
+    let (filer_addr, filer_addrs, filer_net_port) =
+        if let Some(first_filer) = fuse_cfg.filer_addresses.first() {
+            // 解析 host:port 或 仅host（主地址取 host 部分）
+            let parts: Vec<&str> = first_filer.split(':').collect();
+            let host = parts.first().unwrap_or(&"127.0.0.1").to_string();
+            // 所有 Filer 地址取 host 部分，端口统一用 filer_net_port
+            let all_hosts: Vec<String> = fuse_cfg
+                .filer_addresses
+                .iter()
+                .map(|addr| {
+                    let p: Vec<&str> = addr.split(':').collect();
+                    p.first().unwrap_or(&"127.0.0.1").to_string()
+                })
+                .collect();
+            (host, all_hosts, fuse_cfg.filer_net_port)
+        } else {
+            // filer_addresses 为空：由 facade 从 master 拓扑发现 filer 列表。
+            // 这里给一个空字符串作为占位（facade 检测到空会用 topology 列表）。
+            info!("fuse.filer_addresses is empty — will discover filers from master topology");
+            (String::new(), Vec::new(), fuse_cfg.filer_net_port)
+        };
+    let force_mount = fuse_cfg.force_mount;
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
@@ -210,6 +225,7 @@ fn main() {
     info!("  Masters: {}", master_addrs.join(", "));
     info!("  Master net port: {}", master_net_port);
     info!("  Filer: {}:{}", filer_addr, filer_net_port);
+    info!("  Filer addresses (rotation): {:?}", filer_addrs);
     info!("  Volume addresses: {:?}", volume_addrs);
     info!("  Volume net port: {}", volume_net_port);
     info!("  Mount point: {}", mount_point);
@@ -246,10 +262,12 @@ fn main() {
             volume_net_port,
             volume_addrs,
             filer_addr,
+            filer_addrs,
             filer_net_port,
             &lease_mode,
             lease_duration_ms,
             lease_renew_interval_ms,
+            force_mount,
             runtime_arc.clone(),
         )
         .await

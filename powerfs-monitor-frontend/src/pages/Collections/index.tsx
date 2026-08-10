@@ -91,7 +91,8 @@ function formatRedundancy(policy: StoragePolicyInfo | null): string {
 function statusTag(status_name: string): { color: string; text: string } {
   switch ((status_name || '').toLowerCase()) {
     case 'active': return { color: 'green', text: '正常' }
-    case 'readonly': return { color: 'orange', text: '只读' }
+    case 'readonly':
+    case 'read_only': return { color: 'orange', text: '只读' }
     case 'archived': return { color: 'gray', text: '归档' }
     case 'deleted': return { color: 'red', text: '已删除' }
     default: return { color: 'default', text: status_name || '-' }

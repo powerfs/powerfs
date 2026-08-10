@@ -495,8 +495,10 @@ impl ShardStore {
                 mode,
                 uid,
                 gid,
+                mtime,
+                atime,
             } => {
-                self.setattr(inode, size, mode, uid, gid);
+                self.setattr(inode, size, mode, uid, gid, mtime, atime);
             }
             ShardCommand::SetAttrData { inode, size } => {
                 self.setattr_data(inode, size);
@@ -573,6 +575,97 @@ impl ShardStore {
                 ec_chunks,
             } => {
                 self.update_to_ec(inode, reliability, reliability_state, ec_chunks);
+            }
+            // ----- Decomposed inode + dir-entry commands -----
+            // See `ShardCommand` doc for the rationale. Each handler calls
+            // an existing primitive that mutates only one CF, so the two
+            // halves can land on different shards without losing per-CF
+            // atomicity.
+            ShardCommand::CreateInode { info } => {
+                if let Err(e) = self.create_inode(info.clone()) {
+                    log::error!(
+                        "Shard {} apply CreateInode failed for inode {}: {}",
+                        self.shard_id.0,
+                        info.inode,
+                        e
+                    );
+                }
+            }
+            ShardCommand::AddDirEntry {
+                parent_inode,
+                name,
+                inode,
+            } => {
+                if let Err(e) = self.add_dir_entry(parent_inode, &name, inode) {
+                    log::error!(
+                        "Shard {} apply AddDirEntry failed (parent={}, name={}): {}",
+                        self.shard_id.0,
+                        parent_inode,
+                        name,
+                        e
+                    );
+                }
+            }
+            ShardCommand::DeleteInode { inode } => {
+                if let Err(e) = self.delete_inode(inode) {
+                    log::error!(
+                        "Shard {} apply DeleteInode failed for inode {}: {}",
+                        self.shard_id.0,
+                        inode,
+                        e
+                    );
+                }
+            }
+            ShardCommand::RemoveDirEntry { parent_inode, name } => {
+                if let Err(e) = self.remove_dir_entry(parent_inode, &name) {
+                    log::error!(
+                        "Shard {} apply RemoveDirEntry failed (parent={}, name={}): {}",
+                        self.shard_id.0,
+                        parent_inode,
+                        name,
+                        e
+                    );
+                }
+            }
+            ShardCommand::IncrementNlink { inode } => {
+                if let Some(mut info) = self.get_inode(inode) {
+                    info.nlink = info.nlink.saturating_add(1);
+                    if let Err(e) = self.update_inode(info) {
+                        log::error!(
+                            "Shard {} apply IncrementNlink failed for inode {}: {}",
+                            self.shard_id.0,
+                            inode,
+                            e
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Shard {} apply IncrementNlink: inode {} not found",
+                        self.shard_id.0,
+                        inode
+                    );
+                }
+            }
+            ShardCommand::DecrementNlink { inode } => {
+                if let Some(mut info) = self.get_inode(inode) {
+                    if info.nlink > 0 {
+                        info.nlink -= 1;
+                    }
+                    if let Err(e) = self.update_inode(info) {
+                        log::error!(
+                            "Shard {} apply DecrementNlink failed for inode {}: {}",
+                            self.shard_id.0,
+                            inode,
+                            e
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Shard {} apply DecrementNlink: inode {} not found",
+                        self.shard_id.0,
+                        inode
+                    );
+                }
             }
         }
     }
@@ -760,7 +853,7 @@ impl ShardStore {
         // Action enum: None = not found; Decrement(info) = hardlink, update
         // nlink; DeleteData(inode, is_file) = nlink==0, delete inode+data.
         enum PostAction {
-            Decrement(InodeInfo),
+            Decrement(Box<InodeInfo>),
             DeleteData(u64, bool),
         }
         let action = {
@@ -778,7 +871,7 @@ impl ShardStore {
                         // Hardlink: decrement nlink in memory, persist outside lock
                         if let Some(info) = inodes.get_mut(&inode) {
                             info.nlink -= 1;
-                            PostAction::Decrement(info.clone())
+                            PostAction::Decrement(Box::new(info.clone()))
                         } else {
                             // Inode not in memory (shouldn't happen) - dir entry
                             // already removed, skip nlink persistence
@@ -815,7 +908,7 @@ impl ShardStore {
             PostAction::Decrement(info) => {
                 inode_val = info.inode;
                 let new_nlink = info.nlink;
-                let _ = self.update_inode(info.clone());
+                let _ = self.update_inode((*info).clone());
                 info!(
                     "Shard {} unlinked hardlink: parent={}, name={}, inode={}, nlink -> {}",
                     self.shard_id.0, parent_inode, name, inode_val, new_nlink
@@ -925,35 +1018,68 @@ impl ShardStore {
             let mut inodes = self.inodes.write().unwrap();
             let mut dir_entries = self.directory_entries.write().unwrap();
 
+            // Resolve the child inode via an immutable borrow first, so the
+            // emptiness check below doesn't conflict with the later mutable
+            // borrow of the parent's entry map.
+            let child_inode = dir_entries
+                .get(&parent_inode)
+                .and_then(|dir| dir.get(&name).copied());
+
             let mut removed = None;
-            if let Some(dir) = dir_entries.get_mut(&parent_inode) {
-                if let Some(&inode) = dir.get(&name) {
-                    let dir_entry_key = format!("{}:{}", parent_inode, name);
-                    let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
+            if let Some(inode) = child_inode {
+                // Defensive: refuse to delete a non-empty directory. The
+                // Filer pre-checks emptiness before proposing the Raft
+                // command, but a race could add entries between the check
+                // and the apply. Skipping here (rather than recursively
+                // deleting child entries) prevents orphaned inodes. All
+                // replicas apply the same command, so they skip
+                // consistently. (Cross-shard child contents are guarded by
+                // the Filer's list_directory pre-check.)
+                let has_live = dir_entries
+                    .get(&inode)
+                    .map(|child| {
+                        child
+                            .values()
+                            .any(|&ci| inodes.get(&ci).is_some_and(|i| i.delete_time == 0))
+                    })
+                    .unwrap_or(false);
+                if has_live {
+                    warn!(
+                        "Shard {} refusing to delete non-empty directory: parent={}, name={}, inode={}",
+                        self.shard_id.0, parent_inode, name, inode
+                    );
+                    return;
+                }
 
-                    let inode_key = inode.to_be_bytes();
-                    let _ = self.db.delete_cf(cf_inodes, inode_key);
+                if let Some(dir) = dir_entries.get_mut(&parent_inode) {
+                    if dir.get(&name).copied() == Some(inode) {
+                        let dir_entry_key = format!("{}:{}", parent_inode, name);
+                        let _ = self.db.delete_cf(cf_dir_entries, dir_entry_key.as_bytes());
 
-                    let prefix = format!("{}:", inode);
-                    let mut it = self.db.raw_iterator_cf(cf_dir_entries);
-                    it.seek(prefix.as_bytes());
-                    while it.valid() {
-                        if let Some(key) = it.key() {
-                            let key_str = String::from_utf8_lossy(key);
-                            if key_str.starts_with(&prefix) {
-                                let _ = self.db.delete_cf(cf_dir_entries, key);
-                            } else {
-                                break;
+                        let inode_key = inode.to_be_bytes();
+                        let _ = self.db.delete_cf(cf_inodes, inode_key);
+
+                        let prefix = format!("{}:", inode);
+                        let mut it = self.db.raw_iterator_cf(cf_dir_entries);
+                        it.seek(prefix.as_bytes());
+                        while it.valid() {
+                            if let Some(key) = it.key() {
+                                let key_str = String::from_utf8_lossy(key);
+                                if key_str.starts_with(&prefix) {
+                                    let _ = self.db.delete_cf(cf_dir_entries, key);
+                                } else {
+                                    break;
+                                }
                             }
+                            it.next();
                         }
-                        it.next();
-                    }
 
-                    dir.remove(&name);
-                    if let Some(info) = inodes.remove(&inode) {
-                        dir_entries.remove(&inode);
-                        let is_dir = matches!(info.file_type, FileType::Directory);
-                        removed = Some(is_dir);
+                        dir.remove(&name);
+                        if let Some(info) = inodes.remove(&inode) {
+                            dir_entries.remove(&inode);
+                            let is_dir = matches!(info.file_type, FileType::Directory);
+                            removed = Some(is_dir);
+                        }
                     }
                 }
             }
@@ -1094,6 +1220,16 @@ impl ShardStore {
             }
         }
         result
+    }
+
+    /// Return a snapshot of every inode currently in this shard's in-memory
+    /// cache. Used by `MetaShardManager::collect_orphan_inodes` to find
+    /// inode records that have no corresponding dir entry on any shard
+    /// (left behind by a split-create that succeeded Phase A but failed
+    /// Phase B, or a split-delete that succeeded Phase A but failed Phase B).
+    pub fn list_all_inodes(&self) -> Vec<InodeInfo> {
+        let inodes = self.inodes.read().unwrap();
+        inodes.values().cloned().collect()
     }
 
     /// P4: 扫描所有 reliability_state == PendingReplicated 的文件 inode.
@@ -1744,25 +1880,23 @@ impl ShardStore {
         };
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::End);
-        for item in iter {
-            if let Ok((key, _)) = item {
-                if key.len() != 8 {
-                    continue;
-                }
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&key);
-                let inode = u64::from_be_bytes(arr);
-                if inode < range_start {
-                    // Gone below our range; no more candidates
-                    break;
-                }
-                if inode < range_end {
-                    // Found the max inode in our range
-                    return inode + 1;
-                }
-                // inode >= range_end: from a higher-numbered filer node,
-                // keep scanning backwards
+        for (key, _) in iter.flatten() {
+            if key.len() != 8 {
+                continue;
             }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&key);
+            let inode = u64::from_be_bytes(arr);
+            if inode < range_start {
+                // Gone below our range; no more candidates
+                break;
+            }
+            if inode < range_end {
+                // Found the max inode in our range
+                return inode + 1;
+            }
+            // inode >= range_end: from a higher-numbered filer node,
+            // keep scanning backwards
         }
         range_start
     }
@@ -1999,6 +2133,8 @@ impl ShardStore {
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
     ) {
         let info = match self.get_inode(inode) {
             Some(mut info) => {
@@ -2019,7 +2155,18 @@ impl ShardStore {
                 }
                 let now = chrono::Utc::now().timestamp() as u64;
                 info.ctime = now;
-                info.mtime = now;
+                // Only update mtime/atime when explicitly provided.
+                // The writeback path sends size=Some(N) with mtime=None to sync
+                // file size only; auto-setting mtime=now there would overwrite
+                // a prior utimes/touch -d value (T6c regression). The kernel's
+                // O_TRUNC SETATTR already carries mtime=Some(now) at file
+                // creation, and utimes sends mtime=Some(explicit_value).
+                if let Some(mt) = mtime {
+                    info.mtime = mt;
+                }
+                if let Some(at) = atime {
+                    info.atime = at;
+                }
                 info
             }
             None => return,
@@ -2475,5 +2622,72 @@ mod tests {
         // 删除 pending reclaim
         store.remove_pending_reclaim(1, 200);
         assert!(store.list_pending_reclaims().is_empty());
+    }
+
+    fn make_dir_inode(inode: u64, parent: u64, name: &str) -> InodeInfo {
+        let mut info = make_inode(inode, parent, name);
+        info.file_type = FileType::Directory;
+        info.mode = 0o040755;
+        info
+    }
+
+    #[test]
+    fn test_delete_directory_nonempty_is_rejected() {
+        // POSIX: rmdir on a non-empty directory must not delete it.
+        // The defensive check in delete_directory refuses to remove a
+        // directory that still has live (non-tombstoned) entries, preventing
+        // orphaned child inodes.
+        let store = make_store();
+
+        // parent dir (inode 1500) under root (1)
+        store
+            .create_inode_atomic(make_dir_inode(1500, 1, "parent"), 1, "parent")
+            .unwrap();
+        // child file (inode 1501) inside parent
+        store
+            .create_inode_atomic(make_inode(1501, 1500, "child.txt"), 1500, "child.txt")
+            .unwrap();
+
+        // parent is non-empty → delete_directory must NOT remove it
+        store.delete_directory(1, "parent".to_string());
+
+        assert!(
+            store.lookup(1, "parent").is_some(),
+            "non-empty directory should still exist after rejected rmdir"
+        );
+        assert!(
+            store.get_inode(1500).is_some(),
+            "non-empty directory inode should still exist"
+        );
+        assert!(
+            store.lookup(1500, "child.txt").is_some(),
+            "child entry should still exist (no orphaning)"
+        );
+        assert!(
+            store.get_inode(1501).is_some(),
+            "child inode should still exist (no orphaning)"
+        );
+    }
+
+    #[test]
+    fn test_delete_directory_empty_succeeds() {
+        // rmdir on an empty directory should remove it cleanly.
+        let store = make_store();
+
+        store
+            .create_inode_atomic(make_dir_inode(1500, 1, "empty"), 1, "empty")
+            .unwrap();
+        assert!(store.lookup(1, "empty").is_some());
+
+        store.delete_directory(1, "empty".to_string());
+
+        assert!(
+            store.lookup(1, "empty").is_none(),
+            "empty directory should be removed"
+        );
+        assert!(
+            store.get_inode(1500).is_none(),
+            "empty directory inode should be removed"
+        );
     }
 }

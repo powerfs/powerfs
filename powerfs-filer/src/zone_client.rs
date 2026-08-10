@@ -10,7 +10,7 @@
 use log::{debug, warn};
 use powerfs_common::types::{make_needle_id, needle_counter, needle_zone_id, ZoneInfo, ZoneVolume};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
-use powerfs_net::{FieldId, STATUS_ERR_REDIRECT, STATUS_OK};
+use powerfs_net::{FieldId, STATUS_ERR_BAD_REQUEST, STATUS_ERR_REDIRECT, STATUS_OK};
 
 /// Filer 节点发现信息 (随 RegisterFiler 请求一起发送, 替代 gRPC RegisterFiler)
 #[derive(Debug, Clone)]
@@ -25,6 +25,11 @@ pub struct FilerNodeRegistration {
     pub shard_count: u64,
     /// 该 filer 持有的 shard id 列表
     pub shard_ids: Vec<u64>,
+    /// 强制注册标志：为 true 时跳过 master 的 `shard_count` 一致性校验。
+    ///
+    /// 仅用于运维场景（如集群升级、临时 mismatch 调试）；正常启动应保持 false，
+    /// 让 master 拒绝配置不一致的 filer 进入集群，避免路由错位。
+    pub force: bool,
 }
 
 /// 向 Master 发送 RegisterFiler 请求，获取 Zone 分配 (多 Zone)。
@@ -69,6 +74,10 @@ pub async fn register_filer(
         if !shard_ids_blob.is_empty() {
             let _ = enc.add_bytes(FieldId::ShardIdList, &shard_ids_blob);
         }
+        // Force 标志：仅当 reg.force=true 时发送，让 master 跳过 shard_count 一致性校验。
+        // 旧 master 不识别此字段会忽略，所以总是发送是安全的；但仅在 force=true 时
+        // 显式置 1，避免日志噪音（master 端默认按 0 处理）。
+        let _ = enc.add_u8(FieldId::Force, if reg.force { 1 } else { 0 });
         let body = enc.into_bytes();
 
         // 统一 RPC 客户端 (Layer A): connect → handshake → send → read
@@ -117,6 +126,23 @@ pub async fn register_filer(
             return Err("redirected but no leader address".to_string());
         }
 
+        if reply.status == STATUS_ERR_BAD_REQUEST {
+            // Master 拒绝注册：通常是 shard_count 与集群现有 filer 不一致。
+            // 此错误不会因重试而消失——重试只会刷屏日志并推迟崩溃。
+            // 把 master 的 detail（body 中的可读消息）原样带回，由上层
+            // 决定是退出（正常启动）还是继续（force 模式已传过 force=1，
+            //   不应再走到这里；走到这里说明 master 是旧版本不识别 Force）。
+            let detail = String::from_utf8_lossy(&reply.body).to_string();
+            return Err(format!(
+                "RegisterFiler rejected by master (BAD_REQUEST): {}",
+                if detail.is_empty() {
+                    "shard_count mismatch (master did not provide detail)".to_string()
+                } else {
+                    detail
+                }
+            ));
+        }
+
         if reply.status != STATUS_OK {
             return Err(format!(
                 "RegisterFiler failed: status={:#06x}",
@@ -155,12 +181,15 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
                 let addr = dec.next_string(FieldId::Owner).unwrap_or_default();
                 let size = dec.next_u64(FieldId::Size).unwrap_or(0);
                 let used = dec.next_u64(FieldId::UsedSpace).unwrap_or(0);
+                // node_id (FieldId::Backend) — 旧版 Master 可能不发送，默认空字符串
+                let node_id = dec.next_string(FieldId::Backend).unwrap_or_default();
                 if !addr.is_empty() {
                     physical_volumes.push(ZoneVolume {
                         volume_id,
                         addr,
                         size,
                         used,
+                        node_id,
                     });
                 }
             }

@@ -1,28 +1,42 @@
+import { lazy, Suspense } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
+import { Spin } from 'antd'
 import Layout from './components/Layout'
 import ProtectedRoute from './components/ProtectedRoute'
 import Login from './pages/Login'
-import Dashboard from './pages/Dashboard'
-import Nodes from './pages/Nodes'
-import Volumes from './pages/Volumes'
-import Collections from './pages/Collections'
-import StorageDevices from './pages/StorageDevices'
-import BitrotScrub from './pages/BitrotScrub'
-import KV from './pages/KV'
-import Alerts from './pages/Alerts'
-import S3 from './pages/S3'
-import Fuse from './pages/Fuse'
-import Filer from './pages/Filer'
-import Shards from './pages/Shards'
-import ShardBalancing from './pages/ShardBalancing'
-import Conflicts from './pages/Conflicts'
-import Users from './pages/Users'
-import Roles from './pages/Roles'
-import AccessKeys from './pages/AccessKeys'
-import Benchmark from './pages/Benchmark'
-import ClusterTopology from './pages/ClusterTopology'
-import CapacityPlanning from './pages/CapacityPlanning'
-import Optimizations from './pages/Optimizations'
+
+// Route-level code splitting — each page is loaded on demand,
+// reducing the initial bundle from ~2.8MB to just the framework + Layout.
+const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Nodes = lazy(() => import('./pages/Nodes'))
+const Volumes = lazy(() => import('./pages/Volumes'))
+const Collections = lazy(() => import('./pages/Collections'))
+const StorageDevices = lazy(() => import('./pages/StorageDevices'))
+const BitrotScrub = lazy(() => import('./pages/BitrotScrub'))
+const KV = lazy(() => import('./pages/KV'))
+const Alerts = lazy(() => import('./pages/Alerts'))
+const S3 = lazy(() => import('./pages/S3'))
+const Fuse = lazy(() => import('./pages/Fuse'))
+const Filer = lazy(() => import('./pages/Filer'))
+const Shards = lazy(() => import('./pages/Shards'))
+const ShardBalancing = lazy(() => import('./pages/ShardBalancing'))
+const Conflicts = lazy(() => import('./pages/Conflicts'))
+const Users = lazy(() => import('./pages/Users'))
+const Roles = lazy(() => import('./pages/Roles'))
+const AccessKeys = lazy(() => import('./pages/AccessKeys'))
+const Benchmark = lazy(() => import('./pages/Benchmark'))
+const ClusterTopology = lazy(() => import('./pages/ClusterTopology'))
+const CapacityPlanning = lazy(() => import('./pages/CapacityPlanning'))
+const MasterRaft = lazy(() => import('./pages/MasterRaft'))
+const RuntimeConfig = lazy(() => import('./pages/RuntimeConfig'))
+
+function PageLoading() {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 300 }}>
+      <Spin size="large" />
+    </div>
+  )
+}
 
 function App() {
   return (
@@ -40,7 +54,9 @@ function App() {
           index
           element={
             <ProtectedRoute requireAdmin>
-              <Dashboard />
+              <Suspense fallback={<PageLoading />}>
+                <Dashboard />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -48,7 +64,9 @@ function App() {
           path="nodes"
           element={
             <ProtectedRoute requireAdmin>
-              <Nodes />
+              <Suspense fallback={<PageLoading />}>
+                <Nodes />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -56,7 +74,19 @@ function App() {
           path="cluster-topology"
           element={
             <ProtectedRoute requireAdmin>
-              <ClusterTopology />
+              <Suspense fallback={<PageLoading />}>
+                <ClusterTopology />
+              </Suspense>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="master-raft"
+          element={
+            <ProtectedRoute requireAdmin>
+              <Suspense fallback={<PageLoading />}>
+                <MasterRaft />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -64,7 +94,9 @@ function App() {
           path="capacity-planning"
           element={
             <ProtectedRoute requireAdmin>
-              <CapacityPlanning />
+              <Suspense fallback={<PageLoading />}>
+                <CapacityPlanning />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -72,7 +104,9 @@ function App() {
           path="storage-devices"
           element={
             <ProtectedRoute requireAdmin>
-              <StorageDevices />
+              <Suspense fallback={<PageLoading />}>
+                <StorageDevices />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -80,7 +114,9 @@ function App() {
           path="volumes"
           element={
             <ProtectedRoute requireAdmin>
-              <Volumes />
+              <Suspense fallback={<PageLoading />}>
+                <Volumes />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -88,7 +124,9 @@ function App() {
           path="collections"
           element={
             <ProtectedRoute requireAdmin>
-              <Collections />
+              <Suspense fallback={<PageLoading />}>
+                <Collections />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -96,25 +134,45 @@ function App() {
           path="bitrot-scrub"
           element={
             <ProtectedRoute requireAdmin>
-              <BitrotScrub />
+              <Suspense fallback={<PageLoading />}>
+                <BitrotScrub />
+              </Suspense>
             </ProtectedRoute>
           }
         />
-        <Route path="kv" element={<KV />} />
+        <Route
+          path="kv"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <KV />
+            </Suspense>
+          }
+        />
         <Route
           path="benchmark"
           element={
             <ProtectedRoute requireAdmin>
-              <Benchmark />
+              <Suspense fallback={<PageLoading />}>
+                <Benchmark />
+              </Suspense>
             </ProtectedRoute>
           }
         />
-        <Route path="s3" element={<S3 />} />
+        <Route
+          path="s3"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <S3 />
+            </Suspense>
+          }
+        />
         <Route
           path="fuse"
           element={
             <ProtectedRoute requireAdmin>
-              <Fuse />
+              <Suspense fallback={<PageLoading />}>
+                <Fuse />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -122,7 +180,9 @@ function App() {
           path="conflicts"
           element={
             <ProtectedRoute requireAdmin>
-              <Conflicts />
+              <Suspense fallback={<PageLoading />}>
+                <Conflicts />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -130,7 +190,9 @@ function App() {
           path="filer"
           element={
             <ProtectedRoute requireAdmin>
-              <Filer />
+              <Suspense fallback={<PageLoading />}>
+                <Filer />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -138,7 +200,9 @@ function App() {
           path="shards"
           element={
             <ProtectedRoute requireAdmin>
-              <Shards />
+              <Suspense fallback={<PageLoading />}>
+                <Shards />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -146,25 +210,45 @@ function App() {
           path="shard-balancing"
           element={
             <ProtectedRoute requireAdmin>
-              <ShardBalancing />
+              <Suspense fallback={<PageLoading />}>
+                <ShardBalancing />
+              </Suspense>
             </ProtectedRoute>
           }
         />
-        <Route path="alerts" element={<Alerts />} />
         <Route
-          path="optimizations"
+          path="alerts"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <Alerts />
+            </Suspense>
+          }
+        />
+        <Route
+          path="runtime-config"
           element={
             <ProtectedRoute requireAdmin>
-              <Optimizations />
+              <Suspense fallback={<PageLoading />}>
+                <RuntimeConfig />
+              </Suspense>
             </ProtectedRoute>
           }
         />
-        <Route path="access-keys" element={<AccessKeys />} />
+        <Route
+          path="access-keys"
+          element={
+            <Suspense fallback={<PageLoading />}>
+              <AccessKeys />
+            </Suspense>
+          }
+        />
         <Route
           path="users"
           element={
             <ProtectedRoute requireAdmin>
-              <Users />
+              <Suspense fallback={<PageLoading />}>
+                <Users />
+              </Suspense>
             </ProtectedRoute>
           }
         />
@@ -172,7 +256,9 @@ function App() {
           path="roles"
           element={
             <ProtectedRoute requireAdmin>
-              <Roles />
+              <Suspense fallback={<PageLoading />}>
+                <Roles />
+              </Suspense>
             </ProtectedRoute>
           }
         />

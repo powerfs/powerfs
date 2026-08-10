@@ -48,6 +48,10 @@ pub struct ZoneVolume {
     pub addr: String,
     pub size: u64,
     pub used: u64,
+    /// 所属物理节点 ID (用于 EC 分片节点级反亲和性)
+    /// `#[serde(default)]` 保证旧数据反序列化兼容
+    #[serde(default)]
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]

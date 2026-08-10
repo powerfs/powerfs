@@ -31,10 +31,10 @@ ip = "0.0.0.0"             # 绑定所有接口
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
 master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
 data_dir = "/data/filer"
-shard_count = 2
+shard_count = 3
 raft_id = 2
 raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
-inline_max_size = 4096           # P2.5: Inline 小文件优化 (4KB 阈值, 超过自动迁移 Flat)
+inline_max_size = 8192        # K2: 启用 Inline 小文件优化 (8KB 阈值, 内核已支持)
 
 [s3]
 port = 9000

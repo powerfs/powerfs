@@ -22,10 +22,10 @@ export default function Login() {
     setLoading(true)
     try {
       await login(values.username, values.password)
-      message.success('登录成功')
+      message.success('Login successful')
       navigate(redirectTo, { replace: true })
     } catch (err: any) {
-      const msg = err?.response?.data?.message || err?.message || '登录失败'
+      const msg = err?.response?.data?.message || err?.message || 'Login failed'
       message.error(msg)
     } finally {
       setLoading(false)
@@ -48,14 +48,14 @@ export default function Login() {
           boxShadow: '0 10px 40px rgba(0,0,0,0.3)',
           borderRadius: 8,
         }}
-        bodyStyle={{ padding: '32px 32px 24px' }}
+        styles={{ body: { padding: '32px 32px 24px' } }}
       >
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <Logo size={48} />
           <Title level={3} style={{ marginTop: 12, marginBottom: 4 }}>
             PowerFS
           </Title>
-          <Text type="secondary">监控管理平台</Text>
+          <Text type="secondary">Monitoring & Management Platform</Text>
         </div>
         <Form
           name="login"
@@ -66,15 +66,15 @@ export default function Login() {
         >
           <Form.Item
             name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
+            rules={[{ required: true, message: 'Please enter username' }]}
           >
-            <Input prefix={<UserOutlined />} placeholder="用户名" />
+            <Input prefix={<UserOutlined />} placeholder="Username" />
           </Form.Item>
           <Form.Item
             name="password"
-            rules={[{ required: true, message: '请输入密码' }]}
+            rules={[{ required: true, message: 'Please enter password' }]}
           >
-            <Input.Password prefix={<LockOutlined />} placeholder="密码" />
+            <Input.Password prefix={<LockOutlined />} placeholder="Password" />
           </Form.Item>
           <Form.Item style={{ marginBottom: 0 }}>
             <Button
@@ -83,7 +83,7 @@ export default function Login() {
               loading={loading}
               block
             >
-              登录
+              Sign In
             </Button>
           </Form.Item>
         </Form>

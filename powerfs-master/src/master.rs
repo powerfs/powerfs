@@ -923,16 +923,29 @@ impl MasterNode {
         let _grpc_port = params.grpc_port;
 
         let mut topology = self.topology.write().unwrap();
-        let node = DataNodeInfo::new(
-            params.node_id,
-            params.address,
-            rack_id,
-            dc_id,
-            params.http_port,
-            params.grpc_port,
-            params.public_url,
-        );
-        topology.get_or_create_node(node);
+        // Refresh mutable fields on existing nodes (every heartbeat), instead
+        // of only inserting when absent. get_or_create_node uses or_insert_with
+        // which never updates an existing entry, so stale persisted ports
+        // (e.g. grpc_port from a previous run) would linger forever. Callers
+        // build needle-write addresses from grpc_port, so it must stay fresh.
+        let existed = topology.get_node_mut(&params.node_id).map(|existing| {
+            existing.address = params.address.clone();
+            existing.grpc_port = params.grpc_port;
+            existing.http_port = params.http_port;
+            existing.public_url = params.public_url.clone();
+        }).is_some();
+        if !existed {
+            let node = DataNodeInfo::new(
+                params.node_id,
+                params.address,
+                rack_id,
+                dc_id,
+                params.http_port,
+                params.grpc_port,
+                params.public_url,
+            );
+            topology.get_or_create_node(node);
+        }
 
         info!("Applied AddNode: {} at {}:{}", node_id, address, http_port);
 
@@ -1715,12 +1728,35 @@ impl MasterNode {
                 file_key,
             };
 
-            let host_node = nodes
+            let mut host_node = nodes
                 .iter()
                 .find(|n| n.id == host_node_id)
                 .cloned()
                 .into_iter()
                 .collect::<Vec<_>>();
+
+            // Authoritative net address fix: DataNodeInfo.grpc_port may be stale
+            // (the heartbeat handler historically stored http_port there, and
+            // get_or_create_node does not refresh fields on existing nodes).
+            // VolumeRoute.addr is always "ip:net_port" from the latest heartbeat,
+            // so use its port to override grpc_port. Callers (S3 PutObject/Get/
+            // Delete in both Master and Filer) build the needle-write address as
+            // "ip:grpc_port"; without this they hit the HTTP metrics port
+            // (e.g. :8093) instead of the powerfs-net data port (e.g. :8901),
+            // causing "Protocol error: invalid handshake response".
+            if let Some(route) = self.volume_routes.read().unwrap().get(&volume_id.0) {
+                if let Some(net_port) = route
+                    .addr
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u32>().ok())
+                {
+                    if net_port > 0 {
+                        for n in host_node.iter_mut() {
+                            n.grpc_port = net_port;
+                        }
+                    }
+                }
+            }
 
             info!(
                 "Reused existing volume: {} for collection {:?}, fid: {},{},{}",
@@ -2214,6 +2250,69 @@ impl MasterNode {
             .collect()
     }
 
+    /// 节点级反亲和性 volume 选择：从 sorted_routes 中选 count 个 volume，
+    /// 尽量让每个 volume 落在不同物理节点上。
+    ///
+    /// 算法：按 node_id 分组（组内保持按空闲率排序），round-robin 跨节点选取。
+    /// - 节点数 >= count: 每个 volume 落不同节点（完美反亲和）
+    /// - 节点数 < count: 先每节点取 1 个，剩余按空闲率排序补充
+    /// - exclude_ids: 跳过这些 volume_id（用于 zone 扩容时排除已有 volume）
+    fn select_volumes_node_anti_affinity(
+        sorted_routes: &[VolumeRoute],
+        count: usize,
+        exclude_ids: &std::collections::HashSet<u64>,
+    ) -> Vec<powerfs_common::types::ZoneVolume> {
+        use std::collections::HashMap;
+
+        // 按 node_id 分组（跳过已排除的 volume），组内保持 sorted_routes 的空闲率排序
+        let mut node_groups: Vec<(&str, Vec<&VolumeRoute>)> = Vec::new();
+        let mut node_map: HashMap<&str, usize> = HashMap::new();
+        for r in sorted_routes {
+            if exclude_ids.contains(&r.volume_id) {
+                continue;
+            }
+            let nid = r.node_id.as_str();
+            if let std::collections::hash_map::Entry::Vacant(e) = node_map.entry(nid) {
+                e.insert(node_groups.len());
+                node_groups.push((nid, Vec::new()));
+            }
+            let idx = node_map[nid];
+            node_groups[idx].1.push(r);
+        }
+
+        let num_nodes = node_groups.len();
+        if num_nodes == 0 {
+            return Vec::new();
+        }
+
+        // Round-robin 跨节点选取：每轮从每个节点取空闲率最高的 1 个 volume
+        let mut result = Vec::with_capacity(count);
+        loop {
+            let mut picked = false;
+            for (_, group) in node_groups.iter_mut().take(num_nodes) {
+                if result.len() >= count {
+                    break;
+                }
+                if let Some(r) = group.first().copied() {
+                    result.push(powerfs_common::types::ZoneVolume {
+                        volume_id: r.volume_id,
+                        addr: r.addr.clone(),
+                        size: r.size,
+                        used: r.used,
+                        node_id: r.node_id.clone(),
+                    });
+                    group.remove(0);
+                    picked = true;
+                }
+            }
+            if !picked || result.len() >= count {
+                break;
+            }
+        }
+
+        result
+    }
+
     /// Register Filer: 分配 Zone + 选物理 volume
     ///
     /// 1. 分配新 zone_id (或复用已有)
@@ -2225,6 +2324,7 @@ impl MasterNode {
     ///   - 首次注册: 创建 1 个新 Zone, 返回 Vec(1)
     ///   - 重启再注册: 返回该 filer_id 的所有已有 Zone, 不自动创建新 Zone
     ///   - 扩容 (未来): 返回旧 Zone + 创建新 Zone
+    ///
     /// P1.3: Zone 注册/更新通过 Raft 持久化, Master 重启后从 Raft 日志重放恢复.
     pub async fn register_filer_zone(
         &self,
@@ -2240,9 +2340,9 @@ impl MasterNode {
                 .collect()
         };
 
-        // 选 N 个物理 volume (按空闲比例排序, 取前 N 个)
+        // 选 N 个物理 volume (按空闲比例排序, 节点级反亲和性选取)
         // N 自动从 EC 配置推导: max(3, ec_data + ec_parity), 无需用户额外配置.
-        //   - EC(4+2) → N=6, 保证 anti-affinity 每个 shard 落不同 volume
+        //   - EC(4+2) → N=6, 保证 anti-affinity 每个 shard 落不同节点
         //   - 无 EC   → N=3, 满足副本复制需求
         // 用户仍可用 POWERFS_ZONE_VOLUME_COUNT 显式覆盖.
         let ec_data = std::env::var("POWERFS_EC_DATA_SHARDS")
@@ -2275,16 +2375,14 @@ impl MasterNode {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let physical_volumes: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
-            .iter()
-            .take(zone_volume_count)
-            .map(|r| powerfs_common::types::ZoneVolume {
-                volume_id: r.volume_id,
-                addr: r.addr.clone(),
-                size: r.size,
-                used: r.used,
-            })
-            .collect();
+        // 节点级反亲和性选取: 尽量让 N 个 volume 分布在 N 个不同物理节点上
+        let empty_exclude = std::collections::HashSet::new();
+        let physical_volumes: Vec<powerfs_common::types::ZoneVolume> =
+            Self::select_volumes_node_anti_affinity(
+                &sorted_routes,
+                zone_volume_count,
+                &empty_exclude,
+            );
 
         if !existing.is_empty() {
             // 重注册: 保留已有 Zone 的 volume_id 集合 (稳定性),
@@ -2295,7 +2393,7 @@ impl MasterNode {
                 sorted_routes.iter().map(|r| (r.volume_id, r)).collect();
             let mut result = Vec::with_capacity(existing.len());
             for mut zone in existing {
-                // 更新已有 volume 的 addr/size/used, 保留 volume_id 不变
+                // 更新已有 volume 的 addr/size/used/node_id, 保留 volume_id 不变
                 zone.physical_volumes = zone
                     .physical_volumes
                     .iter()
@@ -2307,6 +2405,7 @@ impl MasterNode {
                                 addr: r.addr.clone(),
                                 size: r.size,
                                 used: r.used,
+                                node_id: r.node_id.clone(),
                             })
                     })
                     .collect();
@@ -2320,21 +2419,16 @@ impl MasterNode {
                 }
                 // Zone 扩容: 如果现有 volume 数少于配置值 (POWERFS_ZONE_VOLUME_COUNT),
                 // 从可用路由中补充新 volume (不替换已有 volume, 只追加).
-                // 这支持集群扩容后 EC 转换获取更多 volume.
+                // 使用节点级反亲和性选取, 优先从未覆盖的节点补充.
                 if zone.physical_volumes.len() < zone_volume_count {
                     let existing_ids: std::collections::HashSet<u64> =
                         zone.physical_volumes.iter().map(|v| v.volume_id).collect();
-                    let added: Vec<powerfs_common::types::ZoneVolume> = sorted_routes
-                        .iter()
-                        .filter(|r| !existing_ids.contains(&r.volume_id))
-                        .take(zone_volume_count - zone.physical_volumes.len())
-                        .map(|r| powerfs_common::types::ZoneVolume {
-                            volume_id: r.volume_id,
-                            addr: r.addr.clone(),
-                            size: r.size,
-                            used: r.used,
-                        })
-                        .collect();
+                    let added: Vec<powerfs_common::types::ZoneVolume> =
+                        Self::select_volumes_node_anti_affinity(
+                            &sorted_routes,
+                            zone_volume_count - zone.physical_volumes.len(),
+                            &existing_ids,
+                        );
                     if !added.is_empty() {
                         info!(
                             "MASTER_ZONE: zone_id={} expanding {} -> {} volumes (added {})",
@@ -2344,6 +2438,42 @@ impl MasterNode {
                             added.len()
                         );
                         zone.physical_volumes.extend(added);
+                    }
+                }
+
+                // 节点级反亲和性修复: 如果现有 volumes 集中在少数节点上,
+                // 且当前有更多节点可用, 重新选择 volumes 以改善节点分布.
+                // 这在集群扩容 (新 volume 节点加入) 后尤为重要.
+                // 安全性: zone volumes 仅用于新文件分配, 不影响已有文件访问
+                // (已有文件的 volume_id 存储在 inode 元数据中, 不依赖 zone 成员).
+                {
+                    let current_nodes: std::collections::HashSet<&str> = zone
+                        .physical_volumes
+                        .iter()
+                        .map(|v| v.node_id.as_str())
+                        .collect();
+                    let available_nodes: std::collections::HashSet<&str> =
+                        sorted_routes.iter().map(|r| r.node_id.as_str()).collect();
+                    let target_nodes = zone_volume_count.min(available_nodes.len());
+
+                    if current_nodes.len() < target_nodes {
+                        warn!(
+                            "MASTER_ZONE: zone_id={} anti-affinity re-selection: \
+                             current_nodes={} < target_nodes={} (available={}), \
+                             re-selecting {} volumes across {} nodes",
+                            zone.zone_id,
+                            current_nodes.len(),
+                            target_nodes,
+                            available_nodes.len(),
+                            zone_volume_count,
+                            target_nodes
+                        );
+                        let empty_exclude = std::collections::HashSet::new();
+                        zone.physical_volumes = Self::select_volumes_node_anti_affinity(
+                            &sorted_routes,
+                            zone_volume_count,
+                            &empty_exclude,
+                        );
                     }
                 }
                 // P1.3: propose UpdateZone (apply 到内存 + Raft 日志持久化)
@@ -3288,5 +3418,132 @@ mod tests {
             "round-robin must distribute across all volumes, got: {:?}",
             seen
         );
+    }
+
+    // ========== 节点级反亲和性测试 ==========
+
+    fn make_route(vid: u64, node_id: &str, used: u64, size: u64) -> VolumeRoute {
+        VolumeRoute {
+            volume_id: vid,
+            addr: format!("10.0.0.{}:8080", vid),
+            size,
+            used,
+            file_count: 0,
+            state: VolumeState::Available,
+            node_id: node_id.to_string(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// 测试: 6 节点各 4 volumes, 选 6 个 → 每个 volume 应落不同节点
+    #[test]
+    fn test_node_anti_affinity_perfect_distribution() {
+        // 6 nodes × 4 volumes = 24 volumes, all same free ratio
+        let mut routes: Vec<VolumeRoute> = Vec::new();
+        for node_idx in 0..6u64 {
+            for vol_idx in 0..4u64 {
+                let vid = node_idx * 4 + vol_idx + 1;
+                routes.push(make_route(vid, &format!("node-{}", node_idx), 0, 100));
+            }
+        }
+        // Sort by free ratio (all same, so order preserved)
+        routes.sort_by(|a, b| {
+            let fa = 1.0 - (a.used as f64 / a.size as f64);
+            let fb = 1.0 - (b.used as f64 / b.size as f64);
+            fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let exclude = std::collections::HashSet::new();
+        let result = MasterNode::select_volumes_node_anti_affinity(&routes, 6, &exclude);
+
+        assert_eq!(result.len(), 6, "should select exactly 6 volumes");
+
+        let unique_nodes: std::collections::HashSet<&str> =
+            result.iter().map(|v| v.node_id.as_str()).collect();
+        assert_eq!(
+            unique_nodes.len(),
+            6,
+            "6 volumes should span 6 different nodes, got: {:?}",
+            unique_nodes
+        );
+    }
+
+    /// 测试: 2 节点各 3 volumes, 选 6 个 → 每节点 3 个 (节点数 < count)
+    #[test]
+    fn test_node_anti_affinity_fewer_nodes_than_count() {
+        let routes = vec![
+            make_route(1, "node-A", 0, 100),
+            make_route(2, "node-A", 10, 100),
+            make_route(3, "node-A", 20, 100),
+            make_route(4, "node-B", 0, 100),
+            make_route(5, "node-B", 10, 100),
+            make_route(6, "node-B", 20, 100),
+        ];
+        let mut sorted = routes.clone();
+        sorted.sort_by(|a, b| {
+            let fa = 1.0 - (a.used as f64 / a.size as f64);
+            let fb = 1.0 - (b.used as f64 / b.size as f64);
+            fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let exclude = std::collections::HashSet::new();
+        let result = MasterNode::select_volumes_node_anti_affinity(&sorted, 6, &exclude);
+
+        assert_eq!(result.len(), 6);
+        let node_a_count = result.iter().filter(|v| v.node_id == "node-A").count();
+        let node_b_count = result.iter().filter(|v| v.node_id == "node-B").count();
+        assert_eq!(node_a_count, 3, "node-A should have 3 volumes");
+        assert_eq!(node_b_count, 3, "node-B should have 3 volumes");
+    }
+
+    /// 测试: exclude_ids 排除已有 volume (zone 扩容场景)
+    #[test]
+    fn test_node_anti_affinity_excludes_existing() {
+        let routes = vec![
+            make_route(1, "node-A", 0, 100),
+            make_route(2, "node-B", 0, 100),
+            make_route(3, "node-C", 0, 100),
+            make_route(4, "node-D", 0, 100),
+        ];
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(1u64); // 已有 volume 1 (node-A)
+
+        let result = MasterNode::select_volumes_node_anti_affinity(&routes, 1, &exclude);
+        assert_eq!(result.len(), 1);
+        assert_ne!(
+            result[0].volume_id, 1,
+            "excluded volume should not be selected"
+        );
+        assert_ne!(
+            result[0].node_id, "node-A",
+            "should prefer a different node when expanding"
+        );
+    }
+
+    /// 测试: 旧测试场景 (2 节点, 6 volumes 集中) — 反亲和性应避免集中
+    #[test]
+    fn test_node_anti_affinity_prevents_concentration() {
+        // 模拟 P0 bug 场景: 2 节点, 每节点 3 volumes, 空闲率最高
+        // 旧逻辑: top-6 全在这 2 节点 → 停 1 节点丢 3 分片
+        // 新逻辑: 仍在这 2 节点 (因为只有 2 节点), 但每节点最多 3 个
+        // 实际修复在 Master 层保证 zone 分配时 6 volumes 分布在 6 节点
+        let routes = vec![
+            make_route(1, "node-A", 0, 100),
+            make_route(2, "node-A", 0, 100),
+            make_route(3, "node-A", 0, 100),
+            make_route(4, "node-B", 0, 100),
+            make_route(5, "node-B", 0, 100),
+            make_route(6, "node-B", 0, 100),
+        ];
+
+        let exclude = std::collections::HashSet::new();
+        let result = MasterNode::select_volumes_node_anti_affinity(&routes, 6, &exclude);
+
+        assert_eq!(result.len(), 6);
+        // 6 volumes across 2 nodes → 3 per node (best possible with 2 nodes)
+        let node_a_count = result.iter().filter(|v| v.node_id == "node-A").count();
+        let node_b_count = result.iter().filter(|v| v.node_id == "node-B").count();
+        assert_eq!(node_a_count, 3);
+        assert_eq!(node_b_count, 3);
     }
 }

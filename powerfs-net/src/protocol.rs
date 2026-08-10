@@ -716,6 +716,10 @@ pub const STATUS_ERR_NO_SPACE: u16 = 8;
 pub const STATUS_ERR_BAD_FD: u16 = 9;
 pub const STATUS_ERR_SERVER_ERROR: u16 = 10;
 pub const STATUS_ERR_REDIRECT: u16 = 11;
+/// Bad request — the client supplied an invalid/illegal argument or state.
+/// Used by RegisterFiler when shard_count mismatches the cluster's
+/// established value (unless the client passes Force=1).
+pub const STATUS_ERR_BAD_REQUEST: u16 = 12;
 
 // ============================================================================
 // TLV Field IDs
@@ -892,6 +896,20 @@ pub enum FieldId {
     /// 范围压缩的 volume_ids: [start_volume_id: u64 LE] [count: u32 LE] = 12 bytes.
     /// 当 volume_ids 连续时使用, 替代 VolumeIds (256卷 2KB→12B).
     VolumeIdsRange = 0xB6,
+
+    // ===== Topology extension (0xB7-0xB9) =====
+    /// Filer 节点数量 (u64). GetTopology 响应中 filer 段的条目数.
+    /// 后接每个 filer: FilerAddress + NetPort + IsDir(healthy) + ShardIdList.
+    FilerListEntries = 0xB7,
+    /// 全局 shard_count (u64). Master 持久化的集群级常量, 用于
+    /// `calculate_shard(inode) = (inode / 1_000_000) % total_shards`.
+    /// Fuse 客户端必须使用此值, 而非本地硬编码, 否则与 filer 路由不一致.
+    TotalShards = 0xB8,
+    /// Force 标志 (u8, 0/1). RegisterFiler 请求中携带, 用于绕过
+    /// shard_count 一致性校验 (例如首次启动集群或修复配置不一致时).
+    /// 正常安装时, 若新注册 filer 的 shard_count 与 master 已知值
+    /// 不一致, master 拒绝注册并返回错误; force=1 时允许通过 (warn).
+    Force = 0xB9,
 }
 
 impl FieldId {
@@ -989,6 +1007,9 @@ impl FieldId {
             0xB4 => Some(Self::XattrValue),
             0xB5 => Some(Self::ReplicaChunks),
             0xB6 => Some(Self::VolumeIdsRange),
+            0xB7 => Some(Self::FilerListEntries),
+            0xB8 => Some(Self::TotalShards),
+            0xB9 => Some(Self::Force),
             _ => None,
         }
     }
@@ -1306,6 +1327,14 @@ pub fn check_resp_limits(
     body_len: usize,
     data_seg_len: usize,
 ) -> Result<(), &'static str> {
+    // Raft inter-node messages (MsgType::RaftMessage = 0x0090) legitimately
+    // carry large payloads (snapshots, log batches) up to MAX_FRAME_SIZE.
+    // They are already validated by FrameHeader::validate() against
+    // MAX_FRAME_SIZE, so exempt them from the tighter MAX_BODY_SIZE /
+    // MAX_DATA_SIZE limits that apply to regular metadata/data operations.
+    if msg_type == MsgType::RaftMessage as u16 {
+        return Ok(());
+    }
     if body_len > MAX_BODY_SIZE {
         log::error!(
             "{} msg=0x{:04x} seq={} body_len={} > MAX_BODY_SIZE={}",
@@ -1799,6 +1828,20 @@ mod tests {
     #[test]
     fn test_check_resp_limits_zero() {
         assert!(check_resp_limits(0x0010, 1, 0, 0).is_ok());
+    }
+
+    /// R5 单元测试：Raft 消息 (0x0090) 豁免 body/data 大小限制
+    /// Raft 消息（快照、日志批）可合法达到 MAX_FRAME_SIZE (4MB)
+    #[test]
+    fn test_check_resp_limits_raft_exempt() {
+        let raft = MsgType::RaftMessage as u16;
+        // body 远超 MAX_BODY_SIZE 但在 MAX_FRAME_SIZE 内 → 通过
+        assert!(check_resp_limits(raft, 1, 1024 * 1024, 0).is_ok());
+        assert!(check_resp_limits(raft, 1, 3 * 1024 * 1024, 0).is_ok());
+        // data 段超 MAX_DATA_SIZE 也通过（Raft 不分 body/data）
+        assert!(check_resp_limits(raft, 1, 0, 3 * 1024 * 1024).is_ok());
+        // 零长度也通过
+        assert!(check_resp_limits(raft, 1, 0, 0).is_ok());
     }
 
     /// R5 单元测试：常量值与内核一致
