@@ -403,6 +403,7 @@ mod tests {
                 active_lease_count: 0,
             }],
             cluster_avg_load: 0.0,
+            pinned_volumes: std::collections::HashMap::new(),
         }
     }
 

@@ -1806,6 +1806,52 @@ impl MasterService for MasterGrpcServer {
             })),
         }
     }
+
+    async fn pin_volume(
+        &self,
+        request: Request<PinVolumeRequest>,
+    ) -> Result<Response<VolumeManageResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.pin_volume_to_node(req.volume_id, &req.node_id) {
+                Ok(()) => Ok(Response::new(VolumeManageResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(VolumeManageResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(VolumeManageResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn unpin_volume(
+        &self,
+        request: Request<VolumeIdRequest>,
+    ) -> Result<Response<VolumeManageResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.unpin_volume(req.volume_id) {
+                Ok(()) => Ok(Response::new(VolumeManageResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(VolumeManageResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(VolumeManageResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
 }
 
 // ========================================================================

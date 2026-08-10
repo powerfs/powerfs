@@ -131,6 +131,9 @@ fn draining_volumes(snapshot: &ClusterSnapshot) -> impl Iterator<Item = &VolumeR
 }
 
 /// Active volumes whose usage exceeds `volume_full_threshold`.
+///
+/// Pinned volumes are excluded: their data must stay on the pinned node, so
+/// they are not eligible as cold-data migration sources.
 fn over_threshold_active_volumes<'a>(
     snapshot: &'a ClusterSnapshot,
     policy: &RebalancePolicy,
@@ -141,6 +144,7 @@ fn over_threshold_active_volumes<'a>(
         .filter(|v| {
             v.state == VolumeRuntimeState::Active && v.usage_ratio() > policy.volume_full_threshold
         })
+        .filter(|v| !snapshot.pinned_volumes.contains_key(&v.volume_id))
         .collect()
 }
 
@@ -174,9 +178,9 @@ fn pick_target_volume<'a>(
 ///
 /// Imbalance = max load_score / min load_score among healthy, non-maintenance
 /// nodes. If above `load_imbalance_threshold`, move volume ids from the
-/// busiest node to the idlest. `volume_ids` is left empty — the executor
-/// selects which volumes actually move (those whose needles have no active
-/// lease).
+/// busiest node to the idlest. `volume_ids` is populated with the non-pinned
+/// Active volumes on the busiest node — pinned volumes are protected from
+/// outbound migration.
 fn compute_hot_data_action(
     snapshot: &ClusterSnapshot,
     policy: &RebalancePolicy,
@@ -207,10 +211,23 @@ fn compute_hot_data_action(
         return None;
     }
 
+    // Collect non-pinned Active volumes on the busiest node. The executor
+    // iterates these to migrate needles to the idle node.
+    let volume_ids: Vec<u64> = snapshot
+        .volumes
+        .iter()
+        .filter(|v| {
+            v.state == VolumeRuntimeState::Active
+                && v.node_id == busiest.node_id
+                && !snapshot.pinned_volumes.contains_key(&v.volume_id)
+        })
+        .map(|v| v.volume_id)
+        .collect();
+
     Some(RebalanceAction::MigrateHotData {
         from_node: busiest.node_id.clone(),
         to_node: idlest.node_id.clone(),
-        volume_ids: Vec::new(),
+        volume_ids,
     })
 }
 
@@ -269,6 +286,7 @@ mod tests {
             nodes,
             shards: Vec::new(),
             cluster_avg_load: 0.3,
+            pinned_volumes: std::collections::HashMap::new(),
         }
     }
 
@@ -465,6 +483,66 @@ mod tests {
             assert_eq!(*to_volume, 3);
         } else {
             panic!("expected a drain migration");
+        }
+    }
+
+    #[test]
+    fn test_pinned_volume_excluded_from_cold_migration() {
+        // Volume 1 is over-threshold with enough cold needles, but pinned to
+        // its current node → must NOT be a cold-data migration source.
+        let mut src = vol(1, "n1", 1, 100, 90, VolumeRuntimeState::Active); // 90% > 0.85
+        src.cold_needle_count = 20;
+        let mut snap = make_snapshot(
+            vec![src, vol(2, "n2", 1, 100, 10, VolumeRuntimeState::Active)],
+            vec![
+                node("n1", 0.2, NodeRuntimeState::Healthy),
+                node("n2", 0.2, NodeRuntimeState::Healthy),
+            ],
+        );
+        snap.pinned_volumes.insert(1, "n1".to_string());
+
+        let actions = lb().analyze(&snap);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RebalanceAction::MigrateColdData { from_volume: 1, .. })),
+            "pinned volume must not be a cold-data migration source"
+        );
+    }
+
+    #[test]
+    fn test_pinned_volume_excluded_from_hot_migration() {
+        // n1 is overloaded (0.9 vs 0.2). Volume 1 on n1 is pinned → must NOT
+        // appear in the hot-data migration's volume_ids. Volume 4 on n1 is
+        // unpinned → SHOULD appear.
+        let snap = make_snapshot(
+            vec![
+                vol(1, "n1", 1, 100, 10, VolumeRuntimeState::Active), // pinned
+                vol(4, "n1", 1, 100, 10, VolumeRuntimeState::Active), // not pinned
+            ],
+            vec![
+                node("n1", 0.9, NodeRuntimeState::Healthy),
+                node("n2", 0.2, NodeRuntimeState::Healthy),
+            ],
+        );
+        let mut snap = snap;
+        snap.pinned_volumes.insert(1, "n1".to_string());
+
+        let actions = lb().analyze(&snap);
+        if let Some(RebalanceAction::MigrateHotData { volume_ids, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, RebalanceAction::MigrateHotData { .. }))
+        {
+            assert!(
+                !volume_ids.contains(&1),
+                "pinned volume 1 must not be in hot-data volume_ids"
+            );
+            assert!(
+                volume_ids.contains(&4),
+                "unpinned volume 4 should be in hot-data volume_ids"
+            );
+        } else {
+            panic!("expected a hot-data migration action");
         }
     }
 }
