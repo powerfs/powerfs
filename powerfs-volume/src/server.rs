@@ -315,6 +315,7 @@ impl VolumeServer {
                             powerfs_common::types::VolumeState::Available => "available",
                             powerfs_common::types::VolumeState::Full => "full",
                             powerfs_common::types::VolumeState::ReadOnly => "read_only",
+                            powerfs_common::types::VolumeState::Draining => "draining",
                             powerfs_common::types::VolumeState::Deleting => "deleting",
                         }
                         .to_string(),
@@ -322,6 +323,7 @@ impl VolumeServer {
                         read_only: matches!(
                             volume.state,
                             powerfs_common::types::VolumeState::ReadOnly
+                                | powerfs_common::types::VolumeState::Draining
                         ),
                         replica_placement: volume.replica_count,
                         ttl: volume.ttl.0 as u32,

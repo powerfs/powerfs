@@ -59,6 +59,7 @@ impl VolumeProvider for MasterNode {
                     powerfs_common::types::VolumeState::Available => "available",
                     powerfs_common::types::VolumeState::Full => "full",
                     powerfs_common::types::VolumeState::ReadOnly => "readonly",
+                    powerfs_common::types::VolumeState::Draining => "draining",
                     powerfs_common::types::VolumeState::Deleting => "deleting",
                 };
                 state_str == state

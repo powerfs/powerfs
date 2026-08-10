@@ -397,6 +397,7 @@ fn test_volume_state_all_variants() {
         VolumeState::Available,
         VolumeState::Full,
         VolumeState::ReadOnly,
+        VolumeState::Draining,
         VolumeState::Deleting,
     ];
     // Ensure all variants are different
