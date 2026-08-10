@@ -818,6 +818,49 @@ impl MasterNetHandler {
         ))
     }
 
+    /// Handle StatFs request from kernel client.
+    ///
+    /// Aggregates all volumes' size/used/file_count from the volume router
+    /// to return real filesystem statistics. The kernel caches this with
+    /// a 30s TTL, so real-time precision is not required.
+    ///
+    /// Response TLV fields:
+    ///   Size       (u64) — total bytes across all volumes
+    ///   Free       (u64) — free bytes (total - used)
+    ///   Nlink      (u64) — total file count (reused as total_inodes)
+    ///   FreeInodes (u64) — free inodes (estimated, no hard limit)
+    ///   Blksize    (u32) — block size (4096)
+    async fn handle_statfs(&self, msg: &NetMessage) -> powerfs_net::NetResult<NetMessage> {
+        let volumes = self.master.list_volume_routes();
+
+        let total_size: u64 = volumes.iter().map(|v| v.size).sum();
+        let total_used: u64 = volumes.iter().map(|v| v.used).sum();
+        let total_files: u64 = volumes.iter().map(|v| v.file_count).sum();
+        let free = total_size.saturating_sub(total_used);
+
+        // For free inodes: PowerFS has no hard inode limit (metadata stored in
+        // Raft). Return a large number so df doesn't show "0% free inodes".
+        let free_inodes = 1_000_000_000u64;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Size, total_size);
+        enc.add_u64(FieldId::Free, free);
+        enc.add_u64(FieldId::Nlink, total_files);
+        enc.add_u64(FieldId::FreeInodes, free_inodes);
+        enc.add_u32(FieldId::Blksize, 4096);
+
+        debug!(
+            "MASTER_STATFS: volumes={}, total_size={}, used={}, free={}, files={}",
+            volumes.len(),
+            total_size,
+            total_used,
+            free,
+            total_files
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes(), Vec::new()))
+    }
+
     /// Handle ListFilers request from kernel client.
     /// Returns all registered filer nodes with their powerfs-net addresses,
     /// allowing the kernel to populate its connection pool without manual
@@ -971,6 +1014,7 @@ impl NetHandler for MasterNetHandler {
             MsgType::GetTopology => self.handle_get_topology(msg).await,
             MsgType::RegisterFiler => self.handle_register_filer(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
+            MsgType::StatFs => self.handle_statfs(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
