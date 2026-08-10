@@ -89,6 +89,9 @@ pub struct MasterNode {
     /// `None` until `start()` constructs it; shared so status/monitor queries
     /// can read migration task state.
     rebalance_engine: RwLock<Option<Arc<crate::allocator_integration::RebalanceEngine>>>,
+    /// Allocator management API (volume scaling, migration control, policy
+    /// updates). `None` until `start()` constructs it.
+    management_api: RwLock<Option<Arc<crate::allocator_integration::MasterManagementApi>>>,
 }
 
 #[derive(Clone)]
@@ -416,6 +419,7 @@ impl MasterNode {
             zone_registry: RwLock::new(HashMap::new()),
             next_zone_id: Arc::new(AtomicU32::new(1)),
             rebalance_engine: RwLock::new(None),
+            management_api: RwLock::new(None),
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -2286,6 +2290,12 @@ impl MasterNode {
             .unwrap_or_default()
     }
 
+    /// Return a cloned `Arc` to the management API if initialized.
+    /// For gRPC handlers / admin tools that need to call `ManagementApi` methods.
+    pub fn management_api(&self) -> Option<Arc<crate::allocator_integration::MasterManagementApi>> {
+        self.management_api.read().unwrap().clone()
+    }
+
     /// Build a [`powerfs_allocator::ClusterSnapshot`] from the Master's
     /// current heartbeat-aggregated state.
     ///
@@ -3117,7 +3127,10 @@ impl MasterNode {
             let engine =
                 crate::allocator_integration::RebalanceEngine::new_logging(volume_default_size);
             *self.rebalance_engine.write().unwrap() = Some(Arc::clone(&engine));
-            crate::allocator_integration::spawn_rebalance_loop(engine, Arc::clone(&self));
+            crate::allocator_integration::spawn_rebalance_loop(
+                Arc::clone(&engine),
+                Arc::clone(&self),
+            );
             info!(
                 "Allocator rebalance engine started (scan_interval={}s)",
                 self.rebalance_engine
@@ -3127,6 +3140,14 @@ impl MasterNode {
                     .map(|e| e.scan_interval_secs())
                     .unwrap_or(0)
             );
+
+            // Management API: volume scaling + migration control + policy updates.
+            let mgmt = crate::allocator_integration::MasterManagementApi::new(
+                Arc::clone(&self),
+                Arc::clone(&engine),
+            );
+            *self.management_api.write().unwrap() = Some(Arc::new(mgmt));
+            info!("Allocator management API initialized");
         }
 
         let master_clone = self.clone();
@@ -3330,6 +3351,7 @@ impl Clone for MasterNode {
             zone_registry: RwLock::new(self.zone_registry.read().unwrap().clone()),
             next_zone_id: self.next_zone_id.clone(),
             rebalance_engine: RwLock::new(self.rebalance_engine.read().unwrap().clone()),
+            management_api: RwLock::new(self.management_api.read().unwrap().clone()),
         }
     }
 }
