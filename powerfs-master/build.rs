@@ -13,5 +13,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["../powerfs-volume/proto/powerfs.proto"],
         &["../powerfs-volume/proto"],
     )?;
+
+    // Filer proto: same subdirectory trick to avoid collision.
+    let filer_out_dir = format!("{}/filer_proto", out_dir);
+    std::fs::create_dir_all(&filer_out_dir).expect("failed to create filer_proto out dir");
+    tonic_build::configure().out_dir(&filer_out_dir).compile(
+        &["../powerfs-filer/proto/filer.proto"],
+        &["../powerfs-filer/proto"],
+    )?;
     Ok(())
 }

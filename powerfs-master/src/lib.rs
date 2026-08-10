@@ -1,5 +1,7 @@
 pub mod allocator_integration;
 pub mod collection;
+pub mod filer_client;
+pub mod filer_proto;
 pub mod kv_cache_service;
 pub mod lock_manager;
 pub mod master;
