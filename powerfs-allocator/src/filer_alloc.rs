@@ -185,7 +185,9 @@ pub(crate) fn select_volume_by_free_space(volumes: &[ZoneVolume]) -> Option<&Zon
     volumes.iter().max_by(|a, b| {
         let free_a = free_ratio(a);
         let free_b = free_ratio(b);
-        free_a.partial_cmp(&free_b).unwrap_or(std::cmp::Ordering::Equal)
+        free_a
+            .partial_cmp(&free_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
     })
 }
 
@@ -240,11 +242,14 @@ mod tests {
     #[test]
     fn test_pick_for_new_file_selects_most_free() {
         let alloc = FilerAllocator::new();
-        let zones = vec![zone(1, vec![
-            zv(1, "n1", 100, 80), // 20% free
-            zv(2, "n2", 100, 20), // 80% free
-            zv(3, "n3", 100, 50), // 50% free
-        ])];
+        let zones = vec![zone(
+            1,
+            vec![
+                zv(1, "n1", 100, 80), // 20% free
+                zv(2, "n2", 100, 20), // 80% free
+                zv(3, "n3", 100, 50), // 50% free
+            ],
+        )];
 
         let pick = alloc.pick_for_new_file(&zones).unwrap();
         assert_eq!(pick.volume_id, 2); // most free space
@@ -267,14 +272,17 @@ mod tests {
     fn test_pick_for_stripe_file_anti_affinity() {
         let alloc = FilerAllocator::new();
         // 3 nodes, 2 volumes each → 6 volumes
-        let zones = vec![zone(1, vec![
-            zv(1, "n1", 100, 0),
-            zv(2, "n1", 100, 0),
-            zv(3, "n2", 100, 0),
-            zv(4, "n2", 100, 0),
-            zv(5, "n3", 100, 0),
-            zv(6, "n3", 100, 0),
-        ])];
+        let zones = vec![zone(
+            1,
+            vec![
+                zv(1, "n1", 100, 0),
+                zv(2, "n1", 100, 0),
+                zv(3, "n2", 100, 0),
+                zv(4, "n2", 100, 0),
+                zv(5, "n3", 100, 0),
+                zv(6, "n3", 100, 0),
+            ],
+        )];
 
         let picks = alloc.pick_for_stripe_file(&zones, 3).unwrap();
         assert_eq!(picks.len(), 3);
@@ -304,14 +312,17 @@ mod tests {
     fn test_pick_for_stripe_file_fewer_nodes_than_count() {
         let alloc = FilerAllocator::new();
         // 2 nodes, 3 volumes each → 6 volumes, request 5
-        let zones = vec![zone(1, vec![
-            zv(1, "n1", 100, 0),
-            zv(2, "n1", 100, 0),
-            zv(3, "n1", 100, 0),
-            zv(4, "n2", 100, 0),
-            zv(5, "n2", 100, 0),
-            zv(6, "n2", 100, 0),
-        ])];
+        let zones = vec![zone(
+            1,
+            vec![
+                zv(1, "n1", 100, 0),
+                zv(2, "n1", 100, 0),
+                zv(3, "n1", 100, 0),
+                zv(4, "n2", 100, 0),
+                zv(5, "n2", 100, 0),
+                zv(6, "n2", 100, 0),
+            ],
+        )];
 
         let picks = alloc.pick_for_stripe_file(&zones, 5).unwrap();
         assert_eq!(picks.len(), 5);
@@ -334,8 +345,7 @@ mod tests {
         let picks = alloc.pick_for_stripe_file(&zones, 4).unwrap();
         assert_eq!(picks.len(), 4);
         // Each pick carries its originating zone_id
-        let zone_ids: std::collections::HashSet<u32> =
-            picks.iter().map(|p| p.zone_id).collect();
+        let zone_ids: std::collections::HashSet<u32> = picks.iter().map(|p| p.zone_id).collect();
         assert!(zone_ids.contains(&1));
         assert!(zone_ids.contains(&2));
     }

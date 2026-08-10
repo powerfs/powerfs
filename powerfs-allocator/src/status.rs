@@ -216,10 +216,7 @@ impl SnapshotStatusQuery {
 
     /// Attach a shared migration-task list (used by P7 MigrationScheduler).
     /// Until P7, this stays empty and `migration_tasks()` returns `vec![]`.
-    pub fn with_migration_tasks(
-        mut self,
-        tasks: Arc<RwLock<Vec<MigrationTaskStatus>>>,
-    ) -> Self {
+    pub fn with_migration_tasks(mut self, tasks: Arc<RwLock<Vec<MigrationTaskStatus>>>) -> Self {
         self.migration_tasks = tasks;
         self
     }
@@ -327,9 +324,7 @@ impl StatusQuery for SnapshotStatusQuery {
 
 /// Map node_id → zone_id by scanning volumes (a volume's node_id maps to
 /// its zone_id). Nodes with no volumes default to zone 0.
-fn build_node_zone_lookup(
-    snap: &ClusterSnapshot,
-) -> std::collections::HashMap<String, u32> {
+fn build_node_zone_lookup(snap: &ClusterSnapshot) -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
     for v in &snap.volumes {
         map.entry(v.node_id.clone()).or_insert(v.zone_id);
@@ -411,10 +406,7 @@ mod tests {
         }
     }
 
-    fn build_query(
-        snapshot: ClusterSnapshot,
-        config: ClusterStaticConfig,
-    ) -> SnapshotStatusQuery {
+    fn build_query(snapshot: ClusterSnapshot, config: ClusterStaticConfig) -> SnapshotStatusQuery {
         SnapshotStatusQuery::new(
             Arc::new(RwLock::new(snapshot)),
             Arc::new(RwLock::new(config)),
@@ -567,10 +559,7 @@ mod tests {
         let mut n = make_node("n1", 0.1, NodeRuntimeState::Healthy);
         n.in_maintenance = true;
         let snap = make_snapshot(
-            vec![
-                n,
-                make_node("n2", 0.2, NodeRuntimeState::Healthy),
-            ],
+            vec![n, make_node("n2", 0.2, NodeRuntimeState::Healthy)],
             vec![],
         );
         let q = build_query(snap, ClusterStaticConfig::default());
@@ -599,14 +588,8 @@ mod tests {
         // Master updates the snapshot (new heartbeat)
         {
             let mut s = shared_snap.write().unwrap();
-            s.volumes.push(make_volume(
-                2,
-                "n1",
-                1,
-                100,
-                20,
-                VolumeRuntimeState::Active,
-            ));
+            s.volumes
+                .push(make_volume(2, "n1", 1, 100, 20, VolumeRuntimeState::Active));
             s.version += 1;
         }
 
