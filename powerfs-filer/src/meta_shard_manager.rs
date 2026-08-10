@@ -594,21 +594,51 @@ impl MetaShardManager {
         self.wait_for_entry_removed(shard_dir, parent_inode, name)
             .await;
 
-        // Phase B: delete the inode record on its own shard. Best-effort:
-        // if this fails, GC will collect the orphan inode later.
-        let cmd_ino = ShardCommand::DeleteInode { inode };
-        if let Err(e) = self
-            .raft_group_manager
-            .propose(shard_ino, cmd_ino.serialize())
-            .await
-        {
-            log::warn!(
-                "DeleteInode propose failed for inode {} on shard {}: {}. \
-                 Dir entry already removed; inode will be GC'd.",
-                inode,
-                shard_ino.0,
-                e
-            );
+        // Phase B: Check nlink to decide between DecrementNlink and DeleteInode.
+        // For hardlinks (nlink > 1), only decrement nlink so other links survive.
+        // For the last link (nlink == 1), delete the inode entirely.
+        let nlink = {
+            let stores = self.shard_stores.read().unwrap();
+            if let Some(store) = stores.get(&shard_ino) {
+                store.get_inode(inode).map(|info| info.nlink).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+
+        if nlink > 1 {
+            // Hardlink: decrement nlink, keep inode alive for remaining links.
+            let cmd = ShardCommand::DecrementNlink { inode };
+            if let Err(e) = self
+                .raft_group_manager
+                .propose(shard_ino, cmd.serialize())
+                .await
+            {
+                log::warn!(
+                    "DecrementNlink propose failed for inode {} on shard {}: {}. \
+                     Dir entry already removed; nlink may be stale.",
+                    inode,
+                    shard_ino.0,
+                    e
+                );
+            }
+        } else {
+            // Last link: delete the inode record. Best-effort: if this fails,
+            // GC will collect the orphan inode later.
+            let cmd_ino = ShardCommand::DeleteInode { inode };
+            if let Err(e) = self
+                .raft_group_manager
+                .propose(shard_ino, cmd_ino.serialize())
+                .await
+            {
+                log::warn!(
+                    "DeleteInode propose failed for inode {} on shard {}: {}. \
+                     Dir entry already removed; inode will be GC'd.",
+                    inode,
+                    shard_ino.0,
+                    e
+                );
+            }
         }
 
         Ok(())
@@ -1502,7 +1532,7 @@ impl MetaShardManager {
             name: name.to_string(),
             parent_inode,
             file_type: FileType::Symlink,
-            size: 0,
+            size: target.len() as u64,
             mtime: now,
             atime: now,
             ctime: now,
