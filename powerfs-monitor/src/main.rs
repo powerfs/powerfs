@@ -6544,8 +6544,9 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
     info!("Alert evaluator started");
 
     loop {
+        // 1. 指标阈值告警 (CPU/磁盘/KV, 走 pending/duration)
         let alerts = alert_engine.evaluate_rules().await;
-        for alert in alerts {
+        for alert in &alerts {
             info!("Alert triggered: {}", alert.name);
             let msg = WsAlertUpdate {
                 message_type: "alert_trigger".to_string(),
@@ -6553,8 +6554,205 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
             };
             broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap()).await;
         }
+
+        // 2. 事件驱动告警 (节点离线/Filer 不可达/Raft 无 Leader/分片不均衡)
+        let event_alerts = evaluate_event_alerts(&alert_engine, &app_state).await;
+        for alert in &event_alerts {
+            info!("Event alert triggered: {} - {}", alert.name, alert.message);
+            let msg = WsAlertUpdate {
+                message_type: "alert_trigger".to_string(),
+                payload: serde_json::to_value(alert).unwrap(),
+            };
+            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap()).await;
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
     }
+}
+
+/// 事件驱动告警评估 — 检查节点状态、Filer 可达性、Shard 健康、分片均衡。
+/// 与指标阈值告警不同, 这些告警直接触发 (无 pending 阶段), 条件不满足时自动恢复。
+async fn evaluate_event_alerts(
+    alert_engine: &AlertEngine,
+    state: &Arc<AppState>,
+) -> Vec<AlertInfo> {
+    let mut new_alerts = Vec::new();
+    let nodes = state.metric_store.get_nodes().await;
+
+    // ── 1. 节点离线告警 ──
+    let offline_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.status == "offline")
+        .collect();
+    if offline_nodes.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-node-offline").await;
+    } else {
+        let names: Vec<&str> = offline_nodes.iter().map(|n| n.id.as_str()).collect();
+        let node_types: Vec<&str> = offline_nodes.iter().map(|n| n.node_type.as_str()).collect();
+        let unique_types: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            node_types.iter().copied().filter(|t| seen.insert(*t)).collect()
+        };
+        let source = format!("nodes:{}", unique_types.join(","));
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-node-offline",
+                "节点离线",
+                "critical",
+                &source,
+                &format!("以下节点心跳超时, 已标记离线: {}", names.join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 2. Filer 不可达 + Shard 健康 ──
+    let endpoints = list_filer_endpoints(state).await;
+    let filer_admin = state.filer_admin.clone();
+    let filer_status_futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = filer_admin.clone();
+            async move { (ep.node_id.clone(), client.get_json(&ep, "/admin/status").await) }
+        })
+        .collect();
+    let filer_status_results = futures::future::join_all(filer_status_futures).await;
+
+    let mut unreachable_filers = Vec::new();
+    let mut total_leaders = 0u64;
+    let mut filer_leader_counts: Vec<(String, u64)> = Vec::new();
+
+    for (node_id, result) in &filer_status_results {
+        match result {
+            Ok(json) => {
+                let lc = json.get("leader_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                total_leaders += lc;
+                filer_leader_counts.push((node_id.clone(), lc));
+            }
+            Err(_) => {
+                unreachable_filers.push(node_id.clone());
+            }
+        }
+    }
+
+    // Filer 不可达告警
+    if unreachable_filers.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-filer-unreachable").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-filer-unreachable",
+                "Filer 不可达",
+                "critical",
+                &format!("filers:{}", unreachable_filers.join(",")),
+                &format!("以下 Filer admin API 不可达: {}", unreachable_filers.join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 3. Shard 健康 (无 Leader / 副本不足) ──
+    let shards = fetch_cluster_shards(state).await;
+    let no_leader_shards: Vec<_> = shards
+        .iter()
+        .filter(|s| !s.replicas.iter().any(|r| r.is_leader))
+        .map(|s| s.shard_id)
+        .collect();
+    let insufficient_shards: Vec<_> = shards
+        .iter()
+        .filter(|s| s.replicas.len() < 2)
+        .map(|s| s.shard_id)
+        .collect();
+
+    // Raft 组无 Leader
+    if no_leader_shards.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-no-raft-leader").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-no-raft-leader",
+                "Raft 组无 Leader",
+                "critical",
+                &format!("shards:{}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
+                &format!("以下分片无 Leader, Raft 选举未完成: {}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // Shard 副本不足
+    if insufficient_shards.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-shard-insufficient").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-shard-insufficient",
+                "Shard 副本不足",
+                "warning",
+                &format!("shards:{}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
+                &format!("以下分片副本数 < 2, 可用性风险: {}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 4. 分片不均衡 + Filer 无 Leader ──
+    if !filer_leader_counts.is_empty() && total_leaders > 0 {
+        let max_lc = filer_leader_counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let min_lc = filer_leader_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
+        let no_leader_filers: Vec<_> = filer_leader_counts
+            .iter()
+            .filter(|(_, c)| *c == 0)
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        // 分片不均衡 (max - min > 1)
+        if max_lc.saturating_sub(min_lc) <= 1 {
+            alert_engine.resolve_alerts_by_rule("rule-shard-imbalance").await;
+        } else {
+            if let Some(alert) = alert_engine
+                .trigger_event_alert(
+                    "rule-shard-imbalance",
+                    "分片不均衡",
+                    "warning",
+                    "cluster",
+                    &format!("Leader 分布不均衡: max={}, min={}", max_lc, min_lc),
+                )
+                .await
+            {
+                new_alerts.push(alert);
+            }
+        }
+
+        // Filer 无 Leader 分片
+        if no_leader_filers.is_empty() || max_lc <= 1 {
+            alert_engine.resolve_alerts_by_rule("rule-filer-no-leader").await;
+        } else {
+            if let Some(alert) = alert_engine
+                .trigger_event_alert(
+                    "rule-filer-no-leader",
+                    "Filer 无 Leader 分片",
+                    "warning",
+                    &format!("filers:{}", no_leader_filers.join(",")),
+                    &format!("以下 Filer 无 Leader 分片, 而其他节点有多个: {}", no_leader_filers.join(", ")),
+                )
+                .await
+            {
+                new_alerts.push(alert);
+            }
+        }
+    }
+
+    new_alerts
 }
 
 async fn start_metric_broadcaster(metric_store: Arc<MetricStore>, app_state: Arc<AppState>) {

@@ -193,6 +193,7 @@ export interface KVAccessKey {
 
 export interface AlertInfo {
   id: string
+  rule_id: string
   name: string
   severity: 'critical' | 'warning' | 'info'
   status: 'firing' | 'pending' | 'resolved'

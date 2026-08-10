@@ -205,10 +205,10 @@ export const mockKVSessions: KVSessionInfo[] = [
 ]
 
 export const mockAlerts: AlertInfo[] = [
-  { id: 'alert-1', name: '磁盘使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点磁盘使用率达到88.3%', created_at: '2026-07-04T10:30:00Z' },
-  { id: 'alert-2', name: '内存使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点内存使用率达到92.1%', created_at: '2026-07-04T10:25:00Z' },
-  { id: 'alert-3', name: 'CPU使用率过高', severity: 'critical', status: 'firing', source: 'node-3', message: '节点CPU使用率达到89.5%', created_at: '2026-07-04T10:20:00Z' },
-  { id: 'alert-4', name: 'Volume已满', severity: 'info', status: 'resolved', source: 'volume-5', message: 'Volume 5已达到容量上限', created_at: '2026-07-04T09:00:00Z', resolved_at: '2026-07-04T09:30:00Z' },
+  { id: 'alert-1', rule_id: 'rule-2', name: '磁盘使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点磁盘使用率达到88.3%', created_at: '2026-07-04T10:30:00Z' },
+  { id: 'alert-2', rule_id: 'rule-1', name: '内存使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点内存使用率达到92.1%', created_at: '2026-07-04T10:25:00Z' },
+  { id: 'alert-3', rule_id: 'rule-1', name: 'CPU使用率过高', severity: 'critical', status: 'firing', source: 'node-3', message: '节点CPU使用率达到89.5%', created_at: '2026-07-04T10:20:00Z' },
+  { id: 'alert-4', rule_id: 'rule-node-offline', name: 'Volume已满', severity: 'info', status: 'resolved', source: 'volume-5', message: 'Volume 5已达到容量上限', created_at: '2026-07-04T09:00:00Z', resolved_at: '2026-07-04T09:30:00Z' },
 ]
 
 export const mockAlertRules: AlertRule[] = [
