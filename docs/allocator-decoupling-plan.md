@@ -1,6 +1,6 @@
 # 资源分配策略松耦合方案
 
-> 状态：方案规划，待定是否实施
+> 状态：已实施（P1-P9 + Master 集成全部完成，ManagementApi 15/15 方法实现）
 > 日期：2026-08-10
 > 目标：将元数据和数据分配策略从服务中解耦为独立 crate，提供统一接口规范，支持策略扩展和管理接口，为后续 AI Agent 接入负载均衡奠定基础。
 
@@ -907,7 +907,7 @@ pub struct ShardSplitPlan {
 2. **元数据迁移**：已确认暂不支持，仅做数据迁移。
 3. **管理接口鉴权**：已确认需要 dry-run 模式。完整鉴权方案待定（可能复用 RBAC）。
 4. **needle_id 所有权**：分配器给 `suggested_needle_id`，服务侧原子 CAS 确认。并发冲突时用 `alternatives` 重试。
-5. **策略热更新**：是否支持运行时切换策略（不重启），还是需要重启服务。待定。
+5. **策略热更新**：~~是否支持运行时切换策略（不重启），还是需要重启服务。待定。~~ → **已解决**：通过 `SetPlacementStrategy` Raft 命令实现运行时热切换，无需重启服务。
 6. **Shard 减容**：当前 defer，依赖元数据迁移能力。加 shard 可通过 ShardMap range 分裂实现，无需迁移。
 7. **ShardMap 初始迁移**：从取模改为映射表需要一次性切换。可启动时根据 `shard_count` 生成初始映射表，行为与取模一致，后续分裂时才产生差异。
 
@@ -927,7 +927,7 @@ pub struct ShardSplitPlan {
 | P8 | Shard 伸缩（range 分裂） | ✅ | c80bed0f |
 | P9 | VolumeManager + VolumeControl 伸缩管理 | ✅ | a3635c4f |
 
-### 9.2 Master 集成（进行中）
+### 9.2 Master 集成（已完成）
 
 **已完成：RebalanceEngine 接入 master 后台 tick loop**
 
@@ -941,7 +941,7 @@ pub struct ShardSplitPlan {
 
 **设计决策**：
 - 周期 tick loop（非 heartbeat 回调）：`build_cluster_snapshot` 是聚合视图，适合周期性消费，不适合在每次 heartbeat 触发（高频）。
-- `LoggingExecutor` 而非真实迁移：真实数据迁移需要 volume server 冷数据追踪 + filer needle→inode 反查（计划 §5.2 阶段三前提），属于高风险大改动，留作后续里程碑。
+- ~~`LoggingExecutor` 而非真实迁移：真实数据迁移需要 volume server 冷数据追踪 + filer needle→inode 反查（计划 §5.2 阶段三前提），属于高风险大改动，留作后续里程碑。~~ → **已由 `MasterMigrationExecutor` 替代**（见下方"真实 MigrationExecutor 实现"小节）。
 - sync→async 边界：allocator 全 sync，master 是 tokio async。`run_tick` 为 sync，由 `spawn_blocking` 调用；`is_leader().await` 在 async loop 中检查。
 
 **已完成：VolumeState::Draining 变体 + MasterVolumeControl**
@@ -1011,8 +1011,7 @@ pub struct ShardSplitPlan {
 - gRPC：`PinVolume` / `UnpinVolume` RPC + handler（master.proto + server.rs），复用 `VolumeManageResponse`。
 - 测试：allocator 79（+2 pin 行为测试），master 99，clippy 0 警告，fmt clean。
 
-**待完成**：
-- ~~`set_placement_strategy`：需要运行时策略注册表（低优先级）。~~ → **已完成**
+**全部完成。ManagementApi trait 15/15 方法已实现，0 NYI stub 残留。**
 
 **已完成：set_placement_strategy（运行时策略热切换）**
 
