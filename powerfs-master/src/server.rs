@@ -1852,6 +1852,29 @@ impl MasterService for MasterGrpcServer {
             })),
         }
     }
+
+    async fn set_placement_strategy(
+        &self,
+        request: Request<SetPlacementStrategyRequest>,
+    ) -> Result<Response<VolumeManageResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.set_placement_strategy(&req.strategy) {
+                Ok(()) => Ok(Response::new(VolumeManageResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(VolumeManageResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(VolumeManageResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
 }
 
 // ========================================================================

@@ -550,17 +550,18 @@ impl MasterManagementApi {
     }
 }
 
-fn nyi(what: &str) -> ManageError {
-    ManageError::InvalidState(format!("not yet implemented: {what}"))
-}
-
 impl ManagementApi for MasterManagementApi {
     // ===== Configuration management =====
 
-    fn set_placement_strategy(&self, _strategy: &str) -> Result<(), ManageError> {
-        Err(nyi(
-            "placement strategy switching requires a runtime strategy registry",
-        ))
+    fn set_placement_strategy(&self, strategy: &str) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .set_placement_strategy(strategy)
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
     }
 
     fn update_migration_policy(&self, policy: MigrationPolicy) -> Result<(), ManageError> {
