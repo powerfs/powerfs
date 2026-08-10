@@ -92,6 +92,8 @@ service MasterService {
     rpc UpdateMigrationPolicy(UpdateMigrationPolicyRequest) returns (PolicyUpdateResponse);
     rpc UpdateRebalancePolicy(UpdateRebalancePolicyRequest) returns (PolicyUpdateResponse);
     rpc SetNodeMaintenance(SetNodeMaintenanceRequest) returns (MigrationControlResponse);
+    rpc PinVolume(PinVolumeRequest) returns (VolumeManageResponse);
+    rpc UnpinVolume(VolumeIdRequest) returns (VolumeManageResponse);
 }
 
 message Heartbeat {
@@ -1673,4 +1675,9 @@ message PolicyUpdateResponse {
 message SetNodeMaintenanceRequest {
     string node_id = 1;
     bool enabled = 2;
+}
+
+message PinVolumeRequest {
+    uint64 volume_id = 1;
+    string node_id = 2;
 }

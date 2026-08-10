@@ -113,6 +113,17 @@ pub enum RaftCommand {
         node_id: String,
         enabled: bool,
     },
+    /// Pin a volume to a specific node (ops override). The LoadBalancer will
+    /// not migrate a pinned volume's data away from the pinned node.
+    /// Replicated so all master replicas agree on volume pins.
+    PinVolume {
+        volume_id: u64,
+        node_id: String,
+    },
+    /// Remove a volume pin, restoring normal LoadBalancer migration behaviour.
+    UnpinVolume {
+        volume_id: u64,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)

@@ -150,7 +150,9 @@ impl FilerManagementClient {
         volume_id: u64,
         needle_ids: &[u64],
     ) -> Result<Vec<FilerChunkEntry>, String> {
-        let addr = self.first_filer_address().ok_or("no healthy filer available")?;
+        let addr = self
+            .first_filer_address()
+            .ok_or("no healthy filer available")?;
         let channel = Channel::from_shared(format!("http://{}", addr))
             .map_err(|e| format!("invalid filer address: {}", e))?
             .connect()
@@ -196,7 +198,9 @@ impl FilerManagementClient {
         chunks: &[(u64, u64, u64, u64, u32)], // (offset, size, needle_id, volume_id, crc32)
         client_id: &str,
     ) -> Result<(), String> {
-        let addr = self.first_filer_address().ok_or("no healthy filer available")?;
+        let addr = self
+            .first_filer_address()
+            .ok_or("no healthy filer available")?;
         let channel = Channel::from_shared(format!("http://{}", addr))
             .map_err(|e| format!("invalid filer address: {}", e))?
             .connect()
