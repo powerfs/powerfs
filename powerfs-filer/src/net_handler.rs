@@ -84,7 +84,9 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
     let off_list: Vec<u64> = chunks.iter().map(|c| c.offset).collect();
     info!(
         "K3-DBG detect_placement: chunks={} volume_ids={:?} offsets={:?}",
-        chunks.len(), vid_list, off_list
+        chunks.len(),
+        vid_list,
+        off_list
     );
 
     if chunks.len() < 2 {
@@ -270,7 +272,9 @@ impl FilerNetHandler {
             return None;
         }
 
-        let picks = self.filer_allocator.pick_for_stripe_file(&zone_views, count as usize)?;
+        let picks = self
+            .filer_allocator
+            .pick_for_stripe_file(&zone_views, count as usize)?;
         if picks.is_empty() {
             return Some(Vec::new());
         }
@@ -280,18 +284,15 @@ impl FilerNetHandler {
         for pick in &picks {
             let zone = zones.iter().find(|z| z.zone_id == pick.zone_id);
             if let Some(zone) = zone {
-                let needle_id =
-                    crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
                 result.push((pick.volume_id, needle_id));
             }
         }
 
         let unique_volumes: std::collections::HashSet<u64> =
             result.iter().map(|(v, _)| *v).collect();
-        let unique_nodes: std::collections::HashSet<&str> = picks
-            .iter()
-            .map(|p| p.node_id.as_str())
-            .collect();
+        let unique_nodes: std::collections::HashSet<&str> =
+            picks.iter().map(|p| p.node_id.as_str()).collect();
         let num_nodes = {
             let mut s: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for zv in &zone_views {
@@ -597,7 +598,9 @@ impl FilerNetHandler {
         // and close skips chunk sync. Result: data lost on remount.
         if info.chunks.is_empty() {
             let layout = FileLayout {
-                placement: Placement::Inline { max_size: INLINE_HARD_LIMIT },
+                placement: Placement::Inline {
+                    max_size: INLINE_HARD_LIMIT,
+                },
                 reliability: info.reliability.clone(),
                 reliability_state: info.reliability_state.clone(),
                 compression: info.compression_state.clone(),
@@ -632,7 +635,9 @@ impl FilerNetHandler {
             reliability: info.reliability.clone(),
             reliability_state: info.reliability_state.clone(),
             compression: info.compression_state.clone(),
-            encoding: ChunkEncoding::PerChunk { chunks: chunks.clone() },
+            encoding: ChunkEncoding::PerChunk {
+                chunks: chunks.clone(),
+            },
         };
 
         encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
@@ -745,7 +750,8 @@ impl FilerNetHandler {
                 // 调试: LOOKUP 失败时打印 directory_entries 中的 key 用于对比
                 let shard_id = self.shard_strategy.calculate_shard(parent_ino);
                 let entries = self.meta_shard_manager.list_directory(parent_ino);
-                let entry_names: Vec<String> = entries.iter()
+                let entry_names: Vec<String> = entries
+                    .iter()
                     .map(|e| format!("'{}'(len={})", e.name, e.name.len()))
                     .collect();
                 warn!(
@@ -1094,7 +1100,16 @@ impl FilerNetHandler {
                 let setattr_shard = self.shard_strategy.calculate_shard(ino);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(ino, setattr_shard, None, Some(mode), Some(uid), Some(gid), None, None)
+                    .setattr(
+                        ino,
+                        setattr_shard,
+                        None,
+                        Some(mode),
+                        Some(uid),
+                        Some(gid),
+                        None,
+                        None,
+                    )
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
@@ -1253,7 +1268,16 @@ impl FilerNetHandler {
                 let shard_id = self.shard_strategy.calculate_shard(info.inode);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid), None, None)
+                    .setattr(
+                        info.inode,
+                        shard_id,
+                        None,
+                        Some(mode),
+                        Some(uid),
+                        Some(gid),
+                        None,
+                        None,
+                    )
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）
