@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use powerfs_common::build_info::BuildInfo;
 use powerfs_common::{
-    config::PowerFsConfig,
+    config::{PowerFsConfig, ServiceType},
     error::{PowerFsError, Result},
 };
 use powerfs_master::{
@@ -113,7 +113,7 @@ async fn run_s3(cfg: PowerFsConfig) -> Result<()> {
 }
 
 fn load_config(config_path: &str) -> PowerFsConfig {
-    match PowerFsConfig::load_or_error(config_path) {
+    match PowerFsConfig::load_for_service(config_path, ServiceType::S3) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", config_path);
             cfg

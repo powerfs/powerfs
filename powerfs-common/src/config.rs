@@ -2,19 +2,39 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-/// PowerFS 主配置 - 必须通过配置文件提供所有必需值，无默认值
+/// 服务类型枚举 - 用于按服务类型校验配置
+/// 每个服务只需配置自己的段落，其他段落可省略（使用默认空值）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceType {
+    Master,
+    Volume,
+    Filer,
+    S3,
+    Fuse,
+    Monitor,
+}
+
+/// PowerFS 主配置 - 每个服务只需提供自己段落的配置，其他段落可省略
+/// （serde 会填充默认空值，validate_for 按 ServiceType 只校验本服务字段）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PowerFsConfig {
+    #[serde(default)]
     pub global: GlobalConfig,
+    #[serde(default)]
     pub master: MasterConfig,
+    #[serde(default)]
     pub volume: VolumeConfig,
+    #[serde(default)]
     pub filer: FilerConfig,
+    #[serde(default)]
     pub s3: S3Config,
+    #[serde(default)]
     pub fuse: FuseConfig,
+    #[serde(default)]
     pub monitor: MonitorConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
     pub log_level: String,
     pub log_file: Option<String>,
@@ -22,7 +42,7 @@ pub struct GlobalConfig {
 }
 
 /// Master 节点配置 - 所有端口和地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MasterConfig {
     /// HTTP/gRPC端口 - 必须配置
     pub port: u16,
@@ -39,7 +59,7 @@ pub struct MasterConfig {
 }
 
 /// Volume 节点配置 - 所有端口和地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VolumeConfig {
     /// gRPC端口 - 必须配置
     pub grpc_port: u16,
@@ -72,7 +92,7 @@ pub struct VolumeConfig {
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FilerConfig {
     /// HTTP端口 - 必须配置
     pub port: u16,
@@ -122,7 +142,7 @@ pub struct FilerConfig {
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct S3Config {
     /// 服务端口 - 必须配置
     pub port: u16,
@@ -139,7 +159,7 @@ pub struct S3Config {
 }
 
 /// FUSE 客户端配置 - 所有地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FuseConfig {
     pub mount_point: String,
     /// Master地址列表 - 必须配置
@@ -153,7 +173,9 @@ pub struct FuseConfig {
     ///   3. 启动期到拓扑就绪之前的临时路由。
     #[serde(default)]
     pub filer_addresses: Vec<String>,
-    /// Volume地址列表 - 必须配置
+    /// Volume地址列表 - 可选；为空时由 FUSE 客户端从 master 拓扑发现。
+    /// 新部署只需 master_addresses，volume 路由由 master GetTopology 下发。
+    #[serde(default)]
     pub volume_addresses: Vec<String>,
     /// Master net端口 - 必须配置
     pub master_net_port: u16,
@@ -218,7 +240,7 @@ fn default_renew_interval_ms() -> u64 {
 }
 
 /// Monitor 服务配置 - 所有地址必须显式配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MonitorConfig {
     /// 服务监听地址 (如 "0.0.0.0:8081")
     pub addr: String,
@@ -427,9 +449,13 @@ impl PowerFsConfig {
                     .to_string(),
             ));
         }
-        if self.fuse.volume_addresses.is_empty() {
+        // volume_addresses 现在可选：为空时由 FUSE 客户端从 master 拓扑发现。
+        // force_mount=true 时作为兜底地址必须提供。
+        if self.fuse.volume_addresses.is_empty() && self.fuse.force_mount {
             return Err(ConfigError::ValidationError(
-                "fuse.volume_addresses must not be empty".to_string(),
+                "fuse.volume_addresses must not be empty when force_mount=true \
+                 (no fallback address available)"
+                    .to_string(),
             ));
         }
         if self.fuse.master_net_port == 0 {
@@ -497,6 +523,263 @@ impl PowerFsConfig {
         Ok(())
     }
 
+    /// 按服务类型校验 - 只校验指定服务的必需字段 + global 段
+    /// 精简配置模式下，每个服务配置文件只需包含 [global] + 本服务段，
+    /// 其他段使用默认空值，validate_for 只校验本服务字段。
+    pub fn validate_for(&self, service: ServiceType) -> Result<(), ConfigError> {
+        // global 段始终校验 redis_url (所有服务依赖 redis 事件)
+        if self.global.redis_url.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "global.redis_url must be set".to_string(),
+            ));
+        }
+
+        match service {
+            ServiceType::Master => self.validate_master(),
+            ServiceType::Volume => self.validate_volume(),
+            ServiceType::Filer => self.validate_filer(),
+            ServiceType::S3 => self.validate_s3(),
+            ServiceType::Fuse => self.validate_fuse(),
+            ServiceType::Monitor => self.validate_monitor(),
+        }
+    }
+
+    fn validate_master(&self) -> Result<(), ConfigError> {
+        if self.master.port == 0 {
+            return Err(ConfigError::ValidationError(
+                "master.port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.master.net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "master.net_port must be set (> 0) for FUSE client connections".to_string(),
+            ));
+        }
+        if self.master.port == self.master.net_port {
+            return Err(ConfigError::ValidationError(
+                "master.port and master.net_port must be different".to_string(),
+            ));
+        }
+        if self.master.dir.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "master.dir must be set".to_string(),
+            ));
+        }
+        if self.master.raft_id == 0 {
+            return Err(ConfigError::ValidationError(
+                "master.raft_id must be set (> 0)".to_string(),
+            ));
+        }
+        if self.master.peers.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "master.peers must not be empty (at least one peer required for Raft cluster)"
+                    .to_string(),
+            ));
+        }
+        if self.master.ip.is_none() || self.master.ip.as_ref().unwrap().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "master.ip must be set explicitly (e.g., '0.0.0.0' or specific bind IP)"
+                    .to_string(),
+            ));
+        }
+        if self.master.advertise_addr.is_none()
+            || self.master.advertise_addr.as_ref().unwrap().is_empty()
+        {
+            return Err(ConfigError::ValidationError(
+                "master.advertise_addr must be set explicitly (address used by other nodes to reach this master, e.g., '172.20.0.11:9333')".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_volume(&self) -> Result<(), ConfigError> {
+        if self.volume.grpc_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "volume.grpc_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.volume.http_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "volume.http_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.volume.net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "volume.net_port must be set (> 0) for FUSE client connections".to_string(),
+            ));
+        }
+        if self.volume.http_port == self.volume.net_port {
+            return Err(ConfigError::ValidationError(
+                "volume.http_port and volume.net_port must be different (HTTP port conflicts with powerfs-net port)".to_string(),
+            ));
+        }
+        if self.volume.master_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "volume.master_net_port must be set (> 0) for TLV heartbeat".to_string(),
+            ));
+        }
+        if self.volume.node_id.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "volume.node_id must be set".to_string(),
+            ));
+        }
+        if self.volume.master_addresses.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "volume.master_addresses must not be empty".to_string(),
+            ));
+        }
+        for addr in &self.volume.master_addresses {
+            if !addr.contains(':') {
+                return Err(ConfigError::ValidationError(format!(
+                    "volume.master_addresses entry '{}' must be in host:port format",
+                    addr
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_filer(&self) -> Result<(), ConfigError> {
+        if self.filer.port == 0 {
+            return Err(ConfigError::ValidationError(
+                "filer.port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.filer.grpc_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "filer.grpc_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.filer.net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "filer.net_port must be set (> 0) for FUSE client connections".to_string(),
+            ));
+        }
+        if self.filer.port == self.filer.net_port {
+            return Err(ConfigError::ValidationError(
+                "filer.port and filer.net_port must be different".to_string(),
+            ));
+        }
+        if self.filer.master_addresses.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "filer.master_addresses must not be empty".to_string(),
+            ));
+        }
+        if self.filer.master_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "filer.master_net_port must be set (> 0)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_s3(&self) -> Result<(), ConfigError> {
+        if self.s3.port == 0 {
+            return Err(ConfigError::ValidationError(
+                "s3.port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.s3.master_address.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "s3.master_address must be set".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_fuse(&self) -> Result<(), ConfigError> {
+        if self.fuse.master_addresses.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "fuse.master_addresses must not be empty".to_string(),
+            ));
+        }
+        if self.fuse.filer_addresses.is_empty() && self.fuse.force_mount {
+            return Err(ConfigError::ValidationError(
+                "fuse.filer_addresses must not be empty when force_mount=true".to_string(),
+            ));
+        }
+        if self.fuse.volume_addresses.is_empty() && self.fuse.force_mount {
+            return Err(ConfigError::ValidationError(
+                "fuse.volume_addresses must not be empty when force_mount=true".to_string(),
+            ));
+        }
+        if self.fuse.master_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.master_net_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.fuse.volume_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.volume_net_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.fuse.filer_net_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.filer_net_port must be set (> 0)".to_string(),
+            ));
+        }
+        if self.fuse.mount_point.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "fuse.mount_point must be set".to_string(),
+            ));
+        }
+        let mode = &self.fuse.lease.mode;
+        if mode != "range" && mode != "inode" {
+            return Err(ConfigError::ValidationError(format!(
+                "fuse.lease.mode must be 'range' or 'inode', got '{}'",
+                mode
+            )));
+        }
+        if self.fuse.lease.lease_duration_ms == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.lease.lease_duration_ms must be > 0".to_string(),
+            ));
+        }
+        if self.fuse.lease.renew_interval_ms == 0 {
+            return Err(ConfigError::ValidationError(
+                "fuse.lease.renew_interval_ms must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_monitor(&self) -> Result<(), ConfigError> {
+        if self.monitor.addr.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "monitor.addr must be set (e.g., '0.0.0.0:8081')".to_string(),
+            ));
+        }
+        if self.monitor.redis_url.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "monitor.redis_url must be set".to_string(),
+            ));
+        }
+        if self.monitor.s3_endpoint.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "monitor.s3_endpoint must be set".to_string(),
+            ));
+        }
+        if self.monitor.master_endpoint.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "monitor.master_endpoint must be set".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 为指定服务加载配置 - 只校验该服务的必需字段
+    pub fn load_for_service<P: AsRef<Path>>(
+        path: P,
+        service: ServiceType,
+    ) -> Result<Self, ConfigError> {
+        let content =
+            fs::read_to_string(path).map_err(|e| ConfigError::ReadError(e.to_string()))?;
+        let config: PowerFsConfig =
+            toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.validate_for(service)?;
+        Ok(config)
+    }
+
     /// 生成示例配置文件内容（用于参考，不会自动生效）
     pub fn generate_template() -> String {
         let template = r#"# PowerFS 配置文件模板
@@ -547,9 +830,9 @@ secret_key = "powerfs123"
 
 [fuse]
 mount_point = "/mnt/powerfs"
-master_addresses = ["172.20.0.11"]          # (必填)
-filer_addresses = ["172.20.0.35"]           # (必填)
-volume_addresses = ["172.20.0.21", "172.20.0.22", "172.20.0.23"]  # (必填)
+master_addresses = ["172.20.0.11", "172.20.0.12", "172.20.0.13"]  # (必填，3 个 master 用于 leader 发现和 failover)
+filer_addresses = []                        # (可选，为空时由 master 拓扑发现)
+volume_addresses = []                       # (可选，为空时由 master 拓扑发现)
 master_net_port = 9334                       # (必填)
 volume_net_port = 8901                       # (必填)
 filer_net_port = 9334                        # (必填)

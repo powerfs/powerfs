@@ -313,7 +313,7 @@ async fn test_facade_end_to_end_with_mock_servers() {
 
     // ---- Create FuseClientFacade ----
     let config = FuseClientFacadeConfig {
-        master_addr: "127.0.0.1".to_string(),
+        master_addrs: vec!["127.0.0.1".to_string()],
         master_port: 19333,
         volume_net_port: 19344,
         volume_addrs: Vec::new(),
@@ -581,7 +581,7 @@ async fn test_facade_volume_provider_with_mock() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = FuseClientFacadeConfig {
-        master_addr: "127.0.0.1".to_string(),
+        master_addrs: vec!["127.0.0.1".to_string()],
         master_port: 19433,
         volume_net_port: 19444,
         volume_addrs: Vec::new(),
@@ -708,7 +708,7 @@ async fn test_facade_metadata_provider_with_mock() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = FuseClientFacadeConfig {
-        master_addr: "127.0.0.1".to_string(),
+        master_addrs: vec!["127.0.0.1".to_string()],
         master_port: 19533,
         volume_net_port: 19544,
         volume_addrs: Vec::new(),
