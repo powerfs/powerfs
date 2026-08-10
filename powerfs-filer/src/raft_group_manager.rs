@@ -4,7 +4,9 @@ use powerfs_common::raft::RocksDbRaftStorage;
 use powerfs_net::serialize::TlvEncoder;
 use powerfs_net::FieldId;
 use protobuf::Message;
-use raft::eraftpb::{ConfChange, ConfChangeType, Entry, EntryType, Message as RaftMessage, MessageType};
+use raft::eraftpb::{
+    ConfChange, ConfChangeType, Entry, EntryType, Message as RaftMessage, MessageType,
+};
 use raft::storage::Storage;
 use raft::{Config, RawNode, StateRole};
 use slog::{Discard, Logger};
@@ -193,7 +195,6 @@ pub enum ShardCommand {
     // `CreateInode` succeeds but `AddDirEntry` fails (or vice versa on
     // delete), a tombstone-style orphan is left; the GC scan
     // (`collect_orphan_inodes`) reclaims it.
-
     /// Write an inode record to `CF_INODES` on `calculate_shard(info.inode)`.
     /// Idempotent: re-apply overwrites with same content. Pairs with
     /// `AddDirEntry` to form a complete create.
@@ -344,7 +345,8 @@ impl RaftGroup {
             peer_map.insert(peer.id, peer.clone());
         }
 
-        let (transfer_tx, transfer_rx) = mpsc::channel::<(u64, oneshot::Sender<Result<(), String>>)>(16);
+        let (transfer_tx, transfer_rx) =
+            mpsc::channel::<(u64, oneshot::Sender<Result<(), String>>)>(16);
 
         // Don't pre-set leader_state - let Raft election happen naturally
         // This ensures that the actual Raft state is consistent with leader_state
@@ -1022,7 +1024,8 @@ pub struct RaftGroupManager {
     // Per-shard leader-transfer senders, cached so `transfer_shard_leader`
     // can queue a transfer through the run() select! loop WITHOUT acquiring
     // the group RwLock (which is permanently held by run()).
-    shard_transfer_txs: RwLock<HashMap<ShardId, mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>>>,
+    shard_transfer_txs:
+        RwLock<HashMap<ShardId, mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>>>,
     // Per-shard apply receivers, stored before event loop starts to avoid
     // needing the group RwLock (which is permanently held by run()).
     shard_apply_rxs: RwLock<HashMap<ShardId, mpsc::Receiver<ApplyEntry>>>,
