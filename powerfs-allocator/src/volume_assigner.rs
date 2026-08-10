@@ -234,9 +234,7 @@ impl AssignerType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use powerfs_common::types::{
-        DataCenterId, DataNodeInfo, DegradeType, NodeId, NodeState, RackId, SoftErrorType,
-    };
+    use powerfs_common::types::{DataCenterId, DataNodeInfo, NodeId, NodeState, RackId};
 
     fn make_node(
         id: &str,
