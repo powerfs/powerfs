@@ -953,7 +953,17 @@ pub struct ShardSplitPlan {
 - `map_powerfs_error`：PowerFsError→ManageError 映射（NotLeader→InvalidState, VolumeNotFound→ResourceNotFound 等）+ 3 个单元测试。
 - 测试：allocator 77、common 68（+Draining 变体）、master 99（+3 错误映射+1 map_volume_state），clippy 0 警告。
 
+**已完成：MasterManagementApi 实现 ManagementApi trait**
+
+- `MasterManagementApi`：实现完整 `ManagementApi` trait（15 个方法）。
+  - **可用方法**（9 个）：`update_migration_policy`、`update_rebalance_policy`（策略更新，通过共享 Arc<RwLock>）；`trigger_rebalance_check`（dry_run + 执行）、`execute_migrations`、`pause_all_migrations`、`resume_migrations`、`cancel_migration`（迁移控制，委托 MigrationScheduler）；`create_volume`、`drain_volume`、`remove_volume`（卷伸缩，通过 VolumeManager + MasterVolumeControl）。
+  - **NYI 方法**（6 个）：`set_placement_strategy`（需策略注册表）、`set_node_maintenance`（需 Raft 命令）、`pin_volume_to_node`/`unpin_volume`（需新 feature）、`add_shard`/`drain_shard`/`remove_shard`（需 filer 连接）。返回 `ManageError::InvalidState("not yet implemented: ...")`。
+- `RebalanceEngine`：暴露 `migration_policy()`/`rebalance_policy()` 访问器，供 ManagementApi 更新策略。
+- `MasterNode`：新增 `management_api` 字段 + `management_api()` 访问器，`start()` 中构造。
+- 测试：master 99 测试 PASS，clippy 0 警告，rustfmt clean。
+
 **待完成**：
 - 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新。
-- `ManagementApi` gRPC handler 接入：dry-run 校验 + 执行 + 暂停/恢复/取消。
-- `VolumeManager` 接入 `MasterVolumeControl`：管理操作走 VolumeManager 验证→VolumeControl 执行。
+- `ManagementApi` gRPC handler 接入：将 ManagementApi 暴露为 RPC 端点供运维/AI Agent 调用。
+- `set_node_maintenance` Raft 命令：复制维护状态到所有 master 副本。
+- Shard 伸缩 filer 连接：`add_shard`/`drain_shard`/`remove_shard` 需要 filer Raft 组状态。
