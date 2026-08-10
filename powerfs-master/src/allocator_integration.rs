@@ -34,8 +34,10 @@ use powerfs_allocator::{
     config::{MigrationPolicy, RebalancePolicy},
     error::ManageError,
     migration_scheduler::MigrationExecutor,
-    LoadBalancer, MigrationScheduler, MigrationState, RebalanceAction,
+    LoadBalancer, MigrationScheduler, MigrationState, RebalanceAction, VolumeControl,
 };
+use powerfs_common::error::PowerFsError;
+use powerfs_common::types::{VolumeId, VolumeState};
 
 use crate::master::MasterNode;
 
@@ -83,6 +85,95 @@ impl MigrationExecutor for LoggingExecutor {
     fn cancel_migration(&self, task_id: &str) -> Result<(), ManageError> {
         debug!("[rebalance] executor cancel task={}", task_id);
         Ok(())
+    }
+}
+
+/// Master-backed `VolumeControl`: bridges the allocator's sync trait to the
+/// master's async Raft-replicated volume lifecycle methods.
+///
+/// ## sync→async bridge
+///
+/// The allocator's `VolumeControl` trait is synchronous, but the master's
+/// `create_new_volume_with_preference` / `update_volume_state` / `delete_volume`
+/// are async (they propose Raft commands). This implementation uses
+/// [`tokio::task::block_in_place`] + [`tokio::runtime::Handle::block_on`] to
+/// bridge the boundary.
+///
+/// `block_in_place` is safe here because:
+/// 1. The master runs on `#[tokio::main]` (multi-threaded runtime).
+/// 2. `VolumeControl` is only called from management operations (gRPC
+///    handlers), never from the hot I/O path or from `spawn_blocking`.
+///
+/// ## size parameter
+///
+/// The master's `create_new_volume_with_preference` uses
+/// `cluster_config.volume_size_limit` as the volume size; the `size` parameter
+/// from `VolumeControl` is validated by `VolumeManager` against the snapshot
+/// but the master's configured limit is authoritative. A future refinement may
+/// pass the requested size through to the Raft command.
+pub struct MasterVolumeControl {
+    master: Arc<MasterNode>,
+}
+
+impl MasterVolumeControl {
+    pub fn new(master: Arc<MasterNode>) -> Self {
+        Self { master }
+    }
+}
+
+impl VolumeControl for MasterVolumeControl {
+    fn create_volume(&self, node_id: &str, _zone_id: u32, _size: u64) -> Result<u64, ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let (fid, _nodes) = self
+                    .master
+                    .create_new_volume_with_preference(
+                        "000", // default replication (single replica)
+                        "default",
+                        Some(node_id),
+                    )
+                    .await
+                    .map_err(map_powerfs_error)?;
+                Ok(fid.volume_id.0)
+            })
+        })
+    }
+
+    fn mark_draining(&self, volume_id: u64) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .update_volume_state(&VolumeId(volume_id), VolumeState::Draining)
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
+    }
+
+    fn mark_removed(&self, volume_id: u64) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .delete_volume(&VolumeId(volume_id))
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
+    }
+}
+
+/// Map `PowerFsError` → `ManageError` for the VolumeControl bridge.
+fn map_powerfs_error(err: PowerFsError) -> ManageError {
+    match err {
+        PowerFsError::NotLeader => {
+            ManageError::InvalidState("master is not the Raft leader".to_string())
+        }
+        PowerFsError::VolumeNotFound(vid) => {
+            ManageError::ResourceNotFound(format!("volume {}", vid.0))
+        }
+        PowerFsError::InvalidRequest(msg) => ManageError::InvalidState(msg),
+        PowerFsError::InvalidVolumeState(msg) => ManageError::InvalidState(msg),
+        other => ManageError::InvalidState(format!("{other}")),
     }
 }
 
@@ -233,6 +324,24 @@ pub fn spawn_rebalance_loop(engine: Arc<RebalanceEngine>, master: Arc<MasterNode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_map_powerfs_error_not_leader() {
+        let err = map_powerfs_error(PowerFsError::NotLeader);
+        assert!(matches!(err, ManageError::InvalidState(_)));
+    }
+
+    #[test]
+    fn test_map_powerfs_error_volume_not_found() {
+        let err = map_powerfs_error(PowerFsError::VolumeNotFound(VolumeId(42)));
+        assert!(matches!(err, ManageError::ResourceNotFound(_)));
+    }
+
+    #[test]
+    fn test_map_powerfs_error_invalid_request() {
+        let err = map_powerfs_error(PowerFsError::InvalidRequest("bad".to_string()));
+        assert!(matches!(err, ManageError::InvalidState(_)));
+    }
 
     #[test]
     fn test_logging_executor_completes_immediately() {

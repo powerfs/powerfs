@@ -795,6 +795,7 @@ impl MasterNode {
                     "Available" => VolumeState::Available,
                     "Full" => VolumeState::Full,
                     "ReadOnly" => VolumeState::ReadOnly,
+                    "Draining" => VolumeState::Draining,
                     "Deleting" => VolumeState::Deleting,
                     _ => VolumeState::Available,
                 };
@@ -1539,6 +1540,7 @@ impl MasterNode {
             VolumeState::Available => "Available",
             VolumeState::Full => "Full",
             VolumeState::ReadOnly => "ReadOnly",
+            VolumeState::Draining => "Draining",
             VolumeState::Deleting => "Deleting",
         }
         .to_string();
@@ -3469,6 +3471,7 @@ fn map_volume_state(
         VolumeState::Creating | VolumeState::Available | VolumeState::ReadOnly => {
             VolumeRuntimeState::Active
         }
+        VolumeState::Draining => VolumeRuntimeState::Draining,
         VolumeState::Full => VolumeRuntimeState::Full,
         VolumeState::Deleting => VolumeRuntimeState::Deleted,
     }
@@ -3843,6 +3846,10 @@ mod tests {
         assert_eq!(
             map_volume_state(VolumeState::ReadOnly),
             VolumeRuntimeState::Active
+        );
+        assert_eq!(
+            map_volume_state(VolumeState::Draining),
+            VolumeRuntimeState::Draining
         );
         assert_eq!(
             map_volume_state(VolumeState::Full),
