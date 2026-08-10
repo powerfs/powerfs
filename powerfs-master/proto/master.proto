@@ -94,6 +94,7 @@ service MasterService {
     rpc SetNodeMaintenance(SetNodeMaintenanceRequest) returns (MigrationControlResponse);
     rpc PinVolume(PinVolumeRequest) returns (VolumeManageResponse);
     rpc UnpinVolume(VolumeIdRequest) returns (VolumeManageResponse);
+    rpc SetPlacementStrategy(SetPlacementStrategyRequest) returns (VolumeManageResponse);
 }
 
 message Heartbeat {
@@ -1680,4 +1681,8 @@ message SetNodeMaintenanceRequest {
 message PinVolumeRequest {
     uint64 volume_id = 1;
     string node_id = 2;
+}
+
+message SetPlacementStrategyRequest {
+    string strategy = 1;  // "round_robin" | "least_loaded" | "anti_affinity"
 }

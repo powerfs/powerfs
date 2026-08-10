@@ -124,6 +124,12 @@ pub enum RaftCommand {
     UnpinVolume {
         volume_id: u64,
     },
+    /// Set the global placement strategy (e.g. "round_robin", "least_loaded",
+    /// "anti_affinity"). Replicated so all master replicas agree on which
+    /// assigner to use for new volume allocation.
+    SetPlacementStrategy {
+        strategy: String,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)
