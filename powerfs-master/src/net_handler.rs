@@ -875,7 +875,12 @@ impl MasterNetHandler {
             total_files
         );
 
-        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes(), Vec::new()))
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
     }
 
     /// Handle ListFilers request from kernel client.
