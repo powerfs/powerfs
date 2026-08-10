@@ -91,13 +91,15 @@ pub enum ShardCommand {
         volume_id: u64,
         etag: String,
     },
-    /// Set inode attributes (size, mode, uid, gid) - legacy unified command
+    /// Set inode attributes (size, mode, uid, gid, mtime, atime) - legacy unified command
     SetAttr {
         inode: u64,
         size: Option<u64>,
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
     },
     /// Set data-related inode attributes (size, chunks) - strong consistency via Lease
     SetAttrData {

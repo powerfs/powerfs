@@ -987,6 +987,8 @@ impl MetaShardManager {
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
     ) -> Result<(), String> {
         let cmd = ShardCommand::SetAttr {
             inode,
@@ -994,6 +996,8 @@ impl MetaShardManager {
             mode,
             uid,
             gid,
+            mtime,
+            atime,
         };
 
         self.raft_group_manager
@@ -1004,7 +1008,7 @@ impl MetaShardManager {
         // Must check ALL changed fields (mode, uid, gid, size), not just mode,
         // otherwise chown (UID|GID only) returns before Raft applies the change,
         // causing subsequent GetAttr to read stale data.
-        if mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() {
+        if mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() || mtime.is_some() || atime.is_some() {
             let store = {
                 let stores = self.shard_stores.read().unwrap();
                 stores.get(&shard_id).cloned()
@@ -1018,7 +1022,9 @@ impl MetaShardManager {
                         let uid_ok = uid.is_none_or(|u| info.uid == u as u32);
                         let gid_ok = gid.is_none_or(|g| info.gid == g as u32);
                         let size_ok = size.is_none_or(|s| info.size == s);
-                        if mode_ok && uid_ok && gid_ok && size_ok {
+                        let mtime_ok = mtime.is_none_or(|mt| info.mtime == mt);
+                        let atime_ok = atime.is_none_or(|at| info.atime == at);
+                        if mode_ok && uid_ok && gid_ok && size_ok && mtime_ok && atime_ok {
                             return Ok(());
                         }
                     }

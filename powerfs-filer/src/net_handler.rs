@@ -838,7 +838,7 @@ impl FilerNetHandler {
         // while-loop parsing. Previously used fixed-order next_u64 which
         // desynced the decoder (encoder uses add_u32 for Mode/Uid/Gid, and
         // optional fields may be absent).
-        let (ino, mode, uid, gid, size) = match decode_setattr_req(&msg.body) {
+        let (ino, mode, uid, gid, size, mtime, atime) = match decode_setattr_req(&msg.body) {
             Ok(v) => v,
             Err(e) => {
                 warn!("FILER_NET_SETATTR: decode failed: {}", e);
@@ -854,8 +854,8 @@ impl FilerNetHandler {
         let gid = gid.map(|g| g as u64);
 
         info!(
-            "FILER_NET_SETATTR: ino={}, size={:?}, mode={:?}, uid={:?}, gid={:?}",
-            ino, size, mode, uid, gid
+            "FILER_NET_SETATTR: ino={}, size={:?}, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, atime={:?}",
+            ino, size, mode, uid, gid, mtime, atime
         );
 
         let shard_id = self.shard_strategy.calculate_shard(ino);
@@ -865,7 +865,7 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .setattr(ino, shard_id, size, mode, uid, gid)
+            .setattr(ino, shard_id, size, mode, uid, gid, mtime, atime)
             .await
         {
             Ok(_) => {
@@ -1113,7 +1113,7 @@ impl FilerNetHandler {
                 // Apply mode/uid/gid via setattr
                 let _ = self
                     .meta_shard_manager
-                    .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
+                    .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid), None, None)
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
@@ -1269,7 +1269,7 @@ impl FilerNetHandler {
                 let shard_id = self.shard_strategy.calculate_shard(info.inode);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid))
+                    .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid), None, None)
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）

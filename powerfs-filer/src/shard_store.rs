@@ -495,8 +495,10 @@ impl ShardStore {
                 mode,
                 uid,
                 gid,
+                mtime,
+                atime,
             } => {
-                self.setattr(inode, size, mode, uid, gid);
+                self.setattr(inode, size, mode, uid, gid, mtime, atime);
             }
             ShardCommand::SetAttrData { inode, size } => {
                 self.setattr_data(inode, size);
@@ -2030,6 +2032,8 @@ impl ShardStore {
         mode: Option<u64>,
         uid: Option<u64>,
         gid: Option<u64>,
+        mtime: Option<u64>,
+        atime: Option<u64>,
     ) {
         let info = match self.get_inode(inode) {
             Some(mut info) => {
@@ -2050,7 +2054,18 @@ impl ShardStore {
                 }
                 let now = chrono::Utc::now().timestamp() as u64;
                 info.ctime = now;
-                info.mtime = now;
+                // Only update mtime/atime when explicitly provided.
+                // The writeback path sends size=Some(N) with mtime=None to sync
+                // file size only; auto-setting mtime=now there would overwrite
+                // a prior utimes/touch -d value (T6c regression). The kernel's
+                // O_TRUNC SETATTR already carries mtime=Some(now) at file
+                // creation, and utimes sends mtime=Some(explicit_value).
+                if let Some(mt) = mtime {
+                    info.mtime = mt;
+                }
+                if let Some(at) = atime {
+                    info.atime = at;
+                }
                 info
             }
             None => return,
