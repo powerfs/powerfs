@@ -973,7 +973,27 @@ pub struct ShardSplitPlan {
 - 未初始化优雅降级：engine/API 未就绪时返回 `success=false` + 描述性错误（如 Raft follower 上），不崩溃。
 - 测试：master 99 PASS，allocator 77 PASS，clippy 0 警告，rustfmt clean。
 
+**已完成：Shard 伸缩 filer 连接**
+
+- Filer 侧 proto：新增 `AddShard`/`DrainShard`/`RemoveShard` RPC（FilerMetaService + PosixMetaService 双服务）+ 消息类型。
+- Filer 侧 handler：`grpc_service.rs` + `posix_service.rs` 实现 3 个 handler，委托 `ShardStrategy` 的 `add_shard_auto`/`drain_shard`/`remove_shard`。
+- Filer 侧 `ShardStrategy::remove_shard`：新增方法，委托 `ShardMap::remove_shard`（合并 range 到前一个 Active 条目）+ 递减 shard_count。
+- Master 侧 proto 编译：`build.rs` 新增 filer.proto 编译（filer_proto 子目录避免 package=powerfs 冲突）。
+- Master 侧 `filer_proto` 模块 + `filer_client` 模块：`FilerManagementClient` 连接第一个健康 filer，调用 shard scaling RPC。
+- `MasterManagementApi`：`add_shard`/`drain_shard`/`remove_shard` 从 NYI stub 改为通过 `FilerManagementClient`（`block_in_place`+`Handle::block_on` 桥接）调用 filer gRPC。
+- 测试：master 99 PASS，filer 74 PASS，clippy 0 新增警告，fmt clean。
+
 **待完成**：
 - 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新（高风险，留作后续里程碑）。
-- `set_node_maintenance` Raft 命令：复制维护状态到所有 master 副本。
-- Shard 伸缩 filer 连接：`add_shard`/`drain_shard`/`remove_shard` 需要 filer Raft 组状态。
+- `set_placement_strategy`：需要运行时策略注册表（低优先级）。
+- `pin_volume_to_node`/`unpin_volume`：需要新 feature（低优先级）。
+
+**已完成：set_node_maintenance Raft 命令**
+
+- `RaftCommand::SetNodeMaintenance { node_id, enabled }`：新增 Raft 命令变体，serde_json 自动序列化。
+- `apply_set_node_maintenance`：在 apply_command match 中路由，通过 `topology.get_node_mut` 设置 `maintenance_mode` 标志。
+- `MasterNode::set_node_maintenance`：leader-only async 方法，遵循 `update_volume_state` 的 propose 模式。
+- `MasterManagementApi::set_node_maintenance`：从 NYI stub 改为 `block_in_place`+`Handle::block_on` 桥接，调用 master 的 Raft-proposed 方法。
+- `SetNodeMaintenance` gRPC RPC + handler：供运维/AI Agent 通过 gRPC 设置节点维护模式。
+- 效果：`maintenance_mode=true` 时，集群快照构建器将节点映射为 `NodeRuntimeState::Maintenance`，分配器在所有分配决策中排除该节点。
+- 测试：master 99 PASS，clippy 0 警告，rustfmt clean。

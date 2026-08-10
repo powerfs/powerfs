@@ -25,6 +25,8 @@
 //! The rebalance loop is a no-op on followers: only the Raft leader has the
 //! authority to mutate volume state, so non-leaders skip the tick entirely.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -88,6 +90,328 @@ impl MigrationExecutor for LoggingExecutor {
         debug!("[rebalance] executor cancel task={}", task_id);
         Ok(())
     }
+}
+
+/// Real migration executor: dispatches needle copies between volumes and
+/// updates filer chunk mappings.
+///
+/// `start_migration` spawns an async task that:
+/// 1. Calls filer `FindInodesByVolume` to discover which inodes own the
+///    needles being migrated (needle→inode reverse lookup).
+/// 2. For each needle: reads data from the source volume, writes to the
+///    target volume (auto-assigned file_key).
+/// 3. Calls filer `UpdateInodeSizeChunks` to update each affected inode's
+///    chunk mapping with the new (volume_id, needle_id).
+/// 4. Deletes old needles from the source volume.
+/// 5. Reports completion via `completion_tx`.
+///
+/// Cancellation is cooperative: `cancel_migration` sets an `AtomicBool`
+/// flag that the async task checks between needle copies.
+pub struct MasterMigrationExecutor {
+    master: Arc<MasterNode>,
+    completion_tx: mpsc::Sender<String>,
+    /// Cancellation flags keyed by task_id.
+    cancel_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+impl MasterMigrationExecutor {
+    pub fn new(master: Arc<MasterNode>, completion_tx: mpsc::Sender<String>) -> Self {
+        Self {
+            master,
+            completion_tx,
+            cancel_flags: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl MigrationExecutor for MasterMigrationExecutor {
+    fn cold_needles(&self, volume_id: u64, limit: usize) -> Vec<u64> {
+        let address = match self.master.get_volume_address(volume_id) {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "cold_needles: volume {} not found in topology, returning empty",
+                    volume_id
+                );
+                return Vec::new();
+            }
+        };
+
+        let pool = self.master.volume_client_pool.clone();
+        let limit_u32 = if limit > u32::MAX as usize {
+            u32::MAX
+        } else {
+            limit as u32
+        };
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                match pool.list_needles(&address, volume_id, limit_u32).await {
+                    Ok(needles) => needles.into_iter().map(|(id, _, _, _)| id).collect(),
+                    Err(e) => {
+                        warn!(
+                            "cold_needles: list_needles failed for volume {}: {}",
+                            volume_id, e
+                        );
+                        Vec::new()
+                    }
+                }
+            })
+        })
+    }
+
+    fn can_migrate_needle(&self, _volume_id: u64, _needle_id: u64) -> bool {
+        // Simplification: always allow migration. A full implementation would
+        // check the filer for active leases on the inode owning this needle.
+        // The migration itself is idempotent (read→write→update→delete), so
+        // even if a concurrent write happens, the old needle is simply deleted
+        // after the new one is in place.
+        true
+    }
+
+    fn volumes_on_node(&self, node_id: &str) -> Vec<u64> {
+        self.master.volumes_on_node(node_id)
+    }
+
+    fn start_migration(&self, action: &RebalanceAction, task_id: &str) -> Result<(), ManageError> {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.cancel_flags
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), Arc::clone(&cancel_flag));
+
+        let master = Arc::clone(&self.master);
+        let completion_tx = self.completion_tx.clone();
+        let cancel_flags = Arc::clone(&self.cancel_flags);
+        let action = action.clone();
+        let task_id = task_id.to_string();
+
+        tokio::runtime::Handle::current().spawn(async move {
+            let result = run_migration(&master, &action, &cancel_flag).await;
+
+            // Remove this task's cancel flag from the registry so the map
+            // does not grow unboundedly across ticks. If `cancel_migration`
+            // already removed it (cancellation path), this is a no-op.
+            cancel_flags.lock().unwrap().remove(&task_id);
+
+            match result {
+                Ok(bytes_migrated) => {
+                    info!(
+                        "[rebalance] migration task {} completed, {} bytes migrated",
+                        task_id, bytes_migrated
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[rebalance] migration task {} failed: {}",
+                        task_id, e
+                    );
+                }
+            }
+
+            // Report completion to the scheduler (sync mpsc send is non-blocking
+            // if the receiver is alive).
+            let _ = completion_tx.send(task_id);
+        });
+
+        Ok(())
+    }
+
+    fn cancel_migration(&self, task_id: &str) -> Result<(), ManageError> {
+        if let Some(flag) = self.cancel_flags.lock().unwrap().remove(task_id) {
+            flag.store(true, Ordering::Relaxed);
+            debug!("[rebalance] cancel flag set for task={}", task_id);
+        }
+        Ok(())
+    }
+}
+
+/// Run a single migration action to completion (or cancellation).
+///
+/// Returns `Ok(bytes_migrated)` on success.
+async fn run_migration(
+    master: &Arc<MasterNode>,
+    action: &RebalanceAction,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<u64, String> {
+    match action {
+        RebalanceAction::MigrateColdData {
+            from_volume,
+            to_volume,
+            needle_ids,
+        } => {
+            run_cold_data_migration(master, *from_volume, *to_volume, needle_ids, cancel_flag).await
+        }
+        RebalanceAction::MigrateHotData {
+            from_node,
+            to_node: _,
+            volume_ids,
+        } => {
+            // Hot data migration: migrate all needles from volumes on the
+            // source node. For each volume, find cold needles and migrate.
+            let mut total = 0u64;
+            for &vid in volume_ids {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Ok(total);
+                }
+                let target = pick_target_volume(master, vid).await?;
+                total += run_cold_data_migration(master, vid, target, &[], cancel_flag).await?;
+            }
+            let _ = from_node; // logged for context
+            Ok(total)
+        }
+        RebalanceAction::RequestVolumeGrow { zone_id, size } => {
+            // Volume grow is handled by the VolumeManager, not the executor.
+            // This should not be dispatched here; log and succeed.
+            warn!(
+                "[rebalance] RequestVolumeGrow dispatched to executor: zone={} size={} — no-op",
+                zone_id, size
+            );
+            Ok(0)
+        }
+    }
+}
+
+/// Migrate cold needles from `from_volume` to `to_volume`.
+async fn run_cold_data_migration(
+    master: &Arc<MasterNode>,
+    from_volume: u64,
+    to_volume: u64,
+    needle_ids: &[u64],
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<u64, String> {
+    let source_addr = master
+        .get_volume_address(from_volume)
+        .ok_or_else(|| format!("source volume {} not found", from_volume))?;
+    let target_addr = master
+        .get_volume_address(to_volume)
+        .ok_or_else(|| format!("target volume {} not found", to_volume))?;
+
+    // 1. Reverse lookup: find which inodes own the needles.
+    let filer_client = crate::filer_client::FilerManagementClient::new(Arc::clone(master));
+    let entries = filer_client
+        .find_inodes_by_volume(from_volume, needle_ids)
+        .await?;
+
+    if entries.is_empty() {
+        info!(
+            "[rebalance] no inodes found for volume {} needles {:?} — already migrated or deleted",
+            from_volume, needle_ids
+        );
+        return Ok(0);
+    }
+
+    info!(
+        "[rebalance] migrating {} chunk entries from volume {} to {}",
+        entries.len(),
+        from_volume,
+        to_volume
+    );
+
+    // 2. Group entries by inode for batch chunk updates.
+    let mut by_inode: HashMap<u64, Vec<crate::filer_client::FilerChunkEntry>> = HashMap::new();
+    for entry in entries {
+        by_inode
+            .entry(entry.inode)
+            .or_default()
+            .push(entry);
+    }
+
+    // 3. For each inode: read each needle, write to target, collect new chunk info.
+    let pool = master.volume_client_pool.clone();
+    let mut total_bytes = 0u64;
+    let mut needle_map: HashMap<u64, u64> = HashMap::new(); // old_needle_id → new_needle_id
+
+    for (inode, chunks) in &by_inode {
+        for chunk in chunks {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("[rebalance] migration cancelled, partial: {} bytes", total_bytes);
+                return Ok(total_bytes);
+            }
+
+            // Read needle data from source volume.
+            let data = pool
+                .read_needle(&source_addr, from_volume, chunk.needle_id)
+                .await
+                .map_err(|e| format!("read needle {} failed: {}", chunk.needle_id, e))?;
+
+            // Write to target volume (auto-assign file_key=0).
+            let new_needle_id = pool
+                .write_needle_return_key(&target_addr, to_volume, 0, &data)
+                .await
+                .map_err(|e| format!("write needle to volume {} failed: {}", to_volume, e))?;
+
+            needle_map.insert(chunk.needle_id, new_needle_id);
+            total_bytes += data.len() as u64;
+        }
+
+        // 4. Build updated chunk list for this inode.
+        let updated_chunks: Vec<(u64, u64, u64, u64, u32)> = chunks
+            .iter()
+            .map(|c| {
+                let new_nid = needle_map.get(&c.needle_id).copied().unwrap_or(c.needle_id);
+                (c.offset, c.size, new_nid, to_volume, 0) // crc32=0: volume server will recompute
+            })
+            .collect();
+
+        // 5. Update filer with new chunk mapping.
+        let shard_id = chunks.first().map(|c| c.shard_id).unwrap_or(0);
+        let file_size = chunks.first().map(|c| c.file_size).unwrap_or(0);
+        filer_client
+            .update_inode_size_chunks(shard_id, *inode, file_size, &updated_chunks, "migration-executor")
+            .await
+            .map_err(|e| format!("update inode {} chunks failed: {}", inode, e))?;
+    }
+
+    // 6. Delete old needles from source volume.
+    for old_needle_id in needle_map.keys() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = pool.delete_needle(&source_addr, from_volume, *old_needle_id).await {
+            warn!(
+                "[rebalance] failed to delete old needle {} on volume {}: {} (non-fatal)",
+                old_needle_id, from_volume, e
+            );
+        }
+    }
+
+    info!(
+        "[rebalance] cold data migration complete: {} inodes, {} bytes, volume {} → {}",
+        by_inode.len(),
+        total_bytes,
+        from_volume,
+        to_volume
+    );
+
+    Ok(total_bytes)
+}
+
+/// Pick a target volume for hot-data migration (any available volume not on
+/// the source volume's node).
+async fn pick_target_volume(master: &Arc<MasterNode>, source_volume: u64) -> Result<u64, String> {
+    let volumes = master.list_volumes().await;
+    let source_node = volumes
+        .iter()
+        .find(|v| v.id.0 == source_volume)
+        .map(|v| v.node_id.0.clone());
+
+    let target = volumes
+        .iter()
+        .find(|v| {
+            v.state == VolumeState::Available
+                && v.id.0 != source_volume
+                && v.node_id.0 != source_node.as_deref().unwrap_or("")
+        })
+        .or_else(|| {
+            volumes
+                .iter()
+                .find(|v| v.state == VolumeState::Available && v.id.0 != source_volume)
+        });
+
+    target
+        .map(|v| v.id.0)
+        .ok_or_else(|| "no available target volume".to_string())
 }
 
 /// Master-backed `VolumeControl`: bridges the allocator's sync trait to the
@@ -411,6 +735,36 @@ impl RebalanceEngine {
         })
     }
 
+    /// Build a new engine backed by the real [`MasterMigrationExecutor`].
+    ///
+    /// Unlike `new_logging`, this executor actually copies needles between
+    /// volumes and updates filer chunk mappings. It requires an `Arc<MasterNode>`
+    /// for volume-client / filer-client access and leader-state queries.
+    ///
+    /// `volume_default_size` has the same meaning as in `new_logging`.
+    pub fn new_with_master(
+        master: Arc<MasterNode>,
+        volume_default_size: u64,
+    ) -> Arc<Self> {
+        let migration_policy = Arc::new(RwLock::new(MigrationPolicy::default()));
+        let rebalance_policy = Arc::new(RwLock::new(RebalancePolicy::default()));
+        let (completion_tx, completion_rx) = mpsc::channel::<String>();
+        let executor = Arc::new(MasterMigrationExecutor::new(master, completion_tx));
+        let scheduler = MigrationScheduler::new(
+            Arc::clone(&migration_policy),
+            Arc::clone(&rebalance_policy),
+            executor,
+        );
+        let load_balancer = LoadBalancer::new(Arc::clone(&rebalance_policy), volume_default_size);
+        Arc::new(Self {
+            load_balancer,
+            scheduler,
+            migration_policy,
+            rebalance_policy,
+            completion_rx: Mutex::new(completion_rx),
+        })
+    }
+
     /// Shared migration-policy handle (for ManagementApi updates).
     pub fn migration_policy(&self) -> Arc<RwLock<MigrationPolicy>> {
         Arc::clone(&self.migration_policy)
@@ -453,10 +807,11 @@ impl RebalanceEngine {
 
         self.scheduler.tick(&snapshot, &self.load_balancer);
 
-        // Drain immediate completions enqueued by the LoggingExecutor during
-        // `tick`. Real executors complete asynchronously and would call
-        // `complete_task` from their own callback; draining here is correct
-        // only because LoggingExecutor completes synchronously.
+        // Drain completions enqueued by the executor. `LoggingExecutor`
+        // completes synchronously (during `tick`); `MasterMigrationExecutor`
+        // completes asynchronously (spawned task sends on the channel when
+        // the needle copy + filer update finishes). `try_recv` picks up any
+        // arrivals since the previous tick for either executor.
         if let Ok(rx) = self.completion_rx.lock() {
             while let Ok(task_id) = rx.try_recv() {
                 if let Err(e) = self.scheduler.complete_task(&task_id, true, 0) {

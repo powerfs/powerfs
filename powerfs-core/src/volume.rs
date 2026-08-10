@@ -318,7 +318,15 @@ impl Volume {
             ));
         }
 
-        let needle_id = NeedleId(file_key);
+        // Auto-assign file_key when caller passes 0 (used by migration executor).
+        let actual_key = if file_key == 0 {
+            let next = info_guard.next_file_key;
+            info_guard.next_file_key += 1;
+            next
+        } else {
+            file_key
+        };
+        let needle_id = NeedleId(actual_key);
         let volume_id = info_guard.id;
         let needle =
             Needle::new_with_algorithm(needle_id.clone(), volume_id, data, self.checksum_algorithm);
@@ -520,6 +528,11 @@ impl Volume {
 
     pub fn count(&self) -> usize {
         self.index.len()
+    }
+
+    /// List all live needles on this volume (for migration enumeration).
+    pub fn list_needles(&self) -> Result<Vec<(NeedleId, NeedleInfo)>> {
+        self.index.list_needles()
     }
 
     pub fn set_read_only(&self) {

@@ -825,6 +825,22 @@ impl MetaShardManager {
         result
     }
 
+    /// Find inodes with chunks on `volume_id` across all shards (for migration
+    /// reverse lookup). Returns (inode, shard_id, needle_id, volume_id, offset,
+    /// size, file_size) tuples.
+    pub fn find_inodes_by_volume(
+        &self,
+        volume_id: u64,
+        needle_ids: &[u64],
+    ) -> Vec<(u64, u64, u64, u64, u64, u64, u64)> {
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for shard_store in stores.values() {
+            result.extend(shard_store.find_inodes_by_volume(volume_id, needle_ids));
+        }
+        result
+    }
+
     /// P4: 扫描所有 shard 中 reliability_state == PendingReplicated 的文件.
     /// 返回 (inode, chunks) 对, 供 scrubber worker 进行副本复制.
     pub fn list_pending_replicated(&self) -> Vec<(u64, Vec<crate::shard_store::StoredFileChunk>)> {

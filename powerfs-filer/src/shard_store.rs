@@ -1222,6 +1222,39 @@ impl ShardStore {
         result
     }
 
+    /// Find inodes that have chunks on `volume_id` (optionally filtered by
+    /// `needle_ids`). Returns (inode, shard_id, needle_id, volume_id, offset,
+    /// size, file_size) tuples for migration reverse lookup.
+    pub fn find_inodes_by_volume(
+        &self,
+        volume_id: u64,
+        needle_ids: &[u64],
+    ) -> Vec<(u64, u64, u64, u64, u64, u64, u64)> {
+        let inodes = self.inodes.read().unwrap();
+        let needle_set: std::collections::HashSet<u64> = needle_ids.iter().copied().collect();
+        let mut result = Vec::new();
+        for info in inodes.values() {
+            for chunk in &info.chunks {
+                if chunk.volume_id != volume_id {
+                    continue;
+                }
+                if !needle_set.is_empty() && !needle_set.contains(&chunk.needle_id) {
+                    continue;
+                }
+                result.push((
+                    info.inode,
+                    self.shard_id.0,
+                    chunk.needle_id,
+                    chunk.volume_id,
+                    chunk.offset,
+                    chunk.size,
+                    info.size,
+                ));
+            }
+        }
+        result
+    }
+
     /// Return a snapshot of every inode currently in this shard's in-memory
     /// cache. Used by `MetaShardManager::collect_orphan_inodes` to find
     /// inode records that have no corresponding dir entry on any shard
