@@ -1,7 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::io_stats::IoStatsCollector;
-use crate::proto::{VolumeService, VolumeServiceServer};
+use crate::proto::{NeedleEntry, VolumeService, VolumeServiceServer};
 use crate::range_lease::RangeLeaseManager;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -1426,6 +1426,67 @@ impl VolumeService for VolumeServer {
                     moved_needles: 0,
                     error: format!("task join failed: {}", e),
                 }))
+            }
+        }
+    }
+
+    async fn list_needles(
+        &self,
+        request: Request<crate::proto::ListNeedlesRequest>,
+    ) -> std::result::Result<Response<crate::proto::ListNeedlesResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let limit = if req.limit == 0 {
+            usize::MAX
+        } else {
+            req.limit as usize
+        };
+
+        debug!(
+            "list_needles: volume_id={}, limit={}",
+            volume_id.0, req.limit
+        );
+
+        let storage_manager = self.storage_manager.clone();
+        match tokio::task::spawn_blocking(move || {
+            let volume = match storage_manager.get_volume(&volume_id) {
+                Some(v) => v,
+                None => {
+                    return Err(Status::not_found(format!(
+                        "volume not found: {}",
+                        volume_id.0
+                    )))
+                }
+            };
+
+            let needles = volume
+                .list_needles()
+                .map_err(|e| Status::internal(format!("list_needles failed: {}", e)))?;
+
+            let entries: Vec<NeedleEntry> = needles
+                .into_iter()
+                .take(limit)
+                .map(|(id, info)| NeedleEntry {
+                    needle_id: id.0,
+                    size: info.data_size as u64,
+                    offset: info.offset,
+                    created_at: info.created_at.timestamp(),
+                })
+                .collect();
+
+            Ok(entries)
+        })
+        .await
+        {
+            Ok(Ok(entries)) => Ok(Response::new(crate::proto::ListNeedlesResponse {
+                success: true,
+                needles: entries,
+                error: String::new(),
+            })),
+            Ok(Err(status)) => Err(status),
+            Err(e) => {
+                error!("list_needles task failed: {}", e);
+                Err(Status::internal(format!("task failed: {}", e)))
             }
         }
     }

@@ -1611,6 +1611,26 @@ impl MasterNode {
         self.topology.read().unwrap().get_node(node_id).cloned()
     }
 
+    /// Get the gRPC address (`host:port`) of the volume server hosting
+    /// `volume_id`. Returns `None` if the volume or node is not found.
+    pub fn get_volume_address(&self, volume_id: u64) -> Option<String> {
+        let volumes = self.volumes.read().unwrap();
+        let vol = volumes.get(&VolumeId(volume_id))?;
+        let topology = self.topology.read().unwrap();
+        let node = topology.get_node(&vol.node_id)?;
+        Some(format!("{}:{}", node.address, node.grpc_port))
+    }
+
+    /// Get all volume IDs hosted on `node_id`.
+    pub fn volumes_on_node(&self, node_id: &str) -> Vec<u64> {
+        let volumes = self.volumes.read().unwrap();
+        volumes
+            .values()
+            .filter(|v| v.node_id.0 == node_id)
+            .map(|v| v.id.0)
+            .collect()
+    }
+
     /// P5: Update node load metrics (cpu/memory) on the leader's in-memory
     /// topology. This is a **local** update — not proposed through Raft —
     /// because load metrics are ephemeral monitoring data that changes every
@@ -3165,8 +3185,10 @@ impl MasterNode {
         // Only the Raft leader runs ticks; followers no-op.
         {
             let volume_default_size = self.cluster_config.read().unwrap().volume_size_limit;
-            let engine =
-                crate::allocator_integration::RebalanceEngine::new_logging(volume_default_size);
+            let engine = crate::allocator_integration::RebalanceEngine::new_with_master(
+                Arc::clone(&self),
+                volume_default_size,
+            );
             *self.rebalance_engine.write().unwrap() = Some(Arc::clone(&engine));
             crate::allocator_integration::spawn_rebalance_loop(
                 Arc::clone(&engine),
