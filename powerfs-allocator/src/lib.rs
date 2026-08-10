@@ -48,8 +48,9 @@ pub use snapshot::{
     VolumeRuntimeState,
 };
 pub use status::{
-    AllocationStats, ClusterOverview, MigrationState, MigrationTaskStatus, MigrationType,
-    NodeLoadReport, StatusQuery, VolumeDetail,
+    AllocationStats, AllocationStatsCollector, ClusterOverview, MigrationState,
+    MigrationTaskStatus, MigrationType, NodeLoadReport, SnapshotStatusQuery, StatusQuery,
+    VolumeDetail,
 };
 pub use volume_assigner::{
     AssignContext, AssignerType, ConsistentHashAssigner, RoundRobinAssigner, SmartVolumeAssigner,
