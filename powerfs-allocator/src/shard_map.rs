@@ -23,6 +23,27 @@ pub enum ShardState {
     Draining,
 }
 
+/// Plan returned by a (dry-run) `add_shard` operation.
+///
+/// Describes which existing shard is split, at which inode boundary, and the
+/// new shard id + range that will receive future allocations. Existing inodes
+/// keep their original routing (no metadata migration required).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardSplitPlan {
+    /// Shard whose range is being split.
+    pub split_from: ShardId,
+    /// Inclusive lower bound of the new shard's range (split boundary).
+    pub split_point: u64,
+    /// Id assigned to the new shard.
+    pub new_shard_id: ShardId,
+    /// `[range_start, range_end)` of the new shard.
+    pub new_range: (u64, u64),
+    /// Estimated count of future inode allocations that will land in the new
+    /// shard (half of the split source's range size). Used for capacity
+    /// planning / dry-run previews.
+    pub affected_future_allocations: u64,
+}
+
 /// A single range entry in the shard map.
 #[derive(Clone, Debug)]
 struct ShardMapEntry {
@@ -216,10 +237,7 @@ impl ShardMap {
         }
 
         // Merge the removed shard's range into the previous Active entry
-        let remove_idx = entries
-            .iter()
-            .position(|e| e.shard_id == shard_id)
-            .unwrap();
+        let remove_idx = entries.iter().position(|e| e.shard_id == shard_id).unwrap();
 
         if remove_idx > 0 {
             // Extend the previous entry's range_end to cover the removed entry
@@ -256,6 +274,162 @@ impl ShardMap {
             .map(|e| (e.range_start, e.range_end, e.shard_id, e.state.clone()))
             .collect()
     }
+
+    // ===== P8: High-level shard scaling (auto-selection + dry-run) =====
+
+    /// Auto-select the best shard to split.
+    ///
+    /// Strategy: pick the Active shard with the largest inode range (most
+    /// room for future allocations). Returns `None` if no Active shards.
+    pub fn select_split_candidate(&self) -> Option<ShardId> {
+        let entries = self.entries.read().unwrap();
+        entries
+            .iter()
+            .filter(|e| e.state == ShardState::Active)
+            .max_by_key(|e| e.range_end.saturating_sub(e.range_start))
+            .map(|e| e.shard_id)
+    }
+
+    /// Compute the next available shard ID (max existing + 1).
+    pub fn next_shard_id(&self) -> ShardId {
+        let entries = self.entries.read().unwrap();
+        let max_id = entries.iter().map(|e| e.shard_id.0).max().unwrap_or(0);
+        ShardId(max_id + 1)
+    }
+
+    /// Plan an `add_shard` operation without executing.
+    ///
+    /// - `split_from=None`: auto-selects the largest Active shard.
+    /// - Split point: midpoint of the selected shard's range.
+    /// - New shard ID: `next_shard_id()` (max existing + 1).
+    ///
+    /// Returns a `ShardSplitPlan` that can be inspected (dry-run) or
+    /// passed to `execute_add_shard` for execution.
+    ///
+    /// **Note**: this takes a short-lived read lock only. To avoid a TOCTOU
+    /// race (plan computed, then map mutated by another thread before
+    /// execution), prefer [`add_shard_auto`] which plans and executes under
+    /// a single write lock.
+    pub fn plan_add_shard(
+        &self,
+        split_from: Option<ShardId>,
+    ) -> Result<ShardSplitPlan, ShardError> {
+        let entries = self.entries.read().unwrap();
+        plan_add_shard_locked(&entries, split_from)
+    }
+
+    /// Execute a pre-computed `ShardSplitPlan`.
+    ///
+    /// Re-validates the plan against the current map state (the split source
+    /// must still be Active, the split point must still be in range, and the
+    /// new shard id must not collide). Returns an error if the map has changed
+    /// incompatibly since the plan was computed.
+    pub fn execute_add_shard(&self, plan: &ShardSplitPlan) -> Result<(), ShardError> {
+        let mut entries = self.entries.write().unwrap();
+        execute_add_shard_locked(&mut entries, plan)
+    }
+
+    /// High-level add_shard: plan + optionally execute, atomically.
+    ///
+    /// This is the primary entry point for the ManagementApi's `add_shard`.
+    /// - `split_from=None`: auto-selects the largest Active shard.
+    /// - `dry_run=true`: returns the plan without modifying the map.
+    /// - `dry_run=false`: plans and executes under a single write lock, so
+    ///   no concurrent scaling/routing mutation can interleave between plan
+    ///   and execute.
+    pub fn add_shard_auto(
+        &self,
+        split_from: Option<ShardId>,
+        dry_run: bool,
+    ) -> Result<ShardSplitPlan, ShardError> {
+        let mut entries = self.entries.write().unwrap();
+        let plan = plan_add_shard_locked(&entries, split_from)?;
+        if !dry_run {
+            execute_add_shard_locked(&mut entries, &plan)?;
+        }
+        Ok(plan)
+    }
+}
+
+// ===== Locked helpers (operate on a pre-held guard) =====
+//
+// These exist so that [`ShardMap::add_shard_auto`] can plan and execute
+// under a single write lock, avoiding a TOCTOU race where another thread
+// mutates the map between the (read-locked) plan and the (write-locked)
+// execute.
+
+/// Plan a split against a snapshot of entries held under an external lock.
+fn plan_add_shard_locked(
+    entries: &[ShardMapEntry],
+    split_from: Option<ShardId>,
+) -> Result<ShardSplitPlan, ShardError> {
+    let target = match split_from {
+        Some(id) => entries
+            .iter()
+            .find(|e| e.shard_id == id && e.state == ShardState::Active)
+            .ok_or(ShardError::ShardNotFound(id))?,
+        None => {
+            let candidate = entries
+                .iter()
+                .filter(|e| e.state == ShardState::Active)
+                .max_by_key(|e| e.range_end.saturating_sub(e.range_start))
+                .ok_or(ShardError::NoActiveShardToSplit)?;
+            candidate
+        }
+    };
+
+    let range_size = target.range_end.saturating_sub(target.range_start);
+    let split_point = target.range_start + range_size / 2;
+    let new_id = ShardId(entries.iter().map(|e| e.shard_id.0).max().unwrap_or(0) + 1);
+
+    // Estimate: half the range's future allocations go to the new shard.
+    let affected = range_size / 2;
+
+    Ok(ShardSplitPlan {
+        split_from: target.shard_id,
+        split_point,
+        new_shard_id: new_id,
+        new_range: (split_point, target.range_end),
+        affected_future_allocations: affected,
+    })
+}
+
+/// Execute a split against entries held under an external write lock.
+///
+/// Mirrors the validation in [`ShardMap::add_shard`] so that a stale plan
+/// (e.g. computed against an older map state) is rejected rather than
+/// corrupting the map.
+fn execute_add_shard_locked(
+    entries: &mut Vec<ShardMapEntry>,
+    plan: &ShardSplitPlan,
+) -> Result<(), ShardError> {
+    let entry_idx = entries
+        .iter()
+        .position(|e| e.shard_id == plan.split_from && e.state == ShardState::Active)
+        .ok_or(ShardError::ShardNotFound(plan.split_from))?;
+
+    let entry = &entries[entry_idx];
+
+    if plan.split_point <= entry.range_start || plan.split_point >= entry.range_end {
+        return Err(ShardError::InvalidSplitPoint(plan.split_point));
+    }
+
+    if entries.iter().any(|e| e.shard_id == plan.new_shard_id) {
+        return Err(ShardError::ShardAlreadyExists(plan.new_shard_id));
+    }
+
+    let original_end = entry.range_end;
+    entries[entry_idx].range_end = plan.split_point;
+
+    let new_entry = ShardMapEntry {
+        range_start: plan.split_point,
+        range_end: original_end,
+        shard_id: plan.new_shard_id,
+        state: ShardState::Active,
+    };
+    entries.insert(entry_idx + 1, new_entry);
+
+    Ok(())
 }
 
 impl Default for ShardMap {
@@ -376,9 +550,53 @@ mod tests {
     fn test_duplicate_shard_id() {
         let map = ShardMap::from_shard_count(3);
 
-        let err = map
-            .add_shard(ShardId(1), ShardId(0), 500_000)
-            .unwrap_err();
+        let err = map.add_shard(ShardId(1), ShardId(0), 500_000).unwrap_err();
         assert!(matches!(err, ShardError::ShardAlreadyExists(_)));
+    }
+
+    #[test]
+    fn test_plan_add_shard_no_active_returns_no_active_error() {
+        let map = ShardMap::from_shard_count(3);
+        // Drain all shards → no Active shard to split.
+        map.drain_shard(ShardId(0)).unwrap();
+        map.drain_shard(ShardId(1)).unwrap();
+        map.drain_shard(ShardId(2)).unwrap();
+
+        let err = map.plan_add_shard(None).unwrap_err();
+        assert!(matches!(err, ShardError::NoActiveShardToSplit));
+    }
+
+    #[test]
+    fn test_add_shard_auto_concurrent_no_collisions() {
+        // Many threads add_shard_auto concurrently. Because each call plans
+        // and executes under a single write lock, every new shard id must be
+        // unique and the final active count must equal initial + num_adds.
+        let map = std::sync::Arc::new(ShardMap::from_shard_count(2));
+        let n = 16;
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let m = map.clone();
+                std::thread::spawn(move || m.add_shard_auto(None, false).map(|p| p.new_shard_id))
+            })
+            .collect();
+
+        let mut new_ids: Vec<ShardId> = Vec::new();
+        for h in handles {
+            new_ids.push(h.join().unwrap().unwrap());
+        }
+
+        // All new shard ids must be distinct (no TOCTOU collisions).
+        let mut sorted = new_ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            n as usize,
+            "duplicate new shard ids: {new_ids:?}"
+        );
+
+        // Final active count = initial (2) + successful adds (n).
+        assert_eq!(map.active_shards().len(), 2 + n as usize);
     }
 }
