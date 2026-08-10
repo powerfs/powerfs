@@ -108,6 +108,8 @@ impl MasterClient {
     pub async fn send_heartbeat(
         &self,
         volumes: Vec<VolumeShortInfo>,
+        cpu_usage: f32,
+        memory_usage: f32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         const MAX_REDIRECTS: usize = 5;
         let mut current_addr = self.current_master();
@@ -120,7 +122,10 @@ impl MasterClient {
                 volumes.len()
             );
 
-            match self.send_heartbeat_once(&current_addr, &volumes).await {
+            match self
+                .send_heartbeat_once(&current_addr, &volumes, cpu_usage, memory_usage)
+                .await
+            {
                 Ok(leader) => {
                     // 心跳成功; 更新 current_master_index 指向实际处理心跳的 master。
                     // 重定向后 current_addr 可能不同于 current_master() 返回的地址,
@@ -200,6 +205,8 @@ impl MasterClient {
         &self,
         master_addr: &str,
         volumes: &[VolumeShortInfo],
+        cpu_usage: f32,
+        memory_usage: f32,
     ) -> Result<String, HeartbeatError> {
         // 构建 Heartbeat TLV 请求
         let mut enc = TlvEncoder::new();
@@ -208,6 +215,12 @@ impl MasterClient {
         let _ = enc.add_u64(FieldId::Blksize, self.http_port as u64);
         let _ = enc.add_u64(FieldId::NetPort, self.net_port as u64);
         let _ = enc.add_u64(FieldId::Entries, volumes.len() as u64);
+
+        // P5: Node load metrics — scaled to basis points (0-10000 = 0.00%-100.00%).
+        let cpu_bps = (cpu_usage.clamp(0.0, 1.0) * 10000.0) as u64;
+        let mem_bps = (memory_usage.clamp(0.0, 1.0) * 10000.0) as u64;
+        let _ = enc.add_u64(FieldId::CpuUsage, cpu_bps);
+        let _ = enc.add_u64(FieldId::MemoryUsage, mem_bps);
 
         for vol in volumes {
             let _ = enc.add_u64(FieldId::Ino, vol.volume_id);

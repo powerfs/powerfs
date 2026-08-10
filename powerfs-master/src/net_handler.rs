@@ -300,9 +300,20 @@ impl MasterNetHandler {
         let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
         let volume_count = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
 
+        // P5: Parse node load metrics (basis points 0-10000 → ratio 0.0-1.0).
+        // Absent for pre-P5 volume servers; defaults to 0.0.
+        let cpu_bps = dec.next_u64(FieldId::CpuUsage).unwrap_or(0);
+        let mem_bps = dec.next_u64(FieldId::MemoryUsage).unwrap_or(0);
+        let cpu_usage = (cpu_bps as f32) / 10000.0;
+        let memory_usage = (mem_bps as f32) / 10000.0;
+
         info!(
-            "NET_HEARTBEAT: node={}, ip={}, volumes={}",
-            node_id_str, ip, volume_count
+            "NET_HEARTBEAT: node={}, ip={}, volumes={}, cpu={:.1}%, mem={:.1}%",
+            node_id_str,
+            ip,
+            volume_count,
+            cpu_usage * 100.0,
+            memory_usage * 100.0
         );
 
         // Heartbeat mutates Master topology state (add_node, volume registration).
@@ -396,6 +407,12 @@ impl MasterNetHandler {
                 warn!("NET_HEARTBEAT update_node_volumes failed: {}", e);
             }
         }
+
+        // P5: Update node load metrics (local, non-Raft — ephemeral monitoring
+        // data that doesn't need strong consistency). Stored on DataNodeInfo
+        // in the leader's in-memory topology.
+        self.master
+            .update_node_load_metrics(&node_id, cpu_usage, memory_usage);
 
         let leader = self.master.get_leader().await;
         let default_volume_size = powerfs_common::constants::DEFAULT_VOLUME_SIZE;
