@@ -9,7 +9,7 @@ mod volume_client;
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
     CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, FsckArgs, GrowArgs, HeartbeatArgs,
-    KvArgs, LookupArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -99,6 +99,9 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigSubcommand,
     },
+
+    /// Allocator management API (placement strategy, volume pin, node maintenance, migrations)
+    Manage(ManageArgs),
 }
 
 #[tokio::main]
@@ -156,6 +159,7 @@ async fn main() {
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
         Commands::Fsck(args) => commands::fsck(client, args).await,
         Commands::Config { .. } => unreachable!("handled above"),
+        Commands::Manage(args) => commands::manage(client, args).await,
     };
 
     if let Err(e) = result {
