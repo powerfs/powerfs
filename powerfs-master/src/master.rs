@@ -92,6 +92,11 @@ pub struct MasterNode {
     /// Allocator management API (volume scaling, migration control, policy
     /// updates). `None` until `start()` constructs it.
     management_api: RwLock<Option<Arc<crate::allocator_integration::MasterManagementApi>>>,
+    /// Volume pin registry: `volume_id → node_id`. A pinned volume's data must
+    /// stay on the pinned node; the LoadBalancer skips it as a migration
+    /// source. Raft-replicated via `PinVolume`/`UnpinVolume` commands so all
+    /// master replicas agree.
+    volume_pins: RwLock<HashMap<VolumeId, String>>,
 }
 
 #[derive(Clone)]
@@ -420,6 +425,7 @@ impl MasterNode {
             next_zone_id: Arc::new(AtomicU32::new(1)),
             rebalance_engine: RwLock::new(None),
             management_api: RwLock::new(None),
+            volume_pins: RwLock::new(HashMap::new()),
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -893,6 +899,12 @@ impl MasterNode {
             RaftCommand::SetNodeMaintenance { node_id, enabled } => {
                 self.apply_set_node_maintenance(&node_id, enabled)?;
             }
+            RaftCommand::PinVolume { volume_id, node_id } => {
+                self.apply_pin_volume(volume_id, node_id)?;
+            }
+            RaftCommand::UnpinVolume { volume_id } => {
+                self.apply_unpin_volume(volume_id)?;
+            }
         }
 
         Ok(())
@@ -1121,6 +1133,32 @@ impl MasterNode {
                 node_id, enabled
             );
         }
+        Ok(())
+    }
+
+    /// Apply `PinVolume` Raft command: record `volume_id → node_id` in the pin
+    /// registry. The `ClusterSnapshot` builder exposes this to the LoadBalancer,
+    /// which skips pinned volumes as migration sources.
+    fn apply_pin_volume(&self, volume_id: u64, node_id: String) -> Result<()> {
+        self.volume_pins
+            .write()
+            .unwrap()
+            .insert(VolumeId(volume_id), node_id.clone());
+        debug!(
+            "Applied PinVolume via Raft: volume={} node={}",
+            volume_id, node_id
+        );
+        Ok(())
+    }
+
+    /// Apply `UnpinVolume` Raft command: remove a volume from the pin registry,
+    /// restoring normal LoadBalancer migration behaviour.
+    fn apply_unpin_volume(&self, volume_id: u64) -> Result<()> {
+        self.volume_pins
+            .write()
+            .unwrap()
+            .remove(&VolumeId(volume_id));
+        debug!("Applied UnpinVolume via Raft: volume={}", volume_id);
         Ok(())
     }
 
@@ -1594,6 +1632,40 @@ impl MasterNode {
             node_id: node_id.to_string(),
             enabled,
         };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Pin a volume to a specific node via Raft replication.
+    ///
+    /// Once pinned, the LoadBalancer will not migrate the volume's data away
+    /// from the pinned node. Use `unpin_volume` to restore normal behaviour.
+    ///
+    /// Only the Raft leader can propose this command.
+    pub async fn pin_volume_to_node(&self, volume_id: u64, node_id: &str) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::PinVolume {
+            volume_id,
+            node_id: node_id.to_string(),
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Remove a volume pin via Raft replication.
+    ///
+    /// Only the Raft leader can propose this command.
+    pub async fn unpin_volume(&self, volume_id: u64) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::UnpinVolume { volume_id };
 
         self.propose_command(cmd).await?;
         Ok(())
@@ -2465,6 +2537,16 @@ impl MasterNode {
             nodes.iter().map(|n| n.load_score).sum::<f64>() / nodes.len() as f64
         };
 
+        // --- Volume pins: Raft-replicated pin registry → snapshot ---
+        let pinned_volumes: std::collections::HashMap<u64, String> = {
+            self.volume_pins
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(vid, node_id)| (vid.0, node_id.clone()))
+                .collect()
+        };
+
         powerfs_allocator::ClusterSnapshot {
             version: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2476,6 +2558,7 @@ impl MasterNode {
             nodes,
             shards,
             cluster_avg_load,
+            pinned_volumes,
         }
     }
 
@@ -3415,6 +3498,7 @@ impl Clone for MasterNode {
             next_zone_id: self.next_zone_id.clone(),
             rebalance_engine: RwLock::new(self.rebalance_engine.read().unwrap().clone()),
             management_api: RwLock::new(self.management_api.read().unwrap().clone()),
+            volume_pins: RwLock::new(self.volume_pins.read().unwrap().clone()),
         }
     }
 }

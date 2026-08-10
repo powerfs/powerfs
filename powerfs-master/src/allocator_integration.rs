@@ -202,10 +202,7 @@ impl MigrationExecutor for MasterMigrationExecutor {
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        "[rebalance] migration task {} failed: {}",
-                        task_id, e
-                    );
+                    warn!("[rebalance] migration task {} failed: {}", task_id, e);
                 }
             }
 
@@ -311,10 +308,7 @@ async fn run_cold_data_migration(
     // 2. Group entries by inode for batch chunk updates.
     let mut by_inode: HashMap<u64, Vec<crate::filer_client::FilerChunkEntry>> = HashMap::new();
     for entry in entries {
-        by_inode
-            .entry(entry.inode)
-            .or_default()
-            .push(entry);
+        by_inode.entry(entry.inode).or_default().push(entry);
     }
 
     // 3. For each inode: read each needle, write to target, collect new chunk info.
@@ -325,7 +319,10 @@ async fn run_cold_data_migration(
     for (inode, chunks) in &by_inode {
         for chunk in chunks {
             if cancel_flag.load(Ordering::Relaxed) {
-                info!("[rebalance] migration cancelled, partial: {} bytes", total_bytes);
+                info!(
+                    "[rebalance] migration cancelled, partial: {} bytes",
+                    total_bytes
+                );
                 return Ok(total_bytes);
             }
 
@@ -358,7 +355,13 @@ async fn run_cold_data_migration(
         let shard_id = chunks.first().map(|c| c.shard_id).unwrap_or(0);
         let file_size = chunks.first().map(|c| c.file_size).unwrap_or(0);
         filer_client
-            .update_inode_size_chunks(shard_id, *inode, file_size, &updated_chunks, "migration-executor")
+            .update_inode_size_chunks(
+                shard_id,
+                *inode,
+                file_size,
+                &updated_chunks,
+                "migration-executor",
+            )
             .await
             .map_err(|e| format!("update inode {} chunks failed: {}", inode, e))?;
     }
@@ -368,7 +371,10 @@ async fn run_cold_data_migration(
         if cancel_flag.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(e) = pool.delete_needle(&source_addr, from_volume, *old_needle_id).await {
+        if let Err(e) = pool
+            .delete_needle(&source_addr, from_volume, *old_needle_id)
+            .await
+        {
             warn!(
                 "[rebalance] failed to delete old needle {} on volume {}: {} (non-fatal)",
                 old_needle_id, from_volume, e
@@ -618,12 +624,26 @@ impl ManagementApi for MasterManagementApi {
 
     // ===== Override operations =====
 
-    fn pin_volume_to_node(&self, _volume_id: u64, _node_id: &str) -> Result<(), ManageError> {
-        Err(nyi("volume pinning"))
+    fn pin_volume_to_node(&self, volume_id: u64, node_id: &str) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .pin_volume_to_node(volume_id, node_id)
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
     }
 
-    fn unpin_volume(&self, _volume_id: u64) -> Result<(), ManageError> {
-        Err(nyi("volume pinning"))
+    fn unpin_volume(&self, volume_id: u64) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .unpin_volume(volume_id)
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
     }
 
     // ===== Shard scaling =====
@@ -742,10 +762,7 @@ impl RebalanceEngine {
     /// for volume-client / filer-client access and leader-state queries.
     ///
     /// `volume_default_size` has the same meaning as in `new_logging`.
-    pub fn new_with_master(
-        master: Arc<MasterNode>,
-        volume_default_size: u64,
-    ) -> Arc<Self> {
+    pub fn new_with_master(master: Arc<MasterNode>, volume_default_size: u64) -> Arc<Self> {
         let migration_policy = Arc::new(RwLock::new(MigrationPolicy::default()));
         let rebalance_policy = Arc::new(RwLock::new(RebalancePolicy::default()));
         let (completion_tx, completion_rx) = mpsc::channel::<String>();
@@ -973,6 +990,7 @@ mod tests {
             ],
             shards: Vec::new(),
             cluster_avg_load: 0.2,
+            pinned_volumes: std::collections::HashMap::new(),
         };
         // tick starts a migration (LoggingExecutor enqueues completion).
         engine.scheduler.tick(&snapshot, &engine.load_balancer);
