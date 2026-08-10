@@ -620,6 +620,35 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
         }
     }
 
+    // Fetch real leader_count from each filer's /admin/status (Master gRPC
+    // reports leader_count=0 — it doesn't track Raft leader state).
+    let filer_admin = state.filer_admin.clone();
+    let admin_futures: Vec<_> = filers
+        .iter()
+        .map(|f| {
+            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+            let ep = powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: f.node_id.clone(),
+                address,
+                http_port,
+            };
+            let client = filer_admin.clone();
+            async move { client.get_json(&ep, "/admin/status").await.ok() }
+        })
+        .collect();
+    let admin_results = futures::future::join_all(admin_futures).await;
+    for (filer, result) in filers.iter_mut().zip(admin_results.iter()) {
+        if let Some(json) = result {
+            if let Some(lc) = json.get("leader_count").and_then(|v| v.as_u64()) {
+                filer.leader_count = lc;
+            }
+            if let Some(ts) = json.get("shard_count").and_then(|v| v.as_u64()) {
+                filer.total_shards = ts;
+            }
+        }
+    }
+
     Json(ApiResponse::success(TopologyResponse {
         masters,
         filers,
