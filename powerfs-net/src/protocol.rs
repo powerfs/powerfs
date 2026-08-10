@@ -910,6 +910,13 @@ pub enum FieldId {
     /// 正常安装时, 若新注册 filer 的 shard_count 与 master 已知值
     /// 不一致, master 拒绝注册并返回错误; force=1 时允许通过 (warn).
     Force = 0xB9,
+
+    // ===== P5: Node load metrics in heartbeat (0xBA-0xBB) =====
+    /// CPU usage scaled to basis points (u64, 0-10000 = 0.00%-100.00%).
+    /// Volume server reports via heartbeat; master stores on DataNodeInfo.
+    CpuUsage = 0xBA,
+    /// Memory usage scaled to basis points (u64, 0-10000 = 0.00%-100.00%).
+    MemoryUsage = 0xBB,
 }
 
 impl FieldId {
@@ -1010,6 +1017,8 @@ impl FieldId {
             0xB7 => Some(Self::FilerListEntries),
             0xB8 => Some(Self::TotalShards),
             0xB9 => Some(Self::Force),
+            0xBA => Some(Self::CpuUsage),
+            0xBB => Some(Self::MemoryUsage),
             _ => None,
         }
     }

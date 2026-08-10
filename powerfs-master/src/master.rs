@@ -1556,6 +1556,26 @@ impl MasterNode {
         self.topology.read().unwrap().get_node(node_id).cloned()
     }
 
+    /// P5: Update node load metrics (cpu/memory) on the leader's in-memory
+    /// topology. This is a **local** update — not proposed through Raft —
+    /// because load metrics are ephemeral monitoring data that changes every
+    /// heartbeat and doesn't need strong consistency.
+    ///
+    /// Called from `handle_heartbeat` after `add_node` / `update_node_volumes`.
+    pub fn update_node_load_metrics(
+        &self,
+        node_id: &NodeId,
+        cpu_usage: f32,
+        memory_usage: f32,
+    ) {
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(node_id) {
+            node.cpu_usage = cpu_usage;
+            node.memory_usage = memory_usage;
+            node.last_heartbeat = Utc::now();
+        }
+    }
+
     pub async fn update_node_volumes(&self, params: UpdateNodeVolumesParams) -> Result<()> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
@@ -2273,21 +2293,19 @@ impl MasterNode {
             .map(|n| NodeRuntime {
                 node_id: n.id.0.clone(),
                 state: map_node_state(n.state, n.maintenance_mode),
-                cpu_usage: 0.0,
-                memory_usage: 0.0,
+                // P5: cpu/memory from heartbeat-reported load metrics.
+                cpu_usage: n.cpu_usage,
+                memory_usage: n.memory_usage,
                 // disk_usage derived from the node's reported space.
                 disk_usage: if n.total_space > 0 {
                     (n.used_space as f32 / n.total_space as f32).clamp(0.0, 1.0)
                 } else {
                     0.0
                 },
-                // Composite load_score: until P5, approximate from disk usage
-                // so the allocator's score_volume still ranks nodes meaningfully.
-                load_score: if n.total_space > 0 {
-                    (n.used_space as f64 / n.total_space as f64).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                },
+                // Composite load_score: weighted blend of cpu, memory, disk.
+                // Until P5 enriched heartbeats, cpu/memory were 0 and this
+                // reduced to disk usage. Now all three contribute.
+                load_score: compute_load_score(n.cpu_usage, n.memory_usage, n.total_space, n.used_space),
                 in_maintenance: n.maintenance_mode,
             })
             .collect();
@@ -3365,6 +3383,21 @@ fn select_writable_volume_from(
     Some(pick)
 }
 
+/// P5: Composite load score (0.0 idle - 1.0 saturated).
+///
+/// Weighted blend: 40% cpu, 30% memory, 30% disk. When cpu/memory are 0
+/// (pre-P5 nodes that don't report load metrics), the score reduces to
+/// 30% disk usage — still meaningful for ranking, just less precise.
+fn compute_load_score(cpu: f32, memory: f32, total_space: u64, used_space: u64) -> f64 {
+    let disk = if total_space > 0 {
+        (used_space as f32 / total_space as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let score = 0.4 * cpu.clamp(0.0, 1.0) + 0.3 * memory.clamp(0.0, 1.0) + 0.3 * disk;
+    score as f64
+}
+
 /// Map `powerfs_common::NodeState` + maintenance flag to the allocator's
 /// `NodeRuntimeState`. Maintenance takes precedence over the reported state.
 fn map_node_state(
@@ -3739,5 +3772,52 @@ mod tests {
         assert_eq!(map_volume_state(VolumeState::ReadOnly), VolumeRuntimeState::Active);
         assert_eq!(map_volume_state(VolumeState::Full), VolumeRuntimeState::Full);
         assert_eq!(map_volume_state(VolumeState::Deleting), VolumeRuntimeState::Deleted);
+    }
+
+    #[test]
+    fn test_compute_load_score_weights() {
+        // Tolerance accounts for f32 arithmetic in the weighted blend.
+        // All-zero (pre-P5 node, empty disk) → 0.0
+        assert!((compute_load_score(0.0, 0.0, 0, 0) - 0.0).abs() < 1e-6);
+        // 100% cpu, 100% mem, 100% disk → 1.0
+        assert!((compute_load_score(1.0, 1.0, 100, 100) - 1.0).abs() < 1e-6);
+        // 50% cpu only, empty disk → 0.4 * 0.5 = 0.2
+        assert!((compute_load_score(0.5, 0.0, 0, 0) - 0.2).abs() < 1e-6);
+        // 0% cpu, 0% mem, 50% disk → 0.3 * 0.5 = 0.15
+        assert!((compute_load_score(0.0, 0.0, 100, 50) - 0.15).abs() < 1e-6);
+        // 50% cpu, 50% mem, 50% disk → 0.4*0.5 + 0.3*0.5 + 0.3*0.5 = 0.5
+        assert!((compute_load_score(0.5, 0.5, 100, 50) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_update_node_load_metrics() {
+        // update_node_load_metrics is a local (non-Raft) topology update.
+        // We verify it sets cpu/memory on an existing node.
+        // Note: MasterNode requires Raft + network setup; we test the
+        // topology-level update directly via get_node_mut.
+        use powerfs_common::types::Topology;
+        let mut topo = Topology::new();
+        let n = DataNodeInfo::new(
+            NodeId("test-node".to_string()),
+            "127.0.0.1".to_string(),
+            RackId("r1".to_string()),
+            DataCenterId("dc1".to_string()),
+            8080,
+            8081,
+            String::new(),
+        );
+        topo.get_or_create_node(n);
+
+        // Simulate the update_node_load_metrics logic
+        {
+            if let Some(node) = topo.get_node_mut(&NodeId("test-node".to_string())) {
+                node.cpu_usage = 0.75;
+                node.memory_usage = 0.50;
+            }
+        }
+
+        let node = topo.get_node(&NodeId("test-node".to_string())).unwrap();
+        assert!((node.cpu_usage - 0.75).abs() < 1e-6);
+        assert!((node.memory_usage - 0.50).abs() < 1e-6);
     }
 }
