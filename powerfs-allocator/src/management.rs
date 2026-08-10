@@ -4,6 +4,7 @@
 
 use crate::config::{MigrationPolicy, RebalancePolicy};
 use crate::error::{ManageError, ShardId};
+use crate::shard_map::ShardSplitPlan;
 
 /// Rebalance action — output of LoadBalancer analysis.
 #[derive(Clone, Debug)]
@@ -21,10 +22,7 @@ pub enum RebalanceAction {
         volume_ids: Vec<u64>,
     },
     /// Request Master to create a new volume.
-    RequestVolumeGrow {
-        zone_id: u32,
-        size: u64,
-    },
+    RequestVolumeGrow { zone_id: u32, size: u64 },
 }
 
 /// Result of a migration execution attempt.
@@ -51,17 +49,6 @@ pub enum RejectionReason {
     NodeInMaintenance,
 }
 
-/// Shard split plan (returned by dry-run `add_shard`).
-#[derive(Clone, Debug)]
-pub struct ShardSplitPlan {
-    pub split_from: ShardId,
-    pub split_point: u64,
-    pub new_shard_id: ShardId,
-    pub new_range: (u64, u64),
-    /// Estimated future inodes affected.
-    pub affected_future_allocations: u64,
-}
-
 /// Management API — write operations. Requires auth (TBD, may reuse RBAC).
 pub trait ManagementApi: Send + Sync {
     // ===== Configuration management =====
@@ -82,10 +69,7 @@ pub trait ManagementApi: Send + Sync {
 
     /// Trigger a rebalance check.
     /// `dry_run=true` returns suggestions without executing.
-    fn trigger_rebalance_check(
-        &self,
-        dry_run: bool,
-    ) -> Result<Vec<RebalanceAction>, ManageError>;
+    fn trigger_rebalance_check(&self, dry_run: bool) -> Result<Vec<RebalanceAction>, ManageError>;
 
     /// Execute migration actions.
     /// `dry_run=true` validates without executing, returning accept/reject.

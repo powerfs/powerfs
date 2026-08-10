@@ -96,8 +96,36 @@ impl ShardStrategy {
 
         // Increment shard count
         let mut count = self.shard_count.write().unwrap();
-        *count = *count + 1;
+        *count += 1;
         Ok(())
+    }
+
+    /// Add a shard via the auto-scaling path (plan + optionally execute).
+    ///
+    /// - `split_from = None`: auto-selects the largest Active shard.
+    /// - `dry_run = true`: returns the split plan without modifying the map.
+    /// - `dry_run = false`: plans and executes atomically, then bumps the
+    ///   shard count.
+    ///
+    /// This is the filer-side entry point for the ManagementApi's
+    /// `add_shard` operation. Existing inodes keep their routing; only future
+    /// allocations in the split range land on the new shard.
+    pub fn add_shard_auto(
+        &self,
+        split_from: Option<ShardId>,
+        dry_run: bool,
+    ) -> Result<powerfs_allocator::ShardSplitPlan, String> {
+        let map = self.shard_map.read().unwrap();
+        let plan = map
+            .add_shard_auto(split_from.map(|s| powerfs_allocator::ShardId(s.0)), dry_run)
+            .map_err(|e| e.to_string())?;
+        drop(map);
+
+        if !dry_run {
+            let mut count = self.shard_count.write().unwrap();
+            *count += 1;
+        }
+        Ok(plan)
     }
 
     /// Mark a shard as Draining (stop new allocations).
@@ -161,7 +189,9 @@ mod tests {
         let strategy = ShardStrategy::new(3);
 
         // Split shard 1 at 1_500_000
-        strategy.add_shard(ShardId(3), ShardId(1), 1_500_000).unwrap();
+        strategy
+            .add_shard(ShardId(3), ShardId(1), 1_500_000)
+            .unwrap();
 
         // Existing inodes keep routing
         assert_eq!(strategy.calculate_shard(1_000_000).0, 1);
@@ -194,5 +224,41 @@ mod tests {
         let active = strategy.active_shards();
         assert_eq!(active.len(), 2);
         assert!(!active.contains(&ShardId(1)));
+    }
+
+    #[test]
+    fn test_add_shard_auto_dry_run_no_count_change() {
+        let strategy = ShardStrategy::new(3);
+        let start_count = strategy.get_shard_count();
+
+        let plan = strategy.add_shard_auto(None, true).unwrap();
+        // Dry-run: shard count and routing must be unchanged.
+        assert_eq!(strategy.get_shard_count(), start_count);
+        assert_eq!(strategy.active_shards().len(), 3);
+        // Plan selects the largest active shard (shard 2: [2M, u64::MAX)).
+        assert_eq!(plan.split_from.0, 2);
+        assert_eq!(plan.new_shard_id.0, 3);
+    }
+
+    #[test]
+    fn test_add_shard_auto_execute_bumps_count_and_routes() {
+        let strategy = ShardStrategy::new(3);
+
+        let plan = strategy.add_shard_auto(None, false).unwrap();
+        // Shard count bumped, new shard is active.
+        assert_eq!(strategy.get_shard_count(), 4);
+        assert!(strategy
+            .active_shards()
+            .iter()
+            .any(|s| s.0 == plan.new_shard_id.0));
+
+        // Inodes at/after the split point route to the new shard.
+        assert_eq!(
+            strategy.calculate_shard(plan.split_point).0,
+            plan.new_shard_id.0
+        );
+        // The split source's lower range keeps routing to the source shard.
+        let (src_start, _) = strategy.get_shard_range(ShardId(plan.split_from.0));
+        assert_eq!(strategy.calculate_shard(src_start).0, plan.split_from.0);
     }
 }
