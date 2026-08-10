@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, message, Form, Input, Tabs, Descriptions, Typography } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, message, Form, Input, Tabs, Descriptions, Typography, Tooltip } from 'antd'
 const { Text } = Typography
 import {
   KeyOutlined,
@@ -15,13 +15,13 @@ import type { KVSessionInfo, KVMetrics, KVNamespace } from '@/types'
 import {
   getKVSessions,
   getKVMetrics,
-  deleteKVSession,
   createKVNamespace,
   listKVNamespaces,
   deleteKVNamespace,
 } from '@/services/api'
 import { formatBytes, formatPercent, formatNumber } from '@/utils/format'
 import { generateTimeSeriesData } from '@/utils/mockData'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 function KV() {
   const [sessions, setSessions] = useState<KVSessionInfo[]>([])
@@ -35,12 +35,6 @@ function KV() {
   const [showCreateNamespace, setShowCreateNamespace] = useState(false)
   const [namespaceForm] = Form.useForm()
 
-  useEffect(() => {
-    loadKVData()
-    const interval = setInterval(loadKVData, 10000)
-    return () => clearInterval(interval)
-  }, [])
-
   const loadKVData = async () => {
     const [sessionList, kvMetrics] = await Promise.all([
       getKVSessions(),
@@ -49,6 +43,25 @@ function KV() {
     setSessions(sessionList)
     setMetrics(kvMetrics)
   }
+
+  useEffect(() => {
+    loadKVData()
+    // Backoff polling to 30s — real-time updates flow through WS.
+    const interval = setInterval(loadKVData, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // WS pushes KVMetrics as the kv source. Update metrics live; sessions
+  // still come from axios (backend only broadcasts metrics aggregate).
+  useMetricStream({
+    source: 'kv',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        setMetrics(payload as KVMetrics)
+      }
+    },
+  })
 
   useEffect(() => {
     loadNamespaces()
@@ -64,17 +77,17 @@ function KV() {
     setShowDetail(true)
   }
 
-  const handleDeleteSession = (session: KVSessionInfo) => {
-    setSelectedSession(session)
-    setShowDeleteConfirm(true)
-  }
+  // TODO: restore delete handler after DELETE /metrics/kv/sessions/:id endpoint is added (decision 3)
+  // const handleDeleteSession = (session: KVSessionInfo) => {
+  //   setSelectedSession(session)
+  //   setShowDeleteConfirm(true)
+  // }
 
   const confirmDeleteSession = async () => {
+    // TODO: restore after DELETE /metrics/kv/sessions/:id endpoint is added (decision 3)
     if (selectedSession) {
-      await deleteKVSession(selectedSession.id)
-      message.success('会话删除成功')
+      message.warning('会话删除暂不可用（后端 DELETE 接口待补充）')
       setShowDeleteConfirm(false)
-      loadKVData()
     }
   }
 
@@ -180,14 +193,16 @@ function KV() {
           >
             详情
           </Button>
-          <Button
-            type="text"
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDeleteSession(record)}
-          >
-            删除
-          </Button>
+          <Tooltip title="后端 DELETE 路由待补充，暂不可用">
+            <Button
+              type="text"
+              danger
+              icon={<DeleteOutlined />}
+              disabled
+            >
+              删除
+            </Button>
+          </Tooltip>
         </Space>
       ),
     },
@@ -254,7 +269,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -273,7 +288,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -292,7 +307,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -311,7 +326,7 @@ function KV() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -333,7 +348,7 @@ function KV() {
           <Card
             title="命中率趋势"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <ReactECharts
               option={{
@@ -397,7 +412,7 @@ function KV() {
           <Card
             title="缓存统计"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

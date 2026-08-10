@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message, Tooltip, Typography, Descriptions } from 'antd'
+import { Card, Table, Tag, Button, Modal, Space, Progress, Select, message, Tooltip, Typography, Descriptions, Tabs, Statistic, Row, Col, Empty } from 'antd'
 import {
   DatabaseOutlined,
   DeleteOutlined,
@@ -7,14 +7,18 @@ import {
   FireOutlined,
   ReloadOutlined,
   InfoCircleOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
-import type { VolumeInfo } from '@/types'
-import { getVolumes, deleteVolume } from '@/services/api'
+import { useTranslation } from 'react-i18next'
+import type { VolumeInfo, VolumeIoStats } from '@/types'
+import { getVolumes, getVolumeIo } from '@/services/api'
 import { formatBytes } from '@/utils/format'
+import { useMetricStream } from '@/hooks/useMetricStream'
 
 const { Text } = Typography
 
 function Volumes() {
+  const { t } = useTranslation(['common', 'nav'])
   const [volumes, setVolumes] = useState<VolumeInfo[]>([])
   const [selectedVolume, setSelectedVolume] = useState<VolumeInfo | null>(null)
   const [showDetail, setShowDetail] = useState(false)
@@ -22,12 +26,9 @@ function Volumes() {
   const [showMigrate, setShowMigrate] = useState(false)
   const [filterStatus, setFilterStatus] = useState<string>('')
   const [filterCollection, setFilterCollection] = useState<string>('')
-
-  useEffect(() => {
-    loadVolumes()
-    const interval = setInterval(loadVolumes, 10000)
-    return () => clearInterval(interval)
-  }, [])
+  const [activeTab, setActiveTab] = useState<'volumes' | 'io'>('volumes')
+  const [ioStats, setIoStats] = useState<VolumeIoStats[]>([])
+  const [ioLoading, setIoLoading] = useState(false)
 
   const loadVolumes = async () => {
     const data = await getVolumes()
@@ -35,15 +36,69 @@ function Volumes() {
     setVolumes(data)
   }
 
+  const loadAllIo = async () => {
+    if (volumes.length === 0) return
+    setIoLoading(true)
+    try {
+      const results = await Promise.allSettled(volumes.map(v => getVolumeIo(v.id)))
+      const ok: VolumeIoStats[] = []
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) ok.push(r.value)
+      }
+      setIoStats(ok)
+    } catch (e) {
+      console.error('Failed to load volume IO:', e)
+    } finally {
+      setIoLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadVolumes()
+    // Backoff polling to 30s — real-time updates flow through WS.
+    const interval = setInterval(loadVolumes, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Load IO stats when user switches to the IO tab (lazy).
+  useEffect(() => {
+    if (activeTab === 'io' && ioStats.length === 0 && volumes.length > 0) {
+      void loadAllIo()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, volumes.length])
+
+  // Live merge: WS pushes either a single VolumeInfo (event-driven) or the
+  // full list snapshot (on connect). Both update by volume id.
+  useMetricStream({
+    source: 'volumes',
+    onMetricUpdate: (u) => {
+      const payload = u.payload
+      if (Array.isArray(payload)) {
+        setVolumes(payload as VolumeInfo[])
+      } else if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const vol = payload as VolumeInfo
+        setVolumes((prev) => {
+          const idx = prev.findIndex((v) => v.id === vol.id)
+          if (idx === -1) return [...prev, vol]
+          const next = [...prev]
+          next[idx] = { ...next[idx], ...vol }
+          return next
+        })
+      }
+    },
+  })
+
   const handleViewDetail = (volume: VolumeInfo) => {
     setSelectedVolume(volume)
     setShowDetail(true)
   }
 
-  const handleDelete = (volume: VolumeInfo) => {
-    setSelectedVolume(volume)
-    setShowDeleteConfirm(true)
-  }
+  // TODO: restore delete handler after DELETE /metrics/volumes/:id endpoint is added (decision 3)
+  // const handleDelete = (volume: VolumeInfo) => {
+  //   setSelectedVolume(volume)
+  //   setShowDeleteConfirm(true)
+  // }
 
   const handleMigrate = (volume: VolumeInfo) => {
     setSelectedVolume(volume)
@@ -51,11 +106,10 @@ function Volumes() {
   }
 
   const confirmDelete = async () => {
+    // TODO: restore after DELETE /metrics/volumes/:id endpoint is added (decision 3)
     if (selectedVolume) {
-      await deleteVolume(selectedVolume.id)
-      message.success('Volume删除成功')
+      message.warning('Volume 删除暂不可用（后端 DELETE 接口待补充）')
       setShowDeleteConfirm(false)
-      loadVolumes()
     }
   }
 
@@ -168,15 +222,16 @@ function Volumes() {
           >
             迁移
           </Button>
-          <Button
-            type="text"
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDelete(record)}
-            disabled={record.file_count > 0}
-          >
-            删除
-          </Button>
+          <Tooltip title="后端 DELETE 路由待补充，暂不可用">
+            <Button
+              type="text"
+              danger
+              icon={<DeleteOutlined />}
+              disabled
+            >
+              删除
+            </Button>
+          </Tooltip>
         </Space>
       ),
     },
@@ -193,37 +248,77 @@ function Volumes() {
         </div>
       </Card>
 
+      <Tabs
+        activeKey={activeTab}
+        onChange={(k) => setActiveTab(k as 'volumes' | 'io')}
+        items={[
+          {
+            key: 'volumes',
+            label: <span><DatabaseOutlined /> {t('common:volumeManagement')}</span>,
+            children: renderVolumesTab(),
+          },
+          {
+            key: 'io',
+            label: <span><ThunderboltOutlined /> {t('common:ioPerformance')}</span>,
+            children: renderIoTab(),
+          },
+        ]}
+      />
+
+      {renderModals()}
+
+      <Card title={t('common:info')} size="small" style={{ marginTop: 24 }}>
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="什么是 Volume？">
+            Volume 是 PowerFS 的物理存储单元，每个 Volume 位于一个节点上。Volume 类似于传统文件系统中的磁盘分区或逻辑卷。
+          </Descriptions.Item>
+          <Descriptions.Item label="什么是 Collection？">
+            Collection 是逻辑数据集合，用于隔离不同应用或用户的数据。同一个 Collection 的数据会分布在多个 Volume 上。
+          </Descriptions.Item>
+          <Descriptions.Item label="为什么 Volume 会显示只读？">
+            当 Volume 所在节点出现故障或网络中断时，为了保证数据一致性，系统会将该 Volume 标记为只读状态。
+          </Descriptions.Item>
+          <Descriptions.Item label="如何迁移 Volume？">
+            通过"迁移"操作可以将 Volume 从一个节点迁移到另一个节点。迁移过程中数据会被复制到目标节点，原 Volume 会被删除。
+          </Descriptions.Item>
+        </Descriptions>
+      </Card>
+    </div>
+  )
+
+  function renderVolumesTab() {
+    return (
       <Card
-        title="Volume管理"
+        title={t('common:volumeManagement')}
         style={{ borderRadius: 12, marginBottom: 16 }}
-        bodyStyle={{ paddingBottom: 16 }}
+        styles={{ body: { paddingBottom: 16 } }}
         extra={
-          <Tooltip title="刷新">
-            <Button icon={<ReloadOutlined />} onClick={loadVolumes}>刷新</Button>
+          <Tooltip title={t('common:refresh')}>
+            <Button icon={<ReloadOutlined />} onClick={loadVolumes}>{t('common:refresh')}</Button>
           </Tooltip>
         }
       >
         <Space style={{ marginBottom: 16 }}>
           <Select
-            placeholder="按状态筛选"
+            placeholder={t('common:status')}
             style={{ width: 150 }}
             value={filterStatus || undefined}
             onChange={setFilterStatus}
             options={[
-              { value: '', label: '全部' },
-              { value: 'available', label: '可用' },
-              { value: 'full', label: '已满' },
-              { value: 'readonly', label: '只读' },
-              { value: 'creating', label: '创建中' },
+              { value: '', label: t('common:all') },
+              { value: 'available', label: 'Available' },
+              { value: 'full', label: 'Full' },
+              { value: 'read_only', label: 'Read-only' },
+              { value: 'creating', label: 'Creating' },
             ]}
           />
           <Select
-            placeholder="按Collection筛选"
+            placeholder="Collection"
             style={{ width: 150 }}
             value={filterCollection || undefined}
             onChange={setFilterCollection}
             options={[
-              { value: '', label: '全部' },
+              { value: '', label: t('common:all') },
               ...collections.map(c => ({ value: c, label: c })),
             ]}
           />
@@ -236,7 +331,152 @@ function Volumes() {
           scroll={{ x: 1200 }}
         />
       </Card>
+    )
+  }
 
+  function renderIoTab() {
+    // Aggregate KPIs across all volumes.
+    const totals = ioStats.reduce(
+      (acc, s) => ({
+        read_ops: acc.read_ops + s.read_ops,
+        write_ops: acc.write_ops + s.write_ops,
+        read_bytes: acc.read_bytes + s.read_bytes,
+        write_bytes: acc.write_bytes + s.write_bytes,
+        read_lat_sum: acc.read_lat_sum + s.read_avg_latency_us,
+        write_lat_sum: acc.write_lat_sum + s.write_avg_latency_us,
+        count: acc.count + 1,
+      }),
+      { read_ops: 0, write_ops: 0, read_bytes: 0, write_bytes: 0, read_lat_sum: 0, write_lat_sum: 0, count: 0 },
+    )
+    const avgReadLat = totals.count > 0 ? totals.read_lat_sum / totals.count : 0
+    const avgWriteLat = totals.count > 0 ? totals.write_lat_sum / totals.count : 0
+
+    const ioColumns = [
+      { title: 'Volume ID', dataIndex: 'volume_id', key: 'volume_id', width: 200,
+        render: (id: number) => <strong>{id}</strong> },
+      { title: t('common:readOps'), dataIndex: 'read_ops', key: 'read_ops', width: 120,
+        render: (v: number) => v.toLocaleString() },
+      { title: t('common:writeOps'), dataIndex: 'write_ops', key: 'write_ops', width: 120,
+        render: (v: number) => v.toLocaleString() },
+      { title: t('common:readBytes'), dataIndex: 'read_bytes', key: 'read_bytes', width: 120,
+        render: (v: number) => formatBytes(v) },
+      { title: t('common:writeBytes'), dataIndex: 'write_bytes', key: 'write_bytes', width: 120,
+        render: (v: number) => formatBytes(v) },
+      { title: t('common:readAvgLatency'), dataIndex: 'read_avg_latency_us', key: 'read_avg_latency_us', width: 140,
+        render: (v: number) => v > 0 ? `${(v / 1000).toFixed(2)} ms` : '-' },
+      { title: t('common:writeAvgLatency'), dataIndex: 'write_avg_latency_us', key: 'write_avg_latency_us', width: 140,
+        render: (v: number) => v > 0 ? `${(v / 1000).toFixed(2)} ms` : '-' },
+    ]
+
+    return (
+      <div>
+        <Row gutter={16} style={{ marginBottom: 16 }}>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:totalReadOps')}
+                value={totals.read_ops}
+                valueStyle={{ color: '#1890ff' }}
+              />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:totalWriteOps')}
+                value={totals.write_ops}
+                valueStyle={{ color: '#52c41a' }}
+              />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:totalReadBytes')}
+                value={totals.read_bytes}
+                formatter={(v) => formatBytes(Number(v))}
+                valueStyle={{ color: '#1890ff' }}
+              />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:totalWriteBytes')}
+                value={totals.write_bytes}
+                formatter={(v) => formatBytes(Number(v))}
+                valueStyle={{ color: '#52c41a' }}
+              />
+            </Card>
+          </Col>
+        </Row>
+
+        <Row gutter={16} style={{ marginBottom: 16 }}>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:avgReadLatency')}
+                value={avgReadLat / 1000}
+                precision={2}
+                suffix="ms"
+                valueStyle={{ color: '#faad14' }}
+              />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic
+                title={t('common:avgWriteLatency')}
+                value={avgWriteLat / 1000}
+                precision={2}
+                suffix="ms"
+                valueStyle={{ color: '#faad14' }}
+              />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card size="small">
+              <Statistic title={t('common:volume')} value={ioStats.length} />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Tooltip title={t('common:refresh')}>
+              <Button
+                icon={<ReloadOutlined />}
+                onClick={loadAllIo}
+                loading={ioLoading}
+                style={{ marginTop: 16 }}
+              >
+                {t('common:refresh')}
+              </Button>
+            </Tooltip>
+          </Col>
+        </Row>
+
+        <Card
+          title={`${t('common:ioPerformance')} — ${t('common:volume')}`}
+          style={{ borderRadius: 12 }}
+        >
+          {ioStats.length === 0 && !ioLoading ? (
+            <Empty description={t('common:noData')} />
+          ) : (
+            <Table
+              columns={ioColumns}
+              dataSource={ioStats}
+              rowKey="volume_id"
+              pagination={{ pageSize: 10 }}
+              loading={ioLoading}
+              scroll={{ x: 1000 }}
+            />
+          )}
+        </Card>
+      </div>
+    )
+  }
+
+  function renderModals() {
+    return (
+      <>
       <Modal
         title="Volume详情"
         open={showDetail}
@@ -282,8 +522,8 @@ function Volumes() {
                 <div>
                   <span style={{ color: '#8c8c8c', fontSize: 12 }}>状态</span>
                   <div>
-                    <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? 'orange' : 'blue'}>
-                      {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : selectedVolume.status === 'read_only' || selectedVolume.status === 'readonly' ? '只读' : selectedVolume.status === 'deleting' ? '删除中' : '创建中'}
+                    <Tag color={selectedVolume.status === 'available' ? 'green' : selectedVolume.status === 'full' ? 'red' : selectedVolume.status === 'read_only' ? 'orange' : 'blue'}>
+                      {selectedVolume.status === 'available' ? '可用' : selectedVolume.status === 'full' ? '已满' : selectedVolume.status === 'read_only' ? '只读' : selectedVolume.status === 'deleting' ? '删除中' : '创建中'}
                     </Tag>
                   </div>
                 </div>
@@ -423,25 +663,9 @@ function Volumes() {
           </Space>
         )}
       </Modal>
-
-      <Card title="常见问题" size="small" style={{ marginTop: 24 }}>
-        <Descriptions column={1} size="small">
-          <Descriptions.Item label="什么是 Volume？">
-            Volume 是 PowerFS 的物理存储单元，每个 Volume 位于一个节点上。Volume 类似于传统文件系统中的磁盘分区或逻辑卷。
-          </Descriptions.Item>
-          <Descriptions.Item label="什么是 Collection？">
-            Collection 是逻辑数据集合，用于隔离不同应用或用户的数据。同一个 Collection 的数据会分布在多个 Volume 上。
-          </Descriptions.Item>
-          <Descriptions.Item label="为什么 Volume 会显示只读？">
-            当 Volume 所在节点出现故障或网络中断时，为了保证数据一致性，系统会将该 Volume 标记为只读状态。
-          </Descriptions.Item>
-          <Descriptions.Item label="如何迁移 Volume？">
-            通过"迁移"操作可以将 Volume 从一个节点迁移到另一个节点。迁移过程中数据会被复制到目标节点，原 Volume 会被删除。
-          </Descriptions.Item>
-        </Descriptions>
-      </Card>
-    </div>
-  )
+      </>
+    )
+  }
 }
 
 export default Volumes

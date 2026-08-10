@@ -3,9 +3,9 @@ name: PowerFS CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize" ]
   pull_request:
-    branches: [ main, develop, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize" ]
   workflow_dispatch:
 
 env:
@@ -15,7 +15,7 @@ env:
 jobs:
   # 代码质量检查
   quality:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -43,7 +43,7 @@ jobs:
 
   # 编译检查
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -66,7 +66,7 @@ jobs:
 
   # 单元测试
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -92,8 +92,8 @@ jobs:
 
   # 基准测试
   benchmark:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: [self-hosted, Linux, X64]
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/fronted' && github.event_name == 'push')
     steps:
     - uses: actions/checkout@v4
       with:
@@ -129,7 +129,7 @@ jobs:
 
   # 代码覆盖率
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -171,9 +171,9 @@ jobs:
 
   # Docker 镜像构建
   docker:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     needs: [quality, build, test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
@@ -222,9 +222,9 @@ jobs:
 
   # 部署到测试环境
   deploy-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     needs: [docker]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
@@ -238,7 +238,7 @@ jobs:
 
   # 发布版本
   release:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     needs: [quality, build, test, docker, deploy-test]
     if: contains(github.event.head_commit.message, 'release')
     steps:
@@ -262,7 +262,7 @@ jobs:
 
   # 前端构建
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
     - uses: actions/checkout@v4
       with:

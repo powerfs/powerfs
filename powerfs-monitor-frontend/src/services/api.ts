@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, TopologyData, CollectionInfo, CollectionStats } from '@/types'
+import type { NodeInfo, VolumeInfo, KVSessionInfo, AlertInfo, AlertRule, ClusterMetrics, KVMetrics, TimeSeriesData, BucketInfo, ObjectInfo, MultipartUploadInfo, S3Metrics, FuseMount, ClientStats, S3AccessKey, KVNamespace, KVAccessKey, ConflictRecord, ConflictStats, AutoResolveResult, BatchResolveResult, BatchIgnoreResult, StorageDevice, DataMigrationTask, VolumeScrubStatus, ScrubSummary, BenchmarkResult, BenchmarkReport, FilerStatus, ShardDetail, FilerNode, ClusterShard, ClusterStatusResponse, BatchResult, TopologyData, CollectionInfo, CollectionStats, MasterStatus, CircuitBreakerConfig, CoalescerConfig, VolumeIoStats } from '@/types'
 import { mockNodes, mockVolumes, mockKVSessions, mockAlerts, mockAlertRules, mockClusterMetrics, mockKVMetrics, generateTimeSeriesData, mockBuckets, mockObjects, mockMultipartUploads, mockS3Metrics, mockFuseMounts, mockDevices, mockMigrationTasks, mockScrubStatuses, mockScrubSummary } from '@/utils/mockData'
 import { getToken, refreshAccessToken, isPublicUrl, logout } from './auth'
 
@@ -142,6 +142,22 @@ export async function getVolume(id: number): Promise<VolumeInfo> {
   return response.data.data
 }
 
+export async function getVolumeIo(id: number): Promise<VolumeIoStats> {
+  if (useMock) {
+    return {
+      volume_id: id,
+      read_ops: Math.floor(Math.random() * 5000),
+      write_ops: Math.floor(Math.random() * 3000),
+      read_bytes: Math.floor(Math.random() * 1024 * 1024 * 1024),
+      write_bytes: Math.floor(Math.random() * 512 * 1024 * 1024),
+      read_avg_latency_us: Math.floor(50 + Math.random() * 200),
+      write_avg_latency_us: Math.floor(100 + Math.random() * 400),
+    }
+  }
+  const response = await api.get(`/metrics/volumes/${id}/io`)
+  return response.data.data
+}
+
 export interface DataPoint {
   timestamp: number
   value: number
@@ -230,7 +246,7 @@ export async function deleteVolume(id: number): Promise<void> {
   await api.delete(`/metrics/volumes/${id}`)
 }
 
-export async function getMetricHistory(metric: string): Promise<TimeSeriesData[]> {
+export async function getMetricHistory(metric: string, minutes?: number): Promise<TimeSeriesData[]> {
   if (useMock) {
     const baseValues: Record<string, number> = {
       'powerfs_node_disk_usage': 65,
@@ -240,7 +256,23 @@ export async function getMetricHistory(metric: string): Promise<TimeSeriesData[]
     }
     return generateTimeSeriesData(24, baseValues[metric] || 100, 20)
   }
-  const response = await api.get(`/metrics/history/${metric}`)
+  const url = minutes
+    ? `/metrics/history/${metric}?minutes=${minutes}`
+    : `/metrics/history/${metric}`
+  const response = await api.get(url)
+  return response.data.data
+}
+
+export interface NodeDiskUsageSeries {
+  node_id: string
+  points: TimeSeriesData[]
+}
+
+export async function getClusterDiskUsageBreakdown(minutes: number = 1440): Promise<NodeDiskUsageSeries[]> {
+  if (useMock) {
+    return []
+  }
+  const response = await api.get('/metrics/cluster-disk-usage', { params: { minutes } })
   return response.data.data
 }
 
@@ -374,6 +406,14 @@ export async function getFuseMounts(): Promise<FuseMount[]> {
     return mockFuseMounts
   }
   const response = await api.get('/fuse/mounts')
+  return response.data.data
+}
+
+export async function getFuseClients(): Promise<FuseMount[]> {
+  if (useMock) {
+    return mockFuseMounts
+  }
+  const response = await api.get('/fuse/clients')
   return response.data.data
 }
 
@@ -833,11 +873,35 @@ export async function getBenchmarkReportById(id: string): Promise<BenchmarkResul
   return response.data.data
 }
 
-// ===== Filer & Shard management =====
-// Note: Filer admin APIs are proxied via nginx (/api/filer/* -> filer:8888/admin/*)
-// and return data directly (no { data: ... } wrapper), so we access response.data directly.
+// ===== Filer admin bridge (Monitor 代理 filer /admin/*) =====
+// 设计原则 (见 docs/filer-redesign-plan.md): 前端只跟 Monitor 交互。
+// 所有 filer /admin/* 调用由 Monitor 通过 filer_admin_client 透传,
+// Monitor 统一返回 { code, message, data } ApiResponse 包装,
+// 因此前端读取 response.data.data (而非旧 nginx 反代的 response.data)。
+// 所有 /api/filer/* 接口 (含读操作) 都要求 admin 权限。
 
-export async function getFilerStatus(): Promise<FilerStatus> {
+/**
+ * 集群 filer 节点列表 — 合并 gRPC ListFilers (注册视角) + metric_store (心跳视角)。
+ * 推荐轮询间隔: 10s。
+ */
+export async function getFilerNodes(): Promise<FilerNode[]> {
+  if (useMock) {
+    return [
+      {
+        node_id: 'filer-1', address: '127.0.0.1', http_port: 8888, grpc_port: 8889,
+        is_registered: true, registered_healthy: true,
+        leader_count: 4, total_shards: 4,
+        heartbeat_status: 'online', last_seen_ago_secs: 1,
+        cpu_usage: 12.5, mem_usage: 34.2, disk_usage: 45.0, uptime: 86400,
+      },
+    ]
+  }
+  const response = await api.get('/filer/nodes')
+  return response.data.data
+}
+
+/** 单节点详细状态 (filer /admin/status 透传)。推荐轮询: 不缓存, 要实时。 */
+export async function getFilerNodeStatus(nodeId: string): Promise<FilerStatus> {
   if (useMock) {
     return {
       shard_count: 4,
@@ -848,33 +912,35 @@ export async function getFilerStatus(): Promise<FilerStatus> {
       buckets: ['test-bucket', 'prod-data'],
     }
   }
-  const response = await api.get('/filer/status')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/status`)
+  return response.data.data
 }
 
-export async function getShards(): Promise<ShardDetail[]> {
+/** 单节点 shard 列表 (filer /admin/shards 透传)。 */
+export async function getFilerNodeShards(nodeId: string): Promise<ShardDetail[]> {
   if (useMock) {
     return [
       { shard_id: 0, inode_range_start: 0, inode_range_end: 1000000, is_leader: true, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, file_count: 24, dir_count: 8, write_qps: 120, read_qps: 480 },
       { shard_id: 1, inode_range_start: 1000000, inode_range_end: 2000000, is_leader: true, term: 2, commit_index: 12, applied_index: 12, inode_count: 48, file_count: 36, dir_count: 12, write_qps: 90, read_qps: 360 },
       { shard_id: 2, inode_range_start: 2000000, inode_range_end: 3000000, is_leader: true, term: 2, commit_index: 8, applied_index: 8, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 60, read_qps: 240 },
-      { shard_id: 3, inode_range_start: 3000000, inode_range_end: 18446744073709551615, is_leader: true, term: 2, commit_index: 5, applied_index: 5, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 30, read_qps: 120 },
+      { shard_id: 3, inode_range_start: 3000000, inode_range_end: Number.MAX_SAFE_INTEGER, is_leader: true, term: 2, commit_index: 5, applied_index: 5, inode_count: 24, file_count: 18, dir_count: 6, write_qps: 30, read_qps: 120 },
     ]
   }
-  const response = await api.get('/filer/shards')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/shards`)
+  return response.data.data
 }
 
-export async function getShardDetail(id: number): Promise<ShardDetail> {
+/** 单 shard 详情 (filer /admin/shards/:id 透传)。 */
+export async function getFilerNodeShard(nodeId: string, shardId: number | string): Promise<ShardDetail> {
   if (useMock) {
-    const shards = await getShards()
-    return shards.find(s => s.shard_id === id) || shards[0]
+    const shards = await getFilerNodeShards(nodeId)
+    return shards.find(s => s.shard_id === Number(shardId)) || shards[0]
   }
-  const response = await api.get(`/filer/shards/${id}`)
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/shards/${shardId}`)
+  return response.data.data
 }
 
-// ===== Shard Balancer API =====
+// ===== Shard Balancer API (per-node, Monitor 透传) =====
 
 export interface SchedulerStatus {
   is_running: boolean
@@ -898,7 +964,8 @@ export interface SchedulerConfig {
   disk_threshold: number
 }
 
-export async function getBalancerStatus(): Promise<SchedulerStatus> {
+/** 单节点 balancer 状态 (filer /admin/balancer/status 透传)。推荐轮询: 5s。 */
+export async function getFilerNodeBalancerStatus(nodeId: string): Promise<SchedulerStatus> {
   if (useMock) {
     return {
       is_running: true,
@@ -915,26 +982,26 @@ export async function getBalancerStatus(): Promise<SchedulerStatus> {
       },
     }
   }
-  const response = await api.get('/filer/balancer/status')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/balancer/status`)
+  return response.data.data
 }
 
-export async function startBalancer(): Promise<void> {
+export async function startFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/start')
+  await api.post(`/filer/nodes/${nodeId}/balancer/start`)
 }
 
-export async function stopBalancer(): Promise<void> {
+export async function stopFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/stop')
+  await api.post(`/filer/nodes/${nodeId}/balancer/stop`)
 }
 
-export async function triggerBalance(): Promise<void> {
+export async function triggerFilerNodeBalancer(nodeId: string): Promise<void> {
   if (useMock) return
-  await api.post('/filer/balancer/trigger')
+  await api.post(`/filer/nodes/${nodeId}/balancer/trigger`)
 }
 
-export async function getBalancerConfig(): Promise<SchedulerConfig> {
+export async function getFilerNodeBalancerConfig(nodeId: string): Promise<SchedulerConfig> {
   if (useMock) {
     return {
       check_interval: 60,
@@ -947,13 +1014,193 @@ export async function getBalancerConfig(): Promise<SchedulerConfig> {
       disk_threshold: 0.1,
     }
   }
-  const response = await api.get('/filer/balancer/config')
-  return response.data
+  const response = await api.get(`/filer/nodes/${nodeId}/balancer/config`)
+  return response.data.data
 }
 
+export async function updateFilerNodeBalancerConfig(nodeId: string, config: SchedulerConfig): Promise<void> {
+  if (useMock) return
+  await api.put(`/filer/nodes/${nodeId}/balancer/config`, config)
+}
+
+// ===== Filer cluster aggregation (Phase C) =====
+// 集群聚合端点: Monitor 并发调所有 filer, 缓存 5s (见 docs/filer-redesign-plan.md 决策 3)。
+// 推荐轮询: cluster/status 5s, cluster/shards 15s。
+
+/** 集群级状态聚合 (并发调所有 filer /admin/status)。推荐轮询: 5s。 */
+export async function getFilerClusterStatus(): Promise<ClusterStatusResponse> {
+  if (useMock) {
+    return {
+      nodes: [
+        {
+          node_id: 'filer-1',
+          status: { shard_count: 4, leader_count: 4, total_inodes: 128, total_files: 96, total_dirs: 32, buckets: ['test-bucket'] },
+          error: null,
+        },
+      ],
+      totals: {
+        node_count: 1, reachable: 1, unreachable: 0,
+        total_shards: 4, total_leaders: 4, total_inodes: 128, total_files: 96, total_dirs: 32,
+        all_buckets: ['test-bucket'],
+      },
+    }
+  }
+  const response = await api.get('/filer/cluster/status')
+  return response.data.data
+}
+
+/** 集群级 shard 聚合 (按 shard_id 聚合多副本 + 健康判定)。推荐轮询: 15s。 */
+export async function getFilerClusterShards(): Promise<ClusterShard[]> {
+  if (useMock) {
+    return [
+      {
+        shard_id: 0, inode_range_start: 0, inode_range_end: 1000000,
+        replicas: [
+          { node_id: 'filer-1', is_leader: true, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, write_qps: 120, read_qps: 480 },
+          { node_id: 'filer-2', is_leader: false, term: 2, commit_index: 15, applied_index: 15, inode_count: 32, write_qps: 0, read_qps: 30 },
+        ],
+        is_healthy: true,
+      },
+    ]
+  }
+  const response = await api.get('/filer/cluster/shards')
+  return response.data.data
+}
+
+/** Balancer 批量启动 (并发调所有 filer /admin/balancer/start)。写后失效缓存。 */
+export async function startAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/start-all')
+  return response.data.data
+}
+
+/** Balancer 批量停止 (并发调所有 filer /admin/balancer/stop)。写后失效缓存。 */
+export async function stopAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/stop-all')
+  return response.data.data
+}
+
+/** Balancer 批量触发 (并发调所有 filer /admin/balancer/trigger)。写后失效缓存。 */
+export async function triggerAllBalancers(): Promise<BatchResult> {
+  if (useMock) return { success: ['filer-1'], failed: [], total: 1 }
+  const response = await api.post('/filer/balancer/trigger-all')
+  return response.data.data
+}
+
+// ===== 向后兼容封装 (过渡期, 调用第一个 filer 节点) =====
+// 这些函数保留旧签名, 内部 fetch 节点列表后取第一个节点调用新 per-node 函数。
+// 新代码应直接使用上面的 per-node 函数并显式传 nodeId。
+
+/**
+ * 取第一个在线 filer 节点 ID; 没有节点时返回 null。
+ * 用于向后兼容封装。
+ */
+async function pickFirstFilerNodeId(): Promise<string | null> {
+  const nodes = await getFilerNodes()
+  if (nodes.length === 0) return null
+  // 优先选心跳在线的节点; 都离线时退而取第一个
+  // 存活状态匹配: online/healthy/leader/follower (项目硬约束)
+  const ALIVE_STATES = ['online', 'healthy', 'leader', 'follower']
+  const online = nodes.find(n => ALIVE_STATES.includes(n.heartbeat_status))
+  return (online ?? nodes[0]).node_id
+}
+
+/** @deprecated 使用 getFilerNodeStatus(nodeId) */
+export async function getFilerStatus(): Promise<FilerStatus> {
+  if (useMock) return getFilerNodeStatus('')
+  const EMPTY: FilerStatus = { shard_count: 0, leader_count: 0, total_inodes: 0, total_files: 0, total_dirs: 0, buckets: [] }
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeStatus(nodeId)
+  } catch (e) {
+    console.warn('getFilerStatus fallback (filer unreachable):', e)
+    return EMPTY
+  }
+}
+
+/** @deprecated 使用 getFilerNodeShards(nodeId) */
+export async function getShards(): Promise<ShardDetail[]> {
+  if (useMock) return getFilerNodeShards('')
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return []
+    return await getFilerNodeShards(nodeId)
+  } catch (e) {
+    console.warn('getShards fallback (filer unreachable):', e)
+    return []
+  }
+}
+
+/** @deprecated 使用 getFilerNodeShard(nodeId, shardId) */
+export async function getShardDetail(id: number): Promise<ShardDetail> {
+  const EMPTY: ShardDetail = { shard_id: id, inode_range_start: 0, inode_range_end: 0, is_leader: false, term: 0, commit_index: 0, applied_index: 0, inode_count: 0, file_count: 0, dir_count: 0, write_qps: 0, read_qps: 0 }
+  if (useMock) return getFilerNodeShard('', id)
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeShard(nodeId, id)
+  } catch (e) {
+    console.warn('getShardDetail fallback (filer unreachable):', e)
+    return EMPTY
+  }
+}
+
+/** @deprecated 使用 getFilerNodeBalancerStatus(nodeId) */
+export async function getBalancerStatus(): Promise<SchedulerStatus> {
+  const EMPTY: SchedulerStatus = { is_running: false, last_check_time: 0, total_migrations: 0, successful_migrations: 0, failed_migrations: 0, node_count: 0, shard_count: 0, leader_distribution: {} }
+  if (useMock) return getFilerNodeBalancerStatus('')
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return EMPTY
+    return await getFilerNodeBalancerStatus(nodeId)
+  } catch (e) {
+    console.warn('getBalancerStatus fallback (filer unreachable):', e)
+    return EMPTY
+  }
+}
+
+/** @deprecated 使用 startFilerNodeBalancer(nodeId) */
+export async function startBalancer(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await startFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 stopFilerNodeBalancer(nodeId) */
+export async function stopBalancer(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await stopFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 triggerFilerNodeBalancer(nodeId) */
+export async function triggerBalance(): Promise<void> {
+  if (useMock) return
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await triggerFilerNodeBalancer(nodeId)
+}
+
+/** @deprecated 使用 getFilerNodeBalancerConfig(nodeId) */
+export async function getBalancerConfig(): Promise<SchedulerConfig> {
+  const DEFAULT_CFG: SchedulerConfig = { check_interval: 60, max_transfers_per_round: 2, transfer_interval: 10, cooldown_periods: 5, leader_imbalance_threshold: 1.5, cpu_threshold: 0.8, memory_threshold: 0.85, disk_threshold: 0.1 }
+  if (useMock) return getFilerNodeBalancerConfig('')
+  try {
+    const nodeId = await pickFirstFilerNodeId()
+    if (!nodeId) return DEFAULT_CFG
+    return await getFilerNodeBalancerConfig(nodeId)
+  } catch (e) {
+    console.warn('getBalancerConfig fallback (filer unreachable):', e)
+    return DEFAULT_CFG
+  }
+}
+
+/** @deprecated 使用 updateFilerNodeBalancerConfig(nodeId, config) */
 export async function setBalancerConfig(config: SchedulerConfig): Promise<void> {
   if (useMock) return
-  await api.put('/filer/balancer/config', config)
+  const nodeId = await pickFirstFilerNodeId()
+  if (nodeId) await updateFilerNodeBalancerConfig(nodeId, config)
 }
 
 // ===== Collection management =====
@@ -1031,5 +1278,114 @@ export async function deleteCollection(name: string): Promise<void> {
 
 export async function getCollectionStats(name: string): Promise<CollectionStats> {
   const response = await api.get(`/collections/${name}/stats`)
+  return response.data.data
+}
+
+// ===== Master Raft =====
+export async function getMasterStatus(): Promise<MasterStatus> {
+  if (useMock) {
+    const masters = mockNodes.filter(n => n.node_type === 'master')
+    const leader = masters.find(m => m.is_leader) || null
+    return {
+      nodes: masters,
+      leader,
+      raft_term: leader?.raft_term ?? 0,
+      total_masters: masters.length,
+      healthy_masters: masters.filter(m => ['online', 'healthy', 'leader'].includes(m.status)).length,
+    }
+  }
+  const response = await api.get('/master/status')
+  return response.data.data
+}
+
+export async function transferLeader(targetNodeId: number): Promise<void> {
+  if (useMock) return
+  await api.post('/master/transfer-leader', { target_node_id: targetNodeId })
+}
+
+// ===== Runtime Config (hot-modify) =====
+export async function getCircuitBreakerConfig(): Promise<CircuitBreakerConfig> {
+  if (useMock) {
+    return { failure_threshold: 50, recovery_timeout_ms: 5000, half_open_max_requests: 10 }
+  }
+  const response = await api.get('/config/circuit-breaker')
+  return response.data
+}
+
+export async function putCircuitBreakerConfig(cfg: CircuitBreakerConfig): Promise<void> {
+  if (useMock) return
+  await api.put('/config/circuit-breaker', cfg)
+}
+
+export async function getCoalescerConfig(): Promise<CoalescerConfig> {
+  if (useMock) {
+    return {
+      deadline_ms: 2000,
+      min_pending_writes: 4,
+      max_dirty_bytes_per_entry: 1048576,
+      max_dirty_bytes_total: 67108864,
+      disabled: false,
+    }
+  }
+  const response = await api.get('/config/coalescer')
+  return response.data
+}
+
+export async function putCoalescerConfig(cfg: CoalescerConfig): Promise<void> {
+  if (useMock) return
+  await api.put('/config/coalescer', cfg)
+}
+
+// ===== Filer Bucket management (决策 2: 透传到 Monitor /api/filer/buckets*) =====
+export interface FilerBucketInfo {
+  name: string
+  volume_ids: number[]
+  size_limit: number
+  used_size: number
+  creation_time: string
+  replication: string
+  collection: string
+}
+
+export interface FilerBucketListResponse {
+  buckets: FilerBucketInfo[]
+  total: number
+}
+
+export interface CreateFilerBucketParams {
+  name: string
+  collection?: string
+  size_limit?: number
+}
+
+export async function listFilerBuckets(): Promise<FilerBucketListResponse> {
+  if (useMock) {
+    return { buckets: [], total: 0 }
+  }
+  const response = await api.get('/filer/buckets')
+  // 后端 ApiResponse 包装: { success, data, error }
+  return response.data.data
+}
+
+export async function createFilerBucket(params: CreateFilerBucketParams): Promise<FilerBucketInfo> {
+  if (useMock) {
+    throw new Error('mock mode does not support creating bucket')
+  }
+  const response = await api.post('/filer/buckets', params)
+  return response.data.data
+}
+
+export async function deleteFilerBucket(name: string): Promise<void> {
+  if (useMock) return
+  await api.delete(`/filer/buckets/${encodeURIComponent(name)}`)
+}
+
+export async function setFilerBucketQuota(name: string, sizeLimit: number): Promise<FilerBucketInfo> {
+  if (useMock) {
+    throw new Error('mock mode does not support setting quota')
+  }
+  const response = await api.put(`/filer/buckets/${encodeURIComponent(name)}/quota`, {
+    size_limit: sizeLimit,
+  })
   return response.data.data
 }

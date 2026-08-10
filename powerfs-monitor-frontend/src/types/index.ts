@@ -9,8 +9,6 @@ export type NodeStatus =
   | 'leader'
   | 'follower'
 
-export type RaftRole = 'leader' | 'follower'
-
 export interface NodeInfo {
   id: string
   node_type: 'master' | 'volume' | 'filer'
@@ -25,9 +23,8 @@ export interface NodeInfo {
   network_tx: number
   uptime: number
   volume_count: number
-  device_count?: number
   is_leader?: boolean
-  raft_role?: RaftRole
+  raft_term?: number
 }
 
 export interface DeviceLocation {
@@ -38,9 +35,26 @@ export interface DeviceLocation {
   data_center?: string
 }
 
-export type DeviceType = 'local_file' | 'spdk' | 'nvmeof'
-export type DeviceStatus = 'online' | 'offline' | 'excluded' | 'draining' | 'faulty'
-export type DeviceHealth = 'healthy' | 'warning' | 'critical'
+// Backend DeviceType enum (serde rename_all = "snake_case"):
+// Ssd / Nvme / Hdd / Logical. Legacy values kept for backwards compat.
+export type DeviceType =
+  | 'ssd'
+  | 'nvme'
+  | 'hdd'
+  | 'logical'
+  | 'local_file'
+  | 'spdk'
+  | 'nvmeof'
+// Backend DeviceStatus enum (serde rename_all = "snake_case"):
+// Online / Offline / Draining / Excluded / ReadOnly. `faulty` is legacy.
+export type DeviceStatus =
+  | 'online'
+  | 'offline'
+  | 'excluded'
+  | 'draining'
+  | 'readonly'
+  | 'faulty'
+export type DeviceHealth = 'healthy' | 'warning' | 'critical' | 'unknown'
 
 export interface StorageDevice {
   device_id: string
@@ -87,7 +101,7 @@ export interface VolumeInfo {
   size: number
   used: number
   file_count: number
-  status: 'available' | 'full' | 'readonly' | 'creating' | 'read_only' | 'deleting'
+  status: 'available' | 'full' | 'read_only' | 'creating' | 'deleting'
   collection: string
   created_at: string
   read_only?: boolean
@@ -179,6 +193,7 @@ export interface KVAccessKey {
 
 export interface AlertInfo {
   id: string
+  rule_id: string
   name: string
   severity: 'critical' | 'warning' | 'info'
   status: 'firing' | 'pending' | 'resolved'
@@ -337,7 +352,6 @@ export interface FuseMount {
   mounted_at: string
   pid?: number
   host?: string
-  client_type?: string
   dirty_chunks?: number
   dirty_bytes?: number
   last_heartbeat?: string
@@ -553,4 +567,122 @@ export interface ShardDetail {
   dir_count: number
   write_qps: number
   read_qps: number
+}
+
+// ===== Filer admin bridge types (Monitor 代理 filer /admin/*) =====
+// 设计原则: 前端只跟 Monitor 交互, filer admin 由 Monitor 透传。
+// 详见 docs/filer-redesign-plan.md。
+
+/**
+ * Filer 节点 — 合并 master 注册视角 (gRPC ListFilers) + 心跳视角 (metric_store)。
+ * heartbeat_status 是真实健康状态 (受 NODE_HEARTBEAT_TIMEOUT_SECS 控制),
+ * registered_healthy 只是 master 静态注册值。
+ */
+export interface FilerNode {
+  node_id: string
+  address: string
+  http_port: number
+  grpc_port: number
+  /** master 注册视角的静态健康 (gRPC ListFilers.is_healthy) */
+  is_registered: boolean
+  registered_healthy: boolean
+  leader_count: number
+  total_shards: number
+  /** 心跳视角的真实健康 ('online' | 'offline') */
+  heartbeat_status: string
+  /** 距离上次心跳的秒数 */
+  last_seen_ago_secs: number
+  cpu_usage: number
+  mem_usage: number
+  disk_usage: number
+  uptime: number
+}
+
+/**
+ * 集群级 shard 视图 — 按 shard_id 聚合多 filer 副本。
+ * Phase C 的 /api/filer/cluster/shards 返回此类型。
+ */
+export interface ClusterShardReplica {
+  node_id: string
+  is_leader: boolean
+  term: number
+  commit_index: number
+  applied_index: number
+  inode_count: number
+  write_qps: number
+  read_qps: number
+}
+
+export interface ClusterShard {
+  shard_id: number
+  inode_range_start: number
+  inode_range_end: number
+  replicas: ClusterShardReplica[]
+  /** 集群级健康判定 (term 一致 + commit_index 落后 < 阈值) */
+  is_healthy: boolean
+  /** 不健康时的原因 */
+  lag_reason?: string
+}
+
+/** cluster/status 单节点条目 (status 为 filer /admin/status 原始透传) */
+export interface ClusterStatusNode {
+  node_id: string
+  status: FilerStatus | null
+  error: string | null
+}
+
+/** cluster/status 聚合汇总 */
+export interface ClusterStatusTotals {
+  node_count: number
+  reachable: number
+  unreachable: number
+  total_shards: number
+  total_leaders: number
+  total_inodes: number
+  total_files: number
+  total_dirs: number
+  all_buckets: string[]
+}
+
+/** cluster/status 响应体 */
+export interface ClusterStatusResponse {
+  nodes: ClusterStatusNode[]
+  totals: ClusterStatusTotals
+}
+
+/** Balancer 批量操作单个失败条目 */
+export interface BatchFailure {
+  node_id: string
+  error: string
+}
+
+/** Balancer 批量操作结果 (start/stop/trigger all) */
+export interface BatchResult {
+  success: string[]
+  failed: BatchFailure[]
+  total: number
+}
+
+// ===== Master Raft =====
+export interface MasterStatus {
+  nodes: NodeInfo[]
+  leader: NodeInfo | null
+  raft_term: number
+  total_masters: number
+  healthy_masters: number
+}
+
+// ===== Runtime config (hot-modify via PUT) =====
+export interface CircuitBreakerConfig {
+  failure_threshold: number
+  recovery_timeout_ms: number
+  half_open_max_requests: number
+}
+
+export interface CoalescerConfig {
+  deadline_ms: number
+  min_pending_writes: number
+  max_dirty_bytes_per_entry: number
+  max_dirty_bytes_total: number
+  disabled: boolean
 }

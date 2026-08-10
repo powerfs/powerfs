@@ -119,6 +119,17 @@ impl BucketManager {
             .and_then(|b| b.volume_ids.first().cloned())
     }
 
+    pub async fn set_bucket_quota(&self, bucket: &str, size_limit: u64) -> Result<BucketInfo> {
+        let mut bucket_info = self
+            .metadata_store
+            .get_bucket(bucket)
+            .await
+            .ok_or_else(|| PowerFsError::DirectoryNotFound(bucket.to_string()))?;
+        bucket_info.size_limit = size_limit;
+        self.metadata_store.put_bucket(bucket, &bucket_info).await;
+        Ok(bucket_info)
+    }
+
     pub async fn allocate_volume_for_bucket(&self, bucket: &str, replication: &str) -> Result<u64> {
         // Use the bucket's recorded collection so newly allocated volumes stay
         // in the same collection pool.
