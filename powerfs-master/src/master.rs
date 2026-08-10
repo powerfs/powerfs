@@ -2250,6 +2250,127 @@ impl MasterNode {
             .collect()
     }
 
+    /// Build a [`powerfs_allocator::ClusterSnapshot`] from the Master's
+    /// current heartbeat-aggregated state.
+    ///
+    /// This is the integration point for P6 (StatusQuery): the Master
+    /// produces a snapshot from its existing `Topology`, `volume_routes`,
+    /// `filer_nodes`, and `zone_registry`, then feeds it to
+    /// [`powerfs_allocator::SnapshotStatusQuery`].
+    ///
+    /// Load metrics (cpu/disk/iops/latency) default to zero until P5
+    /// enriches heartbeats; the capacity/health/usage views are fully
+    /// functional today.
+    pub fn build_cluster_snapshot(&self) -> powerfs_allocator::ClusterSnapshot {
+        use powerfs_allocator::{
+            NodeRuntime, ShardRuntime, VolumeLoad, VolumeRuntime,
+        };
+
+        // --- Nodes: Topology → NodeRuntime ---
+        let data_nodes = self.topology.read().unwrap().list_all_nodes();
+        let nodes: Vec<NodeRuntime> = data_nodes
+            .iter()
+            .map(|n| NodeRuntime {
+                node_id: n.id.0.clone(),
+                state: map_node_state(n.state, n.maintenance_mode),
+                cpu_usage: 0.0,
+                memory_usage: 0.0,
+                // disk_usage derived from the node's reported space.
+                disk_usage: if n.total_space > 0 {
+                    (n.used_space as f32 / n.total_space as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                // Composite load_score: until P5, approximate from disk usage
+                // so the allocator's score_volume still ranks nodes meaningfully.
+                load_score: if n.total_space > 0 {
+                    (n.used_space as f64 / n.total_space as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                in_maintenance: n.maintenance_mode,
+            })
+            .collect();
+
+        // --- volume_id → zone_id lookup from zone_registry ---
+        // A volume may belong to one or more zones; we take the first match.
+        let vol_zone: std::collections::HashMap<u64, u32> = {
+            let registry = self.zone_registry.read().unwrap();
+            let mut map = std::collections::HashMap::new();
+            for (zone_id, zone_info) in registry.iter() {
+                for zv in &zone_info.physical_volumes {
+                    map.entry(zv.volume_id).or_insert(*zone_id);
+                }
+            }
+            map
+        };
+
+        // --- Volumes: volume_routes → VolumeRuntime ---
+        let routes = self.volume_routes.read().unwrap();
+        let volumes: Vec<VolumeRuntime> = routes
+            .values()
+            .map(|r| VolumeRuntime {
+                volume_id: r.volume_id,
+                node_id: r.node_id.clone(),
+                zone_id: vol_zone.get(&r.volume_id).copied().unwrap_or(0),
+                total_size: r.size,
+                used_size: r.used,
+                state: map_volume_state(r.state),
+                load: VolumeLoad::default(),
+                cold_needle_count: 0,
+                hot_needle_count: 0,
+            })
+            .collect();
+        drop(routes);
+
+        // --- Shards: filer_nodes + shard_mapping → ShardRuntime ---
+        // shard_mapping: shard_id → filer_id (leader). Each shard's leader_node
+        // is the owning filer; followers are the other filers that replicate it.
+        let filer_ids: Vec<String> = {
+            let filers = self.filer_nodes.read().unwrap();
+            filers.values().map(|f| f.node_id.clone()).collect()
+        };
+        let shards: Vec<ShardRuntime> = {
+            let mapping = self.shard_mapping.read().unwrap();
+            mapping
+                .iter()
+                .map(|(shard_id, leader)| ShardRuntime {
+                    shard_id: *shard_id,
+                    leader_node: leader.clone(),
+                    follower_nodes: filer_ids
+                        .iter()
+                        .filter(|f| **f != *leader)
+                        .cloned()
+                        .collect(),
+                    qps: 0,
+                    raft_backlog: 0,
+                    open_inode_count: 0,
+                    active_lease_count: 0,
+                })
+                .collect()
+        };
+
+        // --- cluster_avg_load: mean of node load_score ---
+        let cluster_avg_load = if nodes.is_empty() {
+            0.0
+        } else {
+            nodes.iter().map(|n| n.load_score).sum::<f64>() / nodes.len() as f64
+        };
+
+        powerfs_allocator::ClusterSnapshot {
+            version: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            timestamp: std::time::Instant::now(),
+            config_version: 1,
+            volumes,
+            nodes,
+            shards,
+            cluster_avg_load,
+        }
+    }
+
     /// 节点级反亲和性 volume 选择：从 sorted_routes 中选 count 个 volume，
     /// 尽量让每个 volume 落在不同物理节点上。
     ///
@@ -3244,6 +3365,41 @@ fn select_writable_volume_from(
     Some(pick)
 }
 
+/// Map `powerfs_common::NodeState` + maintenance flag to the allocator's
+/// `NodeRuntimeState`. Maintenance takes precedence over the reported state.
+fn map_node_state(
+    state: powerfs_common::types::NodeState,
+    in_maintenance: bool,
+) -> powerfs_allocator::NodeRuntimeState {
+    use powerfs_allocator::NodeRuntimeState;
+    use powerfs_common::types::NodeState;
+    if in_maintenance {
+        return NodeRuntimeState::Maintenance;
+    }
+    match state {
+        NodeState::Init | NodeState::Ready | NodeState::Healthy | NodeState::SoftError
+        | NodeState::FailSlow => NodeRuntimeState::Healthy,
+        NodeState::Degraded => NodeRuntimeState::Degraded,
+        NodeState::Maintenance => NodeRuntimeState::Maintenance,
+        NodeState::Fault | NodeState::Unavailable => NodeRuntimeState::Down,
+    }
+}
+
+/// Map `powerfs_common::VolumeState` to the allocator's `VolumeRuntimeState`.
+fn map_volume_state(
+    state: powerfs_common::types::VolumeState,
+) -> powerfs_allocator::VolumeRuntimeState {
+    use powerfs_allocator::VolumeRuntimeState;
+    use powerfs_common::types::VolumeState;
+    match state {
+        VolumeState::Creating | VolumeState::Available | VolumeState::ReadOnly => {
+            VolumeRuntimeState::Active
+        }
+        VolumeState::Full => VolumeRuntimeState::Full,
+        VolumeState::Deleting => VolumeRuntimeState::Deleted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3545,5 +3701,43 @@ mod tests {
         let node_b_count = result.iter().filter(|v| v.node_id == "node-B").count();
         assert_eq!(node_a_count, 3);
         assert_eq!(node_b_count, 3);
+    }
+
+    #[test]
+    fn test_map_node_state_maintenance_precedence() {
+        use powerfs_allocator::NodeRuntimeState;
+        // maintenance_mode flag overrides any reported state
+        assert_eq!(
+            map_node_state(NodeState::Healthy, true),
+            NodeRuntimeState::Maintenance
+        );
+        assert_eq!(
+            map_node_state(NodeState::Fault, true),
+            NodeRuntimeState::Maintenance
+        );
+    }
+
+    #[test]
+    fn test_map_node_state_variants() {
+        use powerfs_allocator::NodeRuntimeState;
+        assert_eq!(map_node_state(NodeState::Healthy, false), NodeRuntimeState::Healthy);
+        assert_eq!(map_node_state(NodeState::Ready, false), NodeRuntimeState::Healthy);
+        assert_eq!(map_node_state(NodeState::SoftError, false), NodeRuntimeState::Healthy);
+        assert_eq!(map_node_state(NodeState::FailSlow, false), NodeRuntimeState::Healthy);
+        assert_eq!(map_node_state(NodeState::Degraded, false), NodeRuntimeState::Degraded);
+        assert_eq!(map_node_state(NodeState::Maintenance, false), NodeRuntimeState::Maintenance);
+        assert_eq!(map_node_state(NodeState::Fault, false), NodeRuntimeState::Down);
+        assert_eq!(map_node_state(NodeState::Unavailable, false), NodeRuntimeState::Down);
+    }
+
+    #[test]
+    fn test_map_volume_state_variants() {
+        use powerfs_allocator::VolumeRuntimeState;
+        use powerfs_common::types::VolumeState;
+        assert_eq!(map_volume_state(VolumeState::Creating), VolumeRuntimeState::Active);
+        assert_eq!(map_volume_state(VolumeState::Available), VolumeRuntimeState::Active);
+        assert_eq!(map_volume_state(VolumeState::ReadOnly), VolumeRuntimeState::Active);
+        assert_eq!(map_volume_state(VolumeState::Full), VolumeRuntimeState::Full);
+        assert_eq!(map_volume_state(VolumeState::Deleting), VolumeRuntimeState::Deleted);
     }
 }

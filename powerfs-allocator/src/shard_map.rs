@@ -49,11 +49,10 @@ impl ShardMap {
     /// This is the zero-migration migration path: behavior is identical to
     /// `inode / inode_per_shard % shard_count`.
     pub fn from_shard_count(shard_count: u64) -> Self {
-        let inode_per_shard = if shard_count > 0 {
-            (u64::MAX / shard_count).min(1_000_000)
-        } else {
-            1_000_000
-        };
+        let inode_per_shard = u64::MAX
+            .checked_div(shard_count)
+            .map(|v| v.min(1_000_000))
+            .unwrap_or(1_000_000);
 
         let mut entries = Vec::with_capacity(shard_count as usize);
         let mut start = 0u64;
