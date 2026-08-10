@@ -1,13 +1,41 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
-    response::IntoResponse,
+    response::{IntoResponse, Json},
     routing::{delete, get, head, post, put},
-    Json, Router, Server,
+    Router, Server,
 };
+
+/// S3 ListObjects (v1) / ListObjectsV2 query parameters.
+/// Implements the subset of S3 semantics needed by PowerFS clients:
+/// prefix filtering, max-keys truncation, delimiter-based common prefixes,
+/// and v2 continuation-token pagination.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ListObjectsParams {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// Echoed back; actual cap is [0, 1000].
+    #[serde(default, rename = "max-keys")]
+    pub max_keys: Option<i64>,
+    /// v2: opaque token returned as NextContinuationToken.
+    #[serde(default, rename = "continuation-token")]
+    pub continuation_token: Option<String>,
+    /// v2: exclusive lower bound on key (skips entries <= start_after).
+    #[serde(default, rename = "start-after")]
+    pub start_after: Option<String>,
+    /// v2: "url" (only value S3 supports); controls key encoding in response.
+    #[serde(default, rename = "encoding-type")]
+    pub encoding_type: Option<String>,
+    /// v2: presence with value "2" selects ListObjectsV2 response shape.
+    #[serde(default, rename = "list-type")]
+    pub list_type: Option<u8>,
+}
 use log::info;
 use powerfs_common::error::PowerFsError;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -89,6 +117,11 @@ impl FilerServer {
             .route("/admin/balancer/trigger", post(admin_balancer_trigger))
             .route("/admin/balancer/config", get(admin_balancer_get_config))
             .route("/admin/balancer/config", put(admin_balancer_set_config))
+            // Admin bucket management (JSON API, proxied via Monitor — docs/filer-redesign-plan.md 决策 2)
+            .route("/admin/buckets", get(admin_list_buckets))
+            .route("/admin/buckets", post(admin_create_bucket))
+            .route("/admin/buckets/:name", delete(admin_delete_bucket))
+            .route("/admin/buckets/:name/quota", put(admin_set_bucket_quota))
             .route("/", get(list_buckets))
             .route("/:bucket", put(create_bucket))
             .route("/:bucket", delete(delete_bucket))
@@ -145,8 +178,9 @@ async fn head_bucket(
 async fn bucket_handler(
     State(state): State<Arc<FilerState>>,
     Path(bucket): Path<String>,
+    Query(params): Query<ListObjectsParams>,
 ) -> axum::response::Response {
-    state.s3_handler.list_objects(&bucket).await
+    state.s3_handler.list_objects(&bucket, &params).await
 }
 
 async fn object_put_handler(
@@ -247,6 +281,68 @@ async fn admin_balancer_set_config(
 ) -> axum::response::Response {
     state.shard_scheduler.set_config(config);
     (axum::http::StatusCode::OK, "Config updated").into_response()
+}
+
+// ========================================================================
+// Admin bucket management (JSON API, proxied via Monitor bridge)
+// 参见 docs/filer-redesign-plan.md 决策 2
+// ========================================================================
+
+async fn admin_list_buckets(State(state): State<Arc<FilerState>>) -> axum::response::Response {
+    state.s3_handler.admin_list_buckets().await
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminCreateBucketBody {
+    name: String,
+    #[serde(default)]
+    collection: Option<String>,
+    #[serde(default)]
+    size_limit: Option<u64>,
+}
+
+async fn admin_create_bucket(
+    State(state): State<Arc<FilerState>>,
+    Json(body): Json<AdminCreateBucketBody>,
+) -> axum::response::Response {
+    use crate::s3_handler::AdminCreateBucketRequest;
+    state
+        .s3_handler
+        .admin_create_bucket(AdminCreateBucketRequest {
+            name: body.name,
+            collection: body.collection,
+            size_limit: body.size_limit,
+        })
+        .await
+}
+
+async fn admin_delete_bucket(
+    State(state): State<Arc<FilerState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    state.s3_handler.admin_delete_bucket(&name).await
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSetQuotaBody {
+    size_limit: u64,
+}
+
+async fn admin_set_bucket_quota(
+    State(state): State<Arc<FilerState>>,
+    Path(name): Path<String>,
+    Json(body): Json<AdminSetQuotaBody>,
+) -> axum::response::Response {
+    use crate::s3_handler::AdminSetQuotaRequest;
+    state
+        .s3_handler
+        .admin_set_quota(
+            &name,
+            AdminSetQuotaRequest {
+                size_limit: body.size_limit,
+            },
+        )
+        .await
 }
 
 // ========================================================================

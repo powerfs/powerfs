@@ -184,8 +184,11 @@ pub struct FuseClientFacadeConfig {
     pub volume_net_port: u16,
     /// Volume 地址列表（如 ["172.20.0.21", "172.20.0.22"]）
     pub volume_addrs: Vec<String>,
-    /// Filer 节点地址（如 "172.20.0.35"）
+    /// Filer 节点地址（如 "172.20.0.35"）— 主地址，兼容旧字段
     pub filer_addr: String,
+    /// 所有 Filer 节点地址列表（用于网络错误时轮换重试）
+    /// 为空时回退到 filer_addr 单地址模式。
+    pub filer_addrs: Vec<String>,
     /// Filer powerfs-net 端口（如 9334）
     pub filer_port: u16,
     /// 请求超时
@@ -207,10 +210,22 @@ pub struct FuseClientFacadeConfig {
     pub lease_duration_ms: u64,
     /// Lease background renew interval in milliseconds (default 10000 = 10s).
     pub lease_renew_interval_ms: u64,
+    /// 强制挂载：跳过拓扑健康检查（total_shards > 0 + 至少 1 个 healthy filer）。
+    ///
+    /// 默认 false：fetch_topology 后若 master 未下发 `total_shards`，或没有任何
+    /// healthy filer，则拒绝挂载并退出（exit 1），避免客户端用错误的 shard_count
+    /// 路由 inode（% 1 兜底 vs filer 的 % 3 → inode not found / EIO）。
+    ///
+    /// 设为 true 仅用于运维场景：master 临时不可达但需用配置中的 filer 列表挂载。
+    pub force_mount: bool,
 }
 
 impl FuseClientFacadeConfig {
     /// 创建新配置 - 所有参数必须显式提供
+    ///
+    /// 注意：`filer_addr` 现在允许为空——空表示"从 master 拓扑发现 filer 列表"，
+    /// 此时 `force_mount` 应保持 false，让 facade 在拓扑未就绪时拒绝挂载。
+    /// 若 `filer_addr` 非空，则作为启动期到拓扑就绪之前的兜底地址。
     pub fn new(
         master_addr: String,
         master_port: u16,
@@ -232,9 +247,8 @@ impl FuseClientFacadeConfig {
         if volume_addrs.is_empty() {
             return Err("volume_addrs must not be empty".to_string());
         }
-        if filer_addr.is_empty() {
-            return Err("filer_addr must not be empty".to_string());
-        }
+        // filer_addr 允许为空（从 topology 发现）；但 filer_port 必须有效，
+        // 因为兜底地址要用 host:port 拼接。
         if filer_port == 0 {
             return Err("filer_port must be > 0".to_string());
         }
@@ -244,7 +258,13 @@ impl FuseClientFacadeConfig {
             master_port,
             volume_net_port,
             volume_addrs,
-            filer_addr,
+            filer_addr: filer_addr.clone(),
+            // 默认 filer_addrs 只包含主地址，调用方可通过 with_filer_addrs 扩展
+            filer_addrs: if filer_addr.is_empty() {
+                Vec::new()
+            } else {
+                vec![filer_addr]
+            },
             filer_port,
             request_timeout: Duration::from_secs(5),
             client_identity: ClientIdentity::new(),
@@ -254,7 +274,19 @@ impl FuseClientFacadeConfig {
             lease_mode: "range".to_string(),
             lease_duration_ms: 30_000,
             lease_renew_interval_ms: 10_000,
+            force_mount: false,
         })
+    }
+
+    /// 设置所有 Filer 地址列表（用于网络错误时轮换重试）
+    /// 第一个地址会同步更新到 filer_addr 字段。
+    pub fn with_filer_addrs(mut self, addrs: Vec<String>) -> Self {
+        let filtered: Vec<String> = addrs.into_iter().filter(|a| !a.is_empty()).collect();
+        if !filtered.is_empty() {
+            self.filer_addr = filtered[0].clone();
+            self.filer_addrs = filtered;
+        }
+        self
     }
 
     /// 设置自定义超时
@@ -277,6 +309,15 @@ impl FuseClientFacadeConfig {
         self.lease_mode = mode.to_string();
         self.lease_duration_ms = duration_ms;
         self.lease_renew_interval_ms = renew_interval_ms;
+        self
+    }
+
+    /// 设置强制挂载标志。
+    ///
+    /// 设为 true 时，`build()` 不会因 `total_shards == 0` 或无 healthy filer 而拒绝挂载，
+    /// 而是降级使用配置中的 filer_addr 作为单分片兜底。仅用于运维场景。
+    pub fn with_force_mount(mut self, force: bool) -> Self {
+        self.force_mount = force;
         self
     }
 }
@@ -467,6 +508,49 @@ impl FuseClientFacade {
             }
         }
         let topology = topology.ok_or_else(|| "Failed to get topology".to_string())?;
+
+        // ---- Mount gate: validate cluster is routable before mounting ----
+        //
+        // Without `total_shards > 0` the MetaShardClient falls back to a
+        // modulus of 1, which means every inode routes to shard 0. If the
+        // filer cluster actually uses shard_count=3, those inodes live in
+        // shards 1/2 and the lookup returns "inode not found" / EIO. Refuse
+        // to mount unless the user opted into `force_mount` (and accepts the
+        // risk of routing to the wrong shard) or the topology is healthy.
+        if !config.force_mount {
+            if topology.shard_count == 0 {
+                return Err(format!(
+                    "Refusing to mount: master returned total_shards=0 (no healthy filer \
+                     registered yet, or old master without the extension). Set fuse.force_mount=true \
+                     to override and use the configured filer_addr as a single-shard fallback."
+                ));
+            }
+            // 至少需要 1 个 shard entry 才能路由；shard_count>0 但 shards map 为空
+            // 表示 master 下发了 total_shards 但没有 filer 注册（不可能但防御性检查）。
+            if topology.shards.is_empty() {
+                return Err(format!(
+                    "Refusing to mount: master reported total_shards={} but no filer route \
+                     available. Wait for filers to register, or set fuse.force_mount=true.",
+                    topology.shard_count
+                ));
+            }
+        } else {
+            log::warn!(
+                "FuseClientFacade: force_mount=true — bypassing topology health check. \
+                 shard_count={} (0 means unknown; MetaShardClient will use a single-route fallback).",
+                topology.shard_count
+            );
+        }
+
+        // 优先使用 master 拓扑下发的 filer 列表（健康节点的 leader_addr），
+        // 回退到配置中的 filer_addrs/filer_addr（force_mount 场景或拓扑为空时）。
+        // 必须在 update_topology 之前从本地 topology 取，避免再 clone 一次。
+        let topology_filer_endpoints: Vec<String> = topology
+            .shards
+            .values()
+            .map(|s| s.leader_addr.clone())
+            .filter(|a| !a.is_empty())
+            .collect();
         master_client.update_topology(topology);
 
         // 创建 MetaShard 客户端（共享连接池）
@@ -477,8 +561,20 @@ impl FuseClientFacade {
             config.client_identity.client_id,
             conn_pool.clone(),
         );
-        meta_shard_client
-            .set_default_filer_addr(format!("{}:{}", config.filer_addr, config.filer_port));
+        // 每个 filer 地址已是 host:port 格式（master 下发的 advertise_addr）；
+        // 兜底场景需要 host + filer_port 拼接。
+        let filer_endpoints: Vec<String> = if !topology_filer_endpoints.is_empty() {
+            topology_filer_endpoints
+        } else if !config.filer_addrs.is_empty() {
+            config
+                .filer_addrs
+                .iter()
+                .map(|h| format!("{}:{}", h, config.filer_port))
+                .collect()
+        } else {
+            vec![format!("{}:{}", config.filer_addr, config.filer_port)]
+        };
+        meta_shard_client.set_filer_addresses(filer_endpoints);
         meta_shard_client.init();
 
         // 创建 Volume 客户端（共享连接池）
@@ -1962,7 +2058,8 @@ mod tests {
         );
         assert!(result.is_err());
 
-        // 空filer_addr应该失败
+        // 空 filer_addr 现在允许：表示由 facade 从 master 拓扑发现 filer 列表。
+        // 校验只要求 filer_port > 0。
         let result = FuseClientFacadeConfig::new(
             "172.20.0.11".to_string(),
             9334,
@@ -1970,6 +2067,20 @@ mod tests {
             vec!["172.20.0.21".to_string()],
             "".to_string(),
             9334,
+        );
+        assert!(
+            result.is_ok(),
+            "empty filer_addr should be allowed (topology discovery)"
+        );
+
+        // filer_port=0 仍然应该失败（兜底地址需要 host:port 拼接）
+        let result = FuseClientFacadeConfig::new(
+            "172.20.0.11".to_string(),
+            9334,
+            8901,
+            vec!["172.20.0.21".to_string()],
+            "172.20.0.35".to_string(),
+            0,
         );
         assert!(result.is_err());
     }

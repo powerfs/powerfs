@@ -425,7 +425,7 @@ function S3() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -446,7 +446,7 @@ function S3() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -466,7 +466,7 @@ function S3() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -486,7 +486,7 @@ function S3() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -510,7 +510,7 @@ function S3() {
           <Card
             hoverable
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
           >
             <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -536,7 +536,7 @@ function S3() {
           <Card
             title="Bucket列表"
             style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
+            styles={{ body: { padding: '20px' } }}
             extra={
               <Space>
                 <Tooltip title="刷新">
@@ -559,140 +559,156 @@ function S3() {
         </Col>
       </Row>
 
-      <Tabs defaultActiveKey="objects" onChange={(key) => { if (key === 'uploads') loadMultipartUploads(); if (key === 'keys') loadAccessKeys(); }}>
-        <Tabs.TabPane tab="对象浏览" key="objects">
-          {selectedBucket ? (
-            <Card
-              title={`Bucket: ${selectedBucket}`}
-              style={{ borderRadius: 12 }}
-              bodyStyle={{ padding: '20px' }}
-              extra={
-                <Space>
-                  <Button type="primary" onClick={() => setUploadModalVisible(true)}>
-                    <UploadOutlined /> 上传文件
+      <Tabs defaultActiveKey="objects" onChange={(key) => { if (key === 'uploads') loadMultipartUploads(); if (key === 'keys') loadAccessKeys(); }}
+        items={[
+          {
+            key: 'objects',
+            label: '对象浏览',
+            children: selectedBucket ? (
+              <Card
+                title={`Bucket: ${selectedBucket}`}
+                style={{ borderRadius: 12 }}
+                styles={{ body: { padding: '20px' } }}
+                extra={
+                  <Space>
+                    <Button type="primary" onClick={() => setUploadModalVisible(true)}>
+                      <UploadOutlined /> 上传文件
+                    </Button>
+                    <Button onClick={() => { setSelectedBucket(null); setObjects([]); }}>
+                      返回Bucket列表
+                    </Button>
+                  </Space>
+                }
+              >
+                <Table
+                  columns={objectColumns}
+                  dataSource={objects}
+                  rowKey="key"
+                  pagination={{ pageSize: 10 }}
+                  size="small"
+                />
+              </Card>
+            ) : (
+              <Card
+                style={{ borderRadius: 12 }}
+                styles={{ body: { padding: '40px', textAlign: 'center' } }}
+              >
+                <Space direction="vertical" align="center">
+                  <FileOutlined style={{ fontSize: 48, color: '#d9d9d9' }} />
+                  <span style={{ color: '#8c8c8c' }}>请选择一个Bucket查看对象列表</span>
+                </Space>
+              </Card>
+            ),
+          },
+          {
+            key: 'uploads',
+            label: '分片上传管理',
+            children: (
+              <Card
+                title="分片上传列表"
+                style={{ borderRadius: 12 }}
+                styles={{ body: { padding: '20px' } }}
+              >
+                <Table
+                  columns={uploadColumns}
+                  dataSource={uploads}
+                  rowKey="upload_id"
+                  pagination={{ pageSize: 10 }}
+                  size="small"
+                />
+              </Card>
+            ),
+          },
+          {
+            key: 'keys',
+            label: '访问密钥管理',
+            children: (
+              <Card
+                title="S3访问密钥"
+                style={{ borderRadius: 12 }}
+                styles={{ body: { padding: '20px' } }}
+                extra={
+                  <Button type="primary" onClick={() => setKeyModalVisible(true)}>
+                    <PlusOutlined /> 创建密钥
                   </Button>
-                  <Button onClick={() => { setSelectedBucket(null); setObjects([]); }}>
-                    返回Bucket列表
-                  </Button>
-                </Space>
-              }
-            >
-              <Table
-                columns={objectColumns}
-                dataSource={objects}
-                rowKey="key"
-                pagination={{ pageSize: 10 }}
-                size="small"
-              />
-            </Card>
-          ) : (
-            <Card
-              style={{ borderRadius: 12 }}
-              bodyStyle={{ padding: '40px', textAlign: 'center' }}
-            >
-              <Space direction="vertical" align="center">
-                <FileOutlined style={{ fontSize: 48, color: '#d9d9d9' }} />
-                <span style={{ color: '#8c8c8c' }}>请选择一个Bucket查看对象列表</span>
-              </Space>
-            </Card>
-          )}
-        </Tabs.TabPane>
-        <Tabs.TabPane tab="分片上传管理" key="uploads">
-          <Card
-            title="分片上传列表"
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Table
-              columns={uploadColumns}
-              dataSource={uploads}
-              rowKey="upload_id"
-              pagination={{ pageSize: 10 }}
-              size="small"
-            />
-          </Card>
-        </Tabs.TabPane>
-        <Tabs.TabPane tab="访问密钥管理" key="keys">
-          <Card
-            title="S3访问密钥"
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-            extra={
-              <Button type="primary" onClick={() => setKeyModalVisible(true)}>
-                <PlusOutlined /> 创建密钥
-              </Button>
-            }
-          >
-            <Alert
-              message="访问密钥用于S3客户端认证"
-              description="S3客户端使用这些密钥通过PowerFS S3 Gateway访问存储。"
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-            />
-            <Table
-              columns={accessKeyColumns}
-              dataSource={accessKeys}
-              rowKey="access_key"
-              pagination={{ pageSize: 10 }}
-              size="small"
-            />
-          </Card>
-        </Tabs.TabPane>
-        <Tabs.TabPane tab="S3网关" key="console">
-          <Card
-            title="PowerFS S3 Gateway"
-            style={{ borderRadius: 12 }}
-            bodyStyle={{ padding: '20px' }}
-          >
-            <Alert
-              message="PowerFS S3网关模式"
-              description="PowerFS内置S3兼容网关，支持AWS S3协议，元数据由Master统一管理，数据存储在分布式Volume Server节点上。"
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-            />
-            <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
-                <Space>
-                  <CloudServerOutlined style={{ fontSize: 32, color: '#1890ff' }} />
-                  <div>
-                    <div style={{ fontSize: 16, fontWeight: 500 }}>S3 API端点</div>
-                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>http://localhost:9000</div>
+                }
+              >
+                <Alert
+                  message="访问密钥用于S3客户端认证"
+                  description="S3客户端使用这些密钥通过PowerFS S3 Gateway访问存储。"
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                />
+                <Table
+                  columns={accessKeyColumns}
+                  dataSource={accessKeys}
+                  rowKey="access_key"
+                  pagination={{ pageSize: 10 }}
+                  size="small"
+                />
+              </Card>
+            ),
+          },
+          {
+            key: 'console',
+            label: 'S3网关',
+            children: (
+              <Card
+                title="PowerFS S3 Gateway"
+                style={{ borderRadius: 12 }}
+                styles={{ body: { padding: '20px' } }}
+              >
+                <Alert
+                  message="PowerFS S3网关模式"
+                  description="PowerFS内置S3兼容网关，支持AWS S3协议，元数据由Master统一管理，数据存储在分布式Volume Server节点上。"
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                />
+                <Space direction="vertical" style={{ width: '100%', gap: 16 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                    <Space>
+                      <CloudServerOutlined style={{ fontSize: 32, color: '#1890ff' }} />
+                      <div>
+                        <div style={{ fontSize: 16, fontWeight: 500 }}>S3 API端点</div>
+                        <div style={{ color: '#8c8c8c', fontSize: 12 }}>http://localhost:9000</div>
+                      </div>
+                    </Space>
+                    <Tag color="green">运行中</Tag>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                    <Space>
+                      <KeyOutlined style={{ fontSize: 32, color: '#52c41a' }} />
+                      <div>
+                        <div style={{ fontSize: 16, fontWeight: 500 }}>默认凭据</div>
+                        <div style={{ color: '#8c8c8c', fontSize: 12 }}>Access Key: powerfs / Secret Key: powerfs123</div>
+                      </div>
+                    </Space>
+                    <Button onClick={loadAccessKeys}>
+                      查看所有密钥
+                    </Button>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
+                    <Space>
+                      <DatabaseOutlined style={{ fontSize: 32, color: '#fa8c16' }} />
+                      <div>
+                        <div style={{ fontSize: 16, fontWeight: 500 }}>数据存储</div>
+                        <div style={{ color: '#8c8c8c', fontSize: 12 }}>元数据存储在Master，实际数据存储在Volume Server节点</div>
+                      </div>
+                    </Space>
+                    <Tag color="blue">分布式</Tag>
                   </div>
                 </Space>
-                <Tag color="green">运行中</Tag>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
-                <Space>
-                  <KeyOutlined style={{ fontSize: 32, color: '#52c41a' }} />
-                  <div>
-                    <div style={{ fontSize: 16, fontWeight: 500 }}>默认凭据</div>
-                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>Access Key: powerfs / Secret Key: powerfs123</div>
-                  </div>
-                </Space>
-                <Button onClick={loadAccessKeys}>
-                  查看所有密钥
-                </Button>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 24px', background: '#fafafa', borderRadius: 8 }}>
-                <Space>
-                  <DatabaseOutlined style={{ fontSize: 32, color: '#fa8c16' }} />
-                  <div>
-                    <div style={{ fontSize: 16, fontWeight: 500 }}>数据存储</div>
-                    <div style={{ color: '#8c8c8c', fontSize: 12 }}>元数据存储在Master，实际数据存储在Volume Server节点</div>
-                  </div>
-                </Space>
-                <Tag color="blue">分布式</Tag>
-              </div>
-            </Space>
-          </Card>
-        </Tabs.TabPane>
-      </Tabs>
+              </Card>
+            ),
+          },
+        ]}
+      />
 
       <Modal
         title="创建Bucket"
-        visible={createModalVisible}
+        open={createModalVisible}
         onCancel={() => setCreateModalVisible(false)}
         footer={null}
       >
@@ -715,7 +731,7 @@ function S3() {
 
       <Modal
         title="上传文件"
-        visible={uploadModalVisible}
+        open={uploadModalVisible}
         onCancel={() => { setUploadModalVisible(false); setUploadFile(null); setUploadKey(''); }}
         footer={null}
       >
@@ -744,7 +760,7 @@ function S3() {
 
       <Modal
         title="创建访问密钥"
-        visible={keyModalVisible}
+        open={keyModalVisible}
         onCancel={() => setKeyModalVisible(false)}
         footer={null}
       >

@@ -74,11 +74,15 @@ pub struct FuseApp {
     volume_net_port: u16,
     volume_addrs: Vec<String>,
     filer_addr: String,
+    /// 所有 Filer 节点地址列表（用于网络错误时轮换重试）
+    filer_addrs: Vec<String>,
     filer_net_port: u16,
     /// Lease mode: "range" (方案 D) or "inode" (方案 A)
     lease_mode: String,
     lease_duration_ms: u64,
     lease_renew_interval_ms: u64,
+    /// 强制挂载：跳过拓扑健康检查。仅用于运维场景。
+    force_mount: bool,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -93,12 +97,25 @@ impl FuseApp {
         volume_net_port: u16,
         volume_addrs: Vec<String>,
         filer_addr: String,
+        filer_addrs: Vec<String>,
         filer_net_port: u16,
         lease_mode: &str,
         lease_duration_ms: u64,
         lease_renew_interval_ms: u64,
+        force_mount: bool,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
+        // filer_addrs 为空且 filer_addr 也为空时，由 facade 从 master 拓扑发现。
+        // 旧逻辑 `vec![filer_addr]` 在 filer_addr="" 时会插入一个空字符串，污染轮换列表。
+        let filer_addrs = if filer_addrs.is_empty() {
+            if filer_addr.is_empty() {
+                Vec::new()
+            } else {
+                vec![filer_addr.clone()]
+            }
+        } else {
+            filer_addrs
+        };
         Ok(FuseApp {
             mount_point: mount_point.to_string(),
             master_addresses: master_addrs.to_vec(),
@@ -108,10 +125,12 @@ impl FuseApp {
             volume_net_port,
             volume_addrs,
             filer_addr,
+            filer_addrs,
             filer_net_port,
             lease_mode: lease_mode.to_string(),
             lease_duration_ms,
             lease_renew_interval_ms,
+            force_mount,
             runtime,
         })
     }
@@ -160,6 +179,7 @@ impl FuseApp {
             volume_net_port: self.volume_net_port,
             volume_addrs: self.volume_addrs.clone(),
             filer_addr: self.filer_addr.clone(),
+            filer_addrs: self.filer_addrs.clone(),
             filer_port: self.filer_net_port,
             request_timeout: Duration::from_secs(10),
             client_identity,
@@ -169,6 +189,7 @@ impl FuseApp {
             lease_mode: self.lease_mode.clone(),
             lease_duration_ms: self.lease_duration_ms,
             lease_renew_interval_ms: self.lease_renew_interval_ms,
+            force_mount: self.force_mount,
         };
 
         let facade = Arc::new(
@@ -529,7 +550,7 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         gid: attr.gid,
         atime: attr.atime as i64,
         mtime: attr.mtime as i64,
-        ctime: attr.ctime as i64,
+        ctime: attr.ctime,
         xattrs: HashMap::new(),
         chunks,
         hard_link_id: String::new(),
@@ -707,8 +728,7 @@ impl PowerFsFs {
         // === P3: Stripe 模式 flush 分支 ===
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // 每个 dirty chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default), so each cache
@@ -1006,8 +1026,12 @@ impl PowerFsFs {
             entry.chunks.len(),
             entry.fid.as_ref().map(|f| f.to_string())
         );
+        info!(
+            "K3-DBG sync_close: inode={} chunks={:?}",
+            inode,
+            entry.chunks.iter().map(|c| (c.offset, c.volume_id, c.needle_id, c.size)).collect::<Vec<_>>()
+        );
 
-        let parent = entry.parent;
         let chunks_wire: Vec<powerfs_coherence::ChunkWire> = entry
             .chunks
             .iter()
@@ -1021,8 +1045,17 @@ impl PowerFsFs {
             })
             .collect();
 
+        // inode-level write → route by calculate_shard_id(inode).
+        // Inode records live on their own hash-derived shard (independent of
+        // the parent dir entry's shard); routing via `parent` would hit the
+        // wrong leader and force a redirect on every close.
+        let routing_shard = self
+            .client
+            .facade()
+            .meta_shard_client()
+            .calculate_shard_id(inode);
         let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
-            shard_id: parent, // dir_ino 作为 shard_id
+            shard_id: routing_shard,
             inode,
             size: entry.content_size,
             chunks: chunks_wire,
@@ -1631,12 +1664,13 @@ impl FileSystem for PowerFsFs {
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
         let attr = self
             .client
             .block_on(async move {
                 meta_client
-                    .mkdir(parent, &name_owned, dir_mode, uid, gid, parent)
+                    .mkdir(parent, &name_owned, dir_mode, uid, gid, shard_id)
                     .await
             })
             .map_err(|e| {
@@ -1658,9 +1692,10 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.rmdir RPC 走 Filer Raft leader（强一致）
         // Filer 的 handle_rmdir 会做空目录检查（ENOTEMPTY），客户端不需要重复检查。
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
         self.client
-            .block_on(async move { meta_client.rmdir(parent, &name_owned, parent).await })
+            .block_on(async move { meta_client.rmdir(parent, &name_owned, shard_id).await })
             .map_err(|e| {
                 let errno = if e.to_string().contains("not empty") {
                     libc::ENOTEMPTY
@@ -1728,9 +1763,10 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.unlink RPC 走 Filer Raft leader（强一致）
         // Filer 端原子地移除目录条目并递减 nlink。
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
         self.client
-            .block_on(async move { meta_client.unlink(parent, &name_owned, parent).await })
+            .block_on(async move { meta_client.unlink(parent, &name_owned, shard_id).await })
             .map_err(|e| {
                 error!("unlink RPC failed: {}", e);
                 std::io::Error::from_raw_os_error(libc::EIO)
@@ -1812,13 +1848,14 @@ impl FileSystem for PowerFsFs {
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
         let t_create = std::time::Instant::now();
         let attr = self
             .client
             .block_on(async move {
                 meta_client
-                    .create(parent, &name_owned, file_mode, uid, gid, parent, None)
+                    .create(parent, &name_owned, file_mode, uid, gid, shard_id, None)
                     .await
             })
             .map_err(|e| {
@@ -2082,7 +2119,7 @@ impl FileSystem for PowerFsFs {
         // setattr/write. Pinning early makes InvalidateHandler skip the
         // notification (open files hold a data lease, so the cache is
         // authoritative).
-        let parent = if let Some(entry) = self.cache.get_inode(inode) {
+        let _parent = if let Some(entry) = self.cache.get_inode(inode) {
             if entry.is_dir {
                 debug!("open: entry is directory, returning EISDIR");
                 return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
@@ -2102,14 +2139,28 @@ impl FileSystem for PowerFsFs {
             // cross-client reads. When dirty chunks exist, the local cache is
             // authoritative (we hold the write lease; no other client can
             // modify the data).
-            if self.chunk_cache.has_dirty_chunks(inode) {
+            let has_dirty_inline = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| b.dirty)
+                .unwrap_or(false);
+            let has_dirty_chunks = self.chunk_cache.has_dirty_chunks(inode);
+            debug!(
+                "open: inode={} dirty_check has_dirty_chunks={} has_dirty_inline={} inline_buffers_contains={}",
+                inode,
+                has_dirty_chunks,
+                has_dirty_inline,
+                self.inline_buffers.contains_key(&inode)
+            );
+            if has_dirty_chunks || has_dirty_inline {
                 // Local cache has unsynced data (write happened but
                 // sync_size_chunks_on_close hasn't completed yet, e.g.,
                 // async FUSE RELEASE). The local cache is authoritative:
                 // skip the Filer refresh to preserve content_size and
-                // chunk data for append writes.
+                // chunk data for append writes. This also covers Inline
+                // mode: dirty data lives in inline_buffers, not chunk_cache.
                 debug!(
-                    "open: skipping filer refresh for inode={} (has dirty/unsynced chunks)",
+                    "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
                 );
             } else if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
@@ -2245,11 +2296,16 @@ impl FileSystem for PowerFsFs {
         // 并发 open 第二次进入) — 此时本地 buffer 权威, 无需刷新.
         if !self.inline_buffers.contains_key(&inode) {
             let meta_client = self.client.facade().meta_shard_client().clone();
-            let parent_for_getattr = parent;
+            // Route getattr via the inode's own shard. After the split-create
+            // refactor the inode record lives on calculate_shard(inode);
+            // any other shard returns "ino not found" → inline_buffers not
+            // populated → read falls through to the stripe/Flat path →
+            // "placement Inline but no chunks" EIO.
+            let routing_shard = meta_client.calculate_shard_id(inode);
             let ino = inode;
             let attr_result = self
                 .client
-                .block_on(async move { meta_client.getattr(ino, parent_for_getattr).await });
+                .block_on(async move { meta_client.getattr(ino, routing_shard).await });
             match attr_result {
                 Ok(attr) if attr.is_inline() => {
                     // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
@@ -2286,8 +2342,10 @@ impl FileSystem for PowerFsFs {
 
         // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
+        // inode-level state → route by calculate_shard_id(inode)
+        let open_count_shard = meta_shard_client.calculate_shard_id(inode);
         let req = powerfs_coherence::OpenCountRequest {
-            shard_id: parent,
+            shard_id: open_count_shard,
             inode,
         };
         if let Err(e) = self
@@ -2365,10 +2423,10 @@ impl FileSystem for PowerFsFs {
             let total_shards = data_shards + parity_shards;
 
             let ec_chunks = entry.chunks.clone();
-            // Guard: EC path requires data+parity shards.
-            if ec_chunks.len() < total_shards {
+            // Guard: EC path requires complete stripe groups (multiples of total_shards).
+            if ec_chunks.is_empty() || ec_chunks.len() % total_shards != 0 {
                 log::warn!(
-                    "read ec: inode={} has {} chunks but need {} (data={}+parity={}), returning EIO",
+                    "read ec: inode={} has {} chunks, need non-empty multiple of {} (data={}+parity={}), returning EIO",
                     inode,
                     ec_chunks.len(),
                     total_shards,
@@ -2377,6 +2435,9 @@ impl FileSystem for PowerFsFs {
                 );
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
+            let num_groups = ec_chunks.len() / total_shards;
+            const EC_SHARD_SIZE: u64 = 1024 * 1024; // 1MB = chunk_size
+            let group_data_size = data_shards as u64 * EC_SHARD_SIZE;
 
             let chunk_size = self.chunk_cache.chunk_size();
             let file_size = entry.size;
@@ -2407,135 +2468,170 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
-                // Reconstruct full file data from EC shards.
-                // Read each shard (data first, then parity) from its volume.
-                // Failed/missing shards become None for degraded reconstruction.
-                let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
-                let mut read_ok = 0usize;
+                // 按 stripe group 重建缺失的 chunk. 每个 group 独立编码/解码,
+                // group 数据 = data_shards × 1MB, 只重建缺失的 group.
+                let start_group = (missing_chunks[0].1 / group_data_size) as usize;
+                let end_group = (missing_chunks.last().unwrap().1 / group_data_size) as usize;
                 let mtime = entry.mtime as u64;
 
-                for (i, chunk) in ec_chunks.iter().enumerate().take(total_shards) {
-                    let read_size = chunk.size as i32;
-                    match self.client.get_volume_addr(chunk.volume_id) {
-                        Ok(addr) => {
-                            match self.client.read_blob(
-                                &addr,
-                                chunk.volume_id,
-                                chunk.needle_id,
-                                0,
-                                read_size,
-                            ) {
-                                Ok(shard_data) => {
-                                    // CRC32 verification: a CRC mismatch is
-                                    // treated as a missing shard so the EC
-                                    // decoder can reconstruct it from parity.
-                                    if chunk.crc32 != 0 {
-                                        let actual = crc32fast::hash(&shard_data);
-                                        if actual != chunk.crc32 {
-                                            log::warn!(
-                                                "read ec: inode={} shard {} CRC mismatch expected={:#x} actual={:#x}, will reconstruct",
-                                                inode, i, chunk.crc32, actual
-                                            );
-                                            continue;
+                // EC 编码器在 group 循环外创建一次, 复用.
+                let ec_config = powerfs_core::ec_thread::EcConfig {
+                    data_shards,
+                    parity_shards,
+                    ..Default::default()
+                };
+                let encoder = powerfs_core::ec_thread::EcEncoder::new(ec_config);
+
+                for group_idx in start_group..=end_group {
+                    if group_idx >= num_groups {
+                        continue;
+                    }
+                    let group_start = group_idx as u64 * group_data_size;
+                    let group_end = std::cmp::min(group_start + group_data_size, file_size);
+
+                    // 跳过该 group 所有 1MB chunk 都已在 chunk_cache 中的情况.
+                    let mut all_cached = true;
+                    let mut co = 0u64;
+                    while co < group_end - group_start {
+                        let cache_offset = group_start + co;
+                        if cache_offset >= file_size {
+                            break;
+                        }
+                        if self.chunk_cache.get(inode, cache_offset).is_none() {
+                            all_cached = false;
+                            break;
+                        }
+                        co += chunk_size;
+                    }
+                    if all_cached {
+                        continue;
+                    }
+
+                    let group_base = group_idx * total_shards;
+
+                    // 读取该 group 的所有 shards (data + parity).
+                    // 失败/缺失的 shard 置 None, 由 parity 降级重建.
+                    let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+                    let mut read_ok = 0usize;
+
+                    for i in 0..total_shards {
+                        let chunk = &ec_chunks[group_base + i];
+                        let read_size = chunk.size as i32;
+                        match self.client.get_volume_addr(chunk.volume_id) {
+                            Ok(addr) => {
+                                match self.client.read_blob(
+                                    &addr,
+                                    chunk.volume_id,
+                                    chunk.needle_id,
+                                    0,
+                                    read_size,
+                                ) {
+                                    Ok(shard_data) => {
+                                        // CRC32 校验: 不匹配视为缺失, 由 parity 重建.
+                                        if chunk.crc32 != 0 {
+                                            let actual = crc32fast::hash(&shard_data);
+                                            if actual != chunk.crc32 {
+                                                log::warn!(
+                                                    "read ec: inode={} group {} shard {} CRC mismatch expected={:#x} actual={:#x}, will reconstruct",
+                                                    inode, group_idx, i, chunk.crc32, actual
+                                                );
+                                                continue;
+                                            }
                                         }
+                                        shards[i] = Some(shard_data);
+                                        read_ok += 1;
                                     }
-                                    shards[i] = Some(shard_data);
-                                    read_ok += 1;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "read ec: inode={} shard {} read failed (vol={} needle={:#x}): {}",
-                                        inode, i, chunk.volume_id, chunk.needle_id, e
-                                    );
+                                    Err(e) => {
+                                        log::warn!(
+                                            "read ec: inode={} group {} shard {} read failed (vol={} needle={:#x}): {}",
+                                            inode, group_idx, i, chunk.volume_id, chunk.needle_id, e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "read ec: inode={} shard {} get_volume_addr failed (vol={}): {}",
-                                inode,
-                                i,
-                                chunk.volume_id,
-                                e
-                            );
+                            Err(e) => {
+                                log::warn!(
+                                    "read ec: inode={} group {} shard {} get_volume_addr failed (vol={}): {}",
+                                    inode,
+                                    group_idx,
+                                    i,
+                                    chunk.volume_id,
+                                    e
+                                );
+                            }
                         }
                     }
-                }
 
-                let data_available = shards
-                    .iter()
-                    .take(data_shards)
-                    .filter(|s| s.is_some())
-                    .count();
+                    let data_available = shards
+                        .iter()
+                        .take(data_shards)
+                        .filter(|s| s.is_some())
+                        .count();
 
-                let file_data: Vec<u8> = if data_available == data_shards {
-                    // Fast path: all data shards present — concatenate and
-                    // truncate to original file size (last shard may be
-                    // zero-padded during encoding).
-                    let mut fdata = Vec::with_capacity(
-                        shards
-                            .iter()
-                            .take(data_shards)
-                            .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
-                            .sum(),
-                    );
-                    for s in shards.iter().take(data_shards) {
-                        fdata.extend_from_slice(s.as_ref().unwrap());
-                    }
-                    fdata.truncate(file_size as usize);
-                    fdata
-                } else if read_ok >= data_shards {
-                    // Degraded path: some data shards missing, but enough
-                    // total shards (data+parity) to reconstruct.
-                    log::info!(
-                        "read ec degraded: inode={} data_available={}/{} total_available={}/{}, reconstructing",
-                        inode,
-                        data_available,
-                        data_shards,
-                        read_ok,
-                        total_shards
-                    );
-                    let ec_config = powerfs_core::ec_thread::EcConfig {
-                        data_shards,
-                        parity_shards,
-                        ..Default::default()
+                    // 重建该 group 的完整数据 (data_shards × 1MB, 末尾可能含零填充).
+                    let group_data: Vec<u8> = if data_available == data_shards {
+                        // Fast path: all data shards present — concatenate.
+                        let mut gdata = Vec::with_capacity(
+                            shards
+                                .iter()
+                                .take(data_shards)
+                                .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
+                                .sum(),
+                        );
+                        for s in shards.iter().take(data_shards) {
+                            gdata.extend_from_slice(s.as_ref().unwrap());
+                        }
+                        gdata
+                    } else if read_ok >= data_shards {
+                        // Degraded path: 部分数据 shard 缺失, 但 data+parity 足够重建.
+                        log::info!(
+                            "read ec degraded: inode={} group {} data_available={}/{} total_available={}/{}, reconstructing",
+                            inode,
+                            group_idx,
+                            data_available,
+                            data_shards,
+                            read_ok,
+                            total_shards
+                        );
+                        match encoder.decode_missing(&mut shards) {
+                            Ok(gdata) => gdata,
+                            Err(e) => {
+                                log::error!(
+                                    "read ec: inode={} group {} decode_missing failed: {}, returning EIO",
+                                    inode,
+                                    group_idx,
+                                    e
+                                );
+                                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                            }
+                        }
+                    } else {
+                        // Not enough shards to reconstruct.
+                        log::error!(
+                            "read ec: inode={} group {} only {}/{} shards available, need {} to reconstruct, returning EIO",
+                            inode,
+                            group_idx,
+                            read_ok,
+                            total_shards,
+                            data_shards
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
                     };
-                    let encoder = powerfs_core::ec_thread::EcEncoder::new(ec_config);
-                    match encoder.decode_missing(&mut shards) {
-                        Ok(mut fdata) => {
-                            fdata.truncate(file_size as usize);
-                            fdata
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "read ec: inode={} decode_missing failed: {}, returning EIO",
-                                inode,
-                                e
-                            );
-                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                        }
-                    }
-                } else {
-                    // Not enough shards to reconstruct.
-                    log::error!(
-                        "read ec: inode={} only {}/{} shards available, need {} to reconstruct, returning EIO",
-                        inode,
-                        read_ok,
-                        total_shards,
-                        data_shards
-                    );
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                };
 
-                // Populate chunk_cache with 1MB chunks from reconstructed file
-                // data so subsequent reads hit the cache without re-decoding.
-                let mut off = 0u64;
-                while off < file_data.len() as u64 {
-                    let chunk_end = std::cmp::min(off + chunk_size, file_data.len() as u64);
-                    let chunk_data = file_data[off as usize..chunk_end as usize].to_vec();
-                    self.chunk_cache
-                        .put(inode, off, chunk_data.into(), mtime, 0);
-                    off = chunk_end;
+                    // 用 1MB chunk 填充 chunk_cache, 末尾按 file_size 截断
+                    // (最后一个 group 的零填充不写入缓存).
+                    let mut off = 0u64;
+                    while off < group_data.len() as u64 {
+                        let cache_offset = group_start + off;
+                        if cache_offset >= file_size {
+                            break;
+                        }
+                        let actual_end = std::cmp::min(off + chunk_size, file_size - group_start);
+                        let chunk_data = group_data[off as usize..actual_end as usize].to_vec();
+                        self.chunk_cache
+                            .put(inode, cache_offset, chunk_data.into(), mtime, 0);
+                        off += chunk_size;
+                    }
                 }
             }
 
@@ -2575,8 +2671,7 @@ impl FileSystem for PowerFsFs {
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // chunk_cache 逻辑与 Flat 相同; 差异仅在 cache miss 时按
         // resolve_stripe_chunk() 路由到正确的 volume/needle.
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
             // Guard: Stripe path requires at least one chunk to route reads.
             // Empty chunks + placement=Some can happen if metadata is incomplete
@@ -2633,10 +2728,18 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
-                // Build chunk_map for O(1) needle_id lookup
+                // Pre-resolve volume addresses to populate volume_router cache.
+                // After FUSE restart, the router only has volumes from the initial
+                // topology fetch. Chunks written to other volumes (assigned by Filer
+                // during create/migrate) need on-demand lookup from Master.
+                for chunk in &stripe_chunks {
+                    let _ = self.client.get_volume_addr(chunk.volume_id);
+                }
+                // Build chunk_map for O(1) (volume_id, needle_id) lookup.
+                // Tuple order MUST match resolve_stripe_chunk's return: (volume_id, needle_id).
                 let chunk_map: HashMap<u64, (u64, u64)> = stripe_chunks
                     .iter()
-                    .map(|c| (c.offset, (c.needle_id, c.volume_id)))
+                    .map(|c| (c.offset, (c.volume_id, c.needle_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
                 let crc_map: HashMap<u64, u32> =
@@ -2986,6 +3089,12 @@ impl FileSystem for PowerFsFs {
                 .collect();
 
             if !missing_chunks.is_empty() {
+                // Pre-resolve volume addresses to populate volume_router cache.
+                // After FUSE restart, the router only has volumes from the initial
+                // topology fetch. Chunks may reference volumes not in the cache.
+                for chunk in &entry.chunks {
+                    let _ = self.client.get_volume_addr(chunk.volume_id);
+                }
                 // Build chunk_map for O(1) needle_id lookup
                 let chunk_map: HashMap<u64, (u64, u64)> = entry
                     .chunks
@@ -3395,14 +3504,18 @@ impl FileSystem for PowerFsFs {
                     data[start..end].copy_from_slice(&buf[..]);
                     data
                 };
-                drop(inline_buf); // 释放 DashMap 写锁后再做 RPC (block_on)
-
-                let parent = entry.parent;
+                let _ = inline_buf; // release DashMap ref after clone above; dropped by scope
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                match self
-                    .client
-                    .block_on(async move { meta_client.migrate_inline_alloc(parent, inode).await })
-                {
+                // Route migrate_inline_alloc via the inode's own shard
+                // (calculate_shard(inode) on the client == calculate_shard(inode)
+                // on the filer, since both use (inode / 1_000_000) % shard_count).
+                // The inode record lives on this shard after the split-create
+                // refactor; routing to any other shard returns "inode not found"
+                // → EFBIG → buffer discarded → 0-byte file on release.
+                let routing_shard = meta_client.calculate_shard_id(inode);
+                match self.client.block_on(async move {
+                    meta_client.migrate_inline_alloc(routing_shard, inode).await
+                }) {
                     Ok((volume_id, needle_id)) => {
                         info!(
                             "write inline migrate: inode={} new_end={} > threshold={} → \
@@ -3511,8 +3624,7 @@ impl FileSystem for PowerFsFs {
         // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
         // 每个 1MB chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
         // chunk_cache 逻辑与 Flat 相同 (按 file offset 缓存 1MB 数据).
-        if entry.placement.is_some() && entry.fid.is_none() {
-            let placement = entry.placement.as_ref().unwrap();
+        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
             let stripe_chunks = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default).
@@ -3907,7 +4019,7 @@ impl FileSystem for PowerFsFs {
         &self,
         _ctx: &Context,
         inode: Self::Inode,
-        _flags: u32,
+        flags: u32,
         _handle: Self::Handle,
         _flush: bool,
         _flock_release: bool,
@@ -3926,25 +4038,47 @@ impl FileSystem for PowerFsFs {
         //
         // 完全绕过 Flat 路径的 flush_dirty_chunks / sync_size_chunks_on_close /
         // lease 释放, 直接完成 close 序列后返回.
-        if let Some((_, inline_buf)) = self.inline_buffers.remove(&inode) {
-            self.inline_max_sizes.remove(&inode);
-            let parent = self
-                .cache
-                .get_inode(inode)
-                .map(|e| e.parent)
-                .unwrap_or(inode);
-            let size = inline_buf.data.len() as u64;
+        //
+        // CRITICAL: Don't remove the inline buffer until AFTER the sync completes.
+        // Removing it before the sync creates a window where a concurrent open
+        // (e.g., shell pipeline `echo > f && cat f`) can't find the inline buffer,
+        // refreshes stale metadata from the Filer (which hasn't received the data
+        // yet), and gets content_size=0 → EIO on read. By keeping the buffer in
+        // inline_buffers during the sync, the open's dirty-inline check fires and
+        // skips the stale Filer refresh.
+        let inline_info = {
+            if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+                let size = inline_buf.data.len() as u64;
+                let dirty = inline_buf.dirty;
+                let data = if dirty {
+                    Some(inline_buf.data.clone())
+                } else {
+                    None
+                };
+                Some((size, dirty, data))
+            } else {
+                None
+            }
+        };
+
+        if let Some((size, dirty, data)) = inline_info {
+            // inode-level write → route by calculate_shard_id(inode). Inline
+            // data + size are stored on the inode's own shard, NOT the parent
+            // dir's shard. Routing via `parent` would send the close-sync to
+            // the wrong leader and corrupt the file (size=0 / inline_data lost).
+            let meta_client_for_calc = self.client.facade().meta_shard_client().clone();
+            let routing_shard = meta_client_for_calc.calculate_shard_id(inode);
 
             // 仅当 write 修改过 (dirty) 才同步; 只读 open → release 不回写,
             // 避免覆盖其他客户端的并发写入 (Inline 无 volume lease 互斥).
-            let sync_result: std::io::Result<()> = if inline_buf.dirty {
+            let sync_result: std::io::Result<()> = if dirty {
                 let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
-                    shard_id: parent, // dir_ino 作为 shard_id
+                    shard_id: routing_shard,
                     inode,
                     size,
                     chunks: Vec::new(), // Inline 模式 chunks 为空
                     client_id: self.client.client_id(),
-                    inline_data: Some(inline_buf.data),
+                    inline_data: data,
                 };
                 // retry + timeout (与 Flat 路径 sync_size_chunks_on_close 一致)
                 let max_retries = 5u32;
@@ -4003,10 +4137,15 @@ impl FileSystem for PowerFsFs {
                 Ok(())
             };
 
+            // Sync complete — NOW safe to remove the inline buffer. The filer
+            // has the data, so a concurrent open will get correct metadata.
+            self.inline_buffers.remove(&inode);
+            self.inline_max_sizes.remove(&inode);
+
             // open_count_dec (best-effort, 同 Flat 路径)
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
             let req = powerfs_coherence::OpenCountRequest {
-                shard_id: parent,
+                shard_id: routing_shard,
                 inode,
             };
             if let Err(e) = self
@@ -4048,14 +4187,26 @@ impl FileSystem for PowerFsFs {
         //    read non-existent chunks, causing cross-client data corruption.
         //    The dirty flag is preserved so the background flusher retries.
         let sync_result = if flush_result.is_ok() {
-            let r = self.sync_size_chunks_on_close(inode);
-            if let Err(e) = &r {
-                error!(
-                    "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
-                    inode, e
+            // Skip sync for read-only opens: no data was written, so syncing
+            // would overwrite the filer with potentially stale cache data
+            // (e.g., a concurrent writer's not-yet-synced inline data).
+            let is_readonly = (flags & libc::O_ACCMODE as u32) == libc::O_RDONLY as u32;
+            if is_readonly {
+                debug!(
+                    "release: skipping sync for inode={} (read-only open, no writes)",
+                    inode
                 );
+                Ok(())
+            } else {
+                let r = self.sync_size_chunks_on_close(inode);
+                if let Err(e) = &r {
+                    error!(
+                        "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
+                        inode, e
+                    );
+                }
+                r
             }
-            r
         } else {
             error!(
                 "release: skipping sync for inode {} because flush failed — \
@@ -4075,10 +4226,12 @@ impl FileSystem for PowerFsFs {
 
         // 3. Phase 3.5.3: 递减 open_count（best-effort，无论 sync 成功与否都执行）
         //    在返回前完成，确保 GC 不会在文件仍被打开时删除
-        if let Some(entry) = self.cache.get_inode(inode) {
+        if self.cache.get_inode(inode).is_some() {
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
+            // inode-level state → route by calculate_shard_id(inode)
+            let open_count_shard = meta_shard_client.calculate_shard_id(inode);
             let req = powerfs_coherence::OpenCountRequest {
-                shard_id: entry.parent,
+                shard_id: open_count_shard,
                 inode,
             };
             if let Err(e) = self
@@ -4253,9 +4406,11 @@ impl FileSystem for PowerFsFs {
             }
             None => {
                 let meta_client = self.client.facade().meta_shard_client().clone();
+                let routing_shard = meta_client.calculate_shard_id(inode);
+                let ino = inode;
                 let attr = self
                     .client
-                    .block_on(async move { meta_client.getattr(inode, inode).await })
+                    .block_on(async move { meta_client.getattr(ino, routing_shard).await })
                     .map_err(|e| {
                         debug!("readdir: getattr RPC failed for inode {}: {}", inode, e);
                         std::io::Error::from_raw_os_error(libc::ENOENT)
@@ -4364,15 +4519,16 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.rename RPC 走 Filer Raft leader（强一致，原子提交）
         // Filer 端原子处理：删除旧目标（如有）+ 移动/重命名条目。
         // 空目录检查由 Filer 在 Raft 提交时完成，返回 ENOTEMPTY 错误。
-        // shard_id = olddir（源目录的 shard）
+        // shard_id = calculate_shard_id(olddir)（源目录的 shard）
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(olddir);
         let old_owned = old_str.to_string();
         let new_owned = new_str.to_string();
         let _attr = self
             .client
             .block_on(async move {
                 meta_client
-                    .rename(olddir, &old_owned, newdir, &new_owned, olddir)
+                    .rename(olddir, &old_owned, newdir, &new_owned, shard_id)
                     .await
             })
             .map_err(|e| {
@@ -4651,8 +4807,37 @@ impl FileSystem for PowerFsFs {
             );
             return Ok(());
         }
+        // Flat/Stripe: flush 数据到 Volume Server, 然后 sync 元数据到 Filer.
+        // fsync 必须保证元数据持久化, 否则 FUSE RELEASE (异步) 可能晚于
+        // 进程退出/重启, 导致元数据丢失 (P2-2 修复).
         match self.flush_dirty_chunks(inode, None) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 数据已持久化到 Volume Server, 现在 sync 元数据到 Filer (Raft).
+                // 仅当有 dirty chunks 被 flush 时才需要 sync.
+                if !self.has_dirty_for_inode(inode) {
+                    match self.sync_size_chunks_on_close(inode) {
+                        Ok(()) => {
+                            debug!("fsync: inode={} data + metadata synced", inode);
+                            self.chunk_cache.clear_dirty(inode);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!(
+                                "fsync: sync_size_chunks_on_close failed for inode={}: {}",
+                                inode, e
+                            );
+                            Err(e)
+                        }
+                    }
+                } else {
+                    // 仍有 dirty chunks (flush 未完全成功), 不 sync 元数据
+                    debug!(
+                        "fsync: inode={} still has dirty chunks after flush, skipping metadata sync",
+                        inode
+                    );
+                    Ok(())
+                }
+            }
             Err(e) => {
                 error!(
                     "fsync: flush_dirty_chunks failed for inode={}: {} (raw_os_error={:?})",

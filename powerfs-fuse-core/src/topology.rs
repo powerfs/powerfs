@@ -77,6 +77,15 @@ pub struct ClusterTopology {
     pub version: u64,
     /// 更新时间
     pub updated_at: Option<Instant>,
+    /// Master 下发的全局 shard_count（每个 healthy filer 一致同意的值）。
+    ///
+    /// 这是 `calculate_shard_id(inode)` 的模数来源，**不应**回退到 `shards.len()`：
+    ///   - `shards.len()` 只反映"已知 leader 的分片"，启动期可能为 0；
+    ///   - `shard_count` 是 filer 集群实际切分的分片总数（例如 3）。
+    ///
+    /// 当 `shard_count == 0` 表示 master 未下发该字段（旧 master 或尚未有 filer
+    /// 注册）；此时调用方应使用配置中的 filer 列表 + `--force` 兜底，或拒绝挂载。
+    pub shard_count: usize,
 }
 
 impl ClusterTopology {
@@ -86,6 +95,7 @@ impl ClusterTopology {
             volumes: HashMap::new(),
             version: 0,
             updated_at: None,
+            shard_count: 0,
         }
     }
 
@@ -97,8 +107,16 @@ impl ClusterTopology {
         self.volumes.get(&volume_id)
     }
 
+    /// 返回集群的 shard 总数。
+    ///
+    /// 优先使用 master 下发的 `shard_count`（即使 `shards` map 尚未填充）；
+    /// 仅在 `shard_count == 0` 时回退到 `shards.len()`，保留对老拓扑路径的兼容。
     pub fn shard_count(&self) -> usize {
-        self.shards.len()
+        if self.shard_count > 0 {
+            self.shard_count
+        } else {
+            self.shards.len()
+        }
     }
 
     pub fn volume_count(&self) -> usize {
@@ -175,6 +193,19 @@ impl ClusterTopologyManager {
     pub fn get_shard_leader(&self, shard_id: u64) -> Option<String> {
         let topology = self.topology.read().unwrap();
         topology.get_shard_leader(shard_id).map(|s| s.to_string())
+    }
+
+    /// 轻量级获取 `shard_count`（仅读一个 usize，避免 clone 整个 ClusterTopology）。
+    ///
+    /// 优先返回 master 下发的 `shard_count`；为 0 时回退到 `shards.len()`，
+    /// 与 `ClusterTopology::shard_count()` 保持一致语义。
+    pub fn shard_count(&self) -> usize {
+        let topology = self.topology.read().unwrap();
+        if topology.shard_count > 0 {
+            topology.shard_count
+        } else {
+            topology.shards.len()
+        }
     }
 
     /// 获取特定 Volume 信息
@@ -417,10 +448,43 @@ impl MasterClient {
                     }
                 }
 
+                // ---- Build shard router from the master-advertised filer list ----
+                //
+                // Each filer reports the shard IDs it participates in. We don't
+                // know which filer is the *leader* of a shard from this response
+                // alone (the master tracks filer health, not per-shard Raft
+                // leadership). For routing purposes we record the first healthy
+                // filer of each shard as the default target — the FUSE client
+                // transparently follows any `STATUS_ERR_REDIRECT` from the filer
+                // to reach the actual leader, so a non-leader initial guess is
+                // still correct in steady state (one extra round-trip on first
+                // contact, then cached by `meta_shard_client`).
+                topology.shard_count = topo.total_shards as usize;
+                for filer in &topo.filers {
+                    if !filer.is_healthy || filer.address.is_empty() {
+                        continue;
+                    }
+                    for sid in &filer.shard_ids {
+                        topology
+                            .shards
+                            .entry(*sid)
+                            .or_insert_with(|| ShardInfo::new(*sid, filer.address.clone()));
+                    }
+                    log::info!(
+                        "fetch_topology: filer addr={}, healthy={}, shards={:?}",
+                        filer.address,
+                        filer.is_healthy,
+                        filer.shard_ids
+                    );
+                }
+
                 log::info!(
-                    "fetch_topology: leader={}, parsed {} volumes from master",
+                    "fetch_topology: leader={}, parsed {} volumes, {} filer routes, {} shard entries, shard_count={}",
                     topo.leader,
-                    topology.volumes.len()
+                    topology.volumes.len(),
+                    topo.filers.len(),
+                    topology.shards.len(),
+                    topology.shard_count,
                 );
 
                 Ok(topology)

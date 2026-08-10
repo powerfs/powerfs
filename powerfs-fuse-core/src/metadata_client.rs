@@ -138,6 +138,7 @@ pub trait MetadataClient: Send + Sync {
     /// create：创建普通文件
     /// fid_info: Optional (volume_id, cookie, file_key) to persist chunk mapping
     /// at create time, preventing "has no fid" errors on cache miss + reopen.
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         parent_ino: u64,

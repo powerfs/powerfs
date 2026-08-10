@@ -61,6 +61,61 @@ pub const INLINE_XATTR_KEY: &str = "powerfs.inline";
 /// 值格式: `flat` | `stripe:<count>:<size>` | `wide_stripe:<count>:<size>`
 pub const PLACEMENT_XATTR_KEY: &str = "powerfs.placement";
 
+/// K3: 从 chunks 列表推断 Placement (用于 GETATTR/LOOKUP 响应编码).
+///
+/// InodeInfo 不持久化 placement 字段 (CREATE 时由父目录 xattr 决定,
+/// 但不存入文件自身元数据). GETATTR 时需从 chunks 结构反推:
+///
+/// - **Flat**: 所有 chunk 同一 volume_id (单卷模型, chunk_size=1MB)
+/// - **Stripe**: chunks 跨多个 volume_id (anti-affinity 分配,
+///   每个 stripe unit 一个 chunk, stripe_size 从 offset 差值推断)
+///
+/// 边界情况:
+/// - 0 chunks: Flat (新创建未写入的文件)
+/// - 1 chunk: Flat (单 chunk 无法判断是否 Stripe)
+/// - 所有 chunk 同 volume: Flat (即使 offset 间隔大, 也按 Flat 处理)
+///
+/// stripe_size 推断: chunks[1].offset - chunks[0].offset.
+/// 若 chunks 未排序或 offset 不均匀, 兜底用 1MB (POWERFS_CHUNK_SIZE).
+fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
+    // K3-DBG: log chunks for stripe detection diagnosis
+    let vid_list: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+    let off_list: Vec<u64> = chunks.iter().map(|c| c.offset).collect();
+    info!(
+        "K3-DBG detect_placement: chunks={} volume_ids={:?} offsets={:?}",
+        chunks.len(), vid_list, off_list
+    );
+
+    if chunks.len() < 2 {
+        return Placement::Flat;
+    }
+
+    // 检查是否跨多个 volume (Stripe 的必要条件)
+    let first_vid = chunks[0].volume_id;
+    let multi_volume = chunks.iter().any(|c| c.volume_id != first_vid);
+    if !multi_volume {
+        return Placement::Flat;
+    }
+
+    // Stripe: 推断 stripe_size 从前两个 chunk 的 offset 差值
+    let stripe_size = if chunks.len() >= 2 && chunks[0].offset < chunks[1].offset {
+        chunks[1].offset - chunks[0].offset
+    } else {
+        // 兜底: 1MB (对齐 POWERFS_CHUNK_SIZE)
+        1 * 1024 * 1024
+    };
+
+    // 收集 volume_ids (按 chunk 顺序, 每个 chunk 代表一个 stripe unit)
+    let volume_ids: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+
+    Placement::Stripe {
+        stripe_size,
+        stripe_count: volume_ids.len() as u32,
+        start_volume_idx: 0,
+        volume_ids,
+    }
+}
+
 impl FilerNetHandler {
     pub fn new(
         meta_shard_manager: Arc<MetaShardManager>,
@@ -184,9 +239,11 @@ impl FilerNetHandler {
     }
 
     /// P3: 为 Stripe 文件分配多个 (volume_id, needle_id) 对.
-    /// anti-affinity: 尽量让每个 chunk 落在不同 volume, 实现跨磁盘并行 I/O.
-    /// 若可用 volume 数 >= count, 每个 chunk 落不同 volume.
-    /// 若可用 volume 数 < count, round-robin 复用 volume.
+    /// 节点级 anti-affinity: 尽量让每个 chunk 落在不同物理节点, 实现跨节点容错.
+    /// 算法: 按 node_id 分组, round-robin 跨节点选取 volume.
+    ///   - 节点数 >= count: 每个 shard 落不同节点 (完美反亲和, 停 1 节点最多丢 1 shard)
+    ///   - 节点数 < count: 先每节点取 1 个, 剩余按节点 round-robin 补充
+    ///
     /// 返回 Vec<(volume_id, needle_id)>, 长度 == count. 若无可用 volume, 返回 None.
     pub fn alloc_for_stripe_file(&self, count: u32) -> Option<Vec<(u64, u64)>> {
         let zones = self.zones.read().unwrap();
@@ -195,11 +252,21 @@ impl FilerNetHandler {
             return None;
         }
 
-        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, zone_idx) 用于后续分配
-        let mut all_volumes: Vec<(u64, usize)> = Vec::new();
+        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, node_id, zone_idx)
+        #[derive(Clone)]
+        struct VolEntry {
+            volume_id: u64,
+            node_id: String,
+            zone_idx: usize,
+        }
+        let mut all_volumes: Vec<VolEntry> = Vec::new();
         for (zidx, zone) in zones.iter().enumerate() {
             for vol in &zone.volumes {
-                all_volumes.push((vol.volume_id, zidx));
+                all_volumes.push(VolEntry {
+                    volume_id: vol.volume_id,
+                    node_id: vol.node_id.clone(),
+                    zone_idx: zidx,
+                });
             }
         }
         if all_volumes.is_empty() {
@@ -207,23 +274,66 @@ impl FilerNetHandler {
             return None;
         }
 
-        let num_volumes = all_volumes.len();
-        let mut result = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            // round-robin 选 volume, 实现 anti-affinity
-            let (volume_id, zidx) = all_volumes[i % num_volumes];
-            let zone = &zones[zidx];
-            let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
-            result.push((volume_id, needle_id));
+        let count = count as usize;
+
+        // 按 node_id 分组，组内保持原始顺序（zone 遍历顺序）
+        use std::collections::HashMap;
+        let mut node_groups: Vec<(String, Vec<VolEntry>)> = Vec::new();
+        let mut node_map: HashMap<String, usize> = HashMap::new();
+        for vol in &all_volumes {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                node_map.entry(vol.node_id.clone())
+            {
+                e.insert(node_groups.len());
+                node_groups.push((vol.node_id.clone(), Vec::new()));
+            }
+            let idx = node_map[&vol.node_id];
+            node_groups[idx].1.push(vol.clone());
+        }
+
+        let num_nodes = node_groups.len();
+        let total_volumes = all_volumes.len();
+
+        // Round-robin 跨节点选取 volume，保证 shard 尽量落不同节点
+        let mut result = Vec::with_capacity(count);
+        loop {
+            let mut picked = false;
+            for (_, group) in node_groups.iter_mut() {
+                if result.len() >= count {
+                    break;
+                }
+                if let Some(vol) = group.first().cloned() {
+                    let zone = &zones[vol.zone_idx];
+                    let needle_id =
+                        crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                    result.push((vol.volume_id, needle_id));
+                    group.remove(0);
+                    picked = true;
+                }
+            }
+            if !picked || result.len() >= count {
+                break;
+            }
         }
 
         let unique_volumes: std::collections::HashSet<u64> =
             result.iter().map(|(v, _)| *v).collect();
+        let unique_nodes: std::collections::HashSet<&str> = result
+            .iter()
+            .filter_map(|(vid, _)| {
+                all_volumes
+                    .iter()
+                    .find(|v| v.volume_id == *vid)
+                    .map(|v| v.node_id.as_str())
+            })
+            .collect();
         info!(
-            "FILER_P3: allocated {} stripe chunks across {} unique volumes ({} total available)",
+            "FILER_P3: allocated {} stripe chunks across {} unique volumes / {} unique nodes ({} vols / {} nodes available)",
             result.len(),
             unique_volumes.len(),
-            num_volumes
+            unique_nodes.len(),
+            total_volumes,
+            num_nodes
         );
         Some(result)
     }
@@ -444,7 +554,7 @@ impl FilerNetHandler {
             uid: info.uid,
             gid: info.gid,
             size: info.size,
-            nlink: if is_dir { 2 } else { 1 },
+            nlink: info.nlink,
             mtime: info.mtime,
             atime: info.atime,
             ctime: info.ctime,
@@ -471,6 +581,24 @@ impl FilerNetHandler {
     /// - **Flat 模式** (info.inline_data = None): Placement::Flat + ChunkEncoding::PerChunk
     ///   常规文件, 完整 chunk 列表, 客户端按 chunk 直连 Volume Server 读写.
     fn encode_chunks_fields(enc: &mut TlvEncoder, info: &InodeInfo) -> Result<(), NetError> {
+        // Symlink: target stored in symlink_target field, encode as inline_data
+        // so the client can read it via InlineData layout. Without this,
+        // remount/lookup returns empty target (inline_data=None, chunks=[]).
+        if let Some(target) = &info.symlink_target {
+            let data = target.as_bytes().to_vec();
+            let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size },
+                reliability: info.reliability.clone(),
+                reliability_state: info.reliability_state.clone(),
+                compression: info.compression_state.clone(),
+                encoding: ChunkEncoding::InlineData { data },
+            };
+            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+            return Ok(());
+        }
+
         // P2.5: Inline 模式 — 数据直接存 Filer 元数据, 响应携带 inline_data
         if let Some(data) = &info.inline_data {
             let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
@@ -486,7 +614,25 @@ impl FilerNetHandler {
             return Ok(());
         }
 
-        // Flat 模式 — chunk 列表
+        // Empty file (no inline_data, no chunks): default to Inline mode.
+        // Without this, detect_placement_from_chunks([]) returns Flat, causing
+        // the kernel client to set placement=FLAT. write_end then skips the
+        // Inline path, writeback fails with -EINVAL (no volume_id/file_key),
+        // and close skips chunk sync. Result: data lost on remount.
+        if info.chunks.is_empty() {
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size: INLINE_HARD_LIMIT },
+                reliability: info.reliability.clone(),
+                reliability_state: info.reliability_state.clone(),
+                compression: info.compression_state.clone(),
+                encoding: ChunkEncoding::InlineData { data: Vec::new() },
+            };
+            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+            return Ok(());
+        }
+
+        // Flat / Stripe 模式 — chunk 列表
         let chunks: Vec<ChunkRef> = info
             .chunks
             .iter()
@@ -500,16 +646,31 @@ impl FilerNetHandler {
             })
             .collect();
 
+        // K3: 检测 Stripe 模式 — chunks 跨多个 volume (anti-affinity 分配).
+        // Flat: 所有 chunk 同一 volume_id; Stripe: 每个 stripe unit 不同 volume_id.
+        // stripe_size 从 chunk offset 差值推断 (chunks[1].offset - chunks[0].offset).
+        let placement = detect_placement_from_chunks(&chunks);
+
         let layout = FileLayout {
-            placement: Placement::Flat,
+            placement: placement.clone(),
             reliability: info.reliability.clone(),
             reliability_state: info.reliability_state.clone(),
             compression: info.compression_state.clone(),
-            encoding: ChunkEncoding::PerChunk { chunks },
+            encoding: ChunkEncoding::PerChunk { chunks: chunks.clone() },
         };
 
         encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
             .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+        // 兼容字段: 直接添加 VolumeId (0x92) + FileKey (0x94), 与 CREATE 响应一致.
+        // 内核 powerfs_net_lookup/getattr 用 find_u64(0x92/0x94) 解析.
+        // Flat: 从第一个 chunk 提取 (单卷模型).
+        // Stripe: 内核 K3 通过 volume_ids[] 数组定位, VolumeId/FileKey 仅作为
+        //         base needle_id 的兜底 (file_key = chunks[0].needle_id).
+        if let Some(first) = chunks.first() {
+            enc.add_u64(FieldId::VolumeId, first.volume_id);
+            enc.add_u64(FieldId::FileKey, first.needle_id);
+        }
 
         // P4: 副本 chunk 列表 — 编码到 FieldId::ReplicaChunks,
         // 客户端读路径 failover 使用 (主 volume 不可用时从副本 volume 读取).
@@ -604,7 +765,19 @@ impl FilerNetHandler {
 
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
-            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+            None => {
+                // 调试: LOOKUP 失败时打印 directory_entries 中的 key 用于对比
+                let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+                let entries = self.meta_shard_manager.list_directory(parent_ino);
+                let entry_names: Vec<String> = entries.iter()
+                    .map(|e| format!("'{}'(len={})", e.name, e.name.len()))
+                    .collect();
+                warn!(
+                    "FILER_NET_LOOKUP: NOT FOUND parent_ino={}, name='{}'(len={}), shard={}, dir_entries=[{}]",
+                    parent_ino, name, name.len(), shard_id.0, entry_names.join(", ")
+                );
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
         }
     }
 
@@ -615,7 +788,7 @@ impl FilerNetHandler {
 
         info!("FILER_NET_GETATTR: ino={}", ino);
 
-        // Check leadership for the correct shard before reading
+        // inode-level read → route by calculate_shard(inode)
         let shard_id = self.shard_strategy.calculate_shard(ino);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
@@ -665,7 +838,7 @@ impl FilerNetHandler {
         // while-loop parsing. Previously used fixed-order next_u64 which
         // desynced the decoder (encoder uses add_u32 for Mode/Uid/Gid, and
         // optional fields may be absent).
-        let (ino, mode, uid, gid, size) = match decode_setattr_req(&msg.body) {
+        let (ino, mode, uid, gid, size, mtime, atime) = match decode_setattr_req(&msg.body) {
             Ok(v) => v,
             Err(e) => {
                 warn!("FILER_NET_SETATTR: decode failed: {}", e);
@@ -681,8 +854,8 @@ impl FilerNetHandler {
         let gid = gid.map(|g| g as u64);
 
         info!(
-            "FILER_NET_SETATTR: ino={}, size={:?}, mode={:?}, uid={:?}, gid={:?}",
-            ino, size, mode, uid, gid
+            "FILER_NET_SETATTR: ino={}, size={:?}, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, atime={:?}",
+            ino, size, mode, uid, gid, mtime, atime
         );
 
         let shard_id = self.shard_strategy.calculate_shard(ino);
@@ -692,7 +865,7 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .setattr(ino, shard_id, size, mode, uid, gid)
+            .setattr(ino, shard_id, size, mode, uid, gid, mtime, atime)
             .await
         {
             Ok(_) => {
@@ -937,10 +1110,15 @@ impl FilerNetHandler {
             .await
         {
             Ok(ino) => {
-                // Apply mode/uid/gid via setattr
+                // Apply mode/uid/gid via setattr. Route by inode's own shard:
+                // after the split create, the inode record lives on
+                // calculate_shard(ino), not on parent's shard. Using the
+                // outer `shard_id` (parent's) here would route to the wrong
+                // shard and the apply would never see the inode.
+                let setattr_shard = self.shard_strategy.calculate_shard(ino);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(ino, shard_id, None, Some(mode), Some(uid), Some(gid))
+                    .setattr(ino, setattr_shard, None, Some(mode), Some(uid), Some(gid), None, None)
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
@@ -1023,9 +1201,12 @@ impl FilerNetHandler {
                     // size=0: 初始无数据, 后续 write 时更新
                     let (volume_id, needle_id) = flat_alloc.unwrap();
                     let fid_str = format!("{},0,{}", volume_id, needle_id);
+                    // Route by inode's own shard: set_chunks mutates the inode
+                    // record on calculate_shard(ino), not the parent's shard.
+                    let setchunks_shard = self.shard_strategy.calculate_shard(ino);
                     if let Err(e) = self
                         .meta_shard_manager
-                        .set_chunks(ino, shard_id, fid_str, volume_id, 0, 0, 0)
+                        .set_chunks(ino, setchunks_shard, fid_str, volume_id, 0, 0, 0)
                         .await
                     {
                         warn!(
@@ -1096,7 +1277,7 @@ impl FilerNetHandler {
                 let shard_id = self.shard_strategy.calculate_shard(info.inode);
                 let _ = self
                     .meta_shard_manager
-                    .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid))
+                    .setattr(info.inode, shard_id, None, Some(mode), Some(uid), Some(gid), None, None)
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）
@@ -1203,10 +1384,14 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_RMDIR failed: {}", e);
+                // Encode the error string in the body (FieldId::Name) so the
+                // FUSE client can map "not empty" -> libc::ENOTEMPTY.
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &e);
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
+                    enc.into_bytes(),
                 ))
             }
         }
@@ -1290,20 +1475,25 @@ impl FilerNetHandler {
                 .join(",")
         );
 
-        // Filter by last_name for pagination
+        // Sort entries by name before pagination. list_directory() returns
+        // entries in HashMap iteration order (non-deterministic). Without
+        // sorting, the last_name cursor (string comparison) can permanently
+        // skip entries that are alphabetically before the cursor, causing
+        // readdir to miss files after remount (T3b/T3c/T9a/T9b failures).
+        let mut sorted_entries = entries;
+        sorted_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Filter by last_name for pagination (string comparison on sorted names)
         let filtered: Vec<&InodeInfo> = if last_name.is_empty() {
-            entries.iter().collect()
+            sorted_entries.iter().collect()
         } else {
-            entries
+            sorted_entries
                 .iter()
                 .filter(|e| e.name.as_str() > last_name.as_str())
                 .collect()
         };
 
         // has_more is true only when there are entries beyond the `limit` window.
-        // Previous logic `(limited.len() < limit) && !entries.is_empty()` was always
-        // true for non-empty dirs (since limited.len() <= limit always), causing the
-        // kernel to loop forever sending READDIR with the same last_name cursor.
         let has_more = filtered.len() > limit as usize;
         let limited: Vec<&InodeInfo> = filtered.into_iter().take(limit as usize).collect();
 
@@ -1316,13 +1506,13 @@ impl FilerNetHandler {
             entry_enc.add_u64(FieldId::Ino, entry.inode);
             entry_enc.add_string(FieldId::Name, &entry.name)?;
             entry_enc.add_u32(FieldId::Mode, entry.mode);
-            entry_enc.add_u64(FieldId::Uid, entry.uid as u64);
-            entry_enc.add_u64(FieldId::Gid, entry.gid as u64);
+            entry_enc.add_u32(FieldId::Uid, entry.uid);
+            entry_enc.add_u32(FieldId::Gid, entry.gid);
             entry_enc.add_u64(FieldId::Size, entry.size);
             entry_enc.add_u64(FieldId::Atime, entry.atime);
             entry_enc.add_u64(FieldId::Mtime, entry.mtime);
             entry_enc.add_u64(FieldId::Ctime, entry.ctime);
-            entry_enc.add_u64(FieldId::Nlink, entry.nlink as u64);
+            entry_enc.add_u32(FieldId::Nlink, entry.nlink);
             // 完整 chunks 列表 + 兼容旧单 chunk 字段
             Self::encode_chunks_fields(&mut entry_enc, entry)?;
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
@@ -1568,11 +1758,10 @@ impl FilerNetHandler {
             shard_id_raw, inode, size, chunks.len(), inline_data.as_ref().map(|d| d.len()).unwrap_or(0), client_id
         );
 
-        // fuse 端传 dir_ino 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // Inode-level write: route by calculate_shard(inode). Inode records
+        // are now stored on their own hash-derived shard (independent of the
+        // parent dir entry's shard), so this is the authoritative location.
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         info!(
             "FILER_NET_UPDATE_SIZE_CHUNKS: calculated shard_id={}, is_leader_check",
             shard_id.0
@@ -1620,14 +1809,11 @@ impl FilerNetHandler {
     ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_inc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
-        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level state → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1657,14 +1843,11 @@ impl FilerNetHandler {
     ///           Response = OpenCount (成功) / Name=error (失败)
     async fn handle_open_count_dec(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
-        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level state → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1702,18 +1885,16 @@ impl FilerNetHandler {
     ///           Response = VolumeId + FileKey(needle_id) / Name=error
     async fn handle_migrate_inline_alloc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id={}, inode={}",
-            shard_id_raw, inode
+            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}",
+            _shard_id_raw, inode
         );
 
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // inode-level write → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1775,12 +1956,13 @@ impl FilerNetHandler {
     /// Response: status only (STATUS_OK or STATUS_ERR_*)
     async fn handle_setxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
         let value = dec.next_bytes(FieldId::XattrValue).unwrap_or_default();
 
-        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        // inode-level write → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1819,11 +2001,12 @@ impl FilerNetHandler {
     /// Response TLV: XattrValue (bytes) or STATUS_ERR_NOT_FOUND
     async fn handle_getxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
 
-        let shard_id = self.shard_strategy.calculate_shard(shard_id_raw);
+        // inode-level read → route by calculate_shard(inode)
+        let shard_id = self.shard_strategy.calculate_shard(inode);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -1832,7 +2015,17 @@ impl FilerNetHandler {
             Some(info) => match info.extended.get(&key) {
                 Some(val) => {
                     let mut enc = TlvEncoder::new();
-                    enc.add_bytes(FieldId::XattrValue, val);
+                    if let Err(e) = enc.add_bytes(FieldId::XattrValue, val) {
+                        warn!(
+                            "FILER_NET_GETXATTR: encode error for inode {}: {}",
+                            inode, e
+                        );
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                        ));
+                    }
                     Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
                 }
                 None => {

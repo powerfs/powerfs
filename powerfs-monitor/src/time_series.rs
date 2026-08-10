@@ -396,4 +396,76 @@ impl TimeSeriesStore {
         let store = self.disk_usage.read().await;
         store.keys().cloned().collect()
     }
+
+    /// Per-node disk usage series (used for the cluster multi-line chart in
+    /// Capacity Planning). Returns one entry per tracked node, with the
+    /// node_id and its filtered points.
+    pub async fn get_per_node_disk_usage(&self, minutes: i64) -> Vec<(String, Vec<DataPoint>)> {
+        let store = self.disk_usage.read().await;
+        let now = chrono::Utc::now().timestamp();
+        let start = now - minutes * 60;
+        let mut out: Vec<(String, Vec<DataPoint>)> = store
+            .iter()
+            .map(|(nid, series)| (nid.clone(), series.range(start, now)))
+            .filter(|(_, pts)| !pts.is_empty())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Cluster-wide disk usage trend: average of per-node disk_usage series,
+    /// sampled at the timestamps present in any node's series. Each output
+    /// point averages the values of all nodes whose series has a point at
+    /// that timestamp (or the latest prior point — simple forward-fill).
+    pub async fn get_cluster_disk_usage_history(&self, minutes: i64) -> Vec<DataPoint> {
+        let store = self.disk_usage.read().await;
+        let now = chrono::Utc::now().timestamp();
+        let start = now - minutes * 60;
+
+        // Collect per-node filtered points (within range).
+        let mut per_node: Vec<Vec<DataPoint>> = Vec::new();
+        let mut all_ts: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for series in store.values() {
+            let pts: Vec<DataPoint> = series.range(start, now);
+            for p in &pts {
+                all_ts.insert(p.timestamp);
+            }
+            if !pts.is_empty() {
+                per_node.push(pts);
+            }
+        }
+        drop(store);
+
+        if per_node.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::with_capacity(all_ts.len());
+        for ts in all_ts {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for node_pts in &per_node {
+                // Forward-fill: pick the latest point with timestamp <= ts.
+                let mut picked: Option<f64> = None;
+                for p in node_pts {
+                    if p.timestamp <= ts {
+                        picked = Some(p.value);
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(v) = picked {
+                    sum += v;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                result.push(DataPoint {
+                    timestamp: ts,
+                    value: sum / count as f64,
+                });
+            }
+        }
+        result
+    }
 }

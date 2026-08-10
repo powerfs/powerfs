@@ -507,7 +507,7 @@ phase_fio_regression() {
     test_start "Phase 8: fio 性能回归 (正常读 vs 降级读)"
 
     # 检查/安装 fio
-    if ! docker exec "$FUSE_CONTAINER" command -v fio >/dev/null 2>&1; then
+    if ! docker exec "$FUSE_CONTAINER" which fio >/dev/null 2>&1; then
         log_info "安装 fio..."
         if ! docker exec "$FUSE_CONTAINER" bash -c "apt-get update -qq && apt-get install -y -qq fio" >/dev/null 2>&1; then
             log_warn "fio 安装失败, 跳过性能回归"
