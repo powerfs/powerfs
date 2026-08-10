@@ -42,6 +42,7 @@ powerfs-common = { path = "../powerfs-common" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
+powerfs-allocator = { path = "../powerfs-allocator" }
 tokio = { workspace = true }
 crossbeam = { workspace = true }
 raft = { workspace = true }

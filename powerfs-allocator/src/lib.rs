@@ -26,6 +26,7 @@ pub mod management;
 pub mod shard_map;
 pub mod snapshot;
 pub mod status;
+pub mod volume_assigner;
 
 // Re-export key types for convenience.
 pub use allocator::{
@@ -49,4 +50,8 @@ pub use snapshot::{
 pub use status::{
     AllocationStats, ClusterOverview, MigrationState, MigrationTaskStatus, MigrationType,
     NodeLoadReport, StatusQuery, VolumeDetail,
+};
+pub use volume_assigner::{
+    AssignContext, AssignerType, ConsistentHashAssigner, RoundRobinAssigner, SmartVolumeAssigner,
+    VolumeAssigner,
 };
