@@ -1783,6 +1783,29 @@ impl MasterService for MasterGrpcServer {
             })),
         }
     }
+
+    async fn set_node_maintenance(
+        &self,
+        request: Request<SetNodeMaintenanceRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.set_node_maintenance(&req.node_id, req.enabled) {
+                Ok(()) => Ok(Response::new(MigrationControlResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(MigrationControlResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
 }
 
 // ========================================================================
