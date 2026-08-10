@@ -30,6 +30,9 @@ service VolumeService {
 
     // Trigger volume compaction (reclaim space from deleted needles)
     rpc CompactVolume(CompactVolumeRequest) returns (CompactVolumeResponse);
+
+    // List needles on a volume (for cold-data migration enumeration)
+    rpc ListNeedles(ListNeedlesRequest) returns (ListNeedlesResponse);
 }
 
 message CreateVolumeRequest {
@@ -303,4 +306,24 @@ message CompactVolumeResponse {
     uint64 reclaimed_bytes = 2;
     uint64 moved_needles = 3;
     string error = 4;
+}
+
+// ===== Needle enumeration (for migration) =====
+
+message ListNeedlesRequest {
+    uint64 volume_id = 1;
+    uint32 limit = 2;   // 0 = no limit
+}
+
+message NeedleEntry {
+    uint64 needle_id = 1;
+    uint64 size = 2;
+    uint64 offset = 3;
+    int64 created_at = 4;  // unix timestamp
+}
+
+message ListNeedlesResponse {
+    bool success = 1;
+    repeated NeedleEntry needles = 2;
+    string error = 3;
 }

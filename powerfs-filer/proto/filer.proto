@@ -33,6 +33,9 @@ service FilerMetaService {
     rpc DrainShard(DrainShardRequest) returns (ShardControlResponse);
     rpc RemoveShard(RemoveShardRequest) returns (ShardControlResponse);
 
+    // Migration support: find inodes by volume (for needle→inode reverse lookup)
+    rpc FindInodesByVolume(FindInodesByVolumeRequest) returns (FindInodesByVolumeResponse);
+
     // Inode 批量授权（fuse 本地分配，Phase 3 写解耦用，§4 1.4）
     rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
 
@@ -71,6 +74,9 @@ service PosixMetaService {
     rpc AddShard(AddShardRequest) returns (AddShardResponse);
     rpc DrainShard(DrainShardRequest) returns (ShardControlResponse);
     rpc RemoveShard(RemoveShardRequest) returns (ShardControlResponse);
+
+    // Migration support: find inodes by volume
+    rpc FindInodesByVolume(FindInodesByVolumeRequest) returns (FindInodesByVolumeResponse);
 
     // Inode 批量授权
     rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
@@ -231,6 +237,28 @@ message RemoveShardRequest {
 
 message ShardControlResponse {
     bool success = 1;
+    string error = 2;
+}
+
+// ===== Migration support: needle→inode reverse lookup =====
+
+message FindInodesByVolumeRequest {
+    uint64 volume_id = 1;
+    repeated uint64 needle_ids = 2;  // empty = all needles on this volume
+}
+
+message InodeChunkEntry {
+    uint64 inode = 1;
+    uint64 shard_id = 2;
+    uint64 needle_id = 3;
+    uint64 volume_id = 4;
+    uint64 offset = 5;     // offset within the file
+    uint64 size = 6;       // chunk size
+    uint64 file_size = 7;  // total file size (for UpdateInodeSizeChunks)
+}
+
+message FindInodesByVolumeResponse {
+    repeated InodeChunkEntry entries = 1;
     string error = 2;
 }
 

@@ -10,11 +10,12 @@ use super::powerfs::filer_meta_service_server::FilerMetaService;
 use super::powerfs::{
     AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
     CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest, DeleteEntryResponse,
-    DrainShardRequest, Entry as ProtoEntry, FileChunk as ProtoFileChunk, FuseAttributes,
-    GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse,
-    GetShardStatsRequest, GetShardStatsResponse, LeaseReleaseRequest, LeaseReleaseResponse,
-    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest,
-    ListEntriesResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
+    DrainShardRequest, Entry as ProtoEntry, FileChunk as ProtoFileChunk, FindInodesByVolumeRequest,
+    FindInodesByVolumeResponse, FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse,
+    GetEntryRequest, GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse,
+    InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest,
+    LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse,
+    ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
     LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
     PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RemoveShardRequest,
     RenameEntryRequest, RenameEntryResponse, ShardControlResponse, UpdateEntryRequest,
@@ -869,6 +870,34 @@ impl FilerMetaService for FilerMetaServiceImpl {
                 error: e,
             })),
         }
+    }
+
+    async fn find_inodes_by_volume(
+        &self,
+        request: Request<FindInodesByVolumeRequest>,
+    ) -> Result<Response<FindInodesByVolumeResponse>, Status> {
+        let req = request.into_inner();
+        let entries = self
+            .meta_shard_manager
+            .find_inodes_by_volume(req.volume_id, &req.needle_ids);
+        let proto_entries: Vec<InodeChunkEntry> = entries
+            .into_iter()
+            .map(
+                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| InodeChunkEntry {
+                    inode,
+                    shard_id,
+                    needle_id,
+                    volume_id,
+                    offset,
+                    size,
+                    file_size,
+                },
+            )
+            .collect();
+        Ok(Response::new(FindInodesByVolumeResponse {
+            entries: proto_entries,
+            error: String::new(),
+        }))
     }
 }
 
