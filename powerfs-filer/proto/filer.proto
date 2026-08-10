@@ -28,6 +28,11 @@ service FilerMetaService {
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
 
+    // Shard scaling (called by master ManagementApi)
+    rpc AddShard(AddShardRequest) returns (AddShardResponse);
+    rpc DrainShard(DrainShardRequest) returns (ShardControlResponse);
+    rpc RemoveShard(RemoveShardRequest) returns (ShardControlResponse);
+
     // Inode 批量授权（fuse 本地分配，Phase 3 写解耦用，§4 1.4）
     rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
 
@@ -46,21 +51,26 @@ service PosixMetaService {
     rpc RenameEntry(RenameEntryRequest) returns (RenameEntryResponse);
     rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
     rpc LookupDirectoryEntry(LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse);
-    
+
     // Delta sync API
     rpc PushDelta(PushDeltaRequest) returns (PushDeltaResponse);
     rpc PullDelta(PullDeltaRequest) returns (PullDeltaResponse);
-    
+
     // Lease management
     rpc AcquireLease(LeaseRequest) returns (LeaseResponse);
     rpc ReleaseLease(LeaseReleaseRequest) returns (LeaseReleaseResponse);
     rpc RenewLease(LeaseRenewRequest) returns (LeaseRenewResponse);
-    
+
     // Raft message exchange
     rpc SendRaftMessage(RaftMessageRequest) returns (RaftMessageResponse);
-    
+
     rpc GetShardStats(GetShardStatsRequest) returns (GetShardStatsResponse);
     rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+
+    // Shard scaling (called by master ManagementApi)
+    rpc AddShard(AddShardRequest) returns (AddShardResponse);
+    rpc DrainShard(DrainShardRequest) returns (ShardControlResponse);
+    rpc RemoveShard(RemoveShardRequest) returns (ShardControlResponse);
 
     // Inode 批量授权
     rpc AllocInodeBatch(AllocInodeBatchRequest) returns (AllocInodeBatchResponse);
@@ -190,6 +200,37 @@ message ListShardsRequest {}
 
 message ListShardsResponse {
     repeated uint64 shard_ids = 1;
+    string error = 2;
+}
+
+// ===== Shard scaling messages =====
+
+message AddShardRequest {
+    uint64 split_from = 1;  // 0 = auto-select largest active shard
+    bool dry_run = 2;
+}
+
+message AddShardResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 new_shard_id = 3;
+    uint64 split_from = 4;
+    uint64 split_point = 5;
+    uint64 new_range_start = 6;
+    uint64 new_range_end = 7;
+    uint64 affected_future_allocations = 8;
+}
+
+message DrainShardRequest {
+    uint64 shard_id = 1;
+}
+
+message RemoveShardRequest {
+    uint64 shard_id = 1;
+}
+
+message ShardControlResponse {
+    bool success = 1;
     string error = 2;
 }
 

@@ -193,19 +193,23 @@ pub struct MasterManagementApi {
     master: Arc<MasterNode>,
     engine: Arc<RebalanceEngine>,
     volume_manager: VolumeManager,
+    filer_client: crate::filer_client::FilerManagementClient,
 }
 
 impl MasterManagementApi {
     /// Construct from the master and its rebalance engine. Creates a
-    /// [`MasterVolumeControl`] internally and wraps it in a [`VolumeManager`].
+    /// [`MasterVolumeControl`] internally and wraps it in a [`VolumeManager`],
+    /// and a [`FilerManagementClient`] for shard scaling via filer gRPC.
     pub fn new(master: Arc<MasterNode>, engine: Arc<RebalanceEngine>) -> Self {
         let volume_control: Arc<dyn VolumeControl> =
             Arc::new(MasterVolumeControl::new(Arc::clone(&master)));
         let volume_manager = VolumeManager::new(volume_control);
+        let filer_client = crate::filer_client::FilerManagementClient::new(Arc::clone(&master));
         Self {
             master,
             engine,
             volume_manager,
+            filer_client,
         }
     }
 
@@ -302,18 +306,40 @@ impl ManagementApi for MasterManagementApi {
 
     fn add_shard(
         &self,
-        _split_from: Option<ShardId>,
-        _dry_run: bool,
+        split_from: Option<ShardId>,
+        dry_run: bool,
     ) -> Result<ShardSplitPlan, ManageError> {
-        Err(nyi("shard scaling requires filer connection"))
+        let split_from_id = split_from.map(|s| s.0);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.filer_client
+                    .add_shard(split_from_id, dry_run)
+                    .await
+                    .map_err(ManageError::InvalidState)
+            })
+        })
     }
 
-    fn drain_shard(&self, _shard_id: ShardId) -> Result<(), ManageError> {
-        Err(nyi("shard scaling requires filer connection"))
+    fn drain_shard(&self, shard_id: ShardId) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.filer_client
+                    .drain_shard(shard_id.0)
+                    .await
+                    .map_err(ManageError::InvalidState)
+            })
+        })
     }
 
-    fn remove_shard(&self, _shard_id: ShardId) -> Result<(), ManageError> {
-        Err(nyi("shard scaling requires filer connection"))
+    fn remove_shard(&self, shard_id: ShardId) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.filer_client
+                    .remove_shard(shard_id.0)
+                    .await
+                    .map_err(ManageError::InvalidState)
+            })
+        })
     }
 
     // ===== Volume scaling =====
