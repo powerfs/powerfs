@@ -107,6 +107,12 @@ pub enum RaftCommand {
     UpdateZone {
         zone: powerfs_common::types::ZoneInfo,
     },
+    /// Set node maintenance mode (excluded from allocation + drained).
+    /// Replicated so all master replicas agree on which nodes are in maintenance.
+    SetNodeMaintenance {
+        node_id: String,
+        enabled: bool,
+    },
 }
 
 /// Volume info for Raft serialization (serde-compatible)
