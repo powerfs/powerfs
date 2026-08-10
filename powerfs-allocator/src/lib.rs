@@ -23,7 +23,9 @@ pub mod allocator;
 pub mod config;
 pub mod error;
 pub mod filer_alloc;
+pub mod load_balancer;
 pub mod management;
+pub mod migration_scheduler;
 pub mod shard_manager;
 pub mod shard_map;
 pub mod snapshot;
@@ -41,9 +43,11 @@ pub use config::{
 };
 pub use error::{AllocError, ManageError, ShardError, ShardId};
 pub use filer_alloc::{FilerAllocator, VolumePick, ZoneView};
+pub use load_balancer::LoadBalancer;
 pub use management::{
     ManagementApi, MigrationExecutionResult, MigrationRejection, RebalanceAction, RejectionReason,
 };
+pub use migration_scheduler::{MigrationExecutor, MigrationScheduler, NoopExecutor};
 pub use shard_manager::ShardManager;
 pub use shard_map::{ShardMap, ShardSplitPlan, ShardState};
 pub use snapshot::{
