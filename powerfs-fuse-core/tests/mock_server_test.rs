@@ -318,6 +318,7 @@ async fn test_facade_end_to_end_with_mock_servers() {
         volume_net_port: 19344,
         volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
+        filer_addrs: vec!["127.0.0.1".to_string()],
         filer_port: 19343,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
@@ -327,6 +328,7 @@ async fn test_facade_end_to_end_with_mock_servers() {
         lease_mode: "range".to_string(),
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
+        force_mount: false,
     };
 
     let facade = FuseClientFacade::new(config)
@@ -584,6 +586,7 @@ async fn test_facade_volume_provider_with_mock() {
         volume_net_port: 19444,
         volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
+        filer_addrs: vec!["127.0.0.1".to_string()],
         filer_port: 19443,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
@@ -593,6 +596,7 @@ async fn test_facade_volume_provider_with_mock() {
         lease_mode: "range".to_string(),
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
+        force_mount: false,
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());
@@ -709,6 +713,7 @@ async fn test_facade_metadata_provider_with_mock() {
         volume_net_port: 19544,
         volume_addrs: Vec::new(),
         filer_addr: "127.0.0.1".to_string(),
+        filer_addrs: vec!["127.0.0.1".to_string()],
         filer_port: 19543,
         request_timeout: Duration::from_secs(5),
         client_identity: ClientIdentity::default(),
@@ -718,6 +723,7 @@ async fn test_facade_metadata_provider_with_mock() {
         lease_mode: "range".to_string(),
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
+        force_mount: false,
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());

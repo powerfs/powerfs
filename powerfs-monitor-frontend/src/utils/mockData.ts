@@ -106,7 +106,7 @@ export const mockNodes: NodeInfo[] = [
     uptime: 86400,
     volume_count: 5,
     is_leader: true,
-    raft_role: 'leader',
+    raft_term: 1000,
   },
   {
     id: 'node-1b',
@@ -123,7 +123,7 @@ export const mockNodes: NodeInfo[] = [
     uptime: 82800,
     volume_count: 3,
     is_leader: false,
-    raft_role: 'follower',
+    raft_term: 1000,
   },
   {
     id: 'node-2',
@@ -205,10 +205,10 @@ export const mockKVSessions: KVSessionInfo[] = [
 ]
 
 export const mockAlerts: AlertInfo[] = [
-  { id: 'alert-1', name: '磁盘使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点磁盘使用率达到88.3%', created_at: '2026-07-04T10:30:00Z' },
-  { id: 'alert-2', name: '内存使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点内存使用率达到92.1%', created_at: '2026-07-04T10:25:00Z' },
-  { id: 'alert-3', name: 'CPU使用率过高', severity: 'critical', status: 'firing', source: 'node-3', message: '节点CPU使用率达到89.5%', created_at: '2026-07-04T10:20:00Z' },
-  { id: 'alert-4', name: 'Volume已满', severity: 'info', status: 'resolved', source: 'volume-5', message: 'Volume 5已达到容量上限', created_at: '2026-07-04T09:00:00Z', resolved_at: '2026-07-04T09:30:00Z' },
+  { id: 'alert-1', rule_id: 'rule-2', name: '磁盘使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点磁盘使用率达到88.3%', created_at: '2026-07-04T10:30:00Z' },
+  { id: 'alert-2', rule_id: 'rule-1', name: '内存使用率过高', severity: 'warning', status: 'firing', source: 'node-3', message: '节点内存使用率达到92.1%', created_at: '2026-07-04T10:25:00Z' },
+  { id: 'alert-3', rule_id: 'rule-1', name: 'CPU使用率过高', severity: 'critical', status: 'firing', source: 'node-3', message: '节点CPU使用率达到89.5%', created_at: '2026-07-04T10:20:00Z' },
+  { id: 'alert-4', rule_id: 'rule-node-offline', name: 'Volume已满', severity: 'info', status: 'resolved', source: 'volume-5', message: 'Volume 5已达到容量上限', created_at: '2026-07-04T09:00:00Z', resolved_at: '2026-07-04T09:30:00Z' },
 ]
 
 export const mockAlertRules: AlertRule[] = [
@@ -406,7 +406,6 @@ export const mockFuseMounts: FuseMount[] = [
     mounted_at: '2026-07-17T08:00:00Z',
     pid: 1234,
     host: 'client-1.example.com',
-    client_type: 'linux',
     dirty_chunks: 15,
     dirty_bytes: 125829120,
     last_heartbeat: '2026-07-17T10:30:00Z',
@@ -422,7 +421,6 @@ export const mockFuseMounts: FuseMount[] = [
     mounted_at: '2026-07-17T09:30:00Z',
     pid: 5678,
     host: 'client-2.example.com',
-    client_type: 'linux',
     dirty_chunks: 0,
     dirty_bytes: 0,
     last_heartbeat: '2026-07-17T10:29:00Z',
@@ -438,7 +436,6 @@ export const mockFuseMounts: FuseMount[] = [
     mounted_at: '2026-07-16T14:00:00Z',
     pid: 9012,
     host: 'backup-server.example.com',
-    client_type: 'linux',
     dirty_chunks: 42,
     dirty_bytes: 440401920,
     last_heartbeat: '2026-07-17T10:28:00Z',
@@ -453,7 +450,6 @@ export const mockFuseMounts: FuseMount[] = [
     status: 'error',
     mounted_at: '2026-07-17T07:00:00Z',
     host: 'test-client.example.com',
-    client_type: 'linux',
     dirty_chunks: 0,
     dirty_bytes: 0,
   },

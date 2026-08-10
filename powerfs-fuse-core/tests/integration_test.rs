@@ -45,6 +45,7 @@ fn test_facade_config_custom_values() {
         volume_net_port: 8002,
         volume_addrs: Vec::new(),
         filer_addr: "192.168.1.200".to_string(),
+        filer_addrs: vec!["192.168.1.200".to_string()],
         filer_port: 8001,
         request_timeout: Duration::from_secs(10),
         client_identity: identity,
@@ -54,6 +55,7 @@ fn test_facade_config_custom_values() {
         lease_mode: "range".to_string(),
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
+        force_mount: false,
     };
 
     assert_eq!(config.master_addr, "192.168.1.100");

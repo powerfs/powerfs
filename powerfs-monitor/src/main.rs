@@ -17,7 +17,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 use powerfs_common::config::PowerFsConfig;
@@ -35,7 +35,9 @@ use powerfs_monitor::auth::{
 };
 use powerfs_monitor::event::{AlertInfo, AlertRule, ClusterMetrics, Event, KVMetrics};
 use powerfs_monitor::event_bus::EventBus;
-use powerfs_monitor::metric_store::{KVSessionInfo, MetricStore, NodeInfo, VolumeInfo};
+use powerfs_monitor::metric_store::{
+    DataMigrationTask, KVSessionInfo, MetricStore, NodeInfo, StorageDevice, VolumeInfo,
+};
 use powerfs_monitor::resilient_master_client;
 use powerfs_monitor::time_series::{DataPoint, TimeSeriesStore};
 
@@ -121,6 +123,29 @@ struct WsAlertUpdate {
     payload: serde_json::Value,
 }
 
+/// Heartbeat timeout: a node that hasn't published a NodeStatusEvent within
+/// this window is considered offline. Producers publish every 5s (see
+/// powerfs-master/src/master.rs:2790, powerfs-volume/src/server.rs:286,
+/// powerfs-filer/src/main.rs:152), so 30s = 6 missed heartbeats — well past
+/// transient jitter, low enough to surface a real outage in <1 minute.
+const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+
+/// Filer cluster 聚合查询缓存 — TTL 5s, 内存 RwLock, 不引入 Redis
+/// (见 docs/filer-redesign-plan.md 决策 3)。集群聚合查询 (cluster/status,
+/// cluster/shards) 缓存 5s 避免前端轮询打爆 filer; 单节点查询不缓存。
+/// 所有写操作 (balancer start/stop/trigger all) 后立即失效缓存。
+#[derive(Default)]
+struct FilerClusterCache {
+    status: Option<(Instant, serde_json::Value)>,
+    shards: Option<(Instant, serde_json::Value)>,
+}
+
+/// 集群聚合查询缓存 TTL (秒)
+const FILER_CLUSTER_CACHE_TTL_SECS: u64 = 5;
+
+/// Shard commit_index 落后阈值 — 超过此值判定 shard 不健康
+const CLUSTER_SHARD_COMMIT_LAG_THRESHOLD: u64 = 100;
+
 struct AppState {
     metric_store: Arc<MetricStore>,
     alert_engine: Arc<AlertEngine>,
@@ -148,6 +173,56 @@ struct AppState {
     master_client: resilient_master_client::SharedMasterClient,
     /// Time-series store for capacity planning
     time_series: Arc<TimeSeriesStore>,
+    /// Runtime-mutable monitor configuration (hot-modify via PUT endpoints).
+    runtime_config: Arc<RwLock<RuntimeConfig>>,
+    /// Filer admin HTTP client — Monitor 作为 filer /admin/* 的唯一入口
+    /// (前端不直连 filer，见 docs/filer-redesign-plan.md)。
+    filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient,
+    /// Filer cluster 聚合查询缓存 (cluster/status, cluster/shards, TTL 5s)
+    filer_cluster_cache: Arc<RwLock<FilerClusterCache>>,
+}
+
+/// Mutable runtime configuration snapshot. Mirrors the defaults exposed via GET
+/// endpoints; PUT updates are kept in-memory and survive until monitor restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeConfig {
+    circuit_breaker: CircuitBreakerConfig,
+    coalescer: CoalescerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CircuitBreakerConfig {
+    failure_threshold: u32,
+    recovery_timeout_ms: u64,
+    half_open_max_requests: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoalescerConfig {
+    deadline_ms: u64,
+    min_pending_writes: u32,
+    max_dirty_bytes_per_entry: u64,
+    max_dirty_bytes_total: u64,
+    disabled: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 50,
+                recovery_timeout_ms: 5000,
+                half_open_max_requests: 10,
+            },
+            coalescer: CoalescerConfig {
+                deadline_ms: 2000,
+                min_pending_writes: 4,
+                max_dirty_bytes_per_entry: 1048576,
+                max_dirty_bytes_total: 67108864,
+                disabled: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -511,6 +586,7 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
                         volume_count: 0,
                         is_leader: false,
                         raft_term: 0,
+                        last_seen: std::time::Instant::now(),
                     },
                     volumes: vec![vol.clone()],
                 });
@@ -541,6 +617,35 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
                 leader_count: 0,
                 total_shards: 0,
             });
+        }
+    }
+
+    // Fetch real leader_count from each filer's /admin/status (Master gRPC
+    // reports leader_count=0 — it doesn't track Raft leader state).
+    let filer_admin = state.filer_admin.clone();
+    let admin_futures: Vec<_> = filers
+        .iter()
+        .map(|f| {
+            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+            let ep = powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: f.node_id.clone(),
+                address,
+                http_port,
+            };
+            let client = filer_admin.clone();
+            async move { client.get_json(&ep, "/admin/status").await.ok() }
+        })
+        .collect();
+    let admin_results = futures::future::join_all(admin_futures).await;
+    for (filer, result) in filers.iter_mut().zip(admin_results.iter()) {
+        if let Some(json) = result {
+            if let Some(lc) = json.get("leader_count").and_then(|v| v.as_u64()) {
+                filer.leader_count = lc;
+            }
+            if let Some(ts) = json.get("shard_count").and_then(|v| v.as_u64()) {
+                filer.total_shards = ts;
+            }
         }
     }
 
@@ -585,6 +690,1123 @@ async fn get_filers_via_grpc(state: &Arc<AppState>) -> Result<Vec<FilerNodeInfo>
     }
 }
 
+// ========== Storage devices & migration handlers ==========
+
+#[derive(Debug, Deserialize)]
+struct DeviceListQuery {
+    node_id: Option<String>,
+}
+
+async fn list_storage_devices(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeviceListQuery>,
+) -> Json<ApiResponse<Vec<StorageDevice>>> {
+    let devs = state
+        .metric_store
+        .get_storage_devices(q.node_id.as_deref())
+        .await;
+    Json(ApiResponse::success(devs))
+}
+
+async fn get_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<StorageDevice>> {
+    match state.metric_store.get_storage_device(&device_id).await {
+        Some(d) => Json(ApiResponse::success(d)),
+        None => Json(ApiResponse::error(&format!(
+            "device {} not found",
+            device_id
+        ))),
+    }
+}
+
+async fn exclude_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.exclude_device(&device_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "device_id": device_id,
+            "status": "excluded",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn restore_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.restore_device(&device_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "device_id": device_id,
+            "status": "restored",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn drain_storage_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+) -> Json<ApiResponse<DataMigrationTask>> {
+    match state.metric_store.drain_device(&device_id).await {
+        Ok(task) => Json(ApiResponse::success(task)),
+        Err(e) => Json(ApiResponse::<DataMigrationTask>::error(&e)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationListQuery {
+    device_id: Option<String>,
+}
+
+async fn list_migration_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MigrationListQuery>,
+) -> Json<ApiResponse<Vec<DataMigrationTask>>> {
+    let mut tasks = state.metric_store.get_migration_tasks().await;
+    if let Some(did) = q.device_id {
+        tasks.retain(|t| t.source_device_id == did || t.target_device_id.as_deref() == Some(&did));
+    }
+    tasks.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+    Json(ApiResponse::success(tasks))
+}
+
+async fn cancel_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.cancel_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "cancelled",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn pause_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.pause_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "paused",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+async fn resume_migration_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match state.metric_store.resume_migration(&task_id).await {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "task_id": task_id,
+            "status": "running",
+        }))),
+        Err(e) => Json(ApiResponse::error(&e)),
+    }
+}
+
+// ========== Filer admin bridge handlers ==========
+//
+// 设计原则 (见 docs/filer-redesign-plan.md): 前端只跟 Monitor 交互。
+// 所有 filer /admin/* 调用由 Monitor 通过 filer_admin_client 代理,
+// 绝不让前端直连 filer 进程。所有操作要求 admin 权限。
+
+/// 通过 gRPC ListFilers 解析指定 node_id 的 filer endpoint。
+async fn resolve_filer_endpoint(
+    state: &Arc<AppState>,
+    node_id: &str,
+) -> Result<powerfs_monitor::filer_admin_client::FilerEndpoint, String> {
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let response = state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+        .map_err(|e| format!("gRPC ListFilers 失败: {}", e))?;
+    let resp = response.into_inner();
+    if let Some(f) = resp.filers.into_iter().find(|f| f.node_id == node_id) {
+        // Master's ListFilers may report http_port=0 (old binary or unregistered
+        // admin port). Default to 8888 — the heartbeat data's http_port is
+        // unreliable (it sometimes reports the gRPC port 8889 instead).
+        let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+        // Strip port from address if present (gRPC ListFilers returns
+        // "host:net_port" but the admin client needs just the host IP).
+        let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+        return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
+            node_id: f.node_id,
+            address,
+            http_port,
+        });
+    }
+
+    // 回退: gRPC 未注册时从 metric_store 心跳数据查找
+    // (filer 可能因 powerfs-net 握手失败未注册到 master, 但心跳仍可达)
+    let heartbeat_nodes = state.metric_store.get_nodes().await;
+    if let Some(n) = heartbeat_nodes
+        .iter()
+        .find(|n| n.node_type == "filer" && n.id == node_id)
+    {
+        let address = if n.address.is_empty() || n.address == "0.0.0.0" {
+            n.id.clone()
+        } else {
+            n.address.clone()
+        };
+        let http_port = if n.address.is_empty() || n.address == "0.0.0.0" || n.http_port == 0 {
+            8888
+        } else {
+            n.http_port
+        };
+        warn!(
+            "resolve_filer_endpoint: gRPC 未注册 {}, 回退到心跳数据 (addr={}, port={})",
+            node_id, address, http_port
+        );
+        return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
+            node_id: n.id.clone(),
+            address,
+            http_port,
+        });
+    }
+
+    Err(format!("filer 节点 {} 未在 master 注册", node_id))
+}
+
+/// 列出所有 filer 节点 — 合并 gRPC ListFilers (注册视角) + metric_store (心跳视角)。
+async fn list_filer_nodes(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<powerfs_monitor::filer_admin_client::FilerNode>>> {
+    // 1. gRPC ListFilers 拿注册信息
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let grpc_filers: Vec<powerfs_master::proto::powerfs::FilerInfo> = match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().filers,
+        Err(e) => return Json(ApiResponse::error(&format!("gRPC ListFilers 失败: {}", e))),
+    };
+
+    // 2. metric_store 拿心跳信息 (受 NODE_HEARTBEAT_TIMEOUT_SECS 控制, 已标 offline)
+    let heartbeat_nodes = state.metric_store.get_nodes().await;
+    let heartbeat_map: HashMap<String, NodeInfo> = heartbeat_nodes
+        .iter()
+        .filter(|n| n.node_type == "filer")
+        .map(|n| (n.id.clone(), n.clone()))
+        .collect();
+
+    // 3. 合并: 以 gRPC 注册为准, 心跳补充实时状态
+    let mut nodes: Vec<powerfs_monitor::filer_admin_client::FilerNode> = grpc_filers
+        .into_iter()
+        .map(|f| {
+            let hb = heartbeat_map.get(&f.node_id);
+            // Strip port from address for display (gRPC returns "host:net_port")
+            let display_address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            // Default to 8888 when master reports http_port=0 (heartbeat
+            // http_port is unreliable — sometimes reports gRPC port 8889).
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+            powerfs_monitor::filer_admin_client::FilerNode {
+                node_id: f.node_id.clone(),
+                address: display_address,
+                http_port,
+                grpc_port: f.grpc_port,
+                is_registered: true,
+                registered_healthy: f.is_healthy,
+                leader_count: f.leader_count,
+                total_shards: f.total_shards,
+                heartbeat_status: hb
+                    .map(|h| h.status.clone())
+                    .unwrap_or_else(|| "offline".to_string()),
+                last_seen_ago_secs: hb
+                    .map(|h| {
+                        // last_seen 是 #[serde(skip)] 不出 API, 这里用 uptime 近似
+                        // (uptime 是进程启动后秒数, 心跳断后 uptime 不再增长)
+                        h.uptime
+                    })
+                    .unwrap_or(0),
+                cpu_usage: hb.map(|h| h.cpu_usage).unwrap_or(0.0),
+                mem_usage: hb.map(|h| h.mem_usage).unwrap_or(0.0),
+                disk_usage: hb.map(|h| h.disk_usage).unwrap_or(0.0),
+                uptime: hb.map(|h| h.uptime).unwrap_or(0),
+            }
+        })
+        .collect();
+
+    // 3.5. 并行获取各 filer /admin/status, 用真实 leader_count 覆盖 Master gRPC 值
+    // (Master gRPC ListFilers 的 leader_count 不可靠, 经常报 0)
+    let filer_admin = state.filer_admin.clone();
+    let admin_futures: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let ep = powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: n.node_id.clone(),
+                address: n.address.clone(),
+                http_port: n.http_port,
+            };
+            let client = filer_admin.clone();
+            async move { client.get_json(&ep, "/admin/status").await.ok() }
+        })
+        .collect();
+    let admin_results = futures::future::join_all(admin_futures).await;
+    for (node, result) in nodes.iter_mut().zip(admin_results.iter()) {
+        if let Some(json) = result {
+            if let Some(lc) = json.get("leader_count").and_then(|v| v.as_u64()) {
+                node.leader_count = lc;
+            }
+            if let Some(ts) = json.get("shard_count").and_then(|v| v.as_u64()) {
+                node.total_shards = ts;
+            }
+        }
+    }
+
+    // 4. 补充: 心跳有但 gRPC 没注册的 filer (master 未感知, 可能注册延迟)
+    let registered_ids: HashSet<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    for n in &heartbeat_nodes {
+        if n.node_type == "filer" && !registered_ids.contains(&n.id) {
+            nodes.push(powerfs_monitor::filer_admin_client::FilerNode {
+                node_id: n.id.clone(),
+                address: n.address.clone(),
+                http_port: n.http_port,
+                grpc_port: n.grpc_port,
+                is_registered: false,
+                registered_healthy: false,
+                leader_count: 0,
+                total_shards: 0,
+                heartbeat_status: n.status.clone(),
+                last_seen_ago_secs: n.uptime,
+                cpu_usage: n.cpu_usage,
+                mem_usage: n.mem_usage,
+                disk_usage: n.disk_usage,
+                uptime: n.uptime,
+            });
+        }
+    }
+
+    // 5. 按 node_id 排序保证稳定顺序
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Json(ApiResponse::success(nodes))
+}
+
+/// 透传 GET 到 filer /admin/<sub_path> — 内部辅助, 由具体 handler 调用。
+async fn filer_admin_get_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+) -> Response {
+    // 所有 filer admin 操作都要求 admin 权限 (见 docs/filer-redesign-plan.md 决策 4)
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.get_json(&ep, &path).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+/// 透传 POST 到 filer /admin/<sub_path> — balancer/start, balancer/stop, balancer/trigger
+async fn filer_admin_post_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+    body: Option<serde_json::Value>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.post_json(&ep, &path, body).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+/// 透传 PUT 到 filer /admin/<sub_path> — balancer/config
+async fn filer_admin_put_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+    body: serde_json::Value,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.put_json(&ep, &path, body).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+/// 透传 DELETE 到 filer /admin/<sub_path> — admin/buckets/:name
+async fn filer_admin_delete_inner(
+    state: &Arc<AppState>,
+    user: &CurrentUser,
+    node_id: &str,
+    sub_path: &str,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match resolve_filer_endpoint(state, node_id).await {
+        Ok(ep) => ep,
+        Err(e) => return Json(ApiResponse::<()>::error(&e)).into_response(),
+    };
+    let path = format!("/admin/{}", sub_path);
+    match state.filer_admin.delete_json(&ep, &path).await {
+        Ok(v) => Json(ApiResponse::success(v)).into_response(),
+        Err(e) => {
+            let code = match &e {
+                powerfs_monitor::filer_admin_client::FilerAdminError::NodeNotFound(_)
+                | powerfs_monitor::filer_admin_client::FilerAdminError::NoHttpEndpoint(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::Unreachable(_, _) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                powerfs_monitor::filer_admin_client::FilerAdminError::HttpStatus(c, _) => *c,
+                powerfs_monitor::filer_admin_client::FilerAdminError::Decode(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+            };
+            (code, Json(ApiResponse::<()>::error(&e.to_string()))).into_response()
+        }
+    }
+}
+
+// --- 具体路由 handler (薄封装, 调用 _inner 辅助函数) ---
+
+async fn filer_get_status(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "status").await
+}
+
+async fn filer_get_shards(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "shards").await
+}
+
+async fn filer_get_shard(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path((node_id, shard_id)): Path<(String, String)>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, &format!("shards/{}", shard_id)).await
+}
+
+async fn filer_get_balancer_status(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "balancer/status").await
+}
+
+async fn filer_get_balancer_config(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_get_inner(&state, &user, &node_id, "balancer/config").await
+}
+
+async fn filer_balancer_start(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/start", None).await
+}
+
+async fn filer_balancer_stop(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/stop", None).await
+}
+
+async fn filer_balancer_trigger(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+) -> Response {
+    filer_admin_post_inner(&state, &user, &node_id, "balancer/trigger", None).await
+}
+
+async fn filer_put_balancer_config(
+    state: State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(node_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    filer_admin_put_inner(&state, &user, &node_id, "balancer/config", body).await
+}
+
+// ── Bucket management handlers (决策 2: 扩展 filer admin bucket 接口) ──
+//
+// 策略: bucket 属于全局元数据，选择任意**在线**的注册 filer 节点透传。
+// 写操作后失效 cluster/status 缓存（该缓存储存聚合后的 buckets 列表）。
+
+/// 从 endpoint 列表中挑一个在线 filer（优先健康节点），找不到返回 error Response。
+async fn pick_online_filer_for_bucket(
+    state: &Arc<AppState>,
+) -> std::result::Result<powerfs_monitor::filer_admin_client::FilerEndpoint, Response> {
+    let endpoints = list_filer_endpoints(state).await;
+    if endpoints.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<()>::error("集群中没有可用的 Filer 节点")),
+        )
+            .into_response());
+    }
+    // 简单策略: 遍历 endpoints, 通过一次 GET /admin/status 验活。
+    // 为了降低延迟: 直接选择第一个 endpoint (ListFilers 通常返回 leader 优先)。
+    Ok(endpoints.into_iter().next().unwrap())
+}
+
+async fn filer_list_buckets(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    filer_admin_get_inner(&state, &user, &node_id, "buckets").await
+}
+
+#[derive(Debug, Deserialize)]
+struct FilerCreateBucketBody {
+    name: String,
+    #[serde(default)]
+    collection: Option<String>,
+    #[serde(default)]
+    size_limit: Option<u64>,
+}
+
+async fn filer_create_bucket(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Json(body): Json<FilerCreateBucketBody>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    if body.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error("Bucket name 不能为空")),
+        )
+            .into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = "buckets".to_string();
+    let body_val = serde_json::json!({
+        "name": body.name,
+        "collection": body.collection,
+        "size_limit": body.size_limit,
+    });
+    let resp = filer_admin_post_inner(&state, &user, &node_id, &sub_path, Some(body_val)).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
+}
+
+async fn filer_delete_bucket(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(name): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = format!("buckets/{}", name);
+    let resp = filer_admin_delete_inner(&state, &user, &node_id, &sub_path).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
+}
+
+#[derive(Debug, Deserialize)]
+struct FilerSetQuotaBody {
+    size_limit: u64,
+}
+
+async fn filer_set_bucket_quota(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Json(body): Json<FilerSetQuotaBody>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let ep = match pick_online_filer_for_bucket(&state).await {
+        Ok(ep) => ep,
+        Err(resp) => return resp,
+    };
+    let node_id = ep.node_id.clone();
+    let sub_path = format!("buckets/{}/quota", name);
+    let body_val = serde_json::json!({ "size_limit": body.size_limit });
+    let resp = filer_admin_put_inner(&state, &user, &node_id, &sub_path, body_val).await;
+    invalidate_filer_cluster_cache(&state).await;
+    resp
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Filer cluster aggregation (Phase C)
+// 见 docs/filer-redesign-plan.md: /api/filer/cluster/* 聚合端点 +
+// Balancer 批量操作。集群聚合查询缓存 5s (决策 3), 写操作后立即失效缓存。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有 filer endpoints (从 gRPC ListFilers 获取)。
+/// 用于 cluster 聚合查询的并发调用。
+async fn list_filer_endpoints(
+    state: &Arc<AppState>,
+) -> Vec<powerfs_monitor::filer_admin_client::FilerEndpoint> {
+    let request = powerfs_master::proto::powerfs::ListFilersRequest {};
+    let response = match state
+        .master_client
+        .call(|client| {
+            let request = request.clone();
+            async move {
+                let mut client = client;
+                client.list_filers(tonic::Request::new(request)).await
+            }
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("list_filer_endpoints: gRPC ListFilers 失败: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut endpoints: Vec<powerfs_monitor::filer_admin_client::FilerEndpoint> = response
+        .into_inner()
+        .filers
+        .into_iter()
+        .map(|f| {
+            // gRPC address 是 "IP:net_port" 格式, 需剥离端口; http_port 常报 0, 默认 8888
+            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
+            powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: f.node_id,
+                address,
+                http_port,
+            }
+        })
+        .collect();
+
+    // 回退: gRPC 返回空时从 metric_store 心跳数据获取 filer 列表。
+    // 当 filer 未注册到 master (powerfs-net 握手失败等环境问题) 时,
+    // 心跳数据仍可用。心跳 address 可能为 "0.0.0.0" (不可达),
+    // 此时用 node_id 作为容器网络主机名 (docker compose 容器名即主机名)。
+    // 心跳 http_port 可能被错误上报为 grpc_port, address 不可达时强制用 8888。
+    if endpoints.is_empty() {
+        let heartbeat_nodes = state.metric_store.get_nodes().await;
+        for n in heartbeat_nodes.iter().filter(|n| n.node_type == "filer") {
+            let (address, http_port): (String, u32) = if n.address.is_empty() || n.address == "0.0.0.0" {
+                (n.id.clone(), 8888)
+            } else {
+                (n.address.clone(), if n.http_port == 0 { 8888 } else { n.http_port })
+            };
+            endpoints.push(powerfs_monitor::filer_admin_client::FilerEndpoint {
+                node_id: n.id.clone(),
+                address,
+                http_port,
+            });
+        }
+        if !endpoints.is_empty() {
+            warn!(
+                "list_filer_endpoints: gRPC ListFilers 为空, 回退到心跳数据 ({} 个 filer)",
+                endpoints.len()
+            );
+        }
+    }
+
+    endpoints
+}
+
+// ── cluster/status 聚合 ──
+
+/// filer /admin/status 返回结构的反序列化镜像 (仅取聚合需要的字段)。
+/// 保持与 powerfs_filer::meta_shard_manager::FilerStatus 同步。
+#[derive(Deserialize)]
+struct FilerStatusRaw {
+    shard_count: u64,
+    leader_count: u64,
+    total_inodes: u64,
+    total_files: u64,
+    total_dirs: u64,
+    #[serde(default)]
+    buckets: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusNode {
+    node_id: String,
+    status: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusTotals {
+    node_count: usize,
+    reachable: usize,
+    unreachable: usize,
+    total_shards: u64,
+    total_leaders: u64,
+    total_inodes: u64,
+    total_files: u64,
+    total_dirs: u64,
+    all_buckets: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusResponse {
+    nodes: Vec<ClusterStatusNode>,
+    totals: ClusterStatusTotals,
+}
+
+/// 并发调用所有 filer /admin/status, 聚合为集群级状态。
+/// 单节点失败不影响其他节点 (partial success 语义)。
+async fn fetch_cluster_status(state: &Arc<AppState>) -> ClusterStatusResponse {
+    let endpoints = list_filer_endpoints(state).await;
+
+    // 并发调用所有 filer (futures::future::join_all)
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            async move {
+                let result = client.get_json(&ep, "/admin/status").await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    let mut nodes = Vec::new();
+    let mut totals = ClusterStatusTotals {
+        node_count: endpoints.len(),
+        reachable: 0,
+        unreachable: 0,
+        total_shards: 0,
+        total_leaders: 0,
+        total_inodes: 0,
+        total_files: 0,
+        total_dirs: 0,
+        all_buckets: Vec::new(),
+    };
+
+    for (node_id, result) in results {
+        match result {
+            Ok(val) => {
+                totals.reachable += 1;
+                // 解析关键字段做聚合 (透传原始 val 给前端)
+                if let Ok(raw) = serde_json::from_value::<FilerStatusRaw>(val.clone()) {
+                    totals.total_shards += raw.shard_count;
+                    totals.total_leaders += raw.leader_count;
+                    totals.total_inodes += raw.total_inodes;
+                    totals.total_files += raw.total_files;
+                    totals.total_dirs += raw.total_dirs;
+                    for b in &raw.buckets {
+                        if !totals.all_buckets.contains(b) {
+                            totals.all_buckets.push(b.clone());
+                        }
+                    }
+                }
+                nodes.push(ClusterStatusNode {
+                    node_id,
+                    status: Some(val),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                totals.unreachable += 1;
+                nodes.push(ClusterStatusNode {
+                    node_id,
+                    status: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    totals.all_buckets.sort();
+    ClusterStatusResponse { nodes, totals }
+}
+
+async fn get_filer_cluster_status(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    // 检查缓存 (TTL 5s)
+    {
+        let cache = state.filer_cluster_cache.read().await;
+        if let Some((t, v)) = &cache.status {
+            if t.elapsed().as_secs() < FILER_CLUSTER_CACHE_TTL_SECS {
+                return Json(ApiResponse::success(v.clone())).into_response();
+            }
+        }
+    }
+    // 未命中, 重新获取并更新缓存
+    let resp = fetch_cluster_status(&state).await;
+    let val = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    {
+        let mut cache = state.filer_cluster_cache.write().await;
+        cache.status = Some((Instant::now(), val.clone()));
+    }
+    Json(ApiResponse::success(val)).into_response()
+}
+
+// ── cluster/shards 聚合 ──
+
+/// filer /admin/shards 返回的单个 shard 反序列化镜像。
+/// 保持与 powerfs_filer::meta_shard_manager::ShardDetail 同步。
+#[derive(Deserialize)]
+struct FilerShardRaw {
+    shard_id: u64,
+    inode_range_start: u64,
+    inode_range_end: u64,
+    is_leader: bool,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
+    inode_count: u64,
+    #[allow(dead_code)]
+    file_count: u64,
+    #[allow(dead_code)]
+    dir_count: u64,
+    write_qps: u64,
+    read_qps: u64,
+}
+
+#[derive(Serialize)]
+struct ClusterShardReplica {
+    node_id: String,
+    is_leader: bool,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
+    inode_count: u64,
+    write_qps: u64,
+    read_qps: u64,
+}
+
+#[derive(Serialize)]
+struct ClusterShardEntry {
+    shard_id: u64,
+    inode_range_start: u64,
+    inode_range_end: u64,
+    replicas: Vec<ClusterShardReplica>,
+    is_healthy: bool,
+    lag_reason: Option<String>,
+}
+
+/// 并发调用所有 filer /admin/shards, 按 shard_id 聚合多副本, 判定健康度。
+/// 健康判定: term 一致 + commit_index 滞后 < 阈值。
+async fn fetch_cluster_shards(state: &Arc<AppState>) -> Vec<ClusterShardEntry> {
+    let endpoints = list_filer_endpoints(state).await;
+
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            async move {
+                let result = client.get_json(&ep, "/admin/shards").await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    // 按 shard_id 聚合多 filer 副本
+    let mut shard_map: HashMap<u64, ClusterShardEntry> = HashMap::new();
+
+    for (node_id, result) in results {
+        match result {
+            Ok(val) => {
+                if let Ok(shards) = serde_json::from_value::<Vec<FilerShardRaw>>(val) {
+                    for s in shards {
+                        let entry =
+                            shard_map
+                                .entry(s.shard_id)
+                                .or_insert_with(|| ClusterShardEntry {
+                                    shard_id: s.shard_id,
+                                    inode_range_start: s.inode_range_start,
+                                    inode_range_end: s.inode_range_end,
+                                    replicas: Vec::new(),
+                                    is_healthy: true,
+                                    lag_reason: None,
+                                });
+                        entry.replicas.push(ClusterShardReplica {
+                            node_id: node_id.clone(),
+                            is_leader: s.is_leader,
+                            term: s.term,
+                            commit_index: s.commit_index,
+                            applied_index: s.applied_index,
+                            inode_count: s.inode_count,
+                            write_qps: s.write_qps,
+                            read_qps: s.read_qps,
+                        });
+                    }
+                }
+            }
+            Err(_) => { /* 单节点失败不影响聚合 */ }
+        }
+    }
+
+    // 健康判定: term 一致性 + commit_index 滞后
+    for entry in shard_map.values_mut() {
+        if entry.replicas.is_empty() {
+            continue;
+        }
+        let terms: Vec<u64> = entry.replicas.iter().map(|r| r.term).collect();
+        let commits: Vec<u64> = entry.replicas.iter().map(|r| r.commit_index).collect();
+
+        let term_consistent = terms.iter().all(|&t| t == terms[0]);
+        let commit_max = *commits.iter().max().unwrap_or(&0);
+        let commit_min = *commits.iter().min().unwrap_or(&0);
+        let commit_lag = commit_max - commit_min;
+        let commit_ok = commit_lag < CLUSTER_SHARD_COMMIT_LAG_THRESHOLD;
+
+        if !term_consistent {
+            entry.is_healthy = false;
+            entry.lag_reason = Some(format!("term 不一致: {:?}", terms));
+        } else if !commit_ok {
+            entry.is_healthy = false;
+            entry.lag_reason = Some(format!("commit_index 滞后 {} 条", commit_lag));
+        }
+    }
+
+    let mut shards: Vec<_> = shard_map.into_values().collect();
+    shards.sort_by_key(|s| s.shard_id);
+    shards
+}
+
+async fn get_filer_cluster_shards(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    // 检查缓存 (TTL 5s)
+    {
+        let cache = state.filer_cluster_cache.read().await;
+        if let Some((t, v)) = &cache.shards {
+            if t.elapsed().as_secs() < FILER_CLUSTER_CACHE_TTL_SECS {
+                return Json(ApiResponse::success(v.clone())).into_response();
+            }
+        }
+    }
+    let resp = fetch_cluster_shards(&state).await;
+    let val = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+    {
+        let mut cache = state.filer_cluster_cache.write().await;
+        cache.shards = Some((Instant::now(), val.clone()));
+    }
+    Json(ApiResponse::success(val)).into_response()
+}
+
+// ── Balancer 批量操作 (start/stop/trigger all) ──
+
+#[derive(Serialize)]
+struct BatchFailure {
+    node_id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct BatchResult {
+    success: Vec<String>,
+    failed: Vec<BatchFailure>,
+    total: usize,
+}
+
+/// 失效 cluster 聚合缓存 (写操作后调用, 见决策 3)
+async fn invalidate_filer_cluster_cache(state: &Arc<AppState>) {
+    let mut cache = state.filer_cluster_cache.write().await;
+    cache.status = None;
+    cache.shards = None;
+}
+
+/// 并发调用所有 filer 的 balancer 子路径 (start/stop/trigger)
+async fn balancer_all_inner(state: &Arc<AppState>, sub_path: &str) -> BatchResult {
+    let endpoints = list_filer_endpoints(state).await;
+    let total = endpoints.len();
+
+    let futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = state.filer_admin.clone();
+            let path = format!("/admin/balancer/{}", sub_path);
+            async move {
+                let result = client.post_json(&ep, &path, None).await;
+                (ep.node_id, result)
+            }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    let mut success = Vec::new();
+    let mut failed = Vec::new();
+    for (node_id, result) in results {
+        match result {
+            Ok(_) => success.push(node_id),
+            Err(e) => failed.push(BatchFailure {
+                node_id,
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    BatchResult {
+        success,
+        failed,
+        total,
+    }
+}
+
+async fn balancer_start_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "start").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
+}
+
+async fn balancer_stop_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "stop").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
+}
+
+async fn balancer_trigger_all(
+    State(state): State<Arc<AppState>>,
+    user: Extension<CurrentUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+    let result = balancer_all_inner(&state, "trigger").await;
+    invalidate_filer_cluster_cache(&state).await;
+    Json(ApiResponse::success(result)).into_response()
+}
+
 async fn get_cluster_metrics(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<ClusterMetrics>> {
@@ -607,6 +1829,21 @@ async fn get_node(
     }
 }
 
+async fn delete_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    if state.metric_store.delete_node(&id).await {
+        Json(ApiResponse::success(serde_json::json!({
+            "id": id,
+            "deleted": true,
+            "note": "Removed from monitor view; next heartbeat from node will re-add unless master drain is invoked separately.",
+        })))
+    } else {
+        Json(ApiResponse::error("Node not found"))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct MasterStatus {
     nodes: Vec<NodeInfo>,
@@ -618,17 +1855,43 @@ struct MasterStatus {
 
 async fn get_master_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<MasterStatus>> {
     let nodes = state.metric_store.get_nodes().await;
+    // Heartbeat staleness check: a master that hasn't published a
+    // NodeStatusEvent within NODE_HEARTBEAT_TIMEOUT_SECS is treated as
+    // offline for quorum purposes, even though its last published status
+    // string (leader/follower) is preserved for role display. We do the
+    // staleness flip here rather than in metric_store because master role
+    // lives on the status field — metric_store.mark_stale_nodes_offline
+    // deliberately skips masters to avoid clobbering role.
+    let now = std::time::Instant::now();
+    let master_timeout = std::time::Duration::from_secs(NODE_HEARTBEAT_TIMEOUT_SECS);
     let master_nodes: Vec<NodeInfo> = nodes
         .iter()
         .filter(|n| n.node_type == "master")
-        .cloned()
+        .map(|n| {
+            let mut m = n.clone();
+            if now.duration_since(n.last_seen) > master_timeout && m.status != "offline" {
+                m.status = "offline".to_string();
+            }
+            m
+        })
         .collect();
 
     let leader = master_nodes.iter().find(|n| n.is_leader).cloned();
     let raft_term = leader.as_ref().map(|n| n.raft_term).unwrap_or(0);
+    // A master is "healthy" from the quorum perspective if it is participating
+    // in the Raft group — i.e. it is the leader OR an active follower. The
+    // status field published by master.rs is exactly "leader" or "follower"
+    // (see powerfs-master/src/master.rs:2804). Legacy "online"/"healthy"
+    // strings are kept for backwards compatibility with older node agents.
+    // A master flipped to "offline" by the staleness check above is excluded.
     let healthy_masters = master_nodes
         .iter()
-        .filter(|n| n.status == "online" || n.status == "healthy" || n.status == "leader")
+        .filter(|n| {
+            n.status == "leader"
+                || n.status == "follower"
+                || n.status == "online"
+                || n.status == "healthy"
+        })
         .count();
     let total_masters = master_nodes.len();
 
@@ -1243,6 +2506,26 @@ async fn get_volume(
     }
 }
 
+async fn delete_volume(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    match id.parse::<u64>() {
+        Ok(id) => {
+            if state.metric_store.delete_volume(id).await {
+                Json(ApiResponse::success(serde_json::json!({
+                    "volume_id": id,
+                    "deleted": true,
+                    "note": "Removed from monitor view; volume creation on the master cluster is required to fully destroy the volume.",
+                })))
+            } else {
+                Json(ApiResponse::error("Volume not found"))
+            }
+        }
+        Err(_) => Json(ApiResponse::error("Invalid volume id")),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct VolumeIoMetricsResponse {
     volume_id: u64,
@@ -1294,6 +2577,20 @@ async fn get_kv_session(
     match state.metric_store.get_kv_session(&id).await {
         Some(session) => Json(ApiResponse::success(session)),
         None => Json(ApiResponse::error("Session not found")),
+    }
+}
+
+async fn delete_kv_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    if state.metric_store.delete_kv_session(&id).await {
+        Json(ApiResponse::success(serde_json::json!({
+            "session_id": id,
+            "deleted": true,
+        })))
+    } else {
+        Json(ApiResponse::error("Session not found"))
     }
 }
 
@@ -2071,27 +3368,138 @@ async fn get_fuse_client_stats(
     Json(ApiResponse::error("FUSE client not found"))
 }
 
+/// GET /api/fuse/clients — list all FUSE clients currently registered at Master.
+///
+/// Unlike `/api/fuse/mounts` this endpoint returns only the master registry
+/// view (no monitor-managed fallback); returns 500 when the master is
+/// unreachable so the UI can clearly distinguish "empty cluster" from
+/// "control plane unreachable".
+async fn list_fuse_clients(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<FuseMount>>> {
+    let clients = match state
+        .master_client
+        .call(|client| async move {
+            let mut client = client;
+            client
+                .get_fuse_clients(tonic::Request::new(
+                    powerfs_master::proto::powerfs::FuseClientsRequest {},
+                ))
+                .await
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().clients,
+        Err(e) => {
+            return Json(ApiResponse::<Vec<FuseMount>>::error(&format!(
+                "Failed to query master fuse clients: {}",
+                e
+            )));
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let mut result: Vec<FuseMount> = clients
+        .into_iter()
+        .map(|client| {
+            let mut mount = FuseMount {
+                id: client.client_id,
+                mount_point: client.mount_point,
+                collection: client.collection,
+                replication: client.replication,
+                filer_address: String::new(),
+                threads: 0,
+                status: "mounted".to_string(),
+                mounted_at: if client.connected_at > 0 {
+                    chrono::DateTime::from_timestamp(client.connected_at as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                pid: Some(client.pid),
+                host: Some(client.host),
+                client_type: Some(client.client_type),
+                dirty_chunks: Some(client.dirty_chunks),
+                dirty_bytes: Some(client.dirty_bytes),
+                last_heartbeat: if client.last_heartbeat > 0 {
+                    chrono::DateTime::from_timestamp(client.last_heartbeat as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                } else {
+                    None
+                },
+                stats: client.stats.map(ClientStatsResponse::from),
+            };
+            if let Some(last_hb) = mount
+                .last_heartbeat
+                .as_ref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp() as u64)
+            {
+                mount.status = if now.saturating_sub(last_hb) <= 60 {
+                    "mounted".to_string()
+                } else {
+                    "unmounted".to_string()
+                };
+            }
+            mount
+        })
+        .collect();
+    result.sort_by(|a, b| {
+        b.last_heartbeat
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.last_heartbeat.as_deref().unwrap_or(""))
+    });
+    Json(ApiResponse::success(result))
+}
+
 /// GET /api/config/circuit-breaker — current default CircuitBreaker config.
 ///
 /// These values mirror the defaults compiled into the FUSE client
 /// (`CircuitBreakerConfig::default()`). They are read-only for now; PUT
 /// support will be added once the master can push config updates to clients.
-async fn get_circuit_breaker_config() -> Json<serde_json::Value> {
+/// GET /api/config/circuit-breaker — current in-memory CircuitBreaker config snapshot.
+async fn get_circuit_breaker_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cfg = state.runtime_config.read().await.circuit_breaker.clone();
+    Json(serde_json::to_value(&cfg).expect("serialize cb config"))
+}
+
+/// PUT /api/config/circuit-breaker — hot-modify CircuitBreaker config (in-memory, survives until restart).
+async fn put_circuit_breaker_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CircuitBreakerConfig>,
+) -> Json<serde_json::Value> {
+    {
+        let mut cfg = state.runtime_config.write().await;
+        cfg.circuit_breaker = payload;
+    }
+    let snapshot = state.runtime_config.read().await.circuit_breaker.clone();
     Json(serde_json::json!({
-        "failure_threshold": 50,
-        "recovery_timeout_ms": 5000,
-        "half_open_max_requests": 10,
+        "updated": true,
+        "config": snapshot,
     }))
 }
 
 /// GET /api/config/coalescer — current default WriteCoalescer config.
-async fn get_coalescer_config() -> Json<serde_json::Value> {
+async fn get_coalescer_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cfg = state.runtime_config.read().await.coalescer.clone();
+    Json(serde_json::to_value(&cfg).expect("serialize coalescer config"))
+}
+
+/// PUT /api/config/coalescer — hot-modify WriteCoalescer config (in-memory, survives until restart).
+async fn put_coalescer_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CoalescerConfig>,
+) -> Json<serde_json::Value> {
+    {
+        let mut cfg = state.runtime_config.write().await;
+        cfg.coalescer = payload;
+    }
+    let snapshot = state.runtime_config.read().await.coalescer.clone();
     Json(serde_json::json!({
-        "deadline_ms": 2000,
-        "min_pending_writes": 4,
-        "max_dirty_bytes_per_entry": 1048576,
-        "max_dirty_bytes_total": 67108864,
-        "disabled": false,
+        "updated": true,
+        "config": snapshot,
     }))
 }
 
@@ -2450,28 +3858,115 @@ fn parse_list_objects_xml(xml: &str) -> Vec<ObjectInfo> {
     objects
 }
 
+/// GET /api/metrics/history/:metric — real time-series data.
+///
+/// Metric name conventions (P3 — wired to TimeSeriesStore):
+///   * `powerfs_node_disk_usage`         — cluster-wide avg disk usage (%)
+///   * `cluster_disk_usage`              — alias of the above
+///   * `disk_usage:<node_id>`            — single node disk usage (%)
+///   * `volume_size:<volume_id>`         — single volume used bytes
+///   * `powerfs_kv_hit_ratio` / `powerfs_node_cpu_usage` / others
+///     — not sampled by TimeSeriesStore; returns empty array (UI shows
+///     "no data" rather than fabricated mock data).
+///
+/// Query params:
+///   * `minutes` — lookback window in minutes (default 1440 = 24h, max 10080 = 7d)
+///
+/// Returned timestamps are RFC3339 strings (UTC), matching the existing
+/// `TimeSeriesPoint` shape.
 async fn get_metric_history(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(metric): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Json<ApiResponse<Vec<TimeSeriesPoint>>> {
-    let mut data = Vec::new();
-    let now = chrono::Utc::now();
-    for i in (0..24).rev() {
-        let time = now - chrono::Duration::hours(i);
-        let base_value = match metric.as_str() {
-            "powerfs_node_disk_usage" => 65.0,
-            "powerfs_node_cpu_usage" => 45.0,
-            "powerfs_kv_hit_ratio" => 90.0,
-            "powerfs_kv_memory_used" => 50.0,
-            _ => 50.0,
-        };
-        let value = base_value + (rand::random::<f64>() - 0.5) * 20.0;
-        data.push(TimeSeriesPoint {
-            time: time.to_rfc3339(),
-            value,
-        });
-    }
+    let minutes: i64 = params
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1440)
+        .clamp(1, 10080);
+
+    let points = match metric.as_str() {
+        "powerfs_node_disk_usage" | "cluster_disk_usage" => {
+            state
+                .time_series
+                .get_cluster_disk_usage_history(minutes)
+                .await
+        }
+        m if m.starts_with("disk_usage:") => {
+            let node_id = &m["disk_usage:".len()..];
+            state.time_series.get_disk_history(node_id, minutes).await
+        }
+        m if m.starts_with("volume_size:") => match m["volume_size:".len()..].parse::<u64>() {
+            Ok(vid) => {
+                state
+                    .time_series
+                    .get_volume_size_history(vid, minutes)
+                    .await
+            }
+            Err(_) => Vec::new(),
+        },
+        // Metrics not sampled by TimeSeriesStore return empty (no mock).
+        _ => Vec::new(),
+    };
+
+    let data: Vec<TimeSeriesPoint> = points
+        .into_iter()
+        .map(|p| {
+            let time = chrono::DateTime::from_timestamp(p.timestamp, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
+            TimeSeriesPoint {
+                time,
+                value: p.value,
+            }
+        })
+        .collect();
+
     Json(ApiResponse::success(data))
+}
+
+/// GET /api/metrics/cluster-disk-usage — per-node disk usage breakdown.
+///
+/// Returns a multi-series payload (one entry per node) suitable for the
+/// Capacity Planning cluster-wide trend chart. Each series is filtered to
+/// the requested `minutes` lookback (default 1440).
+#[derive(Debug, Serialize)]
+struct NodeDiskUsageSeries {
+    node_id: String,
+    points: Vec<TimeSeriesPoint>,
+}
+
+async fn get_cluster_disk_usage_breakdown(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<Vec<NodeDiskUsageSeries>>> {
+    let minutes: i64 = params
+        .get("minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1440)
+        .clamp(1, 10080);
+
+    let per_node = state.time_series.get_per_node_disk_usage(minutes).await;
+    let series: Vec<NodeDiskUsageSeries> = per_node
+        .into_iter()
+        .map(|(node_id, pts)| NodeDiskUsageSeries {
+            node_id,
+            points: pts
+                .into_iter()
+                .map(|p| {
+                    let time = chrono::DateTime::from_timestamp(p.timestamp, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default();
+                    TimeSeriesPoint {
+                        time,
+                        value: p.value,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    Json(ApiResponse::success(series))
 }
 
 async fn get_alerts(
@@ -4186,7 +5681,50 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-    state.ws_clients.lock().await.push(tx);
+    state.ws_clients.lock().await.push(tx.clone());
+
+    // Push an initial snapshot so newly-connected clients see current state
+    // immediately, instead of waiting for the next event_bus tick.
+    let snapshot_state = state.clone();
+    tokio::spawn(async move {
+        // Tiny delay to let the client finish its onopen handler. Harmless
+        // if the client isn't ready yet; messages are buffered in the mpsc.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let nodes = snapshot_state.metric_store.get_nodes().await;
+        if !nodes.is_empty() {
+            let msg = WsMetricUpdate {
+                message_type: "metric_update".to_string(),
+                source: "nodes".to_string(),
+                payload: serde_json::to_value(&nodes).unwrap_or(serde_json::Value::Null),
+            };
+            let _ = tx
+                .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+                .await;
+        }
+
+        let volumes = snapshot_state.metric_store.get_volumes().await;
+        if !volumes.is_empty() {
+            let msg = WsMetricUpdate {
+                message_type: "metric_update".to_string(),
+                source: "volumes".to_string(),
+                payload: serde_json::to_value(&volumes).unwrap_or(serde_json::Value::Null),
+            };
+            let _ = tx
+                .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+                .await;
+        }
+
+        let kv = snapshot_state.metric_store.get_kv_metrics().await;
+        let msg = WsMetricUpdate {
+            message_type: "metric_update".to_string(),
+            source: "kv".to_string(),
+            payload: serde_json::to_value(&kv).unwrap_or(serde_json::Value::Null),
+        };
+        let _ = tx
+            .send(serde_json::to_value(msg).unwrap_or(serde_json::Value::Null))
+            .await;
+    });
 
     let (mut sender, mut receiver) = socket.split();
 
@@ -4607,6 +6145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_client,
         master_client,
         time_series: Arc::new(TimeSeriesStore::with_redis(&redis_url)),
+        runtime_config: Arc::new(RwLock::new(RuntimeConfig::default())),
+        filer_admin: powerfs_monitor::filer_admin_client::FilerAdminClient::new(),
+        filer_cluster_cache: Arc::new(RwLock::new(FilerClusterCache::default())),
     });
 
     // Load time-series history from Redis on startup (if available)
@@ -4641,6 +6182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.clone(),
     ));
 
+    tokio::spawn(start_storage_migration_ticker(metric_store.clone()));
+
+    tokio::spawn(start_node_heartbeat_watchdog(metric_store.clone()));
+
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -4666,8 +6211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/cluster", get(get_cluster_metrics))
         .route("/api/metrics/nodes", get(get_nodes))
         .route("/api/metrics/nodes/:id", get(get_node))
+        .route("/api/metrics/nodes/:id", delete(delete_node))
         .route("/api/metrics/volumes", get(get_volumes))
         .route("/api/metrics/volumes/:id", get(get_volume))
+        .route("/api/metrics/volumes/:id", delete(delete_volume))
         .route("/api/metrics/volumes/:id/io", get(get_volume_io))
         .route(
             "/api/metrics/volumes/:id/capacity-history",
@@ -4680,6 +6227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/metrics/kv", get(get_kv_metrics))
         .route("/api/metrics/kv/sessions", get(get_kv_sessions))
         .route("/api/metrics/kv/sessions/:id", get(get_kv_session))
+        .route("/api/metrics/kv/sessions/:id", delete(delete_kv_session))
         .route("/api/kv/namespaces", get(list_kv_namespaces))
         .route("/api/kv/namespaces", post(create_kv_namespace))
         .route("/api/kv/namespaces/:name", delete(delete_kv_namespace))
@@ -4691,6 +6239,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/kv/keys", post(create_kv_access_key))
         .route("/api/kv/keys/:id", delete(delete_kv_access_key))
         .route("/api/metrics/history/:metric", get(get_metric_history))
+        .route(
+            "/api/metrics/cluster-disk-usage",
+            get(get_cluster_disk_usage_breakdown),
+        )
         .route("/api/metrics/s3", get(get_s3_metrics))
         .route("/api/s3/buckets", get(get_buckets))
         .route("/api/s3/buckets/:name", get(get_bucket))
@@ -4713,12 +6265,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/fuse/mounts", get(get_fuse_mounts))
         .route("/api/fuse/mounts", post(create_fuse_mount))
         .route("/api/fuse/mounts/:id", delete(delete_fuse_mount))
+        .route("/api/fuse/clients", get(list_fuse_clients))
         .route("/api/fuse/clients/:id/stats", get(get_fuse_client_stats))
         .route(
             "/api/config/circuit-breaker",
-            get(get_circuit_breaker_config),
+            get(get_circuit_breaker_config).put(put_circuit_breaker_config),
         )
-        .route("/api/config/coalescer", get(get_coalescer_config))
+        .route(
+            "/api/config/coalescer",
+            get(get_coalescer_config).put(put_coalescer_config),
+        )
         .route("/api/conflicts", get(list_conflicts))
         .route("/api/conflicts/resolve", post(resolve_conflict_handler))
         .route(
@@ -4763,6 +6319,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/benchmarks/:type", get(get_benchmark_report))
         .route("/api/benchmarks/:type/run", post(run_benchmark_handler))
+        // Storage devices & migration
+        .route("/api/storage/devices", get(list_storage_devices))
+        .route("/api/storage/devices/:device_id", get(get_storage_device))
+        .route(
+            "/api/storage/devices/:device_id/exclude",
+            post(exclude_storage_device),
+        )
+        .route(
+            "/api/storage/devices/:device_id/restore",
+            post(restore_storage_device),
+        )
+        .route(
+            "/api/storage/devices/:device_id/drain",
+            post(drain_storage_device),
+        )
+        .route("/api/storage/migrations", get(list_migration_tasks))
+        .route(
+            "/api/storage/migrations/:task_id/cancel",
+            post(cancel_migration_task),
+        )
+        .route(
+            "/api/storage/migrations/:task_id/pause",
+            post(pause_migration_task),
+        )
+        .route(
+            "/api/storage/migrations/:task_id/resume",
+            post(resume_migration_task),
+        )
+        // ========== Filer admin bridge ==========
+        // 设计原则: 前端只跟 Monitor 交互, filer /admin/* 由 Monitor 代理。
+        // 所有操作要求 admin 权限 (见 docs/filer-redesign-plan.md 决策 4)。
+        .route("/api/filer/nodes", get(list_filer_nodes))
+        .route("/api/filer/nodes/:node_id/status", get(filer_get_status))
+        .route("/api/filer/nodes/:node_id/shards", get(filer_get_shards))
+        .route(
+            "/api/filer/nodes/:node_id/shards/:shard_id",
+            get(filer_get_shard),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/status",
+            get(filer_get_balancer_status),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/config",
+            get(filer_get_balancer_config),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/start",
+            post(filer_balancer_start),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/stop",
+            post(filer_balancer_stop),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/trigger",
+            post(filer_balancer_trigger),
+        )
+        .route(
+            "/api/filer/nodes/:node_id/balancer/config",
+            put(filer_put_balancer_config),
+        )
+        // ========== Filer cluster aggregation (Phase C) ==========
+        // 集群聚合端点: 并发调所有 filer, 缓存 5s (见 docs/filer-redesign-plan.md 决策 3)
+        .route("/api/filer/cluster/status", get(get_filer_cluster_status))
+        .route("/api/filer/cluster/shards", get(get_filer_cluster_shards))
+        // Balancer 批量操作: 并发调所有 filer, 返回 BatchResult, 写后失效缓存
+        .route("/api/filer/balancer/start-all", post(balancer_start_all))
+        .route("/api/filer/balancer/stop-all", post(balancer_stop_all))
+        .route(
+            "/api/filer/balancer/trigger-all",
+            post(balancer_trigger_all),
+        )
+        // ========== Bucket management (决策 2: 扩展 filer admin bucket 接口) ==========
+        // bucket 属于全局元数据, Monitor 选择任意在线 filer 透传; 写后失效 cluster 缓存
+        .route("/api/filer/buckets", get(filer_list_buckets))
+        .route("/api/filer/buckets", post(filer_create_bucket))
+        .route("/api/filer/buckets/:name", delete(filer_delete_bucket))
+        .route(
+            "/api/filer/buckets/:name/quota",
+            put(filer_set_bucket_quota),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -4906,8 +6544,9 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
     info!("Alert evaluator started");
 
     loop {
+        // 1. 指标阈值告警 (CPU/磁盘/KV, 走 pending/duration)
         let alerts = alert_engine.evaluate_rules().await;
-        for alert in alerts {
+        for alert in &alerts {
             info!("Alert triggered: {}", alert.name);
             let msg = WsAlertUpdate {
                 message_type: "alert_trigger".to_string(),
@@ -4915,8 +6554,205 @@ async fn start_alert_evaluator(alert_engine: Arc<AlertEngine>, app_state: Arc<Ap
             };
             broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap()).await;
         }
+
+        // 2. 事件驱动告警 (节点离线/Filer 不可达/Raft 无 Leader/分片不均衡)
+        let event_alerts = evaluate_event_alerts(&alert_engine, &app_state).await;
+        for alert in &event_alerts {
+            info!("Event alert triggered: {} - {}", alert.name, alert.message);
+            let msg = WsAlertUpdate {
+                message_type: "alert_trigger".to_string(),
+                payload: serde_json::to_value(alert).unwrap(),
+            };
+            broadcast_message(app_state.clone(), serde_json::to_value(msg).unwrap()).await;
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
     }
+}
+
+/// 事件驱动告警评估 — 检查节点状态、Filer 可达性、Shard 健康、分片均衡。
+/// 与指标阈值告警不同, 这些告警直接触发 (无 pending 阶段), 条件不满足时自动恢复。
+async fn evaluate_event_alerts(
+    alert_engine: &AlertEngine,
+    state: &Arc<AppState>,
+) -> Vec<AlertInfo> {
+    let mut new_alerts = Vec::new();
+    let nodes = state.metric_store.get_nodes().await;
+
+    // ── 1. 节点离线告警 ──
+    let offline_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|n| n.status == "offline")
+        .collect();
+    if offline_nodes.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-node-offline").await;
+    } else {
+        let names: Vec<&str> = offline_nodes.iter().map(|n| n.id.as_str()).collect();
+        let node_types: Vec<&str> = offline_nodes.iter().map(|n| n.node_type.as_str()).collect();
+        let unique_types: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            node_types.iter().copied().filter(|t| seen.insert(*t)).collect()
+        };
+        let source = format!("nodes:{}", unique_types.join(","));
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-node-offline",
+                "节点离线",
+                "critical",
+                &source,
+                &format!("以下节点心跳超时, 已标记离线: {}", names.join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 2. Filer 不可达 + Shard 健康 ──
+    let endpoints = list_filer_endpoints(state).await;
+    let filer_admin = state.filer_admin.clone();
+    let filer_status_futures: Vec<_> = endpoints
+        .iter()
+        .map(|ep| {
+            let ep = ep.clone();
+            let client = filer_admin.clone();
+            async move { (ep.node_id.clone(), client.get_json(&ep, "/admin/status").await) }
+        })
+        .collect();
+    let filer_status_results = futures::future::join_all(filer_status_futures).await;
+
+    let mut unreachable_filers = Vec::new();
+    let mut total_leaders = 0u64;
+    let mut filer_leader_counts: Vec<(String, u64)> = Vec::new();
+
+    for (node_id, result) in &filer_status_results {
+        match result {
+            Ok(json) => {
+                let lc = json.get("leader_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                total_leaders += lc;
+                filer_leader_counts.push((node_id.clone(), lc));
+            }
+            Err(_) => {
+                unreachable_filers.push(node_id.clone());
+            }
+        }
+    }
+
+    // Filer 不可达告警
+    if unreachable_filers.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-filer-unreachable").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-filer-unreachable",
+                "Filer 不可达",
+                "critical",
+                &format!("filers:{}", unreachable_filers.join(",")),
+                &format!("以下 Filer admin API 不可达: {}", unreachable_filers.join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 3. Shard 健康 (无 Leader / 副本不足) ──
+    let shards = fetch_cluster_shards(state).await;
+    let no_leader_shards: Vec<_> = shards
+        .iter()
+        .filter(|s| !s.replicas.iter().any(|r| r.is_leader))
+        .map(|s| s.shard_id)
+        .collect();
+    let insufficient_shards: Vec<_> = shards
+        .iter()
+        .filter(|s| s.replicas.len() < 2)
+        .map(|s| s.shard_id)
+        .collect();
+
+    // Raft 组无 Leader
+    if no_leader_shards.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-no-raft-leader").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-no-raft-leader",
+                "Raft 组无 Leader",
+                "critical",
+                &format!("shards:{}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
+                &format!("以下分片无 Leader, Raft 选举未完成: {}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // Shard 副本不足
+    if insufficient_shards.is_empty() {
+        alert_engine.resolve_alerts_by_rule("rule-shard-insufficient").await;
+    } else {
+        if let Some(alert) = alert_engine
+            .trigger_event_alert(
+                "rule-shard-insufficient",
+                "Shard 副本不足",
+                "warning",
+                &format!("shards:{}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
+                &format!("以下分片副本数 < 2, 可用性风险: {}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+            )
+            .await
+        {
+            new_alerts.push(alert);
+        }
+    }
+
+    // ── 4. 分片不均衡 + Filer 无 Leader ──
+    if !filer_leader_counts.is_empty() && total_leaders > 0 {
+        let max_lc = filer_leader_counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let min_lc = filer_leader_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
+        let no_leader_filers: Vec<_> = filer_leader_counts
+            .iter()
+            .filter(|(_, c)| *c == 0)
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        // 分片不均衡 (max - min > 1)
+        if max_lc.saturating_sub(min_lc) <= 1 {
+            alert_engine.resolve_alerts_by_rule("rule-shard-imbalance").await;
+        } else {
+            if let Some(alert) = alert_engine
+                .trigger_event_alert(
+                    "rule-shard-imbalance",
+                    "分片不均衡",
+                    "warning",
+                    "cluster",
+                    &format!("Leader 分布不均衡: max={}, min={}", max_lc, min_lc),
+                )
+                .await
+            {
+                new_alerts.push(alert);
+            }
+        }
+
+        // Filer 无 Leader 分片
+        if no_leader_filers.is_empty() || max_lc <= 1 {
+            alert_engine.resolve_alerts_by_rule("rule-filer-no-leader").await;
+        } else {
+            if let Some(alert) = alert_engine
+                .trigger_event_alert(
+                    "rule-filer-no-leader",
+                    "Filer 无 Leader 分片",
+                    "warning",
+                    &format!("filers:{}", no_leader_filers.join(",")),
+                    &format!("以下 Filer 无 Leader 分片, 而其他节点有多个: {}", no_leader_filers.join(", ")),
+                )
+                .await
+            {
+                new_alerts.push(alert);
+            }
+        }
+    }
+
+    new_alerts
 }
 
 async fn start_metric_broadcaster(metric_store: Arc<MetricStore>, app_state: Arc<AppState>) {
@@ -4972,6 +6808,31 @@ async fn start_time_series_sampler(metric_store: Arc<MetricStore>, app_state: Ar
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+async fn start_storage_migration_ticker(metric_store: Arc<MetricStore>) {
+    info!("Storage migration ticker started (2s interval)");
+    loop {
+        metric_store.tick_migrations().await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Heartbeat watchdog: every 5s, flips volume/filer nodes that haven't
+/// heartbeated within NODE_HEARTBEAT_TIMEOUT_SECS to "offline". Master
+/// nodes are handled separately in `get_master_status` (role-preserving).
+/// See metric_store::mark_stale_nodes_offline for details.
+async fn start_node_heartbeat_watchdog(metric_store: Arc<MetricStore>) {
+    info!(
+        "Node heartbeat watchdog started (5s tick, {}s timeout)",
+        NODE_HEARTBEAT_TIMEOUT_SECS
+    );
+    loop {
+        metric_store
+            .mark_stale_nodes_offline(NODE_HEARTBEAT_TIMEOUT_SECS)
+            .await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 

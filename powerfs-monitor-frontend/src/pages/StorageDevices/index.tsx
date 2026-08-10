@@ -13,6 +13,7 @@ import {
   ReloadOutlined,
   PlusOutlined,
   InfoCircleOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons'
 import type { StorageDevice, DataMigrationTask } from '@/types'
 import {
@@ -144,23 +145,42 @@ function StorageDevices() {
 
   const deviceStats = useMemo(() => {
     const total = devices.length
-    const online = devices.filter(d => d.status === 'online').length
-    const offline = devices.filter(d => d.status === 'offline' || d.status === 'faulty').length
+    // "online" = available for new writes: online + readonly (read-only
+    // devices are still serving reads, not down). draining is a transient
+    // state counted separately so it doesn't silently vanish from KPIs.
+    const online = devices.filter(d =>
+      d.status === 'online' || d.status === 'readonly',
+    ).length
+    const draining = devices.filter(d => d.status === 'draining').length
+    const excluded = devices.filter(d => d.status === 'excluded').length
+    const offline = devices.filter(
+      d => d.status === 'offline' || d.status === 'faulty',
+    ).length
     const totalCapacity = devices.reduce((sum, d) => sum + d.total_capacity, 0)
-    return { total, online, offline, totalCapacity }
+    return { total, online, draining, excluded, offline, totalCapacity }
   }, [devices])
 
+  // Backend DeviceType enum (snake_case serde): ssd / nvme / hdd / logical.
+  // Legacy values local_file / spdk / nvmeof kept for backwards compat with
+  // older backends that may still emit them.
   const deviceTypeMap: Record<string, string> = {
+    ssd: 'SSD',
+    nvme: 'NVMe',
+    hdd: 'HDD',
+    logical: '逻辑卷',
     local_file: '本地文件',
     spdk: 'SPDK',
     nvmeof: 'NVMe-oF',
   }
 
+  // Backend DeviceStatus enum (snake_case serde): online / offline / draining
+  // / excluded / readonly. `faulty` is a legacy value kept for compat.
   const statusConfig: Record<string, { color: string; text: string }> = {
     online: { color: 'green', text: '在线' },
     offline: { color: 'red', text: '离线' },
     excluded: { color: 'orange', text: '已排除' },
     draining: { color: 'blue', text: '排空中' },
+    readonly: { color: 'gold', text: '只读' },
     faulty: { color: 'red', text: '故障' },
   }
 
@@ -168,6 +188,7 @@ function StorageDevices() {
     healthy: { color: 'green', icon: <CheckCircleOutlined />, text: '健康' },
     warning: { color: 'orange', icon: <ExclamationCircleOutlined />, text: '警告' },
     critical: { color: 'red', icon: <CloseCircleOutlined />, text: '严重' },
+    unknown: { color: 'default', icon: <QuestionCircleOutlined />, text: '未知' },
   }
 
   const migrationStatusConfig: Record<string, { color: string; text: string }> = {
@@ -541,16 +562,19 @@ function StorageDevices() {
       </Card>
 
       <Row gutter={16} style={{ marginBottom: 16 }}>
-        <Col span={6}>
+        <Col span={5}>
           <Card style={{ borderRadius: 12 }}>
             <Statistic
               title="设备总数"
               value={deviceStats.total}
               prefix={<HddOutlined />}
             />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              总容量 {formatBytes(deviceStats.totalCapacity)}
+            </Text>
           </Card>
         </Col>
-        <Col span={6}>
+        <Col span={5}>
           <Card style={{ borderRadius: 12 }}>
             <Statistic
               title="在线设备"
@@ -560,22 +584,31 @@ function StorageDevices() {
             />
           </Card>
         </Col>
-        <Col span={6}>
+        <Col span={5}>
+          <Card style={{ borderRadius: 12 }}>
+            <Statistic
+              title="排空中"
+              value={deviceStats.draining}
+              valueStyle={{ color: '#1677ff' }}
+            />
+          </Card>
+        </Col>
+        <Col span={5}>
+          <Card style={{ borderRadius: 12 }}>
+            <Statistic
+              title="已排除"
+              value={deviceStats.excluded}
+              valueStyle={{ color: '#faad14' }}
+            />
+          </Card>
+        </Col>
+        <Col span={4}>
           <Card style={{ borderRadius: 12 }}>
             <Statistic
               title="异常设备"
               value={deviceStats.offline}
               valueStyle={{ color: '#f5222d' }}
               prefix={<CloseCircleOutlined />}
-            />
-          </Card>
-        </Col>
-        <Col span={6}>
-          <Card style={{ borderRadius: 12 }}>
-            <Statistic
-              title="总容量"
-              value={deviceStats.totalCapacity}
-              formatter={val => formatBytes(Number(val))}
             />
           </Card>
         </Col>
@@ -615,6 +648,7 @@ function StorageDevices() {
                       options={[
                         { value: '', label: '全部状态' },
                         { value: 'online', label: '在线' },
+                        { value: 'readonly', label: '只读' },
                         { value: 'offline', label: '离线' },
                         { value: 'excluded', label: '已排除' },
                         { value: 'draining', label: '排空中' },

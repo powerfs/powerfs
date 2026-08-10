@@ -63,6 +63,61 @@ impl AlertEngine {
         }
     }
 
+    // ── 事件驱动告警 (不走 pending/duration, 直接触发) ──
+
+    /// 检查某 rule_id + source 是否已有 firing 状态告警 (去重)
+    pub async fn has_firing_alert(&self, rule_id: &str, source: &str) -> bool {
+        let alerts = self.alerts.read().await;
+        alerts
+            .values()
+            .any(|a| a.rule_id == rule_id && a.source == source && a.status == "firing")
+    }
+
+    /// 直接触发事件告警 (无 pending 阶段)。返回 Some(alert) 表示新触发, None 表示已存在。
+    pub async fn trigger_event_alert(
+        &self,
+        rule_id: &str,
+        name: &str,
+        severity: &str,
+        source: &str,
+        message: &str,
+    ) -> Option<AlertInfo> {
+        // 去重: 同 rule_id + source 已有 firing 告警时不重复触发
+        if self.has_firing_alert(rule_id, source).await {
+            return None;
+        }
+
+        let alert_id = uuid::Uuid::new_v4().to_string();
+        let alert = AlertInfo {
+            id: alert_id.clone(),
+            rule_id: rule_id.to_string(),
+            name: name.to_string(),
+            severity: severity.to_string(),
+            status: "firing".to_string(),
+            source: source.to_string(),
+            message: message.to_string(),
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+            owner_id: None,
+        };
+
+        let mut alerts = self.alerts.write().await;
+        alerts.insert(alert_id, alert.clone());
+        Some(alert)
+    }
+
+    /// 将某 rule_id 的所有 firing 告警标记为 resolved
+    pub async fn resolve_alerts_by_rule(&self, rule_id: &str) {
+        let mut alerts = self.alerts.write().await;
+        let now = chrono::Utc::now();
+        for alert in alerts.values_mut() {
+            if alert.status == "firing" && alert.rule_id == rule_id {
+                alert.status = "resolved".to_string();
+                alert.resolved_at = Some(now);
+            }
+        }
+    }
+
     pub async fn evaluate_rules(&self) -> Vec<AlertInfo> {
         let rules = self.rules.read().await;
         let mut new_alerts = Vec::new();

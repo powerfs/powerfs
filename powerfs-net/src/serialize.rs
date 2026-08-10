@@ -12,8 +12,8 @@
 use crate::errors::NetError;
 use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
 
-/// Result of decode_setattr_req: (ino, mode, uid, gid, size)
-pub type SetattrResult = (u64, Option<u32>, Option<u32>, Option<u32>, Option<u64>);
+/// Result of decode_setattr_req: (ino, mode, uid, gid, size, mtime, atime)
+pub type SetattrResult = (u64, Option<u32>, Option<u32>, Option<u32>, Option<u64>, Option<u64>, Option<u64>);
 
 /// TLV encoder for building request/response bodies
 pub struct TlvEncoder {
@@ -1024,6 +1024,8 @@ pub fn decode_setattr_req(body: &[u8]) -> Result<SetattrResult, NetError> {
     let mut uid: Option<u32> = None;
     let mut gid: Option<u32> = None;
     let mut size: Option<u64> = None;
+    let mut mtime: Option<u64> = None;
+    let mut atime: Option<u64> = None;
 
     while let Some((field, length)) = dec.next_field() {
         match field {
@@ -1032,11 +1034,13 @@ pub fn decode_setattr_req(body: &[u8]) -> Result<SetattrResult, NetError> {
             FieldId::Uid => uid = Some(dec.read_u32(length)?),
             FieldId::Gid => gid = Some(dec.read_u32(length)?),
             FieldId::Size => size = Some(dec.read_u64(length)?),
+            FieldId::Mtime => mtime = Some(dec.read_u64(length)?),
+            FieldId::Atime => atime = Some(dec.read_u64(length)?),
             _ => dec.skip(length)?,
         }
     }
 
-    Ok((ino, mode, uid, gid, size))
+    Ok((ino, mode, uid, gid, size, mtime, atime))
 }
 
 // ============================================================================
