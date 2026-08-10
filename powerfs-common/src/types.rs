@@ -482,6 +482,14 @@ pub struct DataNodeInfo {
     /// unknown / not reported.
     #[serde(default)]
     pub state_since: u64,
+    /// P5: CPU usage ratio (0.0 - 1.0), reported by the node's heartbeat.
+    /// 0.0 when not reported (pre-P5 nodes).
+    #[serde(default)]
+    pub cpu_usage: f32,
+    /// P5: Memory usage ratio (0.0 - 1.0), reported by the node's heartbeat.
+    /// 0.0 when not reported (pre-P5 nodes).
+    #[serde(default)]
+    pub memory_usage: f32,
 }
 
 impl DataNodeInfo {
@@ -538,6 +546,8 @@ impl DataNodeInfo {
             degrade_type: None,
             degrade_severity: 0,
             state_since: 0,
+            cpu_usage: 0.0,
+            memory_usage: 0.0,
         }
     }
 }

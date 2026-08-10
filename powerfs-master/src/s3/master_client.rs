@@ -125,6 +125,8 @@ impl S3MasterClient {
                     degrade_type: None,
                     degrade_severity: 0,
                     state_since: 0,
+                    cpu_usage: 0.0,
+                    memory_usage: 0.0,
                 }
             })
             .collect();
@@ -216,6 +218,8 @@ impl S3MasterClient {
             degrade_type: None,
             degrade_severity: 0,
             state_since: 0,
+            cpu_usage: 0.0,
+            memory_usage: 0.0,
         })
     }
 }

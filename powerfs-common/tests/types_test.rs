@@ -490,6 +490,8 @@ fn test_data_node_info_url() {
         degrade_type: None,
         degrade_severity: 0,
         state_since: 0,
+        cpu_usage: 0.0,
+        memory_usage: 0.0,
     };
     assert_eq!(node.url(), "192.168.1.1:8081");
 }
@@ -511,6 +513,9 @@ fn test_data_node_info_new_defaults() {
     assert_eq!(node.degrade_severity, 0);
     assert_eq!(node.state_since, 0);
     assert!(!node.maintenance_mode);
+    // P5: load metrics default to 0.0
+    assert_eq!(node.cpu_usage, 0.0);
+    assert_eq!(node.memory_usage, 0.0);
 }
 
 // ============================================================================
