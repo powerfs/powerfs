@@ -1,7 +1,7 @@
 use clap::Parser;
 use log::{error, info, warn};
 use powerfs_common::{
-    config::PowerFsConfig,
+    config::{PowerFsConfig, ServiceType},
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
@@ -369,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_config(config_path: &str) -> PowerFsConfig {
-    match PowerFsConfig::load_or_error(config_path) {
+    match PowerFsConfig::load_for_service(config_path, ServiceType::Volume) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", config_path);
             cfg

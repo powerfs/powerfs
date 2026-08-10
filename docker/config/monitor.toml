@@ -1,72 +1,14 @@
 # PowerFS Monitor 服务配置
+# 精简配置：只需 [global] + [monitor] 段
+
 [global]
 log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
-[master]
-port = 9333
-net_port = 9334
-dir = "/data/master"
-ip = "0.0.0.0"
-advertise_addr = "172.30.0.11:9333"
-raft_id = 1
-peers = ["172.30.0.11:9333"]
-
-[volume]
-grpc_port = 8080
-http_port = 8091
-net_port = 8901
-data_dir = "/data/volume"
-master_addresses = ["172.30.0.11:9333"]
-master_net_port = 9334
-node_id = "volume-server"
-max_volume_size = 10737418240
-initial_volume_count = 4
-
-[filer]
-port = 8888
-grpc_port = 8889
-net_port = 9334
-master_addresses = ["172.30.0.11:9333"]
-data_dir = "/data/filer"
-shard_count = 2
-raft_id = 1
-raft_peers = []
-master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
-
-[s3]
-port = 9000
-master_address = "172.30.0.11:9333"
-dir = "/data/s3"
-access_key = "powerfs"
-secret_key = "powerfs123"
-
-[fuse]
-mount_point = "/mnt/powerfs"
-master_addresses = ["172.30.0.11"]
-filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
-volume_addresses = ["172.30.0.21"]
-master_net_port = 9334
-master_grpc_port = 9333
-volume_net_port = 8901
-filer_net_port = 9334
-collection = "default"
-replication = "000"
-threads = 8
-verbose = false
-container = false
-
 [monitor]
 addr = "0.0.0.0:8081"
 redis_url = "redis://172.30.0.50:6379"
-s3_endpoint = "http://172.30.0.32:9000"
-s3_backend_endpoint = "http://172.30.0.32:9000"
-# Note: master_endpoint should be IP:PORT without protocol prefix
-# KvCacheClient adds http:// prefix automatically
+s3_endpoint = "http://172.30.0.40:9000"
+s3_backend_endpoint = "http://172.30.0.40:9000"
 master_endpoint = "172.30.0.11:9333"
-# All master gRPC endpoints for resilient client (leader discovery + failover)
-master_endpoints = [
-    "172.30.0.11:9333",
-    "172.30.0.12:9333",
-    "172.30.0.13:9333",
-]
+master_endpoints = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
-use powerfs_common::config::PowerFsConfig;
+use powerfs_common::config::{PowerFsConfig, ServiceType};
 use powerfs_kv_client::KvCacheClient;
 use powerfs_master::proto::powerfs::{
     AutoResolveConflictsRequest, BatchIgnoreConflictsRequest, BatchResolveConflictsRequest,
@@ -6039,7 +6039,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Redis URL: {}", redis_url);
 
     fn load_config(config_path: &str) -> PowerFsConfig {
-        match PowerFsConfig::load_or_error(config_path) {
+        match PowerFsConfig::load_for_service(config_path, ServiceType::Monitor) {
             Ok(cfg) => {
                 info!("Successfully loaded configuration from: {}", config_path);
                 cfg

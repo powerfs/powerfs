@@ -15,7 +15,7 @@ use powerfs_fuse_core::*;
 #[test]
 fn test_facade_config_creation() {
     let config = FuseClientFacadeConfig::new(
-        "127.0.0.1".to_string(),
+        vec!["127.0.0.1".to_string()],
         9333,
         8901,
         vec!["127.0.0.1".to_string()],
@@ -25,7 +25,8 @@ fn test_facade_config_creation() {
     .unwrap();
 
     // 验证配置值
-    assert_eq!(config.master_addr, "127.0.0.1");
+    assert_eq!(config.master_addrs.len(), 1);
+    assert_eq!(config.master_addrs[0], "127.0.0.1");
     assert_eq!(config.master_port, 9333);
     assert_eq!(config.filer_addr, "127.0.0.1");
     assert_eq!(config.filer_port, 9343);
@@ -40,7 +41,7 @@ fn test_facade_config_creation() {
 fn test_facade_config_custom_values() {
     let identity = ClientIdentity::new();
     let config = FuseClientFacadeConfig {
-        master_addr: "192.168.1.100".to_string(),
+        master_addrs: vec!["192.168.1.100".to_string(), "192.168.1.101".to_string()],
         master_port: 8000,
         volume_net_port: 8002,
         volume_addrs: Vec::new(),
@@ -58,7 +59,9 @@ fn test_facade_config_custom_values() {
         force_mount: false,
     };
 
-    assert_eq!(config.master_addr, "192.168.1.100");
+    assert_eq!(config.master_addrs.len(), 2);
+    assert_eq!(config.master_addrs[0], "192.168.1.100");
+    assert_eq!(config.master_addrs[1], "192.168.1.101");
     assert_eq!(config.master_port, 8000);
     assert_eq!(config.filer_addr, "192.168.1.200");
     assert_eq!(config.filer_port, 8001);
