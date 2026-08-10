@@ -30,4 +30,13 @@ pub use powerfs::{
     StatisticsResponse, SubscribeMetadataRequest, TransferLeaderRequest, TransferLeaderResponse,
     UpdateEntryRequest, UpdateEntryResponse, VectorClock, VectorClockEntry, VolumeGrowRequest,
     VolumeGrowResponse, VolumeListRequest, VolumeListResponse, VolumeLocation, VolumeShortInfo,
+    // Allocator ManagementApi types (ManagementApi gRPC RPCs)
+    CreateVolumeManagedRequest, CreateVolumeManagedResponse,
+    GetMigrationTasksRequest, GetMigrationTasksResponse, MigrationControlResponse,
+    MigrationTaskInfo, PauseAllMigrationsRequest, PinVolumeRequest,
+    RebalanceActionInfo, ResumeMigrationsRequest,
+    SetNodeMaintenanceRequest, SetPlacementStrategyRequest, TriggerRebalanceCheckRequest,
+    TriggerRebalanceCheckResponse, UpdateMigrationPolicyRequest,
+    UpdateRebalancePolicyRequest, VolumeIdRequest, VolumeManageResponse,
+    PolicyUpdateResponse,
 };
