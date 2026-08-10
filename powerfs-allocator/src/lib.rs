@@ -31,6 +31,7 @@ pub mod shard_map;
 pub mod snapshot;
 pub mod status;
 pub mod volume_assigner;
+pub mod volume_manager;
 
 // Re-export key types for convenience.
 pub use allocator::{
@@ -63,3 +64,4 @@ pub use volume_assigner::{
     AssignContext, AssignerType, ConsistentHashAssigner, RoundRobinAssigner, SmartVolumeAssigner,
     VolumeAssigner,
 };
+pub use volume_manager::{NoopVolumeControl, VolumeControl, VolumeManager};
