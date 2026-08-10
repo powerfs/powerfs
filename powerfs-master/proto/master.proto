@@ -79,6 +79,18 @@ service MasterService {
     rpc ListFilers(ListFilersRequest) returns (ListFilersResponse);
     rpc RegisterFiler(RegisterFilerRequest) returns (RegisterFilerResponse);
     rpc GetShardMapping(GetShardMappingRequest) returns (GetShardMappingResponse);
+
+    // ===== Allocator management (rebalance + volume scaling) =====
+    rpc TriggerRebalanceCheck(TriggerRebalanceCheckRequest) returns (TriggerRebalanceCheckResponse);
+    rpc PauseAllMigrations(PauseAllMigrationsRequest) returns (MigrationControlResponse);
+    rpc ResumeMigrations(ResumeMigrationsRequest) returns (MigrationControlResponse);
+    rpc CancelMigration(CancelMigrationRequest) returns (MigrationControlResponse);
+    rpc GetMigrationTasks(GetMigrationTasksRequest) returns (GetMigrationTasksResponse);
+    rpc CreateVolumeManaged(CreateVolumeManagedRequest) returns (CreateVolumeManagedResponse);
+    rpc DrainVolumeManaged(VolumeIdRequest) returns (VolumeManageResponse);
+    rpc RemoveVolumeManaged(VolumeIdRequest) returns (VolumeManageResponse);
+    rpc UpdateMigrationPolicy(UpdateMigrationPolicyRequest) returns (PolicyUpdateResponse);
+    rpc UpdateRebalancePolicy(UpdateRebalancePolicyRequest) returns (PolicyUpdateResponse);
 }
 
 message Heartbeat {
@@ -1553,4 +1565,106 @@ message BatchIgnoreConflictsResponse {
     bool success = 1;
     string error = 2;
     uint64 ignored_count = 3;
+}
+
+// ============================================================
+// Allocator management messages
+// ============================================================
+
+message TriggerRebalanceCheckRequest {
+    bool dry_run = 1;
+}
+
+message RebalanceActionInfo {
+    enum ActionType {
+        MIGRATE_COLD_DATA = 0;
+        MIGRATE_HOT_DATA = 1;
+        REQUEST_VOLUME_GROW = 2;
+    }
+    ActionType action_type = 1;
+    uint64 from_volume = 2;
+    uint64 to_volume = 3;
+    string from_node = 4;
+    string to_node = 5;
+    uint32 zone_id = 6;
+    uint64 size = 7;
+    repeated uint64 needle_ids = 8;
+    repeated uint64 volume_ids = 9;
+}
+
+message TriggerRebalanceCheckResponse {
+    bool success = 1;
+    string error = 2;
+    repeated RebalanceActionInfo actions = 3;
+}
+
+message PauseAllMigrationsRequest {}
+message ResumeMigrationsRequest {}
+
+message CancelMigrationRequest {
+    string task_id = 1;
+}
+
+message MigrationControlResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetMigrationTasksRequest {}
+
+message MigrationTaskInfo {
+    string task_id = 1;
+    string action_type = 2;
+    string state = 3;
+    float progress = 4;
+    uint64 bytes_migrated = 5;
+    uint64 bytes_total = 6;
+    string pause_reason = 7;
+}
+
+message GetMigrationTasksResponse {
+    repeated MigrationTaskInfo tasks = 1;
+    string error = 2;
+}
+
+message CreateVolumeManagedRequest {
+    uint32 zone_id = 1;
+    string node_id = 2;  // empty = auto-select least-loaded node
+    uint64 size = 3;
+}
+
+message CreateVolumeManagedResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 volume_id = 3;
+}
+
+message VolumeIdRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeManageResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message UpdateMigrationPolicyRequest {
+    uint32 max_concurrent_migrations = 1;
+    uint64 max_bandwidth_mbps = 2;
+    double load_pause_threshold = 3;
+    double load_resume_threshold = 4;
+    uint64 scan_interval_secs = 5;
+}
+
+message UpdateRebalancePolicyRequest {
+    double volume_full_threshold = 1;
+    double near_full_exclude_ratio = 2;
+    double load_imbalance_threshold = 3;
+    uint64 cold_data_threshold_hours = 4;
+    uint32 min_migration_chunk_count = 5;
+}
+
+message PolicyUpdateResponse {
+    bool success = 1;
+    string error = 2;
 }
