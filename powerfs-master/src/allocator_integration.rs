@@ -239,10 +239,15 @@ impl ManagementApi for MasterManagementApi {
         Ok(())
     }
 
-    fn set_node_maintenance(&self, _node_id: &str, _enabled: bool) -> Result<(), ManageError> {
-        Err(nyi(
-            "node maintenance requires a Raft command for replication",
-        ))
+    fn set_node_maintenance(&self, node_id: &str, enabled: bool) -> Result<(), ManageError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.master
+                    .set_node_maintenance(node_id, enabled)
+                    .await
+                    .map_err(map_powerfs_error)
+            })
+        })
     }
 
     // ===== Migration control =====

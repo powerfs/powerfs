@@ -962,8 +962,18 @@ pub struct ShardSplitPlan {
 - `MasterNode`：新增 `management_api` 字段 + `management_api()` 访问器，`start()` 中构造。
 - 测试：master 99 测试 PASS，clippy 0 警告，rustfmt clean。
 
+**已完成：ManagementApi gRPC handler 接入**
+
+- `master.proto`：新增 10 个 allocator 管理 RPC + 对应消息类型：
+  - `TriggerRebalanceCheck`（dry_run + 执行）、`PauseAllMigrations`/`ResumeMigrations`/`CancelMigration`（迁移控制）、`GetMigrationTasks`（任务状态查询）。
+  - `CreateVolumeManaged`/`DrainVolumeManaged`/`RemoveVolumeManaged`（卷伸缩）。
+  - `UpdateMigrationPolicy`/`UpdateRebalancePolicy`（策略热更新）。
+- `server.rs`：10 个 gRPC handler 实现，每个委托 `MasterManagementApi` 对应方法，返回结构化 `success`/`error` 响应。
+- 转换辅助函数：`rebalance_action_to_proto`（RebalanceAction→RebalanceActionInfo）、`migration_task_to_proto`（MigrationTaskStatus→MigrationTaskInfo）。
+- 未初始化优雅降级：engine/API 未就绪时返回 `success=false` + 描述性错误（如 Raft follower 上），不崩溃。
+- 测试：master 99 PASS，allocator 77 PASS，clippy 0 警告，rustfmt clean。
+
 **待完成**：
-- 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新。
-- `ManagementApi` gRPC handler 接入：将 ManagementApi 暴露为 RPC 端点供运维/AI Agent 调用。
+- 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新（高风险，留作后续里程碑）。
 - `set_node_maintenance` Raft 命令：复制维护状态到所有 master 副本。
 - Shard 伸缩 filer 连接：`add_shard`/`drain_shard`/`remove_shard` 需要 filer Raft 组状态。

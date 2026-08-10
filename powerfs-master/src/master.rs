@@ -890,6 +890,9 @@ impl MasterNode {
                 self.zone_registry.write().unwrap().insert(zone_id, zone);
                 debug!("Applied UpdateZone via Raft: zone_id={}", zone_id);
             }
+            RaftCommand::SetNodeMaintenance { node_id, enabled } => {
+                self.apply_set_node_maintenance(&node_id, enabled)?;
+            }
         }
 
         Ok(())
@@ -1100,6 +1103,23 @@ impl MasterNode {
         if let Some(info) = volumes.get_mut(&vid) {
             info.state = state;
             info.modified_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    /// Apply `SetNodeMaintenance` Raft command: toggle `maintenance_mode` on
+    /// the node in the in-memory topology. When enabled, the allocator's
+    /// `ClusterSnapshot` builder maps the node to `NodeRuntimeState::Maintenance`,
+    /// excluding it from allocation decisions.
+    fn apply_set_node_maintenance(&self, node_id: &str, enabled: bool) -> Result<()> {
+        let nid = NodeId(node_id.to_string());
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(&nid) {
+            node.maintenance_mode = enabled;
+            debug!(
+                "Applied SetNodeMaintenance via Raft: node={} enabled={}",
+                node_id, enabled
+            );
         }
         Ok(())
     }
@@ -1552,6 +1572,27 @@ impl MasterNode {
         let cmd = RaftCommand::UpdateVolumeState {
             volume_id: volume_id.0,
             state: state_str,
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Set node maintenance mode via Raft replication.
+    ///
+    /// When `enabled=true`, the node is excluded from allocation decisions
+    /// (mapped to `NodeRuntimeState::Maintenance` in the cluster snapshot).
+    /// When `enabled=false`, the node returns to normal allocation.
+    ///
+    /// Only the Raft leader can propose this command.
+    pub async fn set_node_maintenance(&self, node_id: &str, enabled: bool) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::SetNodeMaintenance {
+            node_id: node_id.to_string(),
+            enabled,
         };
 
         self.propose_command(cmd).await?;
