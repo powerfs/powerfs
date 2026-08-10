@@ -512,13 +512,14 @@ fn map_powerfs_error(err: PowerFsError) -> ManageError {
 /// Master-backed `ManagementApi`: ties the allocator's management interface to
 /// the master's runtime state.
 ///
-/// Implements the full [`ManagementApi`] trait. Methods that can work today
-/// (policy updates, migration control, volume scaling) delegate to the
-/// [`RebalanceEngine`] / [`VolumeManager`] / [`MasterVolumeControl`]. Methods
-/// that need additional service-side work (shard scaling via filer, volume
-/// pinning, node maintenance via Raft) return `InvalidState` with a clear
-/// "not yet implemented" message so callers can distinguish missing features
-/// from transient errors.
+/// Implements the full [`ManagementApi`] trait (15/15 methods).
+///
+/// Policy updates delegate to the [`RebalanceEngine`]'s `Arc<RwLock<…>>`
+/// fields. Volume scaling goes through [`VolumeManager`] +
+/// [`MasterVolumeControl`]. Shard scaling calls the filer via
+/// [`FilerManagementClient`]. Volume pinning, node maintenance, and
+/// placement-strategy switching propose Raft commands on the master (all
+/// replicas agree). Migration control queries the [`MigrationScheduler`].
 pub struct MasterManagementApi {
     master: Arc<MasterNode>,
     engine: Arc<RebalanceEngine>,
