@@ -1,7 +1,7 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
 use crate::volume_proto::powerfs::{
-    CreateVolumeRequest, DeleteNeedleRequest, ReadNeedleRequest, RestoreNeedleRequest,
-    WormLockRequest, WriteNeedleRequest,
+    CreateVolumeRequest, DeleteNeedleRequest, ListNeedlesRequest, ReadNeedleRequest,
+    RestoreNeedleRequest, WormLockRequest, WriteNeedleRequest,
 };
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -289,6 +289,81 @@ impl VolumeClientPool {
             Err(e) => {
                 self.invalidate_channel(address).await;
                 Err(format!("worm_lock failed: {}", e))
+            }
+        }
+    }
+
+    /// List needles on a volume (for cold-data migration enumeration).
+    /// Returns (needle_id, size, offset, created_at) tuples.
+    pub async fn list_needles(
+        &self,
+        address: &str,
+        volume_id: u64,
+        limit: u32,
+    ) -> Result<Vec<(u64, u64, u64, i64)>, String> {
+        let channel = match self.get_or_create_channel(address).await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut service = VolumeServiceClient::new(channel);
+        let request = ListNeedlesRequest { volume_id, limit };
+
+        match service.list_needles(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let result = response.into_inner();
+                if result.success {
+                    Ok(result
+                        .needles
+                        .into_iter()
+                        .map(|n| (n.needle_id, n.size, n.offset, n.created_at))
+                        .collect())
+                } else {
+                    Err(result.error)
+                }
+            }
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("list_needles failed: {}", e))
+            }
+        }
+    }
+
+    /// Write needle data and return the assigned file_key.
+    /// Pass `file_key=0` for auto-assignment by the volume server.
+    pub async fn write_needle_return_key(
+        &self,
+        address: &str,
+        volume_id: u64,
+        file_key: u64,
+        data: &[u8],
+    ) -> Result<u64, String> {
+        let channel = match self.get_or_create_channel(address).await {
+            Ok(ch) => ch,
+            Err(e) => return Err(e),
+        };
+
+        let mut service = VolumeServiceClient::new(channel);
+        let request = WriteNeedleRequest {
+            volume_id,
+            file_key,
+            data: data.to_vec(),
+            cookie: 0,
+            ttl: "".to_string(),
+        };
+
+        match service.write_needle(tonic::Request::new(request)).await {
+            Ok(response) => {
+                let result = response.into_inner();
+                if result.success {
+                    Ok(result.file_key)
+                } else {
+                    Err("write_needle failed".to_string())
+                }
+            }
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("write_needle failed: {}", e))
             }
         }
     }
