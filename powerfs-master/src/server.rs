@@ -5,6 +5,9 @@ use super::proto::powerfs::*;
 use super::proto::*;
 use futures::Stream;
 use log::{info, warn};
+use powerfs_allocator::config::{MigrationPolicy, RebalancePolicy};
+use powerfs_allocator::management::{ManagementApi, RebalanceAction};
+use powerfs_allocator::{MigrationState, MigrationTaskStatus, MigrationType};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
@@ -1531,5 +1534,321 @@ impl MasterService for MasterGrpcServer {
         Err(Status::unimplemented(
             "filesystem metadata operations moved to Filer Raft",
         ))
+    }
+
+    // ========================================================================
+    // Allocator management RPCs (rebalance + volume scaling)
+    // ========================================================================
+
+    async fn trigger_rebalance_check(
+        &self,
+        request: Request<TriggerRebalanceCheckRequest>,
+    ) -> Result<Response<TriggerRebalanceCheckResponse>, Status> {
+        let req = request.into_inner();
+        let mgmt = match self.master.management_api() {
+            Some(m) => m,
+            None => {
+                return Ok(Response::new(TriggerRebalanceCheckResponse {
+                    success: false,
+                    error: "allocator management API not initialized".to_string(),
+                    actions: vec![],
+                }))
+            }
+        };
+        match mgmt.trigger_rebalance_check(req.dry_run) {
+            Ok(actions) => Ok(Response::new(TriggerRebalanceCheckResponse {
+                success: true,
+                error: String::new(),
+                actions: actions.into_iter().map(rebalance_action_to_proto).collect(),
+            })),
+            Err(e) => Ok(Response::new(TriggerRebalanceCheckResponse {
+                success: false,
+                error: e.to_string(),
+                actions: vec![],
+            })),
+        }
+    }
+
+    async fn pause_all_migrations(
+        &self,
+        _request: Request<PauseAllMigrationsRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        match self.master.management_api() {
+            Some(m) => match m.pause_all_migrations() {
+                Ok(()) => Ok(Response::new(MigrationControlResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(MigrationControlResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn resume_migrations(
+        &self,
+        _request: Request<ResumeMigrationsRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        match self.master.management_api() {
+            Some(m) => match m.resume_migrations() {
+                Ok(()) => Ok(Response::new(MigrationControlResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(MigrationControlResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn cancel_migration(
+        &self,
+        request: Request<CancelMigrationRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.cancel_migration(&req.task_id) {
+                Ok(()) => Ok(Response::new(MigrationControlResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(MigrationControlResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn get_migration_tasks(
+        &self,
+        _request: Request<GetMigrationTasksRequest>,
+    ) -> Result<Response<GetMigrationTasksResponse>, Status> {
+        let tasks = self.master.migration_tasks();
+        Ok(Response::new(GetMigrationTasksResponse {
+            tasks: tasks.into_iter().map(migration_task_to_proto).collect(),
+            error: String::new(),
+        }))
+    }
+
+    async fn create_volume_managed(
+        &self,
+        request: Request<CreateVolumeManagedRequest>,
+    ) -> Result<Response<CreateVolumeManagedResponse>, Status> {
+        let req = request.into_inner();
+        let node_id = if req.node_id.is_empty() {
+            None
+        } else {
+            Some(req.node_id)
+        };
+        match self.master.management_api() {
+            Some(m) => match m.create_volume(req.zone_id, node_id, req.size) {
+                Ok(volume_id) => Ok(Response::new(CreateVolumeManagedResponse {
+                    success: true,
+                    error: String::new(),
+                    volume_id,
+                })),
+                Err(e) => Ok(Response::new(CreateVolumeManagedResponse {
+                    success: false,
+                    error: e.to_string(),
+                    volume_id: 0,
+                })),
+            },
+            None => Ok(Response::new(CreateVolumeManagedResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+                volume_id: 0,
+            })),
+        }
+    }
+
+    async fn drain_volume_managed(
+        &self,
+        request: Request<VolumeIdRequest>,
+    ) -> Result<Response<VolumeManageResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.drain_volume(req.volume_id) {
+                Ok(()) => Ok(Response::new(VolumeManageResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(VolumeManageResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(VolumeManageResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn remove_volume_managed(
+        &self,
+        request: Request<VolumeIdRequest>,
+    ) -> Result<Response<VolumeManageResponse>, Status> {
+        let req = request.into_inner();
+        match self.master.management_api() {
+            Some(m) => match m.remove_volume(req.volume_id) {
+                Ok(()) => Ok(Response::new(VolumeManageResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(VolumeManageResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(VolumeManageResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn update_migration_policy(
+        &self,
+        request: Request<UpdateMigrationPolicyRequest>,
+    ) -> Result<Response<PolicyUpdateResponse>, Status> {
+        let req = request.into_inner();
+        let policy = MigrationPolicy {
+            max_concurrent_migrations: req.max_concurrent_migrations,
+            max_bandwidth_mbps: req.max_bandwidth_mbps,
+            load_pause_threshold: req.load_pause_threshold,
+            load_resume_threshold: req.load_resume_threshold,
+            scan_interval_secs: req.scan_interval_secs,
+        };
+        match self.master.management_api() {
+            Some(m) => match m.update_migration_policy(policy) {
+                Ok(()) => Ok(Response::new(PolicyUpdateResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(PolicyUpdateResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(PolicyUpdateResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+
+    async fn update_rebalance_policy(
+        &self,
+        request: Request<UpdateRebalancePolicyRequest>,
+    ) -> Result<Response<PolicyUpdateResponse>, Status> {
+        let req = request.into_inner();
+        let policy = RebalancePolicy {
+            volume_full_threshold: req.volume_full_threshold,
+            near_full_exclude_ratio: req.near_full_exclude_ratio,
+            load_imbalance_threshold: req.load_imbalance_threshold,
+            cold_data_threshold_hours: req.cold_data_threshold_hours,
+            min_migration_chunk_count: req.min_migration_chunk_count,
+        };
+        match self.master.management_api() {
+            Some(m) => match m.update_rebalance_policy(policy) {
+                Ok(()) => Ok(Response::new(PolicyUpdateResponse {
+                    success: true,
+                    error: String::new(),
+                })),
+                Err(e) => Ok(Response::new(PolicyUpdateResponse {
+                    success: false,
+                    error: e.to_string(),
+                })),
+            },
+            None => Ok(Response::new(PolicyUpdateResponse {
+                success: false,
+                error: "allocator management API not initialized".to_string(),
+            })),
+        }
+    }
+}
+
+// ========================================================================
+// Conversion helpers: allocator types → proto types
+// ========================================================================
+
+fn rebalance_action_to_proto(action: RebalanceAction) -> RebalanceActionInfo {
+    let mut info = RebalanceActionInfo {
+        action_type: 0,
+        from_volume: 0,
+        to_volume: 0,
+        from_node: String::new(),
+        to_node: String::new(),
+        zone_id: 0,
+        size: 0,
+        needle_ids: Vec::new(),
+        volume_ids: Vec::new(),
+    };
+    match action {
+        RebalanceAction::MigrateColdData {
+            from_volume,
+            to_volume,
+            needle_ids,
+        } => {
+            info.action_type = rebalance_action_info::ActionType::MigrateColdData as i32;
+            info.from_volume = from_volume;
+            info.to_volume = to_volume;
+            info.needle_ids = needle_ids;
+        }
+        RebalanceAction::MigrateHotData {
+            from_node,
+            to_node,
+            volume_ids,
+        } => {
+            info.action_type = rebalance_action_info::ActionType::MigrateHotData as i32;
+            info.from_node = from_node;
+            info.to_node = to_node;
+            info.volume_ids = volume_ids;
+        }
+        RebalanceAction::RequestVolumeGrow { zone_id, size } => {
+            info.action_type = rebalance_action_info::ActionType::RequestVolumeGrow as i32;
+            info.zone_id = zone_id;
+            info.size = size;
+        }
+    }
+    info
+}
+
+fn migration_task_to_proto(task: MigrationTaskStatus) -> MigrationTaskInfo {
+    MigrationTaskInfo {
+        task_id: task.task_id,
+        action_type: match task.action_type {
+            MigrationType::ColdData => "cold_data".to_string(),
+            MigrationType::HotData => "hot_data".to_string(),
+            MigrationType::VolumeGrow => "volume_grow".to_string(),
+        },
+        state: match task.state {
+            MigrationState::Pending => "pending".to_string(),
+            MigrationState::Running => "running".to_string(),
+            MigrationState::PausedByLoad => "paused_by_load".to_string(),
+            MigrationState::Completed => "completed".to_string(),
+            MigrationState::Failed => "failed".to_string(),
+        },
+        progress: task.progress,
+        bytes_migrated: task.bytes_migrated,
+        bytes_total: task.bytes_total,
+        pause_reason: task.pause_reason.unwrap_or_default(),
     }
 }
