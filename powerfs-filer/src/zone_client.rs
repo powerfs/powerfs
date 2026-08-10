@@ -235,22 +235,3 @@ pub fn alloc_needle_id(zone_id: u32, counter: &std::sync::atomic::AtomicU64) -> 
     let c = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     make_needle_id(zone_id, c)
 }
-
-/// 选空闲比例最大的 volume
-pub fn select_volume(volumes: &[ZoneVolume]) -> Option<&ZoneVolume> {
-    volumes.iter().max_by(|a, b| {
-        let free_a = if a.size > 0 {
-            1.0 - (a.used as f64 / a.size as f64)
-        } else {
-            0.0
-        };
-        let free_b = if b.size > 0 {
-            1.0 - (b.used as f64 / b.size as f64)
-        } else {
-            0.0
-        };
-        free_a
-            .partial_cmp(&free_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
