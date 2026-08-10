@@ -910,3 +910,41 @@ pub struct ShardSplitPlan {
 5. **策略热更新**：是否支持运行时切换策略（不重启），还是需要重启服务。待定。
 6. **Shard 减容**：当前 defer，依赖元数据迁移能力。加 shard 可通过 ShardMap range 分裂实现，无需迁移。
 7. **ShardMap 初始迁移**：从取模改为映射表需要一次性切换。可启动时根据 `shard_count` 生成初始映射表，行为与取模一致，后续分裂时才产生差异。
+
+## 9. 实施进展
+
+### 9.1 Allocator crate（P1-P9，已完成）
+
+| 阶段 | 内容 | 状态 | commit |
+|------|------|------|--------|
+| P1 | 创建 `powerfs-allocator` crate，6 模块 trait 定义 | ✅ | 39a589ff |
+| P2 | ShardMap range 映射替代取模，filer ShardStrategy 迁移 | ✅ | e0a384b4 |
+| P3 | master VolumeAssigner 迁移到 allocator crate | ✅ | bbbca17a |
+| P4 | filer `alloc_for_*` 决策逻辑提取为 FilerAllocator | ✅ | 9d7663dc |
+| P5 | heartbeat 扩展 CPU/内存负载指标 | ✅ | a3884f41 |
+| P6 | SnapshotStatusQuery + master snapshot builder | ✅ | 5e195285 |
+| P7 | LoadBalancer + MigrationScheduler | ✅ | d5924e7d |
+| P8 | Shard 伸缩（range 分裂） | ✅ | c80bed0f |
+| P9 | VolumeManager + VolumeControl 伸缩管理 | ✅ | a3635c4f |
+
+### 9.2 Master 集成（进行中）
+
+**已完成：RebalanceEngine 接入 master 后台 tick loop**
+
+- `powerfs-master/src/allocator_integration.rs`：
+  - `LoggingExecutor`：实现 `MigrationExecutor`，记录每个迁移动作并立即完成（无数据移动）。
+  - `RebalanceEngine`：持有 `LoadBalancer` + `MigrationScheduler`，提供 `run_tick(master)` 和 `tasks()`。
+  - `spawn_rebalance_loop`：周期后台任务，leader-only，每 `scan_interval_secs`（默认 60s）执行一次 tick。
+- `MigrationScheduler::complete_task`：补充执行器完成回调（success/failure → Completed/Failed），释放 source slot。
+- `MasterNode`：新增 `rebalance_engine` 字段、`migration_tasks()` 访问器，`start()` 中构造引擎并启动 loop。
+- 测试：allocator 77 个（+4 complete_task），master 96 个（+2 integration），clippy 0 警告。
+
+**设计决策**：
+- 周期 tick loop（非 heartbeat 回调）：`build_cluster_snapshot` 是聚合视图，适合周期性消费，不适合在每次 heartbeat 触发（高频）。
+- `LoggingExecutor` 而非真实迁移：真实数据迁移需要 volume server 冷数据追踪 + filer needle→inode 反查（计划 §5.2 阶段三前提），属于高风险大改动，留作后续里程碑。
+- sync→async 边界：allocator 全 sync，master 是 tokio async。`run_tick` 为 sync，由 `spawn_blocking` 调用；`is_leader().await` 在 async loop 中检查。
+
+**待完成**：
+- `VolumeControl` 实现：master 侧 `create_volume`/`drain_volume`/`remove_volume` 桥接到现有 Raft 方法。
+- 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新。
+- `ManagementApi` gRPC handler 接入：dry-run 校验 + 执行 + 暂停/恢复/取消。
