@@ -85,6 +85,10 @@ pub struct MasterNode {
     zone_registry: RwLock<HashMap<u32, powerfs_common::types::ZoneInfo>>,
     /// 下一个分配的 zone_id (从 1 开始, 原子递增)
     next_zone_id: Arc<AtomicU32>,
+    /// Allocator rebalance engine (LoadBalancer + MigrationScheduler).
+    /// `None` until `start()` constructs it; shared so status/monitor queries
+    /// can read migration task state.
+    rebalance_engine: RwLock<Option<Arc<crate::allocator_integration::RebalanceEngine>>>,
 }
 
 #[derive(Clone)]
@@ -411,6 +415,7 @@ impl MasterNode {
             volume_round_robin: Arc::new(AtomicU32::new(0)),
             zone_registry: RwLock::new(HashMap::new()),
             next_zone_id: Arc::new(AtomicU32::new(1)),
+            rebalance_engine: RwLock::new(None),
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -928,12 +933,15 @@ impl MasterNode {
         // which never updates an existing entry, so stale persisted ports
         // (e.g. grpc_port from a previous run) would linger forever. Callers
         // build needle-write addresses from grpc_port, so it must stay fresh.
-        let existed = topology.get_node_mut(&params.node_id).map(|existing| {
-            existing.address = params.address.clone();
-            existing.grpc_port = params.grpc_port;
-            existing.http_port = params.http_port;
-            existing.public_url = params.public_url.clone();
-        }).is_some();
+        let existed = topology
+            .get_node_mut(&params.node_id)
+            .map(|existing| {
+                existing.address = params.address.clone();
+                existing.grpc_port = params.grpc_port;
+                existing.http_port = params.http_port;
+                existing.public_url = params.public_url.clone();
+            })
+            .is_some();
         if !existed {
             let node = DataNodeInfo::new(
                 params.node_id,
@@ -1562,12 +1570,7 @@ impl MasterNode {
     /// heartbeat and doesn't need strong consistency.
     ///
     /// Called from `handle_heartbeat` after `add_node` / `update_node_volumes`.
-    pub fn update_node_load_metrics(
-        &self,
-        node_id: &NodeId,
-        cpu_usage: f32,
-        memory_usage: f32,
-    ) {
+    pub fn update_node_load_metrics(&self, node_id: &NodeId, cpu_usage: f32, memory_usage: f32) {
         let mut topology = self.topology.write().unwrap();
         if let Some(node) = topology.get_node_mut(node_id) {
             node.cpu_usage = cpu_usage;
@@ -2270,6 +2273,17 @@ impl MasterNode {
             .collect()
     }
 
+    /// Return a snapshot of the rebalance engine's migration tasks (empty if
+    /// the engine hasn't started yet). For StatusQuery / monitoring.
+    pub fn migration_tasks(&self) -> Vec<powerfs_allocator::MigrationTaskStatus> {
+        self.rebalance_engine
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|e| e.tasks())
+            .unwrap_or_default()
+    }
+
     /// Build a [`powerfs_allocator::ClusterSnapshot`] from the Master's
     /// current heartbeat-aggregated state.
     ///
@@ -2282,9 +2296,7 @@ impl MasterNode {
     /// enriches heartbeats; the capacity/health/usage views are fully
     /// functional today.
     pub fn build_cluster_snapshot(&self) -> powerfs_allocator::ClusterSnapshot {
-        use powerfs_allocator::{
-            NodeRuntime, ShardRuntime, VolumeLoad, VolumeRuntime,
-        };
+        use powerfs_allocator::{NodeRuntime, ShardRuntime, VolumeLoad, VolumeRuntime};
 
         // --- Nodes: Topology → NodeRuntime ---
         let data_nodes = self.topology.read().unwrap().list_all_nodes();
@@ -2305,7 +2317,12 @@ impl MasterNode {
                 // Composite load_score: weighted blend of cpu, memory, disk.
                 // Until P5 enriched heartbeats, cpu/memory were 0 and this
                 // reduced to disk usage. Now all three contribute.
-                load_score: compute_load_score(n.cpu_usage, n.memory_usage, n.total_space, n.used_space),
+                load_score: compute_load_score(
+                    n.cpu_usage,
+                    n.memory_usage,
+                    n.total_space,
+                    n.used_space,
+                ),
                 in_maintenance: n.maintenance_mode,
             })
             .collect();
@@ -3090,6 +3107,26 @@ impl MasterNode {
             }
         });
 
+        // Allocator rebalance engine: build it now (after heartbeats have a
+        // chance to populate topology) and spawn the background tick loop.
+        // Only the Raft leader runs ticks; followers no-op.
+        {
+            let volume_default_size = self.cluster_config.read().unwrap().volume_size_limit;
+            let engine =
+                crate::allocator_integration::RebalanceEngine::new_logging(volume_default_size);
+            *self.rebalance_engine.write().unwrap() = Some(Arc::clone(&engine));
+            crate::allocator_integration::spawn_rebalance_loop(engine, Arc::clone(&self));
+            info!(
+                "Allocator rebalance engine started (scan_interval={}s)",
+                self.rebalance_engine
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|e| e.scan_interval_secs())
+                    .unwrap_or(0)
+            );
+        }
+
         let master_clone = self.clone();
         let kv_cache_clone = self.kv_cache.clone();
         let server_address = self.address;
@@ -3290,6 +3327,7 @@ impl Clone for MasterNode {
             volume_round_robin: self.volume_round_robin.clone(),
             zone_registry: RwLock::new(self.zone_registry.read().unwrap().clone()),
             next_zone_id: self.next_zone_id.clone(),
+            rebalance_engine: RwLock::new(self.rebalance_engine.read().unwrap().clone()),
         }
     }
 }
@@ -3410,7 +3448,10 @@ fn map_node_state(
         return NodeRuntimeState::Maintenance;
     }
     match state {
-        NodeState::Init | NodeState::Ready | NodeState::Healthy | NodeState::SoftError
+        NodeState::Init
+        | NodeState::Ready
+        | NodeState::Healthy
+        | NodeState::SoftError
         | NodeState::FailSlow => NodeRuntimeState::Healthy,
         NodeState::Degraded => NodeRuntimeState::Degraded,
         NodeState::Maintenance => NodeRuntimeState::Maintenance,
@@ -3753,25 +3794,64 @@ mod tests {
     #[test]
     fn test_map_node_state_variants() {
         use powerfs_allocator::NodeRuntimeState;
-        assert_eq!(map_node_state(NodeState::Healthy, false), NodeRuntimeState::Healthy);
-        assert_eq!(map_node_state(NodeState::Ready, false), NodeRuntimeState::Healthy);
-        assert_eq!(map_node_state(NodeState::SoftError, false), NodeRuntimeState::Healthy);
-        assert_eq!(map_node_state(NodeState::FailSlow, false), NodeRuntimeState::Healthy);
-        assert_eq!(map_node_state(NodeState::Degraded, false), NodeRuntimeState::Degraded);
-        assert_eq!(map_node_state(NodeState::Maintenance, false), NodeRuntimeState::Maintenance);
-        assert_eq!(map_node_state(NodeState::Fault, false), NodeRuntimeState::Down);
-        assert_eq!(map_node_state(NodeState::Unavailable, false), NodeRuntimeState::Down);
+        assert_eq!(
+            map_node_state(NodeState::Healthy, false),
+            NodeRuntimeState::Healthy
+        );
+        assert_eq!(
+            map_node_state(NodeState::Ready, false),
+            NodeRuntimeState::Healthy
+        );
+        assert_eq!(
+            map_node_state(NodeState::SoftError, false),
+            NodeRuntimeState::Healthy
+        );
+        assert_eq!(
+            map_node_state(NodeState::FailSlow, false),
+            NodeRuntimeState::Healthy
+        );
+        assert_eq!(
+            map_node_state(NodeState::Degraded, false),
+            NodeRuntimeState::Degraded
+        );
+        assert_eq!(
+            map_node_state(NodeState::Maintenance, false),
+            NodeRuntimeState::Maintenance
+        );
+        assert_eq!(
+            map_node_state(NodeState::Fault, false),
+            NodeRuntimeState::Down
+        );
+        assert_eq!(
+            map_node_state(NodeState::Unavailable, false),
+            NodeRuntimeState::Down
+        );
     }
 
     #[test]
     fn test_map_volume_state_variants() {
         use powerfs_allocator::VolumeRuntimeState;
         use powerfs_common::types::VolumeState;
-        assert_eq!(map_volume_state(VolumeState::Creating), VolumeRuntimeState::Active);
-        assert_eq!(map_volume_state(VolumeState::Available), VolumeRuntimeState::Active);
-        assert_eq!(map_volume_state(VolumeState::ReadOnly), VolumeRuntimeState::Active);
-        assert_eq!(map_volume_state(VolumeState::Full), VolumeRuntimeState::Full);
-        assert_eq!(map_volume_state(VolumeState::Deleting), VolumeRuntimeState::Deleted);
+        assert_eq!(
+            map_volume_state(VolumeState::Creating),
+            VolumeRuntimeState::Active
+        );
+        assert_eq!(
+            map_volume_state(VolumeState::Available),
+            VolumeRuntimeState::Active
+        );
+        assert_eq!(
+            map_volume_state(VolumeState::ReadOnly),
+            VolumeRuntimeState::Active
+        );
+        assert_eq!(
+            map_volume_state(VolumeState::Full),
+            VolumeRuntimeState::Full
+        );
+        assert_eq!(
+            map_volume_state(VolumeState::Deleting),
+            VolumeRuntimeState::Deleted
+        );
     }
 
     #[test]

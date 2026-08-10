@@ -279,6 +279,50 @@ impl MigrationScheduler {
         self.tasks.read().unwrap().clone()
     }
 
+    /// Report completion of a running task.
+    ///
+    /// Called by the service-side executor once the data copy finishes (or
+    /// fails). On success the task moves to `Completed` with `progress=1.0`;
+    /// on failure it moves to `Failed`. Either way the source is released so a
+    /// fresh migration may start for it on a later tick.
+    ///
+    /// Unknown / already-terminal tasks return `InvalidState` (the caller most
+    /// likely raced a cancel or a duplicate completion).
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        success: bool,
+        bytes_migrated: u64,
+    ) -> Result<(), ManageError> {
+        let mut tasks = self.tasks.write().unwrap();
+        let task = tasks
+            .iter_mut()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| ManageError::ResourceNotFound(format!("migration task {task_id}")))?;
+        if task.state == MigrationState::Completed || task.state == MigrationState::Failed {
+            return Err(ManageError::InvalidState(format!(
+                "task {task_id} already in terminal state {:?}",
+                task.state
+            )));
+        }
+        // PausedByLoad tasks may also be completed by the executor (e.g. a
+        // previously-dispatched copy finished while the scheduler paused new
+        // starts). Allow the transition.
+        if success {
+            task.state = MigrationState::Completed;
+            task.progress = 1.0;
+            task.bytes_migrated = bytes_migrated.max(task.bytes_migrated);
+        } else {
+            task.state = MigrationState::Failed;
+            task.bytes_migrated = bytes_migrated.max(task.bytes_migrated);
+        }
+        drop(tasks);
+
+        // Release the source so a fresh migration may start for it.
+        self.task_sources.write().unwrap().remove(task_id);
+        Ok(())
+    }
+
     // ===== Internal helpers =====
 
     fn pause_all_running(&self, policy: &MigrationPolicy) {
@@ -815,5 +859,93 @@ mod tests {
             1,
             "must not start a duplicate migration for the same source"
         );
+    }
+
+    #[test]
+    fn test_complete_task_success_marks_completed_and_releases_source() {
+        let policy = policy_pause_at(0.7, 0.4, 4);
+        let (sched, lb) = scheduler_with(policy);
+        let snapshot = snap(
+            vec![
+                vol(1, "n1", 100, 90, VolumeRuntimeState::Draining),
+                vol(2, "n2", 100, 10, VolumeRuntimeState::Active),
+            ],
+            vec![
+                node("n1", 0.2, NodeRuntimeState::Healthy),
+                node("n2", 0.2, NodeRuntimeState::Healthy),
+            ],
+            0.3,
+        );
+        sched.tick(&snapshot, &lb);
+        let task_id = sched.tasks()[0].task_id.clone();
+        assert_eq!(sched.tasks()[0].state, MigrationState::Running);
+
+        // Executor reports success.
+        sched.complete_task(&task_id, true, 90).unwrap();
+        assert_eq!(sched.tasks()[0].state, MigrationState::Completed);
+        assert_eq!(sched.tasks()[0].progress, 1.0);
+        assert_eq!(sched.tasks()[0].bytes_migrated, 90);
+
+        // Source released → a fresh migration may start for volume 1 next tick.
+        sched.tick(&snapshot, &lb);
+        assert_eq!(
+            sched.count_active(),
+            1,
+            "after completion the source should be eligible again"
+        );
+    }
+
+    #[test]
+    fn test_complete_task_failure_marks_failed() {
+        let policy = policy_pause_at(0.7, 0.4, 4);
+        let (sched, lb) = scheduler_with(policy);
+        let snapshot = snap(
+            vec![
+                vol(1, "n1", 100, 90, VolumeRuntimeState::Draining),
+                vol(2, "n2", 100, 10, VolumeRuntimeState::Active),
+            ],
+            vec![
+                node("n1", 0.2, NodeRuntimeState::Healthy),
+                node("n2", 0.2, NodeRuntimeState::Healthy),
+            ],
+            0.3,
+        );
+        sched.tick(&snapshot, &lb);
+        let task_id = sched.tasks()[0].task_id.clone();
+
+        sched.complete_task(&task_id, false, 10).unwrap();
+        assert_eq!(sched.tasks()[0].state, MigrationState::Failed);
+        assert_eq!(sched.tasks()[0].bytes_migrated, 10);
+    }
+
+    #[test]
+    fn test_complete_task_unknown_rejected() {
+        let policy = policy_pause_at(0.7, 0.4, 4);
+        let (sched, _lb) = scheduler_with(policy);
+        let err = sched.complete_task("nope", true, 0).unwrap_err();
+        assert!(matches!(err, ManageError::ResourceNotFound(_)));
+    }
+
+    #[test]
+    fn test_complete_task_double_complete_rejected() {
+        let policy = policy_pause_at(0.7, 0.4, 4);
+        let (sched, lb) = scheduler_with(policy);
+        let snapshot = snap(
+            vec![
+                vol(1, "n1", 100, 90, VolumeRuntimeState::Draining),
+                vol(2, "n2", 100, 10, VolumeRuntimeState::Active),
+            ],
+            vec![
+                node("n1", 0.2, NodeRuntimeState::Healthy),
+                node("n2", 0.2, NodeRuntimeState::Healthy),
+            ],
+            0.3,
+        );
+        sched.tick(&snapshot, &lb);
+        let task_id = sched.tasks()[0].task_id.clone();
+        sched.complete_task(&task_id, true, 0).unwrap();
+        // Second completion must be rejected (already terminal).
+        let err = sched.complete_task(&task_id, true, 0).unwrap_err();
+        assert!(matches!(err, ManageError::InvalidState(_)));
     }
 }
