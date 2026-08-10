@@ -22,6 +22,7 @@
 pub mod allocator;
 pub mod config;
 pub mod error;
+pub mod filer_alloc;
 pub mod management;
 pub mod shard_map;
 pub mod snapshot;
@@ -38,6 +39,7 @@ pub use config::{
     ClusterStaticConfig, MigrationPolicy, PlacementPolicyConfig, RebalancePolicy, ZoneConfig,
 };
 pub use error::{AllocError, ManageError, ShardError, ShardId};
+pub use filer_alloc::{FilerAllocator, VolumePick, ZoneView};
 pub use management::{
     ManagementApi, MigrationExecutionResult, MigrationRejection, RebalanceAction,
     RejectionReason, ShardSplitPlan,

@@ -44,8 +44,9 @@ pub struct FilerNetHandler {
     /// 该 Filer 拥有的所有 Zone (多 Zone 设计: 旧 + 新)
     /// 空 Vec = 未注册, 无法分配 needle_id
     zones: std::sync::RwLock<Vec<ZoneState>>,
-    /// round-robin 选 Zone 的索引 (fetch_add % zones.len())
-    zone_rr: std::sync::atomic::AtomicU32,
+    /// P4: Filer-side allocation decision logic (extracted to powerfs-allocator).
+    /// Owns the zone round-robin counter. The filer keeps needle_id execution.
+    filer_allocator: powerfs_allocator::FilerAllocator,
     /// P2.5: Inline 小文件全局阈值 (字节). 0 = 禁用 (默认, 保持 Flat 行为).
     /// 大于 0 时, handle_create 对新文件返回 Placement::Inline + 该 max_size,
     /// 跳过 Volume Server 分配. 父目录 `powerfs.inline` xattr 可覆盖此值.
@@ -129,7 +130,7 @@ impl FilerNetHandler {
             inode_notifier: None,
             inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
-            zone_rr: std::sync::atomic::AtomicU32::new(0),
+            filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -148,7 +149,7 @@ impl FilerNetHandler {
             inode_notifier: Some(inode_notifier),
             inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
             zones: std::sync::RwLock::new(Vec::new()),
-            zone_rr: std::sync::atomic::AtomicU32::new(0),
+            filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -252,81 +253,54 @@ impl FilerNetHandler {
             return None;
         }
 
-        // 收集所有可用 volume (跨所有 Zone), 记录 (volume_id, node_id, zone_idx)
-        #[derive(Clone)]
-        struct VolEntry {
-            volume_id: u64,
-            node_id: String,
-            zone_idx: usize,
-        }
-        let mut all_volumes: Vec<VolEntry> = Vec::new();
-        for (zidx, zone) in zones.iter().enumerate() {
-            for vol in &zone.volumes {
-                all_volumes.push(VolEntry {
-                    volume_id: vol.volume_id,
-                    node_id: vol.node_id.clone(),
-                    zone_idx: zidx,
-                });
-            }
-        }
-        if all_volumes.is_empty() {
+        // P4: Build a read-only ZoneView snapshot and delegate the volume
+        // selection *decision* to FilerAllocator. The filer keeps the
+        // needle_id *execution* (atomic counter increment).
+        let zone_views: Vec<powerfs_allocator::ZoneView> = zones
+            .iter()
+            .map(|z| powerfs_allocator::ZoneView {
+                zone_id: z.zone_id,
+                volumes: z.volumes.clone(),
+            })
+            .collect();
+
+        let total_volumes: usize = zone_views.iter().map(|z| z.volumes.len()).sum();
+        if total_volumes == 0 {
             warn!("FILER_P3: no volumes available for stripe allocation");
             return None;
         }
 
-        let count = count as usize;
-
-        // 按 node_id 分组，组内保持原始顺序（zone 遍历顺序）
-        use std::collections::HashMap;
-        let mut node_groups: Vec<(String, Vec<VolEntry>)> = Vec::new();
-        let mut node_map: HashMap<String, usize> = HashMap::new();
-        for vol in &all_volumes {
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                node_map.entry(vol.node_id.clone())
-            {
-                e.insert(node_groups.len());
-                node_groups.push((vol.node_id.clone(), Vec::new()));
-            }
-            let idx = node_map[&vol.node_id];
-            node_groups[idx].1.push(vol.clone());
+        let picks = self.filer_allocator.pick_for_stripe_file(&zone_views, count as usize)?;
+        if picks.is_empty() {
+            return Some(Vec::new());
         }
 
-        let num_nodes = node_groups.len();
-        let total_volumes = all_volumes.len();
-
-        // Round-robin 跨节点选取 volume，保证 shard 尽量落不同节点
-        let mut result = Vec::with_capacity(count);
-        loop {
-            let mut picked = false;
-            for (_, group) in node_groups.iter_mut() {
-                if result.len() >= count {
-                    break;
-                }
-                if let Some(vol) = group.first().cloned() {
-                    let zone = &zones[vol.zone_idx];
-                    let needle_id =
-                        crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
-                    result.push((vol.volume_id, needle_id));
-                    group.remove(0);
-                    picked = true;
-                }
-            }
-            if !picked || result.len() >= count {
-                break;
+        // Execute: allocate needle_id from each pick's zone counter.
+        let mut result = Vec::with_capacity(picks.len());
+        for pick in &picks {
+            let zone = zones.iter().find(|z| z.zone_id == pick.zone_id);
+            if let Some(zone) = zone {
+                let needle_id =
+                    crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                result.push((pick.volume_id, needle_id));
             }
         }
 
         let unique_volumes: std::collections::HashSet<u64> =
             result.iter().map(|(v, _)| *v).collect();
-        let unique_nodes: std::collections::HashSet<&str> = result
+        let unique_nodes: std::collections::HashSet<&str> = picks
             .iter()
-            .filter_map(|(vid, _)| {
-                all_volumes
-                    .iter()
-                    .find(|v| v.volume_id == *vid)
-                    .map(|v| v.node_id.as_str())
-            })
+            .map(|p| p.node_id.as_str())
             .collect();
+        let num_nodes = {
+            let mut s: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for zv in &zone_views {
+                for v in &zv.volumes {
+                    s.insert(v.node_id.as_str());
+                }
+            }
+            s.len()
+        };
         info!(
             "FILER_P3: allocated {} stripe chunks across {} unique volumes / {} unique nodes ({} vols / {} nodes available)",
             result.len(),
@@ -415,30 +389,32 @@ impl FilerNetHandler {
             return None;
         }
 
-        // round-robin 选 Zone: zone_rr.fetch_add(1) % zones.len()
-        let rr = self
-            .zone_rr
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let idx = (rr as usize) % zones.len();
-        let zone = &zones[idx];
+        // P4: Build a read-only ZoneView snapshot and delegate the volume
+        // selection *decision* to FilerAllocator (round-robin zone +
+        // most-free-space volume). The filer keeps the needle_id *execution*.
+        let zone_views: Vec<powerfs_allocator::ZoneView> = zones
+            .iter()
+            .map(|z| powerfs_allocator::ZoneView {
+                zone_id: z.zone_id,
+                volumes: z.volumes.clone(),
+            })
+            .collect();
 
-        // 从选中 Zone 的 counter 分配 needle_id
+        let pick = self.filer_allocator.pick_for_new_file(&zone_views)?;
+
+        // Execute: allocate needle_id from the picked zone's counter.
+        let zone = zones.iter().find(|z| z.zone_id == pick.zone_id)?;
         let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
 
-        // 从该 Zone 的 volumes 中选空闲比例最大的
-        let vol = crate::zone_client::select_volume(&zone.volumes)?;
-        let volume_id = vol.volume_id;
-
         info!(
-            "FILER_ZONE: allocated needle_id={:#x} (zone={}, counter={}, rr_idx={}) volume_id={}",
+            "FILER_ZONE: allocated needle_id={:#x} (zone={}, counter={}) volume_id={}",
             needle_id,
-            zone.zone_id,
+            pick.zone_id,
             powerfs_common::types::needle_counter(needle_id),
-            idx,
-            volume_id
+            pick.volume_id
         );
 
-        Some((volume_id, needle_id))
+        Some((pick.volume_id, needle_id))
     }
 
     /// Notify subscribers that an inode's metadata has changed.
