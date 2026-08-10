@@ -371,6 +371,10 @@ pub enum VolumeState {
     Available,
     Full,
     ReadOnly,
+    /// Draining: stopped accepting new allocations, data being migrated out.
+    /// Maps to `VolumeRuntimeState::Draining` in the allocator snapshot so
+    /// the LoadBalancer schedules cold-data migration off this volume.
+    Draining,
     Deleting,
 }
 

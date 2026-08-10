@@ -944,7 +944,16 @@ pub struct ShardSplitPlan {
 - `LoggingExecutor` 而非真实迁移：真实数据迁移需要 volume server 冷数据追踪 + filer needle→inode 反查（计划 §5.2 阶段三前提），属于高风险大改动，留作后续里程碑。
 - sync→async 边界：allocator 全 sync，master 是 tokio async。`run_tick` 为 sync，由 `spawn_blocking` 调用；`is_leader().await` 在 async loop 中检查。
 
+**已完成：VolumeState::Draining 变体 + MasterVolumeControl**
+
+- `powerfs_common::types::VolumeState`：新增 `Draining` 变体（Creating/Available/Full/ReadOnly/**Draining**/Deleting）。
+- master.rs 3 处穷举 match 更新：Raft string↔VolumeState 双向映射、`map_volume_state`（Draining→VolumeRuntimeState::Draining）。
+- provider_impl.rs Display 映射、volume/server.rs 状态映射 + `read_only` 字段（Draining 也视为只读）。
+- `MasterVolumeControl`：实现 `VolumeControl` trait，通过 `block_in_place`+`Handle::block_on` 桥接 sync→async，调用 master 的 `create_new_volume_with_preference`/`update_volume_state(Draining)`/`delete_volume`。
+- `map_powerfs_error`：PowerFsError→ManageError 映射（NotLeader→InvalidState, VolumeNotFound→ResourceNotFound 等）+ 3 个单元测试。
+- 测试：allocator 77、common 68（+Draining 变体）、master 99（+3 错误映射+1 map_volume_state），clippy 0 警告。
+
 **待完成**：
-- `VolumeControl` 实现：master 侧 `create_volume`/`drain_volume`/`remove_volume` 桥接到现有 Raft 方法。
 - 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新。
 - `ManagementApi` gRPC handler 接入：dry-run 校验 + 执行 + 暂停/恢复/取消。
+- `VolumeManager` 接入 `MasterVolumeControl`：管理操作走 VolumeManager 验证→VolumeControl 执行。
