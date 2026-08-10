@@ -135,6 +135,21 @@ impl ShardStrategy {
             .map_err(|e| e.to_string())
     }
 
+    /// Remove a Draining shard and merge its range back into the previous
+    /// Active entry. The shard must be Draining and have no active inodes.
+    pub fn remove_shard(&self, shard_id: ShardId) -> Result<(), String> {
+        let map = self.shard_map.read().unwrap();
+        map.remove_shard(powerfs_allocator::ShardId(shard_id.0))
+            .map_err(|e| e.to_string())?;
+        drop(map);
+
+        let mut count = self.shard_count.write().unwrap();
+        if *count > 0 {
+            *count -= 1;
+        }
+        Ok(())
+    }
+
     /// Get all Active shard IDs (available for new allocations).
     pub fn active_shards(&self) -> Vec<ShardId> {
         let map = self.shard_map.read().unwrap();

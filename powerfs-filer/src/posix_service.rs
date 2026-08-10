@@ -9,17 +9,18 @@ use crate::shard_strategy::ShardStrategy;
 
 use super::powerfs::posix_meta_service_server::PosixMetaService;
 use super::powerfs::{
-    AllocInodeBatchRequest, AllocInodeBatchResponse, CreateDirectoryRequest,
-    CreateDirectoryResponse, CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest,
-    DeleteEntryResponse, Entry as ProtoEntry, FileChunk as ProtoFileChunk, FuseAttributes,
-    GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse,
-    GetShardStatsRequest, GetShardStatsResponse, LeaseReleaseRequest, LeaseReleaseResponse,
-    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest,
-    ListEntriesResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
-    LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
-    PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RenameEntryRequest,
-    RenameEntryResponse, UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
-    UpdateInodeSizeChunksResponse,
+    AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
+    CreateDirectoryRequest, CreateDirectoryResponse, CreateEntryRequest, CreateEntryResponse,
+    DeleteEntryRequest, DeleteEntryResponse, DrainShardRequest, Entry as ProtoEntry,
+    FileChunk as ProtoFileChunk, FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse,
+    GetEntryRequest, GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse,
+    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse,
+    LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest,
+    ListShardsResponse, LookupDirectoryEntryRequest, LookupDirectoryEntryResponse,
+    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse,
+    RaftMessageRequest, RaftMessageResponse, RemoveShardRequest, RenameEntryRequest,
+    RenameEntryResponse, ShardControlResponse, UpdateEntryRequest, UpdateEntryResponse,
+    UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
 };
 
 const S_IFDIR: u32 = 0o170000;
@@ -894,6 +895,74 @@ impl PosixMetaService for PosixMetaServiceImpl {
                 error: "".to_string(),
             })),
             Err(e) => Ok(Response::new(RaftMessageResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn add_shard(
+        &self,
+        request: Request<AddShardRequest>,
+    ) -> Result<Response<AddShardResponse>, Status> {
+        let req = request.into_inner();
+        let split_from = if req.split_from == 0 {
+            None
+        } else {
+            Some(ShardId(req.split_from))
+        };
+        match self.shard_strategy.add_shard_auto(split_from, req.dry_run) {
+            Ok(plan) => Ok(Response::new(AddShardResponse {
+                success: true,
+                error: String::new(),
+                new_shard_id: plan.new_shard_id.0,
+                split_from: plan.split_from.0,
+                split_point: plan.split_point,
+                new_range_start: plan.new_range.0,
+                new_range_end: plan.new_range.1,
+                affected_future_allocations: plan.affected_future_allocations,
+            })),
+            Err(e) => Ok(Response::new(AddShardResponse {
+                success: false,
+                error: e,
+                new_shard_id: 0,
+                split_from: 0,
+                split_point: 0,
+                new_range_start: 0,
+                new_range_end: 0,
+                affected_future_allocations: 0,
+            })),
+        }
+    }
+
+    async fn drain_shard(
+        &self,
+        request: Request<DrainShardRequest>,
+    ) -> Result<Response<ShardControlResponse>, Status> {
+        let req = request.into_inner();
+        match self.shard_strategy.drain_shard(ShardId(req.shard_id)) {
+            Ok(()) => Ok(Response::new(ShardControlResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ShardControlResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn remove_shard(
+        &self,
+        request: Request<RemoveShardRequest>,
+    ) -> Result<Response<ShardControlResponse>, Status> {
+        let req = request.into_inner();
+        match self.shard_strategy.remove_shard(ShardId(req.shard_id)) {
+            Ok(()) => Ok(Response::new(ShardControlResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(ShardControlResponse {
                 success: false,
                 error: e,
             })),
