@@ -10,6 +10,7 @@ members = [
     "powerfs-fuse-core",
     "powerfs-layout",
     "powerfs-common",
+    "powerfs-allocator",
     "powerfs-s3",
     "powerfs-cli",
     "powerfs-kv-client",
