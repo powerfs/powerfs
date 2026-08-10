@@ -13,6 +13,7 @@ import {
   CheckCircleOutlined as AcknowledgeOutlined,
 } from '@ant-design/icons'
 import type { AlertInfo, AlertRule } from '@/types'
+import type { ColumnsType } from 'antd/es/table'
 import { getAlerts, getAlertRules, acknowledgeAlert } from '@/services/api'
 import { useMetricStream } from '@/hooks/useMetricStream'
 
@@ -23,6 +24,20 @@ function Alerts() {
   const [showDetail, setShowDetail] = useState(false)
   const [showRuleForm, setShowRuleForm] = useState(false)
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null)
+
+  // 告警分类: 根据 rule_id 前缀映射
+  const getCategory = (ruleId: string): { label: string; color: string } => {
+    if (ruleId.startsWith('rule-node-') || ruleId.startsWith('rule-no-raft')) {
+      return { label: '服务状态', color: 'blue' }
+    }
+    if (ruleId.startsWith('rule-shard-') || ruleId.startsWith('rule-filer-no-leader')) {
+      return { label: '均衡迁移', color: 'purple' }
+    }
+    if (ruleId.startsWith('rule-filer-unreachable')) {
+      return { label: '故障', color: 'red' }
+    }
+    return { label: '资源指标', color: 'default' }
+  }
 
   const loadData = async () => {
     const [alertList, ruleList] = await Promise.all([
@@ -63,7 +78,7 @@ function Alerts() {
     setRules(rules.map(r => r.id === rule.id ? { ...r, enabled: !r.enabled } : r))
   }
 
-  const alertColumns = [
+  const alertColumns: ColumnsType<AlertInfo> = [
     {
       title: '告警名称',
       dataIndex: 'name',
@@ -87,6 +102,32 @@ function Alerts() {
             {icon} {text}
           </Tag>
         )
+      },
+    },
+    {
+      title: '分类',
+      dataIndex: 'rule_id',
+      key: 'category',
+      width: 120,
+      filters: [
+        { text: '服务状态', value: 'service' },
+        { text: '均衡迁移', value: 'balancer' },
+        { text: '故障', value: 'failure' },
+        { text: '资源指标', value: 'resource' },
+      ],
+      onFilter: (value: boolean | React.Key, record: AlertInfo) => {
+        const cat = getCategory(record.rule_id)
+        const map: Record<string, string> = {
+          '服务状态': 'service',
+          '均衡迁移': 'balancer',
+          '故障': 'failure',
+          '资源指标': 'resource',
+        }
+        return map[cat.label] === String(value)
+      },
+      render: (ruleId: string) => {
+        const cat = getCategory(ruleId)
+        return <Tag color={cat.color}>{cat.label}</Tag>
       },
     },
     {
