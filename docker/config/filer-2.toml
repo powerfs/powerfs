@@ -1,66 +1,19 @@
 # PowerFS Filer 节点配置 - 节点2
+# 精简配置：只需 [global] + [filer] 段
+
 [global]
 log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
-[master]
-port = 9333
-net_port = 8890
-dir = "/data/master"
+[filer]
+port = 8888
+grpc_port = 8889
+net_port = 9334
 ip = "0.0.0.0"
-advertise_addr = "172.30.0.11:9333"
-raft_id = 1
-peers = ["172.30.0.11:9333"]
-
-[volume]
-grpc_port = 8080
-http_port = 8092
-net_port = 8902
-data_dir = "/data/volume"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
 master_net_port = 9334
-node_id = "volume-server-2"
-max_volume_size = 10737418240
-initial_volume_count = 4
-
-[filer]
-port = 8888                    # HTTP端口
-grpc_port = 8889               # gRPC端口
-net_port = 9334                # powerfs-net端口
-ip = "0.0.0.0"             # 绑定所有接口
-master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
-master_net_port = 9334           # Master的powerfs-net端口 (用于Zone注册)
 data_dir = "/data/filer"
-shard_count = 2
+shard_count = 3
 raft_id = 2
 raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
-inline_max_size = 8192        # K2: 启用 Inline 小文件优化 (8KB 阈值, 内核已支持)
-
-[s3]
-port = 9000
-master_address = "172.30.0.11:9333"
-dir = "/data/s3"
-access_key = "powerfs"
-secret_key = "powerfs123"
-
-[fuse]
-mount_point = "/mnt/powerfs"
-master_addresses = ["172.30.0.11"]
-filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
-volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23"]
-master_net_port = 9334
-master_grpc_port = 9333
-volume_net_port = 8901
-filer_net_port = 9334
-collection = "default"
-replication = "000"
-threads = 8
-verbose = false
-container = false
-
-[monitor]
-addr = "0.0.0.0:8081"
-redis_url = "redis://172.30.0.50:6379"
-s3_endpoint = "http://172.30.0.32:9000"
-s3_backend_endpoint = "http://172.30.0.32:9000"
-master_endpoint = "http://172.30.0.11:9333"
+inline_max_size = 8192

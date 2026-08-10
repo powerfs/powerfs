@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use powerfs_common::config::PowerFsConfig;
+use powerfs_common::config::{PowerFsConfig, ServiceType};
 use powerfs_fuse::FuseApp;
 
 static MOUNT_POINT_PATH: OnceLock<CString> = OnceLock::new();
@@ -84,7 +84,7 @@ fn install_signal_handlers(mount_point: &str) {
 
 /// 从配置文件加载配置，失败时直接退出
 fn load_config(config_path: &str) -> PowerFsConfig {
-    match PowerFsConfig::load_or_error(config_path) {
+    match PowerFsConfig::load_for_service(config_path, ServiceType::Fuse) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", config_path);
             cfg
@@ -167,9 +167,11 @@ fn main() {
         eprintln!("ERROR: fuse.master_addresses must not be empty");
         process::exit(1);
     }
+    // volume_addrs 可选：为空时由 FuseClientFacade 从 master 拓扑动态发现
+    // (master GetTopology 下发 volumes[].addr)。仅当 force_mount=true 且拓扑
+    // 也为空时，才在 facade 层报错（无兜底地址）。
     if volume_addrs.is_empty() {
-        eprintln!("ERROR: fuse.volume_addresses must not be empty");
-        process::exit(1);
+        info!("fuse.volume_addresses is empty — will discover volumes from master topology");
     }
     if master_net_port == 0 {
         eprintln!("ERROR: fuse.master_net_port must be set");

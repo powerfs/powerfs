@@ -3,7 +3,7 @@ use log::info;
 use std::sync::Arc;
 
 use powerfs_common::build_info::BuildInfo;
-use powerfs_common::config::PowerFsConfig;
+use powerfs_common::config::{PowerFsConfig, ServiceType};
 use powerfs_common::types::ClusterConfig;
 use powerfs_master::master::MasterNode;
 
@@ -34,7 +34,7 @@ struct Args {
 }
 
 fn load_config(config_path: &str) -> PowerFsConfig {
-    match PowerFsConfig::load_or_error(config_path) {
+    match PowerFsConfig::load_for_service(config_path, ServiceType::Master) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", config_path);
             cfg

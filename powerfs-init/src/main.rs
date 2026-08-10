@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info};
-use powerfs_common::config::PowerFsConfig;
+use powerfs_common::config::{PowerFsConfig, ServiceType};
 use powerfs_filer::{
     shard_store::{FileType, InodeInfo, ShardStore},
     ShardId,
@@ -40,7 +40,7 @@ fn main() {
     info!("====================================");
 
     // Load config - same config file used by powerfs-filer
-    let config = match PowerFsConfig::load_or_error(&args.config) {
+    let config = match PowerFsConfig::load_for_service(&args.config, ServiceType::Filer) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", args.config);
             cfg

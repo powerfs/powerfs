@@ -243,7 +243,7 @@ fn handle_renew(body: &[u8], leases: &LeaseStore) -> (u16, Vec<u8>) {
 
 async fn create_facade_with_inode_lease(filer_port: u16) -> FuseClientFacade {
     let config = FuseClientFacadeConfig {
-        master_addr: "127.0.0.1".to_string(),
+        master_addrs: vec!["127.0.0.1".to_string()],
         master_port: 19999,
         volume_net_port: 19998,
         volume_addrs: Vec::new(),

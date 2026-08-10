@@ -142,31 +142,28 @@ impl FuseApp {
             self.master_addresses.join(", ")
         );
 
-        // Extract host from master address
-        // Strip protocol prefix (http://, https://) if present
-        let master_full = self
+        // Extract host from each master address (strip protocol prefix and port).
+        // All masters share the same powerfs-net port (`master_net_port`).
+        if self.master_addresses.is_empty() {
+            return Err(PowerFsError::Internal(
+                "master_addresses is empty (must be configured)".to_string(),
+            ));
+        }
+        let master_addrs: Vec<String> = self
             .master_addresses
-            .first()
-            .ok_or_else(|| {
-                PowerFsError::Internal("master_addresses is empty (must be configured)".to_string())
-            })?
-            .clone();
-        let master_addr = {
-            let without_proto = master_full
-                .strip_prefix("http://")
-                .or_else(|| master_full.strip_prefix("https://"))
-                .unwrap_or(&master_full);
-            without_proto
-                .split(':')
-                .next()
-                .ok_or_else(|| {
-                    PowerFsError::Internal(format!(
-                        "Cannot parse host from master address: {}",
-                        master_full
-                    ))
-                })?
-                .to_string()
-        };
+            .iter()
+            .map(|full| {
+                let without_proto = full
+                    .strip_prefix("http://")
+                    .or_else(|| full.strip_prefix("https://"))
+                    .unwrap_or(full);
+                without_proto
+                    .split(':')
+                    .next()
+                    .unwrap_or(without_proto)
+                    .to_string()
+            })
+            .collect();
 
         let client_identity = powerfs_fuse_core::ClientIdentity::stable_for(&self.mount_point);
         info!(
@@ -174,7 +171,7 @@ impl FuseApp {
             client_identity.client_id, client_identity.client_uuid, self.mount_point
         );
         let facade_config = powerfs_fuse_core::FuseClientFacadeConfig {
-            master_addr: master_addr.clone(),
+            master_addrs: master_addrs.clone(),
             master_port: self.master_net_port,
             volume_net_port: self.volume_net_port,
             volume_addrs: self.volume_addrs.clone(),
