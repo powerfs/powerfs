@@ -28,6 +28,7 @@ volumes:
 
 services:
   # ── Wave 1: Redis ──
+  # Redis 不映射端口到宿主机, 仅容器网络内部可访问 (172.30.0.50:6379)
   redis:
     image: redis:7-alpine
     container_name: redis-test
@@ -36,11 +37,9 @@ services:
         ipv4_address: 172.30.0.50
     volumes:
       - redis-data:/data
-    ports:
-      - "6380:6379"
-    command: redis-server --bind 0.0.0.0 --appendonly yes
+    command: redis-server --bind 172.30.0.50 --appendonly yes
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-h", "172.30.0.50", "ping"]
       interval: 2s
       timeout: 2s
       retries: 3
