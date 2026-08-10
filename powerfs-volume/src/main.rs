@@ -2,6 +2,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use powerfs_common::{
     config::{PowerFsConfig, ServiceType},
+    system_metrics::collect_system_metrics,
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
@@ -286,6 +287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
+            // P5: sysinfo instance for node load metrics (cpu/memory).
+            // Refreshed before each heartbeat; first refresh is a warm-up
+            // (sysinfo needs two reads for accurate cpu delta).
+            let mut sys = sysinfo::System::new_all();
+            sys.refresh_all();
+
             // Send initial heartbeat with pre-created volumes
             let volumes = storage_manager.list_volumes();
             let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
@@ -321,7 +328,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Vec<_>>()
             );
 
-            if master_client.send_heartbeat(proto_volumes).await.is_err() {
+            if master_client
+                .send_heartbeat(proto_volumes, 0.0, 0.0)
+                .await
+                .is_err()
+            {
                 warn!("Initial heartbeat failed, reconnecting...");
                 if let Err(e) = master_client.start_heartbeat().await {
                     warn!("Failed to restart heartbeat: {}", e);
@@ -331,6 +342,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Continuous heartbeat loop
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+
+                // P5: Collect node load metrics for this heartbeat.
+                let metrics = collect_system_metrics(&mut sys, "");
+                let cpu_usage = (metrics.cpu_usage / 100.0) as f32;
+                let memory_usage = (metrics.mem_usage / 100.0) as f32;
+
                 let volumes = storage_manager.list_volumes();
                 let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                     .into_iter()
@@ -355,7 +372,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect();
 
-                if master_client.send_heartbeat(proto_volumes).await.is_err() {
+                if master_client
+                    .send_heartbeat(proto_volumes, cpu_usage, memory_usage)
+                    .await
+                    .is_err()
+                {
                     warn!("Failed to send heartbeat (no active connection)");
                 }
             }
