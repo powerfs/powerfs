@@ -554,7 +554,7 @@ impl FilerNetHandler {
             uid: info.uid,
             gid: info.gid,
             size: info.size,
-            nlink: if is_dir { 2 } else { 1 },
+            nlink: info.nlink,
             mtime: info.mtime,
             atime: info.atime,
             ctime: info.ctime,
@@ -581,6 +581,24 @@ impl FilerNetHandler {
     /// - **Flat 模式** (info.inline_data = None): Placement::Flat + ChunkEncoding::PerChunk
     ///   常规文件, 完整 chunk 列表, 客户端按 chunk 直连 Volume Server 读写.
     fn encode_chunks_fields(enc: &mut TlvEncoder, info: &InodeInfo) -> Result<(), NetError> {
+        // Symlink: target stored in symlink_target field, encode as inline_data
+        // so the client can read it via InlineData layout. Without this,
+        // remount/lookup returns empty target (inline_data=None, chunks=[]).
+        if let Some(target) = &info.symlink_target {
+            let data = target.as_bytes().to_vec();
+            let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size },
+                reliability: info.reliability.clone(),
+                reliability_state: info.reliability_state.clone(),
+                compression: info.compression_state.clone(),
+                encoding: ChunkEncoding::InlineData { data },
+            };
+            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+            return Ok(());
+        }
+
         // P2.5: Inline 模式 — 数据直接存 Filer 元数据, 响应携带 inline_data
         if let Some(data) = &info.inline_data {
             let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
@@ -590,6 +608,24 @@ impl FilerNetHandler {
                 reliability_state: info.reliability_state.clone(),
                 compression: info.compression_state.clone(),
                 encoding: ChunkEncoding::InlineData { data: data.clone() },
+            };
+            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+            return Ok(());
+        }
+
+        // Empty file (no inline_data, no chunks): default to Inline mode.
+        // Without this, detect_placement_from_chunks([]) returns Flat, causing
+        // the kernel client to set placement=FLAT. write_end then skips the
+        // Inline path, writeback fails with -EINVAL (no volume_id/file_key),
+        // and close skips chunk sync. Result: data lost on remount.
+        if info.chunks.is_empty() {
+            let layout = FileLayout {
+                placement: Placement::Inline { max_size: INLINE_HARD_LIMIT },
+                reliability: info.reliability.clone(),
+                reliability_state: info.reliability_state.clone(),
+                compression: info.compression_state.clone(),
+                encoding: ChunkEncoding::InlineData { data: Vec::new() },
             };
             encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
                 .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
