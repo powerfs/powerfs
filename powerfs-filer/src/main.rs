@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use powerfs_common::build_info::BuildInfo;
-use powerfs_common::config::PowerFsConfig;
+use powerfs_common::config::{PowerFsConfig, ServiceType};
 use powerfs_common::error::PowerFsError;
 use powerfs_common::traits::EventProvider;
 use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventProvider};
@@ -636,7 +636,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
 }
 
 fn load_config(config_path: &str) -> PowerFsConfig {
-    match PowerFsConfig::load_or_error(config_path) {
+    match PowerFsConfig::load_for_service(config_path, ServiceType::Filer) {
         Ok(cfg) => {
             info!("Successfully loaded configuration from: {}", config_path);
             cfg

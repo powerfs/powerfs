@@ -480,7 +480,7 @@ services:
     container_name: frontend
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.31
+        ipv4_address: 172.30.0.43
     ports:
       - "8084:80"
     healthcheck:

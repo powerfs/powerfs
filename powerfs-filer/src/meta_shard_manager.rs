@@ -506,7 +506,7 @@ impl MetaShardManager {
                 let stores = self.shard_stores.read().unwrap();
                 stores
                     .get(&shard_id)
-                    .map(|s| s.lookup(parent_inode, name).is_some())
+                    .map(|s| s.get_dir_entry_inode(parent_inode, name).is_some())
                     .unwrap_or(false)
             };
             if !still_exists {
@@ -528,7 +528,7 @@ impl MetaShardManager {
                 let stores = self.shard_stores.read().unwrap();
                 stores
                     .get(&shard_id)
-                    .map(|s| s.lookup(parent_inode, name).is_some())
+                    .map(|s| s.get_dir_entry_inode(parent_inode, name).is_some())
                     .unwrap_or(false)
             };
             if exists {
@@ -541,17 +541,17 @@ impl MetaShardManager {
     pub async fn delete_file(&self, parent_inode: u64, name: &str) -> Result<(), String> {
         let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
 
-        // Resolve inode via dir entry on parent's shard.
+        // Resolve inode via dir entry on parent's shard. Use get_dir_entry_inode
+        // (not lookup) because the inode record may be on a different shard.
         let inode = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
                 .get(&shard_dir)
                 .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
 
-            let info = shard_store
-                .lookup(parent_inode, name)
-                .ok_or_else(|| "file not found".to_string())?;
-            info.inode
+            shard_store
+                .get_dir_entry_inode(parent_inode, name)
+                .ok_or_else(|| "file not found".to_string())?
         };
 
         self.propose_remove_direntry_and_inode(parent_inode, name, inode)
@@ -695,39 +695,24 @@ impl MetaShardManager {
 
         let mut current_inode = POSIX_ROOT_INODE;
         for part in &parts {
-            // Check if this component already exists
+            // Check if this component already exists. Use get_dir_entry_inode
+            // (not lookup) because the inode record may be on a different shard.
             let lookup_shard = self.shard_strategy.calculate_shard(current_inode);
-            let exists = {
+            let existing_inode = {
                 let stores = self.shard_stores.read().unwrap();
                 if let Some(store) = stores.get(&lookup_shard) {
-                    store.lookup(current_inode, part).is_some()
+                    store.get_dir_entry_inode(current_inode, part)
                 } else {
-                    false
+                    None
                 }
             };
 
-            if !exists {
+            if let Some(ino) = existing_inode {
+                current_inode = ino;
+            } else {
                 // Create this directory component
                 let info = self.create_directory(current_inode, part).await?;
                 current_inode = info.inode;
-            } else {
-                // Look up the inode for existing directory
-                let lookup_shard = self.shard_strategy.calculate_shard(current_inode);
-                let ino = {
-                    let stores = self.shard_stores.read().unwrap();
-                    if let Some(store) = stores.get(&lookup_shard) {
-                        store
-                            .lookup(current_inode, part)
-                            .map(|e| e.inode)
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    }
-                };
-                if ino == 0 {
-                    return Err(format!("failed to find existing directory: {}", part));
-                }
-                current_inode = ino;
             }
         }
         Ok(current_inode)
@@ -737,17 +722,17 @@ impl MetaShardManager {
         let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
 
         // Resolve the target directory's inode so we can check emptiness.
+        // Use get_dir_entry_inode (not lookup) because the inode record may
+        // be on a different shard than the dir entry.
         let child_inode = {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores
                 .get(&shard_dir)
                 .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
 
-            let info = shard_store
-                .lookup(parent_inode, name)
-                .ok_or_else(|| "directory not found".to_string())?;
-
-            info.inode
+            shard_store
+                .get_dir_entry_inode(parent_inode, name)
+                .ok_or_else(|| "directory not found".to_string())?
         };
 
         // POSIX: rmdir on a non-empty directory must fail with ENOTEMPTY.
@@ -792,12 +777,30 @@ impl MetaShardManager {
     }
 
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Option<InodeInfo> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
+        // With split-create, the dir entry lives on `calculate_shard(parent_inode)`
+        // but the inode record lives on `calculate_shard(inode)`. These may be
+        // different shards, so we:
+        //   1. Find the inode number from the dir entry on the parent's shard.
+        //   2. Fetch the inode record from the inode's own shard.
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
 
+        let inode = {
+            let stores = self.shard_stores.read().unwrap();
+            let shard_store = stores.get(&parent_shard)?;
+            shard_store.get_dir_entry_inode(parent_inode, name)
+        }?;
+
+        // Fetch the inode record from its own shard (may differ from parent_shard).
+        let inode_shard = self.shard_strategy.calculate_shard(inode);
         let stores = self.shard_stores.read().unwrap();
-        let shard_store = stores.get(&shard_id)?;
+        let shard_store = stores.get(&inode_shard)?;
+        let info = shard_store.get_inode(inode)?;
 
-        shard_store.lookup(parent_inode, name)
+        // Phase 3.5: 跳过 tombstoned 条目（延迟删除期间不可见）
+        if info.delete_time > 0 {
+            return None;
+        }
+        Some(info)
     }
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
@@ -854,15 +857,37 @@ impl MetaShardManager {
     }
 
     pub fn list_directory(&self, parent_inode: u64) -> Vec<InodeInfo> {
-        let shard_id = self.shard_strategy.calculate_shard(parent_inode);
+        // With split-create, dir entries live on `calculate_shard(parent_inode)`
+        // but each inode record lives on `calculate_shard(inode)`. We fetch
+        // the (name, inode) pairs from the parent's shard, then resolve each
+        // inode record from its own shard.
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+
+        let pairs = {
+            let stores = self.shard_stores.read().unwrap();
+            match stores.get(&parent_shard) {
+                Some(shard_store) => shard_store.list_dir_entry_inodes(parent_inode),
+                None => Vec::new(),
+            }
+        };
 
         let stores = self.shard_stores.read().unwrap();
-
-        if let Some(shard_store) = stores.get(&shard_id) {
-            shard_store.list_directory(parent_inode)
-        } else {
-            Vec::new()
+        let mut result = Vec::new();
+        for (name, inode) in pairs {
+            let inode_shard = self.shard_strategy.calculate_shard(inode);
+            if let Some(shard_store) = stores.get(&inode_shard) {
+                if let Some(mut info) = shard_store.get_inode(inode) {
+                    // Phase 3.5: 跳过 tombstoned 条目
+                    if info.delete_time > 0 {
+                        continue;
+                    }
+                    info.name = name;
+                    info.parent_inode = parent_inode;
+                    result.push(info);
+                }
+            }
         }
+        result
     }
 
     pub fn get_shard_stats(&self, shard_id: ShardId) -> Option<ShardStats> {
@@ -1603,13 +1628,32 @@ impl MetaShardManager {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<InodeInfo>, String> {
-        let stores = self.shard_stores.read().unwrap();
-        let shard_store = stores
-            .get(&shard_id)
-            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+        // Cross-shard aware: fetch dir entry pairs from the given shard, then
+        // resolve each inode from its own shard.
+        let pairs = {
+            let stores = self.shard_stores.read().unwrap();
+            let shard_store = stores
+                .get(&shard_id)
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+            shard_store.list_dir_entry_inodes(parent_inode)
+        };
 
-        let entries = shard_store.list_directory(parent_inode);
-        Ok(entries.into_iter().take(limit).collect())
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for (name, inode) in pairs {
+            let inode_shard = self.shard_strategy.calculate_shard(inode);
+            if let Some(shard_store) = stores.get(&inode_shard) {
+                if let Some(mut info) = shard_store.get_inode(inode) {
+                    if info.delete_time > 0 {
+                        continue;
+                    }
+                    info.name = name;
+                    info.parent_inode = parent_inode;
+                    result.push(info);
+                }
+            }
+        }
+        Ok(result.into_iter().take(limit).collect())
     }
 
     pub async fn lookup_entry(
@@ -1618,16 +1662,16 @@ impl MetaShardManager {
         name: &str,
         shard_id: ShardId,
     ) -> Result<u64, String> {
+        // Use get_dir_entry_inode because the inode record may be on a
+        // different shard than the dir entry.
         let stores = self.shard_stores.read().unwrap();
         let shard_store = stores
             .get(&shard_id)
             .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-        let inode_info = shard_store
-            .lookup(parent_inode, name)
-            .ok_or_else(|| "entry not found".to_string())?;
-
-        Ok(inode_info.inode)
+        shard_store
+            .get_dir_entry_inode(parent_inode, name)
+            .ok_or_else(|| "entry not found".to_string())
     }
 
     pub async fn get_entry(&self, inode: u64, shard_id: ShardId) -> Result<InodeInfo, String> {
@@ -1691,20 +1735,25 @@ impl MetaShardManager {
         let mut current_inode = POSIX_ROOT_INODE;
 
         for part in parts.iter() {
+            // Use get_dir_entry_inode (not lookup) for cross-shard safety:
+            // the inode record may be on a different shard than the dir entry.
             let shard_id = self.shard_strategy.calculate_shard(current_inode);
-            let stores = self.shard_stores.read().unwrap();
-            let shard_store = stores
-                .get(&shard_id)
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+            let inode = {
+                let stores = self.shard_stores.read().unwrap();
+                let shard_store = stores
+                    .get(&shard_id)
+                    .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+                shard_store
+                    .get_dir_entry_inode(current_inode, part)
+                    .ok_or_else(|| {
+                        format!(
+                            "path component '{}' not found in directory {}",
+                            part, current_inode
+                        )
+                    })?
+            };
 
-            let inode_info = shard_store.lookup(current_inode, part).ok_or_else(|| {
-                format!(
-                    "path component '{}' not found in directory {}",
-                    part, current_inode
-                )
-            })?;
-
-            current_inode = inode_info.inode;
+            current_inode = inode;
         }
 
         Ok(current_inode)
@@ -1845,15 +1894,16 @@ impl MetaShardManager {
         // 2. Check ShardStore — the bucket root may have been created by the
         //    shard-0 leader and replicated to us via Raft AppendEntries, even
         //    though our local root_inodes cache hasn't been populated.
+        //    Use get_dir_entry_inode (not lookup) for cross-shard safety.
         let shard_id = self.shard_strategy.calculate_shard(0);
         {
             let stores = self.shard_stores.read().unwrap();
             if let Some(store) = stores.get(&shard_id) {
-                if let Some(info) = store.lookup(0, bucket) {
+                if let Some(inode) = store.get_dir_entry_inode(0, bucket) {
                     // Found in store — cache and return
                     drop(stores);
-                    self.register_root_inode(bucket, info.inode);
-                    return Ok(info.inode);
+                    self.register_root_inode(bucket, inode);
+                    return Ok(inode);
                 }
             }
         }
@@ -1947,10 +1997,19 @@ impl MetaShardManager {
 
     /// Look up an S3 object entry by bucket root inode and key.
     pub fn get_object_entry(&self, bucket_root_inode: u64, key: &str) -> Option<InodeInfo> {
-        let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);
+        // Cross-shard: dir entry on calculate_shard(bucket_root_inode),
+        // inode record on calculate_shard(inode).
+        let parent_shard = self.shard_strategy.calculate_shard(bucket_root_inode);
+        let inode = {
+            let stores = self.shard_stores.read().unwrap();
+            let store = stores.get(&parent_shard)?;
+            store.get_dir_entry_inode(bucket_root_inode, key)
+        }?;
+
+        let inode_shard = self.shard_strategy.calculate_shard(inode);
         let stores = self.shard_stores.read().unwrap();
-        let store = stores.get(&shard_id)?;
-        store.lookup(bucket_root_inode, key)
+        let store = stores.get(&inode_shard)?;
+        store.get_inode(inode)
     }
 
     /// Delete an S3 object entry by bucket root inode and key.
@@ -1961,15 +2020,16 @@ impl MetaShardManager {
     ) -> Result<(), String> {
         let shard_dir = self.shard_strategy.calculate_shard(bucket_root_inode);
 
+        // Use get_dir_entry_inode (not lookup) because the inode record may
+        // be on a different shard than the dir entry.
         let inode = {
             let stores = self.shard_stores.read().unwrap();
             let store = stores
                 .get(&shard_dir)
                 .ok_or_else(|| format!("shard {} not found", shard_dir.0))?;
-            let info = store
-                .lookup(bucket_root_inode, key)
-                .ok_or_else(|| "object not found".to_string())?;
-            info.inode
+            store
+                .get_dir_entry_inode(bucket_root_inode, key)
+                .ok_or_else(|| "object not found".to_string())?
         };
 
         self.propose_remove_direntry_and_inode(bucket_root_inode, key, inode)
@@ -1978,16 +2038,12 @@ impl MetaShardManager {
 
     /// List S3 object entries under a bucket root inode.
     pub fn list_object_entries(&self, bucket_root_inode: u64) -> Vec<InodeInfo> {
-        let shard_id = self.shard_strategy.calculate_shard(bucket_root_inode);
-        let stores = self.shard_stores.read().unwrap();
-        match stores.get(&shard_id) {
-            Some(store) => store
-                .list_directory(bucket_root_inode)
-                .into_iter()
-                .filter(|info| matches!(info.file_type, crate::shard_store::FileType::File))
-                .collect(),
-            None => Vec::new(),
-        }
+        // Cross-shard: dir entries on calculate_shard(bucket_root_inode),
+        // inode records on their respective shards.
+        self.list_directory(bucket_root_inode)
+            .into_iter()
+            .filter(|info| matches!(info.file_type, crate::shard_store::FileType::File))
+            .collect()
     }
 
     pub async fn list_shards_detail(&self) -> Vec<ShardDetail> {
@@ -2519,13 +2575,17 @@ impl MetaShardManager {
                 );
             }
             Some(crate::powerfs::delta_op::Op::Remove(entry_id)) => {
-                match store.lookup(entry_id.parent_ino, &entry_id.name) {
-                    Some(inode_info) => {
-                        let inode = inode_info.inode;
+                // Use get_dir_entry_inode (not lookup) because the inode
+                // record may be on a different shard than the dir entry.
+                match store.get_dir_entry_inode(entry_id.parent_ino, &entry_id.name) {
+                    Some(inode) => {
                         // Phase 3.5: 延迟删除——仅标记 tombstone，不物理删除。
                         // 物理删除由 GC 任务在 grace_period 后执行（需满足 nlink==0、
                         // 无活跃 lease、open_count==0）。
-                        store.mark_tombstone(inode)?;
+                        // mark_tombstone only works if the inode record is on
+                        // this shard; if not, the GC will eventually reclaim
+                        // it via the orphan scan.
+                        let _ = store.mark_tombstone(inode);
                         info!(
                             "Applied Remove delta (tombstone marked): {}/{} inode={}",
                             entry_id.parent_ino, entry_id.name, inode
@@ -2533,17 +2593,17 @@ impl MetaShardManager {
                     }
                     None => {
                         warn!(
-                            "Applied Remove delta: lookup FAILED {}/{} (parent_ino={}, name={})",
-                            entry_id.parent_ino, entry_id.name, entry_id.parent_ino, entry_id.name
+                            "Applied Remove delta: dir entry not found {}/{}",
+                            entry_id.parent_ino, entry_id.name
                         );
                     }
                 }
             }
             Some(crate::powerfs::delta_op::Op::Rename(rename_op)) => {
-                if let Some(inode_info) =
-                    store.lookup(rename_op.old_parent_ino, &rename_op.old_name)
+                // Use get_dir_entry_inode (not lookup) for cross-shard safety.
+                if let Some(inode) =
+                    store.get_dir_entry_inode(rename_op.old_parent_ino, &rename_op.old_name)
                 {
-                    let inode = inode_info.inode;
                     store.rename_dir_entry_atomic(
                         rename_op.old_parent_ino,
                         &rename_op.old_name,
@@ -2861,11 +2921,15 @@ impl MetaShardManager {
                     continue;
                 }
 
-                // Look up the dir entry on the parent's shard.
+                // Look up the dir entry on the parent's shard. Use
+                // get_dir_entry_inode (not lookup) because with split-create
+                // the inode record lives on calculate_shard(inode), which may
+                // differ from the parent's shard. lookup() would fail to find
+                // the inode record locally and falsely report an orphan.
                 let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
                 let has_dir_entry = stores
                     .get(&parent_shard)
-                    .map(|s| s.lookup(info.parent_inode, &info.name).is_some())
+                    .map(|s| s.get_dir_entry_inode(info.parent_inode, &info.name).is_some())
                     .unwrap_or(false);
 
                 if has_dir_entry {

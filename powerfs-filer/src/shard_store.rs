@@ -1294,6 +1294,13 @@ impl ShardStore {
         result
     }
 
+    /// Look up a single dir entry and return the full InodeInfo.
+    ///
+    /// NOTE: This only finds inodes whose record lives on THIS shard. With
+    /// split-create, the inode record is on `calculate_shard(inode)` which
+    /// may differ from the dir entry's shard (`calculate_shard(parent_inode)`).
+    /// For cross-shard lookups use `get_dir_entry_inode` + `get_inode` via
+    /// `MetaShardManager::lookup` instead.
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Option<InodeInfo> {
         let dir_entries = self.directory_entries.read().unwrap();
         let inodes = self.inodes.read().unwrap();
@@ -1311,6 +1318,27 @@ impl ShardStore {
         }
 
         None
+    }
+
+    /// Return just the inode number for a dir entry, without requiring the
+    /// inode record to be on this shard. Used for cross-shard split-create
+    /// where the dir entry and inode record live on different shards.
+    pub fn get_dir_entry_inode(&self, parent_inode: u64, name: &str) -> Option<u64> {
+        let dir_entries = self.directory_entries.read().unwrap();
+        dir_entries
+            .get(&parent_inode)
+            .and_then(|dir| dir.get(name).copied())
+    }
+
+    /// Return all (name, inode) pairs for a parent directory, without
+    /// requiring the inode records to be on this shard. Used for cross-shard
+    /// readdir where dir entries and inode records live on different shards.
+    pub fn list_dir_entry_inodes(&self, parent_inode: u64) -> Vec<(String, u64)> {
+        let dir_entries = self.directory_entries.read().unwrap();
+        match dir_entries.get(&parent_inode) {
+            Some(dir) => dir.iter().map(|(k, &v)| (k.clone(), v)).collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn list_directory(&self, parent_inode: u64) -> Vec<InodeInfo> {

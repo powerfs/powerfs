@@ -176,8 +176,9 @@ fn hostname_or_unknown() -> String {
 /// 所有端口和地址必须由调用方显式提供，无默认值
 #[derive(Debug, Clone)]
 pub struct FuseClientFacadeConfig {
-    /// Master 节点地址（如 "172.20.0.11"）
-    pub master_addr: String,
+    /// Master 节点地址列表（host 部分，如 ["172.20.0.11", "172.20.0.12", "172.20.0.13"]）
+    /// 所有地址共享 `master_port`，用于 leader 发现和 failover。
+    pub master_addrs: Vec<String>,
     /// Master powerfs-net 端口（如 9334）
     pub master_port: u16,
     /// Volume powerfs-net 端口（如 8901）
@@ -227,7 +228,7 @@ impl FuseClientFacadeConfig {
     /// 此时 `force_mount` 应保持 false，让 facade 在拓扑未就绪时拒绝挂载。
     /// 若 `filer_addr` 非空，则作为启动期到拓扑就绪之前的兜底地址。
     pub fn new(
-        master_addr: String,
+        master_addrs: Vec<String>,
         master_port: u16,
         volume_net_port: u16,
         volume_addrs: Vec<String>,
@@ -235,8 +236,11 @@ impl FuseClientFacadeConfig {
         filer_port: u16,
     ) -> Result<Self, String> {
         // 校验所有必需参数
-        if master_addr.is_empty() {
-            return Err("master_addr must not be empty".to_string());
+        if master_addrs.is_empty() {
+            return Err("master_addrs must not be empty".to_string());
+        }
+        if master_addrs.iter().any(|a| a.is_empty()) {
+            return Err("master_addrs must not contain empty strings".to_string());
         }
         if master_port == 0 {
             return Err("master_port must be > 0".to_string());
@@ -254,7 +258,7 @@ impl FuseClientFacadeConfig {
         }
 
         Ok(Self {
-            master_addr,
+            master_addrs,
             master_port,
             volume_net_port,
             volume_addrs,
@@ -392,7 +396,11 @@ impl FuseClientFacade {
 
         // 创建 Master 客户端
         let master_client_config = MasterClientConfig {
-            master_addrs: vec![format!("{}:{}", config.master_addr, config.master_port)],
+            master_addrs: config
+                .master_addrs
+                .iter()
+                .map(|h| format!("{}:{}", h, config.master_port))
+                .collect(),
             request_timeout: config.request_timeout,
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
@@ -461,7 +469,11 @@ impl FuseClientFacade {
 
         // 创建 Master 客户端（会自动创建自己的网络连接）
         let master_client_config = MasterClientConfig {
-            master_addrs: vec![format!("{}:{}", config.master_addr, config.master_port)],
+            master_addrs: config
+                .master_addrs
+                .iter()
+                .map(|h| format!("{}:{}", h, config.master_port))
+                .collect(),
             request_timeout: config.request_timeout,
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
@@ -551,6 +563,14 @@ impl FuseClientFacade {
             .map(|s| s.leader_addr.clone())
             .filter(|a| !a.is_empty())
             .collect();
+        // 同样从拓扑提取 volume 地址列表（host:port），供 volume_addrs 为空时使用。
+        // master GetTopology 下发 volumes[].addr，fetch_topology 已转成 VolumeInfo.addr。
+        let topology_volume_endpoints: Vec<String> = topology
+            .volumes
+            .values()
+            .map(|v| v.addr.clone())
+            .filter(|a| !a.is_empty())
+            .collect();
         master_client.update_topology(topology);
 
         // 创建 MetaShard 客户端（共享连接池）
@@ -591,12 +611,27 @@ impl FuseClientFacade {
             conn_pool.clone(),
         ));
 
-        // 设置默认 Volume 地址（从配置获取）
-        if !config.volume_addrs.is_empty() {
-            volume_client.set_default_volume_addrs(config.volume_addrs.clone());
+        // 设置默认 Volume 地址：优先使用 master 拓扑下发的 volume 列表
+        // （host:port），回退到配置中的 volume_addrs（force_mount 场景或拓扑为空）。
+        // 新部署只需 master_addresses，volume 路由由 master GetTopology 下发。
+        let from_topology = !topology_volume_endpoints.is_empty();
+        let volume_endpoints: Vec<String> = if from_topology {
+            topology_volume_endpoints
+        } else {
+            config.volume_addrs.clone()
+        };
+        if !volume_endpoints.is_empty() {
+            volume_client.set_default_volume_addrs(volume_endpoints.clone());
             log::info!(
-                "FuseClientFacade: set default volume addrs: {:?}",
-                config.volume_addrs
+                "FuseClientFacade: set default volume addrs ({} from {}): {:?}",
+                volume_endpoints.len(),
+                if from_topology { "topology" } else { "config" },
+                volume_endpoints
+            );
+        } else {
+            log::warn!(
+                "FuseClientFacade: no volume addresses from topology or config — \
+                 volume routing will rely on per-request master lookup"
             );
         }
 
@@ -2005,7 +2040,7 @@ mod tests {
     #[test]
     fn test_facade_config_creation() {
         let config = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string(), "172.20.0.12".to_string(), "172.20.0.13".to_string()],
             9334,
             8901,
             vec!["172.20.0.21".to_string(), "172.20.0.22".to_string()],
@@ -2014,7 +2049,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.master_addr, "172.20.0.11");
+        assert_eq!(config.master_addrs.len(), 3);
+        assert_eq!(config.master_addrs[0], "172.20.0.11");
+        assert_eq!(config.master_addrs[2], "172.20.0.13");
         assert_eq!(config.master_port, 9334);
         assert_eq!(config.volume_net_port, 8901);
         assert_eq!(config.volume_addrs.len(), 2);
@@ -2025,9 +2062,20 @@ mod tests {
 
     #[test]
     fn test_facade_config_validation() {
-        // 空master_addr应该失败
+        // 空 master_addrs 应该失败
         let result = FuseClientFacadeConfig::new(
-            "".to_string(),
+            vec![],
+            9334,
+            8901,
+            vec!["172.20.0.21".to_string()],
+            "172.20.0.35".to_string(),
+            9334,
+        );
+        assert!(result.is_err());
+
+        // master_addrs 包含空字符串应该失败
+        let result = FuseClientFacadeConfig::new(
+            vec!["172.20.0.11".to_string(), "".to_string()],
             9334,
             8901,
             vec!["172.20.0.21".to_string()],
@@ -2038,7 +2086,7 @@ mod tests {
 
         // master_port为0应该失败
         let result = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string()],
             0,
             8901,
             vec!["172.20.0.21".to_string()],
@@ -2049,7 +2097,7 @@ mod tests {
 
         // 空volume_addrs应该失败
         let result = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string()],
             9334,
             8901,
             vec![],
@@ -2061,7 +2109,7 @@ mod tests {
         // 空 filer_addr 现在允许：表示由 facade 从 master 拓扑发现 filer 列表。
         // 校验只要求 filer_port > 0。
         let result = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string()],
             9334,
             8901,
             vec!["172.20.0.21".to_string()],
@@ -2075,7 +2123,7 @@ mod tests {
 
         // filer_port=0 仍然应该失败（兜底地址需要 host:port 拼接）
         let result = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string()],
             9334,
             8901,
             vec!["172.20.0.21".to_string()],
@@ -2088,7 +2136,7 @@ mod tests {
     #[test]
     fn test_facade_config_with_options() {
         let config = FuseClientFacadeConfig::new(
-            "172.20.0.11".to_string(),
+            vec!["172.20.0.11".to_string()],
             9334,
             8901,
             vec!["172.20.0.21".to_string()],
