@@ -983,10 +983,36 @@ pub struct ShardSplitPlan {
 - `MasterManagementApi`：`add_shard`/`drain_shard`/`remove_shard` 从 NYI stub 改为通过 `FilerManagementClient`（`block_in_place`+`Handle::block_on` 桥接）调用 filer gRPC。
 - 测试：master 99 PASS，filer 74 PASS，clippy 0 新增警告，fmt clean。
 
+**已完成：真实 MigrationExecutor 实现**
+
+- `MasterMigrationExecutor`：替换 `LoggingExecutor`，执行端到端数据迁移。
+  - `cold_needles`：通过 volume client `ListNeedles` RPC 枚举冷 needle。
+  - `start_migration`：spawn 异步任务执行 `run_migration`，完成后通过 completion channel 通知 scheduler。
+  - `cancel_migration`：协作式取消（`AtomicBool` 标志），任务在各 needle 拷贝间检查取消标志。
+  - `run_cold_data_migration`：filer `FindInodesByVolume` 反查 needle→inode → 读源 needle → 写目标 volume（auto-assign file_key）→ filer `UpdateInodeSizeChunks` 更新 chunk 映射 → 删除源 needle。
+- Volume 侧：`ListNeedles` RPC + `write_needle` 支持 `file_key=0` 自动分配。
+- Filer 侧：`FindInodesByVolume` RPC（跨 shard needle→inode 反查）+ `UpdateInodeSizeChunks` RPC（Raft 复制 chunk 列表交换）。
+- Master 侧：`volume_client` 新增 `list_needles`/`write_needle_return_key`；`filer_client` 新增 `find_inodes_by_volume`/`update_inode_size_chunks`。
+- `RebalanceEngine::new_with_master`：用 `MasterMigrationExecutor` 构造引擎；`master::start()` 改用此构造器。
+- `run_tick` 完成队列 drain 同时支持 sync（LoggingExecutor）和 async（MasterMigrationExecutor）完成。
+- 测试：master 99、filer 74、volume 18、allocator 77 全部 PASS，clippy 0 新增警告。
+
+**已完成：Volume pinning（pin_volume_to_node / unpin_volume）**
+
+- `RaftCommand::PinVolume { volume_id, node_id }` / `UnpinVolume { volume_id }`：新增 Raft 命令变体，serde 自动序列化，所有 master 副本一致。
+- `MasterNode::volume_pins: RwLock<HashMap<VolumeId, String>>`：Raft 复制的 pin 注册表。
+- `apply_pin_volume` / `apply_unpin_volume`：apply_command match 新增分支，更新内存 pin 注册表。
+- `MasterNode::pin_volume_to_node` / `unpin_volume`：leader-only async 方法，propose Raft 命令。
+- `ClusterSnapshot::pinned_volumes: HashMap<u64, String>`：快照新增字段，`build_cluster_snapshot` 从 pin 注册表注入。
+- LoadBalancer 尊重 pin：
+  - `over_threshold_active_volumes`：跳过 pinned volume（不作为冷数据迁移源）。
+  - `compute_hot_data_action`：`volume_ids` 排除 pinned volume（不作为热数据迁移源），仅包含 busiest 节点上的非 pinned Active volume。
+- `MasterManagementApi::pin_volume_to_node` / `unpin_volume`：从 NYI stub 改为 `block_in_place`+`Handle::block_on` 桥接，调用 master 的 Raft-proposed 方法。
+- gRPC：`PinVolume` / `UnpinVolume` RPC + handler（master.proto + server.rs），复用 `VolumeManageResponse`。
+- 测试：allocator 79（+2 pin 行为测试），master 99，clippy 0 警告，fmt clean。
+
 **待完成**：
-- 真实 `MigrationExecutor` 实现：volume server 冷数据枚举 + needle 拷贝 + filer chunks 更新（高风险，留作后续里程碑）。
 - `set_placement_strategy`：需要运行时策略注册表（低优先级）。
-- `pin_volume_to_node`/`unpin_volume`：需要新 feature（低优先级）。
 
 **已完成：set_node_maintenance Raft 命令**
 

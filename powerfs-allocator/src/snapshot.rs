@@ -3,6 +3,7 @@
 //! Aggregated by Master from heartbeats (10-30s lag). The allocator receives
 //! a `&ClusterSnapshot` reference per allocation call — never queries live state.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,10 @@ pub struct ClusterSnapshot {
     pub shards: Vec<ShardRuntime>,
     /// Cluster-wide average load (0.0-1.0). Used by migration scheduler.
     pub cluster_avg_load: f64,
+    /// Volume pins: `volume_id → node_id`. A pinned volume's data must stay on
+    /// the pinned node; the LoadBalancer skips pinned volumes as migration
+    /// sources. Populated by the master's Raft-replicated pin registry.
+    pub pinned_volumes: HashMap<u64, String>,
 }
 
 impl ClusterSnapshot {

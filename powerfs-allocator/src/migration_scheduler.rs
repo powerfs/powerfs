@@ -570,6 +570,7 @@ mod tests {
             nodes,
             shards: Vec::new(),
             cluster_avg_load: avg_load,
+            pinned_volumes: std::collections::HashMap::new(),
         }
     }
 
