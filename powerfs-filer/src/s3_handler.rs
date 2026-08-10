@@ -506,7 +506,8 @@ impl S3Handler {
         }
 
         // Delimiter → roll matching entries into <CommonPrefixes>.
-        let mut common_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut common_prefixes: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         if let Some(delim) = &params.delimiter {
             if !delim.is_empty() {
                 let mut kept = Vec::with_capacity(entries.len());
@@ -556,7 +557,12 @@ impl S3Handler {
 
         let cp_xml = common_prefixes
             .iter()
-            .map(|cp| format!("  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>", xml_escape(cp)))
+            .map(|cp| {
+                format!(
+                    "  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>",
+                    xml_escape(cp)
+                )
+            })
             .collect::<Vec<String>>()
             .join("\n");
 
@@ -565,13 +571,19 @@ impl S3Handler {
         let v2_fields = if is_v2 {
             let mut s = format!("\n  <KeyCount>{}</KeyCount>", key_count);
             if let Some(ct) = &params.continuation_token {
-                s.push_str(&format!("\n  <ContinuationToken>{}</ContinuationToken>", xml_escape(ct)));
+                s.push_str(&format!(
+                    "\n  <ContinuationToken>{}</ContinuationToken>",
+                    xml_escape(ct)
+                ));
             }
             if let Some(sa) = &params.start_after {
                 s.push_str(&format!("\n  <StartAfter>{}</StartAfter>", xml_escape(sa)));
             }
             if let Some(nct) = &next_ct {
-                s.push_str(&format!("\n  <NextContinuationToken>{}</NextContinuationToken>", xml_escape(nct)));
+                s.push_str(&format!(
+                    "\n  <NextContinuationToken>{}</NextContinuationToken>",
+                    xml_escape(nct)
+                ));
             }
             s
         } else {
@@ -579,7 +591,10 @@ impl S3Handler {
         };
 
         let delim_xml = if params.delimiter.is_some() {
-            format!("\n  <Delimiter>{}</Delimiter>", xml_escape(params.delimiter.as_deref().unwrap_or("")))
+            format!(
+                "\n  <Delimiter>{}</Delimiter>",
+                xml_escape(params.delimiter.as_deref().unwrap_or(""))
+            )
         } else {
             String::new()
         };

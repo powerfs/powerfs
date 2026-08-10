@@ -444,9 +444,7 @@ impl MetaShardManager {
         }
 
         // Phase A: inode record on its own hash-derived shard.
-        let cmd_ino = ShardCommand::CreateInode {
-            info: info.clone(),
-        };
+        let cmd_ino = ShardCommand::CreateInode { info: info.clone() };
         self.raft_group_manager
             .propose(shard_ino, cmd_ino.serialize())
             .await?;
@@ -1177,7 +1175,13 @@ impl MetaShardManager {
         // Must check ALL changed fields (mode, uid, gid, size), not just mode,
         // otherwise chown (UID|GID only) returns before Raft applies the change,
         // causing subsequent GetAttr to read stale data.
-        if mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() || mtime.is_some() || atime.is_some() {
+        if mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || size.is_some()
+            || mtime.is_some()
+            || atime.is_some()
+        {
             let store = {
                 let stores = self.shard_stores.read().unwrap();
                 stores.get(&shard_id).cloned()
@@ -2929,7 +2933,10 @@ impl MetaShardManager {
                 let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
                 let has_dir_entry = stores
                     .get(&parent_shard)
-                    .map(|s| s.get_dir_entry_inode(info.parent_inode, &info.name).is_some())
+                    .map(|s| {
+                        s.get_dir_entry_inode(info.parent_inode, &info.name)
+                            .is_some()
+                    })
                     .unwrap_or(false);
 
                 if has_dir_entry {
