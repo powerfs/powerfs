@@ -1372,6 +1372,14 @@ impl FileSystem for PowerFsFs {
         if capable.contains(fuse_backend_rs::api::filesystem::FsOptions::MAX_PAGES) {
             opts |= fuse_backend_rs::api::filesystem::FsOptions::MAX_PAGES;
         }
+        // AUTO_INVAL_DATA: ask the kernel to refresh directory mtime before
+        // readdir, so that the readdir cache is properly invalidated after
+        // a rename/mkdir/unlink. Without this flag, the kernel uses its
+        // cached mtime (which is stale after a rename) and serves stale
+        // directory entries from the readdir cache for up to 1s.
+        if capable.contains(fuse_backend_rs::api::filesystem::FsOptions::AUTO_INVAL_DATA) {
+            opts |= fuse_backend_rs::api::filesystem::FsOptions::AUTO_INVAL_DATA;
+        }
         Ok(opts)
     }
 
@@ -1381,6 +1389,10 @@ impl FileSystem for PowerFsFs {
 
         // 1. MetadataCache 命中（含完整 attr）— 快速路径
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
+            debug!(
+                "lookup: cache HIT parent={}, name={}, inode={}",
+                parent, name_str, entry.inode
+            );
             return Ok(self.create_fuse_entry(&entry));
         }
 
@@ -1388,17 +1400,46 @@ impl FileSystem for PowerFsFs {
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = meta_client.calculate_shard_id(parent);
         let name_owned = name_str.to_string();
-        let attr = self
+        debug!(
+            "lookup: cache MISS, querying filer shard={} parent={}",
+            shard_id, parent
+        );
+        match self
             .client
             .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
-            .map_err(|e| {
+        {
+            Ok(attr) => {
+                debug!(
+                    "lookup: filer returned inode={} for parent={}, name={}",
+                    attr.inode, parent, name_str
+                );
+                let entry = attr_to_cached_entry(&attr, parent, name_str);
+                self.cache.insert(entry.clone());
+                Ok(self.create_fuse_entry(&entry))
+            }
+            Err(e) => {
                 debug!("lookup RPC failed for '{}/{}': {}", parent, name_str, e);
-                std::io::Error::from_raw_os_error(libc::ENOENT)
-            })?;
-
-        let entry = attr_to_cached_entry(&attr, parent, name_str);
-        self.cache.insert(entry.clone());
-        Ok(self.create_fuse_entry(&entry))
+                // Return a negative Entry (inode=0) with a short entry_timeout.
+                // This tells the kernel to cache the negative result for only
+                // TTL (100ms), so that subsequent lookups after a rename/create
+                // will re-query the FUSE daemon.
+                //
+                // Returning Err(ENOENT) causes the kernel to use its default
+                // negative entry timeout, which can be very long, leading to
+                // stale "file not found" results after a cross-directory rename.
+                // This is the root cause of R6: mv first checks if the target
+                // exists (creating a negative dentry), then renames; the kernel
+                // serves the stale negative dentry for the renamed file.
+                Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                })
+            }
+        }
     }
 
     fn getattr(

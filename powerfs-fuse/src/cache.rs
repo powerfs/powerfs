@@ -885,7 +885,7 @@ impl MetadataCache {
         newdir: u64,
         newname: &str,
     ) -> Result<(), String> {
-        // Find the entry
+        // Find the source entry
         let entry = {
             let children = self.list_children(olddir);
             let mut found = None;
@@ -898,24 +898,43 @@ impl MetadataCache {
             found.ok_or_else(|| "source not found".to_string())?
         };
 
-        // Check if target exists
-        let target_exists = {
-            let children = self.list_children(newdir);
-            children.iter().any(|(_, name, _)| name == newname)
-        };
-
-        // Remove old entry from cache temporarily, update, and re-insert
         let inode = entry.inode;
         let old_parent = entry.parent;
 
-        // Remove from old path
+        // Remove the source entry from path_map BEFORE updating its name,
+        // so that the target lookup below doesn't find the source entry.
         let old_path = self.inode_to_path(inode).unwrap_or_default();
         {
             let mut path_map = self.path_map.write().unwrap();
             path_map.remove(&old_path);
         }
 
-        // Update entry
+        // If target exists, remove it BEFORE renaming the source.
+        // This must happen while the source still has its old name,
+        // otherwise list_children(newdir) would find the renamed source
+        // entry (which now has name == newname) and remove it instead.
+        if olddir == newdir {
+            // Same directory: list children and find target by name.
+            // The source entry still has oldname, so this is safe.
+            let children = self.list_children(newdir);
+            for (target_ino, name, _) in children {
+                if name == newname && target_ino != inode {
+                    let _ = self.remove_entry_only(target_ino);
+                    break;
+                }
+            }
+        } else {
+            // Different directory: just check by name.
+            let children = self.list_children(newdir);
+            for (target_ino, name, _) in children {
+                if name == newname {
+                    let _ = self.remove_entry_only(target_ino);
+                    break;
+                }
+            }
+        }
+
+        // Now update the source entry's parent and name
         {
             let mut cache = self.inode_cache.write().unwrap();
             if let Some(e) = cache.get_mut(&inode) {
@@ -924,19 +943,6 @@ impl MetadataCache {
                 let now = chrono::Utc::now().timestamp();
                 e.ctime = now;
                 e.mtime = now;
-            }
-        }
-
-        // If target exists, remove it first
-        if target_exists {
-            let children = self.list_children(newdir);
-            for (ino, name, _) in children {
-                if name == newname {
-                    // Don't actually delete data here, just remove from cache
-                    // The caller should handle data deletion
-                    let _ = self.remove_entry_only(ino);
-                    break;
-                }
             }
         }
 
@@ -953,6 +959,29 @@ impl MetadataCache {
         {
             let mut path_map = self.path_map.write().unwrap();
             path_map.insert(new_path, inode);
+        }
+
+        // POSIX: rename updates mtime/ctime of both parent directories.
+        // This is critical for kernel readdir cache invalidation: the kernel
+        // compares the directory's mtime (fetched via getattr) with its
+        // cached value to decide whether to serve stale readdir entries.
+        // Without this update, the kernel's readdir cache returns the old
+        // source name for up to 1s after the rename.
+        {
+            let now = chrono::Utc::now().timestamp();
+            let mut cache = self.inode_cache.write().unwrap();
+            if let Some(e) = cache.get_mut(&old_parent) {
+                e.mtime = now;
+                e.ctime = now;
+                e.cached_at = Instant::now();
+            }
+            if old_parent != newdir {
+                if let Some(e) = cache.get_mut(&newdir) {
+                    e.mtime = now;
+                    e.ctime = now;
+                    e.cached_at = Instant::now();
+                }
+            }
         }
 
         // Invalidate old and new directory caches
