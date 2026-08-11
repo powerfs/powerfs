@@ -1144,7 +1144,15 @@ impl MetaShardClient {
                     // 其他错误：尝试从 body 解析错误信息
                     // 优先尝试 TLV (FieldId::Name = error string, 用于 UpdateInodeSizeChunks),
                     // 回退到 JSON (用于 OpenCountInc/Dec, alloc_inode_batch 等仍用 JSON 的协议)
-                    self.breakers.record_failure(&target_addr);
+                    //
+                    // Client errors (ENOENT, EEXIST, EACCES, etc.) are normal
+                    // responses — the server is healthy. Don't count them
+                    // toward the CircuitBreaker, otherwise a burst of ENOENT
+                    // responses (e.g., concurrent lookups for missing files)
+                    // would trip the breaker and block ALL traffic.
+                    if !powerfs_net::is_client_error(status) {
+                        self.breakers.record_failure(&target_addr);
+                    }
                     let err_msg = {
                         use powerfs_net::serialize::TlvDecoder;
                         let mut dec = TlvDecoder::new(&resp.body);
@@ -2365,7 +2373,19 @@ pub(crate) async fn process_request_internal(
                     return Ok(RequestResult::empty(request_id));
                 }
 
-                // 其他错误或超过重试次数
+                // Other client errors (EEXIST, EACCES, EINVAL, etc.) are
+                // also normal responses — the server is healthy. Don't count
+                // them toward the CircuitBreaker. Only server-side errors
+                // (EIO, ENOSPC, EINTERNAL) should trip the breaker.
+                if powerfs_net::is_client_error(status) {
+                    breakers.record_success(&target_addr);
+                    return Err(ClientError::Server(format!(
+                        "Client error: status={}",
+                        status
+                    )));
+                }
+
+                // Server error (EIO, ENOSPC, EINTERNAL) — count as failure
                 breakers.record_failure(&target_addr);
                 return Err(ClientError::Server(format!("Server error: {}", status)));
             }
