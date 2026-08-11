@@ -13,7 +13,7 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
-use powerfs_allocator::ShardMap;
+use powerfs_allocator::{ShardId, ShardMap, ShardState};
 use powerfs_net::client::NotificationHandler;
 use powerfs_net::PowerFsNetClient;
 
@@ -631,18 +631,48 @@ impl MetaShardClient {
         }
     }
 
-    /// Sync the ShardMap from topology's shard_count.
-    /// Uses `ShardMap::from_shard_count(n)` which generates the same
-    /// range-based routing as the Filer's ShardStrategy. This replaces
-    /// the old modulo-based `calculate_shard_id` that diverged for
-    /// inodes >= shard_count * 1M.
+    /// Sync the ShardMap from topology.
+    ///
+    /// S3: When Master provides `shard_map_entries` (non-empty), reconstruct
+    /// the ShardMap from those entries — this is the authoritative source and
+    /// matches the Filer's map exactly, including post-split ranges.
+    ///
+    /// Fallback: When `shard_map_entries` is empty (old Master without the
+    /// `ShardMapEntries` extension), use `ShardMap::from_shard_count(n)` which
+    /// generates the same range-based routing as the Filer's initial state.
     fn sync_shard_map(&self) {
-        let shard_count = self.topology_manager.shard_count() as u64;
+        let topology = self.topology_manager.get_topology();
+
+        // S3: prefer Master-provided entries snapshot (authoritative).
+        if !topology.shard_map_entries.is_empty() {
+            let entries: Vec<(u64, u64, ShardId, ShardState)> = topology
+                .shard_map_entries
+                .iter()
+                .map(|&(rs, re, sid, state)| {
+                    let state = match state {
+                        1 => ShardState::Draining,
+                        _ => ShardState::Active,
+                    };
+                    (rs, re, ShardId(sid), state)
+                })
+                .collect();
+            let entry_count = entries.len();
+            let new_map = ShardMap::from_entries(entries);
+            *self.shard_map.lock().unwrap() = new_map;
+            log::info!(
+                "MetaShardClient: ShardMap synced from Master entries ({} ranges, range-based routing)",
+                entry_count
+            );
+            return;
+        }
+
+        // Fallback: construct from shard_count (equivalent for initial state).
+        let shard_count = topology.shard_count() as u64;
         if shard_count > 0 {
             let new_map = ShardMap::from_shard_count(shard_count);
             *self.shard_map.lock().unwrap() = new_map;
             log::info!(
-                "MetaShardClient: ShardMap synced (shard_count={}, range-based routing)",
+                "MetaShardClient: ShardMap synced from shard_count={} (range-based routing, no Master entries)",
                 shard_count
             );
         }
