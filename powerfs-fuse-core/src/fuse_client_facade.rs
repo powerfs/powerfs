@@ -701,6 +701,14 @@ impl FuseClientFacade {
         &self.meta_shard_client
     }
 
+    /// Get the request statistics tracker (for debug/admin endpoint).
+    ///
+    /// Delegates to the inner `MetaShardClient::stats()`. The stats are
+    /// updated on every `ShardedRpcPool::submit()` call.
+    pub fn stats(&self) -> &Arc<crate::request_stats::RequestStats> {
+        self.meta_shard_client.stats()
+    }
+
     /// 获取 Volume 客户端引用
     pub fn volume_client(&self) -> &VolumeClient {
         self.volume_client.as_ref()
@@ -1255,6 +1263,11 @@ impl SyncFuseClientFacade {
 
     pub fn facade(&self) -> &Arc<FuseClientFacade> {
         &self.facade
+    }
+
+    /// Get the request statistics tracker (for debug/admin endpoint).
+    pub fn stats(&self) -> &Arc<crate::request_stats::RequestStats> {
+        self.facade.stats()
     }
 
     pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {

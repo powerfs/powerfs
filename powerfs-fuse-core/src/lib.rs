@@ -9,6 +9,7 @@ pub mod metadata_client;
 pub mod orset;
 pub mod provider_adapter;
 pub mod request_id;
+pub mod request_stats;
 pub mod request_state;
 pub mod sharded_rpc;
 pub mod stats_reporter;
@@ -31,6 +32,7 @@ pub use meta_shard_client::{
 };
 pub use provider_adapter::{FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider};
 pub use request_id::RequestId;
+pub use request_stats::{msg_type_name, InFlightEntry, MsgTypeStats, RequestStats, SharedRequestStats, StatsSnapshot};
 pub use request_state::{RequestContext, RequestKind, RequestState};
 pub use stats_reporter::{MasterStatsReporter, StatsReporterConfig};
 pub use topology::{

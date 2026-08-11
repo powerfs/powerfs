@@ -203,6 +203,13 @@ pub struct FuseConfig {
     /// 默认 10s (生产)；测试环境建议设 3s 以快速暴露挂起问题。
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Admin/debug HTTP server port (0 = disabled).
+    ///
+    /// When non-zero, FUSE starts a minimal HTTP server on this port exposing
+    /// request statistics and in-flight request tracking for debugging hangs.
+    /// Query via `powerfs-cli fuse-stats --addr <host>:<port>`.
+    #[serde(default)]
+    pub admin_port: u16,
 }
 
 /// Lease 模式配置

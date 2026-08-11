@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use crate::circuit_breaker::CircuitBreakerPool;
 use crate::client_error::{ClientError, ClientResult};
 use crate::meta_shard_client::{process_request_internal, PendingRequest, RequestResult};
+use crate::request_stats::RequestStats;
 use crate::topology::ShardInfo;
 
 /// 每个 worker 负责的分片数（可配，默认 16）
@@ -91,6 +92,8 @@ pub struct ShardedRpcPool {
     shard_router: Arc<DashMap<u64, ShardInfo>>,
     /// Default filer addr — fallback when shard not in router.
     default_filer_addr: Arc<Mutex<String>>,
+    /// Request statistics tracker — for debug switch / admin endpoint.
+    stats: Arc<RequestStats>,
 }
 
 impl ShardedRpcPool {
@@ -102,6 +105,7 @@ impl ShardedRpcPool {
         breakers: Arc<CircuitBreakerPool>,
         shard_router: Arc<DashMap<u64, ShardInfo>>,
         filer_addresses: Arc<Mutex<Vec<String>>>,
+        stats: Arc<RequestStats>,
     ) -> Self {
         let worker_count = worker_count.clamp(MIN_WORKERS, MAX_WORKERS);
         let mut workers = Vec::with_capacity(worker_count);
@@ -140,6 +144,7 @@ impl ShardedRpcPool {
             breakers,
             shard_router,
             default_filer_addr,
+            stats,
         }
     }
 
@@ -161,6 +166,9 @@ impl ShardedRpcPool {
     ) -> ClientResult<RequestResult> {
         let worker_idx = (req.shard_id as usize) % self.workers.len();
 
+        // Record request start for statistics / stuck-request tracking.
+        let stats_id = self.stats.record_start(req.context.msg_type, req.shard_id);
+
         // 1) CircuitBreaker pre-check: resolve target filer addr and check
         //    before enqueueing. This avoids wasting queue space and spawn
         //    resources on a filer that is known to be down.
@@ -178,6 +186,8 @@ impl ShardedRpcPool {
                 "ShardedRpcPool: submit rejected by circuit breaker (shard={}, filer={})",
                 req.shard_id, filer_addr
             );
+            self.stats
+                .record_complete(stats_id, Err(&ClientError::CircuitOpen));
             return Err(ClientError::CircuitOpen);
         }
 
@@ -187,27 +197,41 @@ impl ShardedRpcPool {
         //    immediately when the worker's queue is at capacity, giving
         //    the caller instant backpressure instead of unbounded memory
         //    growth.
-        self.workers[worker_idx]
-            .try_send((req, tx))
-            .map_err(|e| match e {
+        if let Err(e) = self.workers[worker_idx].try_send((req, tx)) {
+            let err = match e {
                 mpsc::error::TrySendError::Full(_) => {
                     ClientError::QueueFull(WORKER_QUEUE_CAPACITY)
                 }
                 mpsc::error::TrySendError::Closed(_) => {
                     ClientError::Internal("worker channel closed".to_string())
                 }
-            })?;
+            };
+            self.stats.record_complete(stats_id, Err(&err));
+            return Err(err);
+        }
 
-        match tokio::time::timeout(timeout, rx).await {
+        let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::Cancelled),
             Err(_) => Err(ClientError::Timeout(timeout)),
+        };
+
+        match &result {
+            Ok(_) => self.stats.record_complete(stats_id, Ok(())),
+            Err(e) => self.stats.record_complete(stats_id, Err(e)),
         }
+
+        result
     }
 
     /// 当前 worker 数
     pub fn worker_count(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Get a reference to the request stats tracker.
+    pub fn stats(&self) -> &Arc<RequestStats> {
+        &self.stats
     }
 }
 
