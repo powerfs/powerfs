@@ -13,6 +13,7 @@ powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 powerfs-coherence = { path = "../powerfs-coherence" }
 powerfs-layout = { path = "../powerfs-layout" }
+powerfs-allocator = { path = "../powerfs-allocator" }
 libc = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
