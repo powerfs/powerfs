@@ -804,7 +804,7 @@ data_dir = "./data/volume"
 master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
 master_net_port = 9334   # Master的powerfs-net端口 (必填, 用于TLV心跳)
 node_id = "volume-server-1"
-max_volume_size = 10737418240
+max_volume_size = 107374182400   # 100GB (must be 100GB, not 10GB)
 initial_volume_count = 4
 lease_enabled = true          # Volume Server 是否支持 range lease (NVMe-oF target 设为 false)
 
