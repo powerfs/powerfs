@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xz-utils \
         gzip \
         coreutils \
+        attr \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- FUSE configuration ----------

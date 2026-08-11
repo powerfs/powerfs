@@ -1111,11 +1111,21 @@ impl PowerFsFs {
     fn create_stat(&self, entry: &CachedEntry) -> libc::stat64 {
         let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
         attr.st_ino = entry.inode;
+        // Determine st_mode: preserve file type bits for special files
+        // (FIFO/block/char/socket) created via mknod. The Filer stores the
+        // full mode (including S_IFMT bits), so if the mode already has a
+        // file type, use it as-is. Otherwise apply type from is_dir/is_symlink
+        // flags, defaulting to S_IFREG.
+        const S_IFMT: u32 = 0o170000;
         attr.st_mode = if entry.is_symlink {
-            (entry.mode | 0o120000) as libc::mode_t
+            ((entry.mode & !S_IFMT) | 0o120000) as libc::mode_t
         } else if entry.is_dir {
-            (entry.mode | 0o040000) as libc::mode_t
+            ((entry.mode & !S_IFMT) | 0o040000) as libc::mode_t
+        } else if (entry.mode & S_IFMT) != 0 {
+            // Special file (FIFO/BLK/CHR/SOCK): mode already carries type bits
+            entry.mode as libc::mode_t
         } else {
+            // Regular file: mode has no type bits, add S_IFREG
             (entry.mode | 0o100000) as libc::mode_t
         };
         attr.st_nlink = entry.nlink as u64;
@@ -1678,6 +1688,54 @@ impl FileSystem for PowerFsFs {
         let entry = attr_to_cached_entry(&attr, parent, name_str);
         self.cache.insert(entry.clone());
         debug!("mkdir: RPC done, inode={}, dir={}", attr.inode, parent);
+
+        Ok(self.create_fuse_entry(&entry))
+    }
+
+    fn mknod(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        _umask: u32,
+    ) -> std::io::Result<Entry> {
+        let name_str = name.to_str().unwrap_or("");
+        debug!(
+            "mknod: parent={}, name={}, mode={:o}",
+            parent, name_str, mode
+        );
+
+        if self.entry_exists(parent, name_str) {
+            return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+        }
+
+        // The mode from VFS already includes the file type bits
+        // (S_IFBLK=0o060000, S_IFCHR=0o020000, S_IFIFO=0o010000, S_IFSOCK=0o140000).
+        // Pass it directly to the Filer's create endpoint, which stores the
+        // mode via setattr. The Filer skips volume/needle allocation for
+        // non-regular files (see handle_create is_special_file check).
+        let uid = ctx.uid;
+        let gid = ctx.gid;
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(parent);
+        let name_owned = name_str.to_string();
+        let attr = self
+            .client
+            .block_on(async move {
+                meta_client
+                    .create(parent, &name_owned, mode, uid, gid, shard_id, None)
+                    .await
+            })
+            .map_err(|e| {
+                error!("mknod RPC failed: {}", e);
+                std::io::Error::from_raw_os_error(libc::EIO)
+            })?;
+
+        let entry = attr_to_cached_entry(&attr, parent, name_str);
+        self.cache.insert(entry.clone());
+        debug!("mknod: RPC done, inode={}, parent={}", attr.inode, parent);
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -4861,6 +4919,20 @@ impl FileSystem for PowerFsFs {
             inode, mode, offset, length
         );
 
+        // Only support default (allocate) and KEEP_SIZE / PUNCH_HOLE modes.
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        // PUNCH_HOLE must be combined with KEEP_SIZE.
+        if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        if length == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
         let entry = self
             .cache
             .get_inode(inode)
@@ -4870,9 +4942,32 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
         }
 
-        let new_size = offset + length;
-        if new_size > entry.size {
-            self.cache.update_size(inode, new_size);
+        // When KEEP_SIZE is not set, fallocate may extend the file size.
+        if (mode & FALLOC_FL_KEEP_SIZE) == 0 {
+            let new_size = offset + length;
+            if new_size > entry.size {
+                // Sync the new size to the Filer via setattr RPC so that
+                // other clients and remounts see the correct size.
+                // Without this, stat() would re-fetch size=0 from the Filer.
+                let params = SetattrParams {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(new_size),
+                    atime: None,
+                    mtime: None,
+                };
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let shard_id = meta_client.calculate_shard_id(inode);
+                self.client
+                    .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
+                    .map_err(|e| {
+                        error!("fallocate setattr RPC failed for inode {}: {}", inode, e);
+                        std::io::Error::from_raw_os_error(libc::EIO)
+                    })?;
+
+                self.cache.update_size(inode, new_size);
+            }
         }
 
         Ok(())
