@@ -2011,11 +2011,15 @@ impl SyncFuseClientFacade {
                         .unwrap_or_default()
                 })
                 .or_else(|| {
-                    result.payload.as_deref().filter(|d| !d.is_empty()).map(|d| {
-                        let mut dec = powerfs_net::TlvDecoder::new(d);
-                        dec.next_string(powerfs_net::FieldId::SymlinkTarget)
-                            .unwrap_or_default()
-                    })
+                    result
+                        .payload
+                        .as_deref()
+                        .filter(|d| !d.is_empty())
+                        .map(|d| {
+                            let mut dec = powerfs_net::TlvDecoder::new(d);
+                            dec.next_string(powerfs_net::FieldId::SymlinkTarget)
+                                .unwrap_or_default()
+                        })
                 })
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "Failed to parse symlink target from response".to_string())?;
@@ -2072,7 +2076,11 @@ mod tests {
     #[test]
     fn test_facade_config_creation() {
         let config = FuseClientFacadeConfig::new(
-            vec!["172.20.0.11".to_string(), "172.20.0.12".to_string(), "172.20.0.13".to_string()],
+            vec![
+                "172.20.0.11".to_string(),
+                "172.20.0.12".to_string(),
+                "172.20.0.13".to_string(),
+            ],
             9334,
             8901,
             vec!["172.20.0.21".to_string(), "172.20.0.22".to_string()],
