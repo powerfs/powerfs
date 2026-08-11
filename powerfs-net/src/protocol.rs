@@ -565,6 +565,16 @@ pub enum MsgType {
     /// Response: XattrValue (bytes) or STATUS_ERR_NOT_FOUND.
     GetXattr = 0x0039,
 
+    /// Remove an extended attribute from an inode (persisted via Raft).
+    /// Request: ShardId + Ino + XattrKey.
+    /// Response: status only.
+    RemoveXattr = 0x003a,
+
+    /// List all extended attribute keys on an inode.
+    /// Request: ShardId + Ino.
+    /// Response: XattrKeys (repeated string, NUL-separated) or empty.
+    ListXattr = 0x003b,
+
     // Status
     StatFs = 0x0040,
 
@@ -654,6 +664,8 @@ impl MsgType {
             0x0037 => Some(Self::MigrateInlineAlloc),
             0x0038 => Some(Self::SetXattr),
             0x0039 => Some(Self::GetXattr),
+            0x003a => Some(Self::RemoveXattr),
+            0x003b => Some(Self::ListXattr),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -917,6 +929,10 @@ pub enum FieldId {
     CpuUsage = 0xBA,
     /// Memory usage scaled to basis points (u64, 0-10000 = 0.00%-100.00%).
     MemoryUsage = 0xBB,
+
+    /// Xattr key list for ListXattr response. Format: NUL-separated keys
+    /// packed into a single bytes field.
+    XattrKeys = 0xBC,
 }
 
 impl FieldId {
@@ -1019,6 +1035,7 @@ impl FieldId {
             0xB9 => Some(Self::Force),
             0xBA => Some(Self::CpuUsage),
             0xBB => Some(Self::MemoryUsage),
+            0xBC => Some(Self::XattrKeys),
             _ => None,
         }
     }

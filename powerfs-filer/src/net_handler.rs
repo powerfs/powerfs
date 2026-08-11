@@ -2062,6 +2062,89 @@ impl FilerNetHandler {
         }
     }
 
+    /// Handle RemoveXattr request — remove an extended attribute via Raft.
+    ///
+    /// Request TLV: ShardId + Ino + XattrKey (string)
+    /// Response: status only.
+    async fn handle_remove_xattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let key = dec.next_string(FieldId::XattrKey).unwrap_or_default();
+
+        let shard_id = self.shard_strategy.calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        info!(
+            "FILER_NET_REMOVEXATTR: inode={} key={}",
+            inode, key
+        );
+
+        match self
+            .meta_shard_manager
+            .remove_xattr(inode, shard_id, &key)
+            .await
+        {
+            Ok(()) => {
+                let now = crate::shard_store::ShardStore::current_time();
+                self.notify_inode_change(inode, now);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_NET_REMOVEXATTR: failed for inode {} key {}: {}",
+                    inode, key, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle ListXattr request — list all extended attribute keys on an inode.
+    ///
+    /// Request TLV: ShardId + Ino
+    /// Response TLV: XattrKeys (bytes, NUL-separated keys) or empty.
+    async fn handle_list_xattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+
+        let shard_id = self.shard_strategy.calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.meta_shard_manager.get_inode(inode) {
+            Some(info) => {
+                let mut buf = Vec::new();
+                for key in info.extended.keys() {
+                    buf.extend_from_slice(key.as_bytes());
+                    buf.push(0); // NUL separator
+                }
+                let mut enc = TlvEncoder::new();
+                if !buf.is_empty() {
+                    let _ = enc.add_bytes(FieldId::XattrKeys, &buf);
+                }
+                debug!(
+                    "FILER_NET_LISTXATTR: inode={} keys={}",
+                    inode,
+                    info.extended.keys().len()
+                );
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            None => {
+                warn!("FILER_NET_LISTXATTR: inode {} not found", inode);
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
+        }
+    }
+
     /// Handle AcquireInodeLease request (方案 A, Phase 2).
     ///
     /// Request TLV: Ino, ClientId, LeaseDuration
@@ -2439,6 +2522,8 @@ impl NetHandler for FilerNetHandler {
             MsgType::MigrateInlineAlloc => self.handle_migrate_inline_alloc(msg).await,
             MsgType::SetXattr => self.handle_setxattr(msg).await,
             MsgType::GetXattr => self.handle_getxattr(msg).await,
+            MsgType::RemoveXattr => self.handle_remove_xattr(msg).await,
+            MsgType::ListXattr => self.handle_list_xattr(msg).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
