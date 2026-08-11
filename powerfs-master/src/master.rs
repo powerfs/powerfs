@@ -677,6 +677,23 @@ impl MasterNode {
             "Registered filer: id={}, address={}, shards={:?}",
             info.node_id, info.address, info.shard_ids
         );
+
+        // Push a TopologyChanged NOTIFY to all TLV clients (FUSE/kernel FS)
+        // so they re-fetch the full topology and update their shard routing
+        // tables. Without this, clients never receive TopologyChanged and
+        // rely solely on passive RPC redirects to repair stale routes after
+        // a filer restart or leader change.
+        let update = VolumeLocationUpdate {
+            new_vids: Vec::new(),
+            deleted_vids: Vec::new(),
+            leader: info.address.clone(),
+        };
+        if let Err(e) = self.notify_tx.try_send(update) {
+            warn!(
+                "register_filer: failed to notify topology change for filer {}: {}",
+                info.node_id, e
+            );
+        }
     }
 
     pub fn get_filer_for_inode(&self, inode: u64) -> Option<String> {

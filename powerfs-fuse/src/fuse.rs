@@ -85,6 +85,8 @@ pub struct FuseApp {
     force_mount: bool,
     /// 请求超时 (秒)
     request_timeout_secs: u64,
+    /// Admin/debug HTTP server port (0 = disabled).
+    admin_port: u16,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -106,6 +108,7 @@ impl FuseApp {
         lease_renew_interval_ms: u64,
         force_mount: bool,
         request_timeout_secs: u64,
+        admin_port: u16,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
         // filer_addrs 为空且 filer_addr 也为空时，由 facade 从 master 拓扑发现。
@@ -135,6 +138,7 @@ impl FuseApp {
             lease_renew_interval_ms,
             force_mount,
             request_timeout_secs,
+            admin_port,
             runtime,
         })
     }
@@ -205,6 +209,17 @@ impl FuseApp {
             facade,
             self.runtime.clone(),
         ));
+
+        // Start admin/debug HTTP server if admin_port is configured.
+        // Exposes /stats (request statistics + in-flight tracking) and
+        // /health endpoints for `powerfs-cli fuse-stats` to query.
+        if self.admin_port > 0 {
+            let bind_addr = format!("0.0.0.0:{}", self.admin_port);
+            crate::admin_server::AdminServer::start(bind_addr, sync_client.stats().clone());
+            info!("Admin/debug server enabled on port {}", self.admin_port);
+        } else {
+            info!("Admin/debug server disabled (admin_port=0)");
+        }
 
         let cache = Arc::new(MetadataCache::new());
         // Create the chunk (data) cache up front so it can be shared with the

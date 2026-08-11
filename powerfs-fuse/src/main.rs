@@ -162,6 +162,10 @@ fn main() {
         fuse_cfg.request_timeout_secs
     };
     info!("Request timeout: {}s", request_timeout_secs);
+    let admin_port = fuse_cfg.admin_port;
+    if admin_port > 0 {
+        info!("Admin/debug server port: {}", admin_port);
+    }
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
@@ -277,6 +281,7 @@ fn main() {
             lease_renew_interval_ms,
             force_mount,
             request_timeout_secs,
+            admin_port,
             runtime_arc.clone(),
         )
         .await

@@ -350,6 +350,8 @@ services:
     networks:
       powerfs-network:
         ipv4_address: 172.30.0.40
+    ports:
+      - "9999:9999"
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -380,6 +382,8 @@ services:
     volumes:
       - /tmp/powerfs/test:/tmp/test-results
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
+      - /home/portion/powerfs/target/release/powerfs-cli:/app/powerfs-cli:ro
     healthcheck:
       test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
       interval: 3s
