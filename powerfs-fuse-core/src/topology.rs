@@ -86,6 +86,14 @@ pub struct ClusterTopology {
     /// 当 `shard_count == 0` 表示 master 未下发该字段（旧 master 或尚未有 filer
     /// 注册）；此时调用方应使用配置中的 filer 列表 + `--force` 兜底，或拒绝挂载。
     pub shard_count: usize,
+    /// ShardMap entries snapshot from Master (S3).
+    ///
+    /// Each tuple = `(range_start, range_end, shard_id, state)` where
+    /// `state` is `0=Active, 1=Draining`. When non-empty, `sync_shard_map`
+    /// reconstructs the ShardMap from these entries (identical to the Filer's
+    /// map, including post-split ranges). When empty, falls back to
+    /// `ShardMap::from_shard_count(shard_count)`.
+    pub shard_map_entries: Vec<(u64, u64, u64, u8)>,
 }
 
 impl ClusterTopology {
@@ -96,6 +104,7 @@ impl ClusterTopology {
             version: 0,
             updated_at: None,
             shard_count: 0,
+            shard_map_entries: Vec::new(),
         }
     }
 
@@ -460,6 +469,7 @@ impl MasterClient {
                 // still correct in steady state (one extra round-trip on first
                 // contact, then cached by `meta_shard_client`).
                 topology.shard_count = topo.total_shards as usize;
+                topology.shard_map_entries = topo.shard_map_entries.clone();
                 for filer in &topo.filers {
                     if !filer.is_healthy || filer.address.is_empty() {
                         continue;

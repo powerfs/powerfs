@@ -651,7 +651,7 @@ impl PowerFsFs {
     /// 缓存 miss 或 `shard_id=None` 时回退到 `calculate_shard_id(inode)`。
     ///
     /// 这是 S5 的核心：正常路径（缓存命中）零计算，直接用 Filer 权威值。
-    /// S6 会将所有 `calculate_shard_id` 调用点替换为此方法。
+    /// S6: 所有 inode-level / parent-level 操作都通过此方法路由。
     fn routing_shard(&self, inode: u64) -> u64 {
         if let Some(entry) = self.cache.get_inode(inode) {
             if let Some(sid) = entry.shard_id {
@@ -1232,15 +1232,11 @@ impl PowerFsFs {
             })
             .collect();
 
-        // inode-level write → route by calculate_shard_id(inode).
+        // inode-level write → route by routing_shard(inode).
         // Inode records live on their own hash-derived shard (independent of
         // the parent dir entry's shard); routing via `parent` would hit the
         // wrong leader and force a redirect on every close.
-        let routing_shard = self
-            .client
-            .facade()
-            .meta_shard_client()
-            .calculate_shard_id(inode);
+        let routing_shard = self.routing_shard(inode);
         let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
             shard_id: routing_shard,
             inode,
@@ -1356,7 +1352,7 @@ impl PowerFsFs {
         }
         // 查 Filer（shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name.to_string();
         self.client
             .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
@@ -1812,7 +1808,7 @@ impl FileSystem for PowerFsFs {
 
         // 2. Step 2: Filer RPC（强一致 Leader Lease Read, shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         debug!(
             "lookup: cache MISS, querying filer shard={} parent={}",
@@ -2179,7 +2175,7 @@ impl FileSystem for PowerFsFs {
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         let attr = self
             .client
@@ -2235,7 +2231,7 @@ impl FileSystem for PowerFsFs {
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         let attr = self
             .client
@@ -2268,7 +2264,7 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.rmdir RPC 走 Filer Raft leader（强一致）
         // Filer 的 handle_rmdir 会做空目录检查（ENOTEMPTY），客户端不需要重复检查。
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         self.client
             .block_on(async move { meta_client.rmdir(parent, &name_owned, shard_id).await })
@@ -2305,7 +2301,7 @@ impl FileSystem for PowerFsFs {
                 parent, name_str
             );
             let meta_client = self.client.facade().meta_shard_client().clone();
-            let shard_id = meta_client.calculate_shard_id(parent);
+            let shard_id = self.routing_shard(parent);
             let name_owned = name_str.to_string();
             let attr = self
                 .client
@@ -2339,7 +2335,7 @@ impl FileSystem for PowerFsFs {
         // Step 2: 通过 MetadataClient.unlink RPC 走 Filer Raft leader（强一致）
         // Filer 端原子地移除目录条目并递减 nlink。
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         self.client
             .block_on(async move { meta_client.unlink(parent, &name_owned, shard_id).await })
@@ -2429,7 +2425,7 @@ impl FileSystem for PowerFsFs {
         let uid = ctx.uid;
         let gid = ctx.gid;
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(parent);
+        let shard_id = self.routing_shard(parent);
         let name_owned = name_str.to_string();
         let t_create = std::time::Instant::now();
         let attr = self
@@ -2903,7 +2899,7 @@ impl FileSystem for PowerFsFs {
             // any other shard returns "ino not found" → inline_buffers not
             // populated → read falls through to the stripe/Flat path →
             // "placement Inline but no chunks" EIO.
-            let routing_shard = meta_client.calculate_shard_id(inode);
+            let routing_shard = self.routing_shard(inode);
             let ino = inode;
             let attr_result = self
                 .client
@@ -2945,7 +2941,7 @@ impl FileSystem for PowerFsFs {
         // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
         // inode-level state → route by calculate_shard_id(inode)
-        let open_count_shard = meta_shard_client.calculate_shard_id(inode);
+        let open_count_shard = self.routing_shard(inode);
         let req = powerfs_coherence::OpenCountRequest {
             shard_id: open_count_shard,
             inode,
@@ -3003,7 +2999,7 @@ impl FileSystem for PowerFsFs {
                 inode
             );
             let meta_client = self.client.facade().meta_shard_client().clone();
-            let routing_shard = meta_client.calculate_shard_id(inode);
+            let routing_shard = self.routing_shard(inode);
             let ino = inode;
             match self
                 .client
@@ -4216,7 +4212,7 @@ impl FileSystem for PowerFsFs {
             // The inode record lives on this shard after the split-create
             // refactor; routing to any other shard returns "inode not found"
             // → EFBIG → buffer discarded → 0-byte file on release.
-            let routing_shard = meta_client.calculate_shard_id(inode);
+            let routing_shard = self.routing_shard(inode);
             match self.client.block_on(async move {
                 meta_client.migrate_inline_alloc(routing_shard, inode).await
             }) {
@@ -4735,12 +4731,11 @@ impl FileSystem for PowerFsFs {
         };
 
         if let Some((size, dirty, data)) = inline_info {
-            // inode-level write → route by calculate_shard_id(inode). Inline
+            // inode-level write → route by routing_shard(inode). Inline
             // data + size are stored on the inode's own shard, NOT the parent
             // dir's shard. Routing via `parent` would send the close-sync to
             // the wrong leader and corrupt the file (size=0 / inline_data lost).
-            let meta_client_for_calc = self.client.facade().meta_shard_client().clone();
-            let routing_shard = meta_client_for_calc.calculate_shard_id(inode);
+            let routing_shard = self.routing_shard(inode);
 
             // 仅当 write 修改过 (dirty) 才同步; 只读 open → release 不回写,
             // 避免覆盖其他客户端的并发写入 (Inline 无 volume lease 互斥).
@@ -4902,7 +4897,7 @@ impl FileSystem for PowerFsFs {
         if self.cache.get_inode(inode).is_some() {
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
             // inode-level state → route by calculate_shard_id(inode)
-            let open_count_shard = meta_shard_client.calculate_shard_id(inode);
+            let open_count_shard = self.routing_shard(inode);
             let req = powerfs_coherence::OpenCountRequest {
                 shard_id: open_count_shard,
                 inode,
@@ -5079,7 +5074,7 @@ impl FileSystem for PowerFsFs {
             }
             None => {
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                let routing_shard = meta_client.calculate_shard_id(inode);
+                let routing_shard = self.routing_shard(inode);
                 let ino = inode;
                 let attr = self
                     .client
@@ -5223,7 +5218,7 @@ impl FileSystem for PowerFsFs {
         // 空目录检查由 Filer 在 Raft 提交时完成，返回 ENOTEMPTY 错误。
         // shard_id = calculate_shard_id(olddir)（源目录的 shard）
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(olddir);
+        let shard_id = self.routing_shard(olddir);
         let old_owned = old_str.to_string();
         let new_owned = new_str.to_string();
         let _attr = self
@@ -5611,7 +5606,7 @@ impl FileSystem for PowerFsFs {
                     mtime: None,
                 };
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                let shard_id = meta_client.calculate_shard_id(inode);
+                let shard_id = self.routing_shard(inode);
                 self.client
                     .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
                     .map_err(|e| {
@@ -5759,10 +5754,10 @@ impl FileSystem for PowerFsFs {
         };
 
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = self.routing_shard(inode);
         let value_owned = value.to_vec();
         let name_for_rpc = normalized_name.to_string();
         match self.client.block_on(async move {
-            let shard_id = meta_client.calculate_shard_id(inode);
             meta_client
                 .set_xattr(shard_id, inode, &name_for_rpc, &value_owned)
                 .await
@@ -5812,7 +5807,7 @@ impl FileSystem for PowerFsFs {
                     mtime: None,
                 };
                 let meta_client = self.client.facade().meta_shard_client().clone();
-                let shard_id = meta_client.calculate_shard_id(inode);
+                let shard_id = self.routing_shard(inode);
                 match self
                     .client
                     .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
@@ -5870,9 +5865,9 @@ impl FileSystem for PowerFsFs {
             };
 
             let meta_client = self.client.facade().meta_shard_client().clone();
+            let shard_id = self.routing_shard(inode);
             let name_for_rpc = normalized_name.to_string();
             match self.client.block_on(async move {
-                let shard_id = meta_client.calculate_shard_id(inode);
                 meta_client.get_xattr(shard_id, inode, &name_for_rpc).await
             }) {
                 Ok(value) => {
@@ -5919,8 +5914,8 @@ impl FileSystem for PowerFsFs {
         // doesn't include xattrs) or after a remount (cache is empty).
         if xattrs.is_empty() {
             let meta_client = self.client.facade().meta_shard_client().clone();
+            let shard_id = self.routing_shard(inode);
             match self.client.block_on(async move {
-                let shard_id = meta_client.calculate_shard_id(inode);
                 meta_client.list_xattr(shard_id, inode).await
             }) {
                 Ok(keys) => {
@@ -5981,9 +5976,9 @@ impl FileSystem for PowerFsFs {
         };
 
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = self.routing_shard(inode);
         let name_for_rpc = normalized_name.to_string();
         match self.client.block_on(async move {
-            let shard_id = meta_client.calculate_shard_id(inode);
             meta_client
                 .remove_xattr(shard_id, inode, &name_for_rpc)
                 .await

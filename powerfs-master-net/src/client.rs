@@ -299,6 +299,7 @@ impl TlvMasterClient {
         // FilerListEntries immediately but it will still be found.
         let mut filers = Vec::new();
         let mut total_shards: u64 = 0;
+        let mut shard_map_entries: Vec<(u64, u64, u64, u8)> = Vec::new();
         if dec.contains_field(FieldId::FilerListEntries) {
             // Advance past any unexpected fields until we reach FilerListEntries.
             // next_field() returns (FieldId, length) and consumes the 5-byte
@@ -331,14 +332,35 @@ impl TlvMasterClient {
                 let _ = dec.skip(len);
             }
             total_shards = dec.next_u64(FieldId::TotalShards).unwrap_or(0);
+
+            // ShardMap entries snapshot (S3): packed blob of 25-byte entries.
+            // Absent on old masters → empty Vec → client falls back to
+            // from_shard_count(total_shards).
+            let entries_blob = dec
+                .next_bytes(FieldId::ShardMapEntries)
+                .unwrap_or_default();
+            shard_map_entries = entries_blob
+                .chunks_exact(25)
+                .filter_map(|c| {
+                    if c.len() < 25 {
+                        return None;
+                    }
+                    let range_start = u64::from_le_bytes(c[0..8].try_into().ok()?);
+                    let range_end = u64::from_le_bytes(c[8..16].try_into().ok()?);
+                    let shard_id = u64::from_le_bytes(c[16..24].try_into().ok()?);
+                    let state = c[24];
+                    Some((range_start, range_end, shard_id, state))
+                })
+                .collect();
         }
 
         info!(
-            "TlvMasterClient: get_topology leader={}, volumes={}, filers={}, total_shards={}",
+            "TlvMasterClient: get_topology leader={}, volumes={}, filers={}, total_shards={}, shard_map_entries={}",
             leader,
             volumes.len(),
             filers.len(),
-            total_shards
+            total_shards,
+            shard_map_entries.len()
         );
 
         Ok(TopologyInfo {
@@ -346,6 +368,7 @@ impl TlvMasterClient {
             volumes,
             filers,
             total_shards,
+            shard_map_entries,
         })
     }
 

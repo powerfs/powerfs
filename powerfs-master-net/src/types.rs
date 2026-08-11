@@ -48,6 +48,14 @@ pub struct TopologyInfo {
     /// a hardcoded value (such as the legacy 256) is incorrect when the filer
     /// cluster uses a different shard_count.
     pub total_shards: u64,
+    /// ShardMap entries snapshot from Master (S3).
+    ///
+    /// Each tuple = `(range_start, range_end, shard_id, state)` where
+    /// `state` is `0=Active, 1=Draining`. When non-empty, clients reconstruct
+    /// the ShardMap from these entries (identical to the Filer's map, including
+    /// post-split ranges). When empty (old Master without the `ShardMapEntries`
+    /// extension), clients fall back to `ShardMap::from_shard_count(total_shards)`.
+    pub shard_map_entries: Vec<(u64, u64, u64, u8)>,
 }
 
 /// Result of an `assign()` call.
