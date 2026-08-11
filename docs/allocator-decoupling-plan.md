@@ -1040,3 +1040,105 @@ pub struct ShardSplitPlan {
 - `SetNodeMaintenance` gRPC RPC + handler：供运维/AI Agent 通过 gRPC 设置节点维护模式。
 - 效果：`maintenance_mode=true` 时，集群快照构建器将节点映射为 `NodeRuntimeState::Maintenance`，分配器在所有分配决策中排除该节点。
 - 测试：master 99 PASS，clippy 0 警告，rustfmt clean。
+
+## 10. 统一 Shard 路由接口
+
+> 日期：2026-08-11
+> 状态：设计中 → 实施
+
+### 10.1 问题
+
+Shard 路由计算分散在客户端和 Filer 两处，算法不一致导致 cross-shard 操作失败：
+
+| 位置 | 算法 | 行为 |
+|------|------|------|
+| FUSE 客户端 `calculate_shard_id` | `(inode / 1M) % shard_count` 模运算 | inode ≥ 3M 时回绕到 shard 0 |
+| Filer `ShardStrategy::calculate_shard` | `ShardMap::route(inode)` 区间查找 | inode ≥ 3M 全落最后 shard（不回绕）|
+| `readdir` (fuse.rs:5141) | 直接传 `inode` 当 `shard_id` | inode=1 → shard=1（应 shard 0）|
+
+**后果**：
+- 客户端算出错误 shard_id → Filer 在错误 shard 上查找 → NOT_FOUND → ENOENT/EIO
+- `cp -prf` 批量创建后 setattr/lookup 路由到错误 shard → "No such file or directory"
+- 路由策略变更（如加 shard）需要改客户端和 Filer 两处
+
+**根因**：路由计算分散在 33 处调用点，没有统一接口。
+
+### 10.2 设计方案：A + B 组合
+
+#### 方案 A：共享路由 crate（基础层）
+
+`powerfs-allocator::ShardMap` 已存在，提供 `route(inode) -> ShardId`。
+
+**改动**：
+1. FUSE 客户端引入 `ShardMap`，替代 `calculate_shard_id` 的模运算
+2. Master 通过 topology 下发 `ShardMap` 的 `entries_snapshot()`（序列化为 `(range_start, range_end, shard_id, state)` 列表）
+3. 客户端用 `ShardMap::route(inode)` 计算路由，与 Filer 完全一致
+4. 加 shard / drain shard 时，Master 下发新 ShardMap，客户端自动适配
+
+**优势**：单一算法源，改路由只改 `ShardMap`，客户端和 Filer 同时生效。
+
+#### 方案 B：Filer 返回 shard_id（快速路径）
+
+Filer 在元数据响应中附带 `shard_id`，客户端缓存后直接使用，免去计算。
+
+**改动**：
+1. **协议扩展**：`MetadataAttr` 结构新增 `shard_id: u16` 字段
+   - create / mkdir / mknod / lookup / getattr / readdir 响应均携带
+   - 向后兼容：`shard_id=0` 时回退到 `ShardMap::route(inode)`
+2. **客户端缓存**：`CachedEntry` 新增 `shard_id` 字段
+   - mkdir/create 返回的 entry 直接缓存 Filer 提供的 shard_id
+   - setattr/getattr 等操作优先用缓存的 shard_id
+   - 缓存 miss 时回退到 `ShardMap::route(inode)`
+3. **readdir 修复**：dir_entries 携带每个子条目的 shard_id，lookup 后缓存
+
+**优势**：
+- 正常路径（缓存命中）零计算，直接用 Filer 权威值
+- 缓存 miss 回退到共享 ShardMap，仍保证正确性
+- Filer 调整路由策略后，新创建的 inode 自动携带新 shard_id
+
+### 10.3 数据流
+
+```
+                         Master topology
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+              ┌──────────┐        ┌──────────┐
+              │  Filer   │        │  Client  │
+              │ ShardMap │◄──────►│ ShardMap │  (方案A: 共享)
+              └────┬─────┘        └────┬─────┘
+                   │                   │
+     create/lookup/getattr 响应         │
+     ─────────────────────────────────►│
+         attr.shard_id = N             │  (方案B: 快速路径)
+                   │                   │
+                   │             ┌─────┴──────┐
+                   │             │ CachedEntry │
+                   │             │ .shard_id=N │
+                   │             └─────┬──────┘
+                   │                   │
+                   │   setattr/getattr │
+                   │   ◄───────────────│  用缓存的 shard_id
+                   │                   │
+                   │  缓存 miss 时     │
+                   │   route(inode)   │  回退到 ShardMap
+                   └───────────────────┘
+```
+
+### 10.4 实施步骤
+
+| 步骤 | 内容 | 优先级 |
+|------|------|--------|
+| S1 | 修复 `readdir` 传 `inode` 当 `shard_id` 的 bug → 改为 `calculate_shard_id(inode)` | P0 立即 |
+| S2 | 客户端引入 `ShardMap`，`calculate_shard_id` 改为 `ShardMap::route(inode)` | P0 |
+| S3 | Master topology 下发 ShardMap entries_snapshot | P1 |
+| S4 | `MetadataAttr` 新增 `shard_id` 字段，Filer 响应中填充 | P1 |
+| S5 | `CachedEntry` 新增 `shard_id`，操作时优先用缓存值 | P1 |
+| S6 | 所有 33 处 `calculate_shard_id` 调用替换为统一 `route(inode)` 接口 | P2 |
+
+### 10.5 约束
+
+1. **向后兼容**：`shard_id=0` 或缺失时回退到 `ShardMap::route(inode)`，不影响旧 Filer
+2. **线程安全**：`ShardMap` 已用 `RwLock`，客户端可直接持有 `Arc<ShardMap>`
+3. **拓扑同步**：Master 下发 ShardMap 与 shard leader 地址一起，复用现有 `sync_shard_router` 机制
+4. **不引入 Filer 内部转发**：保持客户端计算路由，避免多一跳延迟
