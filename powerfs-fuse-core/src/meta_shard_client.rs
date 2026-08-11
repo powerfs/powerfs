@@ -1348,6 +1348,70 @@ impl MetaShardClient {
             .map_err(|e| format!("get_xattr: response missing XattrValue: {:?}", e))
     }
 
+    /// Remove an extended attribute from an inode (persisted via Raft).
+    pub async fn remove_xattr(
+        &self,
+        shard_id: u64,
+        inode: u64,
+        key: &str,
+    ) -> Result<(), String> {
+        use powerfs_net::serialize::TlvEncoder;
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, shard_id);
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_string(FieldId::XattrKey, key)
+            .map_err(|e| format!("encode xattr key: {:?}", e))?;
+
+        let body = enc.into_bytes();
+        self.send_coherence_msg(powerfs_net::MsgType::RemoveXattr, shard_id, body)
+            .await?;
+        Ok(())
+    }
+
+    /// List all extended attribute keys on an inode.
+    /// Returns a list of key strings. Empty list if no xattrs.
+    pub async fn list_xattr(
+        &self,
+        shard_id: u64,
+        inode: u64,
+    ) -> Result<Vec<String>, String> {
+        use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+        use powerfs_net::FieldId;
+
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ShardId, shard_id);
+        enc.add_u64(FieldId::Ino, inode);
+
+        let body = enc.into_bytes();
+        let resp_body = self
+            .send_coherence_msg(powerfs_net::MsgType::ListXattr, shard_id, body)
+            .await?;
+
+        // Response may be empty (no xattrs) or contain XattrKeys field
+        if resp_body.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut dec = TlvDecoder::new(&resp_body);
+        match dec.next_bytes(FieldId::XattrKeys) {
+            Ok(data) => {
+                // NUL-separated keys
+                let keys: Vec<String> = data
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect();
+                Ok(keys)
+            }
+            Err(_) => {
+                // No XattrKeys field → no xattrs
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
     ///
     /// TLV 编码: Request = ShardId + Ino

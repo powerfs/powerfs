@@ -5195,40 +5195,39 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
-        // P3: Persist powerfs.* xattrs to Filer via Raft (for placement policy inheritance).
-        // The `attr`/`setfattr` tool sends names in the "user." namespace, so
-        // "user.powerfs.placement" must be normalized to "powerfs.placement"
-        // before sending to the Filer (which stores keys without "user." prefix).
-        // The local cache keeps the ORIGINAL name so the kernel can find it.
+        // Persist ALL xattrs to Filer via Raft.
+        // The `attr`/`setfattr` tool sends names in the "user." namespace.
+        // For powerfs.* xattrs, normalize "user.powerfs.*" → "powerfs.*"
+        // (Filer stores these without "user." prefix for placement policy).
+        // For other xattrs, store with the original name (including "user.").
+        // The local cache always keeps the ORIGINAL name so the kernel finds it.
         let normalized_name = if name_str.starts_with("user.powerfs.") {
             &name_str[5..] // strip "user." → "powerfs.*"
         } else {
             name_str
         };
 
-        if normalized_name.starts_with("powerfs.") {
-            let meta_client = self.client.facade().meta_shard_client().clone();
-            let value_owned = value.to_vec();
-            let name_for_rpc = normalized_name.to_string();
-            match self.client.block_on(async move {
-                let shard_id = meta_client.calculate_shard_id(inode);
-                meta_client
-                    .set_xattr(shard_id, inode, &name_for_rpc, &value_owned)
-                    .await
-            }) {
-                Ok(()) => {
-                    info!(
-                        "setxattr: persisted {} on inode {} to Filer (original={})",
-                        normalized_name, inode, name_str
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "setxattr: failed to persist {} on inode {}: {}",
-                        normalized_name, inode, e
-                    );
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                }
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let value_owned = value.to_vec();
+        let name_for_rpc = normalized_name.to_string();
+        match self.client.block_on(async move {
+            let shard_id = meta_client.calculate_shard_id(inode);
+            meta_client
+                .set_xattr(shard_id, inode, &name_for_rpc, &value_owned)
+                .await
+        }) {
+            Ok(()) => {
+                debug!(
+                    "setxattr: persisted {} on inode {} to Filer (original={})",
+                    normalized_name, inode, name_str
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "setxattr: failed to persist {} on inode {}: {}",
+                    normalized_name, inode, e
+                );
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         }
 
@@ -5246,14 +5245,6 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("getxattr: inode={}, name={}", inode, name_str);
 
-        // Do NOT return ENOENT when the inode is not in the cache.
-        // The kernel calls getxattr (e.g., security.selinux) after setattr,
-        // and the InvalidateHandler may have evicted the cache entry between
-        // the setattr and this call. Returning ENODATA is safe: PowerFS does
-        // not store xattrs, so the kernel treats the file as having no xattrs.
-        // Returning ENOENT here would cause the preceding operation (e.g.,
-        // chown) to report "No such file or directory" even though it succeeded.
-
         if let Some(value) = self.cache.get_xattr(inode, name_str) {
             if size == 0 {
                 Ok(GetxattrReply::Count(value.len() as u32))
@@ -5263,51 +5254,47 @@ impl FileSystem for PowerFsFs {
                 Ok(GetxattrReply::Value(value))
             }
         } else {
-            // P3: Cache miss for powerfs.* xattr — fetch from Filer.
+            // Cache miss — fetch from Filer for ALL xattr names.
             // Normalize "user.powerfs.*" → "powerfs.*" for the Filer lookup
-            // (Filer stores keys without the "user." namespace prefix).
-            // Cache the result with the ORIGINAL name so the kernel finds it.
+            // (Filer stores powerfs keys without "user." prefix).
+            // Other xattrs are stored with their full name on the Filer.
             let normalized_name = if name_str.starts_with("user.powerfs.") {
                 &name_str[5..]
             } else {
                 name_str
             };
 
-            if normalized_name.starts_with("powerfs.") {
-                let meta_client = self.client.facade().meta_shard_client().clone();
-                let name_for_rpc = normalized_name.to_string();
-                match self.client.block_on(async move {
-                    let shard_id = meta_client.calculate_shard_id(inode);
-                    meta_client.get_xattr(shard_id, inode, &name_for_rpc).await
-                }) {
-                    Ok(value) => {
-                        debug!(
-                            "getxattr: fetched {} from Filer for inode {} ({} bytes, original={})",
-                            normalized_name,
-                            inode,
-                            value.len(),
-                            name_str
-                        );
-                        // Cache with the ORIGINAL name (kernel uses "user.powerfs.*").
-                        self.cache.set_xattr(inode, name_str, &value);
-                        if size == 0 {
-                            Ok(GetxattrReply::Count(value.len() as u32))
-                        } else if value.len() > size as usize {
-                            Err(std::io::Error::from_raw_os_error(libc::ERANGE))
-                        } else {
-                            Ok(GetxattrReply::Value(value))
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            "getxattr: {} not found on Filer for inode {}: {}",
-                            normalized_name, inode, e
-                        );
-                        Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let name_for_rpc = normalized_name.to_string();
+            match self.client.block_on(async move {
+                let shard_id = meta_client.calculate_shard_id(inode);
+                meta_client.get_xattr(shard_id, inode, &name_for_rpc).await
+            }) {
+                Ok(value) => {
+                    debug!(
+                        "getxattr: fetched {} from Filer for inode {} ({} bytes, original={})",
+                        normalized_name,
+                        inode,
+                        value.len(),
+                        name_str
+                    );
+                    // Cache with the ORIGINAL name (kernel uses "user.*").
+                    self.cache.set_xattr(inode, name_str, &value);
+                    if size == 0 {
+                        Ok(GetxattrReply::Count(value.len() as u32))
+                    } else if value.len() > size as usize {
+                        Err(std::io::Error::from_raw_os_error(libc::ERANGE))
+                    } else {
+                        Ok(GetxattrReply::Value(value))
                     }
                 }
-            } else {
-                Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+                Err(e) => {
+                    debug!(
+                        "getxattr: {} not found on Filer for inode {}: {}",
+                        normalized_name, inode, e
+                    );
+                    Err(std::io::Error::from_raw_os_error(libc::ENODATA))
+                }
             }
         }
     }
@@ -5320,8 +5307,42 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<ListxattrReply> {
         debug!("listxattr: inode={}", inode);
 
-        // Do NOT return ENOENT when the inode is not in the cache.
-        // See getxattr comment for rationale.
+        let xattrs = self.cache.list_xattrs(inode);
+
+        // If the cache has no xattrs, try fetching from the Filer.
+        // This handles the case where the inode was loaded via lookup (which
+        // doesn't include xattrs) or after a remount (cache is empty).
+        if xattrs.is_empty() {
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            match self.client.block_on(async move {
+                let shard_id = meta_client.calculate_shard_id(inode);
+                meta_client.list_xattr(shard_id, inode).await
+            }) {
+                Ok(keys) => {
+                    for key in &keys {
+                        // Cache each key with an empty value so listxattr
+                        // returns the keys. The actual value will be fetched
+                        // by getxattr on demand.
+                        if self.cache.get_xattr(inode, key).is_none() {
+                            self.cache.set_xattr(inode, key, b"");
+                        }
+                    }
+                    if !keys.is_empty() {
+                        debug!(
+                            "listxattr: fetched {} keys from Filer for inode {}",
+                            keys.len(),
+                            inode
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "listxattr: failed to fetch keys from Filer for inode {}: {}",
+                        inode, e
+                    );
+                }
+            }
+        }
 
         let xattrs = self.cache.list_xattrs(inode);
         let mut buf = Vec::new();
@@ -5347,7 +5368,39 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
+        // Remove from Filer (persisted via Raft).
+        let normalized_name = if name_str.starts_with("user.powerfs.") {
+            &name_str[5..]
+        } else {
+            name_str
+        };
+
+        let meta_client = self.client.facade().meta_shard_client().clone();
+        let name_for_rpc = normalized_name.to_string();
+        match self.client.block_on(async move {
+            let shard_id = meta_client.calculate_shard_id(inode);
+            meta_client
+                .remove_xattr(shard_id, inode, &name_for_rpc)
+                .await
+        }) {
+            Ok(()) => {
+                debug!(
+                    "removexattr: removed {} from Filer for inode {}",
+                    normalized_name, inode
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "removexattr: failed to remove {} from Filer for inode {}: {}",
+                    normalized_name, inode, e
+                );
+                // Continue to remove from local cache anyway
+            }
+        }
+
         if !self.cache.remove_xattr(inode, name_str) {
+            // Not in local cache, but may have been removed from Filer
+            // Return ENODATA if the Filer also didn't have it
             return Err(std::io::Error::from_raw_os_error(libc::ENODATA));
         }
 
