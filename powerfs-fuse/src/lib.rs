@@ -1,3 +1,4 @@
+pub mod admin_server;
 pub mod cache;
 pub mod fuse;
 pub mod invalidate_handler;

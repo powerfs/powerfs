@@ -721,6 +721,7 @@ fn build_config(
             lease: powerfs_common::config::LeaseConfig::default(),
             force_mount: false,
             request_timeout_secs: 15,
+            admin_port: 0,
         },
         monitor: MonitorConfig {
             addr: format!("0.0.0.0:{}", cfg.monitor_port),
