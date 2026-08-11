@@ -110,6 +110,28 @@ impl ShardMap {
         }
     }
 
+    /// Reconstruct a ShardMap from an `entries_snapshot()` produced by another
+    /// ShardMap (e.g. Master → client topology sync via S3).
+    ///
+    /// Each tuple = `(range_start, range_end, shard_id, state)`.
+    /// Entries are sorted by `range_start` to ensure binary-search correctness.
+    /// Malformed entries (state > 1) are treated as Active.
+    pub fn from_entries(entries: Vec<(u64, u64, ShardId, ShardState)>) -> Self {
+        let mut entries: Vec<ShardMapEntry> = entries
+            .into_iter()
+            .map(|(range_start, range_end, shard_id, state)| ShardMapEntry {
+                range_start,
+                range_end,
+                shard_id,
+                state,
+            })
+            .collect();
+        entries.sort_by_key(|e| e.range_start);
+        Self {
+            entries: RwLock::new(entries),
+        }
+    }
+
     /// Route an inode to its shard via binary search.
     ///
     /// Returns `ShardId(0)` if the map is empty (should not happen in production).
@@ -604,5 +626,55 @@ mod tests {
 
         // Final active count = initial (2) + successful adds (n).
         assert_eq!(map.active_shards().len(), 2 + n as usize);
+    }
+
+    #[test]
+    fn test_from_entries_roundtrip() {
+        // from_entries(entries_snapshot()) should produce an equivalent map.
+        let original = ShardMap::from_shard_count(4);
+        let snapshot = original.entries_snapshot();
+        let reconstructed = ShardMap::from_entries(snapshot);
+
+        // Routing must match for all inodes in [0, 4M).
+        for inode in [0u64, 1, 999_999, 1_000_000, 2_000_001, 3_500_000] {
+            assert_eq!(
+                original.route(inode),
+                reconstructed.route(inode),
+                "inode {} routed differently after roundtrip",
+                inode
+            );
+        }
+        assert_eq!(original.entry_count(), reconstructed.entry_count());
+        assert_eq!(original.active_shards(), reconstructed.active_shards());
+    }
+
+    #[test]
+    fn test_from_entries_unsorted_input() {
+        // from_entries should sort by range_start internally.
+        let entries = vec![
+            (2_000_000, 3_000_000, ShardId(2), ShardState::Active),
+            (0, 1_000_000, ShardId(0), ShardState::Active),
+            (1_000_000, 2_000_000, ShardId(1), ShardState::Active),
+        ];
+        let map = ShardMap::from_entries(entries);
+        // Binary search requires sorted entries; if unsorted, route() would
+        // return wrong results.
+        assert_eq!(map.route(500_000), ShardId(0));
+        assert_eq!(map.route(1_500_000), ShardId(1));
+        assert_eq!(map.route(2_500_000), ShardId(2));
+    }
+
+    #[test]
+    fn test_from_entries_with_draining() {
+        // Reconstruct a map that includes a Draining shard.
+        let entries = vec![
+            (0, 1_000_000, ShardId(0), ShardState::Active),
+            (1_000_000, 2_000_000, ShardId(1), ShardState::Draining),
+        ];
+        let map = ShardMap::from_entries(entries);
+        assert_eq!(map.active_shards(), vec![ShardId(0)]);
+        assert_eq!(map.draining_shards(), vec![ShardId(1)]);
+        // Draining shards still route correctly.
+        assert_eq!(map.route(1_500_000), ShardId(1));
     }
 }

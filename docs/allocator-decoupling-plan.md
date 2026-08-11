@@ -1131,10 +1131,10 @@ Filer 在元数据响应中附带 `shard_id`，客户端缓存后直接使用，
 |------|------|--------|------|
 | S1 | 修复 `readdir` 传 `inode` 当 `shard_id` 的 bug → 改为 `calculate_shard_id(inode)` | P0 立即 | ✅ |
 | S2 | 客户端引入 `ShardMap`，`calculate_shard_id` 改为 `ShardMap::route(inode)` | P0 | ✅ |
-| S3 | Master topology 下发 ShardMap entries_snapshot | P1 | 待定（当前 `from_shard_count` 等价，shard 分裂时需） |
+| S3 | Master topology 下发 ShardMap entries_snapshot | P1 | ✅ |
 | S4 | `MetadataAttr` 新增 `shard_id` 字段，Filer 响应中填充 | P1 | ✅ |
 | S5 | `CachedEntry` 新增 `shard_id`，操作时优先用缓存值 | P1 | ✅ |
-| S6 | 所有 33 处 `calculate_shard_id` 调用替换为统一 `route(inode)` 接口 | P2 | 待定 |
+| S6 | 所有 `calculate_shard_id` 调用替换为统一 `routing_shard(inode)` 接口 | P2 | ✅ |
 
 ### 10.5 约束
 
@@ -1190,15 +1190,72 @@ Filer 在元数据响应中附带 `shard_id`，客户端缓存后直接使用，
 **操作接入**（S5 首批，S6 将完成剩余）:
 - `setattr`: 改用 `self.routing_shard(inode)`（inode-level 操作）
 - `readdir`: 改用 `self.routing_shard(inode)`（目录 inode-level 操作）
-- 其余 30 处 `calculate_shard_id` 调用保留，待 S6 统一替换
+- 其余 `calculate_shard_id` 调用保留，待 S6 统一替换
+
+#### S3: Master topology 下发 ShardMap entries_snapshot（已完成）
+
+**动机**：当前客户端用 `ShardMap::from_shard_count(n)` 构建路由表，与 Filer 初始状态等价。
+但当 Shard 发生分裂（`add_shard`）后，Filer 的 ShardMap 不再是等分区间，客户端若仍用
+`from_shard_count` 会路由到错误 shard。S3 让 Master 在 topology 响应中携带完整的
+`entries_snapshot()`，客户端直接重建，保证与 Filer 完全一致。
+
+**协议层** (`powerfs-net/src/protocol.rs`):
+- 新增 `ShardMapEntries = 0xB9` FieldId
+- 编码格式：packed blob，每条目 25 字节 = `range_start:u64 LE` + `range_end:u64 LE` + `shard_id:u64 LE` + `state:u8`（0=Active, 1=Draining）
+- 字段可选：旧 Master 不编码 → 客户端回退 `from_shard_count(total_shards)`
+
+**Master** (`powerfs-master/src/net_handler.rs`):
+- `NET_GET_TOPOLOGY` 中，从 `total_shards` 构建 `ShardMap::from_shard_count(n)`
+- 调用 `entries_snapshot()` 编码为 packed blob，追加 `ShardMapEntries` 字段
+- 当前等价于 `from_shard_count`（未来 Filer 上报实际 entries 时直接转发）
+
+**Master-net** (`powerfs-master-net/src/types.rs` + `client.rs`):
+- `TopologyInfo` 新增 `shard_map_entries: Vec<ShardMapEntry>`（每条目 = `(u64, u64, u64, u8)`）
+- `get_topology()` 解码 `ShardMapEntries` blob（25 字节为一组）
+- 旧 Master 不含此字段 → `shard_map_entries` 为空 Vec
+
+**Fuse-core** (`powerfs-fuse-core/src/topology.rs` + `meta_shard_client.rs`):
+- `ClusterTopology` 新增 `shard_map_entries: Vec<(u64, u64, u64, u8)>` 字段
+- `fetch_topology()` 映射 `TopologyInfo.shard_map_entries` → `ClusterTopology.shard_map_entries`
+- `sync_shard_map()` 优先从 `entries` 重建 ShardMap（逐条 insert），为空时回退 `from_shard_count`
+
+**向后兼容**：
+- 旧 Master 不编码 `ShardMapEntries` → `entries` 为空 → 客户端回退 `from_shard_count(total_shards)`
+- 旧客户端不解析 `ShardMapEntries` → 忽略新字段，仍用 `total_shards` + `from_shard_count`
+
+#### S6: 统一替换 calculate_shard_id 为 routing_shard（已完成）
+
+**动机**：S5 引入了 `routing_shard(inode)` 快速路径（缓存命中时用 Filer 权威 shard_id，
+免去 `ShardMap::route` 计算），但仅接入 `setattr` 和 `readdir`。S6 将剩余所有
+`calculate_shard_id` 调用统一替换为 `routing_shard`，确保正常路径（缓存命中）零计算。
+
+**替换规则** (`powerfs-fuse/src/fuse.rs`):
+- 所有 `meta_client.calculate_shard_id(inode)` → `self.routing_shard(inode)`
+- `routing_shard` 内部：缓存命中 + `shard_id=Some(sid)` → 返回 `sid`；否则回退 `calculate_shard_id`
+- `meta_shard_client.rs` 内部的 3 处 `calculate_shard_id` 保留（属于路由实现层，非调用方）
+
+**不变量**：
+- inode-level 操作（getattr/setattr/write-back/open-count）→ `routing_shard(inode)`
+- parent-level 操作（lookup/create/mkdir/readdir）→ `routing_shard(parent)`
+- rename → `routing_shard(olddir)`（源目录 shard）
+
+**收益**：
+- 缓存命中时免去 `ShardMap::route` 的 RwLock 读锁 + 二分查找
+- 使用 Filer 权威 shard_id，彻底消除客户端/Filer 路由分歧可能
+- 统一入口，后续修改路由逻辑只需改 `routing_shard` 一处
 
 ### 10.7 测试验证
 
-- `cargo check` 全通过（powerfs-net / powerfs-fuse-core / powerfs-filer / powerfs-fuse）
-- `cargo clippy` 0 警告
+S1-S6 全部完成后：
+
+- `cargo check --all` 通过（0 error，仅 1 个 pre-existing dead_code warning in powerfs-filer）
+- `cargo clippy --all` 0 警告
 - `cargo test`:
+  - powerfs-allocator: 82 passed（含 3 个 `from_entries` 新测试）
   - powerfs-net: 166 passed
+  - powerfs-master-net: 全部通过
   - powerfs-fuse-core: 73 passed
+  - powerfs-master: 全部通过
   - powerfs-fuse (lib): 38 passed
-  - powerfs-filer: 74 passed
   - powerfs-fuse (tests): 8 passed
+  - powerfs-filer: 74 passed
