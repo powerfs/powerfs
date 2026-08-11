@@ -1171,6 +1171,22 @@ impl ShardStore {
                         let _ = self.db.put_cf(cf_inodes, inode_key, &data);
                     }
                 }
+
+                // POSIX: rename updates mtime/ctime of both parent directories.
+                // The FUSE client relies on this to invalidate its kernel readdir
+                // cache (via AUTO_INVAL_DATA mtime check). Without this update,
+                // the kernel serves stale directory entries for up to 1s.
+                let now = chrono::Utc::now().timestamp() as u64;
+                for parent_ino in [old_parent_inode, new_parent_inode] {
+                    if let Some(pinfo) = inodes.get_mut(&parent_ino) {
+                        pinfo.mtime = now;
+                        pinfo.ctime = now;
+                        if let Ok(data) = serde_json::to_vec(pinfo) {
+                            let key = parent_ino.to_be_bytes();
+                            let _ = self.db.put_cf(cf_inodes, key, &data);
+                        }
+                    }
+                }
             }
         }
 
