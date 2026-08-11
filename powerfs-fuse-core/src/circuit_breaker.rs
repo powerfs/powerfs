@@ -66,6 +66,10 @@ struct CircuitBreakerInner {
     last_failure_time: Option<Instant>,
     half_open_requests: u32,
     opened_at: Option<Instant>,
+    /// When HalfOpen state was entered. Used for HalfOpen timeout:
+    /// if probes don't reach a conclusion within recovery_timeout,
+    /// transition back to Open for another cooldown cycle.
+    half_opened_at: Option<Instant>,
 }
 
 impl CircuitBreaker {
@@ -80,6 +84,7 @@ impl CircuitBreaker {
                 last_failure_time: None,
                 half_open_requests: 0,
                 opened_at: None,
+                half_opened_at: None,
             }),
         }
     }
@@ -117,6 +122,16 @@ impl CircuitBreaker {
         }
     }
 
+    /// Check if the circuit is definitely open (no probing).
+    /// Unlike `is_available()`, this does NOT consume a HalfOpen slot.
+    /// Used for secondary checks (e.g., inside process_request_internal
+    /// where submit() already consumed the slot).
+    pub fn is_open(&self) -> bool {
+        let mut inner = self.state.lock().unwrap();
+        self.check_state_transition(&mut inner);
+        inner.state == CircuitState::Open
+    }
+
     /// 记录成功
     pub fn record_success(&self) {
         let mut inner = self.state.lock().unwrap();
@@ -124,6 +139,10 @@ impl CircuitBreaker {
         match inner.state {
             CircuitState::HalfOpen => {
                 inner.success_count += 1;
+                // Free up a slot so more probe requests can be sent
+                if inner.half_open_requests > 0 {
+                    inner.half_open_requests -= 1;
+                }
 
                 // 如果连续成功次数达到阈值，恢复到 Closed
                 if inner.success_count >= self.config.half_open_max_requests {
@@ -132,6 +151,7 @@ impl CircuitBreaker {
                     inner.success_count = 0;
                     inner.half_open_requests = 0;
                     inner.opened_at = None;
+                    inner.half_opened_at = None;
                     log::info!("CircuitBreaker: HalfOpen -> Closed (success threshold reached)");
                 }
             }
@@ -161,6 +181,7 @@ impl CircuitBreaker {
                     inner.state = CircuitState::Open;
                     inner.opened_at = Some(Instant::now());
                     inner.half_open_requests = 0;
+                    inner.half_opened_at = None;
                     log::warn!(
                         "CircuitBreaker: Closed -> Open (failure threshold reached: {})",
                         inner.failure_count
@@ -174,6 +195,7 @@ impl CircuitBreaker {
                 inner.last_failure_time = Some(Instant::now());
                 inner.opened_at = Some(Instant::now());
                 inner.half_open_requests = 0;
+                inner.half_opened_at = None;
                 log::warn!("CircuitBreaker: HalfOpen -> Open (failure in half-open state)");
             }
             CircuitState::Open => {
@@ -190,6 +212,7 @@ impl CircuitBreaker {
         inner.success_count = 0;
         inner.half_open_requests = 0;
         inner.opened_at = None;
+        inner.half_opened_at = None;
         log::info!("CircuitBreaker: Manually reset to Closed");
     }
 
@@ -202,7 +225,27 @@ impl CircuitBreaker {
                     inner.state = CircuitState::HalfOpen;
                     inner.half_open_requests = 0;
                     inner.success_count = 0;
+                    inner.half_opened_at = Some(Instant::now());
                     log::info!("CircuitBreaker: Open -> HalfOpen (recovery timeout elapsed)");
+                }
+            }
+        } else if inner.state == CircuitState::HalfOpen {
+            // HalfOpen timeout: if probes didn't reach a conclusion within
+            // recovery_timeout (e.g., requests got stuck or were lost),
+            // transition back to Open for another cooldown cycle.
+            // This prevents the breaker from being permanently stuck in
+            // HalfOpen when half_open_requests is maxed out but neither
+            // enough successes nor any failure were recorded.
+            if let Some(half_opened_at) = inner.half_opened_at {
+                if half_opened_at.elapsed() >= self.config.recovery_timeout {
+                    inner.state = CircuitState::Open;
+                    inner.opened_at = Some(Instant::now());
+                    inner.half_open_requests = 0;
+                    inner.success_count = 0;
+                    inner.half_opened_at = None;
+                    log::warn!(
+                        "CircuitBreaker: HalfOpen -> Open (half-open timeout elapsed, probes inconclusive)"
+                    );
                 }
             }
         }
@@ -272,6 +315,12 @@ impl CircuitBreakerPool {
     /// Creates a new breaker if none exists for this address.
     pub fn check(&self, addr: &str) -> bool {
         self.get_or_create(addr).is_available()
+    }
+
+    /// Check if the circuit is definitely open (no probing).
+    /// Unlike `check()`, this does NOT consume a HalfOpen slot.
+    pub fn is_open(&self, addr: &str) -> bool {
+        self.get_or_create(addr).is_open()
     }
 
     /// Record a success for the given server address.
@@ -468,6 +517,71 @@ mod tests {
         // 失败立即重新打开
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_half_open_timeout_recovers_from_stuck_state() {
+        // Regression test: HalfOpen with all slots consumed but no
+        // record_success/record_failure called should transition back to
+        // Open after recovery_timeout, then to HalfOpen again.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            recovery_timeout: Duration::from_millis(50),
+            half_open_max_requests: 3,
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Trip the breaker
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for HalfOpen
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Consume all HalfOpen slots without recording success/failure
+        // (simulates requests that got stuck or were lost)
+        assert!(cb.is_available());
+        assert!(cb.is_available());
+        assert!(cb.is_available());
+        assert!(!cb.is_available()); // slots exhausted
+
+        // Without the HalfOpen timeout fix, the breaker would be stuck
+        // in HalfOpen forever. With the fix, it transitions back to Open
+        // after recovery_timeout.
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // And eventually back to HalfOpen for another probe cycle
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_is_open_does_not_consume_half_open_slots() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            recovery_timeout: Duration::from_millis(10),
+            half_open_max_requests: 2,
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Trip and wait for HalfOpen
+        cb.record_failure();
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // is_open() should NOT consume slots
+        assert!(!cb.is_open());
+        assert!(!cb.is_open());
+        assert!(!cb.is_open());
+
+        // All 2 slots should still be available
+        assert!(cb.is_available());
+        assert!(cb.is_available());
+        assert!(!cb.is_available()); // now exhausted
     }
 
     #[test]

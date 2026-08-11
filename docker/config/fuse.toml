@@ -18,7 +18,7 @@ threads = 8
 verbose = true
 container = true
 log_file = "/var/log/powerfs-fuse.log"
-request_timeout_secs = 3             # 测试环境: 3s 快速超时, 生产环境用 10s
+request_timeout_secs = 10            # 测试环境: 10s, 给 Raft 共识足够时间
 admin_port = 9999                    # Admin/debug HTTP server for request stats
 
 [fuse.lease]
