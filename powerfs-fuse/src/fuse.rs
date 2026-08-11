@@ -458,6 +458,65 @@ fn chunks_match(a: &[CachedFileChunk], b: &[CachedFileChunk]) -> bool {
     })
 }
 
+/// Map a Filer RPC error to the correct errno.
+///
+/// The Filer returns status codes (0=OK, 1=ENOENT, 2=EEXIST, etc.) which
+/// `send_coherence_msg` embeds in the error string as `"server status N"`.
+/// This function parses the status code and maps it to the matching errno,
+/// so that applications see correct POSIX errors instead of a blanket EIO.
+///
+/// For body-embedded error messages (e.g., "not empty" from rmdir), falls
+/// back to pattern matching. Only truly unknown/network errors default to EIO.
+fn filer_error_to_errno(e: &str) -> i32 {
+    // Parse "server status N" pattern (from send_coherence_msg)
+    if let Some(pos) = e.find("server status ") {
+        let rest = &e[pos + "server status ".len()..];
+        if let Ok(status) = rest.split_whitespace().next().unwrap_or("").parse::<u16>() {
+            return status_to_errno(status);
+        }
+    }
+
+    // Fall back to pattern matching for body-embedded error messages
+    let lower = e.to_lowercase();
+    if lower.contains("not empty") {
+        libc::ENOTEMPTY
+    } else if lower.contains("not found") || lower.contains("no such file") {
+        libc::ENOENT
+    } else if lower.contains("already exists") {
+        libc::EEXIST
+    } else if lower.contains("permission denied") || lower.contains("access denied") {
+        libc::EACCES
+    } else if lower.contains("not a directory") {
+        libc::ENOTDIR
+    } else if lower.contains("is a directory") {
+        libc::EISDIR
+    } else if lower.contains("no space") {
+        libc::ENOSPC
+    } else if lower.contains("invalid argument") || lower.contains("bad request") {
+        libc::EINVAL
+    } else {
+        libc::EIO
+    }
+}
+
+/// Map a Filer status code to the matching POSIX errno.
+fn status_to_errno(status: u16) -> i32 {
+    match status {
+        powerfs_net::STATUS_ERR_NOT_FOUND => libc::ENOENT,
+        powerfs_net::STATUS_ERR_ALREADY_EXISTS => libc::EEXIST,
+        powerfs_net::STATUS_ERR_PERMISSION_DENIED => libc::EACCES,
+        powerfs_net::STATUS_ERR_IO => libc::EIO,
+        powerfs_net::STATUS_ERR_INVALID_ARG => libc::EINVAL,
+        powerfs_net::STATUS_ERR_NOT_DIR => libc::ENOTDIR,
+        powerfs_net::STATUS_ERR_IS_DIR => libc::EISDIR,
+        powerfs_net::STATUS_ERR_NO_SPACE => libc::ENOSPC,
+        powerfs_net::STATUS_ERR_BAD_FD => libc::EBADF,
+        powerfs_net::STATUS_ERR_SERVER_ERROR => libc::EIO,
+        powerfs_net::STATUS_ERR_BAD_REQUEST => libc::EINVAL,
+        _ => libc::EIO,
+    }
+}
+
 /// P3: Resolve (volume_id, needle_id) for a 1MB chunk at `file_offset` in
 /// Stripe mode.
 ///
@@ -1971,8 +2030,13 @@ impl FileSystem for PowerFsFs {
         self.client
             .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
             .map_err(|e| {
-                error!("setattr RPC failed for inode {}: {}", inode, e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    error!("setattr RPC failed for inode {}: {}", inode, e);
+                } else {
+                    debug!("setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                }
+                std::io::Error::from_raw_os_error(errno)
             })?;
 
         // RPC 成功后更新本地缓存（含 size，供 FUSE 立即返回最新 stat）
@@ -2104,8 +2168,13 @@ impl FileSystem for PowerFsFs {
                     .await
             })
             .map_err(|e| {
-                error!("mkdir RPC failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    error!("mkdir RPC failed: {}", e);
+                } else {
+                    debug!("mkdir RPC failed: {} -> errno={}", e, errno);
+                }
+                std::io::Error::from_raw_os_error(errno)
             })?;
 
         let entry = attr_to_cached_entry(&attr, parent, name_str);
@@ -2155,8 +2224,13 @@ impl FileSystem for PowerFsFs {
                     .await
             })
             .map_err(|e| {
-                error!("mknod RPC failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    error!("mknod RPC failed: {}", e);
+                } else {
+                    debug!("mknod RPC failed: {} -> errno={}", e, errno);
+                }
+                std::io::Error::from_raw_os_error(errno)
             })?;
 
         let entry = attr_to_cached_entry(&attr, parent, name_str);
@@ -2178,12 +2252,12 @@ impl FileSystem for PowerFsFs {
         self.client
             .block_on(async move { meta_client.rmdir(parent, &name_owned, shard_id).await })
             .map_err(|e| {
-                let errno = if e.to_string().contains("not empty") {
-                    libc::ENOTEMPTY
-                } else {
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
                     error!("rmdir RPC failed: {}", e);
-                    libc::EIO
-                };
+                } else {
+                    debug!("rmdir RPC failed: {} -> errno={}", e, errno);
+                }
                 std::io::Error::from_raw_os_error(errno)
             })?;
 
@@ -2249,8 +2323,13 @@ impl FileSystem for PowerFsFs {
         self.client
             .block_on(async move { meta_client.unlink(parent, &name_owned, shard_id).await })
             .map_err(|e| {
-                error!("unlink RPC failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    error!("unlink RPC failed: {}", e);
+                } else {
+                    debug!("unlink RPC failed: {} -> errno={}", e, errno);
+                }
+                std::io::Error::from_raw_os_error(errno)
             })?;
 
         if should_delete {
@@ -2340,8 +2419,13 @@ impl FileSystem for PowerFsFs {
                     .await
             })
             .map_err(|e| {
-                error!("create RPC failed: {}", e);
-                std::io::Error::from_raw_os_error(libc::EIO)
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    error!("create RPC failed: {}", e);
+                } else {
+                    debug!("create RPC failed: {} -> errno={}", e, errno);
+                }
+                std::io::Error::from_raw_os_error(errno)
             })?;
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
@@ -5050,11 +5134,14 @@ impl FileSystem for PowerFsFs {
         idx += 1;
 
         // Step 2: 通过 MetadataClient.readdir RPC 走 Filer Raft leader（强一致 Leader Lease Read）
-        // shard_id = inode（对 inode 操作）
+        // shard_id = calculate_shard_id(inode) — route to the shard that owns the
+        // directory's entries (the parent's shard, which is calculate_shard_id(inode)
+        // because the dir_entry table is stored on calculate_shard(parent_inode)).
         let meta_client = self.client.facade().meta_shard_client().clone();
+        let shard_id = meta_client.calculate_shard_id(inode);
         let dir_entries: Vec<MetadataDirEntry> = self
             .client
-            .block_on(async move { meta_client.readdir(inode, offset, 1000, inode).await })
+            .block_on(async move { meta_client.readdir(inode, offset, 1000, shard_id).await })
             .map_err(|e| {
                 error!("readdir RPC failed for inode {}: {}", inode, e);
                 std::io::Error::from_raw_os_error(libc::EIO)
@@ -5124,12 +5211,12 @@ impl FileSystem for PowerFsFs {
                     .await
             })
             .map_err(|e| {
-                let errno = if e.to_string().contains("not empty") {
-                    libc::ENOTEMPTY
-                } else {
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
                     error!("rename RPC failed: {}", e);
-                    libc::EIO
-                };
+                } else {
+                    debug!("rename RPC failed: {} -> errno={}", e, errno);
+                }
                 std::io::Error::from_raw_os_error(errno)
             })?;
 
@@ -5503,8 +5590,13 @@ impl FileSystem for PowerFsFs {
                 self.client
                     .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
                     .map_err(|e| {
-                        error!("fallocate setattr RPC failed for inode {}: {}", inode, e);
-                        std::io::Error::from_raw_os_error(libc::EIO)
+                        let errno = filer_error_to_errno(&e.to_string());
+                        if errno == libc::EIO {
+                            error!("fallocate setattr RPC failed for inode {}: {}", inode, e);
+                        } else {
+                            debug!("fallocate setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                        }
+                        std::io::Error::from_raw_os_error(errno)
                     })?;
 
                 self.cache.update_size(inode, new_size);
@@ -5658,11 +5750,19 @@ impl FileSystem for PowerFsFs {
                 );
             }
             Err(e) => {
-                warn!(
-                    "setxattr: failed to persist {} on inode {}: {}",
-                    normalized_name, inode, e
-                );
-                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                let errno = filer_error_to_errno(&e.to_string());
+                if errno == libc::EIO {
+                    warn!(
+                        "setxattr: failed to persist {} on inode {}: {}",
+                        normalized_name, inode, e
+                    );
+                } else {
+                    debug!(
+                        "setxattr: failed to persist {} on inode {}: {} -> errno={}",
+                        normalized_name, inode, e, errno
+                    );
+                }
+                return Err(std::io::Error::from_raw_os_error(errno));
             }
         }
 

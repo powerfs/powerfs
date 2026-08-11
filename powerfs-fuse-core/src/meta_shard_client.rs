@@ -13,6 +13,7 @@ use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
 use crate::topology::{ClusterTopologyManager, ShardInfo};
+use powerfs_allocator::ShardMap;
 use powerfs_net::client::NotificationHandler;
 use powerfs_net::PowerFsNetClient;
 
@@ -296,6 +297,10 @@ pub struct MetaShardClient {
     /// the cache may have missed Invalidate notifications (inspired by
     /// JuiceFS redisCache.onInvalidateConnect which Purges all caches).
     cache_epoch: Arc<AtomicU64>,
+    /// Shared ShardMap for routing inodes to shards. Same algorithm as the
+    /// Filer's ShardStrategy (both use powerfs_allocator::ShardMap).
+    /// Updated from topology via `update_shard_map()`.
+    shard_map: Arc<Mutex<ShardMap>>,
 }
 
 impl MetaShardClient {
@@ -328,6 +333,7 @@ impl MetaShardClient {
             notification_handler: Arc::new(std::sync::RwLock::new(None)),
             client_id,
             cache_epoch: Arc::new(AtomicU64::new(0)),
+            shard_map: Arc::new(Mutex::new(ShardMap::new())),
         }
     }
 
@@ -536,6 +542,8 @@ impl MetaShardClient {
     pub fn init(&self) {
         // 从拓扑管理器加载分片信息
         self.sync_shard_router();
+        // 同步 ShardMap（与 Filer 一致的路由算法）
+        self.sync_shard_map();
 
         // 如果分片路由表为空（新集群或拓扑未就绪），设置默认路由
         // 这确保所有分片请求都能被路由到 filer 进行处理
@@ -623,29 +631,45 @@ impl MetaShardClient {
         }
     }
 
+    /// Sync the ShardMap from topology's shard_count.
+    /// Uses `ShardMap::from_shard_count(n)` which generates the same
+    /// range-based routing as the Filer's ShardStrategy. This replaces
+    /// the old modulo-based `calculate_shard_id` that diverged for
+    /// inodes >= shard_count * 1M.
+    fn sync_shard_map(&self) {
+        let shard_count = self.topology_manager.shard_count() as u64;
+        if shard_count > 0 {
+            let new_map = ShardMap::from_shard_count(shard_count);
+            *self.shard_map.lock().unwrap() = new_map;
+            log::info!(
+                "MetaShardClient: ShardMap synced (shard_count={}, range-based routing)",
+                shard_count
+            );
+        }
+    }
+
     /// 直接设置分片 Leader（用于测试或动态路由更新）
     pub fn set_shard_leader(&self, shard_id: u64, leader_addr: String) {
         self.shard_router
             .insert(shard_id, ShardInfo::new(shard_id, leader_addr));
     }
 
-    /// Calculate shard_id from an inode using the same formula as the filer's ShardStrategy.
-    /// This ensures the FUSE client looks up the correct leader in shard_router,
-    /// avoiding redirects on every request.
-    /// Formula: (inode / inode_per_shard) % shard_count
-    /// inode_per_shard = 1_000_000 (must match filer's ShardStrategy::calculate_inode_per_shard)
+    /// Calculate shard_id from an inode using the same `ShardMap` as the Filer.
     ///
-    /// 模数来源优先级：
-    ///   1. master 下发的 `topology.shard_count`（权威值，与 filer 一致同意）；
-    ///   2. `shard_router.len()`（拓扑已填充 shard→leader 但 master 未下发 total_shards）；
-    ///   3. `1`（拓扑完全未就绪 → 返回 0，由 default_filer_addr 兜底）。
+    /// This replaces the old modulo-based formula `(inode / 1M) % shard_count`
+    /// which diverged from the Filer's range-based routing for inodes >=
+    /// shard_count * 1M (modulo wraps around, range-based maps to last shard).
+    ///
+    /// Uses `powerfs_allocator::ShardMap::route(inode)` — identical algorithm
+    /// to the Filer's `ShardStrategy::calculate_shard(inode)`. The ShardMap
+    /// is synced from topology's `shard_count` in `init()` and on topology
+    /// updates.
+    ///
+    /// When the ShardMap is empty (topology not yet ready), returns 0 so
+    /// the request routes to the default filer via `shard_router` fallback.
     pub fn calculate_shard_id(&self, inode: u64) -> u64 {
-        let shard_count = self.topology_manager.shard_count().max(1) as u64;
-        if shard_count <= 1 {
-            return 0;
-        }
-        let inode_per_shard = 1_000_000u64;
-        (inode / inode_per_shard) % shard_count
+        let map = self.shard_map.lock().unwrap();
+        map.route(inode).0
     }
 
     /// 获取当前状态
