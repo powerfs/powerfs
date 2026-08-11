@@ -1748,6 +1748,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         chunks: Vec::new(),
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
+        shard_id: resp.shard_id,
     }
 }
 
