@@ -597,6 +597,10 @@ impl FuseClientFacade {
         };
         meta_shard_client.set_filer_addresses(filer_endpoints);
         meta_shard_client.init();
+        let meta_shard_client = Arc::new(meta_shard_client);
+        // Register as TopologyUpdateListener so shard_router and shard_map
+        // are automatically re-synced on Master TopologyChanged notifications.
+        meta_shard_client.register_topology_listener();
 
         // 创建 Volume 客户端（共享连接池）
         // CRITICAL: sync volume_config.client_id with client_identity.client_id so
@@ -668,7 +672,7 @@ impl FuseClientFacade {
             config,
             topology_manager,
             master_client,
-            meta_shard_client: Arc::new(meta_shard_client),
+            meta_shard_client,
             volume_client,
             conn_pool,
             stats_reporter,
