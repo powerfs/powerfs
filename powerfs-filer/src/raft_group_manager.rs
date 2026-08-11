@@ -1195,18 +1195,37 @@ impl RaftGroupManager {
                 );
             }
             Ok(reply) => {
+                // Non-OK status (e.g. STATUS_ERR_SERVER_ERROR=10 "Client not
+                // found"). This happens when the peer restarted and lost the
+                // connection state for our client_id. The TCP connection is
+                // still alive, so call_with_retry doesn't detect the stale
+                // connection. Drop the connection from the pool so the next
+                // Raft message creates a fresh connection (with a new
+                // handshake that re-registers our client_id).
                 warn!(
-                    "Failed to send Raft message to peer {}: status={:#06x}: {}",
+                    "Failed to send Raft message to peer {}: status={:#06x}: {} — dropping stale connection",
                     peer_net_addr,
                     reply.status,
                     reply.body_str()
                 );
+                drop(conn);
+                let mut conns = self.peer_conns.lock().await;
+                conns.remove(peer_net_addr);
+                log::info!(
+                    "FILER_RAFT: dropped stale connection to {} (will reconnect on next message)",
+                    peer_net_addr
+                );
             }
             Err(e) => {
+                // Network-level error — connection is broken. Drop it so the
+                // next message creates a new connection.
                 warn!(
-                    "Failed to send Raft message to peer {}: {}",
+                    "Failed to send Raft message to peer {}: {} — dropping broken connection",
                     peer_net_addr, e
                 );
+                drop(conn);
+                let mut conns = self.peer_conns.lock().await;
+                conns.remove(peer_net_addr);
             }
         }
     }

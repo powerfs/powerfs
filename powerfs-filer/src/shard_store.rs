@@ -1056,7 +1056,10 @@ impl ShardStore {
                 dir.insert(name, inode);
             }
 
-            dir_entries.entry(inode).or_default();
+            // Always start with a fresh empty map for the new directory's
+            // own entries. Using or_default() would keep stale entries if the
+            // inode number was reused after an incomplete cleanup.
+            dir_entries.insert(inode, std::collections::HashMap::new());
         }
         {
             let mut stats = self.stats.write().unwrap();
@@ -1451,6 +1454,46 @@ impl ShardStore {
         }
     }
 
+    /// Read dir entries directly from RocksDB, bypassing the in-memory cache.
+    /// Used by rmdir's empty-directory check to avoid stale in-memory entries
+    /// (e.g., from OR-Set sync re-adding deleted entries via
+    /// `create_inode_atomic`). Returns raw (name, inode) pairs without
+    /// checking inode records — the caller is responsible for resolving
+    /// inodes (potentially on a different shard) and filtering tombstones.
+    pub fn list_dir_entry_inodes_rocksdb(&self, parent_inode: u64) -> Vec<(String, u64)> {
+        let cf_dir = match self.db.cf_handle(CF_DIR_ENTRIES) {
+            Some(cf) => cf,
+            None => return Vec::new(),
+        };
+
+        let prefix = format!("{}:", parent_inode);
+        let mut it = self.db.raw_iterator_cf(cf_dir);
+        it.seek(prefix.as_bytes());
+
+        let mut result = Vec::new();
+        while it.valid() {
+            if let Some(key) = it.key() {
+                let key_str = String::from_utf8_lossy(key);
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                let name = key_str[prefix.len()..].to_string();
+                if let Some(value) = it.value() {
+                    if value.len() >= 8 {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&value[..8]);
+                        let inode = u64::from_be_bytes(bytes);
+                        result.push((name, inode));
+                    }
+                }
+            } else {
+                break;
+            }
+            it.next();
+        }
+        result
+    }
+
     pub fn list_directory(&self, parent_inode: u64) -> Vec<InodeInfo> {
         let dir_entries = self.directory_entries.read().unwrap();
         let inodes = self.inodes.read().unwrap();
@@ -1592,6 +1635,10 @@ impl ShardStore {
             .db
             .cf_handle(CF_INODES)
             .ok_or_else(|| "CF_INODES not found".to_string())?;
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
 
         self.db
             .delete_cf(cf_inodes, inode.to_be_bytes())
@@ -1605,6 +1652,42 @@ impl ShardStore {
                 (is_file, is_dir)
             })
         };
+
+        // If the inode is a directory, clean up its directory entries from
+        // both RocksDB and the in-memory map. Without this, reused inode
+        // numbers would inherit stale entries from a previous directory,
+        // causing phantom files to appear in readdir (ISSUE: phantom files
+        // after inode reuse).
+        let mut was_dir = false;
+        if let Some((is_file, is_dir)) = &removed {
+            if *is_dir {
+                was_dir = true;
+                let prefix = format!("{}:", inode);
+                let mut it = self.db.raw_iterator_cf(cf_dir_entries);
+                it.seek(prefix.as_bytes());
+                while it.valid() {
+                    if let Some(key) = it.key() {
+                        let key_str = String::from_utf8_lossy(key);
+                        if key_str.starts_with(&prefix) {
+                            let _ = self.db.delete_cf(cf_dir_entries, key);
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    it.next();
+                }
+            }
+        }
+
+        // Remove the in-memory dir_entries map for this inode (whether or not
+        // it was a directory — harmless no-op for files).
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            dir_entries.remove(&inode);
+        }
+
         if let Some((is_file, is_dir)) = removed {
             {
                 let mut stats = self.stats.write().unwrap();
@@ -1617,6 +1700,14 @@ impl ShardStore {
                 }
             }
             self.save_stats();
+        }
+
+        if was_dir {
+            log::info!(
+                "Shard {} delete_inode: cleaned up directory entries for inode={}",
+                self.shard_id.0,
+                inode
+            );
         }
 
         Ok(())
@@ -2090,15 +2181,30 @@ impl ShardStore {
         let mut info = self
             .get_inode(inode)
             .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
+        // Track what actually changed before overwriting fields. This is critical
+        // for mtime correctness: the FUSE release path calls this on every close,
+        // including read-only opens and delayed releases that re-sync identical
+        // data. Setting mtime here races with a concurrent SETATTR (e.g.
+        // `touch -d`, `rsync -a`) that goes through Raft consensus. The
+        // Raft-applied SETATTR sets mtime=user_value, but this direct write
+        // (bypassing Raft) immediately overwrites it with current_time, causing
+        // the SETATTR polling loop to time out (EIO).
+        //
+        // Fix: do NOT set mtime here at all. mtime is managed exclusively by
+        // the SETATTR path (Raft consensus). The FUSE kernel sends
+        // SETATTR(MTIME_NOW) after writes, which updates mtime through Raft.
+        // This cleanly separates concerns:
+        //   - Data sync (this function): size, chunks, inline_data
+        //   - Metadata sync (SETATTR via Raft): mode, uid, gid, mtime, atime
+        let chunks_changed = info.chunks != chunks;
+
         info.size = size;
         info.blocks = size.div_ceil(512);
         // P4: 只在 chunks 实际变化时才重置 reliability_state,
         // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
         // 不必要地清空 replica_chunks.
-        let chunks_changed = info.chunks != chunks;
         info.chunks = chunks;
         info.inline_data = inline_data;
-        info.mtime = Self::current_time();
         // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
         // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
         // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
@@ -2387,14 +2493,10 @@ impl ShardStore {
                     info.gid = g as u32;
                 }
                 if let Some(mt) = mtime {
-                    if mt > info.mtime {
-                        info.mtime = mt;
-                    }
+                    info.mtime = mt;
                 }
                 if let Some(at) = atime {
-                    if at > info.atime {
-                        info.atime = at;
-                    }
+                    info.atime = at;
                 }
                 info
             }

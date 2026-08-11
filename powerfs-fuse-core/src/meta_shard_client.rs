@@ -2196,6 +2196,8 @@ impl MetadataClient for MetaShardClient {
                 params.uid,
                 params.gid,
                 params.size,
+                params.atime,
+                params.mtime,
             )
             .map_err(map_err)?;
             let resp = self
@@ -2416,8 +2418,11 @@ pub(crate) async fn process_request_internal(
             }
         };
 
-        // 3) Per-server circuit breaker check
-        if !breakers.check(&target_addr) {
+        // 3) Per-server circuit breaker check (non-consuming: submit() already
+        //    consumed the HalfOpen slot. Using is_open() here avoids
+        //    double-counting which would permanently stuck the breaker in
+        //    HalfOpen with all slots consumed but no record_success called.)
+        if breakers.is_open(&target_addr) {
             last_err = ClientError::CircuitOpen;
             log::warn!(
                 "process_request_internal: shard={} attempt {}/{} circuit open for {}",
