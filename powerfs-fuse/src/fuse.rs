@@ -637,6 +637,7 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
                 crc32: c.crc32,
             })
             .collect(),
+        shard_id: attr.shard_id,
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),
@@ -644,6 +645,25 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
 }
 
 impl PowerFsFs {
+    /// 方案 B (S5): 返回 inode 的路由 shard_id, 优先用缓存中的权威值。
+    ///
+    /// 缓存命中时直接用 Filer 返回的 `shard_id`（免 ShardMap::route 计算）;
+    /// 缓存 miss 或 `shard_id=None` 时回退到 `calculate_shard_id(inode)`。
+    ///
+    /// 这是 S5 的核心：正常路径（缓存命中）零计算，直接用 Filer 权威值。
+    /// S6 会将所有 `calculate_shard_id` 调用点替换为此方法。
+    fn routing_shard(&self, inode: u64) -> u64 {
+        if let Some(entry) = self.cache.get_inode(inode) {
+            if let Some(sid) = entry.shard_id {
+                return sid;
+            }
+        }
+        self.client
+            .facade()
+            .meta_shard_client()
+            .calculate_shard_id(inode)
+    }
+
     /// Check if the Filer leader has changed since the last call.
     /// If so, invalidate all cached metadata to handle potentially missed
     /// Invalidate notifications during the leader change window.
@@ -1629,6 +1649,7 @@ impl PowerFsFs {
             placement: None,
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks,
+            shard_id: None,
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
@@ -2026,7 +2047,7 @@ impl FileSystem for PowerFsFs {
             mtime,
         };
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(inode);
+        let shard_id = self.routing_shard(inode);
         self.client
             .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
             .map_err(|e| {
@@ -2484,6 +2505,7 @@ impl FileSystem for PowerFsFs {
                 placement: None,
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
+                shard_id: None,
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
@@ -2555,6 +2577,7 @@ impl FileSystem for PowerFsFs {
                 placement: Some(placement),
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
+                shard_id: None,
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
@@ -2635,6 +2658,7 @@ impl FileSystem for PowerFsFs {
             placement: None,
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
+            shard_id: None,
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
@@ -5134,11 +5158,10 @@ impl FileSystem for PowerFsFs {
         idx += 1;
 
         // Step 2: 通过 MetadataClient.readdir RPC 走 Filer Raft leader（强一致 Leader Lease Read）
-        // shard_id = calculate_shard_id(inode) — route to the shard that owns the
-        // directory's entries (the parent's shard, which is calculate_shard_id(inode)
-        // because the dir_entry table is stored on calculate_shard(parent_inode)).
+        // 方案 B (S5): 优先用缓存的 shard_id (目录 inode 创建时 Filer 返回的权威值),
+        // 缓存 miss 时回退到 calculate_shard_id(inode)。
         let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = meta_client.calculate_shard_id(inode);
+        let shard_id = self.routing_shard(inode);
         let dir_entries: Vec<MetadataDirEntry> = self
             .client
             .block_on(async move { meta_client.readdir(inode, offset, 1000, shard_id).await })
@@ -5286,6 +5309,7 @@ impl FileSystem for PowerFsFs {
             placement: None,
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
+            shard_id: None,
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
@@ -5381,6 +5405,7 @@ impl FileSystem for PowerFsFs {
                     placement: None,
                     reliability: powerfs_layout::reliability::Reliability::default(),
                     replica_chunks: Vec::new(),
+                    shard_id: None,
                     cached_at: Instant::now(),
                     state: EntryState::default(),
                     hold: HoldState::default(),

@@ -1207,6 +1207,10 @@ pub struct AttrResponse {
     /// Filer 在 create 响应中返回的 needle_id（file_key）。
     /// 客户端必须用此值写入 Volume Server，保证与 Filer 元数据一致。
     pub file_key: Option<u64>,
+    /// Filer 在元数据响应中返回的 shard_id（方案 B 快速路径）。
+    /// 客户端缓存后直接使用，免去 ShardMap::route(inode) 计算。
+    /// None 表示 Filer 未携带（旧版本），客户端回退到 ShardMap::route。
+    pub shard_id: Option<u64>,
 }
 
 /// Decode a common attr response (lookup/getattr return TLV)
@@ -1233,6 +1237,9 @@ pub fn decode_attr_resp(body: &[u8]) -> Result<AttrResponse, NetError> {
             // 客户端必须用这两个值构造 fid，保证与 Filer 元数据一致。
             FieldId::VolumeId => resp.volume_id = Some(dec.read_u64(length)?),
             FieldId::FileKey => resp.file_key = Some(dec.read_u64(length)?),
+            // 方案 B: Filer 在元数据响应中返回 shard_id (权威路由值)。
+            // 客户端缓存后直接使用, None 时回退到 ShardMap::route。
+            FieldId::ShardId => resp.shard_id = Some(dec.read_u64(length)?),
             _ => dec.skip(length)?,
         }
     }
