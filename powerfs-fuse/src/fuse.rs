@@ -83,6 +83,8 @@ pub struct FuseApp {
     lease_renew_interval_ms: u64,
     /// 强制挂载：跳过拓扑健康检查。仅用于运维场景。
     force_mount: bool,
+    /// 请求超时 (秒)
+    request_timeout_secs: u64,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -103,6 +105,7 @@ impl FuseApp {
         lease_duration_ms: u64,
         lease_renew_interval_ms: u64,
         force_mount: bool,
+        request_timeout_secs: u64,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
         // filer_addrs 为空且 filer_addr 也为空时，由 facade 从 master 拓扑发现。
@@ -131,6 +134,7 @@ impl FuseApp {
             lease_duration_ms,
             lease_renew_interval_ms,
             force_mount,
+            request_timeout_secs,
             runtime,
         })
     }
@@ -178,7 +182,7 @@ impl FuseApp {
             filer_addr: self.filer_addr.clone(),
             filer_addrs: self.filer_addrs.clone(),
             filer_port: self.filer_net_port,
-            request_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(self.request_timeout_secs),
             client_identity,
             mount_point: self.mount_point.clone(),
             collection: self.collection.clone(),
@@ -796,6 +800,23 @@ impl PowerFsFs {
                     .clear_dirty_for_chunks(inode, &flushed_indices);
             }
 
+            // ISSUE-001 diagnostic: log post-flush dirty state for stripe path
+            let has_dirty_shards = self.has_dirty_for_inode(inode);
+            let has_dirty_cache = self.chunk_cache.has_dirty_chunks(inode);
+            if flushed_indices.len() == dirty.len() && (has_dirty_shards || has_dirty_cache) {
+                warn!(
+                    "flush_dirty_chunks_impl(stripe): inode={} post-flush dirty NOT cleared! \
+                     flushed={}/{} has_dirty_shards={} has_dirty_cache={}",
+                    inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                );
+            } else {
+                debug!(
+                    "flush_dirty_chunks_impl(stripe): inode={} post-flush OK flushed={}/{} \
+                     has_dirty_shards={} has_dirty_cache={}",
+                    inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                );
+            }
+
             if had_error {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
@@ -904,6 +925,26 @@ impl PowerFsFs {
         if !flushed_indices.is_empty() {
             self.chunk_cache
                 .clear_dirty_for_chunks(inode, &flushed_indices);
+        }
+
+        // ISSUE-001 diagnostic: log post-flush dirty state to verify clearing.
+        // has_dirty_for_inode checks dirty_shards; has_dirty_chunks checks
+        // chunk_cache internal dirty flag. Both should be false after a
+        // successful flush with all chunks flushed.
+        let has_dirty_shards = self.has_dirty_for_inode(inode);
+        let has_dirty_cache = self.chunk_cache.has_dirty_chunks(inode);
+        if flushed_indices.len() == dirty.len() && (has_dirty_shards || has_dirty_cache) {
+            warn!(
+                "flush_dirty_chunks_impl: inode={} post-flush dirty NOT cleared! \
+                 flushed={}/{} has_dirty_shards={} has_dirty_cache={} — possible re-mark race",
+                inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+            );
+        } else {
+            debug!(
+                "flush_dirty_chunks_impl: inode={} post-flush OK flushed={}/{} \
+                 has_dirty_shards={} has_dirty_cache={}",
+                inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+            );
         }
 
         if had_error {
@@ -3532,141 +3573,151 @@ impl FileSystem for PowerFsFs {
         //   5. close 时 sync_size_chunks_on_close 原子清除 inline_data + 设 Flat chunks
         // crash safety: Filer 不修改 inode (保留 inline_data), 客户端崩溃后文件
         // 仍可作 Inline 读; needle_id 泄漏可接受 (同 CREATE 失败).
-        if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-            let new_end = offset + read_len as u64;
-            let max_size = self
-                .inline_max_sizes
-                .get(&inode)
-                .map(|v| *v as u64)
-                .unwrap_or(INLINE_HARD_LIMIT as u64);
-            // 迁移阈值 = min(max_size × 1.5, INLINE_HARD_LIMIT). 滞后窗口避免边界抖动.
-            let migrate_threshold = (max_size * 3 / 2).min(INLINE_HARD_LIMIT as u64);
+        // Phase 1: Extract data for migration (if needed), or do inline write.
+        // The DashMap RefMut from get_mut MUST be dropped before calling
+        // self.inline_buffers.remove() — otherwise the remove tries to
+        // acquire a write lock on the same shard that RefMut still holds,
+        // causing a deadlock (fuse_worker thread hangs in futex_wait).
+        let migrate_data: Option<(Vec<u8>, u64, u64)> = {
+            if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                let new_end = offset + read_len as u64;
+                let max_size = self
+                    .inline_max_sizes
+                    .get(&inode)
+                    .map(|v| *v as u64)
+                    .unwrap_or(INLINE_HARD_LIMIT as u64);
+                // 迁移阈值 = min(max_size × 1.5, INLINE_HARD_LIMIT). 滞后窗口避免边界抖动.
+                let migrate_threshold = (max_size * 3 / 2).min(INLINE_HARD_LIMIT as u64);
 
-            if new_end > migrate_threshold {
-                // P2.5c: 自动迁移. 先合并数据 (不修改 inline_buf, 失败时 buffer 不受影响),
-                // 再调 Filer 分配. 成功后切换 Flat; 失败返回 EFBIG, inline buffer 保持原状.
-                let merged_data = {
-                    let mut data = inline_buf.data.clone();
-                    let buf_len = data.len() as u64;
-                    if offset > buf_len {
-                        data.resize(offset as usize, 0);
-                    }
-                    let start = offset as usize;
-                    let end = new_end as usize;
-                    if data.len() < end {
-                        data.resize(end, 0);
-                    }
-                    data[start..end].copy_from_slice(&buf[..]);
-                    data
-                };
-                let _ = inline_buf; // release DashMap ref after clone above; dropped by scope
-                let meta_client = self.client.facade().meta_shard_client().clone();
-                // Route migrate_inline_alloc via the inode's own shard
-                // (calculate_shard(inode) on the client == calculate_shard(inode)
-                // on the filer, since both use (inode / 1_000_000) % shard_count).
-                // The inode record lives on this shard after the split-create
-                // refactor; routing to any other shard returns "inode not found"
-                // → EFBIG → buffer discarded → 0-byte file on release.
-                let routing_shard = meta_client.calculate_shard_id(inode);
-                match self.client.block_on(async move {
-                    meta_client.migrate_inline_alloc(routing_shard, inode).await
-                }) {
-                    Ok((volume_id, needle_id)) => {
-                        info!(
-                            "write inline migrate: inode={} new_end={} > threshold={} → \
-                             Flat volume_id={} needle_id={:#x}",
-                            inode, new_end, migrate_threshold, volume_id, needle_id
-                        );
-                        // 数据放入 chunk_cache (dirty). 必须放入: 否则后续 append 走
-                        // Flat 路径时 chunk 0 不在 cache → no_data_before 优化跳过
-                        // read-before-write → 零填充覆盖迁移数据.
-                        // P4 fix: 必须调用 mark_dirty, 否则 release/flusher 不会将
-                        // 迁移数据 flush 到 Volume Server, 导致数据只在内存中.
-                        let mtime = chrono::Utc::now().timestamp() as u64;
-                        self.chunk_cache
-                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
-                        self.mark_dirty(inode, 0);
-
-                        // 切换 cache 到 Flat 模式
-                        let fid = Fid {
-                            volume_id: VolumeId(volume_id),
-                            cookie: 0,
-                            file_key: needle_id,
-                        };
-                        let new_size = new_end;
-                        let chunks = vec![CachedFileChunk {
-                            offset: 0,
-                            size: new_size,
-                            mtime,
-                            needle_id,
-                            volume_id,
-                            crc32: 0,
-                        }];
-                        self.cache.update_fid(inode, fid);
-                        self.cache.update_chunks(inode, chunks);
-                        self.cache.update_size(inode, new_size);
-
-                        // 移除 inline buffer, 后续 write 走 Flat 路径
-                        self.inline_buffers.remove(&inode);
-                        self.inline_max_sizes.remove(&inode);
-
-                        debug!(
-                            "write inline migrate done: inode={} size={} → Flat, \
-                             subsequent writes → Volume Server",
-                            inode, new_size
-                        );
-                        return Ok(read_len);
-                    }
-                    Err(e) => {
-                        // 迁移失败: inline_buffer 未修改 (仅 clone), 数据安全.
-                        // 返回 EFBIG, 应用层可重试或关闭. close 时 inline_data
-                        // (≤ 8KB) 正常同步到 Filer.
-                        error!(
-                            "write inline migrate FAILED: inode={} new_end={} error={} — \
-                             EFBIG, inline buffer unmodified",
-                            inode, new_end, e
+                if new_end > migrate_threshold {
+                    // P2.5c: 自动迁移. 先合并数据 (不修改 inline_buf, 失败时 buffer 不受影响),
+                    // 再调 Filer 分配. 成功后切换 Flat; 失败返回 EFBIG, inline buffer 保持原状.
+                    let merged_data = {
+                        let mut data = inline_buf.data.clone();
+                        let buf_len = data.len() as u64;
+                        if offset > buf_len {
+                            data.resize(offset as usize, 0);
+                        }
+                        let start = offset as usize;
+                        let end = new_end as usize;
+                        if data.len() < end {
+                            data.resize(end, 0);
+                        }
+                        data[start..end].copy_from_slice(&buf[..]);
+                        data
+                    };
+                    // RefMut dropped at scope end — no more DashMap lock held
+                    Some((merged_data, new_end, migrate_threshold))
+                } else {
+                    // 未超阈值: 原有 inline 写路径 (直接覆盖/追加 buffer)
+                    // 安全检查: new_end 不应超 INLINE_HARD_LIMIT (migrate_threshold <= HARD_LIMIT,
+                    // 超阈值已迁移). 保留作防御.
+                    if new_end > INLINE_HARD_LIMIT as u64 {
+                        warn!(
+                            "write inline: inode={} new_end={} > INLINE_HARD_LIMIT={} (unexpected)",
+                            inode, new_end, INLINE_HARD_LIMIT
                         );
                         return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
                     }
+                    // 支持 offset <= buf_len (覆盖/追加); offset > buf_len 零填充间隙
+                    let buf_len = inline_buf.data.len() as u64;
+                    if offset > buf_len {
+                        inline_buf.data.resize(offset as usize, 0);
+                    }
+                    let start = offset as usize;
+                    let end = new_end as usize;
+                    if inline_buf.data.len() < end {
+                        inline_buf.data.resize(end, 0);
+                    }
+                    inline_buf.data[start..end].copy_from_slice(&buf[..]);
+                    inline_buf.dirty = true; // 标记已修改, release 时需同步到 Filer
+
+                    let updated_size = inline_buf.data.len() as u64;
+                    debug!(
+                        "write inline: inode={} offset={} len={} buffer_len={}",
+                        inode, offset, read_len, updated_size
+                    );
+                    // Update content_size in cache so getattr reports correct size
+                    self.cache.update_size(inode, updated_size);
+                    return Ok(read_len);
                 }
+            } else {
+                None
             }
+        }; // RefMut guaranteed dropped here
 
-            // 未超阈值: 原有 inline 写路径 (直接覆盖/追加 buffer)
-            // 安全检查: new_end 不应超 INLINE_HARD_LIMIT (migrate_threshold <= HARD_LIMIT,
-            // 超阈值已迁移). 保留作防御.
-            if new_end > INLINE_HARD_LIMIT as u64 {
-                warn!(
-                    "write inline: inode={} new_end={} > INLINE_HARD_LIMIT={} (unexpected)",
-                    inode, new_end, INLINE_HARD_LIMIT
-                );
-                return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
-            }
-            // 支持 offset <= buf_len (覆盖/追加); offset > buf_len 零填充间隙
-            let buf_len = inline_buf.data.len() as u64;
-            if offset > buf_len {
-                inline_buf.data.resize(offset as usize, 0);
-            }
-            let start = offset as usize;
-            let end = new_end as usize;
-            if inline_buf.data.len() < end {
-                inline_buf.data.resize(end, 0);
-            }
-            inline_buf.data[start..end].copy_from_slice(&buf[..]);
-            inline_buf.dirty = true; // 标记已修改, release 时需同步到 Filer
-            let new_size = new_end;
-            drop(inline_buf); // 释放 DashMap 写锁后再更新 cache
+        // Phase 2: Inline→Flat migration (no DashMap lock held)
+        if let Some((merged_data, new_end, migrate_threshold)) = migrate_data {
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            // Route migrate_inline_alloc via the inode's own shard
+            // (calculate_shard(inode) on the client == calculate_shard(inode)
+            // on the filer, since both use (inode / 1_000_000) % shard_count).
+            // The inode record lives on this shard after the split-create
+            // refactor; routing to any other shard returns "inode not found"
+            // → EFBIG → buffer discarded → 0-byte file on release.
+            let routing_shard = meta_client.calculate_shard_id(inode);
+            match self.client.block_on(async move {
+                meta_client.migrate_inline_alloc(routing_shard, inode).await
+            }) {
+                Ok((volume_id, needle_id)) => {
+                    info!(
+                        "write inline migrate: inode={} new_end={} > threshold={} → \
+                         Flat volume_id={} needle_id={:#x}",
+                        inode, new_end, migrate_threshold, volume_id, needle_id
+                    );
+                    // 数据放入 chunk_cache (dirty). 必须放入: 否则后续 append 走
+                    // Flat 路径时 chunk 0 不在 cache → no_data_before 优化跳过
+                    // read-before-write → 零填充覆盖迁移数据.
+                    // P4 fix: 必须调用 mark_dirty, 否则 release/flusher 不会将
+                    // 迁移数据 flush 到 Volume Server, 导致数据只在内存中.
+                    let mtime = chrono::Utc::now().timestamp() as u64;
+                    self.chunk_cache
+                        .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                    self.mark_dirty(inode, 0);
 
-            // 同步 cache content_size (供 getattr/read 使用)
-            if let Some(current_entry) = self.cache.get_inode(inode) {
-                if new_size > current_entry.size {
+                    // 切换 cache 到 Flat 模式
+                    let fid = Fid {
+                        volume_id: VolumeId(volume_id),
+                        cookie: 0,
+                        file_key: needle_id,
+                    };
+                    let new_size = new_end;
+                    let chunks = vec![CachedFileChunk {
+                        offset: 0,
+                        size: new_size,
+                        mtime,
+                        needle_id,
+                        volume_id,
+                        crc32: 0,
+                    }];
+                    self.cache.update_fid(inode, fid);
+                    self.cache.update_chunks(inode, chunks);
                     self.cache.update_size(inode, new_size);
+
+                    // 移除 inline buffer, 后续 write 走 Flat 路径
+                    // Safe: RefMut was dropped at scope end above, no DashMap lock held
+                    self.inline_buffers.remove(&inode);
+                    self.inline_max_sizes.remove(&inode);
+
+                    debug!(
+                        "write inline migrate done: inode={} size={} → Flat, \
+                         subsequent writes → Volume Server",
+                        inode, new_size
+                    );
+                    return Ok(read_len);
+                }
+                Err(e) => {
+                    // 迁移失败: inline_buffer 未修改 (仅 clone), 数据安全.
+                    // 返回 EFBIG, 应用层可重试或关闭. close 时 inline_data
+                    // (≤ 8KB) 正常同步到 Filer.
+                    error!(
+                        "write inline migrate FAILED: inode={} new_end={} error={} — \
+                         EFBIG, inline buffer unmodified",
+                        inode, new_end, e
+                    );
+                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
                 }
             }
-            debug!(
-                "write inline: inode={} offset={} len={} buffer_len={}",
-                inode, offset, read_len, new_size
-            );
-            return Ok(read_len);
         }
 
         // Phase 3.3+: lease 由 provider_adapter::ensure_lease 内部管理（带缓存复用），
