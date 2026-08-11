@@ -1214,6 +1214,182 @@ impl PowerFsFs {
             .is_ok()
     }
 
+    /// Lookup "." — return the directory's own attributes.
+    ///
+    /// The kernel calls `lookup(parent, ".")` when revalidating an expired
+    /// dentry for the current directory. Since "." is never stored as a
+    /// dir_entry in the Filer, we resolve it locally:
+    /// 1. Try the metadata cache (fast path)
+    /// 2. On cache miss, fetch via `get_entry_by_inode(parent)` (Filer RPC)
+    fn lookup_dot(&self, parent: u64) -> std::io::Result<Entry> {
+        debug!("lookup_dot: parent={}", parent);
+
+        // Fast path: cache hit
+        if let Some(entry) = self.cache.get_inode(parent) {
+            debug!(
+                "lookup_dot: cache HIT parent={}, inode={}",
+                parent, entry.inode
+            );
+            return Ok(self.create_fuse_entry(&entry));
+        }
+
+        // Cache miss: fetch from Filer via get_entry_by_inode
+        debug!("lookup_dot: cache MISS, fetching from filer parent={}", parent);
+        match self.client.get_entry_by_inode(parent) {
+            Ok(Some((filer_entry, path))) => {
+                // Resolve grandparent from the returned path. The Entry proto
+                // has no parent_ino field, so we derive it from the path.
+                let grandparent = self.resolve_parent_from_path(parent, &path);
+                let cached = self.entry_to_cached(grandparent, &filer_entry);
+                self.cache.insert(cached.clone());
+                debug!(
+                    "lookup_dot: fetched parent={} from filer, inode={}, grandparent={}",
+                    parent, cached.inode, grandparent
+                );
+                Ok(self.create_fuse_entry(&cached))
+            }
+            Ok(None) => {
+                debug!("lookup_dot: parent={} not found in filer", parent);
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            Err(e) => {
+                warn!("lookup_dot: failed to query filer for parent={}: {}", parent, e);
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+    }
+
+    /// Lookup ".." — return the parent directory's attributes.
+    ///
+    /// The kernel calls `lookup(parent, "..")` when revalidating an expired
+    /// dentry for the parent directory. Since ".." is never stored as a
+    /// dir_entry in the Filer, we resolve it locally:
+    /// 1. Get parent's `parent` inode from cache (or Filer RPC on miss)
+    /// 2. Return the grandparent's attributes
+    /// 3. Root's ".." returns root itself (POSIX convention)
+    fn lookup_dotdot(&self, parent: u64) -> std::io::Result<Entry> {
+        debug!("lookup_dotdot: parent={}", parent);
+
+        // Root's ".." is root itself (POSIX convention)
+        if parent == ROOT_INODE {
+            debug!("lookup_dotdot: parent is ROOT, returning root");
+            return self.lookup_dot(ROOT_INODE);
+        }
+
+        // Step 1: resolve grandparent inode
+        let grandparent = match self.cache.get_inode(parent) {
+            Some(entry) => entry.parent,
+            None => {
+                // Cache miss: fetch parent's metadata from Filer to get its
+                // parent_inode. The Entry proto has no parent_ino field, so
+                // we resolve the grandparent from the returned path string.
+                debug!(
+                    "lookup_dotdot: cache MISS for parent={}, fetching from filer",
+                    parent
+                );
+                match self.client.get_entry_by_inode(parent) {
+                    Ok(Some((filer_entry, path))) => {
+                        let gp = self.resolve_parent_from_path(parent, &path);
+                        // Cache the parent entry with the correct grandparent
+                        let cached = self.entry_to_cached(gp, &filer_entry);
+                        self.cache.insert(cached.clone());
+                        debug!(
+                            "lookup_dotdot: fetched parent={} from filer, grandparent={}",
+                            parent, gp
+                        );
+                        gp
+                    }
+                    Ok(None) => {
+                        warn!("lookup_dotdot: parent={} not found in filer", parent);
+                        return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "lookup_dotdot: failed to query filer for parent={}: {}",
+                            parent, e
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+            }
+        };
+
+        // Root's parent is root
+        if grandparent == ROOT_INODE || grandparent == 0 {
+            return self.lookup_dot(ROOT_INODE);
+        }
+
+        // Step 2: fetch grandparent's attributes (cache or Filer)
+        if let Some(entry) = self.cache.get_inode(grandparent) {
+            debug!(
+                "lookup_dotdot: cache HIT grandparent={}, inode={}",
+                grandparent, entry.inode
+            );
+            return Ok(self.create_fuse_entry(&entry));
+        }
+
+        debug!(
+            "lookup_dotdot: cache MISS for grandparent={}, fetching from filer",
+            grandparent
+        );
+        match self.client.get_entry_by_inode(grandparent) {
+            Ok(Some((filer_entry, path))) => {
+                let great_gp = self.resolve_parent_from_path(grandparent, &path);
+                let cached = self.entry_to_cached(great_gp, &filer_entry);
+                self.cache.insert(cached.clone());
+                debug!(
+                    "lookup_dotdot: fetched grandparent={} from filer, inode={}",
+                    grandparent, cached.inode
+                );
+                Ok(self.create_fuse_entry(&cached))
+            }
+            Ok(None) => {
+                warn!(
+                    "lookup_dotdot: grandparent={} not found in filer",
+                    grandparent
+                );
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            Err(e) => {
+                warn!(
+                    "lookup_dotdot: failed to query filer for grandparent={}: {}",
+                    grandparent, e
+                );
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+    }
+
+    /// Resolve the parent inode of `child_inode` from a Filer-returned path.
+    ///
+    /// `get_entry_by_inode` returns `(Entry, path)` where `path` is the full
+    /// POSIX path of the entry (e.g. "/a/b/c"). The Entry proto has no
+    /// `parent_ino` field, so we derive the parent inode by:
+    /// 1. Stripping the last path component → parent path
+    /// 2. Resolving the parent path to an inode via `resolve_path_inode`
+    /// 3. Falling back to the cached parent, then ROOT_INODE
+    fn resolve_parent_from_path(&self, child_inode: u64, path: &str) -> u64 {
+        if path.is_empty() || path == "/" {
+            return self
+                .cache
+                .get_inode(child_inode)
+                .map(|e| e.parent)
+                .unwrap_or(ROOT_INODE);
+        }
+        let parent_path = match path.rfind('/') {
+            Some(0) => "/".to_string(),
+            Some(pos) => path[..pos].to_string(),
+            None => "/".to_string(),
+        };
+        self.resolve_path_inode(&parent_path).unwrap_or_else(|| {
+            self.cache
+                .get_inode(child_inode)
+                .map(|e| e.parent)
+                .unwrap_or(ROOT_INODE)
+        })
+    }
+
+
     fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
         let attrs = entry.attributes.as_ref();
         let chunks = entry
@@ -1386,6 +1562,17 @@ impl FileSystem for PowerFsFs {
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {
         let name_str = name.to_str().unwrap_or("");
         debug!("lookup: parent={}, name={}", parent, name_str);
+
+        // Intercept "." and ".." — these are never stored as dir_entries
+        // in the Filer. The kernel calls lookup for them when revalidating
+        // expired dentries (entry_timeout=100ms). Without this interception,
+        // "." and ".." are forwarded to the Filer, which returns ENOENT
+        // (no dir_entry named "." or ".." exists).
+        match name_str {
+            "." => return self.lookup_dot(parent),
+            ".." => return self.lookup_dotdot(parent),
+            _ => {}
+        }
 
         // 1. MetadataCache 命中（含完整 attr）— 快速路径
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
@@ -4633,7 +4820,34 @@ impl FileSystem for PowerFsFs {
         let parent_ino = if inode == ROOT_INODE {
             ROOT_INODE
         } else {
-            cached_entry.as_ref().map(|e| e.parent).unwrap_or(inode)
+            match &cached_entry {
+                Some(e) => e.parent,
+                None => {
+                    // Cache miss: fetch from Filer to get the real parent
+                    // inode. Using `inode` as fallback would make ".." point
+                    // to self, breaking `cd ..` after the dentry cache expires.
+                    debug!(
+                        "readdir: cache MISS for inode={}, fetching parent from filer",
+                        inode
+                    );
+                    match self.client.get_entry_by_inode(inode) {
+                        Ok(Some((filer_entry, path))) => {
+                            let gp = self.resolve_parent_from_path(inode, &path);
+                            // Cache the entry so subsequent readdir calls hit
+                            let cached = self.entry_to_cached(gp, &filer_entry);
+                            self.cache.insert(cached.clone());
+                            gp
+                        }
+                        _ => {
+                            warn!(
+                                "readdir: failed to fetch parent for inode={}, using self as fallback",
+                                inode
+                            );
+                            inode // last resort: point to self
+                        }
+                    }
+                }
+            }
         };
 
         let mut idx = 0u64;

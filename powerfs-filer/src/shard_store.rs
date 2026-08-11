@@ -694,6 +694,40 @@ impl ShardStore {
                     );
                 }
             }
+            ShardCommand::RenameInode {
+                inode,
+                new_name,
+                new_parent_inode,
+            } => {
+                log::info!(
+                    "Shard {} apply RenameInode: inode={} new_name={} new_parent={}",
+                    self.shard_id.0,
+                    inode,
+                    new_name,
+                    new_parent_inode
+                );
+                if let Some(mut info) = self.get_inode(inode) {
+                    info.name = new_name.clone();
+                    info.parent_inode = new_parent_inode;
+                    let now = chrono::Utc::now().timestamp() as u64;
+                    info.ctime = now;
+                    info.mtime = now;
+                    if let Err(e) = self.update_inode(info) {
+                        log::error!(
+                            "Shard {} apply RenameInode failed for inode {}: {}",
+                            self.shard_id.0,
+                            inode,
+                            e
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "Shard {} apply RenameInode: inode {} not found",
+                        self.shard_id.0,
+                        inode
+                    );
+                }
+            }
         }
     }
 

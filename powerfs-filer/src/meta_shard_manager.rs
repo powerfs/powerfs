@@ -131,9 +131,21 @@ pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManager>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
-    inode_generator: Arc<AtomicU64>,
-    /// Filer node id, used to partition the inode space
-    /// (each node owns [node_id*1B+1000, (node_id+1)*1B)).
+    /// Per-shard inode allocators. Each shard has its own counter within
+    /// the shard's inode range, with a per-node offset to avoid collisions
+    /// across filer nodes.
+    ///
+    /// Replaces the old single `inode_generator: AtomicU64` which allocated
+    /// all inodes from `node_id * 1B + 1000`, causing severe shard imbalance
+    /// (nodes 1+ crammed all inodes into the last shard because 1B >> 1M
+    /// shard range size).
+    ///
+    /// With per-shard allocators:
+    /// - Files get inodes in the parent directory's shard range (locality)
+    /// - Directories get inodes in a different shard's range (distribution)
+    /// - Each node has a non-overlapping slot within each shard range
+    shard_allocators: RwLock<Vec<ShardAllocator>>,
+    /// Filer node id, used to partition the inode space within each shard.
     node_id: u64,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
@@ -147,6 +159,30 @@ pub struct MetaShardManager {
     orset_states: RwLock<HashMap<(ShardId, u64), ServerDirORSet>>,
 }
 
+/// Per-shard inode allocator.
+///
+/// Each filer node owns a non-overlapping slot within each shard's inode
+/// range. The slot is calculated as:
+///   node_offset = node_id * (range_size / MAX_NODES)
+///   actual_inode = shard_range_start + node_offset + counter
+///
+/// This ensures:
+/// 1. No collisions between nodes (each node has a unique offset)
+/// 2. Balanced distribution across shards (each shard gets allocations)
+/// 3. Files can be placed on the parent's shard (locality for readdir)
+struct ShardAllocator {
+    /// Next counter value within this shard's slot.
+    counter: AtomicU64,
+    /// Start of this shard's inode range.
+    shard_start: u64,
+    /// Per-node offset within the shard range.
+    node_offset: u64,
+}
+
+/// Maximum number of filer nodes supported. Each shard range is divided
+/// into this many equal slots, one per node.
+const MAX_FILER_NODES: u64 = 64;
+
 impl MetaShardManager {
     pub fn new(
         raft_group_manager: Arc<RaftGroupManager>,
@@ -154,14 +190,15 @@ impl MetaShardManager {
         data_path: String,
         node_id: u64,
     ) -> Self {
-        // Use node_id to offset inode generator so that different Filer nodes
-        // generate unique inodes. Each node gets a range of 1 billion inodes.
-        let inode_base = node_id * 1_000_000_000 + 1000;
+        // Build per-shard allocators. Each shard gets its own counter within
+        // the shard's inode range, with a per-node offset to avoid collisions.
+        let shard_count = shard_strategy.get_shard_count();
+        let allocators = Self::build_shard_allocators(&shard_strategy, shard_count, node_id);
         Self {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
-            inode_generator: Arc::new(AtomicU64::new(inode_base)),
+            shard_allocators: RwLock::new(allocators),
             node_id,
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
@@ -171,6 +208,37 @@ impl MetaShardManager {
             delta_logs: RwLock::new(HashMap::new()),
             orset_states: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Build per-shard allocators for the given shard count and node_id.
+    /// Each allocator owns a non-overlapping slot within its shard's range.
+    fn build_shard_allocators(
+        shard_strategy: &ShardStrategy,
+        shard_count: u64,
+        node_id: u64,
+    ) -> Vec<ShardAllocator> {
+        let mut allocators = Vec::with_capacity(shard_count as usize);
+        for sid in 0..shard_count {
+            let (start, end) = shard_strategy.get_shard_range(ShardId(sid));
+            let range_size = end.saturating_sub(start);
+            // Per-node slot: divide the shard range into MAX_FILER_NODES slots.
+            // node_id < MAX_FILER_NODES gets a unique slot.
+            let slot = range_size / MAX_FILER_NODES;
+            let node_offset = node_id * slot;
+            // Reserve the first 1000 inodes in each shard for special inodes
+            // (root=1, bucket roots, etc.)
+            let reserved = 1000u64;
+            allocators.push(ShardAllocator {
+                counter: AtomicU64::new(reserved),
+                shard_start: start,
+                node_offset,
+            });
+            info!(
+                "ShardAllocator init: shard={} range=[{}, {}) slot={} node_offset={} (node_id={})",
+                sid, start, end, slot, node_offset, node_id
+            );
+        }
+        allocators
     }
 
     fn get_or_create_delta_log(&self, shard_id: ShardId) -> Arc<DeltaLog> {
@@ -364,7 +432,12 @@ impl MetaShardManager {
     pub async fn create_file(&self, parent_inode: u64, name: &str) -> Result<InodeInfo, String> {
         let t0 = std::time::Instant::now();
 
-        let inode = self.generate_inode();
+        // Phase 3: Allocate inode within the parent directory's shard range.
+        // This ensures calculate_shard(inode) == calculate_shard(parent_inode),
+        // so readdir can fetch file inode records from the same shard as the
+        // dir entries (no cross-shard lookup for files).
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         let info = InodeInfo {
             inode,
@@ -682,7 +755,14 @@ impl MetaShardManager {
         parent_inode: u64,
         name: &str,
     ) -> Result<InodeInfo, String> {
-        let inode = self.generate_inode();
+        // Phase 3: Allocate the directory's inode on a different shard from
+        // the parent. The dir_entry goes on the parent's shard (so lookup
+        // can find it), but the inode record goes on the target shard.
+        // This spreads the directory tree across shards for load balancing,
+        // while keeping files on the parent's shard for readdir locality.
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let target_shard = self.pick_child_dir_shard(parent_shard);
+        let inode = self.alloc_inode_in_shard(target_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         let info = InodeInfo {
             inode,
@@ -805,7 +885,83 @@ impl MetaShardManager {
                 .await;
             Ok(())
         } else {
-            Err("cross-shard rename not supported yet".to_string())
+            // Cross-shard rename: decompose into AddDirEntry + RemoveDirEntry
+            // + RenameInode. Each propose is forwarded to the respective
+            // shard leader (see RaftGroup::handle_propose), so this node
+            // does not need to be the leader of all involved shards.
+            //
+            // Phase A: resolve inode from old dir_entry (old_parent's shard)
+            let inode = {
+                let stores = self.shard_stores.read().unwrap();
+                let shard_store = stores
+                    .get(&old_shard)
+                    .ok_or_else(|| format!("shard {} not found", old_shard.0))?;
+                shard_store
+                    .get_dir_entry_inode(old_parent_inode, old_name)
+                    .ok_or_else(|| "rename: source not found".to_string())?
+            };
+
+            // Phase B: AddDirEntry on new_parent's shard
+            let add_cmd = ShardCommand::AddDirEntry {
+                parent_inode: new_parent_inode,
+                name: new_name.to_string(),
+                inode,
+            };
+            self.raft_group_manager
+                .propose(new_shard, add_cmd.serialize())
+                .await?;
+            self.wait_for_entry_appeared(new_shard, new_parent_inode, new_name)
+                .await;
+
+            // Phase C: RemoveDirEntry on old_parent's shard
+            let rem_cmd = ShardCommand::RemoveDirEntry {
+                parent_inode: old_parent_inode,
+                name: old_name.to_string(),
+            };
+            self.raft_group_manager
+                .propose(old_shard, rem_cmd.serialize())
+                .await?;
+            self.wait_for_entry_removed(old_shard, old_parent_inode, old_name)
+                .await;
+
+            // Phase D: RenameInode on inode's shard (update name + parent)
+            let inode_shard = self.shard_strategy.calculate_shard(inode);
+            let rename_cmd = ShardCommand::RenameInode {
+                inode,
+                new_name: new_name.to_string(),
+                new_parent_inode,
+            };
+            if let Err(e) = self
+                .raft_group_manager
+                .propose(inode_shard, rename_cmd.serialize())
+                .await
+            {
+                log::warn!(
+                    "cross-shard rename: RenameInode proposal failed (dir entries already moved): {}",
+                    e
+                );
+            }
+
+            // POSIX: update mtime/ctime of both parent directories
+            let now = chrono::Utc::now().timestamp() as u64;
+            for parent_ino in [old_parent_inode, new_parent_inode] {
+                let p_shard = self.shard_strategy.calculate_shard(parent_ino);
+                let attr_cmd = ShardCommand::SetAttr {
+                    inode: parent_ino,
+                    size: None,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    mtime: Some(now),
+                    atime: Some(now),
+                };
+                let _ = self
+                    .raft_group_manager
+                    .propose(p_shard, attr_cmd.serialize())
+                    .await;
+            }
+
+            Ok(())
         }
     }
 
@@ -997,48 +1153,95 @@ impl MetaShardManager {
         last_info
     }
 
-    pub fn generate_inode(&self) -> u64 {
-        self.inode_generator.fetch_add(1, Ordering::SeqCst)
+    /// Allocate an inode within a specific shard's range.
+    ///
+    /// This is the shard-aware replacement for the old `generate_inode()`.
+    /// It ensures the allocated inode routes to the specified shard via
+    /// `calculate_shard(inode)`, enabling:
+    /// - Files to be placed on the parent directory's shard (readdir locality)
+    /// - Directories to be placed on a different shard (tree distribution)
+    ///
+    /// The inode is allocated from this node's non-overlapping slot within
+    /// the shard range, so multiple filer nodes can allocate concurrently
+    /// without collisions.
+    pub fn alloc_inode_in_shard(&self, shard_id: ShardId) -> u64 {
+        let allocators = self.shard_allocators.read().unwrap();
+        let alloc = &allocators[shard_id.0 as usize];
+        let n = alloc.counter.fetch_add(1, Ordering::SeqCst);
+        let inode = alloc.shard_start + alloc.node_offset + n;
+        debug!(
+            "alloc_inode_in_shard: shard={} inode={} (start={} offset={} counter={})",
+            shard_id.0, inode, alloc.shard_start, alloc.node_offset, n
+        );
+        inode
     }
 
-    /// Recover inode_generator by scanning existing inodes in RocksDB.
+    /// Pick a target shard for a new child directory.
     ///
-    /// Problem: `inode_generator` is an in-memory AtomicU64 initialized to
-    /// `node_id * 1B + 1000` on every restart. If the filer allocated inodes
-    /// before restart, the counter resets and reuses existing inode numbers,
-    /// causing `-ENOSPC` in the kernel (`new_inode called for existing inode`).
+    /// Strategy: round-robin to the next shard after the parent's shard.
+    /// This spreads the directory tree across shards while keeping files
+    /// on the parent's shard for readdir locality.
     ///
-    /// Fix: After all shard stores are loaded, scan `CF_INODES` for the max
-    /// inode in this node's range and advance `inode_generator` past it.
-    /// This is O(N) in inode count but runs once at startup.
-    pub fn recover_inode_generator(&self) {
-        let range_start = self.node_id * 1_000_000_000 + 1000;
-        let range_end = (self.node_id + 1) * 1_000_000_000;
-
-        let stores = self.shard_stores.read().unwrap();
-        let mut max_existing = range_start;
-        for store in stores.values() {
-            let max = store.get_max_inode_in_range(range_start, range_end);
-            if max > max_existing {
-                max_existing = max;
-            }
+    /// For single-shard clusters, returns the same shard.
+    pub fn pick_child_dir_shard(&self, parent_shard: ShardId) -> ShardId {
+        let count = self.shard_strategy.get_shard_count();
+        if count <= 1 {
+            return parent_shard;
         }
+        ShardId((parent_shard.0 + 1) % count)
+    }
 
-        let current = self.inode_generator.load(Ordering::SeqCst);
-        if max_existing > current {
-            self.inode_generator.store(max_existing, Ordering::SeqCst);
-            info!(
-                "Recovered inode_generator: {} -> {} (node_id={}, scanned max={})",
-                current,
-                max_existing,
-                self.node_id,
-                max_existing - 1
-            );
-        } else {
-            info!(
-                "inode_generator base {} is already >= scanned max {} (node_id={})",
-                current, max_existing, self.node_id
-            );
+    /// Legacy inode allocation — allocates from shard 0's range.
+    ///
+    /// Kept for backward compatibility with callers that haven't been
+    /// migrated to `alloc_inode_in_shard` yet. New code should use
+    /// `alloc_inode_in_shard` with an explicit shard.
+    pub fn generate_inode(&self) -> u64 {
+        self.alloc_inode_in_shard(ShardId(0))
+    }
+
+    /// Recover shard allocators by scanning existing inodes in RocksDB.
+    ///
+    /// After all shard stores are loaded, scan `CF_INODES` for the max
+    /// inode in each shard's range (for this node's slot) and advance
+    /// each shard's counter past it. This prevents inode reuse after
+    /// filer restart.
+    pub fn recover_inode_generator(&self) {
+        let allocators = self.shard_allocators.read().unwrap();
+        let stores = self.shard_stores.read().unwrap();
+
+        for (idx, alloc) in allocators.iter().enumerate() {
+            let shard_id = ShardId(idx as u64);
+            let slot_start = alloc.shard_start + alloc.node_offset;
+            let slot_end = alloc.shard_start + alloc.node_offset
+                + (self.shard_strategy.get_shard_range(shard_id).1
+                    - self.shard_strategy.get_shard_range(shard_id).0)
+                    / MAX_FILER_NODES;
+
+            let mut max_existing = slot_start;
+            for store in stores.values() {
+                let max = store.get_max_inode_in_range(slot_start, slot_end);
+                if max > max_existing {
+                    max_existing = max;
+                }
+            }
+
+            // Convert max existing inode back to counter value
+            let max_counter = max_existing.saturating_sub(alloc.shard_start + alloc.node_offset);
+            let current = alloc.counter.load(Ordering::SeqCst);
+            if max_counter > current {
+                alloc.counter.store(max_counter + 1, Ordering::SeqCst);
+                info!(
+                    "Recovered shard_allocator[{}]: counter {} -> {} (node_id={}, slot=[{}, {}), max_inode={})",
+                    idx, current, max_counter + 1, self.node_id,
+                    slot_start, slot_end, max_existing
+                );
+            } else {
+                debug!(
+                    "shard_allocator[{}] counter {} is already >= scanned max {} (node_id={})",
+                    idx, current, max_counter, self.node_id
+                );
+            }
         }
     }
 
@@ -1058,7 +1261,10 @@ impl MetaShardManager {
     ) -> Result<u64, String> {
         let t0 = std::time::Instant::now();
 
-        let inode = self.generate_inode();
+        // Phase 3: Allocate inode within the parent directory's shard range
+        // (same as create_file). The _shard_id parameter is ignored.
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         let info = InodeInfo {
             inode,
@@ -1644,7 +1850,9 @@ impl MetaShardManager {
         name: &str,
         target: &str,
     ) -> Result<InodeInfo, String> {
-        let inode = self.generate_inode();
+        // Phase 3: Symlinks follow the parent's shard (like files).
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         let info = InodeInfo {
             inode,
@@ -2072,7 +2280,9 @@ impl MetaShardManager {
         volume_id: u64,
         etag: &str,
     ) -> Result<u64, String> {
-        let inode = self.generate_inode();
+        // Phase 3: S3 objects follow the bucket root's shard (like files).
+        let parent_shard = self.shard_strategy.calculate_shard(bucket_root_inode);
+        let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         let info = InodeInfo {
             inode,
