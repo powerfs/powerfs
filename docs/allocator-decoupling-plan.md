@@ -1259,3 +1259,181 @@ S1-S6 全部完成后：
   - powerfs-fuse (lib): 38 passed
   - powerfs-fuse (tests): 8 passed
   - powerfs-filer: 74 passed
+
+### 10.8 FUSE TopologyUpdateListener 动态同步
+
+> 日期：2026-08-11
+> 状态：已实施（代码完成，待 VM/容器回归测试）
+
+#### 问题
+
+`MetaShardClient` 只在 `init()` 中调用 `sync_shard_router()` + `sync_shard_map()`。
+`MasterStatsReporter` 收到 `TopologyChanged` NOTIFY 后更新 `ClusterTopologyManager`，
+但 `MetaShardClient` **未注册为 `TopologyUpdateListener`**，导致：
+
+- `shard_router`（shard_id → filer 地址映射）不会自动更新——靠 RPC redirect 被动修复
+- `shard_map`（ShardMap 区间路由表）不会自动更新——S3 下发的 entries 只在 init 时生效一次
+
+Filer 重启后，客户端 `shard_router` 仍指向旧地址，请求失败后才通过 redirect 恢复，
+增加了首请求延迟和错误日志噪音。
+
+#### 方案
+
+`MetaShardClient` 实现 `TopologyUpdateListener` trait，在 `on_topology_update` 中：
+
+1. 调用 `sync_shard_router()` — 重建 shard_id → filer 地址映射
+2. 调用 `sync_shard_map()` — 从 `shard_map_entries` 重建 ShardMap（S3）
+3. 对比新旧拓扑中 shard leader 变化的分片，调用 `bump_cache_epoch()` 触发缓存失效
+
+```
+MasterStatsReporter                 MetaShardClient
+      │                                    │
+      │ TopologyChanged NOTIFY             │
+      ▼                                    │
+ fetch_topology()                          │
+      │                                    │
+      ▼                                    │
+ topology_manager.update_topology(topo)    │
+      │                                    │
+      ├──── on_topology_update(old, new) ──▶│
+      │                                    ▼
+      │                              sync_shard_router()
+      │                              sync_shard_map()
+      │                              detect leader change → bump_cache_epoch()
+```
+
+#### 实现
+
+- `MetaShardClient` 新增 `register_topology_listener()` 方法
+- `FuseClientFacade` 在创建 `MetaShardClient` 后调用 `register_topology_listener()`
+- `on_topology_update` 对比 `old.shards` 和 `new.shards` 中每个 shard 的 `leader_addr`，
+  若有变化则 `bump_cache_epoch()`（触发 FUSE 层 `check_cache_epoch` → `invalidate_all`）
+
+实现位置：
+- `powerfs-fuse-core/src/meta_shard_client.rs` — `impl TopologyUpdateListener for MetaShardClient`
+  + `pub fn register_topology_listener(&self)`，对比新旧 `shards` 中每个分片的 `leader_addr`，
+  任意分片 leader 变化即调用 `bump_cache_epoch()`，随后 `sync_shard_router()` + `sync_shard_map()`
+- `powerfs-fuse-core/src/fuse_client_facade.rs` — `Arc<MetaShardClient>` 创建后立即调用
+  `register_topology_listener()`，注册到 `ClusterTopologyManager`
+
+#### 向后兼容
+
+- `TopologyUpdateListener` 是已有 trait，无需协议变更
+- 监听器注册失败不影响 `init()` 已建立的路由
+
+### 10.9 内核模块 Shard 路由统一
+
+> 日期：2026-08-11
+> 状态：已实施（代码完成 + 内核模块编译通过，待 QEMU VM 回归测试）
+
+#### 问题
+
+内核模块 (`kernel/powerfs_mod/`) 的 shard 路由与 FUSE 客户端不一致：
+
+| 位置 | 路由方式 | 问题 |
+|------|----------|------|
+| FUSE 客户端 (S1-S6) | `ShardMap::route(inode)` 区间查找 | ✅ 正确 |
+| 内核模块 `powerfs_fs.c` | `shard_id = parent_ino` 直接用 inode 号 | ⚠️ 见下 |
+
+内核模块用 `parent_ino`（inode 号）直接索引 `shard_route.entries[parent_ino]`：
+
+1. **效率低**：`parent_ino = 5` 而只有 3 个 shard 时，`entries[5]` 为 `ROUTE_UNKNOWN`，
+   退化为 round-robin，可能命中非 leader filer → 触发 REDIRECT → 重试
+2. **无法支持 shard 分裂**：分裂后 `parent_ino = 5` 可能从 shard 0 变到新 shard 3，
+   内核没有区间查找，无法正确路由
+3. **`parent_ino >= POWERFS_MAX_SHARDS (64)` 时直接返回 `-ENOTCONN`**
+
+功能上暂时正确：Filer **忽略**客户端发送的 `shard_id`，自己用
+`calculate_shard(inode)` 重算（net_handler.rs:1831）。但客户端侧路由效率差。
+
+#### 方案
+
+##### K1: C 语言实现 ShardMap 区间路由
+
+在 `powerfs_net.c` 中实现等价于 `ShardMap::route(inode)` 的区间二分查找：
+
+```c
+struct shard_map_entry {
+    u64 range_start;  /* inclusive */
+    u64 range_end;    /* exclusive */
+    u64 shard_id;
+};
+
+struct shard_map {
+    struct shard_map_entry entries[POWERFS_MAX_SHARDS];
+    int entry_count;
+    spinlock_t lock;
+};
+
+/* 区间二分查找：返回 inode 所属 shard_id */
+u64 shard_map_route(struct shard_map *map, u64 inode);
+```
+
+- `from_shard_count(n)`：等价于 `ShardMap::from_shard_count`，每 shard 1M 区间
+- `from_entries(blob, len)`：解析 Master 下发的 0xBD entries blob（25 字节/条目）
+
+##### K2: 替换 parent_ino 路由
+
+所有 `shard_id = pi->parent_ino ? pi->parent_ino : ino;` 替换为：
+```c
+shard_id = shard_map_route(&g_shard_map, pi->parent_ino ? pi->parent_ino : ino);
+```
+
+涉及文件：`powerfs_fs.c`（4 处：migrate_inline, file_release, write_end, fsync）
+
+##### K3: 解析 Master topology ShardMapEntries (0xBD)
+
+在 `powerfs_net.c` 的 `discover_filers()` / topology 解析路径中：
+1. 解析 `ShardMapEntries` (0xBD) 字段（25 字节/条目的 packed blob）
+2. 调用 `shard_map_from_entries()` 重建区间表
+3. 若 0xBD 缺失（旧 Master），回退 `shard_map_from_shard_count(shard_count)`
+
+##### K4: 模块参数保留
+
+`shard_count` 模块参数保留为 fallback（旧 Master 无 0xBD 时使用），
+优先使用 Master 下发的 `ShardMapEntries`。
+
+#### 实现
+
+K1（ShardMap 实现）— `kernel/powerfs_mod/powerfs_net.c`：
+- 全局 `struct shard_map g_shard_map`（spinlock 保护）
+- `shard_map_route(inode)`：区间二分查找，返回 `entries[idx].shard_id`
+  （找最后一个 `range_start <= inode` 的条目）
+- `shard_map_from_shard_count(count)`：等分 1M 区间，等价
+  `ShardMap::from_shard_count`
+- `shard_map_from_entries(blob, len)`：解析 25B/条目的 packed blob
+  （`range_start:u64 LE + range_end:u64 LE + shard_id:u64 LE + state:u8`），
+  解析后按 `range_start` 插入排序（防御性，Master 已排序）
+- 声明在 `powerfs_net.h`，`EXPORT_SYMBOL_GPL` 导出
+
+K2（替换 parent_ino 路由）— `kernel/powerfs_mod/powerfs_fs.c`：
+4 处 `shard_id = pi->parent_ino ? pi->parent_ino : ino;` 全部替换为
+`shard_id = shard_map_route(pi->parent_ino ? pi->parent_ino : ino);`：
+- `powerfs_migrate_inline_alloc` 路径（migrate_inline）
+- `powerfs_file_release` Inline 路径（file_release）
+- `powerfs_write_end` Inline 同步路径（write_end）
+- `powerfs_fsync` Inline 提交路径（fsync）
+- `powerfs_file_release` Flat 路径（file_release，`inode->i_ino` 变体）
+
+K3 + K4（topology 解析 + fallback）— `kernel/powerfs_mod/powerfs_net.c`：
+- `powerfs_net_pool_init()`：初始化时调用 `shard_map_from_shard_count(shard_count)`
+  （模块参数 fallback，保证 Master 不可达时也有可用路由表）
+- `powerfs_net_discover_volumes()`：解析完 volume routes 后，从同一
+  GET_TOPOLOGY 响应中查找 `ShardMapEntries` (0xBD) 与 `TotalShards` (0xB8)：
+  1. 优先 `0xBD` → `shard_map_from_entries()`（支持 shard 分裂后的非等分区间）
+  2. 次选 `0xB8` → `shard_map_from_shard_count(total_shards)`
+  3. 两者皆无 → 保留 `pool_init` 中的模块参数 fallback
+- 使用 `powerfs_tlv_dec_find_raw` / `powerfs_tlv_dec_find_u64`（重置 `dec->pos`
+  从头扫描，与 volume 解码顺序解耦）
+
+#### 编译验证
+
+`make` 在 `kernel/powerfs_mod/` 通过，产物 `powerfs.ko`（4.4M），
+仅一个无关的 `volume_read` 未使用标签警告（pre-existing）。
+
+#### 测试
+
+- QEMU VM 中加载模块，验证 `shard_id` 路由正确（dmesg 日志）
+- 对比 FUSE 客户端路由结果（同一 inode 应路由到同一 shard）
+- `parent_ino > shard_count` 时不再退化为 round-robin
+- 持续运行 1 分钟 + 定期 dmesg 检查

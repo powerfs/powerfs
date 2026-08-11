@@ -12,7 +12,7 @@ use crate::client_error::{ClientError, ClientResult};
 use crate::request_id::RequestId;
 use crate::request_state::{RequestContext, RequestKind};
 use crate::sharded_rpc::{calc_worker_count, ShardedRpcPool};
-use crate::topology::{ClusterTopologyManager, ShardInfo};
+use crate::topology::{ClusterTopology, ClusterTopologyManager, ShardInfo};
 use powerfs_allocator::{ShardId, ShardMap, ShardState};
 use powerfs_net::client::NotificationHandler;
 use powerfs_net::PowerFsNetClient;
@@ -561,6 +561,19 @@ impl MetaShardClient {
             "MetaShardClient: Initialized (shard_count={})",
             self.shard_router.len()
         );
+    }
+
+    /// Register as a TopologyUpdateListener so that `shard_router` and
+    /// `shard_map` are automatically re-synced when the Master pushes a
+    /// `TopologyChanged` notification. Must be called after `init()`.
+    ///
+    /// Without this, `sync_shard_router()` and `sync_shard_map()` only run
+    /// once during `init()`. After Filer restart / leader change, the stale
+    /// `shard_router` causes unnecessary RPC redirects until the redirect
+    /// mechanism passively updates individual entries.
+    pub fn register_topology_listener(self: &Arc<Self>) {
+        self.topology_manager.add_listener(self.clone());
+        log::info!("MetaShardClient: registered as TopologyUpdateListener");
     }
 
     /// 确保 ShardedRpcPool 已创建（延迟初始化，在 async 上下文中调用）
@@ -2486,6 +2499,53 @@ async fn get_or_create_filer_client(
         .get_or_connect_addr(addr)
         .await
         .map_err(ClientError::from_net_error)
+}
+
+impl crate::topology::TopologyUpdateListener for MetaShardClient {
+    fn on_topology_update(&self, old: &ClusterTopology, new: &ClusterTopology) {
+        // Detect shard leader changes — if any shard's leader_addr changed,
+        // bump cache_epoch to trigger FUSE-layer cache invalidation.
+        let mut leader_changed = false;
+        for (shard_id, new_shard) in &new.shards {
+            if let Some(old_shard) = old.shards.get(shard_id) {
+                if old_shard.leader_addr != new_shard.leader_addr {
+                    log::warn!(
+                        "MetaShardClient: topology update — shard {} leader changed: {} -> {}",
+                        shard_id,
+                        old_shard.leader_addr,
+                        new_shard.leader_addr
+                    );
+                    leader_changed = true;
+                }
+            } else {
+                log::info!(
+                    "MetaShardClient: topology update — shard {} appeared (leader={})",
+                    shard_id,
+                    new_shard.leader_addr
+                );
+                leader_changed = true;
+            }
+        }
+
+        // Re-sync shard_router (shard_id → filer address mapping)
+        self.sync_shard_router();
+
+        // Re-sync shard_map (ShardMap from Master entries or shard_count)
+        self.sync_shard_map();
+
+        // If any leader changed, bump cache_epoch so FUSE invalidates its
+        // MetadataCache on the next access (handles missed Invalidate
+        // notifications during the leader change window).
+        if leader_changed {
+            self.bump_cache_epoch();
+        }
+
+        log::info!(
+            "MetaShardClient: topology update processed (shards={}, leader_changed={})",
+            new.shards.len(),
+            leader_changed
+        );
+    }
 }
 
 #[cfg(test)]
