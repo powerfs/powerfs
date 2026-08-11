@@ -658,16 +658,29 @@ impl ShardStore {
                 }
             }
             ShardCommand::DecrementNlink { inode } => {
+                log::info!(
+                    "Shard {} apply DecrementNlink for inode {}",
+                    self.shard_id.0,
+                    inode
+                );
                 if let Some(mut info) = self.get_inode(inode) {
                     if info.nlink > 0 {
                         info.nlink -= 1;
                     }
+                    let new_nlink = info.nlink;
                     if let Err(e) = self.update_inode(info) {
                         log::error!(
                             "Shard {} apply DecrementNlink failed for inode {}: {}",
                             self.shard_id.0,
                             inode,
                             e
+                        );
+                    } else {
+                        log::info!(
+                            "Shard {} DecrementNlink: inode {} nlink -> {}",
+                            self.shard_id.0,
+                            inode,
+                            new_nlink
                         );
                     }
                 } else {
