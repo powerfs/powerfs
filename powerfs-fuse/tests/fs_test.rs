@@ -1,4 +1,6 @@
-use powerfs_fuse::cache::{CachedEntry, MetadataCache, UpdateAttrParams, ROOT_INODE};
+use powerfs_fuse::cache::{
+    CachedEntry, EntryState, HoldState, MetadataCache, UpdateAttrParams, ROOT_INODE,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +35,8 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 
@@ -64,6 +68,8 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 

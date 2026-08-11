@@ -204,7 +204,7 @@ impl NotificationHandler for InvalidateHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CachedEntry, ChunkCache};
+    use crate::cache::{CachedEntry, ChunkCache, EntryState, HoldState};
     use powerfs_net::serialize::TlvEncoder;
     use std::collections::HashMap;
 
@@ -244,6 +244,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: std::time::Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         }
     }
 

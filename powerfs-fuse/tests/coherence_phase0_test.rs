@@ -1,4 +1,4 @@
-use powerfs_fuse::cache::{CachedEntry, MetadataCache};
+use powerfs_fuse::cache::{CachedEntry, EntryState, HoldState, MetadataCache};
 use std::time::Instant;
 
 fn make_entry(inode: u64, parent: u64, name: &str, is_dir: bool) -> CachedEntry {
@@ -29,6 +29,8 @@ fn make_entry(inode: u64, parent: u64, name: &str, is_dir: bool) -> CachedEntry 
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 
