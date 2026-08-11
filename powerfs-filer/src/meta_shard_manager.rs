@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1619,11 +1619,20 @@ impl MetaShardManager {
         let shard_ino = self.shard_strategy.calculate_shard(inode);
         let shard_dir = self.shard_strategy.calculate_shard(new_parent_inode);
 
+        info!(
+            "create_hard_link: inode={}, shard_ino={}, new_parent={}, shard_dir={}, new_name={}",
+            inode, shard_ino.0, new_parent_inode, shard_dir.0, new_name
+        );
+
         // Phase A: bump nlink on the inode's own shard.
         let cmd_nlink = ShardCommand::IncrementNlink { inode };
-        self.raft_group_manager
-            .propose(shard_ino, cmd_nlink.serialize())
-            .await?;
+        match self.raft_group_manager.propose(shard_ino, cmd_nlink.serialize()).await {
+            Ok(idx) => info!("create_hard_link: Phase A IncrementNlink proposed on shard {} at index {}", shard_ino.0, idx),
+            Err(e) => {
+                error!("create_hard_link: Phase A IncrementNlink FAILED on shard {}: {}", shard_ino.0, e);
+                return Err(e);
+            }
+        }
 
         // Phase B: add dir entry on the new parent's shard. If this fails
         // after A succeeded, nlink is over-counted by 1 — the next unlink
@@ -1633,12 +1642,23 @@ impl MetaShardManager {
             name: new_name.to_string(),
             inode,
         };
-        self.raft_group_manager
-            .propose(shard_dir, cmd_dir.serialize())
-            .await?;
+        match self.raft_group_manager.propose(shard_dir, cmd_dir.serialize()).await {
+            Ok(idx) => info!("create_hard_link: Phase B AddDirEntry proposed on shard {} at index {}", shard_dir.0, idx),
+            Err(e) => {
+                error!("create_hard_link: Phase B AddDirEntry FAILED on shard {}: {}", shard_dir.0, e);
+                return Err(e);
+            }
+        }
 
         self.wait_for_entry_appeared(shard_dir, new_parent_inode, new_name)
             .await;
+
+        // Verify nlink was actually incremented
+        match self.get_inode(inode) {
+            Some(info) => info!("create_hard_link: verified nlink={} for inode={}", info.nlink, inode),
+            None => warn!("create_hard_link: inode {} not found after link creation", inode),
+        }
+
         Ok(())
     }
 
