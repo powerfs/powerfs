@@ -546,12 +546,35 @@ impl MetaShardManager {
         let mut retries = 0;
         while retries < 100 {
             if shard_store.get_inode(inode).is_some() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            retries += 1;
+        }
+        if retries >= 100 {
+            return Err("create: timeout waiting for inode apply".to_string());
+        }
+
+        // Also wait for the dir_entry to be visible on shard_dir (the parent's
+        // shard). Without this, a subsequent lookup(parent, name) may race
+        // with the apply loop and return NOT_FOUND, causing failures in
+        // cp -prf (which creates dirs then immediately does lookup/chmod).
+        let dir_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_dir)
+                .ok_or_else(|| format!("shard {} not found", shard_dir.0))?
+                .clone()
+        };
+        let mut retries = 0;
+        while retries < 100 {
+            if dir_store.get_dir_entry_inode(parent_inode, name).is_some() {
                 return Ok(());
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             retries += 1;
         }
-        Err("create: timeout waiting for inode apply".to_string())
+        Err("create: timeout waiting for dir_entry apply".to_string())
     }
 
     pub async fn update_file(&self, inode: u64, size: u64, mtime: u64) -> Result<(), String> {
