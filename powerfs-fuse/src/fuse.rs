@@ -261,6 +261,7 @@ impl FuseApp {
             open_inodes: Arc::new(RwLock::new(HashSet::new())),
             inline_buffers: Arc::new(DashMap::new()),
             inline_max_sizes: Arc::new(DashMap::new()),
+            last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         };
 
         let fs_arc = Arc::new(fs);
@@ -427,6 +428,10 @@ struct PowerFsFs {
     /// 当前 MVP 阶段未实现 MIGRATE_INLINE, 故允许 buffer 增长到 8KB 硬上限,
     /// 超过则返回 EFBIG。此字段保留供后续迁移逻辑使用。
     inline_max_sizes: Arc<DashMap<u64, u32>>,
+    /// Last-seen cache epoch from MetaShardClient. When this differs from
+    /// the current epoch, it means a Filer leader change occurred and the
+    /// cache may have missed Invalidate notifications — call invalidate_all().
+    last_cache_epoch: std::sync::atomic::AtomicU64,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -580,6 +585,27 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
 }
 
 impl PowerFsFs {
+    /// Check if the Filer leader has changed since the last call.
+    /// If so, invalidate all cached metadata to handle potentially missed
+    /// Invalidate notifications during the leader change window.
+    /// Inspired by JuiceFS redisCache.onInvalidateConnect (Purge on reconnect).
+    fn check_cache_epoch(&self) {
+        let current = self.client.facade().meta_shard_client().cache_epoch();
+        let last = self
+            .last_cache_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if current != last {
+            log::warn!(
+                "check_cache_epoch: epoch changed {} -> {}, invalidating all cached metadata",
+                last,
+                current
+            );
+            self.cache.invalidate_all();
+            self.last_cache_epoch
+                .store(current, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn get_write_lock(&self, inode: u64, chunk_idx: u64) -> Arc<std::sync::Mutex<()>> {
         let key = (inode, chunk_idx);
         let mut locks = self.write_locks.lock().unwrap();
@@ -1654,6 +1680,11 @@ impl FileSystem for PowerFsFs {
     }
 
     fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<Entry> {
+        // Check for Filer leader change before any cache access.
+        // If the leader changed, invalidate_all() is called to handle
+        // potentially missed Invalidate notifications.
+        self.check_cache_epoch();
+
         let name_str = name.to_str().unwrap_or("");
         debug!("lookup: parent={}, name={}", parent, name_str);
 
@@ -1729,6 +1760,8 @@ impl FileSystem for PowerFsFs {
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> std::io::Result<(libc::stat64, Duration)> {
+        // Check for Filer leader change (cheap: one AtomicU64 load + compare).
+        self.check_cache_epoch();
         debug!("getattr: inode={}", inode);
 
         // Phase 4.3: 已打开文件的 size/chunks 在 open→release 期间权威

@@ -140,6 +140,25 @@ impl NotificationHandler for InvalidateHandler {
                     return;
                 }
 
+                // State machine check: skip invalidation for Dirty/Flushing
+                // entries. These have local authoritative data that must not
+                // be invalidated (core state machine rule: Dirty/Flushing →
+                // Stale is forbidden). This complements the has_chunks check
+                // below — once write/setattr paths set Dirty state (Phase 2
+                // task p2-4), this becomes the primary guard.
+                if let Some(state) = self.cache.get_entry_state(inode) {
+                    if state == crate::cache::EntryState::Dirty
+                        || state == crate::cache::EntryState::Flushing
+                    {
+                        debug!(
+                            "InvalidateHandler: skipping invalidation for inode={} (state={:?}, local authoritative data, server_v={})",
+                            inode, state, version
+                        );
+                        self.mark_processed(inode, version);
+                        return;
+                    }
+                }
+
                 // Skip invalidation if the inode has ANY chunks (dirty or clean)
                 // in the ChunkCache. This is broader than checking only dirty
                 // chunks to protect the flusher's drain window:
