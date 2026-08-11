@@ -236,6 +236,15 @@ pub enum ShardCommand {
     DecrementNlink {
         inode: u64,
     },
+    /// Update an inode record's `name` and `parent_inode` fields in-place.
+    /// Used by cross-shard rename to update the inode record on its own shard
+    /// after the dir_entry has been moved to a different shard.
+    /// Routed via `calculate_shard(inode)`.
+    RenameInode {
+        inode: u64,
+        new_name: String,
+        new_parent_inode: u64,
+    },
 }
 
 impl ShardCommand {

@@ -173,12 +173,14 @@ mod tests {
     fn test_calculate_shard() {
         let strategy = ShardStrategy::new(3);
 
-        // Range-based routing: [0, 1M) → shard 0, [1M, 2M) → shard 1, [2M, MAX) → shard 2
+        // Range-based routing: [0, 1M) → shard 0, [1M, 2M) → shard 1, [2M, 3M) → shard 2
         assert_eq!(strategy.calculate_shard(0).0, 0);
         assert_eq!(strategy.calculate_shard(999_999).0, 0);
         assert_eq!(strategy.calculate_shard(1_000_000).0, 1);
         assert_eq!(strategy.calculate_shard(1_500_000).0, 1);
         assert_eq!(strategy.calculate_shard(2_000_000).0, 2);
+        assert_eq!(strategy.calculate_shard(2_999_999).0, 2);
+        // Inodes beyond 3M route to last shard (binary search falls through)
         assert_eq!(strategy.calculate_shard(u64::MAX).0, 2);
     }
 
@@ -196,7 +198,7 @@ mod tests {
 
         let (start, end) = strategy.get_shard_range(ShardId(2));
         assert_eq!(start, 2_000_000);
-        assert_eq!(end, u64::MAX);
+        assert_eq!(end, 3_000_000); // capped at 1M, not u64::MAX
     }
 
     #[test]

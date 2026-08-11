@@ -538,7 +538,7 @@ impl FilerNetHandler {
             name: info.name.clone(),
             is_dir,
             symlink_target: if matches!(info.file_type, FileType::Symlink) {
-                Some(info.name.clone())
+                info.symlink_target.clone()
             } else {
                 None
             },
