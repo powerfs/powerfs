@@ -8,8 +8,9 @@ mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, FsckArgs, GrowArgs, HeartbeatArgs,
-    KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs, WriteArgs,
+    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, FsckArgs, FuseStatsArgs, GrowArgs,
+    HeartbeatArgs, KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
+    WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -94,6 +95,9 @@ enum Commands {
     /// Filesystem consistency check (orphaned needles, ghost references, metadata anomalies)
     Fsck(FsckArgs),
 
+    /// Query FUSE client request statistics and in-flight requests (stuck detection)
+    FuseStats(FuseStatsArgs),
+
     /// Configuration file management (generate per-node configs from topology)
     Config {
         #[command(subcommand)]
@@ -158,6 +162,7 @@ async fn main() {
         }
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
         Commands::Fsck(args) => commands::fsck(client, args).await,
+        Commands::FuseStats(args) => commands::fuse_stats(&cli.master, args),
         Commands::Config { .. } => unreachable!("handled above"),
         Commands::Manage(args) => commands::manage(client, args).await,
     };

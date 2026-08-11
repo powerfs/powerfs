@@ -282,6 +282,9 @@ pub struct MetaShardClient {
     /// Sharded RPC Pool — 并发派发元数据请求，消除全局 response_waiters 锁。
     /// 在 init() 中创建（需要 shard_router 已填充）。
     rpc_pool: Arc<Mutex<Option<Arc<ShardedRpcPool>>>>,
+    /// Request statistics tracker — shared with ShardedRpcPool for in-flight
+    /// request tracking and per-msg_type latency/error counters.
+    stats: Arc<crate::request_stats::RequestStats>,
     /// Phase 2: Notification handler for server-pushed Invalidate messages.
     /// Applied to every new Filer connection so the client can receive
     /// cache invalidation callbacks.
@@ -330,6 +333,7 @@ impl MetaShardClient {
             default_filer_addr: Arc::new(Mutex::new(String::new())),
             filer_addresses: Arc::new(Mutex::new(Vec::new())),
             rpc_pool: Arc::new(Mutex::new(None)),
+            stats: Arc::new(crate::request_stats::RequestStats::new()),
             notification_handler: Arc::new(std::sync::RwLock::new(None)),
             client_id,
             cache_epoch: Arc::new(AtomicU64::new(0)),
@@ -523,6 +527,15 @@ impl MetaShardClient {
         self.default_filer_addr.lock().unwrap().clone()
     }
 
+    /// Get a reference to the request statistics tracker.
+    ///
+    /// The stats are shared with the ShardedRpcPool and updated on every
+    /// `submit()` call. Use this to query in-flight requests and per-msg_type
+    /// counters for the admin/debug endpoint.
+    pub fn stats(&self) -> &Arc<crate::request_stats::RequestStats> {
+        &self.stats
+    }
+
     /// 获取用于轮换重试的 Filer 地址候选列表。
     /// 优先返回 filer_addresses（去重保序），为空时回退到 default_filer_addr。
     fn rotation_candidates(&self) -> Vec<String> {
@@ -589,6 +602,7 @@ impl MetaShardClient {
                 self.breakers.clone(),
                 self.shard_router.clone(),
                 self.filer_addresses.clone(),
+                self.stats.clone(),
             );
             *guard = Some(Arc::new(pool));
         }
@@ -1066,11 +1080,36 @@ impl MetaShardClient {
     /// - 网络错误: 记录失败，轮换到下一个 Filer 候选地址，指数退避重试（50ms→1s）
     /// - 熔断打开: 轮换到下一个 Filer 候选地址重试
     ///   最多 MAX_ATTEMPTS 次尝试。
+    /// Send a coherence message to the Filer, with request statistics tracking.
+    ///
+    /// This is the main entry point for all metadata RPCs (lookup, mkdir,
+    /// create, unlink, etc.). It wraps `send_coherence_msg_impl` with
+    /// `record_start`/`record_complete` so the admin/debug endpoint can
+    /// report per-MsgType counters, latency, and in-flight requests.
     async fn send_coherence_msg(
         &self,
         msg_type: powerfs_net::MsgType,
         shard_id: u64,
         body: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let stats_id = self.stats.record_start(msg_type as u16, shard_id);
+        let result = self
+            .send_coherence_msg_impl(msg_type, shard_id, body, stats_id)
+            .await;
+        // Fallback: if _impl returned without calling record_complete (should
+        // not happen, but guard against future code changes), record it here.
+        // record_complete is idempotent if the id was already removed.
+        // However, _impl always calls record_complete before returning, so
+        // this is a no-op safety net.
+        result
+    }
+
+    async fn send_coherence_msg_impl(
+        &self,
+        msg_type: powerfs_net::MsgType,
+        shard_id: u64,
+        body: Vec<u8>,
+        stats_id: u64,
     ) -> Result<Vec<u8>, String> {
         // 10 次尝试：覆盖 Raft 选举（~1-3s）+ 网络抖动恢复窗口
         const MAX_ATTEMPTS: u32 = 10;
@@ -1092,6 +1131,8 @@ impl MetaShardClient {
                 .unwrap_or_else(|| self.default_filer_addr());
 
             if leader_addr.is_empty() && rotation.is_empty() {
+                self.stats
+                    .record_complete(stats_id, Err(&ClientError::NoShardLeader(shard_id)));
                 return Err(format!("no leader for shard {}", shard_id));
             }
 
@@ -1106,6 +1147,8 @@ impl MetaShardClient {
             };
 
             if target_addr.is_empty() {
+                self.stats
+                    .record_complete(stats_id, Err(&ClientError::NoShardLeader(shard_id)));
                 return Err(format!("no leader for shard {}", shard_id));
             }
 
@@ -1129,6 +1172,10 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
+                    self.stats.record_complete(
+                        stats_id,
+                        Err(&ClientError::Network(last_err.clone())),
+                    );
                     return Err(last_err);
                 }
             };
@@ -1150,6 +1197,8 @@ impl MetaShardClient {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
                 }
+                self.stats
+                    .record_complete(stats_id, Err(&ClientError::CircuitOpen));
                 return Err(last_err);
             }
 
@@ -1176,6 +1225,7 @@ impl MetaShardClient {
                             self.shard_router
                                 .insert(shard_id, ShardInfo::new(shard_id, target_addr.clone()));
                         }
+                        self.stats.record_complete(stats_id, Ok(()));
                         return Ok(resp.body);
                     }
 
@@ -1233,6 +1283,18 @@ impl MetaShardClient {
                             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                     })
                     .unwrap_or_else(|| format!("server status {}", status));
+
+                    // Client errors (ENOENT, ENODATA, EEXIST, etc.) are
+                    // normal responses — the server is healthy. Don't count
+                    // them as errors in stats to avoid inflating error rate.
+                    if powerfs_net::is_client_error(status) {
+                        self.stats.record_complete(stats_id, Ok(()));
+                    } else {
+                        self.stats.record_complete(
+                            stats_id,
+                            Err(&ClientError::Server(err_msg.clone())),
+                        );
+                    }
                     return Err(err_msg);
                 }
                 Err(e) => {
@@ -1253,6 +1315,10 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
+                    self.stats.record_complete(
+                        stats_id,
+                        Err(&ClientError::Network(last_err.clone())),
+                    );
                     return Err(last_err);
                 }
             }
