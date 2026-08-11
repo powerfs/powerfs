@@ -101,6 +101,21 @@ impl NotificationHandler for InvalidateHandler {
                     return;
                 }
 
+                // Never evict the root inode (inode=1). The root must always
+                // be in the cache — evicting it breaks all subsequent path
+                // resolutions (create/lookup/getattr on /mnt/fuse/* fail with
+                // ENOENT/EIO). Instead of evicting, mark it Stale so the next
+                // access refreshes attributes from the Filer.
+                if inode == crate::cache::ROOT_INODE {
+                    debug!(
+                        "InvalidateHandler: refreshing root inode (v={}) instead of evicting",
+                        version
+                    );
+                    self.cache.mark_stale(inode);
+                    self.mark_processed(inode, version);
+                    return;
+                }
+
                 debug!(
                     "InvalidateHandler: received Invalidate(inode={}, version={})",
                     inode, version
@@ -323,6 +338,25 @@ mod tests {
 
         let msg = make_invalidate_msg(0, 1);
         handler.handle_notification(&msg);
+    }
+
+    #[test]
+    fn test_invalidate_root_inode_never_evicted() {
+        let cache = Arc::new(MetadataCache::new());
+        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+
+        // Root inode (1) is initialized by MetadataCache::new()
+        assert!(cache.peek_inode(crate::cache::ROOT_INODE).is_some());
+
+        // Send Invalidate for root with a high version
+        let msg = make_invalidate_msg(crate::cache::ROOT_INODE, 99999);
+        handler.handle_notification(&msg);
+
+        // Root must still be in the cache (not evicted)
+        assert!(
+            cache.peek_inode(crate::cache::ROOT_INODE).is_some(),
+            "root inode must never be evicted by InvalidateHandler"
+        );
     }
 
     #[test]
