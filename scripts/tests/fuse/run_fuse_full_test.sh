@@ -264,7 +264,8 @@ assert_eq "755" "$PERMS" "T3.02 chmod 755"
 # T3.03 chmod 000
 chmod 000 "$TEST_ROOT/t3/perm.txt"
 PERMS=$(stat -c "%a" "$TEST_ROOT/t3/perm.txt")
-assert_eq "000" "$PERMS" "T3.03 chmod 000"
+# stat -c "%a" returns "0" (not zero-padded "000") for permission 0
+assert_eq "0" "$PERMS" "T3.03 chmod 000"
 chmod 644 "$TEST_ROOT/t3/perm.txt"  # restore
 
 # T3.04 chown uid
@@ -435,7 +436,8 @@ if command -v setfattr >/dev/null 2>&1; then
 
     # T7.04 removexattr
     setfattr -x user.key1 "$TEST_ROOT/t7/xa.txt" 2>/dev/null
-    if getfattr -n user.key1 "$TEST_ROOT/t7/xa.txt" 2>/dev/null | grep -q "No such attribute"; then
+    # getfattr outputs "No such attribute" to stderr; merge with stdout for grep
+    if getfattr -n user.key1 "$TEST_ROOT/t7/xa.txt" 2>&1 | grep -q "No such attribute"; then
         record_pass
     else
         record_fail "T7.04 removexattr"
