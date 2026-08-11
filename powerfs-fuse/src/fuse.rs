@@ -714,6 +714,11 @@ impl PowerFsFs {
             return Ok(());
         }
 
+        // EntryState: Dirty→Flushing before starting flush RPC. On failure the
+        // entry stays Flushing (no mark_clean); subsequent retries re-enter
+        // Flushing (same-state transition is allowed by try_transition).
+        self.cache.mark_flushing(inode);
+
         debug!(
             "flush_dirty_chunks_impl: inode={}, dirty_count={} (drained, has_dirty_after={})",
             inode,
@@ -856,6 +861,8 @@ impl PowerFsFs {
             if had_error {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
+            // EntryState: Flushing→Clean after successful stripe flush RPC.
+            self.cache.mark_clean(inode);
             return Ok(());
         }
 
@@ -994,6 +1001,9 @@ impl PowerFsFs {
         if had_error {
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
+
+        // EntryState: Flushing→Clean after successful flat flush RPC.
+        self.cache.mark_clean(inode);
 
         // Phase 3.4: size/chunks 元数据同步移至 release()（close 时强一致 sync），
         // flush_dirty_chunks 只负责将数据持久化到 volume server。
@@ -1965,6 +1975,11 @@ impl FileSystem for PowerFsFs {
                 mtime: mtime.map(|t| t as i64),
             },
         );
+
+        // EntryState: 标记 Dirty 以反映本地属性已修改（仅在 size/mode/uid/gid 实际变化时）
+        if mode.is_some() || size.is_some() || uid.is_some() || gid.is_some() {
+            self.cache.mark_dirty(inode);
+        }
 
         // Truncate 处理：清除旧数据缓存，防止 read/flush 返回 truncate 前的残留数据。
         //
@@ -4066,6 +4081,8 @@ impl FileSystem for PowerFsFs {
                     );
                     // Update content_size in cache so getattr reports correct size
                     self.cache.update_size(inode, updated_size);
+                    // EntryState: 标记 Dirty 以反映 inline buffer 已修改
+                    self.cache.mark_dirty(inode);
                     return Ok(read_len);
                 }
             } else {
@@ -4131,6 +4148,8 @@ impl FileSystem for PowerFsFs {
                          subsequent writes → Volume Server",
                         inode, new_size
                     );
+                    // EntryState: 标记 Dirty 以反映 chunk_cache 已写入迁移数据
+                    self.cache.mark_dirty(inode);
                     return Ok(read_len);
                 }
                 Err(e) => {
@@ -4338,6 +4357,8 @@ impl FileSystem for PowerFsFs {
                 placement,
                 &stripe_chunks,
             );
+            // EntryState: 标记 Dirty 以反映 chunk_cache 已写入数据
+            self.cache.mark_dirty(inode);
             return Ok(read_len);
         }
 
@@ -4545,6 +4566,8 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
+        // EntryState: 标记 Dirty 以反映 chunk_cache 已写入数据
+        self.cache.mark_dirty(inode);
         Ok(read_len)
     }
 
