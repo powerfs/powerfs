@@ -312,18 +312,26 @@ impl MetadataCache {
         // Pinned inodes (open files) skip TTL expiry to prevent cache miss
         // during slow writes that exceed metadata_ttl.
         let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
-        if !is_pinned && entry.cached_at.elapsed() > self.metadata_ttl {
-            // Phase 1: record Stale transition (observational).
-            // try_transition will log REJECTED if entry is Dirty/Flushing —
-            // that indicates a bug (local authoritative data expired by TTL).
+        // Phase 3: Dirty/Flushing entries have local authoritative data
+        // and must NOT be expired by TTL, even if cached_at is old.
+        // This is the core state machine rule: Dirty/Flushing → Stale is
+        // forbidden. Previously this was only logged (Phase 1); now it
+        // actually prevents expiry (Phase 3).
+        let has_authoritative_data =
+            entry.state == EntryState::Dirty || entry.state == EntryState::Flushing;
+        if !is_pinned && !has_authoritative_data && entry.cached_at.elapsed() > self.metadata_ttl {
+            // Entry is Clean/New and TTL expired — mark Stale.
+            // try_transition will log REJECTED if somehow Dirty/Flushing
+            // (shouldn't happen due to check above, but defensive).
             if let Some(e) = cache.get_mut(&inode) {
                 e.try_transition(EntryState::Stale);
             }
             debug!(
-                "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}), treating as stale",
+                "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}, state={:?}), treating as stale",
                 inode,
                 entry.cached_at.elapsed(),
                 self.metadata_ttl,
+                entry.state,
             );
             None
         } else {
