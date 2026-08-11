@@ -452,6 +452,17 @@ impl MetadataCache {
         }
     }
 
+    /// Mark an inode as Stale (needs refresh on next access).
+    /// Called by InvalidateHandler for the root inode (which must never be
+    /// evicted). The Stale state causes get_inode to return None, triggering
+    /// a re-fetch from the Filer on the next access.
+    pub fn mark_stale(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Stale);
+        }
+    }
+
     /// Get path by walking up parent chain
     pub fn get_path_by_parent_chain(&self, inode: u64) -> Option<String> {
         if inode == 1 {
@@ -487,6 +498,16 @@ impl MetadataCache {
     pub fn get_path(&self, path: &str) -> Option<u64> {
         let path_map = self.path_map.read().unwrap();
         path_map.get(path).copied()
+    }
+
+    /// Insert an entry as Pinned (open_count=1). Used by create/open callbacks
+    /// where the entry is new (not yet in cache) and must be pinned from the
+    /// moment it enters the cache. This replaces the old pattern of calling
+    /// pin_inode() before insert(), which was a no-op when the inode was not
+    /// yet in the cache (Phase 3: entry.hold is authoritative, not pinned_inodes).
+    pub fn insert_pinned(&self, mut entry: CachedEntry) {
+        entry.hold = HoldState::Pinned { open_count: 1 };
+        self.insert(entry);
     }
 
     /// Insert an entry into the cache (only update path_map, keep existing inode_cache entry for hard links)
