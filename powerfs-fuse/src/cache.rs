@@ -411,6 +411,16 @@ impl MetadataCache {
         cache.peek(&inode).map(|e| e.state)
     }
 
+    /// Peek at a cached entry without TTL check. Returns None only if the
+    /// inode is truly not in the cache (not just TTL-expired).
+    /// Used by FUSE callbacks (setxattr, etc.) that need to verify inode
+    /// existence without triggering a stale-cache refresh — the entry is
+    /// still physically present, just past its TTL.
+    pub fn peek_inode(&self, inode: u64) -> Option<CachedEntry> {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).cloned()
+    }
+
     /// Mark an inode as Dirty (has unsynced local modifications).
     /// Called by write/setattr paths after modifying local data/metadata.
     pub fn mark_dirty(&self, inode: u64) {
