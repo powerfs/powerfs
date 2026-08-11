@@ -637,6 +637,11 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
             let mtime = entry.mtime.max(0) as u64;
+            let chunks_before = entry.chunks.iter().map(|c| c.offset).collect::<Vec<_>>();
+            log::debug!(
+                "update_chunk_sizes_after_write: inode={} offset={} len={} chunk_idx={}..={} chunks_before={:?} fid.file_key={}",
+                inode, offset, length, start_chunk_idx, end_chunk_idx, chunks_before, fid.file_key
+            );
 
             for chunk_idx in start_chunk_idx..=end_chunk_idx {
                 // Safety: chunk_idx must fit within FILE_KEY_BLOCK_SIZE to avoid
@@ -666,8 +671,17 @@ impl MetadataCache {
                         volume_id: fid.volume_id.0,
                         crc32: 0,
                     });
+                    log::debug!(
+                        "update_chunk_sizes_after_write: inode={} added new chunk at offset={} needle_id={}",
+                        inode, chunk_offset, fid.file_key.saturating_add(chunk_idx)
+                    );
                 }
             }
+            let chunks_after = entry.chunks.iter().map(|c| c.offset).collect::<Vec<_>>();
+            log::debug!(
+                "update_chunk_sizes_after_write: inode={} chunks_after={:?}",
+                inode, chunks_after
+            );
         }
     }
 

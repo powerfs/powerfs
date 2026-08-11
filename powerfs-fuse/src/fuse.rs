@@ -2388,9 +2388,19 @@ impl FileSystem for PowerFsFs {
         // 文件被重新打开), 从 Filer getattr 拉取 inline_data 填充 buffer.
         // 数据在 Filer 元数据中, 一次 RPC 拿全, 后续 read 直接从 buffer 服务.
         //
-        // 跳过条件: inode 已在 inline_buffers 中 (create 刚创建仍在写, 或
-        // 并发 open 第二次进入) — 此时本地 buffer 权威, 无需刷新.
-        if !self.inline_buffers.contains_key(&inode) {
+        // 跳过条件:
+        // 1. inode 已在 inline_buffers 中 (create 刚创建仍在写, 或
+        //    并发 open 第二次进入) — 此时本地 buffer 权威, 无需刷新.
+        // 2. entry.fid.is_some() — 文件已迁移到 Flat 模式. Filer 可能仍返回
+        //    is_inline()=true (迁移尚未 sync 到 Filer), 重新创建 inline buffer
+        //    会导致文件回退到 Inline 模式, 丢失 Flat 路径的 chunks 数据.
+        //    (BUG: append 写入时 open 回调将已迁移文件回退为 Inline)
+        let skip_inline_refresh = self
+            .cache
+            .get_inode(inode)
+            .map(|e| e.fid.is_some())
+            .unwrap_or(false);
+        if !self.inline_buffers.contains_key(&inode) && !skip_inline_refresh {
             let meta_client = self.client.facade().meta_shard_client().clone();
             // Route getattr via the inode's own shard. After the split-create
             // refactor the inode record lives on calculate_shard(inode);
