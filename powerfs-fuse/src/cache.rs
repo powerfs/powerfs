@@ -229,11 +229,6 @@ pub struct MetadataCache {
     metadata_ttl: Duration,
     /// Latest known generation per path (from notifications)
     path_generations: RwLock<HashMap<String, u64>>,
-    /// Pinned inodes (open files): skip TTL expiry to prevent cache miss
-    /// during slow writes that exceed metadata_ttl. Uses reference counting
-    /// so concurrent open/release on the same inode (different FUSE workers)
-    /// don't prematurely unpin.
-    pinned_inodes: RwLock<HashMap<u64, u32>>,
 }
 
 impl MetadataCache {
@@ -259,7 +254,6 @@ impl MetadataCache {
             dir_cache_ttl: Duration::from_secs(5),
             metadata_ttl,
             path_generations: RwLock::new(HashMap::new()),
-            pinned_inodes: RwLock::new(HashMap::new()),
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
@@ -309,20 +303,18 @@ impl MetadataCache {
     pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
         let mut cache = self.inode_cache.write().unwrap();
         let entry = cache.get(&inode).cloned()?;
-        // Pinned inodes (open files) skip TTL expiry to prevent cache miss
-        // during slow writes that exceed metadata_ttl.
-        let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
+        // Phase 3: entry.hold is the authoritative source for pin status.
+        // Pinned inodes (open files with lease) skip TTL expiry to prevent
+        // cache miss during slow writes that exceed metadata_ttl.
+        let is_pinned = entry.hold.is_pinned();
         // Phase 3: Dirty/Flushing entries have local authoritative data
         // and must NOT be expired by TTL, even if cached_at is old.
         // This is the core state machine rule: Dirty/Flushing → Stale is
-        // forbidden. Previously this was only logged (Phase 1); now it
-        // actually prevents expiry (Phase 3).
+        // forbidden.
         let has_authoritative_data =
             entry.state == EntryState::Dirty || entry.state == EntryState::Flushing;
         if !is_pinned && !has_authoritative_data && entry.cached_at.elapsed() > self.metadata_ttl {
             // Entry is Clean/New and TTL expired — mark Stale.
-            // try_transition will log REJECTED if somehow Dirty/Flushing
-            // (shouldn't happen due to check above, but defensive).
             if let Some(e) = cache.get_mut(&inode) {
                 e.try_transition(EntryState::Stale);
             }
@@ -344,18 +336,20 @@ impl MetadataCache {
     /// decrements. The inode is only unpinned when the count reaches 0.
     /// This prevents concurrent open/release (different FUSE workers) from
     /// prematurely unpinning an inode that is still open by another handle.
+    ///
+    /// Phase 3: entry.hold is the single authoritative source for pin
+    /// status. The old pinned_inodes HashMap has been removed.
     pub fn pin_inode(&self, inode: u64) {
-        let mut pinned = self.pinned_inodes.write().unwrap();
-        let count = pinned.entry(inode).or_insert(0);
-        *count += 1;
-        let new_count = *count;
-        drop(pinned);
-        // Phase 1: mirror pin to entry.hold (observational).
-        // pinned_inodes remains the authoritative source in Phase 1;
-        // entry.hold will become authoritative in Phase 2.
-        if let Some(e) = self.inode_cache.write().unwrap().get_mut(&inode) {
+        let mut cache = self.inode_cache.write().unwrap();
+        let new_count = if let Some(e) = cache.get_mut(&inode) {
             e.pin();
-        }
+            match e.hold {
+                HoldState::Pinned { open_count } => open_count,
+                HoldState::Unpinned => 0,
+            }
+        } else {
+            0
+        };
         debug!(
             "pin_inode: inode={} new_count={} thread={:?}",
             inode,
@@ -366,29 +360,32 @@ impl MetadataCache {
 
     /// Unpin an inode (called on release/close).
     /// Decrements the reference count; only removes when count reaches 0.
+    ///
+    /// Phase 3: entry.hold is the single authoritative source for pin
+    /// status. The old pinned_inodes HashMap has been removed.
     pub fn unpin_inode(&self, inode: u64) {
-        let mut pinned = self.pinned_inodes.write().unwrap();
-        let was_pinned = pinned.contains_key(&inode);
-        if let Some(count) = pinned.get_mut(&inode) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                pinned.remove(&inode);
-            }
-        }
-        drop(pinned);
-        // Phase 1: mirror unpin to entry.hold (observational).
-        if let Some(e) = self.inode_cache.write().unwrap().get_mut(&inode) {
-            e.unpin();
+        let was_pinned;
+        let released;
+        {
+            let mut cache = self.inode_cache.write().unwrap();
+            was_pinned = cache
+                .peek(&inode)
+                .map(|e| e.hold.is_pinned())
+                .unwrap_or(false);
+            released = if let Some(e) = cache.get_mut(&inode) {
+                e.unpin()
+            } else {
+                false
+            };
         }
         // RACE_TRACE: Log unpin with caller context to detect the race where
         // the background flusher unpins a still-open inode, allowing the
         // InvalidateHandler to evict it mid-write.
         debug!(
-            "unpin_inode: inode={} was_pinned={} thread={:?}",
+            "unpin_inode: inode={} was_pinned={} released={} thread={:?}",
             inode,
             was_pinned,
+            released,
             std::thread::current().id()
         );
     }
@@ -398,8 +395,12 @@ impl MetadataCache {
     /// invalidated by server-pushed Invalidate notifications. This prevents
     /// a self-invalidation race where a client's own setattr triggers an
     /// Invalidate that evicts the entry it just updated (causing ENOENT).
+    ///
+    /// Phase 3: entry.hold is the single authoritative source. Reads from
+    /// inode_cache without TTL check (peek) to avoid side effects.
     pub fn is_pinned(&self, inode: u64) -> bool {
-        self.pinned_inodes.read().unwrap().contains_key(&inode)
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).map(|e| e.hold.is_pinned()).unwrap_or(false)
     }
 
     /// Get the EntryState of a cached inode without TTL check.
@@ -588,7 +589,7 @@ impl MetadataCache {
                 //
                 // Truncate (which legitimately shrinks size) goes through
                 // setattr(), not insert(), so this guard is safe.
-                let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
+                let is_pinned = existing.hold.is_pinned();
                 if is_pinned && existing.content_size > entry.content_size {
                     debug!(
                         "insert: preserving larger content_size for pinned inode={} (existing={}, filer={})",
@@ -635,13 +636,10 @@ impl MetadataCache {
             // size/chunks sync → cross-client stale metadata / data loss.
             let evicted = cache.push(inode, entry);
             if let Some((evicted_inode, evicted_entry)) = evicted {
-                if evicted_inode != inode
-                    && self
-                        .pinned_inodes
-                        .read()
-                        .unwrap()
-                        .contains_key(&evicted_inode)
-                {
+                // Phase 3: check evicted_entry.hold directly instead of the
+                // old pinned_inodes HashMap. This is also more correct: no
+                // TOCTOU between eviction and pin check.
+                if evicted_inode != inode && evicted_entry.hold.is_pinned() {
                     // Re-insert the evicted pinned entry. This may evict
                     // another entry, but pinned entries are few relative to
                     // the 10000-entry cache, so cascading eviction of another
@@ -2666,6 +2664,189 @@ mod chunk_cache_tests {
             cache.get_entry_state(ino).unwrap(),
             EntryState::Dirty,
             "Dirty→Clean must be rejected: concurrent write made entry Dirty during flush"
+        );
+    }
+
+    /// Phase 3: entry.hold is the authoritative source for pin status.
+    /// Verifies that pin_inode/unpin_inode/is_pinned all operate on
+    /// entry.hold directly (no separate pinned_inodes HashMap).
+    #[test]
+    fn test_pin_unpin_via_entry_hold() {
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_secs(60));
+        let ino = cache.allocate_inode();
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "pinned.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        });
+
+        // Initially not pinned
+        assert!(!cache.is_pinned(ino));
+
+        // Pin once (open)
+        cache.pin_inode(ino);
+        assert!(cache.is_pinned(ino));
+
+        // Pin again (second open — reference counting)
+        cache.pin_inode(ino);
+        assert!(cache.is_pinned(ino));
+
+        // Unpin once (first close — still pinned by second handle)
+        cache.unpin_inode(ino);
+        assert!(cache.is_pinned(ino), "should still be pinned after first unpin");
+
+        // Unpin again (second close — fully released)
+        cache.unpin_inode(ino);
+        assert!(!cache.is_pinned(ino), "should be unpinned after all handles closed");
+    }
+
+    /// Phase 3: pinned inodes bypass TTL expiry via entry.hold.
+    /// Verifies that a pinned inode survives TTL expiry, while an unpinned
+    /// inode with the same TTL is expired.
+    #[test]
+    fn test_pinned_inode_bypasses_ttl_via_hold() {
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_millis(50));
+        let pinned_ino = cache.allocate_inode();
+        let unpinned_ino = cache.allocate_inode();
+
+        let make_entry = |ino: u64| CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: format!("file_{}.txt", ino),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        };
+
+        cache.insert(make_entry(pinned_ino));
+        cache.insert(make_entry(unpinned_ino));
+
+        // Pin one inode
+        cache.pin_inode(pinned_ino);
+
+        // Wait for TTL to expire
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Pinned inode should still be retrievable
+        assert!(
+            cache.get_inode(pinned_ino).is_some(),
+            "pinned inode should bypass TTL expiry"
+        );
+        // Unpinned inode should be expired
+        assert!(
+            cache.get_inode(unpinned_ino).is_none(),
+            "unpinned inode should be expired by TTL"
+        );
+    }
+
+    /// Phase 3: LRU eviction preserves pinned entries via entry.hold.
+    /// Verifies that a pinned entry is re-inserted when evicted by LRU.
+    #[test]
+    fn test_lru_eviction_preserves_pinned_via_hold() {
+        // Small cache to force eviction
+        let cache = MetadataCache::with_capacity_and_ttl(3, Duration::from_secs(60));
+
+        let make_entry = |ino: u64, name: &str| CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        };
+
+        // Insert 3 entries (fills cache: root=1, ino=2, ino=3, ino=4 → cap=3 means 3 entries after root)
+        let ino_a = cache.allocate_inode(); // 2
+        let ino_b = cache.allocate_inode(); // 3
+        let ino_c = cache.allocate_inode(); // 4
+        cache.insert(make_entry(ino_a, "a"));
+        cache.insert(make_entry(ino_b, "b"));
+        cache.insert(make_entry(ino_c, "c"));
+
+        // Pin entry B (middle of LRU)
+        cache.pin_inode(ino_b);
+
+        // Insert a new entry to trigger eviction
+        let ino_d = cache.allocate_inode(); // 5
+        cache.insert(make_entry(ino_d, "d"));
+
+        // Pinned entry B should still be in cache
+        assert!(
+            cache.peek_inode(ino_b).is_some(),
+            "pinned entry should survive LRU eviction"
+        );
+        assert!(
+            cache.is_pinned(ino_b),
+            "pinned entry should still be marked as pinned after re-insertion"
         );
     }
 }
