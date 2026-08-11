@@ -998,6 +998,8 @@ pub fn encode_setattr_req(
     uid: Option<u32>,
     gid: Option<u32>,
     size: Option<u64>,
+    atime: Option<u64>,
+    mtime: Option<u64>,
 ) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::Ino, ino);
@@ -1012,6 +1014,12 @@ pub fn encode_setattr_req(
     }
     if let Some(s) = size {
         enc.add_u64(FieldId::Size, s);
+    }
+    if let Some(a) = atime {
+        enc.add_u64(FieldId::Atime, a);
+    }
+    if let Some(mt) = mtime {
+        enc.add_u64(FieldId::Mtime, mt);
     }
     Ok(enc.into_bytes())
 }

@@ -874,7 +874,12 @@ impl MetaShardManager {
         // POSIX: rmdir on a non-empty directory must fail with ENOTEMPTY.
         // Reject before proposing the Raft command so the client gets a
         // clear error (the FUSE layer maps "not empty" to libc::ENOTEMPTY).
-        if !self.list_directory(child_inode).is_empty() {
+        //
+        // Use `is_directory_empty_strict` (reads from RocksDB) instead of
+        // `list_directory` (reads from in-memory cache) to avoid stale
+        // entries from OR-Set sync re-adding deleted dir entries via
+        // `create_inode_atomic`, which would cause spurious ENOTEMPTY.
+        if !self.is_directory_empty_strict(child_inode) {
             return Err("directory not empty".to_string());
         }
 
@@ -1149,6 +1154,44 @@ impl MetaShardManager {
             }
         }
         result
+    }
+
+    /// Strict empty-directory check that reads dir entries from RocksDB
+    /// (bypassing the in-memory cache) to avoid stale entries from OR-Set
+    /// sync. Used by `delete_directory` (rmdir) for the POSIX ENOTEMPTY
+    /// check. Cross-shard inode resolution is performed using the in-memory
+    /// cache; tombstoned inodes (delete_time > 0) are filtered out.
+    pub fn is_directory_empty_strict(&self, parent_inode: u64) -> bool {
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+
+        // Read dir entries from RocksDB (source of truth)
+        let pairs = {
+            let stores = self.shard_stores.read().unwrap();
+            match stores.get(&parent_shard) {
+                Some(shard_store) => shard_store.list_dir_entry_inodes_rocksdb(parent_inode),
+                None => return true, // no shard → empty
+            }
+        };
+
+        if pairs.is_empty() {
+            return true;
+        }
+
+        // Resolve each inode and check if any are live (not tombstoned)
+        let stores = self.shard_stores.read().unwrap();
+        for (_name, inode) in pairs {
+            let inode_shard = self.shard_strategy.calculate_shard(inode);
+            if let Some(shard_store) = stores.get(&inode_shard) {
+                if let Some(info) = shard_store.get_inode(inode) {
+                    if info.delete_time == 0 {
+                        return false; // Found a live entry → not empty
+                    }
+                }
+            }
+        }
+
+        // All entries are either missing or tombstoned → empty
+        true
     }
 
     pub fn get_shard_stats(&self, shard_id: ShardId) -> Option<ShardStats> {
@@ -1500,8 +1543,14 @@ impl MetaShardManager {
                 stores.get(&shard_id).cloned()
             };
             if let Some(store) = store {
+                // Increased from 50 (500ms) to 200 (2s) to handle concurrent
+                // Raft commands. Under load (e.g. rsync -a syncing many files
+                // while release paths sync size/chunks), the Raft group may
+                // take longer to apply the SETATTR command. The previous 500ms
+                // timeout caused spurious EIO when UPDATE_SIZE_CHUNKS (direct
+                // write, bypassing Raft) was running concurrently.
                 let mut retries = 0;
-                while retries < 50 {
+                while retries < 200 {
                     if let Some(info) = store.get_inode(inode) {
                         let mode_ok =
                             mode.is_none_or(|m| (info.mode & 0o7777) == (m as u32 & 0o7777));

@@ -1217,6 +1217,21 @@ impl PowerFsFs {
             return Ok(());
         }
 
+        // Guard: If the file is in Inline mode (no fid, no chunks) and the
+        // inline buffer was already removed by a prior release, skip this sync.
+        // The Flat path sends inline_data=None, which would CLEAR the Filer's
+        // inline_data — corrupting Inline mode files that were already synced
+        // by the inline release path. This happens when multiple overlapping
+        // opens exist (FUSE kernel delays releases) and the first release
+        // (inline path) removes the buffer before subsequent releases run.
+        if entry.fid.is_none() && entry.chunks.is_empty() && !self.inline_buffers.contains_key(&inode) {
+            debug!(
+                "sync_size_chunks_on_close: inode {} is Inline mode (no fid, no chunks, no buffer) — skipping Flat sync to preserve Filer inline_data",
+                inode
+            );
+            return Ok(());
+        }
+
         debug!(
             "sync_size_chunks_on_close: inode={}, content_size={}, chunks={}, fid={:?}",
             inode,
@@ -2928,10 +2943,9 @@ impl FileSystem for PowerFsFs {
                     }
                     // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
                     let data = attr.inline_data.unwrap_or_default();
-                    debug!(
-                        "open: inline mode inode={}, fetched {} bytes from filer",
-                        inode,
-                        data.len()
+                    warn!(
+                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, thread={:?}",
+                        inode, data.len(), attr.size, std::thread::current().id()
                     );
                     self.inline_buffers
                         .insert(inode, InlineBuffer { data, dirty: false });
@@ -3026,16 +3040,12 @@ impl FileSystem for PowerFsFs {
                     if let Some(max_size) = attr.inline_max_size {
                         self.inline_max_sizes.insert(inode, max_size);
                     }
+                    warn!(
+                        "READ_DBG: inode={} inline_buf INSERT from filer (read fallback), data_len={}, attr.size={}, thread={:?}",
+                        inode, data.len(), attr.size, std::thread::current().id()
+                    );
                     self.inline_buffers
                         .insert(inode, InlineBuffer { data, dirty: false });
-                    debug!(
-                        "read: fetched {} bytes of inline data for inode={}",
-                        self.inline_buffers
-                            .get(&inode)
-                            .map(|b| b.data.len())
-                            .unwrap_or(0),
-                        inode
-                    );
                 }
                 Ok(_) => {
                     warn!(
@@ -4730,43 +4740,79 @@ impl FileSystem for PowerFsFs {
         // yet), and gets content_size=0 → EIO on read. By keeping the buffer in
         // inline_buffers during the sync, the open's dirty-inline check fires and
         // skips the stale Filer refresh.
-        let inline_info = {
-            if let Some(inline_buf) = self.inline_buffers.get(&inode) {
-                let size = inline_buf.data.len() as u64;
-                let dirty = inline_buf.dirty;
-                let data = if dirty {
-                    Some(inline_buf.data.clone())
-                } else {
-                    None
-                };
-                Some((size, dirty, data))
-            } else {
-                None
-            }
-        };
+        //
+        // RACE FIX: Use mark-clean → sync → check-dirty-again loop to handle
+        // concurrent writes that extend the buffer during the sync RPC.
+        // Without this, a delayed RELEASE (common with FUSE kernel batching)
+        // snapshots a stale buffer (e.g., 6 bytes), syncs it, then removes
+        // the buffer that has since grown to 18 bytes — losing the appended data.
+        let has_inline_buffer = self.inline_buffers.contains_key(&inode);
 
-        if let Some((size, dirty, data)) = inline_info {
+        if has_inline_buffer {
             // inode-level write → route by routing_shard(inode). Inline
             // data + size are stored on the inode's own shard, NOT the parent
             // dir's shard. Routing via `parent` would send the close-sync to
             // the wrong leader and corrupt the file (size=0 / inline_data lost).
             let routing_shard = self.routing_shard(inode);
 
-            // 仅当 write 修改过 (dirty) 才同步; 只读 open → release 不回写,
-            // 避免覆盖其他客户端的并发写入 (Inline 无 volume lease 互斥).
-            let sync_result: std::io::Result<()> = if dirty {
+            // Loop: mark-clean → clone → sync → check-dirty-again
+            // If a concurrent write marks the buffer dirty during the sync RPC,
+            // we re-sync the updated buffer. Max 3 iterations to avoid infinite
+            // loops under sustained write pressure.
+            let mut sync_ok = true;
+            let mut final_size = 0u64;
+
+            for sync_round in 0..3u32 {
+                // Step 1: Clone current data WITHOUT marking dirty=false.
+                // Marking dirty=false before sync creates a window where a
+                // concurrent open sees the buffer as not-dirty and refreshes
+                // stale metadata from the Filer (size=0), causing append writes
+                // to use offset=0 and overwrite existing data.
+                // Instead, keep dirty=true during sync and detect concurrent
+                // writes by comparing buffer length before and after sync.
+                let snapshot: Option<(u64, Option<Vec<u8>>)> = {
+                    if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+                        let size = inline_buf.data.len() as u64;
+                        let was_dirty = inline_buf.dirty;
+                        let data = if was_dirty {
+                            Some(inline_buf.data.clone())
+                        } else {
+                            None
+                        };
+                        final_size = size;
+                        Some((size, data))
+                    } else {
+                        // Buffer was removed by someone else (e.g., migration)
+                        None
+                    }
+                };
+
+                let Some((size, data)) = snapshot else {
+                    // Buffer gone, nothing to sync
+                    break;
+                };
+
+                // Step 2: If not dirty (read-only open), skip sync entirely.
+                if data.is_none() {
+                    debug!(
+                        "release inline: inode={} not dirty (round {}), skip sync",
+                        inode, sync_round
+                    );
+                    break;
+                }
+
+                // Step 3: Sync the snapshot to the Filer (outside DashMap lock).
                 let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
                     shard_id: routing_shard,
                     inode,
                     size,
-                    chunks: Vec::new(), // Inline 模式 chunks 为空
+                    chunks: Vec::new(),
                     client_id: self.client.client_id(),
                     inline_data: data,
                 };
-                // retry + timeout (与 Flat 路径 sync_size_chunks_on_close 一致)
                 let max_retries = 5u32;
                 let mut last_err = String::new();
-                let mut ok = false;
+                let mut round_ok = false;
                 for attempt in 1..=max_retries {
                     let meta_client = self.client.facade().meta_shard_client().clone();
                     let req = req.clone();
@@ -4776,24 +4822,24 @@ impl FileSystem for PowerFsFs {
                     match result {
                         Ok(resp) if resp.success => {
                             info!(
-                                "release inline: inode={} synced size={} (attempt {})",
-                                inode, size, attempt
+                                "release inline: inode={} synced size={} (round {} attempt {})",
+                                inode, size, sync_round, attempt
                             );
-                            ok = true;
+                            round_ok = true;
                             break;
                         }
                         Ok(resp) => {
                             last_err = resp.error;
                             warn!(
-                                "release inline: inode={} attempt {} failed: {}",
-                                inode, attempt, last_err
+                                "release inline: inode={} round {} attempt {} failed: {}",
+                                inode, sync_round, attempt, last_err
                             );
                         }
                         Err(e) => {
                             last_err = e;
                             warn!(
-                                "release inline: inode={} attempt {} error: {}",
-                                inode, attempt, last_err
+                                "release inline: inode={} round {} attempt {} error: {}",
+                                inode, sync_round, attempt, last_err
                             );
                         }
                     }
@@ -4803,25 +4849,65 @@ impl FileSystem for PowerFsFs {
                         ));
                     }
                 }
-                if ok {
-                    Ok(())
-                } else {
+
+                if !round_ok {
                     error!(
                         "release inline: inode={} FAILED after {} attempts: {} — data may be lost",
                         inode, max_retries, last_err
                     );
-                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    sync_ok = false;
+                    // Re-mark as dirty so a future release can retry
+                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                        inline_buf.dirty = true;
+                    }
+                    break;
                 }
-            } else {
-                debug!(
-                    "release inline: inode={} not dirty (read-only open), skip sync",
-                    inode
-                );
-                Ok(())
-            };
 
-            // Sync complete — NOW safe to remove the inline buffer. The filer
-            // has the data, so a concurrent open will get correct metadata.
+                // Step 4: Check if the buffer grew during the sync.
+                // Compare current length with synced size. If the buffer grew,
+                // a concurrent write happened — re-sync with the updated data.
+                let current_len = self
+                    .inline_buffers
+                    .get(&inode)
+                    .map(|b| b.data.len())
+                    .unwrap_or(0);
+
+                if current_len as u64 > size {
+                    warn!(
+                        "release inline: inode={} buffer grew during sync (synced={}, current={}), re-syncing (round {})",
+                        inode, size, current_len, sync_round
+                    );
+                    continue; // Re-sync with the updated buffer
+                }
+
+                // Buffer unchanged — mark as not dirty and remove.
+                // Use get_mut to atomically clear dirty and check size again.
+                let can_remove = {
+                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                        if inline_buf.data.len() as u64 > size {
+                            // Buffer grew between the check above and here
+                            false
+                        } else {
+                            inline_buf.dirty = false;
+                            true
+                        }
+                    } else {
+                        false // Buffer removed by someone else
+                    }
+                };
+
+                if !can_remove {
+                    warn!(
+                        "release inline: inode={} buffer grew between check and remove, re-syncing (round {})",
+                        inode, sync_round
+                    );
+                    continue;
+                }
+
+                break;
+            }
+
+            // Remove the inline buffer (sync complete, buffer is clean)
             self.inline_buffers.remove(&inode);
             self.inline_max_sizes.remove(&inode);
 
@@ -4845,8 +4931,10 @@ impl FileSystem for PowerFsFs {
             self.open_inodes.write().unwrap().remove(&inode);
             self.cache.unpin_inode(inode);
 
-            sync_result?;
-            debug!("release inline: inode={} closed, size={}", inode, size);
+            if !sync_ok {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            debug!("release inline: inode={} closed, size={}", inode, final_size);
             return Ok(());
         }
 
