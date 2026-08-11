@@ -201,7 +201,7 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     let uid = dec.next_u32(FieldId::Uid).unwrap_or(0);
     let gid = dec.next_u32(FieldId::Gid).unwrap_or(0);
     let size = dec.next_u64(FieldId::Size).unwrap_or(0);
-    let _nlink = dec.next_u32(FieldId::Nlink).unwrap_or(1);
+    let nlink = dec.next_u32(FieldId::Nlink).unwrap_or(1);
     let mtime = dec.next_u64(FieldId::Mtime).unwrap_or(0);
     let atime = dec.next_u64(FieldId::Atime).unwrap_or(0);
     let ctime = dec.next_u64(FieldId::Ctime).unwrap_or(0);
@@ -281,6 +281,7 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         mode,
         uid,
         gid,
+        nlink,
         atime: parse_unix_time(atime).unwrap_or(default_time),
         mtime: parse_unix_time(mtime).unwrap_or(default_time),
         ctime: parse_unix_time(ctime).unwrap_or(default_time),
