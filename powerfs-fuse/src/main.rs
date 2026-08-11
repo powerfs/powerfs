@@ -156,6 +156,12 @@ fn main() {
             (String::new(), Vec::new(), fuse_cfg.filer_net_port)
         };
     let force_mount = fuse_cfg.force_mount;
+    let request_timeout_secs = if fuse_cfg.request_timeout_secs == 0 {
+        10
+    } else {
+        fuse_cfg.request_timeout_secs
+    };
+    info!("Request timeout: {}s", request_timeout_secs);
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
@@ -270,6 +276,7 @@ fn main() {
             lease_duration_ms,
             lease_renew_interval_ms,
             force_mount,
+            request_timeout_secs,
             runtime_arc.clone(),
         )
         .await
