@@ -77,6 +77,7 @@ impl ClientError {
                 | ClientError::CircuitOpen
                 | ClientError::NoShardLeader(_)
                 | ClientError::VolumeNotFound(_)
+                | ClientError::QueueFull(_)
         )
     }
 }
@@ -113,6 +114,7 @@ mod tests {
         assert!(ClientError::CircuitOpen.is_retryable());
         assert!(ClientError::NoShardLeader(1).is_retryable());
         assert!(ClientError::VolumeNotFound(1).is_retryable());
+        assert!(ClientError::QueueFull(256).is_retryable());
 
         assert!(!ClientError::Server("test".to_string()).is_retryable());
         assert!(!ClientError::UnsupportedRequest("test".to_string()).is_retryable());
