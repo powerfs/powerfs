@@ -606,6 +606,7 @@ impl MetaShardManager {
 
         if nlink > 1 {
             // Hardlink: decrement nlink, keep inode alive for remaining links.
+            let expected_nlink = nlink - 1;
             let cmd = ShardCommand::DecrementNlink { inode };
             if let Err(e) = self
                 .raft_group_manager
@@ -619,6 +620,13 @@ impl MetaShardManager {
                     shard_ino.0,
                     e
                 );
+            } else {
+                // Wait for DecrementNlink to be applied to the state machine.
+                // Without this wait, a subsequent getattr may read the stale
+                // nlink value (before decrement), causing T5.04 intermittent
+                // failures (expected nlink=1, actual nlink=2).
+                self.wait_for_nlink(shard_ino, inode, expected_nlink)
+                    .await;
             }
         } else {
             // Last link: delete the inode record. Best-effort: if this fails,
@@ -640,6 +648,33 @@ impl MetaShardManager {
         }
 
         Ok(())
+    }
+
+    /// Poll the shard store until the inode's nlink reaches `expected`, or
+    /// timeout (5 s). Same rationale as `wait_for_entry_removed`: the spawned
+    /// apply task runs asynchronously so the nlink change may not be visible
+    /// immediately after `propose()` returns.
+    async fn wait_for_nlink(&self, shard_id: ShardId, inode: u64, expected: u32) {
+        for _ in 0..100 {
+            let current = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .and_then(|s| s.get_inode(inode))
+                    .map(|info| info.nlink)
+                    .unwrap_or(0)
+            };
+            if current == expected {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        log::warn!(
+            "wait_for_nlink: timed out waiting for inode {} nlink to reach {} on shard {}",
+            inode,
+            expected,
+            shard_id.0
+        );
     }
 
     pub async fn create_directory(
