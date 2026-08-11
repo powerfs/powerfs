@@ -1512,6 +1512,45 @@ impl MetaShardManager {
         Ok(())
     }
 
+    /// Remove an extended attribute from an inode via Raft consensus.
+    /// Waits for the command to be applied before returning.
+    pub async fn remove_xattr(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        key: &str,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::RemoveXattr {
+            inode,
+            key: key.to_string(),
+        };
+
+        self.raft_group_manager
+            .propose(shard_id, cmd.serialize())
+            .await?;
+
+        // Wait for the command to be applied
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).cloned()
+        };
+        if let Some(store) = store {
+            let mut retries = 0;
+            while retries < 20 {
+                if let Some(info) = store.get_inode(inode) {
+                    if !info.extended.contains_key(key) {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                retries += 1;
+            }
+            return Err("remove_xattr timeout waiting for apply".to_string());
+        }
+
+        Ok(())
+    }
+
     /// P4: Update reliability state via Raft consensus.
     /// Called by scrubber worker after completing replica replication.
     pub async fn update_reliability(
