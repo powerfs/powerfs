@@ -713,6 +713,11 @@ impl FilerNetHandler {
                     enc.add_u64(FieldId::Atime, entry_info.atime);
                     enc.add_u64(FieldId::Ctime, entry_info.ctime);
                     enc.add_string(FieldId::Name, &entry_info.name)?;
+                    // 方案 B: 返回 inode 所在 shard_id, 客户端缓存后直接使用
+                    enc.add_u64(
+                        FieldId::ShardId,
+                        self.shard_strategy.calculate_shard(info.inode).0,
+                    );
                     return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
                 }
                 None => {
@@ -740,6 +745,11 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+                // 方案 B: 返回 inode 所在 shard_id, 客户端缓存后直接使用
+                enc.add_u64(
+                    FieldId::ShardId,
+                    self.shard_strategy.calculate_shard(info.inode).0,
+                );
 
                 // 完整 chunks 列表 + 兼容旧单 chunk 字段
                 Self::encode_chunks_fields(&mut enc, &info)?;
@@ -790,6 +800,8 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Atime, entry_info.atime);
                 enc.add_u64(FieldId::Ctime, entry_info.ctime);
                 enc.add_string(FieldId::Name, &entry_info.name)?;
+                // 方案 B: 返回 inode 所在 shard_id, 客户端缓存后直接使用
+                enc.add_u64(FieldId::ShardId, shard_id.0);
                 // 完整 chunks 列表 + 兼容旧单 chunk 字段。
                 // 修复历史 bug：此前 GetAttr 完全缺失 chunks 序列化，
                 // 导致 fuse 端 get_entry_by_inode 拿到的 chunks 恒为空，
@@ -1134,6 +1146,9 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Ino, ino);
                 enc.add_u32(FieldId::Mode, mode as u32);
                 enc.add_string(FieldId::Name, &name)?;
+                // 方案 B: 返回 inode 所在 shard_id (setattr_shard = calculate_shard(ino)),
+                // 客户端缓存后直接用于后续 setattr/getattr 等路由
+                enc.add_u64(FieldId::ShardId, setattr_shard.0);
 
                 if let Some(max_size) = inline_max {
                     // === P2.5 Inline 模式 ===
@@ -1326,6 +1341,9 @@ impl FilerNetHandler {
                 enc.add_u64(FieldId::Ctime, info.ctime);
                 enc.add_u8(FieldId::IsDir, 1);
                 enc.add_string(FieldId::Name, &name)?;
+                // 方案 B: 返回 inode 所在 shard_id (shard_id = calculate_shard(info.inode)),
+                // 客户端缓存后直接用于后续 readdir/getattr 等路由
+                enc.add_u64(FieldId::ShardId, shard_id.0);
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
@@ -1549,6 +1567,11 @@ impl FilerNetHandler {
             entry_enc.add_u64(FieldId::Mtime, entry.mtime);
             entry_enc.add_u64(FieldId::Ctime, entry.ctime);
             entry_enc.add_u32(FieldId::Nlink, entry.nlink);
+            // 方案 B: 返回每个子条目 inode 所在 shard_id, 客户端 lookup 后缓存
+            entry_enc.add_u64(
+                FieldId::ShardId,
+                self.shard_strategy.calculate_shard(entry.inode).0,
+            );
             // 完整 chunks 列表 + 兼容旧单 chunk 字段
             Self::encode_chunks_fields(&mut entry_enc, entry)?;
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
@@ -1597,6 +1620,11 @@ impl FilerNetHandler {
                 enc.add_u32(FieldId::Mode, info.mode);
                 enc.add_string(FieldId::Name, &name)?;
                 enc.add_string(FieldId::SymlinkTarget, &target)?;
+                // 方案 B: 返回 inode 所在 shard_id
+                enc.add_u64(
+                    FieldId::ShardId,
+                    self.shard_strategy.calculate_shard(info.inode).0,
+                );
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
@@ -1668,6 +1696,8 @@ impl FilerNetHandler {
             Ok(_) => {
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
+                // 方案 B: 返回 inode 所在 shard_id (inode 已存在, 路由不变)
+                enc.add_u64(FieldId::ShardId, self.shard_strategy.calculate_shard(ino).0);
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
