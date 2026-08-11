@@ -1914,6 +1914,7 @@ impl SyncFuseClientFacade {
         let name = name.to_string();
         let target = target.to_string();
         self.runtime.block_on(async move {
+            let shard_id = facade.meta_shard_client().calculate_shard_id(parent);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
                 let _ = enc.add_u64(powerfs_net::FieldId::ParentIno, parent);
@@ -1934,13 +1935,16 @@ impl SyncFuseClientFacade {
             let timeout = facade.config.request_timeout;
             let result = facade
                 .meta_shard_client
-                .submit_metadata_request_and_wait(context, parent, timeout)
+                .submit_metadata_request_and_wait(context, shard_id, timeout)
                 .await
                 .map_err(|e| format!("symlink failed: {}", e))?;
 
-            // Parse the inode from response
+            // Parse the inode from response. success_with_payload maps
+            // resp.body -> result.data and resp.data -> result.payload.
+            // The Filer puts the TLV (with Ino) in resp.body, so check
+            // result.data first, then fall back to result.payload.
             let inode = result
-                .payload
+                .data
                 .as_deref()
                 .filter(|d| !d.is_empty())
                 .and_then(|d| {
@@ -1949,7 +1953,7 @@ impl SyncFuseClientFacade {
                 })
                 .or_else(|| {
                     result
-                        .data
+                        .payload
                         .as_deref()
                         .filter(|d| !d.is_empty())
                         .and_then(|d| {
@@ -1957,7 +1961,13 @@ impl SyncFuseClientFacade {
                             dec.next_u64(powerfs_net::FieldId::Ino).ok()
                         })
                 })
-                .ok_or_else(|| "Failed to parse inode from symlink response".to_string())?;
+                .ok_or_else(|| {
+                    format!(
+                        "Failed to parse inode from symlink response (data_len={}, payload_len={})",
+                        result.data.as_ref().map(|d| d.len()).unwrap_or(0),
+                        result.payload.as_ref().map(|d| d.len()).unwrap_or(0),
+                    )
+                })?;
             Ok(inode)
         })
     }
@@ -1966,6 +1976,7 @@ impl SyncFuseClientFacade {
     pub fn readlink(&self, inode: u64) -> Result<String, String> {
         let facade = self.facade.clone();
         self.runtime.block_on(async move {
+            let shard_id = facade.meta_shard_client().calculate_shard_id(inode);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
                 let _ = enc.add_u64(powerfs_net::FieldId::Ino, inode);
@@ -1984,13 +1995,14 @@ impl SyncFuseClientFacade {
             let timeout = facade.config.request_timeout;
             let result = facade
                 .meta_shard_client
-                .submit_metadata_request_and_wait(context, inode, timeout)
+                .submit_metadata_request_and_wait(context, shard_id, timeout)
                 .await
                 .map_err(|e| format!("readlink failed: {}", e))?;
 
-            // Parse the symlink target from response
+            // Parse the symlink target from response. success_with_payload
+            // maps resp.body -> result.data, resp.data -> result.payload.
             let target = result
-                .payload
+                .data
                 .as_deref()
                 .filter(|d| !d.is_empty())
                 .map(|d| {
@@ -1999,7 +2011,7 @@ impl SyncFuseClientFacade {
                         .unwrap_or_default()
                 })
                 .or_else(|| {
-                    result.data.as_deref().filter(|d| !d.is_empty()).map(|d| {
+                    result.payload.as_deref().filter(|d| !d.is_empty()).map(|d| {
                         let mut dec = powerfs_net::TlvDecoder::new(d);
                         dec.next_string(powerfs_net::FieldId::SymlinkTarget)
                             .unwrap_or_default()
@@ -2016,6 +2028,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let name = name.to_string();
         self.runtime.block_on(async move {
+            let shard_id = facade.meta_shard_client().calculate_shard_id(newparent);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
                 let _ = enc.add_u64(powerfs_net::FieldId::Ino, inode);
@@ -2036,7 +2049,7 @@ impl SyncFuseClientFacade {
             let timeout = facade.config.request_timeout;
             let _result = facade
                 .meta_shard_client
-                .submit_metadata_request_and_wait(context, newparent, timeout)
+                .submit_metadata_request_and_wait(context, shard_id, timeout)
                 .await
                 .map_err(|e| format!("link failed: {}", e))?;
 
