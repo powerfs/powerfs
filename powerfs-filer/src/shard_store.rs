@@ -628,8 +628,19 @@ impl ShardStore {
                 }
             }
             ShardCommand::IncrementNlink { inode } => {
+                log::info!(
+                    "Shard {} apply IncrementNlink for inode {}",
+                    self.shard_id.0,
+                    inode
+                );
                 if let Some(mut info) = self.get_inode(inode) {
                     info.nlink = info.nlink.saturating_add(1);
+                    log::info!(
+                        "Shard {} IncrementNlink: inode {} nlink -> {}",
+                        self.shard_id.0,
+                        inode,
+                        info.nlink
+                    );
                     if let Err(e) = self.update_inode(info) {
                         log::error!(
                             "Shard {} apply IncrementNlink failed for inode {}: {}",
