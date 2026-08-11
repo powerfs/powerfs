@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -290,6 +291,11 @@ pub struct MetaShardClient {
     /// all FUSE clients share client_id=0 and notifications go to the last
     /// connected client instead of the subscriber.
     client_id: u64,
+    /// Cache epoch — incremented on Filer leader change / reconnect.
+    /// FUSE layer compares this with its last-seen epoch to detect when
+    /// the cache may have missed Invalidate notifications (inspired by
+    /// JuiceFS redisCache.onInvalidateConnect which Purges all caches).
+    cache_epoch: Arc<AtomicU64>,
 }
 
 impl MetaShardClient {
@@ -321,6 +327,7 @@ impl MetaShardClient {
             rpc_pool: Arc::new(Mutex::new(None)),
             notification_handler: Arc::new(std::sync::RwLock::new(None)),
             client_id,
+            cache_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -334,6 +341,25 @@ impl MetaShardClient {
     /// only stores the handler in the struct field for API compatibility.
     pub fn set_notification_handler(&self, handler: Arc<dyn NotificationHandler + Send + Sync>) {
         *self.notification_handler.write().unwrap() = Some(handler);
+    }
+
+    /// Returns the current cache epoch. The FUSE layer compares this with
+    /// its last-seen value to detect Filer leader changes / reconnects that
+    /// may have missed Invalidate notifications.
+    pub fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    /// Increment the cache epoch to signal that the cache may be stale
+    /// (Filer leader changed or connection was lost). Called internally
+    /// by `handle_leader_change`.
+    fn bump_cache_epoch(&self) {
+        let prev = self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+        log::warn!(
+            "MetaShardClient: cache_epoch bumped {} -> {} (Filer leader change/reconnect)",
+            prev,
+            prev + 1
+        );
     }
 
     /// 获取或创建到指定 filer 地址的连接
@@ -760,6 +786,11 @@ impl MetaShardClient {
             shard_id,
             new_leader
         );
+
+        // Bump cache epoch so the FUSE layer can invalidate its MetadataCache
+        // on the next access. This handles missed Invalidate notifications
+        // during the leader change window (inspired by JuiceFS reconnect Purge).
+        self.bump_cache_epoch();
 
         // 步骤 1: 暂停客户端，停止队列消费
         *self.state.lock().unwrap() = MetaShardClientState::Suspended;
@@ -1349,12 +1380,7 @@ impl MetaShardClient {
     }
 
     /// Remove an extended attribute from an inode (persisted via Raft).
-    pub async fn remove_xattr(
-        &self,
-        shard_id: u64,
-        inode: u64,
-        key: &str,
-    ) -> Result<(), String> {
+    pub async fn remove_xattr(&self, shard_id: u64, inode: u64, key: &str) -> Result<(), String> {
         use powerfs_net::serialize::TlvEncoder;
         use powerfs_net::FieldId;
 
@@ -1372,11 +1398,7 @@ impl MetaShardClient {
 
     /// List all extended attribute keys on an inode.
     /// Returns a list of key strings. Empty list if no xattrs.
-    pub async fn list_xattr(
-        &self,
-        shard_id: u64,
-        inode: u64,
-    ) -> Result<Vec<String>, String> {
+    pub async fn list_xattr(&self, shard_id: u64, inode: u64) -> Result<Vec<String>, String> {
         use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
         use powerfs_net::FieldId;
 

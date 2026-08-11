@@ -394,6 +394,15 @@ impl MetadataCache {
         self.pinned_inodes.read().unwrap().contains_key(&inode)
     }
 
+    /// Get the EntryState of a cached inode without TTL check.
+    /// Returns None if the inode is not in the cache.
+    /// Used by InvalidateHandler to decide whether to skip invalidation
+    /// (Dirty/Flushing entries have local authoritative data).
+    pub fn get_entry_state(&self, inode: u64) -> Option<EntryState> {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).map(|e| e.state)
+    }
+
     /// Get path by walking up parent chain
     pub fn get_path_by_parent_chain(&self, inode: u64) -> Option<String> {
         if inode == 1 {
@@ -707,6 +716,46 @@ impl MetadataCache {
         dir_cache.remove(&parent_inode);
     }
 
+    /// Mark all cached entries as Stale. Called when Filer reconnects or
+    /// leader changes, to handle potentially missed Invalidate notifications
+    /// (inspired by JuiceFS redisCache.onInvalidateConnect which Purges all
+    /// caches on reconnect).
+    ///
+    /// Does NOT delete entries — entries with local authoritative data
+    /// (Dirty/Flushing) are preserved and will be synced normally.
+    /// Non-dirty entries are marked Stale so the next access fetches fresh
+    /// data from the Filer.
+    pub fn invalidate_all(&self) {
+        let mut cache = self.inode_cache.write().unwrap();
+        let mut invalidated = 0u32;
+        let mut preserved = 0u32;
+        for (_, entry) in cache.iter_mut() {
+            // Dirty/Flushing entries have local authoritative data that
+            // must not be invalidated — they will be synced via flusher.
+            if entry.state == EntryState::Dirty || entry.state == EntryState::Flushing {
+                preserved += 1;
+                continue;
+            }
+            // Force TTL expiry by setting cached_at far in the past.
+            // get_inode() will return None, triggering a fresh Filer fetch.
+            entry.cached_at = Instant::now() - self.metadata_ttl * 2;
+            entry.try_transition(EntryState::Stale);
+            invalidated += 1;
+        }
+        drop(cache);
+
+        // Clear dir_cache — directory listings are no longer trustworthy
+        let dir_count = self.dir_cache.read().unwrap().len();
+        self.dir_cache.write().unwrap().clear();
+
+        log::warn!(
+            "MetadataCache: invalidate_all — {} entries marked Stale, {} Dirty/Flushing preserved, {} dir_cache entries cleared",
+            invalidated,
+            preserved,
+            dir_count
+        );
+    }
+
     /// Get directory listing (returns cached if fresh, None if needs refresh)
     pub fn get_dir_listing(&self, parent_inode: u64) -> Option<Vec<(u64, String, bool)>> {
         let dir_cache = self.dir_cache.read().unwrap();
@@ -948,83 +997,31 @@ impl MetadataCache {
         }
     }
 
-    /// List children of a directory from cache (supports hard links via path_map)
+    /// List children of a directory from cache by scanning inode_cache
+    /// parent field. Supports hard links (same inode, different names).
     pub fn list_children(&self, parent_inode: u64) -> Vec<(u64, String, bool)> {
-        let parent_path = match self.inode_to_path(parent_inode) {
-            Some(p) => p,
-            None => {
-                // Fallback: use inode_cache only
-                let cache = self.inode_cache.read().unwrap();
-                let mut children = Vec::new();
-                for (_, entry) in cache.iter() {
-                    if entry.parent == parent_inode && entry.inode != parent_inode {
-                        children.push((entry.inode, entry.name.clone(), entry.is_dir));
-                    }
-                }
-                return children;
-            }
-        };
+        // Scan inode_cache directly by parent field, bypassing path_map.
+        // path_map is unreliable for child enumeration because insert()
+        // builds paths by walking the parent chain, which can truncate if
+        // an ancestor is missing from cache. This caused cp -prf to miss
+        // children after large directory copies (path_map had stale/truncated
+        // paths, so the prefix scan skipped valid entries).
+        //
+        // inode_cache is the authoritative source: every cached entry has a
+        // correct `parent` field set at insert time. Scanning by parent is
+        // O(n) over the cache but avoids all path-construction bugs.
+        // Use peek() (not get()) to bypass TTL — entries physically present
+        // in the cache have correct is_dir regardless of TTL expiry.
+        let cache = self.inode_cache.read().unwrap();
+        let children: Vec<(u64, String, bool)> = cache
+            .iter()
+            .filter(|(_, e)| e.parent == parent_inode && e.inode != parent_inode)
+            .map(|(_, e)| (e.inode, e.name.clone(), e.is_dir))
+            .collect();
 
-        let path_map = self.path_map.read().unwrap();
-        // Acquire inode_cache read lock once for is_dir lookups.
-        // Use direct cache access (not get_inode) to bypass TTL — entries
-        // physically present in inode_cache have correct is_dir regardless
-        // of TTL expiry. Using get_inode here causes directories to be
-        // misreported as files when their cache entries expire (TTL=2s),
-        // breaking find/cp -prf recursion after large directory copies.
-        let inode_cache = self.inode_cache.read().unwrap();
-        let mut children = Vec::new();
-
-        let prefix = if parent_path == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/", parent_path)
-        };
-
-        // Collect all entries from path_map that are direct children
-        // Each path represents a separate directory entry, even if they point to the same inode (hard links)
-        for (path, ino) in path_map.iter() {
-            if path.starts_with(&prefix) && *ino != parent_inode {
-                // Check if it's a direct child (no additional slashes beyond the prefix)
-                let relative = &path[prefix.len()..];
-                if !relative.is_empty() && !relative.contains('/') {
-                    // Get is_dir from inode_cache directly (no TTL check, no LRU touch)
-                    let is_dir = inode_cache.peek(ino).map(|e| e.is_dir).unwrap_or(false);
-                    children.push((*ino, relative.to_string(), is_dir));
-                }
-            }
-        }
-        drop(path_map);
-
-        // Also check inode_cache for any entries that might not be in path_map
-        // Use a set of (inode, name) pairs to avoid duplicates, but allow hard links with different names
-        let mut seen_pairs = std::collections::HashSet::new();
-        for (_, entry) in inode_cache.iter() {
-            if entry.parent == parent_inode && entry.inode != parent_inode {
-                let pair = (entry.inode, entry.name.clone());
-                if seen_pairs.insert(pair) {
-                    // Check if this entry is already in children.
-                    // If it is but has wrong is_dir (from path_map scan with
-                    // expired get_inode), update it with the correct value.
-                    let existing = children
-                        .iter_mut()
-                        .find(|(ino, name, _)| *ino == entry.inode && *name == entry.name);
-                    if let Some(existing) = existing {
-                        existing.2 = entry.is_dir;
-                    } else {
-                        children.push((entry.inode, entry.name.clone(), entry.is_dir));
-                    }
-                }
-            }
-        }
-
-        drop(inode_cache);
-
-        // Debug logging
         log::debug!(
-            "list_children(parent_inode={}, parent_path={}) returned {} children: {:?}",
+            "list_children(parent_inode={}) returned {} children: {:?}",
             parent_inode,
-            parent_path,
             children.len(),
             children
                 .iter()
