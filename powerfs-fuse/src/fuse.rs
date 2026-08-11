@@ -2404,11 +2404,11 @@ impl FileSystem for PowerFsFs {
                 state: EntryState::default(),
                 hold: HoldState::default(),
             };
-            // CRITICAL: 同 Flat 路径, pin 必须在 insert 之前, 防止 Filer
-            // Invalidate 在 insert→pin 之间到达导致 entry 被驱逐。
+            // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
+            // The old pattern (pin_inode before insert) was a no-op when the
+            // inode was not yet in the cache (entry.hold is authoritative).
             self.open_inodes.write().unwrap().insert(inode);
-            self.cache.pin_inode(inode);
-            self.cache.insert(entry.clone());
+            self.cache.insert_pinned(entry.clone());
             debug!("create: inline mode, inode={}, dir={}", inode, parent);
             return Ok((
                 self.create_fuse_entry(&entry),
@@ -2476,8 +2476,7 @@ impl FileSystem for PowerFsFs {
                 hold: HoldState::default(),
             };
             self.open_inodes.write().unwrap().insert(inode);
-            self.cache.pin_inode(inode);
-            self.cache.insert(entry.clone());
+            self.cache.insert_pinned(entry.clone());
             debug!("create: stripe mode, inode={}, dir={}", inode, parent);
             return Ok((
                 self.create_fuse_entry(&entry),
@@ -2558,15 +2557,13 @@ impl FileSystem for PowerFsFs {
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
         // The Filer pushes an Invalidate after the create RPC commits, and
-        // the InvalidateHandler (running in a separate thread) can process
-        // it between insert() and pin_inode(). If the entry is inserted but
-        // not pinned when the Invalidate arrives, the handler evicts it
-        // (is_pinned returns false). This causes sync_size_chunks_on_close
-        // to find an empty cache → skip metadata sync → data loss.
-        // Pinning before insert makes the handler skip the invalidation.
+        // Phase 3: use insert_pinned to atomically set hold=Pinned and insert.
+        // The old pattern (pin_inode before insert) was a no-op because the
+        // inode was not yet in the cache (entry.hold is authoritative, not
+        // pinned_inodes). insert_pinned sets hold on the entry before insert,
+        // so InvalidateHandler skips the entry from the moment it enters cache.
         self.open_inodes.write().unwrap().insert(inode);
-        self.cache.pin_inode(inode);
-        self.cache.insert(entry.clone());
+        self.cache.insert_pinned(entry.clone());
         debug!("create: RPC done, inode={}, dir={}", inode, parent);
 
         Ok((
@@ -2751,11 +2748,11 @@ impl FileSystem for PowerFsFs {
                         debug!("open: filer entry is directory, returning EISDIR");
                         return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
                     }
-                    // Pin before insert: same self-invalidation race protection.
+                    // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
+                    // pin_inode() is a no-op when the inode is not in the cache.
                     self.open_inodes.write().unwrap().insert(inode);
-                    self.cache.pin_inode(inode);
                     let cached = self.entry_to_cached(p, &filer_entry);
-                    self.cache.insert(cached);
+                    self.cache.insert_pinned(cached);
                     // Clear ChunkCache: same cross-client visibility guarantee,
                     // but only if no dirty chunks (see cache-hit branch above).
                     if !self.chunk_cache.has_dirty_chunks(inode) {
