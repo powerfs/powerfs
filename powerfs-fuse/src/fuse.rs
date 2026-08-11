@@ -5612,7 +5612,12 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("setxattr: inode={}, name={}", inode, name_str);
 
-        if self.cache.get_inode(inode).is_none() {
+        // Use peek_inode (bypasses TTL) instead of get_inode: the entry may
+        // be TTL-expired but still physically present in the cache. cp -prf
+        // sets xattrs (system.posix_acl_access) on files whose cache entries
+        // were populated seconds ago and have since crossed metadata_ttl.
+        // Returning ENOENT here breaks "cp: preserving permissions".
+        if self.cache.peek_inode(inode).is_none() {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
@@ -5831,7 +5836,8 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("removexattr: inode={}, name={}", inode, name_str);
 
-        if self.cache.get_inode(inode).is_none() {
+        // Use peek_inode (bypasses TTL) — see setxattr for rationale.
+        if self.cache.peek_inode(inode).is_none() {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
