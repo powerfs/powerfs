@@ -119,7 +119,7 @@ impl CachedEntry {
     pub fn try_transition(&mut self, target: EntryState) -> bool {
         use EntryState::*;
         let allowed = match (self.state, target) {
-            (New, Clean) | (New, Dirty) => true,
+            (New, Clean) | (New, Dirty) | (New, Stale) | (New, Tombstone) => true,
             (Clean, Dirty) | (Clean, Stale) | (Clean, Tombstone) => true,
             (Dirty, Flushing) | (Dirty, Tombstone) => true,
             (Flushing, Clean) | (Flushing, Dirty) => true,
@@ -297,29 +297,60 @@ impl MetadataCache {
         self.next_inode.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Get an entry by inode. Returns None if the inode is not cached or if
-    /// the entry has exceeded the metadata TTL (used as a fallback when
-    /// Invalidation notifications are lost).
+    /// Get an entry by inode. Returns None if the inode is not cached, if
+    /// the entry is in Stale/Tombstone state, or if the TTL safety net has
+    /// expired (fallback when Invalidation notifications are lost).
+    ///
+    /// Phase 3: the state machine is authoritative. The check order is:
+    ///   1. Stale/Tombstone → None (explicit state, set by InvalidateHandler
+    ///      or unlink/rmdir)
+    ///   2. Dirty/Flushing → Some (local authoritative data, TTL bypassed)
+    ///   3. Pinned → Some (open file with lease, TTL bypassed)
+    ///   4. TTL expired (Clean/New only) → mark Stale, return None
+    ///
+    /// The TTL check is a safety net for lost Invalidate notifications, not
+    /// the primary invalidation mechanism. InvalidateHandler sets Stale
+    /// directly when the Filer pushes a notification.
     pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
         let mut cache = self.inode_cache.write().unwrap();
         let entry = cache.get(&inode).cloned()?;
-        // Phase 3: entry.hold is the authoritative source for pin status.
-        // Pinned inodes (open files with lease) skip TTL expiry to prevent
-        // cache miss during slow writes that exceed metadata_ttl.
-        let is_pinned = entry.hold.is_pinned();
-        // Phase 3: Dirty/Flushing entries have local authoritative data
-        // and must NOT be expired by TTL, even if cached_at is old.
-        // This is the core state machine rule: Dirty/Flushing → Stale is
-        // forbidden.
+
+        // 1. Stale/Tombstone: state machine says "needs refresh" or "deleted".
+        //    Return None to trigger a fresh Filer fetch on the next access.
+        //    This is the authoritative check — even if cached_at is fresh,
+        //    a Stale entry must not be served (e.g., root inode marked Stale
+        //    by InvalidateHandler, or an entry invalidated between TTL checks).
+        if entry.state == EntryState::Stale || entry.state == EntryState::Tombstone {
+            debug!(
+                "MetadataCache: inode {} is {:?} (state machine), returning None to trigger refresh",
+                inode, entry.state
+            );
+            return None;
+        }
+
+        // 2. Dirty/Flushing: local authoritative data, TTL must NOT expire.
+        //    Core state machine rule: Dirty/Flushing → Stale is forbidden.
         let has_authoritative_data =
             entry.state == EntryState::Dirty || entry.state == EntryState::Flushing;
-        if !is_pinned && !has_authoritative_data && entry.cached_at.elapsed() > self.metadata_ttl {
-            // Entry is Clean/New and TTL expired — mark Stale.
+        if has_authoritative_data {
+            return Some(entry);
+        }
+
+        // 3. Pinned (open file with lease): TTL bypassed to prevent cache
+        //    miss during slow writes that exceed metadata_ttl.
+        if entry.hold.is_pinned() {
+            return Some(entry);
+        }
+
+        // 4. TTL safety net: Clean/New entries that haven't been refreshed
+        //    within metadata_ttl are marked Stale. This catches lost
+        //    Invalidate notifications (network issues, Filer restart).
+        if entry.cached_at.elapsed() > self.metadata_ttl {
             if let Some(e) = cache.get_mut(&inode) {
                 e.try_transition(EntryState::Stale);
             }
             debug!(
-                "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}, state={:?}), treating as stale",
+                "MetadataCache: inode {} TTL expired (age={:?} > ttl={:?}, state={:?}), marking Stale",
                 inode,
                 entry.cached_at.elapsed(),
                 self.metadata_ttl,
@@ -2869,5 +2900,161 @@ mod chunk_cache_tests {
             cache.is_pinned(ino_b),
             "pinned entry should still be marked as pinned after re-insertion"
         );
+    }
+
+    #[test]
+    fn test_stale_state_returns_none_regardless_of_ttl() {
+        // Phase 3: state machine is authoritative. A Stale entry must return
+        // None from get_inode even if cached_at is fresh (TTL not expired).
+        // This is the key fix — previously, mark_stale() set the state but
+        // get_inode only checked TTL, so Stale entries were still served
+        // until TTL expired.
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_secs(60));
+
+        let make_entry = |ino: u64, name: &str| CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        };
+
+        let ino = cache.allocate_inode();
+        cache.insert(make_entry(ino, "stale-test"));
+        assert!(cache.get_inode(ino).is_some());
+
+        // Mark Stale via mark_stale (used by InvalidateHandler for root inode)
+        cache.mark_stale(ino);
+
+        // get_inode must return None even though cached_at is fresh (60s TTL)
+        assert!(
+            cache.get_inode(ino).is_none(),
+            "Stale entry must return None regardless of TTL"
+        );
+
+        // Entry is still physically in cache (peek bypasses state check)
+        assert!(
+            cache.peek_inode(ino).is_some(),
+            "Stale entry should still be physically in cache"
+        );
+    }
+
+    #[test]
+    fn test_dirty_state_bypasses_ttl() {
+        // Phase 3: Dirty entries have local authoritative data and must NOT
+        // be expired by TTL, even if cached_at is very old.
+        let cache = MetadataCache::with_capacity_and_ttl(100, Duration::from_millis(1));
+
+        let make_entry = |ino: u64, name: &str| CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        };
+
+        let ino = cache.allocate_inode();
+        cache.insert(make_entry(ino, "dirty-test"));
+
+        // Mark as Dirty (has unsynced local modifications)
+        cache.mark_dirty(ino);
+
+        // Wait for TTL to expire (1ms)
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Dirty entry must still be returned despite TTL expiry
+        assert!(
+            cache.get_inode(ino).is_some(),
+            "Dirty entry must bypass TTL expiry"
+        );
+    }
+
+    #[test]
+    fn test_new_to_stale_transition_allowed() {
+        // Phase 3: New→Stale is now allowed (added to transition matrix).
+        // This is needed for invalidate_all() and the TTL safety net to
+        // correctly mark unpopulated New entries as Stale.
+        let mut entry = CachedEntry {
+            inode: 42,
+            parent: 1,
+            name: "new-entry".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::New,
+            hold: HoldState::default(),
+        };
+
+        assert!(
+            entry.try_transition(EntryState::Stale),
+            "New→Stale should be allowed"
+        );
+        assert_eq!(entry.state, EntryState::Stale);
     }
 }
