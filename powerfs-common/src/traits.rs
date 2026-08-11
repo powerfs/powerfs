@@ -76,6 +76,7 @@ pub struct EntryAttributes {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    pub nlink: u32,
     pub atime: DateTime<Utc>,
     pub mtime: DateTime<Utc>,
     pub ctime: DateTime<Utc>,
