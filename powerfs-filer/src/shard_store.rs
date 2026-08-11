@@ -560,6 +560,9 @@ impl ShardStore {
             ShardCommand::SetXattr { inode, key, value } => {
                 self.set_xattr(inode, key, value);
             }
+            ShardCommand::RemoveXattr { inode, key } => {
+                self.remove_xattr(inode, key);
+            }
             ShardCommand::UpdateReliability {
                 inode,
                 reliability,
@@ -2103,6 +2106,39 @@ impl ShardStore {
             }
         };
         info.extended.insert(key, value);
+        info.mtime = Self::current_time();
+        if let Ok(data) = serde_json::to_vec(&info) {
+            let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
+        }
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
+    }
+
+    /// Remove an extended attribute from an inode (persisted to RocksDB).
+    /// Called from apply_command when ShardCommand::RemoveXattr is committed.
+    pub fn remove_xattr(&self, inode: u64, key: String) {
+        let cf_inodes = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {}: CF_INODES not found for remove_xattr",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        let mut info = match self.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "Shard {} remove_xattr: inode {} not found",
+                    self.shard_id.0,
+                    inode
+                );
+                return;
+            }
+        };
+        info.extended.remove(&key);
         info.mtime = Self::current_time();
         if let Ok(data) = serde_json::to_vec(&info) {
             let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);

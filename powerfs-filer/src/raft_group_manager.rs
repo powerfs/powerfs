@@ -161,6 +161,11 @@ pub enum ShardCommand {
         key: String,
         value: Vec<u8>,
     },
+    /// Remove an extended attribute from an inode (persisted via Raft).
+    RemoveXattr {
+        inode: u64,
+        key: String,
+    },
     /// P4: Update reliability state after scrubber completes replication.
     /// Sets reliability = Replicated{count}, state = Replicated, and stores
     /// replica_chunks (the secondary copy locations).
