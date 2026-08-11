@@ -1788,6 +1788,13 @@ impl SyncFuseClientFacade {
     /// Batch write multiple chunks in parallel using tokio::join_all.
     /// Each chunk is sent concurrently (up to the runtime's thread pool),
     /// reducing total flush time from N×latency to ~1×latency.
+    ///
+    /// Each write is wrapped in `tokio::time::timeout` using the configured
+    /// `request_timeout`. This prevents close/release from hanging indefinitely
+    /// when the Volume Server data channel connection stalls (ISSUE-001).
+    /// On timeout, the error is returned to `flush_dirty_chunks_impl`, which
+    /// re-marks the chunk dirty for background-flusher retry, and release
+    /// returns EIO so the FUSE operation completes (no D-state hang).
     pub fn write_blob_batch_with_lease(
         &self,
         requests: Vec<WriteBlobRequest>,
@@ -1795,6 +1802,7 @@ impl SyncFuseClientFacade {
     ) -> Vec<Result<(), String>> {
         let facade = self.facade.clone();
         let lease_owned = lease_token.map(|s| s.to_string());
+        let timeout = self.facade.config.request_timeout;
         self.runtime.block_on(async move {
             let futures: Vec<_> = requests
                 .into_iter()
@@ -1803,18 +1811,28 @@ impl SyncFuseClientFacade {
                     let lease_ref = lease_owned.as_deref();
                     async move {
                         let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
-                        provider
-                            .write_blob_with_lease(
-                                req.volume_id,
-                                req.file_key,
-                                req.inode,
-                                req.offset,
-                                req.size,
-                                &req.data,
-                                lease_ref,
-                            )
-                            .await
-                            .map_err(pfe_to_string)
+                        let write_fut = provider.write_blob_with_lease(
+                            req.volume_id,
+                            req.file_key,
+                            req.inode,
+                            req.offset,
+                            req.size,
+                            &req.data,
+                            lease_ref,
+                        );
+                        match tokio::time::timeout(timeout, write_fut).await {
+                            Ok(result) => result.map_err(pfe_to_string),
+                            Err(_) => {
+                                log::error!(
+                                    "write_blob timed out after {:?} (volume={} inode={} offset={})",
+                                    timeout, req.volume_id, req.inode, req.offset
+                                );
+                                Err(format!(
+                                    "write_blob timed out after {:?} (volume={} inode={})",
+                                    timeout, req.volume_id, req.inode
+                                ))
+                            }
+                        }
                     }
                 })
                 .collect();
