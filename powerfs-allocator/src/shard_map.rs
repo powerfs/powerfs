@@ -66,9 +66,16 @@ pub struct ShardMap {
 impl ShardMap {
     /// Create an initial ShardMap equivalent to the old modulo-based routing.
     ///
-    /// Divides `[0, u64::MAX]` into `shard_count` equal ranges, one per shard.
-    /// This is the zero-migration migration path: behavior is identical to
-    /// `inode / inode_per_shard % shard_count`.
+    /// Divides the inode space into `shard_count` equal ranges of 1M each,
+    /// one per shard. The last shard does NOT extend to u64::MAX — instead,
+    /// it also gets a 1M range. This keeps inode numbers small and
+    /// predictable, which is important for:
+    /// - Debugging (human-readable inode numbers)
+    /// - Tool compatibility (some tools don't handle 18-digit inode numbers)
+    /// - Per-node allocator offsets (large ranges produce huge offsets)
+    ///
+    /// Inodes outside [0, shard_count * 1M) are never allocated and will
+    /// route to the last shard (binary search falls through).
     pub fn from_shard_count(shard_count: u64) -> Self {
         let inode_per_shard = u64::MAX
             .checked_div(shard_count)
@@ -78,11 +85,10 @@ impl ShardMap {
         let mut entries = Vec::with_capacity(shard_count as usize);
         let mut start = 0u64;
         for i in 0..shard_count {
-            let end = if i == shard_count - 1 {
-                u64::MAX
-            } else {
-                start.saturating_add(inode_per_shard)
-            };
+            // All shards get equal 1M ranges. The last shard does NOT extend
+            // to u64::MAX — this prevents absurdly large inode numbers from
+            // per-node offsets in the last shard's enormous range.
+            let end = start.saturating_add(inode_per_shard);
             entries.push(ShardMapEntry {
                 range_start: start,
                 range_end: end,
@@ -526,7 +532,7 @@ mod tests {
 
         let (start, end) = map.shard_range(ShardId(2)).unwrap();
         assert_eq!(start, 2_000_000);
-        assert_eq!(end, u64::MAX);
+        assert_eq!(end, 3_000_000); // capped at 1M, not u64::MAX
     }
 
     #[test]

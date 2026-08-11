@@ -1731,6 +1731,18 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
     // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
     attr.replica_chunks = parse_replica_chunks_from_body(body);
 
+    // Symlink: extract target from inline_data. The Filer encodes the symlink
+    // target as InlineData in the FileLayout (see encode_chunks_fields). Without
+    // this, lookup/getattr after a cross-shard rename creates a cache entry with
+    // symlink_target=None, causing readlink to return empty.
+    if attr.file_type == libc::DT_LNK {
+        if let Some(data) = &attr.inline_data {
+            if let Ok(target) = std::str::from_utf8(data) {
+                attr.symlink_target = Some(target.to_string());
+            }
+        }
+    }
+
     attr
 }
 
