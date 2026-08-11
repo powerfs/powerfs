@@ -733,6 +733,37 @@ pub const STATUS_ERR_REDIRECT: u16 = 11;
 /// established value (unless the client passes Force=1).
 pub const STATUS_ERR_BAD_REQUEST: u16 = 12;
 
+/// Returns `true` if the status code represents a **client-level error**
+/// (e.g., ENOENT, EEXIST, EACCES) rather than a server failure.
+///
+/// Client errors are normal responses — the server is healthy and processed
+/// the request correctly, but the request itself was invalid (file not found,
+/// permission denied, etc.). These must NOT be counted toward the
+/// CircuitBreaker failure counter, otherwise a burst of ENOENT responses
+/// (e.g., concurrent `ls` on a directory with many missing files) would
+/// incorrectly trip the breaker and block all traffic.
+///
+/// Server errors that SHOULD count toward the breaker:
+/// - `STATUS_ERR_IO` (4) — disk/I/O failure on the server
+/// - `STATUS_ERR_NO_SPACE` (8) — server disk full
+/// - `STATUS_ERR_SERVER_ERROR` (10) — internal server error (panic, bug)
+///
+/// `STATUS_OK` (0) and `STATUS_ERR_REDIRECT` (11) are handled separately
+/// and are not classified as either client or server errors.
+pub fn is_client_error(status: u16) -> bool {
+    matches!(
+        status,
+        STATUS_ERR_NOT_FOUND
+            | STATUS_ERR_ALREADY_EXISTS
+            | STATUS_ERR_PERMISSION_DENIED
+            | STATUS_ERR_INVALID_ARG
+            | STATUS_ERR_NOT_DIR
+            | STATUS_ERR_IS_DIR
+            | STATUS_ERR_BAD_FD
+            | STATUS_ERR_BAD_REQUEST
+    )
+}
+
 // ============================================================================
 // TLV Field IDs
 // ============================================================================
