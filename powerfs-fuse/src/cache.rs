@@ -403,6 +403,36 @@ impl MetadataCache {
         cache.peek(&inode).map(|e| e.state)
     }
 
+    /// Mark an inode as Dirty (has unsynced local modifications).
+    /// Called by write/setattr paths after modifying local data/metadata.
+    pub fn mark_dirty(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Dirty);
+        }
+    }
+
+    /// Mark an inode as Flushing (currently syncing to Filer/Volume).
+    /// Called by flusher before starting RPC.
+    pub fn mark_flushing(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Flushing);
+        }
+    }
+
+    /// Mark an inode as Clean (synced, no dirty data).
+    /// Called by flusher after successful RPC completion.
+    pub fn mark_clean(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            // Flushing→Clean is allowed; also update cached_at to prevent
+            // immediate TTL expiry after sync.
+            e.try_transition(EntryState::Clean);
+            e.cached_at = Instant::now();
+        }
+    }
+
     /// Get path by walking up parent chain
     pub fn get_path_by_parent_chain(&self, inode: u64) -> Option<String> {
         if inode == 1 {
