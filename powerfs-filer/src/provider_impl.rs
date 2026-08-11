@@ -12,6 +12,7 @@ fn inode_info_to_entry(info: &crate::shard_store::InodeInfo) -> Entry {
         mode: info.mode,
         uid: info.uid,
         gid: info.gid,
+        nlink: info.nlink,
         atime: chrono::DateTime::from_timestamp(info.atime as i64, 0)
             .unwrap_or_else(chrono::Utc::now),
         mtime: chrono::DateTime::from_timestamp(info.mtime as i64, 0)

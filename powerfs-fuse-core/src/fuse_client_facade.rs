@@ -33,6 +33,7 @@ pub(crate) fn proto_entry_to_traits(entry: &ProtoEntry) -> powerfs_common::trait
             mode: a.mode,
             uid: a.uid,
             gid: a.gid,
+            nlink: a.nlink,
             atime: chrono::DateTime::from_timestamp(a.atime as i64, 0)
                 .unwrap_or_else(chrono::Utc::now),
             mtime: chrono::DateTime::from_timestamp(a.mtime as i64, 0)
@@ -92,7 +93,7 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
     let attributes = entry.attributes.as_ref().map(|a| ProtoFuseAttributes {
         ino: a.ino,
         mode: a.mode,
-        nlink: 1,
+        nlink: a.nlink,
         uid: a.uid,
         gid: a.gid,
         rdev: 0,
