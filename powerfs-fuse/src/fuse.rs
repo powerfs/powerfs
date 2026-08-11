@@ -859,6 +859,10 @@ impl PowerFsFs {
             }
 
             if had_error {
+                // EntryState: Flushing→Dirty on failure (Phase 4). Chunks
+                // were already re-marked dirty per-chunk above; transition
+                // the entry state back so it's not stuck in Flushing.
+                self.cache.mark_dirty(inode);
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
             // EntryState: Flushing→Clean after successful stripe flush RPC.
@@ -877,6 +881,8 @@ impl PowerFsFs {
                 for (_, idx) in &dirty {
                     self.mark_dirty(inode, *idx);
                 }
+                // EntryState: Flushing→Dirty on failure (Phase 4).
+                self.cache.mark_dirty(inode);
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         };
@@ -888,6 +894,8 @@ impl PowerFsFs {
                 for (_, idx) in &dirty {
                     self.mark_dirty(inode, *idx);
                 }
+                // EntryState: Flushing→Dirty on failure (Phase 4).
+                self.cache.mark_dirty(inode);
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         };
@@ -999,6 +1007,10 @@ impl PowerFsFs {
         }
 
         if had_error {
+            // EntryState: Flushing→Dirty on failure (Phase 4). Chunks
+            // were already re-marked dirty per-chunk above; transition
+            // the entry state back so it's not stuck in Flushing.
+            self.cache.mark_dirty(inode);
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
