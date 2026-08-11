@@ -54,6 +54,11 @@ pub struct MetadataAttr {
     /// P4: 副本 chunk 列表 (来自 GETATTR/LOOKUP 响应的 FieldId::ReplicaChunks).
     /// 读路径 failover: 主 volume 不可用时从副本 volume 读取相同 needle_id.
     pub replica_chunks: Vec<powerfs_layout::encoding::ChunkRef>,
+    /// 方案 B (S4): Filer 在元数据响应中返回的权威 shard_id。
+    /// 客户端缓存后直接使用, 免去 ShardMap::route(inode) 计算。
+    /// None 表示 Filer 未携带 (旧版本或 mkdir 等简单响应),
+    /// 客户端回退到 ShardMap::route(inode)。
+    pub shard_id: Option<u64>,
 }
 
 impl MetadataAttr {

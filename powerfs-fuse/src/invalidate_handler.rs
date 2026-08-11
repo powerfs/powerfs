@@ -277,6 +277,7 @@ mod tests {
             placement: None,
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
+            shard_id: None,
             cached_at: std::time::Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),

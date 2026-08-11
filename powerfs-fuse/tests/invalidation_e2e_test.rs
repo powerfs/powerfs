@@ -45,6 +45,7 @@ fn make_entry(inode: u64, parent: u64, name: &str, generation: u64) -> CachedEnt
         placement: None,
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
+        shard_id: None,
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),

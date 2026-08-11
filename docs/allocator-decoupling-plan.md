@@ -1127,14 +1127,14 @@ Filer 在元数据响应中附带 `shard_id`，客户端缓存后直接使用，
 
 ### 10.4 实施步骤
 
-| 步骤 | 内容 | 优先级 |
-|------|------|--------|
-| S1 | 修复 `readdir` 传 `inode` 当 `shard_id` 的 bug → 改为 `calculate_shard_id(inode)` | P0 立即 |
-| S2 | 客户端引入 `ShardMap`，`calculate_shard_id` 改为 `ShardMap::route(inode)` | P0 |
-| S3 | Master topology 下发 ShardMap entries_snapshot | P1 |
-| S4 | `MetadataAttr` 新增 `shard_id` 字段，Filer 响应中填充 | P1 |
-| S5 | `CachedEntry` 新增 `shard_id`，操作时优先用缓存值 | P1 |
-| S6 | 所有 33 处 `calculate_shard_id` 调用替换为统一 `route(inode)` 接口 | P2 |
+| 步骤 | 内容 | 优先级 | 状态 |
+|------|------|--------|------|
+| S1 | 修复 `readdir` 传 `inode` 当 `shard_id` 的 bug → 改为 `calculate_shard_id(inode)` | P0 立即 | ✅ |
+| S2 | 客户端引入 `ShardMap`，`calculate_shard_id` 改为 `ShardMap::route(inode)` | P0 | ✅ |
+| S3 | Master topology 下发 ShardMap entries_snapshot | P1 | 待定（当前 `from_shard_count` 等价，shard 分裂时需） |
+| S4 | `MetadataAttr` 新增 `shard_id` 字段，Filer 响应中填充 | P1 | ✅ |
+| S5 | `CachedEntry` 新增 `shard_id`，操作时优先用缓存值 | P1 | ✅ |
+| S6 | 所有 33 处 `calculate_shard_id` 调用替换为统一 `route(inode)` 接口 | P2 | 待定 |
 
 ### 10.5 约束
 
@@ -1142,3 +1142,63 @@ Filer 在元数据响应中附带 `shard_id`，客户端缓存后直接使用，
 2. **线程安全**：`ShardMap` 已用 `RwLock`，客户端可直接持有 `Arc<ShardMap>`
 3. **拓扑同步**：Master 下发 ShardMap 与 shard leader 地址一起，复用现有 `sync_shard_router` 机制
 4. **不引入 Filer 内部转发**：保持客户端计算路由，避免多一跳延迟
+
+### 10.6 实施进展
+
+#### S1+S2: 客户端 ShardMap 统一路由（已完成）
+
+- `MetaShardClient` 新增 `shard_map: Arc<Mutex<ShardMap>>` 字段
+- `sync_shard_map()` 从 topology 的 `shard_count` 构建 `ShardMap::from_shard_count(n)`
+- `calculate_shard_id(inode)` 改为 `shard_map.route(inode).0`，与 Filer `ShardStrategy::calculate_shard` 完全一致
+- `readdir` 修复：不再传 `inode` 当 `shard_id`，改用 `calculate_shard_id(inode)`
+- 替代了旧的 `(inode / 1M) % shard_count` 模运算（inode ≥ 3M 时回绕到 shard 0 的 bug）
+
+#### S4: MetadataAttr 携带 shard_id（已完成）
+
+**协议层** (`powerfs-net/src/serialize.rs`):
+- `AttrResponse` 新增 `shard_id: Option<u64>` 字段
+- `decode_attr_resp` 解码 `FieldId::ShardId`（复用已有 field id 0x70，u64 LE）
+
+**客户端** (`powerfs-fuse-core/src/metadata_client.rs` + `meta_shard_client.rs`):
+- `MetadataAttr` 新增 `shard_id: Option<u64>` 字段
+- `attr_from_resp` 映射 `resp.shard_id` → `attr.shard_id`
+- 所有响应路径（lookup/getattr/create/mkdir/symlink/link/readdir）自动继承
+
+**Filer** (`powerfs-filer/src/net_handler.rs`):
+- `handle_lookup`: 响应中编码 `FieldId::ShardId = calculate_shard(info.inode)`
+- `handle_getattr`: 响应中编码 `FieldId::ShardId = calculate_shard(ino)`
+- `handle_create`: 响应中编码 `FieldId::ShardId = calculate_shard(ino)`（`setattr_shard`）
+- `handle_mkdir`: 响应中编码 `FieldId::ShardId = calculate_shard(info.inode)`
+- `handle_symlink`: 响应中编码 `FieldId::ShardId = calculate_shard(info.inode)`
+- `handle_link`: 响应中编码 `FieldId::ShardId = calculate_shard(ino)`
+- `handle_readdir`: 每个子条目编码 `FieldId::ShardId = calculate_shard(entry.inode)`
+
+**向后兼容**：旧客户端不解析 `FieldId::ShardId` 会被 `_ => skip` 跳过；旧 Filer 不编码则 `shard_id=None`，客户端回退到 `ShardMap::route`。
+
+#### S5: CachedEntry 缓存 shard_id + 优先用缓存值（已完成）
+
+**缓存层** (`powerfs-fuse/src/cache.rs`):
+- `CachedEntry` 新增 `shard_id: Option<u64>` 字段
+- 36 处 `CachedEntry { ... }` 构造点更新（cache.rs / fuse.rs / invalidate_handler.rs / benches / tests）
+
+**转换层** (`powerfs-fuse/src/fuse.rs`):
+- `attr_to_cached_entry`: 从 `MetadataAttr.shard_id` 映射到 `CachedEntry.shard_id`
+- 新增 `routing_shard(inode)` 辅助方法：
+  - 缓存命中且 `shard_id=Some(sid)` → 直接返回 `sid`（零计算快速路径）
+  - 缓存 miss 或 `shard_id=None` → 回退到 `calculate_shard_id(inode)`
+
+**操作接入**（S5 首批，S6 将完成剩余）:
+- `setattr`: 改用 `self.routing_shard(inode)`（inode-level 操作）
+- `readdir`: 改用 `self.routing_shard(inode)`（目录 inode-level 操作）
+- 其余 30 处 `calculate_shard_id` 调用保留，待 S6 统一替换
+
+### 10.7 测试验证
+
+- `cargo check` 全通过（powerfs-net / powerfs-fuse-core / powerfs-filer / powerfs-fuse）
+- `cargo clippy` 0 警告
+- `cargo test`:
+  - powerfs-net: 166 passed
+  - powerfs-fuse-core: 73 passed
+  - powerfs-fuse (lib): 38 passed
+  - powerfs-filer: 74 passed
+  - powerfs-fuse (tests): 8 passed

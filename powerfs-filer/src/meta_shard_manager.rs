@@ -1000,13 +1000,46 @@ impl MetaShardManager {
             let stores = self.shard_stores.read().unwrap();
             let shard_store = stores.get(&parent_shard)?;
             shard_store.get_dir_entry_inode(parent_inode, name)
-        }?;
+        };
+
+        // If dir_entry not found, return None immediately.
+        let inode = match inode {
+            Some(i) => i,
+            None => {
+                log::debug!(
+                    "lookup: dir_entry not found parent_ino={} name='{}' shard={}",
+                    parent_inode, name, parent_shard.0
+                );
+                return None;
+            }
+        };
 
         // Fetch the inode record from its own shard (may differ from parent_shard).
         let inode_shard = self.shard_strategy.calculate_shard(inode);
         let stores = self.shard_stores.read().unwrap();
-        let shard_store = stores.get(&inode_shard)?;
-        let info = shard_store.get_inode(inode)?;
+        let shard_store = stores.get(&inode_shard);
+        let info = match &shard_store {
+            Some(s) => s.get_inode(inode),
+            None => {
+                log::warn!(
+                    "lookup: inode_shard {} not found for inode {} (parent={}, name='{}')",
+                    inode_shard.0, inode, parent_inode, name
+                );
+                return None;
+            }
+        };
+
+        let info = match info {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "lookup: inode record not found inode={} shard={} (parent={}, name='{}') \
+                     — dir_entry exists but inode record missing (cross-shard apply lag)",
+                    inode, inode_shard.0, parent_inode, name
+                );
+                return None;
+            }
+        };
 
         // Phase 3.5: 跳过 tombstoned 条目（延迟删除期间不可见）
         if info.delete_time > 0 {
