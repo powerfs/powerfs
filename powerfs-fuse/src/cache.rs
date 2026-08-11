@@ -2550,4 +2550,122 @@ mod chunk_cache_tests {
             "Generation tracking should be cleared"
         );
     }
+
+    /// Phase 4: Flushing→Dirty transition on flush failure.
+    /// Verifies that after a failed flush, the entry state recovers to Dirty
+    /// (not stuck in Flushing), so subsequent flush cycles and invalidate
+    /// handling treat it as having local authoritative data.
+    #[test]
+    fn test_state_transition_flushing_to_dirty_on_failure() {
+        let cache = MetadataCache::new();
+        let ino = cache.allocate_inode();
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "flush_fail.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        });
+
+        // New → Dirty (write path)
+        cache.mark_dirty(ino);
+        assert_eq!(cache.get_entry_state(ino).unwrap(), EntryState::Dirty);
+
+        // Dirty → Flushing (flusher starts RPC)
+        cache.mark_flushing(ino);
+        assert_eq!(cache.get_entry_state(ino).unwrap(), EntryState::Flushing);
+
+        // Flushing → Dirty (flush failure recovery, Phase 4)
+        cache.mark_dirty(ino);
+        assert_eq!(
+            cache.get_entry_state(ino).unwrap(),
+            EntryState::Dirty,
+            "Flushing→Dirty on failure must recover to Dirty, not stay Flushing"
+        );
+
+        // Dirty → Flushing → Clean (successful flush path)
+        cache.mark_flushing(ino);
+        cache.mark_clean(ino);
+        assert_eq!(cache.get_entry_state(ino).unwrap(), EntryState::Clean);
+    }
+
+    /// Phase 4: concurrent write during Flushing keeps entry Dirty.
+    /// Verifies that a write (mark_dirty) during Flushing transitions to Dirty,
+    /// and the subsequent mark_clean is REJECTED (Dirty→Clean not allowed),
+    /// preventing data loss when a concurrent write happens during flush.
+    #[test]
+    fn test_concurrent_write_during_flushing_keeps_dirty() {
+        let cache = MetadataCache::new();
+        let ino = cache.allocate_inode();
+        cache.insert(CachedEntry {
+            inode: ino,
+            parent: 1,
+            name: "concurrent.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 1,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+        });
+
+        // Write → Dirty → Flushing (flusher starts)
+        cache.mark_dirty(ino);
+        cache.mark_flushing(ino);
+        assert_eq!(cache.get_entry_state(ino).unwrap(), EntryState::Flushing);
+
+        // Concurrent write during Flushing: Flushing → Dirty (allowed)
+        cache.mark_dirty(ino);
+        assert_eq!(cache.get_entry_state(ino).unwrap(), EntryState::Dirty);
+
+        // Flusher completes RPC, calls mark_clean: Dirty → Clean REJECTED
+        cache.mark_clean(ino);
+        assert_eq!(
+            cache.get_entry_state(ino).unwrap(),
+            EntryState::Dirty,
+            "Dirty→Clean must be rejected: concurrent write made entry Dirty during flush"
+        );
+    }
 }
