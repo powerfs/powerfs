@@ -1022,6 +1022,19 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
+        // Special files (block/char devices, FIFOs, sockets) have no data
+        // storage — skip volume/needle/inline allocation entirely.
+        const S_IFMT: u64 = 0o170000;
+        const S_IFBLK: u64 = 0o060000;
+        const S_IFCHR: u64 = 0o020000;
+        const S_IFIFO: u64 = 0o010000;
+        const S_IFSOCK: u64 = 0o140000;
+        let file_type = mode & S_IFMT;
+        let is_special_file = file_type == S_IFBLK
+            || file_type == S_IFCHR
+            || file_type == S_IFIFO
+            || file_type == S_IFSOCK;
+
         // === P2.5/P3: 决定 Inline vs Stripe vs Flat ===
         // 优先级: 显式 Stripe/WideStripe > Inline > Flat
         // - 若父目录设了 powerfs.placement=stripe:..., 使用 Stripe (忽略 Inline)
@@ -1032,8 +1045,8 @@ impl FilerNetHandler {
             Some(PlacementSpec::Stripe { .. }) | Some(PlacementSpec::WideStripe { .. })
         );
 
-        // Inline 仅在未显式指定 Stripe 时生效
-        let inline_max = if is_explicit_stripe {
+        // Inline 仅在未显式指定 Stripe 时生效; 特殊文件不分配.
+        let inline_max = if is_special_file || is_explicit_stripe {
             None
         } else {
             self.resolve_inline_max_size(parent_ino)
@@ -1068,7 +1081,7 @@ impl FilerNetHandler {
         //   - counter 单调递增, 不会重复
         //
         // Inline/Stripe 模式跳过单卷分配.
-        let flat_alloc = if inline_max.is_none() && stripe_alloc.is_none() {
+        let flat_alloc = if !is_special_file && inline_max.is_none() && stripe_alloc.is_none() {
             match self.alloc_for_new_file() {
                 Some(v) => Some(v),
                 None => {
@@ -1185,6 +1198,14 @@ impl FilerNetHandler {
                     encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
                         |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
                     )?;
+                } else if is_special_file {
+                    // === Special file (device/fifo/socket): no data storage ===
+                    // No volume/needle/inline allocation. The inode is created
+                    // with mode (S_IFBLK/S_IFCHR/S_IFIFO/S_IFSOCK) and no chunks.
+                    info!(
+                        "FILER_NET_CREATE: special file inode={} mode={:o} (no allocation)",
+                        ino, mode
+                    );
                 } else {
                     // === Flat 模式: 持久化 chunk 映射 (volume_id, needle_id) via Raft ===
                     // fid 格式 "volume_id,cookie,needle_id": set_chunks 从第 3 字段解析 needle_id
