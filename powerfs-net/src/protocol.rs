@@ -964,6 +964,13 @@ pub enum FieldId {
     /// Xattr key list for ListXattr response. Format: NUL-separated keys
     /// packed into a single bytes field.
     XattrKeys = 0xBC,
+    /// ShardMap entries snapshot (bytes). Packed array of entries, each 25
+    /// bytes: range_start:u64 LE + range_end:u64 LE + shard_id:u64 LE +
+    /// state:u8 (0=Active, 1=Draining). Sent by Master in GetTopology so
+    /// clients can reconstruct the exact same ShardMap the Filer uses,
+    /// including post-split ranges. Absent → client falls back to
+    /// `ShardMap::from_shard_count(total_shards)`.
+    ShardMapEntries = 0xBD,
 }
 
 impl FieldId {
@@ -1067,6 +1074,7 @@ impl FieldId {
             0xBA => Some(Self::CpuUsage),
             0xBB => Some(Self::MemoryUsage),
             0xBC => Some(Self::XattrKeys),
+            0xBD => Some(Self::ShardMapEntries),
             _ => None,
         }
     }

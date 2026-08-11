@@ -6,6 +6,7 @@
 use crate::master::MasterNode;
 use crate::proto::powerfs::VolumeShortInfo;
 use log::{debug, error, info, warn};
+use powerfs_allocator::{ShardMap, ShardState};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_BAD_REQUEST,
@@ -641,6 +642,40 @@ impl MasterNetHandler {
             "NET_GET_TOPOLOGY: filers={}, total_shards={}",
             filer_count, total_shards
         );
+
+        // ---- ShardMap entries snapshot (S3) ----
+        //
+        // Encode the full ShardMap entries so clients can reconstruct the
+        // exact same range-based routing table the Filer uses, including
+        // post-split ranges. Currently constructed from `total_shards`
+        // (equivalent to `ShardMap::from_shard_count`); once Filer reports
+        // actual entries via heartbeat, the Master will forward those
+        // directly.
+        //
+        // Format: packed blob, each entry = 25 bytes:
+        //   range_start:u64 LE | range_end:u64 LE | shard_id:u64 LE | state:u8
+        //
+        // Absent (empty blob) → client falls back to from_shard_count.
+        if total_shards > 0 {
+            let shard_map = ShardMap::from_shard_count(total_shards);
+            let entries = shard_map.entries_snapshot();
+            let mut blob = Vec::with_capacity(entries.len() * 25);
+            for (range_start, range_end, sid, state) in &entries {
+                blob.extend_from_slice(&range_start.to_le_bytes());
+                blob.extend_from_slice(&range_end.to_le_bytes());
+                blob.extend_from_slice(&sid.0.to_le_bytes());
+                blob.push(match state {
+                    ShardState::Active => 0u8,
+                    ShardState::Draining => 1u8,
+                });
+            }
+            let _ = enc.add_bytes(FieldId::ShardMapEntries, &blob);
+            info!(
+                "NET_GET_TOPOLOGY: ShardMap entries={} ({} bytes)",
+                entries.len(),
+                blob.len()
+            );
+        }
 
         Ok(Self::build_response(
             msg,
