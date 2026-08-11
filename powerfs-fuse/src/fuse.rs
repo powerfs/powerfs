@@ -1,4 +1,4 @@
-use crate::cache::{CachedEntry, ChunkCache, MetadataCache, ROOT_INODE};
+use crate::cache::{CachedEntry, ChunkCache, EntryState, HoldState, MetadataCache, ROOT_INODE};
 use bytes::BytesMut;
 use dashmap::DashMap;
 use fuse_backend_rs::api::filesystem::{
@@ -574,6 +574,8 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
             })
             .collect(),
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 
@@ -807,13 +809,21 @@ impl PowerFsFs {
                 warn!(
                     "flush_dirty_chunks_impl(stripe): inode={} post-flush dirty NOT cleared! \
                      flushed={}/{} has_dirty_shards={} has_dirty_cache={}",
-                    inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                    inode,
+                    flushed_indices.len(),
+                    dirty.len(),
+                    has_dirty_shards,
+                    has_dirty_cache
                 );
             } else {
                 debug!(
                     "flush_dirty_chunks_impl(stripe): inode={} post-flush OK flushed={}/{} \
                      has_dirty_shards={} has_dirty_cache={}",
-                    inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                    inode,
+                    flushed_indices.len(),
+                    dirty.len(),
+                    has_dirty_shards,
+                    has_dirty_cache
                 );
             }
 
@@ -937,13 +947,21 @@ impl PowerFsFs {
             warn!(
                 "flush_dirty_chunks_impl: inode={} post-flush dirty NOT cleared! \
                  flushed={}/{} has_dirty_shards={} has_dirty_cache={} — possible re-mark race",
-                inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                inode,
+                flushed_indices.len(),
+                dirty.len(),
+                has_dirty_shards,
+                has_dirty_cache
             );
         } else {
             debug!(
                 "flush_dirty_chunks_impl: inode={} post-flush OK flushed={}/{} \
                  has_dirty_shards={} has_dirty_cache={}",
-                inode, flushed_indices.len(), dirty.len(), has_dirty_shards, has_dirty_cache
+                inode,
+                flushed_indices.len(),
+                dirty.len(),
+                has_dirty_shards,
+                has_dirty_cache
             );
         }
 
@@ -1067,7 +1085,11 @@ impl PowerFsFs {
         info!(
             "K3-DBG sync_close: inode={} chunks={:?}",
             inode,
-            entry.chunks.iter().map(|c| (c.offset, c.volume_id, c.needle_id, c.size)).collect::<Vec<_>>()
+            entry
+                .chunks
+                .iter()
+                .map(|c| (c.offset, c.volume_id, c.needle_id, c.size))
+                .collect::<Vec<_>>()
         );
 
         let chunks_wire: Vec<powerfs_coherence::ChunkWire> = entry
@@ -1234,7 +1256,10 @@ impl PowerFsFs {
         }
 
         // Cache miss: fetch from Filer via get_entry_by_inode
-        debug!("lookup_dot: cache MISS, fetching from filer parent={}", parent);
+        debug!(
+            "lookup_dot: cache MISS, fetching from filer parent={}",
+            parent
+        );
         match self.client.get_entry_by_inode(parent) {
             Ok(Some((filer_entry, path))) => {
                 // Resolve grandparent from the returned path. The Entry proto
@@ -1253,7 +1278,10 @@ impl PowerFsFs {
                 Err(std::io::Error::from_raw_os_error(libc::ENOENT))
             }
             Err(e) => {
-                warn!("lookup_dot: failed to query filer for parent={}: {}", parent, e);
+                warn!(
+                    "lookup_dot: failed to query filer for parent={}: {}",
+                    parent, e
+                );
                 Err(std::io::Error::from_raw_os_error(libc::EIO))
             }
         }
@@ -1389,7 +1417,6 @@ impl PowerFsFs {
         })
     }
 
-
     fn entry_to_cached(&self, parent: u64, entry: &FilerEntry) -> CachedEntry {
         let attrs = entry.attributes.as_ref();
         let chunks = entry
@@ -1496,6 +1523,8 @@ impl PowerFsFs {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks,
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         }
     }
 
@@ -1527,6 +1556,71 @@ impl PowerFsFs {
         }
         Some(current)
     }
+}
+
+/// Parse POSIX ACL access xattr data to extract the file mode bits.
+///
+/// `cp -p` uses `fsetxattr("system.posix_acl_access", ...)` instead of
+/// `chmod` to preserve file permissions. The FUSE user-space library
+/// must parse the ACL and update the file mode itself.
+///
+/// `cur_mode` provides fallback bits for entries missing from the ACL
+/// (e.g. cp -p omits ACL_OTHER when it matches the current other bits).
+///
+/// Format: 4-byte version (2=ACL_EA_VERSION), then 8-byte entries:
+///   tag(2 LE): 1=USER_OBJ 2=USER 4=GROUP_OBJ 8=GROUP 0x20=MASK 0x10=OTHER
+///   perm(2 LE): rwx bits
+///   id(4 LE): user/group id (unused for mode)
+fn parse_posix_acl_mode(acl_data: &[u8], cur_mode: u32) -> Option<u32> {
+    if acl_data.len() < 4 {
+        return None;
+    }
+    let version = u32::from_le_bytes([acl_data[0], acl_data[1], acl_data[2], acl_data[3]]);
+    if version != 2 {
+        return None;
+    }
+    let mut user_obj_perm: Option<u32> = None;
+    let mut group_obj_perm: Option<u32> = None;
+    let mut mask_perm: Option<u32> = None;
+    let mut other_perm: Option<u32> = None;
+    let mut offset = 4;
+    while offset + 8 <= acl_data.len() {
+        let tag = u16::from_le_bytes([acl_data[offset], acl_data[offset + 1]]);
+        let perm = u16::from_le_bytes([acl_data[offset + 2], acl_data[offset + 3]]) as u32;
+        match tag {
+            1 => user_obj_perm = Some(perm),
+            4 => group_obj_perm = Some(perm),
+            0x20 => mask_perm = Some(perm),
+            0x10 => other_perm = Some(perm),
+            _ => {}
+        }
+        offset += 8;
+    }
+    let owner = user_obj_perm.unwrap_or((cur_mode >> 6) & 0o7);
+    // cp -p writes an incomplete ACL (USER_OBJ, GROUP_OBJ, MASK, no OTHER)
+    // where MASK stores the *other* permission bits, not the group mask.
+    // Verified empirically on tmpfs: a 640 file gets ACL with
+    // USER_OBJ=6, GROUP_OBJ=4, MASK=0 -> resulting mode is 640 (not 600).
+    // Standard ACLs (with OTHER entry) follow POSIX semantics:
+    // mode.group = MASK, mode.other = OTHER.
+    let (group, other) = if let Some(oth) = other_perm {
+        // Complete ACL: standard POSIX semantics
+        let grp = mask_perm
+            .or(group_obj_perm)
+            .unwrap_or((cur_mode >> 3) & 0o7);
+        (grp, oth)
+    } else {
+        // Incomplete ACL (cp -p): MASK = other bits, group = GROUP_OBJ
+        let grp = group_obj_perm.unwrap_or((cur_mode >> 3) & 0o7);
+        let oth = mask_perm.unwrap_or(cur_mode & 0o7);
+        (grp, oth)
+    };
+    let mode = (owner << 6) | (group << 3) | other;
+    log::debug!(
+        "parse_posix_acl_mode: cur_mode={:o}, user_obj={:?}, group_obj={:?}, mask={:?}, other_entry={:?} -> owner={}, group={}, other={}, mode={:o}",
+        cur_mode, user_obj_perm, group_obj_perm, mask_perm, other_perm, owner, group, other, mode
+    );
+    Some(mode)
 }
 
 impl FileSystem for PowerFsFs {
@@ -1956,7 +2050,10 @@ impl FileSystem for PowerFsFs {
 
         let entry = attr_to_cached_entry(&attr, parent, name_str);
         self.cache.insert(entry.clone());
-        debug!("mkdir: RPC done, inode={}, dir={}", attr.inode, parent);
+        debug!(
+            "mkdir: RPC done, inode={}, dir={}, mode={:o}, nlink={}, size={}, uid={}, gid={}, mtime={}, atime={}, ctime={}",
+            attr.inode, parent, attr.mode, attr.nlink, attr.size, attr.uid, attr.gid, attr.mtime, attr.atime, attr.ctime
+        );
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -2244,6 +2341,8 @@ impl FileSystem for PowerFsFs {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
+                state: EntryState::default(),
+                hold: HoldState::default(),
             };
             // CRITICAL: 同 Flat 路径, pin 必须在 insert 之前, 防止 Filer
             // Invalidate 在 insert→pin 之间到达导致 entry 被驱逐。
@@ -2313,6 +2412,8 @@ impl FileSystem for PowerFsFs {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
+                state: EntryState::default(),
+                hold: HoldState::default(),
             };
             self.open_inodes.write().unwrap().insert(inode);
             self.cache.pin_inode(inode);
@@ -2392,6 +2493,8 @@ impl FileSystem for PowerFsFs {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
         // The Filer pushes an Invalidate after the create RPC commits, and
@@ -2751,7 +2854,10 @@ impl FileSystem for PowerFsFs {
                         .insert(inode, InlineBuffer { data, dirty: false });
                     debug!(
                         "read: fetched {} bytes of inline data for inode={}",
-                        self.inline_buffers.get(&inode).map(|b| b.data.len()).unwrap_or(0),
+                        self.inline_buffers
+                            .get(&inode)
+                            .map(|b| b.data.len())
+                            .unwrap_or(0),
                         inode
                     );
                 }
@@ -5029,6 +5135,8 @@ impl FileSystem for PowerFsFs {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         };
         self.cache.insert(cached_entry.clone());
         Ok(self.create_fuse_entry(&cached_entry))
@@ -5122,6 +5230,8 @@ impl FileSystem for PowerFsFs {
                     reliability: powerfs_layout::reliability::Reliability::default(),
                     replica_chunks: Vec::new(),
                     cached_at: Instant::now(),
+                    state: EntryState::default(),
+                    hold: HoldState::default(),
                 };
 
                 self.cache.insert(new_entry.clone());
@@ -5487,6 +5597,52 @@ impl FileSystem for PowerFsFs {
         }
 
         self.cache.set_xattr(inode, name_str, value);
+
+        // Handle POSIX ACL: cp -p and other tools use
+        // fsetxattr("system.posix_acl_access") instead of chmod to set file
+        // permissions. Parse the ACL data and update the file mode via setattr
+        // so cp -prf preserves permissions correctly on FUSE.
+        if name_str == "system.posix_acl_access" {
+            let cur_mode = self.cache.get_inode(inode).map(|e| e.mode).unwrap_or(0o644);
+            if let Some(acl_mode) = parse_posix_acl_mode(value, cur_mode) {
+                debug!(
+                    "setxattr: ACL mode for inode {} = {:o}, updating via setattr",
+                    inode, acl_mode
+                );
+                let params = SetattrParams {
+                    mode: Some(acl_mode),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime: None,
+                    mtime: None,
+                };
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let shard_id = meta_client.calculate_shard_id(inode);
+                match self
+                    .client
+                    .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
+                {
+                    Ok(_) => {
+                        self.cache.update_attr(
+                            inode,
+                            crate::cache::UpdateAttrParams {
+                                mode: Some(acl_mode),
+                                size: None,
+                                uid: None,
+                                gid: None,
+                                atime: None,
+                                mtime: None,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        warn!("setxattr: ACL setattr failed for inode {}: {}", inode, e);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 

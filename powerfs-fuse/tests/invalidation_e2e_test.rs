@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use powerfs_fuse::cache::{CachedEntry, ChunkCache, MetadataCache};
+use powerfs_fuse::cache::{CachedEntry, ChunkCache, EntryState, HoldState, MetadataCache};
 use powerfs_fuse::invalidate_handler::InvalidateHandler;
 use powerfs_net::client_conn::{ClientConn, ConnRegistry};
 use powerfs_net::protocol::{ClientType, FrameFlags, FrameHeader, MsgType, NetMessage};
@@ -46,6 +46,8 @@ fn make_entry(inode: u64, parent: u64, name: &str, generation: u64) -> CachedEnt
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 

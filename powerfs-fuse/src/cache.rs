@@ -24,6 +24,48 @@ pub fn chunk_from_proto(chunk: FileChunk) -> CachedFileChunk {
     }
 }
 
+/// Cache entry lifecycle state (see docs/cache-entry-state-machine-design.md).
+///
+/// Phase 1: introduced as observational field; logic still uses existing
+/// `cached_at`/`pinned_inodes` mechanisms. Phase 2+ will make this the
+/// authoritative state used by `try_transition()` guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntryState {
+    /// Just allocated, attributes not yet populated.
+    #[default]
+    New,
+    /// Attributes populated and consistent with Filer, no dirty data.
+    Clean,
+    /// Has unsynced local modifications (dirty chunks / pending setattr).
+    Dirty,
+    /// Currently syncing to Filer/Volume Server.
+    Flushing,
+    /// TTL expired or Invalidate received; needs refresh on next access.
+    Stale,
+    /// Deleted (unlink/rmdir), pending removal from cache.
+    Tombstone,
+}
+
+/// Orthogonal hold state: whether the inode is open (lease-held).
+///
+/// Independent of `EntryState` — a Dirty+Pinned entry is the common
+/// "open file with unsynced writes" case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HoldState {
+    /// No open handle, no lease. TTL applies, LRU may evict.
+    #[default]
+    Unpinned,
+    /// At least one open handle holds a data lease. TTL bypassed,
+    /// cannot evict. Reference-counted for concurrent open/release.
+    Pinned { open_count: u32 },
+}
+
+impl HoldState {
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, HoldState::Pinned { .. })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub inode: u64,
@@ -61,6 +103,89 @@ pub struct CachedEntry {
     pub replica_chunks: Vec<CachedFileChunk>,
     /// When this cache entry was populated (used for TTL fallback)
     pub cached_at: Instant,
+    /// Lifecycle state (Phase 1: observational; Phase 2+: authoritative).
+    pub state: EntryState,
+    /// Hold state (open/lease reference count). Orthogonal to `state`.
+    pub hold: HoldState,
+}
+
+impl CachedEntry {
+    /// Attempt a state transition. Returns `false` if the transition is not
+    /// allowed by the state machine (see design doc §2.5 transition matrix).
+    ///
+    /// Phase 1: only logs the transition; existing logic still uses
+    /// `cached_at`/`pinned_inodes`. Phase 2+ will enforce the guard.
+    #[allow(dead_code)]
+    pub fn try_transition(&mut self, target: EntryState) -> bool {
+        use EntryState::*;
+        let allowed = match (self.state, target) {
+            (New, Clean) | (New, Dirty) => true,
+            (Clean, Dirty) | (Clean, Stale) | (Clean, Tombstone) => true,
+            (Dirty, Flushing) | (Dirty, Tombstone) => true,
+            (Flushing, Clean) | (Flushing, Dirty) => true,
+            (Stale, Clean) | (Stale, Tombstone) => true,
+            // Dirty/Flushing -> Stale: explicitly forbidden (core rule:
+            // local authoritative data must not be invalidated).
+            (Dirty, Stale) | (Flushing, Stale) => false,
+            // Same-state transition allowed (refresh cached_at etc.)
+            (s, t) if s == t => true,
+            _ => false,
+        };
+        if allowed {
+            debug!(
+                "EntryState: inode={} transition {:?} -> {:?}",
+                self.inode, self.state, target
+            );
+            self.state = target;
+        } else {
+            warn!(
+                "EntryState: inode={} transition {:?} -> {:?} REJECTED",
+                self.inode, self.state, target
+            );
+        }
+        allowed
+    }
+
+    /// Increment open/lease reference count (orthogonal to lifecycle state).
+    #[allow(dead_code)]
+    pub fn pin(&mut self) {
+        match self.hold {
+            HoldState::Unpinned => {
+                self.hold = HoldState::Pinned { open_count: 1 };
+            }
+            HoldState::Pinned { ref mut open_count } => {
+                *open_count += 1;
+            }
+        }
+        debug!(
+            "EntryState: inode={} pin -> hold={:?}",
+            self.inode, self.hold
+        );
+    }
+
+    /// Decrement open/lease reference count. Returns `true` if fully released.
+    #[allow(dead_code)]
+    pub fn unpin(&mut self) -> bool {
+        let released = match self.hold {
+            HoldState::Pinned { ref mut open_count } => {
+                if *open_count > 0 {
+                    *open_count -= 1;
+                }
+                if *open_count == 0 {
+                    self.hold = HoldState::Unpinned;
+                    true
+                } else {
+                    false
+                }
+            }
+            HoldState::Unpinned => false,
+        };
+        debug!(
+            "EntryState: inode={} unpin -> hold={:?} released={}",
+            self.inode, self.hold, released
+        );
+        released
+    }
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +292,8 @@ impl MetadataCache {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
         cache
     }
@@ -186,7 +313,12 @@ impl MetadataCache {
         // during slow writes that exceed metadata_ttl.
         let is_pinned = self.pinned_inodes.read().unwrap().contains_key(&inode);
         if !is_pinned && entry.cached_at.elapsed() > self.metadata_ttl {
-            // Entry too old, treat as stale
+            // Phase 1: record Stale transition (observational).
+            // try_transition will log REJECTED if entry is Dirty/Flushing —
+            // that indicates a bug (local authoritative data expired by TTL).
+            if let Some(e) = cache.get_mut(&inode) {
+                e.try_transition(EntryState::Stale);
+            }
             debug!(
                 "MetadataCache: inode {} cache expired (age={:?} > ttl={:?}), treating as stale",
                 inode,
@@ -210,6 +342,12 @@ impl MetadataCache {
         *count += 1;
         let new_count = *count;
         drop(pinned);
+        // Phase 1: mirror pin to entry.hold (observational).
+        // pinned_inodes remains the authoritative source in Phase 1;
+        // entry.hold will become authoritative in Phase 2.
+        if let Some(e) = self.inode_cache.write().unwrap().get_mut(&inode) {
+            e.pin();
+        }
         debug!(
             "pin_inode: inode={} new_count={} thread={:?}",
             inode,
@@ -232,6 +370,10 @@ impl MetadataCache {
             }
         }
         drop(pinned);
+        // Phase 1: mirror unpin to entry.hold (observational).
+        if let Some(e) = self.inode_cache.write().unwrap().get_mut(&inode) {
+            e.unpin();
+        }
         // RACE_TRACE: Log unpin with caller context to detect the race where
         // the background flusher unpins a still-open inode, allowing the
         // InvalidateHandler to evict it mid-write.
@@ -409,7 +551,18 @@ impl MetadataCache {
                 existing.is_dir = entry.is_dir;
                 existing.is_symlink = entry.is_symlink;
                 if entry.is_symlink {
-                    existing.symlink_target = entry.symlink_target.clone();
+                    // Only overwrite symlink_target if the new value is non-empty.
+                    // Filer lookup responses may omit symlink_target, causing
+                    // entry_to_cached to produce Some(""). Overwriting with an
+                    // empty string breaks readlink after a successful symlink()
+                    // that cached the correct target.
+                    if entry
+                        .symlink_target
+                        .as_deref()
+                        .is_some_and(|t| !t.is_empty())
+                    {
+                        existing.symlink_target = entry.symlink_target.clone();
+                    }
                 }
                 existing.disk_size = entry.disk_size;
                 existing.generation = entry.generation;
@@ -440,6 +593,13 @@ impl MetadataCache {
                     let _ = cache.push(evicted_inode, evicted_entry);
                 }
             }
+        }
+        // Phase 1: record Clean transition for inserted/updated entry.
+        // try_transition logs REJECTED if entry is Dirty — that indicates
+        // insert() is overwriting dirty data with a Filer response, which
+        // may be a bug (open refresh overwriting unflushed writes).
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Clean);
         }
         drop(cache);
     }
@@ -680,7 +840,8 @@ impl MetadataCache {
             let chunks_after = entry.chunks.iter().map(|c| c.offset).collect::<Vec<_>>();
             log::debug!(
                 "update_chunk_sizes_after_write: inode={} chunks_after={:?}",
-                inode, chunks_after
+                inode,
+                chunks_after
             );
         }
     }
@@ -1180,6 +1341,8 @@ impl MetadataCache {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
+                state: EntryState::default(),
+                hold: HoldState::default(),
             },
         );
         drop(cache);
@@ -1322,6 +1485,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -1363,6 +1528,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -1404,6 +1571,8 @@ mod tests {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 replica_chunks: Vec::new(),
                 cached_at: Instant::now(),
+                state: EntryState::default(),
+                hold: HoldState::default(),
             });
         }
 
@@ -1443,6 +1612,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         cache.update_size(inode, 1024);
@@ -1482,6 +1653,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -1524,6 +1697,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -1567,6 +1742,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -1612,6 +1789,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         // Fresh entry should be returned
@@ -1660,6 +1839,8 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         // Wait some time (but less than TTL)
@@ -2251,6 +2432,8 @@ mod chunk_cache_tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         // No generation tracking -> not stale
@@ -2302,6 +2485,8 @@ mod chunk_cache_tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             replica_chunks: Vec::new(),
             cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
         });
 
         cache.update_path_generation("/clear_test.txt", 5);
