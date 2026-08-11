@@ -18,6 +18,7 @@ threads = 8
 verbose = true
 container = true
 log_file = "/var/log/powerfs-fuse.log"
+request_timeout_secs = 3             # 测试环境: 3s 快速超时, 生产环境用 10s
 
 [fuse.lease]
 mode = "range"

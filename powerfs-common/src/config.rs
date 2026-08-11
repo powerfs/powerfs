@@ -199,6 +199,10 @@ pub struct FuseConfig {
     /// 仅用于运维场景（master 临时不可达但需挂载）。
     #[serde(default)]
     pub force_mount: bool,
+    /// 请求超时 (秒) — FUSE 对 master/filer/volume 的单次 RPC 超时。
+    /// 默认 10s (生产)；测试环境建议设 3s 以快速暴露挂起问题。
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 /// Lease 模式配置
@@ -237,6 +241,10 @@ fn default_lease_duration_ms() -> u64 {
 
 fn default_renew_interval_ms() -> u64 {
     10000
+}
+
+fn default_request_timeout_secs() -> u64 {
+    10
 }
 
 /// Monitor 服务配置 - 所有地址必须显式配置
@@ -841,6 +849,7 @@ replication = "000"
 threads = 8
 verbose = false
 container = false
+request_timeout_secs = 10          # 请求超时 (秒), 测试环境建议 3s
 
 [fuse.lease]
 mode = "range"               # "range" (方案D, 默认) 或 "inode" (方案A, NVMe-oF target)
