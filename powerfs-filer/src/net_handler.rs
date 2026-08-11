@@ -1306,9 +1306,24 @@ impl FilerNetHandler {
                 self.notify_inode_change(parent_ino, now);
                 self.notify_inode_change(info.inode, now);
 
+                // Return full attributes so the FUSE client can populate its
+                // cache with correct nlink/size/uid/gid/timestamps. Previously
+                // only Ino/Mode/IsDir/Name were sent, causing stat() to report
+                // nlink=0, size=0, and epoch (1970) timestamps on new dirs.
+                // Use the setattr-applied mode (with S_IFDIR) and the client-
+                // supplied uid/gid; the InodeInfo from create_directory already
+                // has nlink=2 and now-timestamps.
+                let dir_mode = (mode | 0o040000) as u32;
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, info.inode);
-                enc.add_u32(FieldId::Mode, (mode | 0o040000) as u32);
+                enc.add_u32(FieldId::Mode, dir_mode);
+                enc.add_u32(FieldId::Uid, uid as u32);
+                enc.add_u32(FieldId::Gid, gid as u32);
+                enc.add_u64(FieldId::Size, info.size);
+                enc.add_u32(FieldId::Nlink, info.nlink);
+                enc.add_u64(FieldId::Mtime, info.mtime);
+                enc.add_u64(FieldId::Atime, info.atime);
+                enc.add_u64(FieldId::Ctime, info.ctime);
                 enc.add_u8(FieldId::IsDir, 1);
                 enc.add_string(FieldId::Name, &name)?;
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
