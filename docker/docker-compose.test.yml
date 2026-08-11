@@ -264,6 +264,7 @@ services:
     volumes:
       - filer-1-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
@@ -295,6 +296,7 @@ services:
     volumes:
       - filer-2-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
@@ -326,6 +328,7 @@ services:
     volumes:
       - filer-3-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8888 && nc -z localhost 8889 && nc -z localhost 9334 || exit 1"]
       interval: 3s
