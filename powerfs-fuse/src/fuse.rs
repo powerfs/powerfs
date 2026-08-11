@@ -2492,6 +2492,56 @@ impl FileSystem for PowerFsFs {
         // P2.5: Inline 模式读取分支. 数据在 inline_buffers 中 (内存),
         // 直接切片返回, 完全绕过 Volume Server + chunk_cache + lease.
         // 仅 Inline 模式 inode (create/open 时插入 inline_buffers) 走此路径.
+        //
+        // Fallback: if the file is inline (fid=None, chunks empty) but the
+        // inline_buffers entry is missing (e.g., open's getattr failed under
+        // concurrent access), fetch inline_data from the Filer on-demand.
+        // Without this, read falls through to the Flat path which returns EIO
+        // because fid is None — causing T8.02 concurrent read failures.
+        if self.inline_buffers.get(&inode).is_none()
+            && entry.fid.is_none()
+            && entry.chunks.is_empty()
+        {
+            debug!(
+                "read: inode={} is inline (no fid, no chunks) but inline_buffers missing, fetching from filer",
+                inode
+            );
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let routing_shard = meta_client.calculate_shard_id(inode);
+            let ino = inode;
+            match self
+                .client
+                .block_on(async move { meta_client.getattr(ino, routing_shard).await })
+            {
+                Ok(attr) if attr.is_inline() => {
+                    let data = attr.inline_data.unwrap_or_default();
+                    self.cache.set_content_size(inode, attr.size);
+                    if let Some(max_size) = attr.inline_max_size {
+                        self.inline_max_sizes.insert(inode, max_size);
+                    }
+                    self.inline_buffers
+                        .insert(inode, InlineBuffer { data, dirty: false });
+                    debug!(
+                        "read: fetched {} bytes of inline data for inode={}",
+                        self.inline_buffers.get(&inode).map(|b| b.data.len()).unwrap_or(0),
+                        inode
+                    );
+                }
+                Ok(_) => {
+                    warn!(
+                        "read: inode={} getattr returned non-inline, cannot read inline file",
+                        inode
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "read: inode={} getattr failed while fetching inline data: {}",
+                        inode, e
+                    );
+                }
+            }
+        }
+
         if let Some(inline_buf) = self.inline_buffers.get(&inode) {
             let file_size = inline_buf.data.len() as u64;
             if offset >= file_size {
