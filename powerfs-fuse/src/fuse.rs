@@ -5738,14 +5738,13 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("setxattr: inode={}, name={}", inode, name_str);
 
-        // Use peek_inode (bypasses TTL) instead of get_inode: the entry may
-        // be TTL-expired but still physically present in the cache. cp -prf
-        // sets xattrs (system.posix_acl_access) on files whose cache entries
-        // were populated seconds ago and have since crossed metadata_ttl.
-        // Returning ENOENT here breaks "cp: preserving permissions".
-        if self.cache.peek_inode(inode).is_none() {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
+        // Do NOT return ENOENT when the cache entry is missing. The Filer
+        // may have evicted it via an Invalidate notification (e.g. the Filer
+        // notifies about a new inode right after mkdir, causing the local
+        // cache to evict the entry we just created). The set_xattr RPC below
+        // will query the Filer, which returns NOT_FOUND → ENOENT if the inode
+        // truly doesn't exist. Returning ENOENT prematurely here breaks
+        // "cp -prf" preserving permissions (system.posix_acl_access).
 
         // Persist ALL xattrs to Filer via Raft.
         // The `attr`/`setfattr` tool sends names in the "user." namespace.
@@ -5970,10 +5969,9 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("removexattr: inode={}, name={}", inode, name_str);
 
-        // Use peek_inode (bypasses TTL) — see setxattr for rationale.
-        if self.cache.peek_inode(inode).is_none() {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
+        // Do NOT return ENOENT when the cache entry is missing — see setxattr
+        // for rationale. The remove_xattr RPC below will query the Filer,
+        // which returns NOT_FOUND → ENOENT if the inode truly doesn't exist.
 
         // Remove from Filer (persisted via Raft).
         let normalized_name = if name_str.starts_with("user.powerfs.") {
