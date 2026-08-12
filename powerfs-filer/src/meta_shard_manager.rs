@@ -420,7 +420,7 @@ impl MetaShardManager {
         let mgr = self.raft_group_manager.clone();
         tokio::spawn(async move {
             while let Some(index) = apply_rx.recv().await {
-                match mgr.read_applied_entry(shard_id, index) {
+                match mgr.read_applied_entry(shard_id, index).await {
                     Ok(Some(payload)) => match ShardCommand::deserialize(&payload) {
                         Ok(cmd) => shard_store.apply_command(cmd),
                         Err(e) => error!(

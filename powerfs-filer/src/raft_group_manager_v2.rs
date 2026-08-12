@@ -705,13 +705,13 @@ impl RaftGroupManagerV2 {
     ///
     /// 返回 `ShardCommand` 的序列化 bytes（即 `serde_json::to_vec(&ShardCommand)` 的结果）。
     /// 调用方进一步 `ShardCommand::deserialize(&payload)` 还原业务命令。
-    pub fn read_applied_entry(
+    pub async fn read_applied_entry(
         &self,
         shard_id: ShardId,
         index: u64,
     ) -> Result<Option<Vec<u8>>, String> {
-        // 同步读取 — 需要阻塞获取 groups 读锁
-        let groups = self.groups.blocking_read();
+        // 异步读取 — 避免 blocking_read 在 async 上下文中 panic
+        let groups = self.groups.read().await;
         let group = groups
             .get(&shard_id)
             .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
