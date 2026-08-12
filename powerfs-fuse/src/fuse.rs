@@ -3076,6 +3076,17 @@ impl FileSystem for PowerFsFs {
         //    This catches cases where the buffer was populated from a stale
         //    cache entry or the file was modified by other clients while we
         //    had no buffer (e.g., between release and the next open).
+        //
+        // Track whether the buffer was removed due to staleness. Only in
+        // that case do we need to invalidate the kernel page cache after
+        // re-fetching from the Filer. If the buffer was simply absent
+        // (first open or after normal release), the kernel page cache is
+        // either empty or already invalidated by the release path —
+        // invalidating again is harmless but unnecessary, and worse, it
+        // can discard valid kernel page cache when delayed RELEASEs haven't
+        // synced yet (the Filer returns stale data, and the kernel had the
+        // correct data from the writes).
+        let mut was_stale = false;
         if !skip_inline_refresh {
             if let Some(inline_buf) = self.inline_buffers.get(&inode) {
                 if !inline_buf.dirty {
@@ -3094,6 +3105,7 @@ impl FileSystem for PowerFsFs {
                         );
                         drop(inline_buf); // release DashMap read guard before remove
                         self.inline_buffers.remove(&inode);
+                        was_stale = true;
                     }
                 }
             }
@@ -3122,8 +3134,8 @@ impl FileSystem for PowerFsFs {
                     let data = attr.inline_data.unwrap_or_default();
                     let data_len = data.len();
                     warn!(
-                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, thread={:?}",
-                        inode, data_len, attr.size, std::thread::current().id()
+                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
+                        inode, data_len, attr.size, was_stale, std::thread::current().id()
                     );
                     self.inline_buffers.insert(
                         inode,
@@ -3143,10 +3155,7 @@ impl FileSystem for PowerFsFs {
                     // preventing automatic page cache invalidation even
                     // though keep_cache is not set). Without this, reads
                     // after the open serve from the stale kernel page cache
-                    // instead of the freshly-refreshed inline buffer, causing
-                    // cross-client stale reads (L4.21: A sees 165/200 lines
-                    // despite the FUSE client having fetched all 200 lines
-                    // from the Filer).
+                    // instead of the freshly-refreshed inline buffer.
                     self.notify_kernel_inval_inode(inode);
                 }
                 Ok(_) => {
@@ -3254,8 +3263,12 @@ impl FileSystem for PowerFsFs {
                             needs_refresh: false,
                         },
                     );
-                    // L4.21 fix: Invalidate kernel page cache (same as open path)
-                    self.notify_kernel_inval_inode(inode);
+                    // Note: Do NOT call notify_kernel_inval_inode here.
+                    // The read path is called after open(), which already
+                    // handles kernel page cache invalidation when needed
+                    // (only when the buffer was stale). Invalidating here
+                    // would discard valid kernel page cache when delayed
+                    // RELEASEs haven't synced yet.
                 }
                 Ok(_) => {
                     warn!(
