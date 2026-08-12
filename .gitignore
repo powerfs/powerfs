@@ -4,6 +4,7 @@ linux*
 xfstests-dev/
 docs/
 kernel/
+openraft/
 dynalock/
 lustre-release/
 cubefs/
