@@ -3519,7 +3519,13 @@ impl FileSystem for PowerFsFs {
                         if cache_offset >= file_size {
                             break;
                         }
-                        let actual_end = std::cmp::min(off + chunk_size, file_size - group_start);
+                        // Bound by both file_size and group_data.len() to prevent
+                        // slice out-of-bounds when group_data is shorter than expected
+                        // (e.g., EC reconstruction produced fewer bytes than file_size).
+                        let actual_end = std::cmp::min(
+                            off + chunk_size,
+                            std::cmp::min(file_size - group_start, group_data.len() as u64),
+                        );
                         let chunk_data = group_data[off as usize..actual_end as usize].to_vec();
                         self.chunk_cache
                             .put(inode, cache_offset, chunk_data.into(), mtime, 0);

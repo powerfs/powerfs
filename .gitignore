@@ -42,16 +42,6 @@ kvplan.md
 
 note.md
 
-# Kernel module build artifacts
-kernel/**/*.o
-kernel/**/*.ko
-kernel/**/*.mod.c
-kernel/**/*.mod
-kernel/**/Module.symvers
-kernel/**/modules.order
-kernel/**/.*.cmd
-kernel/**/.*.o
-
 # Prost/tonic generated proto files (generated to OUT_DIR by build.rs)
 powerfs-filer/src/powerfs.rs
 powerfs-master/src/volume_proto/powerfs.rs
