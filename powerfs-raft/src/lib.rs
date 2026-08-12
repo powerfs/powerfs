@@ -16,21 +16,24 @@
 
 #![allow(clippy::uninlined_format_args)]
 
-// ---- 阶段 2 启用的 proto 生成（占位，proto 文件待阶段 2 落地）----
-// pub mod protobuf {
-//     tonic::include_proto!("powerfs_raft");
-// }
-// mod pb_impl;
+// ---- 阶段 2：proto 生成 ----
+pub mod protobuf {
+    tonic::include_proto!("powerfs_raftpb");
+}
 
-// ---- 阶段 1/2 待实现的模块（占位声明，TODO 阶段 1-2 填充）----
-// pub mod store;       // RaftLogStorage + RaftStateMachine（RocksDB）
-// pub mod network;     // RaftNetwork / RaftNetworkFactory（gRPC 客户端）
-// pub mod grpc;        // RaftService gRPC 服务端（接收对端 RPC）
+pub mod grpc;
+pub mod multi;
+pub mod multi_network;
+pub mod network;
+pub mod pb_impl;
+pub mod store;
 
 use std::fmt;
 use std::io::Cursor;
 
-use openraft::{BasicNode, Raft};
+// 重新导出 openraft 的公共类型，方便上层（含集成测试）引用。
+pub use openraft::BasicNode;
+pub use openraft::Raft;
 
 // =============================================================================
 // TypeConfig
@@ -83,7 +86,7 @@ impl fmt::Display for MasterRequest {
 }
 
 /// Master 业务写入响应占位类型。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MasterResponse {
     pub ok: bool,
     pub message: String,
@@ -105,7 +108,7 @@ impl fmt::Display for FilerRequest {
 }
 
 /// Filer 业务写入响应占位类型。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FilerResponse {
     pub ok: bool,
     pub message: String,
@@ -157,7 +160,10 @@ mod tests {
         let _cfg = default_config();
         // 仅验证类型存在，不实例化 Raft（需 store/network，阶段 1-2 才有）
         let _req = MasterRequest { payload: vec![] };
-        let _resp = MasterResponse { ok: true, message: String::new() };
+        let _resp = MasterResponse {
+            ok: true,
+            message: String::new(),
+        };
         assert_eq!(_req.payload.len(), 0);
         assert!(_resp.ok);
     }

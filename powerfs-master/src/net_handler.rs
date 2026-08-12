@@ -12,7 +12,6 @@ use powerfs_net::{
     FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_BAD_REQUEST,
     STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
-use protobuf::Message as ProtoMessage;
 use std::sync::Arc;
 
 /// Master Net Handler implementation
@@ -985,57 +984,21 @@ impl MasterNetHandler {
         &self,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_val = dec.next_u64(FieldId::ShardId).unwrap_or(0);
-        let payload = dec.next_bytes(FieldId::RaftPayload).unwrap_or_default();
-
-        if payload.is_empty() {
-            warn!(
-                "MASTER_RAFT: received empty RaftPayload for shard {}",
-                shard_id_val
-            );
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_SERVER_ERROR,
-                b"empty raft payload".to_vec(),
-                Vec::new(),
-            ));
-        }
-
-        let mut raft_msg = raft::eraftpb::Message::new();
-        if let Err(e) = ProtoMessage::merge_from_bytes(&mut raft_msg, &payload) {
-            warn!("MASTER_RAFT: failed to deserialize Raft message: {}", e);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_SERVER_ERROR,
-                format!("failed to deserialize: {}", e).into_bytes(),
-                Vec::new(),
-            ));
-        }
-
-        debug!(
-            "MASTER_RAFT: received raft message (type={:?}, to={}, from={})",
-            raft_msg.msg_type, raft_msg.to, raft_msg.from
+        // openraft manages its own gRPC transport (RaftService started inside
+        // RaftNodeV2::new). The legacy TLV-based RaftMessage path is deprecated;
+        // return an error so any stale caller fails fast.
+        warn!(
+            "MASTER_RAFT: TLV RaftMessage transport is deprecated; \
+             openraft uses its own RaftService gRPC transport"
         );
-
-        let step_tx = self.master.raft_step_tx();
-        match step_tx.send(raft_msg).await {
-            Ok(_) => {
-                debug!("MASTER_RAFT: stepped raft message");
-                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
-            }
-            Err(e) => {
-                warn!("MASTER_RAFT: failed to step raft message: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    "failed to send message to step channel"
-                        .to_string()
-                        .into_bytes(),
-                    Vec::new(),
-                ))
-            }
-        }
+        Ok(Self::build_response(
+            msg,
+            STATUS_ERR_SERVER_ERROR,
+            "TLV raft transport deprecated; openraft uses gRPC RaftService"
+                .to_string()
+                .into_bytes(),
+            Vec::new(),
+        ))
     }
 
     /// Helper: build a response message

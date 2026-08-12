@@ -45,7 +45,7 @@ use crate::meta_shard_manager::{
     CrdtOverview, FilerStatus, MetaShardManager, OrsetStateDetail, ShardDetail,
 };
 use crate::metadata_store::MetadataStore;
-use crate::raft_group_manager::ShardId;
+use crate::raft_group_manager_v2::ShardId;
 use crate::s3_handler::S3Handler;
 use crate::shard_scheduler::{SchedulerConfig, SchedulerStatus};
 use crate::volume_router::VolumeRouter;

@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use protobuf::Message;
 use tonic::{Request, Response, Status};
 
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
-use crate::raft_group_manager::ShardId;
+use crate::raft_group_manager_v2::ShardId;
 use crate::shard_strategy::ShardStrategy;
 
 use super::powerfs::posix_meta_service_server::PosixMetaService;
@@ -15,13 +14,13 @@ use super::powerfs::{
     FileChunk as ProtoFileChunk, FindInodesByVolumeRequest, FindInodesByVolumeResponse,
     FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
     GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse, InodeChunkEntry,
-    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse,
-    LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest,
-    ListShardsResponse, LookupDirectoryEntryRequest, LookupDirectoryEntryResponse,
-    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse,
-    RaftMessageRequest, RaftMessageResponse, RemoveShardRequest, RenameEntryRequest,
-    RenameEntryResponse, ShardControlResponse, UpdateEntryRequest, UpdateEntryResponse,
-    UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
+    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
+    LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
+    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
+    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
+    RemoveShardRequest, RenameEntryRequest, RenameEntryResponse, ShardControlResponse,
+    UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
+    UpdateInodeSizeChunksResponse,
 };
 
 const S_IFDIR: u32 = 0o170000;
@@ -866,40 +865,15 @@ impl PosixMetaService for PosixMetaServiceImpl {
 
     async fn send_raft_message(
         &self,
-        request: Request<RaftMessageRequest>,
+        _request: Request<RaftMessageRequest>,
     ) -> Result<Response<RaftMessageResponse>, Status> {
-        let req = request.into_inner();
-        let shard_id = ShardId(req.shard_id);
-        let message_data = req.message;
-
-        log::debug!("Received Raft message for shard {}", shard_id.0);
-
-        // Deserialize the Raft message
-        let mut msg = raft::eraftpb::Message::new();
-        if let Err(e) = msg.merge_from_bytes(&message_data) {
-            log::error!("Failed to deserialize Raft message: {}", e);
-            return Ok(Response::new(RaftMessageResponse {
-                success: false,
-                error: format!("failed to deserialize message: {}", e),
-            }));
-        }
-
-        // Pass the message to the Raft group manager
-        let result = self
-            .meta_shard_manager
-            .step_raft_message(shard_id, msg)
-            .await;
-
-        match result {
-            Ok(_) => Ok(Response::new(RaftMessageResponse {
-                success: true,
-                error: "".to_string(),
-            })),
-            Err(e) => Ok(Response::new(RaftMessageResponse {
-                success: false,
-                error: e,
-            })),
-        }
+        log::warn!(
+            "send_raft_message is deprecated; openraft uses gRPC RaftService (MultiRaftServiceImpl)"
+        );
+        Ok(Response::new(RaftMessageResponse {
+            success: false,
+            error: "TLV raft transport deprecated; openraft uses gRPC RaftService".to_string(),
+        }))
     }
 
     async fn add_shard(
@@ -981,14 +955,16 @@ impl PosixMetaService for PosixMetaServiceImpl {
         let proto_entries: Vec<InodeChunkEntry> = entries
             .into_iter()
             .map(
-                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| InodeChunkEntry {
-                    inode,
-                    shard_id,
-                    needle_id,
-                    volume_id,
-                    offset,
-                    size,
-                    file_size,
+                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| {
+                    InodeChunkEntry {
+                        inode,
+                        shard_id,
+                        needle_id,
+                        volume_id,
+                        offset,
+                        size,
+                        file_size,
+                    }
                 },
             )
             .collect();
