@@ -4,3 +4,6 @@
 [submodule "s3-tests"]
 	path = s3-tests
 	url = https://github.com/FudanPPI/s3-tests.git
+[submodule "kernel"]
+	path = kernel
+	url = git@github.com:powerfs/powerfs-kernel.git

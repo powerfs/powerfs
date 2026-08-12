@@ -4,7 +4,6 @@ linux*
 prompt.md
 xfstests-dev/
 docs/
-kernel/
 dynalock/
 lustre-release/
 cubefs/
