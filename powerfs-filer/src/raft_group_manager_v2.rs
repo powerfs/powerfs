@@ -19,7 +19,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use std::time::Duration;
 use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
 use openraft::ServerState;
@@ -34,6 +33,7 @@ use powerfs_raft::BasicNode;
 use powerfs_raft::FilerRequest;
 use powerfs_raft::FilerTypeConfig;
 use rocksdb::DB;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
@@ -487,7 +487,10 @@ impl RaftGroupManagerV2 {
                 let is_forward = err_str.contains("has to forward request to")
                     || err_str.contains("not the leader");
                 if !is_forward {
-                    return Err(format!("client_write failed for shard {}: {}", shard_id.0, e));
+                    return Err(format!(
+                        "client_write failed for shard {}: {}",
+                        shard_id.0, e
+                    ));
                 }
                 // 是 ForwardToLeader 错误，继续转发流程
                 debug!(
@@ -558,7 +561,9 @@ impl RaftGroupManagerV2 {
                         shard_id.0, target_id, fwd_id, err
                     );
                     let peers = self.peers.read().await;
-                    forward_target = peers.get(&fwd_id.parse::<u64>().ok().unwrap_or(0)).map(|p| p.address.clone());
+                    forward_target = peers
+                        .get(&fwd_id.parse::<u64>().ok().unwrap_or(0))
+                        .map(|p| p.address.clone());
                     drop(peers);
                     retries += 1;
                     if retries >= 5 {
