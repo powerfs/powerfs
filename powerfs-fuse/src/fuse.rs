@@ -1224,7 +1224,10 @@ impl PowerFsFs {
         // by the inline release path. This happens when multiple overlapping
         // opens exist (FUSE kernel delays releases) and the first release
         // (inline path) removes the buffer before subsequent releases run.
-        if entry.fid.is_none() && entry.chunks.is_empty() && !self.inline_buffers.contains_key(&inode) {
+        if entry.fid.is_none()
+            && entry.chunks.is_empty()
+            && !self.inline_buffers.contains_key(&inode)
+        {
             debug!(
                 "sync_size_chunks_on_close: inode {} is Inline mode (no fid, no chunks, no buffer) — skipping Flat sync to preserve Filer inline_data",
                 inode
@@ -2081,7 +2084,10 @@ impl FileSystem for PowerFsFs {
                 if errno == libc::EIO {
                     error!("setattr RPC failed for inode {}: {}", inode, e);
                 } else {
-                    debug!("setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                    debug!(
+                        "setattr RPC failed for inode {}: {} -> errno={}",
+                        inode, e, errno
+                    );
                 }
                 std::io::Error::from_raw_os_error(errno)
             })?;
@@ -4934,7 +4940,10 @@ impl FileSystem for PowerFsFs {
             if !sync_ok {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
-            debug!("release inline: inode={} closed, size={}", inode, final_size);
+            debug!(
+                "release inline: inode={} closed, size={}",
+                inode, final_size
+            );
             return Ok(());
         }
 
@@ -5717,7 +5726,10 @@ impl FileSystem for PowerFsFs {
                         if errno == libc::EIO {
                             error!("fallocate setattr RPC failed for inode {}: {}", inode, e);
                         } else {
-                            debug!("fallocate setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                            debug!(
+                                "fallocate setattr RPC failed for inode {}: {} -> errno={}",
+                                inode, e, errno
+                            );
                         }
                         std::io::Error::from_raw_os_error(errno)
                     })?;
@@ -6018,9 +6030,10 @@ impl FileSystem for PowerFsFs {
         if xattrs.is_empty() {
             let meta_client = self.client.facade().meta_shard_client().clone();
             let shard_id = self.routing_shard(inode);
-            match self.client.block_on(async move {
-                meta_client.list_xattr(shard_id, inode).await
-            }) {
+            match self
+                .client
+                .block_on(async move { meta_client.list_xattr(shard_id, inode).await })
+            {
                 Ok(keys) => {
                     for key in &keys {
                         // Cache each key with an empty value so listxattr

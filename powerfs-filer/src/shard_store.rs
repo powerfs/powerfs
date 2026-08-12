@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::crdt_orset::{ServerDirORSet, Tombstone};
-use crate::raft_group_manager::{ShardCommand, ShardId};
+use crate::raft_group_manager_v2::{ShardCommand, ShardId};
 
 const CF_INODES: &str = "inodes";
 const CF_DIR_ENTRIES: &str = "dir_entries";
@@ -1659,7 +1659,7 @@ impl ShardStore {
         // causing phantom files to appear in readdir (ISSUE: phantom files
         // after inode reuse).
         let mut was_dir = false;
-        if let Some((is_file, is_dir)) = &removed {
+        if let Some((_, is_dir)) = &removed {
             if *is_dir {
                 was_dir = true;
                 let prefix = format!("{}:", inode);
@@ -2724,7 +2724,7 @@ impl ShardStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft_group_manager::ShardId;
+    use crate::raft_group_manager_v2::ShardId;
 
     fn make_store() -> ShardStore {
         let tmp_dir = std::env::temp_dir().join(format!(

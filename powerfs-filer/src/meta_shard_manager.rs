@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crate::crdt_orset::{
     DirEntryOrset, EntryTag, MergeResult, ServerDirORSet, ServerVectorClock, Tombstone,
 };
-use crate::raft_group_manager::{Peer, RaftGroupManager, ShardCommand, ShardId};
+use crate::raft_group_manager_v2::RaftGroupManagerV2;
+use crate::raft_group_manager_v2::{Peer, ShardCommand, ShardId};
 use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
 use crate::shard_strategy::ShardStrategy;
 use crate::tlv_volume_client::TlvVolumeClient;
@@ -128,7 +129,7 @@ pub struct OrsetStateDetail {
 }
 
 pub struct MetaShardManager {
-    raft_group_manager: Arc<RaftGroupManager>,
+    raft_group_manager: Arc<RaftGroupManagerV2>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
     /// Per-shard inode allocators. Each shard has its own counter within
@@ -185,7 +186,7 @@ const MAX_FILER_NODES: u64 = 64;
 
 impl MetaShardManager {
     pub fn new(
-        raft_group_manager: Arc<RaftGroupManager>,
+        raft_group_manager: Arc<RaftGroupManagerV2>,
         shard_strategy: Arc<ShardStrategy>,
         data_path: String,
         node_id: u64,
@@ -368,15 +369,11 @@ impl MetaShardManager {
     pub async fn create_shard(&self, shard_id: ShardId, peers: Vec<Peer>) -> Result<(), String> {
         let inode_range = self.shard_strategy.get_shard_range(shard_id);
 
-        self.raft_group_manager
-            .create_group(shard_id, peers)
-            .await?;
-
+        // create_group 返回 apply_rx（接收 applied log index）
         let mut apply_rx = self
             .raft_group_manager
-            .get_apply_rx(shard_id)
-            .await
-            .ok_or_else(|| format!("shard {} apply_rx not found", shard_id.0))?;
+            .create_group(shard_id, peers)
+            .await?;
 
         let db_path = format!("{}/shard_{}_data", self.data_path, shard_id.0);
         let shard_store = Arc::new(
@@ -419,9 +416,31 @@ impl MetaShardManager {
             }
         });
 
+        // apply 循环：接收 applied log index → 从 Raft 状态机读取 payload → 反序列化为 ShardCommand → 应用到 ShardStore
+        let mgr = self.raft_group_manager.clone();
         tokio::spawn(async move {
-            while let Some(entry) = apply_rx.recv().await {
-                shard_store.apply_command(entry.command);
+            while let Some(index) = apply_rx.recv().await {
+                match mgr.read_applied_entry(shard_id, index) {
+                    Ok(Some(payload)) => match ShardCommand::deserialize(&payload) {
+                        Ok(cmd) => shard_store.apply_command(cmd),
+                        Err(e) => error!(
+                            "shard {}: failed to deserialize ShardCommand at index {}: {}",
+                            shard_id.0, index, e
+                        ),
+                    },
+                    Ok(None) => {
+                        warn!(
+                            "shard {}: no applied entry at index {} (may be Blank/Membership)",
+                            shard_id.0, index
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "shard {}: failed to read applied entry at index {}: {}",
+                            shard_id.0, index, e
+                        );
+                    }
+                }
             }
         });
 
@@ -721,8 +740,7 @@ impl MetaShardManager {
                 // Without this wait, a subsequent getattr may read the stale
                 // nlink value (before decrement), causing T5.04 intermittent
                 // failures (expected nlink=1, actual nlink=2).
-                self.wait_for_nlink(shard_ino, inode, expected_nlink)
-                    .await;
+                self.wait_for_nlink(shard_ino, inode, expected_nlink).await;
             }
         } else {
             // Last link: delete the inode record. Best-effort: if this fails,
@@ -1013,7 +1031,9 @@ impl MetaShardManager {
             None => {
                 log::debug!(
                     "lookup: dir_entry not found parent_ino={} name='{}' shard={}",
-                    parent_inode, name, parent_shard.0
+                    parent_inode,
+                    name,
+                    parent_shard.0
                 );
                 return None;
             }
@@ -1028,7 +1048,10 @@ impl MetaShardManager {
             None => {
                 log::warn!(
                     "lookup: inode_shard {} not found for inode {} (parent={}, name='{}')",
-                    inode_shard.0, inode, parent_inode, name
+                    inode_shard.0,
+                    inode,
+                    parent_inode,
+                    name
                 );
                 return None;
             }
@@ -1040,7 +1063,10 @@ impl MetaShardManager {
                 log::warn!(
                     "lookup: inode record not found inode={} shard={} (parent={}, name='{}') \
                      — dir_entry exists but inode record missing (cross-shard apply lag)",
-                    inode, inode_shard.0, parent_inode, name
+                    inode,
+                    inode_shard.0,
+                    parent_inode,
+                    name
                 );
                 return None;
             }
@@ -1312,7 +1338,8 @@ impl MetaShardManager {
         for (idx, alloc) in allocators.iter().enumerate() {
             let shard_id = ShardId(idx as u64);
             let slot_start = alloc.shard_start + alloc.node_offset;
-            let slot_end = alloc.shard_start + alloc.node_offset
+            let slot_end = alloc.shard_start
+                + alloc.node_offset
                 + (self.shard_strategy.get_shard_range(shard_id).1
                     - self.shard_strategy.get_shard_range(shard_id).0)
                     / MAX_FILER_NODES;
@@ -2013,10 +2040,20 @@ impl MetaShardManager {
 
         // Phase A: bump nlink on the inode's own shard.
         let cmd_nlink = ShardCommand::IncrementNlink { inode };
-        match self.raft_group_manager.propose(shard_ino, cmd_nlink.serialize()).await {
-            Ok(idx) => info!("create_hard_link: Phase A IncrementNlink proposed on shard {} at index {}", shard_ino.0, idx),
+        match self
+            .raft_group_manager
+            .propose(shard_ino, cmd_nlink.serialize())
+            .await
+        {
+            Ok(idx) => info!(
+                "create_hard_link: Phase A IncrementNlink proposed on shard {} at index {}",
+                shard_ino.0, idx
+            ),
             Err(e) => {
-                error!("create_hard_link: Phase A IncrementNlink FAILED on shard {}: {}", shard_ino.0, e);
+                error!(
+                    "create_hard_link: Phase A IncrementNlink FAILED on shard {}: {}",
+                    shard_ino.0, e
+                );
                 return Err(e);
             }
         }
@@ -2029,10 +2066,20 @@ impl MetaShardManager {
             name: new_name.to_string(),
             inode,
         };
-        match self.raft_group_manager.propose(shard_dir, cmd_dir.serialize()).await {
-            Ok(idx) => info!("create_hard_link: Phase B AddDirEntry proposed on shard {} at index {}", shard_dir.0, idx),
+        match self
+            .raft_group_manager
+            .propose(shard_dir, cmd_dir.serialize())
+            .await
+        {
+            Ok(idx) => info!(
+                "create_hard_link: Phase B AddDirEntry proposed on shard {} at index {}",
+                shard_dir.0, idx
+            ),
             Err(e) => {
-                error!("create_hard_link: Phase B AddDirEntry FAILED on shard {}: {}", shard_dir.0, e);
+                error!(
+                    "create_hard_link: Phase B AddDirEntry FAILED on shard {}: {}",
+                    shard_dir.0, e
+                );
                 return Err(e);
             }
         }
@@ -2042,8 +2089,14 @@ impl MetaShardManager {
 
         // Verify nlink was actually incremented
         match self.get_inode(inode) {
-            Some(info) => info!("create_hard_link: verified nlink={} for inode={}", info.nlink, inode),
-            None => warn!("create_hard_link: inode {} not found after link creation", inode),
+            Some(info) => info!(
+                "create_hard_link: verified nlink={} for inode={}",
+                info.nlink, inode
+            ),
+            None => warn!(
+                "create_hard_link: inode {} not found after link creation",
+                inode
+            ),
         }
 
         Ok(())
@@ -3146,13 +3199,10 @@ impl MetaShardManager {
         Ok(info.epoch)
     }
 
-    /// Step a Raft message to the appropriate shard's Raft group
-    pub async fn step_raft_message(
-        &self,
-        shard_id: ShardId,
-        msg: raft::eraftpb::Message,
-    ) -> Result<(), String> {
-        self.raft_group_manager.step(shard_id, msg).await
+    /// Deprecated: Raft inter-node messaging is now handled by openraft's gRPC
+    /// RaftService (MultiRaftServiceImpl). TLV MsgType::RaftMessage is no longer used.
+    pub async fn step_raft_message(&self, _shard_id: ShardId) -> Result<(), String> {
+        Err("step_raft_message is deprecated; openraft uses gRPC RaftService".to_string())
     }
 
     // ========================================================================
@@ -3736,33 +3786,43 @@ fn extract_seq_from_delta(delta: &crate::powerfs::DeltaOp) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft_group_manager::RaftGroupManager;
+    use crate::raft_group_manager_v2::RaftGroupManagerV2;
     use crate::shard_strategy::ShardStrategy;
+    use std::sync::atomic::{AtomicU16, Ordering};
 
-    fn make_manager() -> Arc<MetaShardManager> {
+    static TEST_PORT: AtomicU16 = AtomicU16::new(30000);
+
+    fn next_test_port() -> u16 {
+        TEST_PORT.fetch_add(1, Ordering::SeqCst)
+    }
+
+    async fn make_manager() -> Arc<MetaShardManager> {
         let tmp_dir =
             std::env::temp_dir().join(format!("powerfs-filer-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_dir);
         let data_path = tmp_dir.to_string_lossy().to_string();
 
-        let raft_addr = "127.0.0.1:19999".to_string();
-        let raft_mgr = Arc::new(RaftGroupManager::new(1, raft_addr, data_path.clone()));
+        let port = next_test_port();
+        let raft_addr = format!("127.0.0.1:{}", port);
+        let raft_mgr = RaftGroupManagerV2::new(1, raft_addr, format!("{}/raft", data_path))
+            .await
+            .unwrap();
         let strategy = Arc::new(ShardStrategy::new(4));
         Arc::new(MetaShardManager::new(raft_mgr, strategy, data_path, 1))
     }
 
-    #[test]
-    fn test_crdt_maintenance_empty_state() {
-        let mgr = make_manager();
+    #[tokio::test]
+    async fn test_crdt_maintenance_empty_state() {
+        let mgr = make_manager().await;
         let (tombstone_cleaned, orset_count, delta_trimmed) = mgr.crdt_maintenance(24, true);
         assert_eq!(tombstone_cleaned, 0, "no shard stores yet");
         assert_eq!(orset_count, 0, "no orset states yet");
         assert_eq!(delta_trimmed, 0, "no delta logs yet");
     }
 
-    #[test]
-    fn test_crdt_maintenance_disable_delta_compaction() {
-        let mgr = make_manager();
+    #[tokio::test]
+    async fn test_crdt_maintenance_disable_delta_compaction() {
+        let mgr = make_manager().await;
         // Populate a delta log manually
         let log = mgr.get_or_create_delta_log(ShardId(0));
         for i in 0..200 {
@@ -3786,9 +3846,9 @@ mod tests {
         assert_eq!(after, before, "entries untouched");
     }
 
-    #[test]
-    fn test_crdt_maintenance_delta_log_compaction() {
-        let mgr = make_manager();
+    #[tokio::test]
+    async fn test_crdt_maintenance_delta_log_compaction() {
+        let mgr = make_manager().await;
         let log = mgr.get_or_create_delta_log(ShardId(0));
         // Fill log beyond 50% of capacity (max_size=10000, trigger at >5000)
         for i in 0..6000 {
@@ -3818,9 +3878,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_crdt_maintenance_small_log_no_compaction() {
-        let mgr = make_manager();
+    #[tokio::test]
+    async fn test_crdt_maintenance_small_log_no_compaction() {
+        let mgr = make_manager().await;
         let log = mgr.get_or_create_delta_log(ShardId(0));
         for i in 0..100 {
             log.append(

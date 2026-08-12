@@ -5,7 +5,6 @@ pub mod dynamic_log;
 pub mod error;
 pub mod event;
 pub mod id_generator;
-pub mod raft;
 pub mod retry;
 pub mod storage;
 pub mod system_metrics;

@@ -1228,7 +1228,7 @@ impl MasterService for MasterGrpcServer {
         );
 
         // 单节点模式下不支持 leader 转移
-        match self.master.raft_transfer_leader(req.target_node_id) {
+        match self.master.raft_transfer_leader(req.target_node_id).await {
             Ok(()) => Ok(Response::new(TransferLeaderResponse {
                 success: true,
                 error: String::new(),

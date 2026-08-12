@@ -1,4 +1,6 @@
-use powerfs_fuse::cache::{CachedEntry, MetadataCache, UpdateAttrParams, ROOT_INODE};
+use powerfs_fuse::cache::{
+    CachedEntry, EntryState, HoldState, MetadataCache, UpdateAttrParams, ROOT_INODE,
+};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +34,8 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         replica_chunks: Vec::new(),
         shard_id: None,
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 
@@ -64,6 +68,8 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         replica_chunks: Vec::new(),
         shard_id: None,
         cached_at: Instant::now(),
+        state: EntryState::default(),
+        hold: HoldState::default(),
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::meta_shard_manager::MetaShardManager;
-use crate::raft_group_manager::ShardId;
+use crate::raft_group_manager_v2::ShardId;
 use crate::shard_strategy::ShardStrategy;
 
 use super::powerfs::filer_meta_service_server::FilerMetaService;
@@ -883,14 +883,16 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let proto_entries: Vec<InodeChunkEntry> = entries
             .into_iter()
             .map(
-                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| InodeChunkEntry {
-                    inode,
-                    shard_id,
-                    needle_id,
-                    volume_id,
-                    offset,
-                    size,
-                    file_size,
+                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| {
+                    InodeChunkEntry {
+                        inode,
+                        shard_id,
+                        needle_id,
+                        volume_id,
+                        offset,
+                        size,
+                        file_size,
+                    }
                 },
             )
             .collect();

@@ -108,9 +108,10 @@ Master 与 Filer 各一份（Filer 多组时可共用同一 TypeConfig，组 ID 
 
 ### 3.3 存储拆分
 
-- `RaftLogStorage`：仅管日志 CF（`raft_log`）。方法 `append` / `truncate` / `get_entry` / `hard_state`（openraft 内部用）/ `save_committed` 等。
-- `RaftStateMachine`：管 `raft_state` CF（last_applied / membership）+ `raft_snapshot` CF（快照数据）。实现 `RaftSnapshotBuilder::build_snapshot` + `apply`。
-- 复用现有 3 个 RocksDB CF，不改磁盘格式（保证迁移期可读旧数据）。
+- `RaftLogStorage`：仅管日志 CF（`raft_log`）+ 元数据 CF（`raft_log_meta`：vote / last_purged）。方法 `append` / `truncate` / `purge` / `save_vote` / `get_log_state` 等。
+- `RaftStateMachine`：管 `raft_state_meta` CF（last_applied_log / last_membership）+ `raft_state_data` CF（业务状态）+ 快照目录（`snapshot_dir`，文件名按 log_id 序排序）。实现 `apply` / `applied_state` / `build_snapshot` / `install_snapshot` / `get_current_snapshot`。
+- **不复用旧 RocksDB CF 数据格式**（决策 6.6 已确认全量重建）：旧 `eraftpb` entry 与 openraft `Entry<C>` 序列化不兼容，新存储首次启动清理旧 CF。CF 命名沿用 powerfs-master 风格（`raft_*` 前缀）。
+- **存储实现策略（2026-08-12 确认）**：在 `powerfs-raft` 内重新实现 `RocksLogStore<C>` + `RocksStateMachine<C>`，泛型于 `C: RaftTypeConfig`（同一份代码服务 Master + Filer）。参考 `openraft/examples/log-rocks`（log 层范本）与 `openraft/examples/sm-rocks`（state machine 范本），但不直接 path-dep（避免与 crates.io openraft 版本冲突）。总代码量约 700 行。
 - 旧 `RocksDbStorage` / `RocksDbRaftStorage` 的内存 `entries` 缓存删除——openraft 直接走 RocksDB，避免双写。
 
 ### 3.4 传输层
@@ -289,6 +290,24 @@ openraft：`raft.change_membership(ChangeMembers::AddVoters(ids) | RemoveVoters(
 4. ✅ 已确认：不用 feature flag，直接在分支上替换（§6.5 → B）。
 5. ✅ 已确认：openraft 依赖走 crates.io（§6.4 → A，已验证 0.10.0-alpha.33 可拉取编译）。
 6. ✅ 已确认：Master 先、Filer 后（§6.5 节奏 → Master 先行）。
+7. ✅ **阶段 1 完成（2026-08-12）**：`powerfs-raft` 内实现 `RocksLogStore<C>` + `RocksStateMachine<C>`，通过 `openraft::testing::Suite` 官方存储一致性套件（`1 passed; 0 failed`，8.6s）。CF 布局：`raft_log` / `raft_log_meta` / `raft_state_meta` / `raft_state_data`。Normal entry payload 存储留给阶段 3/4 业务特定实现。
+8. ✅ **阶段 2 完成（2026-08-12）**：gRPC 传输层落地。新增 `proto/raft.proto`（NodeId=string，Entry.app_data=bytes）+ `pb_impl.rs`（泛型于 `C: RaftTypeConfig` 的 proto ↔ openraft 类型转换）+ `network.rs`（`RaftNetworkV2` 客户端，实现 Vote/AppendEntries/StreamAppend/FullSnapshot RPC）+ `grpc.rs`（`RaftService` 服务端，处理入站 RPC 并转发给 `Raft<C, RocksStateMachine>`）。端到端集成测试 `tests/grpc_cluster.rs` 启动 3 节点集群，验证 Vote/AppendEntries/StreamAppend RPC：领导者选举、成员变更（add_learner + change_membership）、10 条日志复制全部通过（0.43s）。
+9. ✅ **阶段 3 完成（2026-08-12）**：Master 节点接入 openraft。`RocksStateMachine::apply()` 增强：存储 Normal entry payload 到 `raft_state_data` CF + 通过 channel 通知 applied index。新增 `raft_v2.rs`（`RaftNodeV2` 封装 `Raft<MasterTypeConfig, RocksStateMachine>`，提供 propose/add_learner/change_membership/transfer_leader/scan_applied_entries API）。`master.rs` 完全替换 `RaftNode` → `RaftNodeV2`：初始化、apply 循环（u64 index → read_applied_entry → 反序列化 RaftCommand）、propose（双重 apply：本地立即 + Raft 持久化）、transfer_leader（async）、get_cluster_info。废弃 TLV raft 消息转发器和 `raft_message_stream` gRPC（openraft 用自己的 RaftService gRPC）。`cargo check`/`clippy`/`fmt` 干净，workspace 全部测试通过（0 failures）。
+10. ✅ **阶段 4 完成（2026-08-12）**：Filer 多组接入 openraft。扩展 `raft.proto` 新增 `group_id` 字段支持多组路由（VoteRequest/AppendEntriesRequest/SnapshotRequestMeta）。实现多组服务端路由 `MultiRaftRouter<C>` + `MultiRaftServiceImpl<C>`（按 group_id 分发入站 RPC）。实现多组客户端网络层 `MultiGroupRouter` + `MultiNetworkFactory`（共享 gRPC 连接池，按 group_id 携带出站 RPC）。创建 `RaftGroupManagerV2`（替代旧 `RaftGroupManager`，管理每 shard 的 `Raft<FilerTypeConfig, RocksStateMachine>` 实例 + 共享 gRPC 服务 + apply 通知 channel）。适配 `MetaShardManager`（create_shard 使用新 apply 循环：apply_rx → read_applied_entry → ShardCommand::deserialize → shard_store.apply_command）、`ShardScheduler`、`main.rs`。废弃 `net_handler.rs` 的 TLV `handle_raft_message`。`cargo check`/`clippy`/`fmt` 干净，workspace 全部测试通过（0 failures）。
+11. ✅ **阶段 5 完成（2026-08-12）**：清理旧 raft-rs 代码。删除旧文件：`powerfs-filer/src/raft_group_manager.rs`、`powerfs-master/src/raft_node.rs`、`raft_storage.rs`、`raft_server.rs`、`raft_client.rs`、`powerfs-common/src/raft/mod.rs`、`powerfs-common/src/raft/storage.rs`。共享类型（Peer/ApplyEntry/RaftCommand/RaftVolumeShortInfo）迁移到 [raft_group_manager_v2.rs](file:///home/portion/powerfs/powerfs-filer/src/raft_group_manager_v2.rs) 和 [raft_v2.rs](file:///home/portion/powerfs/powerfs-master/src/raft_v2.rs)。移除所有 Cargo.toml 中的 `raft` 和 `protobuf` 依赖（workspace + powerfs-master + powerfs-filer + powerfs-common）。修复 [powerfs-common/src/error.rs](file:///home/portion/powerfs/powerfs-common/src/error.rs) 残留的 `raft` 导入和 `Raft(Box<raft::Error>)` 错误变体。`cargo build --workspace` 通过（仅 3 个无关的 dead code/unused variable 警告），`cargo test --workspace --lib --bins --tests` 全部通过（0 failures）。
+
+---
+
+## 10. 实施进度
+
+| 阶段 | 状态 | 完成日期 | 备注 |
+|---|---|---|---|
+| 0 | ✅ 完成 | 2026-08-12 | 依赖接入 + TypeConfig + crate 骨架 |
+| 1 | ✅ 完成 | 2026-08-12 | RocksLogStore + RocksStateMachine + Suite 全绿 |
+| 2 | ✅ 完成 | 2026-08-12 | gRPC 传输层（proto + pb_impl + network + grpc）+ 3 节点端到端测试通过 |
+| 3 | ✅ 完成 | 2026-08-12 | Master 接入（RocksStateMachine apply 增强 + raft_v2.rs + master.rs 全替换）|
+| 4 | ✅ 完成 | 2026-08-12 | Filer 多组接入（raft.proto group_id + MultiRaftRouter/MultiRaftServiceImpl + MultiGroupRouter/MultiNetworkFactory + RaftGroupManagerV2 + MetaShardManager/ShardScheduler/main.rs 适配 + TLV RaftMessage 废弃）|
+| 5 | ✅ 完成 | 2026-08-12 | 清理旧 raft-rs 代码（删除 7 个旧文件 + 移除 raft/protobuf 依赖 + 修复 error.rs 残留引用 + 类型迁移到 v2 文件）|
 
 ---
 
@@ -299,4 +318,4 @@ openraft：`raft.change_membership(ChangeMembers::AddVoters(ids) | RemoveVoters(
 - gRPC 示例：[openraft/examples/raft-kv-memstore-grpc/](file:///home/portion/powerfs/openraft/examples/raft-kv-memstore-grpc/)
 - multiraft：[openraft/multiraft/](file:///home/portion/powerfs/openraft/multiraft/)
 - openraft 升级文档：[openraft/openraft/src/docs/upgrade_guide/upgrade.md](file:///home/portion/powerfs/openraft/openraft/src/docs/upgrade_guide/upgrade.md)
-- 当前实现：[raft_storage.rs](file:///home/portion/powerfs/powerfs-master/src/raft_storage.rs) / [raft_node.rs](file:///home/portion/powerfs/powerfs-master/src/raft_node.rs) / [raft_group_manager.rs](file:///home/portion/powerfs/powerfs-filer/src/raft_group_manager.rs) / [powerfs-common/src/raft/storage.rs](file:///home/portion/powerfs/powerfs-common/src/raft/storage.rs)
+- 当前实现（v2）：[raft_v2.rs](file:///home/portion/powerfs/powerfs-master/src/raft_v2.rs)（Master）/ [raft_group_manager_v2.rs](file:///home/portion/powerfs/powerfs-filer/src/raft_group_manager_v2.rs)（Filer）/ [powerfs-raft/src/store/](file:///home/portion/powerfs/powerfs-raft/src/store/)（存储层）/ [powerfs-raft/src/grpc.rs](file:///home/portion/powerfs/powerfs-raft/src/grpc.rs)（gRPC 服务端）/ [powerfs-raft/src/network.rs](file:///home/portion/powerfs/powerfs-raft/src/network.rs)（gRPC 客户端）/ [powerfs-raft/src/multi.rs](file:///home/portion/powerfs/powerfs-raft/src/multi.rs) + [multi_network.rs](file:///home/portion/powerfs/powerfs-raft/src/multi_network.rs)（多组路由）
