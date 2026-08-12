@@ -199,9 +199,7 @@ impl ShardedRpcPool {
         //    growth.
         if let Err(e) = self.workers[worker_idx].try_send((req, tx)) {
             let err = match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    ClientError::QueueFull(WORKER_QUEUE_CAPACITY)
-                }
+                mpsc::error::TrySendError::Full(_) => ClientError::QueueFull(WORKER_QUEUE_CAPACITY),
                 mpsc::error::TrySendError::Closed(_) => {
                     ClientError::Internal("worker channel closed".to_string())
                 }

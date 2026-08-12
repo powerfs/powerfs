@@ -136,6 +136,7 @@ pub struct ShardScheduler {
     last_check_time: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[allow(dead_code)]
 impl ShardScheduler {
     pub fn new(
         raft_group_manager: Arc<RaftGroupManager>,
