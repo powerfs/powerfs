@@ -2285,8 +2285,8 @@ impl MetaShardManager {
                     break;
                 }
                 Err(e) => {
-                    let is_forward = e.contains("not the leader")
-                        || e.contains("has to forward request to");
+                    let is_forward =
+                        e.contains("not the leader") || e.contains("has to forward request to");
                     if is_forward {
                         propose_retries += 1;
                         if propose_retries >= 60 {
