@@ -1400,6 +1400,10 @@ impl MetaShardClient {
             };
             encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
                 .map_err(|e| format!("encode_file_layout: {}", e))?;
+            // IsAppend flag: tell the Filer to append (not overwrite) inline_data
+            if req.is_append {
+                enc.add_u8(FieldId::IsAppend, 1);
+            }
         } else if !req.chunks.is_empty() {
             let chunks: Vec<ChunkRef> = req
                 .chunks
@@ -1865,7 +1869,11 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
 fn parse_layout_from_body(body: &[u8]) -> Option<powerfs_layout::layout::FileLayout> {
     use powerfs_net::serialize::TlvDecoder;
     let mut dec = TlvDecoder::new(body);
-    powerfs_layout::codec::decode_file_layout(&mut dec).ok()
+    // Use decode_file_layout_from_mixed because the body starts with
+    // non-FileLayout fields (Ino/Mode/Name/ShardId). decode_file_layout
+    // alone would stop at the first non-FileLayout field and return an
+    // empty default layout, missing the Inline/Stripe placement.
+    powerfs_layout::codec::decode_file_layout_from_mixed(&mut dec).ok()
 }
 
 /// P2.5: 构造 MetadataAttr 并从响应 body 解析 FileLayout, 提取

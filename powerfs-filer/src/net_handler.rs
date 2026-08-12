@@ -52,6 +52,17 @@ pub struct FilerNetHandler {
     /// 跳过 Volume Server 分配. 父目录 `powerfs.inline` xattr 可覆盖此值.
     /// 上限 8KB (Placement::Inline 硬上限).
     inline_max_size: std::sync::atomic::AtomicU32,
+    /// L4.21 fix: Global monotonically increasing version counter for
+    /// cache invalidation notifications. Initialized to current time in
+    /// milliseconds to survive Filer restarts (new start time >= old time).
+    ///
+    /// Previously, notify_inode_change used SystemTime::now().as_secs()
+    /// (1-second resolution). Multiple operations within the same second
+    /// produced the same version, causing the client's is_duplicate check
+    /// (version <= last_seen) to suppress subsequent notifications —
+    /// clients only saw the first change per second, missing concurrent
+    /// appends from other clients.
+    version_counter: std::sync::atomic::AtomicU64,
 }
 
 /// P2.5: Inline 模式硬上限 (Placement::Inline 的 max_size 不可超过此值)
@@ -134,6 +145,7 @@ impl FilerNetHandler {
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
+            version_counter: Self::init_version_counter(),
         }
     }
 
@@ -153,7 +165,33 @@ impl FilerNetHandler {
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
+            version_counter: Self::init_version_counter(),
         }
+    }
+
+    /// L4.21 fix: Initialize the version counter to current time in
+    /// milliseconds. This ensures that after a Filer restart, the counter
+    /// starts from a value >= any previously-sent version (which were also
+    /// time-based), so clients don't suppress new notifications as stale.
+    fn init_version_counter() -> std::sync::atomic::AtomicU64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        std::sync::atomic::AtomicU64::new(now_ms)
+    }
+
+    /// L4.21 fix: Generate the next monotonically increasing version number.
+    /// Each call returns a unique value, guaranteeing that no two
+    /// notify_inode_change calls produce the same version — even if they
+    /// happen in the same millisecond. This fixes the root cause of L4.21
+    /// where the client's is_duplicate check (version <= last_seen)
+    /// suppressed concurrent append notifications that shared the same
+    /// second-resolution timestamp.
+    fn next_version(&self) -> u64 {
+        self.version_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// P2.5: 设置 Inline 小文件全局阈值 (字节). 0 = 禁用.
@@ -869,8 +907,7 @@ impl FilerNetHandler {
                 // possibly size) changed. Without this, truncate operations
                 // via SetAttr are invisible to other clients' cached metadata
                 // until TTL expiry, causing stale reads.
-                let now = chrono::Utc::now().timestamp() as u64;
-                self.notify_inode_change(ino, now);
+                self.notify_inode_change(ino, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -909,8 +946,7 @@ impl FilerNetHandler {
         {
             Ok(_) => {
                 // Notify other clients that this inode's data (size/chunks) changed
-                let now = chrono::Utc::now().timestamp() as u64;
-                self.notify_inode_change(ino, now);
+                self.notify_inode_change(ino, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -981,7 +1017,7 @@ impl FilerNetHandler {
         {
             Ok(_) => {
                 // Notify other clients that this inode's metadata changed
-                self.notify_inode_change(ino, timestamp);
+                self.notify_inode_change(ino, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -1138,9 +1174,9 @@ impl FilerNetHandler {
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(parent_ino, now);
-                self.notify_inode_change(ino, now);
+                let v = self.next_version();
+                self.notify_inode_change(parent_ino, v);
+                self.notify_inode_change(ino, v);
 
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
@@ -1317,9 +1353,9 @@ impl FilerNetHandler {
                     .await;
 
                 // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(parent_ino, now);
-                self.notify_inode_change(info.inode, now);
+                let v = self.next_version();
+                self.notify_inode_change(parent_ino, v);
+                self.notify_inode_change(info.inode, v);
 
                 // Return full attributes so the FUSE client can populate its
                 // cache with correct nlink/size/uid/gid/timestamps. Previously
@@ -1387,9 +1423,9 @@ impl FilerNetHandler {
                 match self.meta_shard_manager.delete_file(parent_ino, &name).await {
                     Ok(_) => {
                         // B5: notify 目录条目变更（parent readdir 缓存 + 被删 inode 失效）
-                        let now = crate::shard_store::ShardStore::current_time();
-                        self.notify_inode_change(parent_ino, now);
-                        self.notify_inode_change(info.inode, now);
+                        let v = self.next_version();
+                        self.notify_inode_change(parent_ino, v);
+                        self.notify_inode_change(info.inode, v);
                         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
                     }
                     Err(e) => {
@@ -1432,8 +1468,7 @@ impl FilerNetHandler {
         {
             Ok(_) => {
                 // B5: notify 目录条目变更
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(parent_ino, now);
+                self.notify_inode_change(parent_ino, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -1476,16 +1511,34 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
+        // Look up the source inode BEFORE renaming so we can notify
+        // subscribers of the renamed inode itself. Without this, clients
+        // that have the old dentry cached continue to serve stale entries
+        // after a rename (L4.13 dentry cache invalidation failure).
+        // This mirrors handle_unlink's pattern of notifying info.inode.
+        let renamed_inode = self
+            .meta_shard_manager
+            .lookup(old_parent_ino, &old_name)
+            .map(|info| info.inode);
+
         match self
             .meta_shard_manager
             .rename(old_parent_ino, &old_name, new_parent_ino, &new_name)
             .await
         {
             Ok(_) => {
-                // B5: notify 两个目录条目变更
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(old_parent_ino, now);
-                self.notify_inode_change(new_parent_ino, now);
+                // B5: notify 两个目录条目变更 + 被重命名 inode 本身
+                // Notifying the renamed inode is critical: it triggers
+                // FUSE_NOTIFY_INVAL_ENTRY on clients so they drop the old
+                // dentry cache, and FUSE_NOTIFY_INVAL_INODE to drop page
+                // cache. Without it, cross-client stat/ls on the old name
+                // continues to succeed after rename.
+                let v = self.next_version();
+                self.notify_inode_change(old_parent_ino, v);
+                self.notify_inode_change(new_parent_ino, v);
+                if let Some(inode) = renamed_inode {
+                    self.notify_inode_change(inode, v);
+                }
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -1800,6 +1853,11 @@ impl FilerNetHandler {
             _ => dec.next_bytes(FieldId::InlineData).ok(),
         };
 
+        // IsAppend flag: when 1, the Filer appends inline_data to the
+        // existing data instead of overwriting (cross-client concurrent
+        // append support). Absent → false (overwrite, backward compatible).
+        let is_append = dec.next_u8(FieldId::IsAppend).unwrap_or(0) != 0;
+
         // 安全检查: inline_data 不应超过 8KB (Placement::Inline 的硬上限)
         if let Some(d) = &inline_data {
             if d.len() > 8 * 1024 {
@@ -1839,7 +1897,7 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data)
+            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data, is_append)
             .await
         {
             Ok(_) => {
@@ -1848,11 +1906,13 @@ impl FilerNetHandler {
                 // entries. Without this, a second client that previously
                 // looked up the file would keep serving the old content
                 // until the 30s TTL expires.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                self.notify_inode_change(inode, now);
+                //
+                // L4.21 fix: use next_version() instead of SystemTime seconds
+                // to ensure each notification has a unique, monotonically
+                // increasing version. This prevents the client's is_duplicate
+                // check from suppressing concurrent append notifications that
+                // would otherwise share the same second-resolution timestamp.
+                self.notify_inode_change(inode, self.next_version());
                 // 成功: STATUS_OK + 空 body
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
@@ -2047,12 +2107,11 @@ impl FilerNetHandler {
             .await
         {
             Ok(()) => {
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(inode, now);
+                self.notify_inode_change(inode, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
-                warn!("FILER_NET_SETXATTR: failed for inode {}: {}", inode, e);
+                warn!("FILER_NET_SETXATTR failed: {}", e);
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
@@ -2133,8 +2192,7 @@ impl FilerNetHandler {
             .await
         {
             Ok(()) => {
-                let now = crate::shard_store::ShardStore::current_time();
-                self.notify_inode_change(inode, now);
+                self.notify_inode_change(inode, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
@@ -2492,7 +2550,30 @@ impl NetHandler for FilerNetHandler {
                 }
                 Ok(response)
             }
-            MsgType::GetAttr => self.handle_getattr(msg).await,
+            MsgType::GetAttr => {
+                let response = self.handle_getattr(msg).await?;
+                // Subscribe the client to the inode's notifications so it
+                // receives Invalidate messages when the file is modified by
+                // another client. Without this, a client that accesses a file
+                // via getattr (e.g., `cat`, `md5sum`, `stat`) won't be
+                // notified of changes, causing stale reads.
+                if response.header.status == STATUS_OK {
+                    if let Some(ref notifier) = self.inode_notifier {
+                        let client_id = ctx.client.client_id;
+                        let ino = TlvDecoder::new(&msg.body)
+                            .next_u64(FieldId::Ino)
+                            .unwrap_or(0);
+                        if ino != 0 {
+                            notifier.subscribe(ino, client_id);
+                            info!(
+                                "FILER_NET_SUBSCRIBE: client {} subscribed to inode {} (getattr)",
+                                client_id, ino
+                            );
+                        }
+                    }
+                }
+                Ok(response)
+            }
             MsgType::SetAttr => self.handle_setattr(msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
             MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,

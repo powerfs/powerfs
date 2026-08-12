@@ -121,6 +121,12 @@ pub struct UpdateInodeSizeChunksRequest {
     /// 数据直接存 Filer 元数据, chunks 应为空. None 时走原 Flat 路径.
     #[serde(default)]
     pub inline_data: Option<Vec<u8>>,
+    /// When true, the Filer appends `inline_data` to the existing inline_data
+    /// instead of overwriting. Used by FUSE release to support cross-client
+    /// concurrent appends without lost updates. The `size` field is ignored
+    /// in append mode (the Filer computes the new size).
+    #[serde(default)]
+    pub is_append: bool,
 }
 
 /// update_inode_size_chunks 响应体

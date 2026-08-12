@@ -153,6 +153,8 @@ pub enum ShardCommand {
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         #[serde(default)]
         inline_data: Option<Vec<u8>>,
+        #[serde(default)]
+        is_append: bool,
     },
     /// P3: Set an extended attribute on an inode (persisted via Raft).
     /// Used for `powerfs.placement` xattr on directories.
