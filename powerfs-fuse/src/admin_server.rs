@@ -95,7 +95,10 @@ async fn handle_connection(
             let snap = stats.snapshot();
             match serde_json::to_string(&snap) {
                 Ok(json) => ("200 OK", json),
-                Err(e) => ("500 Internal Server Error", format!("{{\"error\":\"{}\"}}", e)),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    format!("{{\"error\":\"{}\"}}", e),
+                ),
             }
         }
         "/health" => ("200 OK", r#"{"status":"ok"}"#.to_string()),

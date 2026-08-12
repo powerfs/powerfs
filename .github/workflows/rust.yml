@@ -2,9 +2,9 @@ name: Rust CI
 
 on:
   push:
-    branches: [ fronted, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
   pull_request:
-    branches: [ fronted, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
 
 env:
   CARGO_TERM_COLOR: always

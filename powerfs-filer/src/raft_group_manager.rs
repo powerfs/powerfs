@@ -53,6 +53,7 @@ pub struct ApplyEntry {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ShardCommand {
     CreateFile {
         parent_inode: u64,
@@ -1040,6 +1041,7 @@ pub struct RaftGroupManager {
     // Per-shard leader-transfer senders, cached so `transfer_shard_leader`
     // can queue a transfer through the run() select! loop WITHOUT acquiring
     // the group RwLock (which is permanently held by run()).
+    #[allow(clippy::type_complexity)]
     shard_transfer_txs:
         RwLock<HashMap<ShardId, mpsc::Sender<(u64, oneshot::Sender<Result<(), String>>)>>>,
     // Per-shard apply receivers, stored before event loop starts to avoid

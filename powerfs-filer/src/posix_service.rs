@@ -15,13 +15,13 @@ use super::powerfs::{
     FileChunk as ProtoFileChunk, FindInodesByVolumeRequest, FindInodesByVolumeResponse,
     FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
     GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse, InodeChunkEntry,
-    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse,
-    LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest,
-    ListShardsResponse, LookupDirectoryEntryRequest, LookupDirectoryEntryResponse,
-    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse,
-    RaftMessageRequest, RaftMessageResponse, RemoveShardRequest, RenameEntryRequest,
-    RenameEntryResponse, ShardControlResponse, UpdateEntryRequest, UpdateEntryResponse,
-    UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
+    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
+    LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
+    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
+    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
+    RemoveShardRequest, RenameEntryRequest, RenameEntryResponse, ShardControlResponse,
+    UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
+    UpdateInodeSizeChunksResponse,
 };
 
 const S_IFDIR: u32 = 0o170000;
@@ -981,14 +981,16 @@ impl PosixMetaService for PosixMetaServiceImpl {
         let proto_entries: Vec<InodeChunkEntry> = entries
             .into_iter()
             .map(
-                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| InodeChunkEntry {
-                    inode,
-                    shard_id,
-                    needle_id,
-                    volume_id,
-                    offset,
-                    size,
-                    file_size,
+                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| {
+                    InodeChunkEntry {
+                        inode,
+                        shard_id,
+                        needle_id,
+                        volume_id,
+                        offset,
+                        size,
+                        file_size,
+                    }
                 },
             )
             .collect();

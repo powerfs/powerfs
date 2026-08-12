@@ -1664,7 +1664,7 @@ impl ShardStore {
         // causing phantom files to appear in readdir (ISSUE: phantom files
         // after inode reuse).
         let mut was_dir = false;
-        if let Some((is_file, is_dir)) = &removed {
+        if let Some((_is_file, is_dir)) = &removed {
             if *is_dir {
                 was_dir = true;
                 let prefix = format!("{}:", inode);
@@ -2474,6 +2474,7 @@ impl ShardStore {
     }
 
     /// Set inode attributes
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         inode: u64,

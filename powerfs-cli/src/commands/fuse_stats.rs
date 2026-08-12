@@ -72,9 +72,9 @@ fn fetch_stats(addr: &str) -> Result<String> {
 
     // Parse HTTP response: skip headers, return body
     let response_str = String::from_utf8_lossy(&response);
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .ok_or_else(|| PowerFsError::Internal("malformed HTTP response (no header/body separator)".into()))?;
+    let body_start = response_str.find("\r\n\r\n").ok_or_else(|| {
+        PowerFsError::Internal("malformed HTTP response (no header/body separator)".into())
+    })?;
     let body = &response_str[body_start + 4..];
 
     // Check HTTP status
@@ -99,10 +99,19 @@ fn display_formatted(json_str: &str, addr: &str) -> Result<()> {
     println!("═══════════════════════════════════════════════════════════════");
 
     // Global summary
-    let total_submitted = v.get("total_submitted").and_then(|x| x.as_u64()).unwrap_or(0);
-    let total_completed = v.get("total_completed").and_then(|x| x.as_u64()).unwrap_or(0);
+    let total_submitted = v
+        .get("total_submitted")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let total_completed = v
+        .get("total_completed")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
     let total_errors = v.get("total_errors").and_then(|x| x.as_u64()).unwrap_or(0);
-    let in_flight = v.get("in_flight_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    let in_flight = v
+        .get("in_flight_count")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
     let uptime = v.get("uptime_secs").and_then(|x| x.as_u64()).unwrap_or(0);
 
     println!("\n┌─ Global ────────────────────────────────────────────────────");
@@ -144,7 +153,10 @@ fn display_formatted(json_str: &str, addr: &str) -> Result<()> {
                 let completed = stats.get("completed").and_then(|x| x.as_u64()).unwrap_or(0);
                 let errors = stats.get("errors").and_then(|x| x.as_u64()).unwrap_or(0);
                 let timeouts = stats.get("timeouts").and_then(|x| x.as_u64()).unwrap_or(0);
-                let queue_fulls = stats.get("queue_fulls").and_then(|x| x.as_u64()).unwrap_or(0);
+                let queue_fulls = stats
+                    .get("queue_fulls")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
                 let min_us = stats.get("min_us").and_then(|x| x.as_u64()).unwrap_or(0);
                 let max_us = stats.get("max_us").and_then(|x| x.as_u64()).unwrap_or(0);
                 let total_us = stats.get("total_us").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -152,7 +164,15 @@ fn display_formatted(json_str: &str, addr: &str) -> Result<()> {
 
                 println!(
                     "│ {:<18} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8}",
-                    name, submitted, completed, errors, timeouts, queue_fulls, min_us, max_us, avg_us
+                    name,
+                    submitted,
+                    completed,
+                    errors,
+                    timeouts,
+                    queue_fulls,
+                    min_us,
+                    max_us,
+                    avg_us
                 );
             }
             println!("└──────────────────────────────────────────────────────────────");
@@ -174,14 +194,8 @@ fn display_formatted(json_str: &str, addr: &str) -> Result<()> {
                     .get("msg_type_name")
                     .and_then(|x| x.as_str())
                     .unwrap_or("?");
-                let shard_id = req
-                    .get("shard_id")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                let age_ms = req
-                    .get("age_ms")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
+                let shard_id = req.get("shard_id").and_then(|x| x.as_u64()).unwrap_or(0);
+                let age_ms = req.get("age_ms").and_then(|x| x.as_u64()).unwrap_or(0);
 
                 // Flag requests older than 1 second as potentially stuck
                 let marker = if age_ms > 5000 {

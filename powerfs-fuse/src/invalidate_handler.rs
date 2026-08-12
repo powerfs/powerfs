@@ -4,8 +4,8 @@
 //! handling `Invalidate` messages from the Filer to maintain cache consistency.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
@@ -125,14 +125,14 @@ impl InvalidateHandler {
         let mut buf = [0u8; 40];
 
         // OutHeader
-        buf[0..4].copy_from_slice(&40u32.to_ne_bytes());      // len
-        buf[4..8].copy_from_slice(&2i32.to_ne_bytes());        // error = NotifyOpcode::InvalInode
-        buf[8..16].copy_from_slice(&0u64.to_ne_bytes());       // unique = 0
+        buf[0..4].copy_from_slice(&40u32.to_ne_bytes()); // len
+        buf[4..8].copy_from_slice(&2i32.to_ne_bytes()); // error = NotifyOpcode::InvalInode
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
 
         // NotifyInvalInodeOut
-        buf[16..24].copy_from_slice(&inode.to_ne_bytes());     // ino
-        buf[24..32].copy_from_slice(&0i64.to_ne_bytes());      // off = 0
-        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes());   // len = -1 (entire file)
+        buf[16..24].copy_from_slice(&inode.to_ne_bytes()); // ino
+        buf[24..32].copy_from_slice(&0i64.to_ne_bytes()); // off = 0
+        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes()); // len = -1 (entire file)
 
         // Write to /dev/fuse — this is safe because the fd is a valid
         // /dev/fuse descriptor and we're writing a well-formed notification.
@@ -141,7 +141,9 @@ impl InvalidateHandler {
             let err = std::io::Error::last_os_error();
             warn!(
                 "notify_kernel_inval_inode: write to /dev/fuse failed for inode={}: {} (errno={})",
-                inode, err, err.raw_os_error().unwrap_or(0)
+                inode,
+                err,
+                err.raw_os_error().unwrap_or(0)
             );
         } else {
             info!(
@@ -187,14 +189,14 @@ impl InvalidateHandler {
         let mut buf = vec![0u8; total_len];
 
         // OutHeader
-        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());   // len
-        buf[4..8].copy_from_slice(&3i32.to_ne_bytes());                  // error = NotifyOpcode::InvalEntry
-        buf[8..16].copy_from_slice(&0u64.to_ne_bytes());                 // unique = 0
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes()); // len
+        buf[4..8].copy_from_slice(&3i32.to_ne_bytes()); // error = NotifyOpcode::InvalEntry
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
 
         // NotifyInvalEntryOut
-        buf[16..24].copy_from_slice(&parent.to_ne_bytes());              // parent
+        buf[16..24].copy_from_slice(&parent.to_ne_bytes()); // parent
         buf[24..28].copy_from_slice(&(name_bytes.len() as u32).to_ne_bytes()); // namelen (without null)
-        buf[28..32].copy_from_slice(&0u32.to_ne_bytes());                // padding
+        buf[28..32].copy_from_slice(&0u32.to_ne_bytes()); // padding
 
         // name (null-terminated)
         buf[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
@@ -545,7 +547,8 @@ mod tests {
         assert!(cache.get_inode(inode).is_some());
 
         // Server sends version=5 (newer than cached 1)
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -561,7 +564,8 @@ mod tests {
         cache.insert(make_test_entry(inode, "fresh.txt", 10));
 
         // Server sends version=5 (older than cached 10)
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -572,7 +576,8 @@ mod tests {
     #[test]
     fn test_invalidate_inode_not_in_cache() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = make_invalidate_msg(99999, 1);
         handler.handle_notification(&msg);
@@ -583,7 +588,8 @@ mod tests {
     #[test]
     fn test_invalidate_zero_inode_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = make_invalidate_msg(0, 1);
         handler.handle_notification(&msg);
@@ -592,7 +598,8 @@ mod tests {
     #[test]
     fn test_invalidate_root_inode_never_evicted() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         // Root inode (1) is initialized by MetadataCache::new()
         assert!(cache.peek_inode(crate::cache::ROOT_INODE).is_some());
@@ -611,7 +618,8 @@ mod tests {
     #[test]
     fn test_non_invalidate_message_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = NetMessage::notification(MsgType::Ping, Vec::new(), Vec::new());
 
@@ -633,7 +641,8 @@ mod tests {
 
         // Server sends version=5 (newer than cached 1) — simulates the
         // Invalidate triggered by this client's own setattr.
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -669,7 +678,8 @@ mod tests {
         cache.insert(make_test_entry(inode, "write.bin", 1));
         cache.pin_inode(inode);
 
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         // First notification while pinned → skipped
         handler.handle_notification(&make_invalidate_msg(inode, 5));
@@ -708,7 +718,8 @@ mod tests {
         assert!(chunk_cache.has_chunks(inode));
         assert!(chunk_cache.has_dirty_chunks(inode));
 
-        let handler = InvalidateHandler::new(cache.clone(), chunk_cache.clone(), make_inline_buffers());
+        let handler =
+            InvalidateHandler::new(cache.clone(), chunk_cache.clone(), make_inline_buffers());
 
         // First notification → skipped (has chunks)
         handler.handle_notification(&make_invalidate_msg(inode, 5));

@@ -18,11 +18,11 @@ use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::os::unix::io::AsRawFd;
 
 /// TTL for kernel attribute cache. A short TTL (100ms) reduces FUSE
 /// getattr round-trips for repeated stat calls while still providing
@@ -737,9 +737,7 @@ impl PowerFsFs {
     /// prevent subsequent reads from seeing other clients' concurrent
     /// appends that were synced to the Filer.
     fn notify_kernel_inval_inode(&self, inode: u64) {
-        let fd = self
-            .fuse_fd
-            .load(std::sync::atomic::Ordering::Acquire);
+        let fd = self.fuse_fd.load(std::sync::atomic::Ordering::Acquire);
         if fd < 0 {
             return;
         }
@@ -750,13 +748,7 @@ impl PowerFsFs {
         buf[16..24].copy_from_slice(&inode.to_ne_bytes());
         buf[24..32].copy_from_slice(&0i64.to_ne_bytes());
         buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes());
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf.as_ptr() as *const libc::c_void,
-                40,
-            )
-        };
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 40) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             warn!(
@@ -1337,7 +1329,10 @@ impl PowerFsFs {
         // by the inline release path. This happens when multiple overlapping
         // opens exist (FUSE kernel delays releases) and the first release
         // (inline path) removes the buffer before subsequent releases run.
-        if entry.fid.is_none() && entry.chunks.is_empty() && !self.inline_buffers.contains_key(&inode) {
+        if entry.fid.is_none()
+            && entry.chunks.is_empty()
+            && !self.inline_buffers.contains_key(&inode)
+        {
             debug!(
                 "sync_size_chunks_on_close: inode {} is Inline mode (no fid, no chunks, no buffer) — skipping Flat sync to preserve Filer inline_data",
                 inode
@@ -2195,7 +2190,10 @@ impl FileSystem for PowerFsFs {
                 if errno == libc::EIO {
                     error!("setattr RPC failed for inode {}: {}", inode, e);
                 } else {
-                    debug!("setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                    debug!(
+                        "setattr RPC failed for inode {}: {} -> errno={}",
+                        inode, e, errno
+                    );
                 }
                 std::io::Error::from_raw_os_error(errno)
             })?;
@@ -3092,11 +3090,7 @@ impl FileSystem for PowerFsFs {
                 if !inline_buf.dirty {
                     let needs_refresh = inline_buf.needs_refresh;
                     let buf_len = inline_buf.data.len() as u64;
-                    let entry_size = self
-                        .cache
-                        .get_inode(inode)
-                        .map(|e| e.size)
-                        .unwrap_or(0);
+                    let entry_size = self.cache.get_inode(inode).map(|e| e.size).unwrap_or(0);
                     if needs_refresh || entry_size != buf_len {
                         warn!(
                             "open: inode={} removing stale inline buffer \
@@ -4434,10 +4428,10 @@ impl FileSystem for PowerFsFs {
                     }
                     inline_buf.data[start..end].copy_from_slice(&buf[..]);
                     inline_buf.dirty = true; // 标记已修改, release 时需同步到 Filer
-                    // Track in-place modification: if the write touched data
-                    // below original_len, we can't use append mode on release
-                    // (the delta would miss the in-place changes). This causes
-                    // release to fall back to full-buffer overwrite mode.
+                                             // Track in-place modification: if the write touched data
+                                             // below original_len, we can't use append mode on release
+                                             // (the delta would miss the in-place changes). This causes
+                                             // release to fall back to full-buffer overwrite mode.
                     if (offset as usize) < inline_buf.original_len {
                         inline_buf.modified_in_place = true;
                     }
@@ -5294,7 +5288,10 @@ impl FileSystem for PowerFsFs {
             if !sync_ok {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
-            debug!("release inline: inode={} closed, size={}", inode, final_size);
+            debug!(
+                "release inline: inode={} closed, size={}",
+                inode, final_size
+            );
             return Ok(());
         }
 
@@ -6077,7 +6074,10 @@ impl FileSystem for PowerFsFs {
                         if errno == libc::EIO {
                             error!("fallocate setattr RPC failed for inode {}: {}", inode, e);
                         } else {
-                            debug!("fallocate setattr RPC failed for inode {}: {} -> errno={}", inode, e, errno);
+                            debug!(
+                                "fallocate setattr RPC failed for inode {}: {} -> errno={}",
+                                inode, e, errno
+                            );
                         }
                         std::io::Error::from_raw_os_error(errno)
                     })?;
@@ -6378,9 +6378,10 @@ impl FileSystem for PowerFsFs {
         if xattrs.is_empty() {
             let meta_client = self.client.facade().meta_shard_client().clone();
             let shard_id = self.routing_shard(inode);
-            match self.client.block_on(async move {
-                meta_client.list_xattr(shard_id, inode).await
-            }) {
+            match self
+                .client
+                .block_on(async move { meta_client.list_xattr(shard_id, inode).await })
+            {
                 Ok(keys) => {
                     for key in &keys {
                         // Cache each key with an empty value so listxattr

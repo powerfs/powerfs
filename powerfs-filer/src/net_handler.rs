@@ -116,7 +116,7 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
         chunks[1].offset - chunks[0].offset
     } else {
         // 兜底: 1MB (对齐 POWERFS_CHUNK_SIZE)
-        1 * 1024 * 1024
+        1024 * 1024
     };
 
     // 收集 volume_ids (按 chunk 顺序, 每个 chunk 代表一个 stripe unit)
@@ -2181,10 +2181,7 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        info!(
-            "FILER_NET_REMOVEXATTR: inode={} key={}",
-            inode, key
-        );
+        info!("FILER_NET_REMOVEXATTR: inode={} key={}", inode, key);
 
         match self
             .meta_shard_manager

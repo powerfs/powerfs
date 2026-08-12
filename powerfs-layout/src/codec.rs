@@ -153,7 +153,7 @@ fn is_file_layout_field(field: FieldId) -> bool {
 /// (后者在处理完 FileLayout 字段后遇到非 FileLayout 字段时停止).
 pub fn decode_file_layout_from_mixed(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
     // Skip leading non-FileLayout fields (e.g., Ino/Mode/Name/ShardId).
-    while dec.peek_field().map_or(false, |f| !is_file_layout_field(f)) {
+    while dec.peek_field().is_some_and(|f| !is_file_layout_field(f)) {
         let (_, length) = dec.next_field().ok_or(LayoutError::TlvDecode(
             "peeked field vanished during skip".to_string(),
         ))?;
@@ -193,7 +193,7 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
     // after the FileLayout. Previously the loop consumed ALL remaining
     // fields via `dec.skip`, silently eating IsAppend and causing
     // append-mode syncs to be treated as overwrites (size=0, data lost).
-    while dec.peek_field().map_or(false, is_file_layout_field) {
+    while dec.peek_field().is_some_and(is_file_layout_field) {
         let (field, length) = dec.next_field().expect("peeked field must exist");
         match field {
             // --- Placement ---

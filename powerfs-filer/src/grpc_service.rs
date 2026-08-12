@@ -883,14 +883,16 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let proto_entries: Vec<InodeChunkEntry> = entries
             .into_iter()
             .map(
-                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| InodeChunkEntry {
-                    inode,
-                    shard_id,
-                    needle_id,
-                    volume_id,
-                    offset,
-                    size,
-                    file_size,
+                |(inode, shard_id, needle_id, volume_id, offset, size, file_size)| {
+                    InodeChunkEntry {
+                        inode,
+                        shard_id,
+                        needle_id,
+                        volume_id,
+                        offset,
+                        size,
+                        file_size,
+                    }
                 },
             )
             .collect();

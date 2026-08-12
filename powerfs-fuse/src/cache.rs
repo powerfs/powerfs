@@ -440,7 +440,10 @@ impl MetadataCache {
     /// inode_cache without TTL check (peek) to avoid side effects.
     pub fn is_pinned(&self, inode: u64) -> bool {
         let cache = self.inode_cache.read().unwrap();
-        cache.peek(&inode).map(|e| e.hold.is_pinned()).unwrap_or(false)
+        cache
+            .peek(&inode)
+            .map(|e| e.hold.is_pinned())
+            .unwrap_or(false)
     }
 
     /// Get the EntryState of a cached inode without TTL check.
@@ -2794,11 +2797,17 @@ mod chunk_cache_tests {
 
         // Unpin once (first close — still pinned by second handle)
         cache.unpin_inode(ino);
-        assert!(cache.is_pinned(ino), "should still be pinned after first unpin");
+        assert!(
+            cache.is_pinned(ino),
+            "should still be pinned after first unpin"
+        );
 
         // Unpin again (second close — fully released)
         cache.unpin_inode(ino);
-        assert!(!cache.is_pinned(ino), "should be unpinned after all handles closed");
+        assert!(
+            !cache.is_pinned(ino),
+            "should be unpinned after all handles closed"
+        );
     }
 
     /// Phase 3: pinned inodes bypass TTL expiry via entry.hold.

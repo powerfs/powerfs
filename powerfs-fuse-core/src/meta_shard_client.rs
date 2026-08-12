@@ -1080,7 +1080,7 @@ impl MetaShardClient {
     /// - 网络错误: 记录失败，轮换到下一个 Filer 候选地址，指数退避重试（50ms→1s）
     /// - 熔断打开: 轮换到下一个 Filer 候选地址重试
     ///   最多 MAX_ATTEMPTS 次尝试。
-    /// Send a coherence message to the Filer, with request statistics tracking.
+    ///   Send a coherence message to the Filer, with request statistics tracking.
     ///
     /// This is the main entry point for all metadata RPCs (lookup, mkdir,
     /// create, unlink, etc.). It wraps `send_coherence_msg_impl` with
@@ -1172,10 +1172,8 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    self.stats.record_complete(
-                        stats_id,
-                        Err(&ClientError::Network(last_err.clone())),
-                    );
+                    self.stats
+                        .record_complete(stats_id, Err(&ClientError::Network(last_err.clone())));
                     return Err(last_err);
                 }
             };
@@ -1290,10 +1288,8 @@ impl MetaShardClient {
                     if powerfs_net::is_client_error(status) {
                         self.stats.record_complete(stats_id, Ok(()));
                     } else {
-                        self.stats.record_complete(
-                            stats_id,
-                            Err(&ClientError::Server(err_msg.clone())),
-                        );
+                        self.stats
+                            .record_complete(stats_id, Err(&ClientError::Server(err_msg.clone())));
                     }
                     return Err(err_msg);
                 }
@@ -1315,10 +1311,8 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    self.stats.record_complete(
-                        stats_id,
-                        Err(&ClientError::Network(last_err.clone())),
-                    );
+                    self.stats
+                        .record_complete(stats_id, Err(&ClientError::Network(last_err.clone())));
                     return Err(last_err);
                 }
             }

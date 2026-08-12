@@ -721,8 +721,7 @@ impl MetaShardManager {
                 // Without this wait, a subsequent getattr may read the stale
                 // nlink value (before decrement), causing T5.04 intermittent
                 // failures (expected nlink=1, actual nlink=2).
-                self.wait_for_nlink(shard_ino, inode, expected_nlink)
-                    .await;
+                self.wait_for_nlink(shard_ino, inode, expected_nlink).await;
             }
         } else {
             // Last link: delete the inode record. Best-effort: if this fails,
@@ -1013,7 +1012,9 @@ impl MetaShardManager {
             None => {
                 log::debug!(
                     "lookup: dir_entry not found parent_ino={} name='{}' shard={}",
-                    parent_inode, name, parent_shard.0
+                    parent_inode,
+                    name,
+                    parent_shard.0
                 );
                 return None;
             }
@@ -1028,7 +1029,10 @@ impl MetaShardManager {
             None => {
                 log::warn!(
                     "lookup: inode_shard {} not found for inode {} (parent={}, name='{}')",
-                    inode_shard.0, inode, parent_inode, name
+                    inode_shard.0,
+                    inode,
+                    parent_inode,
+                    name
                 );
                 return None;
             }
@@ -1040,7 +1044,10 @@ impl MetaShardManager {
                 log::warn!(
                     "lookup: inode record not found inode={} shard={} (parent={}, name='{}') \
                      — dir_entry exists but inode record missing (cross-shard apply lag)",
-                    inode, inode_shard.0, parent_inode, name
+                    inode,
+                    inode_shard.0,
+                    parent_inode,
+                    name
                 );
                 return None;
             }
@@ -1312,7 +1319,8 @@ impl MetaShardManager {
         for (idx, alloc) in allocators.iter().enumerate() {
             let shard_id = ShardId(idx as u64);
             let slot_start = alloc.shard_start + alloc.node_offset;
-            let slot_end = alloc.shard_start + alloc.node_offset
+            let slot_end = alloc.shard_start
+                + alloc.node_offset
                 + (self.shard_strategy.get_shard_range(shard_id).1
                     - self.shard_strategy.get_shard_range(shard_id).0)
                     / MAX_FILER_NODES;
@@ -1502,6 +1510,7 @@ impl MetaShardManager {
     }
 
     /// Set inode attributes via Raft consensus
+    #[allow(clippy::too_many_arguments)]
     pub async fn setattr(
         &self,
         inode: u64,
@@ -2013,10 +2022,20 @@ impl MetaShardManager {
 
         // Phase A: bump nlink on the inode's own shard.
         let cmd_nlink = ShardCommand::IncrementNlink { inode };
-        match self.raft_group_manager.propose(shard_ino, cmd_nlink.serialize()).await {
-            Ok(idx) => info!("create_hard_link: Phase A IncrementNlink proposed on shard {} at index {}", shard_ino.0, idx),
+        match self
+            .raft_group_manager
+            .propose(shard_ino, cmd_nlink.serialize())
+            .await
+        {
+            Ok(idx) => info!(
+                "create_hard_link: Phase A IncrementNlink proposed on shard {} at index {}",
+                shard_ino.0, idx
+            ),
             Err(e) => {
-                error!("create_hard_link: Phase A IncrementNlink FAILED on shard {}: {}", shard_ino.0, e);
+                error!(
+                    "create_hard_link: Phase A IncrementNlink FAILED on shard {}: {}",
+                    shard_ino.0, e
+                );
                 return Err(e);
             }
         }
@@ -2029,10 +2048,20 @@ impl MetaShardManager {
             name: new_name.to_string(),
             inode,
         };
-        match self.raft_group_manager.propose(shard_dir, cmd_dir.serialize()).await {
-            Ok(idx) => info!("create_hard_link: Phase B AddDirEntry proposed on shard {} at index {}", shard_dir.0, idx),
+        match self
+            .raft_group_manager
+            .propose(shard_dir, cmd_dir.serialize())
+            .await
+        {
+            Ok(idx) => info!(
+                "create_hard_link: Phase B AddDirEntry proposed on shard {} at index {}",
+                shard_dir.0, idx
+            ),
             Err(e) => {
-                error!("create_hard_link: Phase B AddDirEntry FAILED on shard {}: {}", shard_dir.0, e);
+                error!(
+                    "create_hard_link: Phase B AddDirEntry FAILED on shard {}: {}",
+                    shard_dir.0, e
+                );
                 return Err(e);
             }
         }
@@ -2042,8 +2071,14 @@ impl MetaShardManager {
 
         // Verify nlink was actually incremented
         match self.get_inode(inode) {
-            Some(info) => info!("create_hard_link: verified nlink={} for inode={}", info.nlink, inode),
-            None => warn!("create_hard_link: inode {} not found after link creation", inode),
+            Some(info) => info!(
+                "create_hard_link: verified nlink={} for inode={}",
+                info.nlink, inode
+            ),
+            None => warn!(
+                "create_hard_link: inode {} not found after link creation",
+                inode
+            ),
         }
 
         Ok(())
@@ -2621,7 +2656,12 @@ impl MetaShardManager {
                     // Append mode: the Filer computes the new size, so we
                     // can't check info.size == size. Instead, check that
                     // inline_data is non-empty (the append succeeded).
-                    if info.inline_data.as_ref().map(|d| !d.is_empty()).unwrap_or(false) {
+                    if info
+                        .inline_data
+                        .as_ref()
+                        .map(|d| !d.is_empty())
+                        .unwrap_or(false)
+                    {
                         return Ok(());
                     }
                 } else if info.size == size && info.chunks.len() == target_chunk_count {
