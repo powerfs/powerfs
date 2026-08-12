@@ -262,8 +262,12 @@ impl RaftNodeV2 {
             }
         });
 
-        // 8) 单节点模式：立即初始化集群
-        if peers.is_empty() {
+        // 8) 初始化集群
+        // - 单节点模式（无 peers）：立即初始化为单节点集群
+        // - 多节点模式：仅 id=1 的节点 bootstrap 整个集群（含所有 peers），
+        //   其他节点不调用 initialize，等待 leader 推送初始配置
+        let should_bootstrap = peers.is_empty() || id == 1;
+        if should_bootstrap {
             let mut members: BTreeMap<String, BasicNode> = BTreeMap::new();
             members.insert(
                 node_id.clone(),
@@ -271,13 +275,29 @@ impl RaftNodeV2 {
                     addr: address.clone(),
                 },
             );
-            raft.initialize(members)
-                .await
-                .map_err(|e| format!("initialize failed: {}", e))?;
-            info!(
-                "RaftNodeV2: single-node cluster initialized (id={})",
-                node_id
-            );
+            for peer in &peers {
+                members.insert(
+                    peer.id.to_string(),
+                    BasicNode {
+                        addr: peer.address.clone(),
+                    },
+                );
+            }
+            match raft.initialize(members).await {
+                Ok(()) => {
+                    info!(
+                        "RaftNodeV2: cluster initialized (id={}, members={})",
+                        node_id,
+                        peers.len() + 1
+                    );
+                }
+                Err(e) => {
+                    info!(
+                        "RaftNodeV2: initialize returned (likely already initialized): {}",
+                        e
+                    );
+                }
+            }
         }
 
         info!(

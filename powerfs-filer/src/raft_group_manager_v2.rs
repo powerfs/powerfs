@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
+use std::time::Duration;
 use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
 use openraft::ServerState;
@@ -467,6 +468,9 @@ impl RaftGroupManagerV2 {
     ///
     /// `data` 是序列化后的 `ShardCommand`（`serde_json::to_vec`）。
     /// 返回 committed log index。
+    ///
+    /// 如果本地节点不是 leader，自动通过 gRPC `Propose` RPC 转发到 leader 节点。
+    /// 转发最多重试 5 次以应对 leader 切换。
     pub async fn propose(&self, shard_id: ShardId, data: Vec<u8>) -> Result<u64, String> {
         let group = self
             .get_group(shard_id)
@@ -474,12 +478,120 @@ impl RaftGroupManagerV2 {
             .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
         let req = FilerRequest { payload: data };
-        let resp = group
-            .raft
-            .client_write(req)
-            .await
-            .map_err(|e| format!("client_write failed for shard {}: {}", shard_id.0, e))?;
-        Ok(resp.log_id.index())
+
+        // 1) 尝试本地 client_write
+        match group.raft.client_write(req.clone()).await {
+            Ok(resp) => return Ok(resp.log_id.index()),
+            Err(e) => {
+                let err_str = format!("{}", e);
+                let is_forward = err_str.contains("has to forward request to")
+                    || err_str.contains("not the leader");
+                if !is_forward {
+                    return Err(format!("client_write failed for shard {}: {}", shard_id.0, e));
+                }
+                // 是 ForwardToLeader 错误，继续转发流程
+                debug!(
+                    "shard {}: local node not leader, forwarding propose: {}",
+                    shard_id.0, err_str
+                );
+            }
+        }
+
+        // 2) 本地不是 leader，通过 gRPC 转发到 leader
+        let group_id = shard_id.0.to_string();
+        let payload_bytes = serde_json::to_vec(&req)
+            .map_err(|e| format!("failed to serialize FilerRequest: {}", e))?;
+
+        let mut forward_target = self.get_shard_leader(shard_id).await;
+        let mut retries = 0;
+        loop {
+            let target_id = match &forward_target {
+                Some(addr) => {
+                    // 从 peers 表反查 node_id
+                    let peers = self.peers.read().await;
+                    peers
+                        .iter()
+                        .find(|(_, p)| &p.address == addr)
+                        .map(|(id, _)| id.to_string())
+                        .or_else(|| {
+                            // leader 可能是本节点（地址匹配 self.node_address）
+                            if addr == &self.node_address {
+                                Some(self.node_id.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                }
+                None => None,
+            };
+
+            let target_id = match target_id {
+                Some(id) => id,
+                None => {
+                    retries += 1;
+                    if retries >= 5 {
+                        return Err(format!(
+                            "shard {}: propose forward failed: no leader known after {} retries",
+                            shard_id.0, retries
+                        ));
+                    }
+                    debug!(
+                        "shard {}: no leader known, retrying ({}/5)",
+                        shard_id.0, retries
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    forward_target = self.get_shard_leader(shard_id).await;
+                    continue;
+                }
+            };
+
+            match self
+                .network_router
+                .propose_forward(&target_id, &group_id, payload_bytes.clone())
+                .await
+            {
+                Ok((true, log_index, _, _)) => return Ok(log_index),
+                Ok((false, _, ref fwd_id, ref err)) if !fwd_id.is_empty() => {
+                    // leader 又变了，更新 target 重试
+                    debug!(
+                        "shard {}: forwarded to '{}' but should go to '{}': {}",
+                        shard_id.0, target_id, fwd_id, err
+                    );
+                    let peers = self.peers.read().await;
+                    forward_target = peers.get(&fwd_id.parse::<u64>().ok().unwrap_or(0)).map(|p| p.address.clone());
+                    drop(peers);
+                    retries += 1;
+                    if retries >= 5 {
+                        return Err(format!(
+                            "shard {}: propose forward failed after {} retries: leader kept changing",
+                            shard_id.0, retries
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Ok((false, _, _, err)) => {
+                    return Err(format!(
+                        "shard {}: propose forward to '{}' failed: {}",
+                        shard_id.0, target_id, err
+                    ));
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries >= 5 {
+                        return Err(format!(
+                            "shard {}: propose forward to '{}' failed after {} retries: {}",
+                            shard_id.0, target_id, retries, e
+                        ));
+                    }
+                    debug!(
+                        "shard {}: propose forward to '{}' failed (retry {}/5): {}",
+                        shard_id.0, target_id, retries, e
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    forward_target = self.get_shard_leader(shard_id).await;
+                }
+            }
+        }
     }
 
     /// 检查本节点是否为指定 shard 的 leader。

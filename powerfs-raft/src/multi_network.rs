@@ -133,6 +133,41 @@ impl MultiGroupRouter {
         }
         Ok(())
     }
+
+    /// 转发 propose 请求到指定节点（leader）。
+    ///
+    /// 当本地节点不是 leader 时，通过此方法将 `client_write` 请求转发到 leader 节点。
+    /// `payload` 是序列化后的 `C::D`（如 `FilerRequest`，使用 `serde_json`）。
+    ///
+    /// 返回 `(ok, log_index, forward_leader_id)`：
+    /// - 如果 `ok=true`，`log_index` 是已提交的日志索引。
+    /// - 如果 `ok=false` 且 `forward_leader_id` 非空，应转发到该节点。
+    /// - 如果 `ok=false` 且 `forward_leader_id` 为空，表示其他错误。
+    pub async fn propose_forward(
+        &self,
+        target_node_id: &str,
+        group_id: &str,
+        payload: Vec<u8>,
+    ) -> Result<(bool, u64, String, String), String> {
+        let channel = self
+            .get_channel(target_node_id)
+            .await
+            .map_err(|e| format!("failed to get channel to '{}': {}", target_node_id, e))?;
+        let mut client = RaftServiceClient::new(channel);
+
+        let pb_req = pb::ProposeRequest {
+            group_id: group_id.to_string(),
+            payload,
+        };
+
+        let response = client
+            .propose(pb_req)
+            .await
+            .map_err(|e| format!("propose RPC to '{}' failed: {}", target_node_id, e))?;
+
+        let resp = response.into_inner();
+        Ok((resp.ok, resp.log_index, resp.forward_leader_id, resp.error))
+    }
 }
 
 impl Default for MultiGroupRouter {
