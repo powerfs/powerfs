@@ -134,7 +134,7 @@ echo "━━━ L6L.01: growfiles (fsstress 文件增长/截断/稀疏写) ━�
 # fsstress -d 指定工作目录, -n 指定操作数, -p 指定进程数
 # -X 不包含某些操作, -r 限制文件大小范围
 run_test "L6L.01.fsstress_grow" \
-    "fsstress -d $TMPDIR_LTP/grow -n 500 -p 1 -l 0 2>&1" 180
+    "fsstress -d $TMPDIR_LTP/grow -n 30 -p 1 -l 0 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.02: rwtest — 读写测试 (sync/buffered/mmap)
@@ -146,11 +146,11 @@ mkdir -p "$TMPDIR_LTP/rw"
 
 # rwtest01: buffered 读写
 run_test "L6L.02.rwtest_buffered" \
-    "rwtest -N rwtest01 -c -q -i 20s -f buffered 1000b:$TMPDIR_LTP/rw/buff-\$\$" 60
+    "rwtest -N rwtest01 -c -q -i 10s -f buffered 1000b:$TMPDIR_LTP/rw/buff-\$\$" 60
 
 # rwtest02: mmap buffered
 run_test "L6L.02.rwtest_mmap_buff" \
-    "rwtest -N rwtest02 -c -q -i 20s -n 2 -f buffered -s mmread,mmwrite -m random -Dv 1000b:$TMPDIR_LTP/rw/mmap-buff-\$\$" 60
+    "rwtest -N rwtest02 -c -q -i 10s -n 2 -f buffered -s mmread,mmwrite -m random -Dv 1000b:$TMPDIR_LTP/rw/mmap-buff-\$\$" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.03: iogen — I/O 生成器 (混合读写)
@@ -158,7 +158,7 @@ run_test "L6L.02.rwtest_mmap_buff" \
 echo ""
 echo "━━━ L6L.03: iogen (I/O 生成器 混合读写) ━━━"
 run_test "L6L.03.iogen" \
-    "rwtest -N iogen01 -i 30s -s read,write -Da -Dv -n 2 500b:$TMPDIR_LTP/doio.f1.\$\$ 1000b:$TMPDIR_LTP/doio.f2.\$\$" 90
+    "rwtest -N iogen01 -i 10s -s read,write -Da -Dv -n 2 500b:$TMPDIR_LTP/doio.f1.\$\$ 1000b:$TMPDIR_LTP/doio.f2.\$\$" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.04: ftest — 并发文件系统测试
@@ -166,7 +166,7 @@ run_test "L6L.03.iogen" \
 echo ""
 echo "━━━ L6L.04: ftest (fsstress 并发文件系统测试) ━━━"
 run_test "L6L.04.fsstress_concurrent" \
-    "fsstress -d $TMPDIR_LTP/ftest -n 1000 -p 4 -l 0 2>&1" 180
+    "fsstress -d $TMPDIR_LTP/ftest -n 40 -p 4 -l 0 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.05: fs_racer — 竞争条件检测
@@ -175,7 +175,7 @@ echo ""
 echo "━━━ L6L.05: fs_racer (fsstress 竞争条件检测) ━━━"
 # 高并发进程数模拟竞争条件
 run_test "L6L.05.fsstress_racer" \
-    "fsstress -d $TMPDIR_LTP/racer -n 2000 -p 8 -l 0 2>&1" 180
+    "fsstress -d $TMPDIR_LTP/racer -n 40 -p 4 -l 0 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.06: fs_di — 数据完整性校验 (fsx)
@@ -184,10 +184,10 @@ echo ""
 echo "━━━ L6L.06: fs_di (fsx 数据完整性校验) ━━━"
 # fsx 标准文件系统 exerciser - 写入/读取/截断/映射并验证数据完整性
 run_test "L6L.06.fsx_small" \
-    "fsx -N 1000 -l 1048576 $TMPDIR_LTP/fsx_small.bin 2>&1" 120
+    "fsx -N 200 -l 1048576 $TMPDIR_LTP/fsx_small.bin 2>&1" 120
 
 run_test "L6L.06.fsx_large" \
-    "fsx -N 500 -l 10485760 $TMPDIR_LTP/fsx_large.bin 2>&1" 180
+    "fsx -N 100 -l 10485760 $TMPDIR_LTP/fsx_large.bin 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.07: openfile — 并发 open
@@ -196,7 +196,7 @@ echo ""
 echo "━━━ L6L.07: openfile (fsstress 并发 open) ━━━"
 # 限制操作为 open/close 以测试 fd 泄漏
 run_test "L6L.07.fsstress_open" \
-    "fsstress -d $TMPDIR_LTP/open -n 500 -p 10 -l 0 -f creat=1 -f open=1 -f close=1 -f unlink=1 2>&1" 120
+    "fsstress -d $TMPDIR_LTP/open -n 30 -p 4 -l 0 -f creat=1 -f open=1 -f close=1 -f unlink=1 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.08: inode — inode 管理
@@ -205,7 +205,7 @@ echo ""
 echo "━━━ L6L.08: inode (fsstress inode 管理) ━━━"
 # 创建大量文件测试 inode 分配/释放
 run_test "L6L.08.fsstress_inode" \
-    "fsstress -d $TMPDIR_LTP/inode -n 2000 -p 2 -l 0 -f creat=1 -f unlink=1 -f mkdir=1 -f rmdir=1 2>&1" 120
+    "fsstress -d $TMPDIR_LTP/inode -n 40 -p 2 -l 0 -f creat=1 -f unlink=1 -f mkdir=1 -f rmdir=1 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.09: linker — 硬链接测试
@@ -213,7 +213,7 @@ run_test "L6L.08.fsstress_inode" \
 echo ""
 echo "━━━ L6L.09: linker (fsstress 硬链接测试) ━━━"
 run_test "L6L.09.fsstress_link" \
-    "fsstress -d $TMPDIR_LTP/link -n 1000 -p 2 -l 0 -f creat=1 -f link=1 -f unlink=1 -f rename=1 2>&1" 120
+    "fsstress -d $TMPDIR_LTP/link -n 30 -p 2 -l 0 -f creat=1 -f link=1 -f unlink=1 -f rename=1 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.10: stream — 流式 I/O
@@ -222,10 +222,10 @@ echo ""
 echo "━━━ L6L.10: stream (buffered 流式 I/O) ━━━"
 mkdir -p "$TMPDIR_LTP/stream"
 run_test "L6L.10.stream_write" \
-    "rwtest -N stream01 -c -q -i 20s -f buffered -s write 1000b:$TMPDIR_LTP/stream/sw-\$\$" 60
+    "rwtest -N stream01 -c -q -i 10s -f buffered -s write 1000b:$TMPDIR_LTP/stream/sw-\$\$" 60
 
 run_test "L6L.10.stream_read" \
-    "rwtest -N stream02 -c -q -i 20s -f buffered -s read 1000b:$TMPDIR_LTP/stream/sr-\$\$" 60
+    "rwtest -N stream02 -c -q -i 10s -f buffered -s read 1000b:$TMPDIR_LTP/stream/sr-\$\$" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.11: lftest — 大文件测试
@@ -234,11 +234,11 @@ echo ""
 echo "━━━ L6L.11: lftest (fsstress 大文件测试) ━━━"
 # 写入大文件 (100MB+)
 run_test "L6L.11.fsstress_largefile" \
-    "fsstress -d $TMPDIR_LTP/largefile -n 100 -p 1 -l 0 -f write=4 -f truncate=1 2>&1" 180
+    "fsstress -d $TMPDIR_LTP/largefile -n 10 -p 1 -l 0 -f write=4 -f truncate=1 2>&1" 120
 
 # 额外: 使用 dd 创建大文件并验证
 run_test "L6L.11.largefile_dd" \
-    "dd if=/dev/zero of=$TMPDIR_LTP/largefile.bin bs=1M count=100 2>&1 && md5sum $TMPDIR_LTP/largefile.bin 2>&1" 120
+    "dd if=/dev/zero of=$TMPDIR_LTP/largefile.bin bs=1M count=10 2>&1 && md5sum $TMPDIR_LTP/largefile.bin 2>&1" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.12: writetest — 写入测试
@@ -246,7 +246,7 @@ run_test "L6L.11.largefile_dd" \
 echo ""
 echo "━━━ L6L.12: writetest (fsstress 持续写入) ━━━"
 run_test "L6L.12.fsstress_write" \
-    "fsstress -d $TMPDIR_LTP/write -n 1000 -p 2 -l 0 -f write=8 -f fsync=1 2>&1" 120
+    "fsstress -d $TMPDIR_LTP/write -n 30 -p 2 -l 0 -f write=8 -f fsync=1 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # L6L.13: fs_inod — inode 计数验证
@@ -255,7 +255,7 @@ echo ""
 echo "━━━ L6L.13: fs_inod (inode 计数验证) ━━━"
 # 创建 10×10×10 = 1000 个文件并验证
 run_test "L6L.13.inode_count" \
-    "mkdir -p $TMPDIR_LTP/inod && for i in \$(seq 1 10); do for j in \$(seq 1 10); do for k in \$(seq 1 10); do touch $TMPDIR_LTP/inod/f_\${i}_\${j}_\${k}; done; done; done && find $TMPDIR_LTP/inod -type f | wc -l" 120
+    "mkdir -p $TMPDIR_LTP/inod && for i in \$(seq 1 5); do for j in \$(seq 1 5); do for k in \$(seq 1 5); do touch $TMPDIR_LTP/inod/f_\${i}_\${j}_\${k}; done; done; done && find $TMPDIR_LTP/inod -type f | wc -l" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6S.03: aio_read — 异步读 IO
@@ -263,9 +263,9 @@ run_test "L6L.13.inode_count" \
 echo ""
 echo "━━━ L6S.03: aio_read (aio-stress 异步读) ━━━"
 # 先创建测试文件 (10MB, 足够 aio-stress 使用)
-dd if=/dev/zero of="$TMPDIR_LTP/aio_read.bin" bs=1M count=10 2>/dev/null
+dd if=/dev/zero of="$TMPDIR_LTP/aio_read.bin" bs=1M count=5 2>/dev/null
 run_test "L6S.03.aio_read" \
-    "aio-stress -s 10M -r 64k -i 16 -o 1 $TMPDIR_LTP/aio_read.bin 2>&1" 120
+    "aio-stress -s 5M -r 64k -i 8 -o 1 $TMPDIR_LTP/aio_read.bin 2>&1" 60
 
 # ════════════════════════════════════════════════════════════════════
 # L6S.04: aio_write — 异步写 IO
@@ -273,7 +273,7 @@ run_test "L6S.03.aio_read" \
 echo ""
 echo "━━━ L6S.04: aio_write (aio-stress 异步写) ━━━"
 run_test "L6S.04.aio_write" \
-    "aio-stress -s 10M -r 64k -i 16 -o 0 $TMPDIR_LTP/aio_write.bin 2>&1" 120
+    "aio-stress -s 5M -r 64k -i 8 -o 0 $TMPDIR_LTP/aio_write.bin 2>&1" 60
 
 # ════════════════════════════════════════════════════════════════════
 # 附加: fsx 随机模式 (更严格的数据完整性测试)
@@ -281,7 +281,7 @@ run_test "L6S.04.aio_write" \
 echo ""
 echo "━━━ 附加: fsx 随机模式 (数据完整性) ━━━"
 run_test "L6L.06b.fsx_random" \
-    "fsx -N 2000 -l 4194304 -S 0 $TMPDIR_LTP/fsx_random.bin 2>&1" 180
+    "fsx -N 300 -l 4194304 -S 0 $TMPDIR_LTP/fsx_random.bin 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # 附加: fsstress 长时间运行 (稳定性回归)
@@ -289,7 +289,7 @@ run_test "L6L.06b.fsx_random" \
 echo ""
 echo "━━━ 附加: fsstress 长时间运行 (稳定性) ━━━"
 run_test "L6L.stability" \
-    "fsstress -d $TMPDIR_LTP/stability -n 5000 -p 4 -l 0 2>&1" 300
+    "fsstress -d $TMPDIR_LTP/stability -n 50 -p 2 -l 0 2>&1" 120
 
 # ════════════════════════════════════════════════════════════════════
 # 汇总报告

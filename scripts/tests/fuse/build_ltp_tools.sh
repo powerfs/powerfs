@@ -1,10 +1,21 @@
 #!/bin/bash
 # Build xfstests-dev/ltp tools inside the fuse-test container
 # Usage: bash build_ltp_tools.sh
+#
+# xfstests-dev is cloned from upstream since kernel/ is maintained in a
+# separate repository.
 set -e
 
-LTP_SRC="/home/portion/powerfs/kernel/xfstests-dev"
+LTP_SRC="${LTP_SRC:-/tmp/xfstests-dev}"
 LTP_INSTALL="/opt/ltp-tools"
+
+# Clone xfstests-dev if not present locally
+if [ ! -d "$LTP_SRC/ltp" ]; then
+    echo "Cloning xfstests-dev..."
+    git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git "$LTP_SRC" 2>/dev/null || \
+    git clone --depth 1 https://github.com/kdave/xfstests.git "$LTP_SRC" 2>/dev/null || \
+    { echo "ERROR: Failed to clone xfstests-dev"; exit 1; }
+fi
 
 # Install build dependencies
 docker exec fuse-test bash -c '
