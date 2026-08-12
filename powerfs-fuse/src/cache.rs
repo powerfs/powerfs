@@ -399,7 +399,10 @@ impl MetadataCache {
     ///
     /// Phase 3: entry.hold is the single authoritative source for pin
     /// status. The old pinned_inodes HashMap has been removed.
-    pub fn unpin_inode(&self, inode: u64) {
+    ///
+    /// Returns `true` if the inode was fully released (open_count reached 0),
+    /// `false` if other handles are still open.
+    pub fn unpin_inode(&self, inode: u64) -> bool {
         let was_pinned;
         let released;
         {
@@ -424,6 +427,7 @@ impl MetadataCache {
             released,
             std::thread::current().id()
         );
+        released
     }
 
     /// Check if an inode is pinned (open). Pinned inodes hold a data lease,

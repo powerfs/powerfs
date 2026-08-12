@@ -118,10 +118,61 @@ pub fn encode_file_layout(
     Ok(())
 }
 
+/// Returns true if `field` belongs to the FileLayout encoding (Placement,
+/// Reliability, ReliabilityState, Compression, ChunkEncoding, InlineData,
+/// and their sub-fields). Used by `decode_file_layout` to know when to
+/// stop — without this, the greedy `while` loop would consume subsequent
+/// non-FileLayout fields (e.g. `IsAppend` in UpdateInodeSizeChunks),
+/// silently swallowing them and breaking the caller's protocol.
+fn is_file_layout_field(field: FieldId) -> bool {
+    matches!(
+        field,
+        FieldId::Placement
+            | FieldId::InlineMaxSize
+            | FieldId::StripeSize
+            | FieldId::StripeCount
+            | FieldId::StartVolumeIdx
+            | FieldId::VolumeIds
+            | FieldId::VolumeIdsRange
+            | FieldId::Reliability
+            | FieldId::ReliabilityState
+            | FieldId::Compression
+            | FieldId::ChunkLayout
+            | FieldId::InlineData
+    )
+}
+
+/// 从混合 TLV 流解码 FileLayout (跳过前导非 FileLayout 字段).
+///
+/// 用于 Create/Lookup/Getattr 响应: body 以 Ino/Mode/Name/ShardId 等
+/// 非 FileLayout 字段开头, FileLayout 字段在后. `decode_file_layout`
+/// 会在第一个非 FileLayout 字段处停止, 若直接调用会立即返回空默认值
+/// (Placement::Flat), 导致 Inline 模式丢失.
+///
+/// 本函数先跳过前导非 FileLayout 字段, 再委托 `decode_file_layout`
+/// (后者在处理完 FileLayout 字段后遇到非 FileLayout 字段时停止).
+pub fn decode_file_layout_from_mixed(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
+    // Skip leading non-FileLayout fields (e.g., Ino/Mode/Name/ShardId).
+    while dec.peek_field().map_or(false, |f| !is_file_layout_field(f)) {
+        let (_, length) = dec.next_field().ok_or(LayoutError::TlvDecode(
+            "peeked field vanished during skip".to_string(),
+        ))?;
+        dec.skip(length)?;
+    }
+    decode_file_layout(dec)
+}
+
 /// 从 TLV 解码 FileLayout.
 ///
-/// 使用 while 循环遍历所有字段, 支持乱序和可选字段.
-/// 未知字段自动跳过 (前向兼容).
+/// 使用 while 循环遍历 FileLayout 字段, 支持乱序和可选字段.
+/// 遇到不属于 FileLayout 的字段时停止 (不消费), 让调用方继续解码
+/// 后续字段. 这对于 UpdateInodeSizeChunks 等复合消息至关重要:
+/// FileLayout 后面可能跟 IsAppend 等字段, 若被这里消费掉, 调用方
+/// 就读不到了 (L4.01/L4.03/L4.21 全部失败的根因).
+///
+/// 注意: 调用前解码器应已定位到 FileLayout 字段. 若 body 以非
+/// FileLayout 字段开头 (如 Create 响应的 Ino/Mode/Name), 请使用
+/// `decode_file_layout_from_mixed`.
 pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
     // 收集所有字段
     let mut placement_tag: Option<u8> = None;
@@ -137,7 +188,13 @@ pub fn decode_file_layout(dec: &mut TlvDecoder) -> LayoutResult<FileLayout> {
     let mut encoding: Option<ChunkEncoding> = None;
     let mut inline_data: Option<Vec<u8>> = None;
 
-    while let Some((field, length)) = dec.next_field() {
+    // Peek before consuming: stop at the first non-FileLayout field so the
+    // caller can decode trailing fields (IsAppend, etc.) that were encoded
+    // after the FileLayout. Previously the loop consumed ALL remaining
+    // fields via `dec.skip`, silently eating IsAppend and causing
+    // append-mode syncs to be treated as overwrites (size=0, data lost).
+    while dec.peek_field().map_or(false, is_file_layout_field) {
+        let (field, length) = dec.next_field().expect("peeked field must exist");
         match field {
             // --- Placement ---
             FieldId::Placement => {

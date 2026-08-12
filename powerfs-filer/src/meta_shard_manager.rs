@@ -2589,6 +2589,7 @@ impl MetaShardManager {
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
+        is_append: bool,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
         let cmd = ShardCommand::UpdateInodeSizeChunks {
@@ -2596,6 +2597,7 @@ impl MetaShardManager {
             size,
             chunks,
             inline_data,
+            is_append,
         };
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
@@ -2615,7 +2617,14 @@ impl MetaShardManager {
         let mut retries = 0;
         while retries < 50 {
             if let Some(info) = shard_store.get_inode(inode) {
-                if info.size == size && info.chunks.len() == target_chunk_count {
+                if is_append {
+                    // Append mode: the Filer computes the new size, so we
+                    // can't check info.size == size. Instead, check that
+                    // inline_data is non-empty (the append succeeded).
+                    if info.inline_data.as_ref().map(|d| !d.is_empty()).unwrap_or(false) {
+                        return Ok(());
+                    }
+                } else if info.size == size && info.chunks.len() == target_chunk_count {
                     return Ok(());
                 }
             }

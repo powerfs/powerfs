@@ -545,10 +545,15 @@ impl ShardStore {
                 size,
                 chunks,
                 inline_data,
+                is_append,
             } => {
-                if let Err(e) =
-                    self.update_inode_size_chunks_atomic(inode, size, chunks, inline_data)
-                {
+                if let Err(e) = self.update_inode_size_chunks_atomic(
+                    inode,
+                    size,
+                    chunks,
+                    inline_data,
+                    is_append,
+                ) {
                     log::error!(
                         "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
                         self.shard_id.0,
@@ -2173,14 +2178,31 @@ impl ShardStore {
         size: u64,
         chunks: Vec<StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
+        is_append: bool,
     ) -> Result<(), String> {
         let cf_inodes = self
             .db
             .cf_handle(CF_INODES)
             .ok_or_else(|| "CF_INODES not found".to_string())?;
-        let mut info = self
-            .get_inode(inode)
+
+        // L4.21 fix: Hold the write lock for the ENTIRE read-modify-write
+        // sequence when is_append=true. Without this, two concurrent append
+        // RPCs (from different FUSE clients) both read the same inline_data,
+        // each append their own delta, and the last write wins — losing the
+        // other client's data. The lock must be held across the RocksDB
+        // sync write to prevent a concurrent append from reading stale data
+        // between the in-memory read and the persistent write.
+        //
+        // For is_append=false (overwrite mode), the client sends the full
+        // buffer, so there's no read-modify-write race on inline_data.
+        // We still acquire the write lock for consistency, but the critical
+        // section is the same.
+        let mut inodes_guard = self.inodes.write().unwrap();
+        let mut info = inodes_guard
+            .get(&inode)
+            .cloned()
             .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
+
         // Track what actually changed before overwriting fields. This is critical
         // for mtime correctness: the FUSE release path calls this on every close,
         // including read-only opens and delayed releases that re-sync identical
@@ -2198,13 +2220,63 @@ impl ShardStore {
         //   - Metadata sync (SETATTR via Raft): mode, uid, gid, mtime, atime
         let chunks_changed = info.chunks != chunks;
 
-        info.size = size;
-        info.blocks = size.div_ceil(512);
-        // P4: 只在 chunks 实际变化时才重置 reliability_state,
-        // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
-        // 不必要地清空 replica_chunks.
-        info.chunks = chunks;
-        info.inline_data = inline_data;
+        // IsAppend mode: atomically append inline_data to the existing
+        // inline_data instead of overwriting. This prevents lost updates
+        // when two FUSE clients concurrently append to the same inline file
+        // (L4.21: each client builds its own full buffer; without append
+        // mode, the last sync overwrites the other's data).
+        //
+        // The client sends only the delta (bytes appended since open), so
+        // the Filer's existing inline_data is preserved and the delta is
+        // concatenated. The new size = existing_size + delta_len.
+        if is_append {
+            if let Some(delta) = &inline_data {
+                let existing_len = info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0);
+                let mut combined = info.inline_data.clone().unwrap_or_default();
+                combined.extend_from_slice(delta);
+                let new_size = combined.len() as u64;
+                info.size = new_size;
+                info.blocks = new_size.div_ceil(512);
+                info.chunks = chunks; // empty for inline
+                info.inline_data = Some(combined);
+                log::info!(
+                    "Shard {} IsAppend: inode {} appended {} bytes to existing {} bytes, new_size={}",
+                    self.shard_id.0,
+                    inode,
+                    delta.len(),
+                    existing_len,
+                    info.size
+                );
+            } else {
+                // is_append without inline_data — no-op
+                return Ok(());
+            }
+        } else {
+            // Overwrite mode: log when inline_data is being replaced, to
+            // diagnose cross-client data loss (L4.21: a client sending
+            // is_append=false with stale inline_data overwrites the
+            // Filer's current data, causing other clients' appends to
+            // be lost). This is the ONLY place inline_data is overwritten
+            // (not appended), so any size regression traces back to here.
+            if inline_data.is_some() {
+                log::info!(
+                    "Shard {} Overwrite: inode {} size={} inline_len={} (existing_inline_len={}) — \
+                     is_append=false, client buffer sent in overwrite mode",
+                    self.shard_id.0,
+                    inode,
+                    size,
+                    inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                    info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                );
+            }
+            info.size = size;
+            info.blocks = size.div_ceil(512);
+            // P4: 只在 chunks 实际变化时才重置 reliability_state,
+            // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
+            // 不必要地清空 replica_chunks.
+            info.chunks = chunks;
+            info.inline_data = inline_data;
+        }
         // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
         // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
         // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
@@ -2232,8 +2304,7 @@ impl ShardStore {
         self.db
             .put_cf_opt(cf_inodes, inode.to_be_bytes(), &data, &write_opts)
             .map_err(|e| format!("put inode size/chunks: {}", e))?;
-        let mut inodes = self.inodes.write().unwrap();
-        inodes.insert(inode, info);
+        inodes_guard.insert(inode, info);
         Ok(())
     }
 
