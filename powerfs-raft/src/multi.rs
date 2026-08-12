@@ -18,6 +18,8 @@ use std::sync::Arc;
 use futures::Stream;
 use futures::StreamExt;
 use openraft::entry::RaftEntry;
+use openraft::errors::ClientWriteError;
+use openraft::errors::RaftError;
 use openraft::storage::RaftStateMachine;
 use openraft::storage::SnapshotMeta;
 use openraft::vote::RaftLeaderId;
@@ -294,5 +296,58 @@ where
         Ok(Response::new(pb::SnapshotResponse {
             vote: Some(crate::pb_impl::vote_to_pb::<C>(&resp.vote)),
         }))
+    }
+
+    async fn propose(
+        &self,
+        request: Request<pb::ProposeRequest>,
+    ) -> Result<Response<pb::ProposeResponse>, Status> {
+        let pb_req = request.into_inner();
+        let group_id = pb_req.group_id.clone();
+
+        let raft = self
+            .router
+            .get_group(&group_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Raft group '{}' not found", group_id)))?;
+
+        // Deserialize payload as C::D (e.g., FilerRequest) using serde_json
+        let req: C::D = serde_json::from_slice(&pb_req.payload).map_err(|e| {
+            Status::invalid_argument(format!("Failed to deserialize propose payload: {}", e))
+        })?;
+
+        match raft.client_write(req).await {
+            Ok(resp) => Ok(Response::new(pb::ProposeResponse {
+                ok: true,
+                error: String::new(),
+                log_index: resp.log_id.index(),
+                forward_leader_id: String::new(),
+            })),
+            Err(RaftError::APIError(api_err)) => match api_err {
+                ClientWriteError::ForwardToLeader(fwd) => {
+                    let leader_id = fwd
+                        .leader_id
+                        .as_ref()
+                        .map(|id| id.to_string())
+                        .unwrap_or_default();
+                    Ok(Response::new(pb::ProposeResponse {
+                        ok: false,
+                        error: format!("has to forward request to: {:?}", fwd.leader_id),
+                        log_index: 0,
+                        forward_leader_id: leader_id,
+                    }))
+                }
+                other => Ok(Response::new(pb::ProposeResponse {
+                    ok: false,
+                    error: format!("client_write API error: {}", other),
+                    log_index: 0,
+                    forward_leader_id: String::new(),
+                })),
+            },
+            Err(RaftError::Fatal(f)) => Err(Status::internal(format!(
+                "Raft fatal error during propose: {}",
+                f
+            ))),
+        }
     }
 }

@@ -2265,7 +2265,11 @@ impl MetaShardManager {
         };
         let data = cmd.serialize();
 
-        // Retry propose with backoff to handle leader election
+        // Retry propose with backoff to handle leader election and forwarding.
+        // openraft returns one of:
+        //   - "not the leader"
+        //   - "has to forward request to: Some(\"<id>\"), Some(BasicNode { addr: ... })"
+        // when the local node is not the leader. We retry until leader election completes.
         let mut propose_retries = 0;
         loop {
             match self
@@ -2273,19 +2277,27 @@ impl MetaShardManager {
                 .propose(shard_id, data.clone())
                 .await
             {
-                Ok(_) => break,
+                Ok(idx) => {
+                    info!(
+                        "POSIX root proposed at log index {} on shard {}",
+                        idx, shard_id.0
+                    );
+                    break;
+                }
                 Err(e) => {
-                    if e.contains("not the leader") {
+                    let is_forward = e.contains("not the leader")
+                        || e.contains("has to forward request to");
+                    if is_forward {
                         propose_retries += 1;
-                        if propose_retries >= 30 {
+                        if propose_retries >= 60 {
                             return Err(format!(
-                                "failed to propose POSIX root: leader election timeout after {} retries",
-                                propose_retries
+                                "failed to propose POSIX root: leader election timeout after {} retries: {}",
+                                propose_retries, e
                             ));
                         }
                         debug!(
-                            "Waiting for Raft leader election (retry {}/30)...",
-                            propose_retries
+                            "Waiting for Raft leader election (retry {}/60): {}",
+                            propose_retries, e
                         );
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     } else {
@@ -2295,9 +2307,9 @@ impl MetaShardManager {
             }
         }
 
-        // Wait for apply
+        // Wait for apply (up to 30 seconds; leader election can take 5+ seconds).
         let mut retries = 0;
-        while retries < 20 {
+        while retries < 300 {
             let applied = {
                 let stores = self.shard_stores.read().unwrap();
                 stores

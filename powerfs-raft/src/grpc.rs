@@ -214,4 +214,18 @@ where
             vote: Some(crate::pb_impl::vote_to_pb::<C>(&resp.vote)),
         }))
     }
+
+    /// 处理 Propose（客户端写入转发）。
+    ///
+    /// 单组部署（Master）目前不使用 propose 转发，返回 Unimplemented。
+    /// Filer 多组场景由 `MultiRaftServiceImpl::propose` 处理。
+    async fn propose(
+        &self,
+        _request: Request<pb::ProposeRequest>,
+    ) -> Result<Response<pb::ProposeResponse>, Status> {
+        Err(Status::unimplemented(
+            "Propose RPC is not supported on single-group RaftServiceImpl (Master). \
+             Use MultiRaftServiceImpl for Filer multi-group propose forwarding.",
+        ))
+    }
 }

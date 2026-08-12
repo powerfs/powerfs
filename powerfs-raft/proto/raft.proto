@@ -136,6 +136,27 @@ message SnapshotResponse {
   Vote vote = 1;
 }
 
+// ProposeRequest 是客户端写入请求转发（Filer propose forward）。
+// 当 Filer 收到 propose 但本地不是 leader 时，通过此 RPC 转发到 leader 节点。
+message ProposeRequest {
+  // 多 Raft 组路由标识（Filer 多分片场景）。单组部署（Master）留空。
+  string group_id = 1;
+  // 序列化后的业务 payload（C::D，如 FilerRequest）。
+  bytes payload = 2;
+}
+
+// ProposeResponse 是 propose 转发的响应。
+message ProposeResponse {
+  // 是否成功。
+  bool ok = 1;
+  // 失败时的错误信息。
+  string error = 2;
+  // 成功时的 log index。
+  uint64 log_index = 3;
+  // 如果 ok=false 且此字段非空，表示当前节点不是 leader，应转发到此节点。
+  string forward_leader_id = 4;
+}
+
 // RaftService 处理 Raft 节点间的内部通信。
 service RaftService {
   // Vote 处理领导者选举中的投票请求。
@@ -149,4 +170,7 @@ service RaftService {
 
   // Snapshot 处理快照安装 RPC。
   rpc Snapshot(stream SnapshotRequest) returns (SnapshotResponse) {}
+
+  // Propose 处理客户端写入转发（Filer propose forward to leader）。
+  rpc Propose(ProposeRequest) returns (ProposeResponse) {}
 }
