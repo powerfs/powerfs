@@ -215,8 +215,25 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
 }
 
 /// 从 chunk 映射恢复 needle_id counter。
+/// File-key 分配步长.
 ///
-/// 遍历所有 chunks，找到属于本 zone 的最大 counter，返回 max + 1。
+/// needle_id = file_key + chunk_idx (Flat 模式), 每个文件的 chunks 占用
+/// [file_key, file_key + N) 的 needle_id 区间. 若 file_key 顺序递增 (步长=1),
+/// 后一个文件的 file_key 会落入前一个文件的 chunk 区间, 导致 needle_id
+/// 碰撞和数据覆盖.
+///
+/// 步长 65536 (= 2^16): 每个文件预留 65536 个 needle_id (1MB chunk × 65536
+/// = 64GB 最大文件). counter 有 40 bits (1万亿/zone), 步长 65536 可容纳
+/// 2^24 = 1677 万个文件/zone.
+pub const FILE_KEY_STRIDE: u64 = 65536;
+
+///
+/// 遍历所有 chunks，找到属于本 zone 的最大 counter，返回 next stride boundary.
+///
+/// 注意: Flat 文件仅存储 chunk 0 的 needle_id (= file_key) 在 Filer 元数据中,
+/// 后续 chunks (file_key+1, ...) 不存储. 因此 max_counter 可能是某个文件的
+/// file_key, 其后续 chunks 仍在使用中. 必须向上取整到下一个 stride boundary,
+/// 避免恢复后的 counter 落入已有文件的 chunk 区间.
 pub fn recover_counter(zone_id: u32, chunks: &[(u64, u64)]) -> u64 {
     let mut max_counter = 0u64;
     for &(_, needle_id) in chunks {
@@ -227,11 +244,25 @@ pub fn recover_counter(zone_id: u32, chunks: &[(u64, u64)]) -> u64 {
             }
         }
     }
-    max_counter + 1
+    // 向上取整到下一个 stride boundary, 避免与已有文件的 chunks 碰撞.
+    // Stripe 文件的 per-chunk 分配 (步长=1) 也在 max_counter 之下, 不受影响.
+    ((max_counter / FILE_KEY_STRIDE) + 1) * FILE_KEY_STRIDE
 }
 
 /// 分配 needle_id (zone_id << 40 | counter)
+///
+/// 用于 Stripe 文件的 per-chunk 分配, 步长=1.
 pub fn alloc_needle_id(zone_id: u32, counter: &std::sync::atomic::AtomicU64) -> u64 {
     let c = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    make_needle_id(zone_id, c)
+}
+
+/// 分配 file_key (zone_id << 40 | counter), 步长=FILE_KEY_STRIDE.
+///
+/// 用于 Flat 文件的 file_key 分配 (CREATE + MIGRATE_INLINE_ALLOC).
+/// 客户端用 file_key + chunk_idx 计算每个 chunk 的 needle_id,
+/// 步长确保不同文件的 needle_id 区间不重叠.
+pub fn alloc_file_key(zone_id: u32, counter: &std::sync::atomic::AtomicU64) -> u64 {
+    let c = counter.fetch_add(FILE_KEY_STRIDE, std::sync::atomic::Ordering::SeqCst);
     make_needle_id(zone_id, c)
 }

@@ -58,6 +58,14 @@ pub struct InvalidateHandler {
     /// InvalidateHandler runs in the notification thread (not the FUSE
     /// worker thread), so it cannot use the Server's notify methods.
     fuse_fd: Arc<AtomicI32>,
+    /// Reference to the FUSE client's open_inodes tracker.
+    /// Used as a secondary check: even if hold is momentarily Unpinned
+    /// (during the window between open_inodes increment and pin_inode),
+    /// the InvalidateHandler skips invalidation for inodes that are
+    /// tracked as open. This prevents the race where Invalidate arrives
+    /// between release's unpin and the next open's pin, causing eviction
+    /// of an inode that is being opened (ENOENT in mdtest-hard).
+    open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
 }
 
 impl InvalidateHandler {
@@ -73,6 +81,7 @@ impl InvalidateHandler {
             inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd: Arc::new(AtomicI32::new(-1)),
+            open_inodes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -90,6 +99,29 @@ impl InvalidateHandler {
             inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd,
+            open_inodes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new InvalidateHandler with a shared FUSE file descriptor
+    /// and the FUSE client's open_inodes tracker. The open_inodes map
+    /// is checked as a secondary guard: even if hold is momentarily
+    /// Unpinned (race between release's unpin and the next open's pin),
+    /// the handler skips invalidation for inodes tracked as open.
+    pub fn new_with_fuse_fd_and_open_inodes(
+        cache: Arc<MetadataCache>,
+        chunk_cache: Arc<ChunkCache>,
+        inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
+        fuse_fd: Arc<AtomicI32>,
+        open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
+    ) -> Self {
+        Self {
+            cache,
+            chunk_cache,
+            inline_buffers,
+            processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            fuse_fd,
+            open_inodes,
         }
     }
 
@@ -319,6 +351,29 @@ impl NotificationHandler for InvalidateHandler {
                     return;
                 }
 
+                // Secondary guard: check open_inodes tracker. Even if hold
+                // is momentarily Unpinned — during the race window between
+                // release's unpin_inode (hold → Unpinned) and the next open's
+                // pin_inode (hold → Pinned) — the inode is still tracked in
+                // open_inodes. Without this check, the InvalidateHandler
+                // would evict the inode mid-open, causing ENOENT when the
+                // write path tries to access it (mdtest-hard crash).
+                //
+                // The open path holds open_inodes.write() while calling
+                // pin_inode, but the InvalidateHandler doesn't acquire
+                // open_inodes — it only checks inode_cache (for is_pinned).
+                // This check closes the gap: if open_inodes has the inode,
+                // an open is in progress (or just completed) and the cache
+                // will be refreshed by the open path.
+                if self.open_inodes.read().unwrap().contains_key(&inode) {
+                    debug!(
+                        "InvalidateHandler: skipping invalidation for open inode={} (is_pinned=false but open_inodes has it, server_v={}) — race window between release unpin and open pin",
+                        inode, version
+                    );
+                    self.mark_processed(inode, version);
+                    return;
+                }
+
                 // State machine check: skip invalidation for Dirty/Flushing
                 // entries. These have local authoritative data that must not
                 // be invalidated (core state machine rule: Dirty/Flushing →
@@ -393,6 +448,31 @@ impl NotificationHandler for InvalidateHandler {
 
                 // Check if our cached version is stale
                 if self.cache.is_inode_stale(inode, version) {
+                    // FINAL GUARD: Re-check is_open under read lock and HOLD
+                    // the lock through eviction. This prevents a concurrent
+                    // open from pinning the inode between the initial is_open
+                    // check (above) and the actual eviction. Without this, the
+                    // following race causes ENOENT in mdtest-hard:
+                    //   1. InvalidateHandler: is_open → false (release removed it)
+                    //   2. Open #2: acquires open_inodes.write(), adds inode,
+                    //      calls pin_inode (hold → Pinned)
+                    //   3. InvalidateHandler: invalidate_inode → evicts
+                    //      (was_pinned=true because open #2 just pinned it!)
+                    //   4. Write: ENOENT (inode was evicted)
+                    //
+                    // Holding open_inodes.read() blocks the open path's
+                    // open_inodes.write(), so open #2 can't pin until after
+                    // eviction completes. Then open #2 re-fetches from Filer.
+                    let open_guard = self.open_inodes.read().unwrap();
+                    if open_guard.contains_key(&inode) {
+                        debug!(
+                            "InvalidateHandler: skipping invalidation for open inode={} (re-check before eviction, server_v={}) — inode was opened after initial is_open check",
+                            inode, version
+                        );
+                        self.mark_processed(inode, version);
+                        return;
+                    }
+
                     // RACE_TRACE: Log eviction decision with full context.
                     // This is where the inode gets evicted — correlate with
                     // unpin_inode and flush_all_dirty_chunks logs to identify

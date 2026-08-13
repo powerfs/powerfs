@@ -8,7 +8,9 @@ use powerfs_common::{
     },
     types::{Fid, NodeId, VolumeId, VolumeInfo},
 };
-use powerfs_layout::codec::{decode_file_layout, encode_file_layout, FEATURE_CHUNK_LAYOUT_V2};
+use powerfs_layout::codec::{
+    decode_file_layout_from_mixed, encode_file_layout, FEATURE_CHUNK_LAYOUT_V2,
+};
 use powerfs_layout::encoding::ChunkEncoding;
 use powerfs_layout::layout::FileLayout;
 use powerfs_layout::placement::Placement;
@@ -216,12 +218,16 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
     );
 
     // Decode FileLayout from remaining TLV fields (binary TLV, replaces JSON Chunks).
-    // If no layout fields are present, decode_file_layout returns a default
-    // FileLayout with empty ChunkEncoding::PerChunk.
+    // Use decode_file_layout_from_mixed (not decode_file_layout) because the
+    // GETATTR response includes ShardId between Name and the FileLayout fields.
+    // decode_file_layout stops at the first non-FileLayout field (ShardId),
+    // returning an empty layout with chunks=[] — causing the FUSE client to
+    // see fid=None, chunks=0 even when the Filer has chunks stored.
+    // decode_file_layout_from_mixed skips leading non-FileLayout fields first.
     // P4: Save remaining bytes BEFORE decode_file_layout, because its while-loop
     // consumes ALL remaining fields (including ReplicaChunks via the _ => skip branch).
     let remaining_before_layout = dec.remaining_slice().to_vec();
-    let layout = decode_file_layout(&mut dec).unwrap_or(FileLayout {
+    let layout = decode_file_layout_from_mixed(&mut dec).unwrap_or(FileLayout {
         placement: Placement::Flat,
         reliability: Reliability::SingleReplica,
         reliability_state: ReliabilityState::default(),

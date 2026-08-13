@@ -441,15 +441,18 @@ impl FilerNetHandler {
 
         let pick = self.filer_allocator.pick_for_new_file(&zone_views)?;
 
-        // Execute: allocate needle_id from the picked zone's counter.
+        // Execute: allocate file_key from the picked zone's counter (with stride).
+        // 使用 alloc_file_key (步长=FILE_KEY_STRIDE) 而非 alloc_needle_id (步长=1),
+        // 因为 Flat 文件用 file_key + chunk_idx 计算 needle_id, 需要预留区间.
         let zone = zones.iter().find(|z| z.zone_id == pick.zone_id)?;
-        let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+        let needle_id = crate::zone_client::alloc_file_key(zone.zone_id, &zone.counter);
 
         info!(
-            "FILER_ZONE: allocated needle_id={:#x} (zone={}, counter={}) volume_id={}",
+            "FILER_ZONE: allocated file_key={:#x} (zone={}, counter={}, stride={}) volume_id={}",
             needle_id,
             pick.zone_id,
             powerfs_common::types::needle_counter(needle_id),
+            crate::zone_client::FILE_KEY_STRIDE,
             pick.volume_id
         );
 
@@ -1625,8 +1628,12 @@ impl FilerNetHandler {
                 FieldId::ShardId,
                 self.shard_strategy.calculate_shard(entry.inode).0,
             );
-            // 完整 chunks 列表 + 兼容旧单 chunk 字段
-            Self::encode_chunks_fields(&mut entry_enc, entry)?;
+            // 不在 readdir 响应中编码 chunks/inline_data (encode_chunks_fields).
+            // 原因: 每个条目的 inline_data 可达 8KB, 1000 条目 = 8MB,
+            // 远超 MAX_BODY_SIZE (256KB), 导致客户端拒绝响应 (RX_TRUNCATE),
+            // 进而导致 IO500 mdtest-hard 崩溃.
+            // 客户端 readdir 只需要 inode/name/mode, chunks 在 GETATTR/LOOKUP 时按需获取.
+            // (decode_readdir_resp 用 _ => skip(el) 安全跳过缺失字段)
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
         }
 

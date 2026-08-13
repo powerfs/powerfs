@@ -321,6 +321,22 @@ impl WriteCoalescer {
             .contains_key(needle_id)
     }
 
+    /// Remove and discard any un-flushed dirty buffer for `needle_id`.
+    ///
+    /// This must be called by paths that write directly to the backend
+    /// (bypassing the coalescer), such as [`Volume::write_needle`] and
+    /// [`Volume::delete_needle`].  Without invalidation, a stale dirty
+    /// entry from a *previous* file (same `NeedleId` due to fkey reuse)
+    /// could be flushed later and silently overwrite the correct data.
+    pub fn invalidate(&self, needle_id: &NeedleId) {
+        let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
+        if let Some(entry) = inner.entries.remove(needle_id) {
+            // Keep the budget counter in sync.
+            inner.dirty_bytes_total =
+                inner.dirty_bytes_total.saturating_sub(entry.merged.capacity());
+        }
+    }
+
     /// Number of currently dirty entries.  Exposed for tests and metrics.
     pub fn dirty_entry_count(&self) -> usize {
         self.inner
