@@ -1,7 +1,7 @@
 use log::{debug, info, warn};
 use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::crdt_orset::{ServerDirORSet, Tombstone};
@@ -76,6 +76,37 @@ pub struct InodeInfo {
     pub replica_chunks: Vec<StoredFileChunk>,
 }
 
+/// Lightweight directory entry for readdir responses.
+/// Contains only the fields needed by readdir, avoiding expensive
+/// clones of chunks/inline_data/extended/replica_chunks from full InodeInfo.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub inode: u64,
+    pub name: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
+}
+
+/// Lightweight inode metadata for cross-shard readdir resolution.
+/// Avoids cloning chunks/inline_data/extended from full InodeInfo.
+#[derive(Debug, Clone)]
+pub struct InodeMetadata {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
+}
+
 /// Stored file chunk (persisted in Filer InodeInfo)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredFileChunk {
@@ -110,7 +141,7 @@ pub struct ShardStore {
     inode_range: (u64, u64),
     db: DB,
     inodes: RwLock<HashMap<u64, InodeInfo>>,
-    directory_entries: RwLock<HashMap<u64, HashMap<String, u64>>>,
+    directory_entries: RwLock<HashMap<u64, BTreeMap<String, u64>>>,
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
     next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
@@ -1064,7 +1095,7 @@ impl ShardStore {
             // Always start with a fresh empty map for the new directory's
             // own entries. Using or_default() would keep stale entries if the
             // inode number was reused after an incomplete cleanup.
-            dir_entries.insert(inode, std::collections::HashMap::new());
+            dir_entries.insert(inode, BTreeMap::new());
         }
         {
             let mut stats = self.stats.write().unwrap();
@@ -1528,6 +1559,108 @@ impl ShardStore {
         }
 
         result
+    }
+
+    /// Paginated directory entry listing using BTreeMap ordering.
+    /// Returns (name, inode) pairs starting after `last_name`, up to `limit + 1`.
+    /// Fetching limit+1 allows the caller to determine has_more without a
+    /// second scan.
+    pub fn list_dir_entry_inodes_paginated(
+        &self,
+        parent_inode: u64,
+        last_name: &str,
+        limit: usize,
+    ) -> (Vec<(String, u64)>, bool) {
+        let dir_entries = self.directory_entries.read().unwrap();
+        let mut result = Vec::with_capacity(limit + 1);
+        let mut has_more = false;
+
+        if let Some(dir) = dir_entries.get(&parent_inode) {
+            for (name, &inode) in dir.iter() {
+                // BTreeMap is sorted by name; skip until past last_name
+                if !last_name.is_empty() && name.as_str() <= last_name {
+                    continue;
+                }
+                if result.len() >= limit + 1 {
+                    has_more = true;
+                    break;
+                }
+                result.push((name.clone(), inode));
+            }
+        }
+
+        (result, has_more)
+    }
+
+    /// Lightweight inode metadata lookup — returns only the fields needed
+    /// for readdir without cloning chunks/inline_data/extended/replica_chunks.
+    /// Returns None if inode not found or tombstoned.
+    pub fn get_inode_metadata(&self, inode: u64) -> Option<InodeMetadata> {
+        let inodes = self.inodes.read().unwrap();
+        inodes.get(&inode).and_then(|info| {
+            if info.delete_time > 0 {
+                None
+            } else {
+                Some(InodeMetadata {
+                    mode: info.mode,
+                    uid: info.uid,
+                    gid: info.gid,
+                    size: info.size,
+                    atime: info.atime,
+                    mtime: info.mtime,
+                    ctime: info.ctime,
+                    nlink: info.nlink,
+                })
+            }
+        })
+    }
+
+    /// Paginated directory listing with lightweight DirEntry.
+    /// Uses BTreeMap ordering for efficient seek + limit.
+    /// Acquires directory_entries and inodes read locks once.
+    /// Returns (entries, has_more).
+    pub fn list_directory_paginated(
+        &self,
+        parent_inode: u64,
+        last_name: &str,
+        limit: usize,
+    ) -> (Vec<DirEntry>, bool) {
+        let dir_entries = self.directory_entries.read().unwrap();
+        let inodes = self.inodes.read().unwrap();
+
+        let mut result = Vec::with_capacity(limit + 1);
+        let mut has_more = false;
+
+        if let Some(dir) = dir_entries.get(&parent_inode) {
+            for (name, &inode) in dir.iter() {
+                if !last_name.is_empty() && name.as_str() <= last_name {
+                    continue;
+                }
+                if result.len() >= limit {
+                    has_more = true;
+                    break;
+                }
+                if let Some(info) = inodes.get(&inode) {
+                    if info.delete_time > 0 {
+                        continue;
+                    }
+                    result.push(DirEntry {
+                        inode: info.inode,
+                        name: name.clone(),
+                        mode: info.mode,
+                        uid: info.uid,
+                        gid: info.gid,
+                        size: info.size,
+                        atime: info.atime,
+                        mtime: info.mtime,
+                        ctime: info.ctime,
+                        nlink: info.nlink,
+                    });
+                }
+            }
+        }
+
+        (result, has_more)
     }
 
     pub fn get_stats(&self) -> ShardStats {

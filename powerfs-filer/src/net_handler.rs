@@ -1573,45 +1573,28 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        let entries = self.meta_shard_manager.list_directory(parent_ino);
+        // Paginated listing: BTreeMap seek + lightweight DirEntry (no
+        // chunks/inline_data clone). Entries are already sorted by name
+        // (BTreeMap ordering) and paginated at the source.
+        let (entries, has_more) = self
+            .meta_shard_manager
+            .list_directory_paginated(parent_ino, &last_name, limit as usize);
 
+        // Log entry count + first few names (avoid flooding for large dirs)
+        let preview: Vec<&str> = entries.iter().take(10).map(|e| e.name.as_str()).collect();
         info!(
-            "FILER_NET_READDIR: parent_ino={}, entries={}",
+            "FILER_NET_READDIR: parent_ino={}, count={}, has_more={}, preview={}",
             parent_ino,
-            entries
-                .iter()
-                .map(|e| e.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
+            entries.len(),
+            has_more,
+            preview.join(","),
         );
 
-        // Sort entries by name before pagination. list_directory() returns
-        // entries in HashMap iteration order (non-deterministic). Without
-        // sorting, the last_name cursor (string comparison) can permanently
-        // skip entries that are alphabetically before the cursor, causing
-        // readdir to miss files after remount (T3b/T3c/T9a/T9b failures).
-        let mut sorted_entries = entries;
-        sorted_entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Filter by last_name for pagination (string comparison on sorted names)
-        let filtered: Vec<&InodeInfo> = if last_name.is_empty() {
-            sorted_entries.iter().collect()
-        } else {
-            sorted_entries
-                .iter()
-                .filter(|e| e.name.as_str() > last_name.as_str())
-                .collect()
-        };
-
-        // has_more is true only when there are entries beyond the `limit` window.
-        let has_more = filtered.len() > limit as usize;
-        let limited: Vec<&InodeInfo> = filtered.into_iter().take(limit as usize).collect();
-
         let mut enc = TlvEncoder::new();
-        enc.add_u32(FieldId::Count, limited.len() as u32);
+        enc.add_u32(FieldId::Count, entries.len() as u32);
         enc.add_u64(FieldId::HasMore, if has_more { 1 } else { 0 });
 
-        for entry in &limited {
+        for entry in &entries {
             let mut entry_enc = TlvEncoder::new();
             entry_enc.add_u64(FieldId::Ino, entry.inode);
             entry_enc.add_string(FieldId::Name, &entry.name)?;
@@ -1623,17 +1606,10 @@ impl FilerNetHandler {
             entry_enc.add_u64(FieldId::Mtime, entry.mtime);
             entry_enc.add_u64(FieldId::Ctime, entry.ctime);
             entry_enc.add_u32(FieldId::Nlink, entry.nlink);
-            // 方案 B: 返回每个子条目 inode 所在 shard_id, 客户端 lookup 后缓存
             entry_enc.add_u64(
                 FieldId::ShardId,
                 self.shard_strategy.calculate_shard(entry.inode).0,
             );
-            // 不在 readdir 响应中编码 chunks/inline_data (encode_chunks_fields).
-            // 原因: 每个条目的 inline_data 可达 8KB, 1000 条目 = 8MB,
-            // 远超 MAX_BODY_SIZE (256KB), 导致客户端拒绝响应 (RX_TRUNCATE),
-            // 进而导致 IO500 mdtest-hard 崩溃.
-            // 客户端 readdir 只需要 inode/name/mode, chunks 在 GETATTR/LOOKUP 时按需获取.
-            // (decode_readdir_resp 用 _ => skip(el) 安全跳过缺失字段)
             enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
         }
 
