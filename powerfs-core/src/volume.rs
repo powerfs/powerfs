@@ -328,6 +328,13 @@ impl Volume {
         };
         let needle_id = NeedleId(actual_key);
         let volume_id = info_guard.id;
+
+        // Invalidate any stale coalescer dirty entry for this needle_id.
+        // write_needle writes directly to the backend (bypassing the coalescer),
+        // so a stale dirty entry from a previous file (same NeedleId due to
+        // fkey reuse) must be discarded — otherwise it would be flushed later
+        // and silently overwrite the correct data just written below.
+        self.coalescer.invalidate(&needle_id);
         let needle =
             Needle::new_with_algorithm(needle_id.clone(), volume_id, data, self.checksum_algorithm);
 
@@ -427,6 +434,10 @@ impl Volume {
     }
 
     pub fn delete_needle(&self, needle_id: &NeedleId) -> Result<()> {
+        // Discard any stale coalescer dirty entry so it cannot be flushed
+        // after the needle is deleted and silently resurrect stale data.
+        self.coalescer.invalidate(needle_id);
+
         // 先检查 needle 存在且未被删除
         if let Some(info) = self.index.get(needle_id) {
             if info.deleted_at.is_some() {
