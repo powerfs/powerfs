@@ -21,6 +21,9 @@ jobs:
       with:
         submodules: false
 
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -49,6 +52,9 @@ jobs:
       with:
         submodules: false
 
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     
@@ -71,6 +77,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: false
+
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -98,6 +107,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: false
+
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -134,6 +146,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: false
+
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
