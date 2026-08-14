@@ -103,7 +103,7 @@ jobs:
       run: cargo test --all -- --test-threads=2
     
     - name: Benchmark Tests
-      run: cargo test --package powerfs-core --test benchmark -- --test-threads=1
+      run: cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
 
   # 基准测试
   benchmark:
@@ -132,12 +132,12 @@ jobs:
       uses: Swatinem/rust-cache@v2
     
     - name: Build Benchmark
-      run: cargo build --package powerfs-core --release --bench benchmark
+      run: cargo build --package powerfs-core --release --bench kv_benchmark
     
     - name: Run Benchmark
       run: |
         mkdir -p benchmark-results
-        ./target/release/deps/powerfs_core-* --bench --save-baseline baseline
+        cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
     
