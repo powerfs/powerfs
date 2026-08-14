@@ -13,14 +13,18 @@ fn make_data(size: usize) -> Vec<u8> {
     data
 }
 
-fn make_engine() -> KVCacheEngine {
+/// Keep the `TempDir` guard alive for the lifetime of the engine, otherwise
+/// RocksDB's backing files disappear mid-benchmark.
+fn make_engine() -> (KVCacheEngine, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().to_str().unwrap();
-    KVCacheEngine::new_with_db(10 * 1024 * 1024, 1024 * 1024, db_path).unwrap()
+    let engine = KVCacheEngine::new_with_db(10 * 1024 * 1024, 1024 * 1024, db_path).unwrap();
+    (engine, temp_dir)
 }
 
 fn kv_put_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
@@ -45,7 +49,8 @@ fn kv_put_benchmark(c: &mut Criterion) {
 }
 
 fn kv_get_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
@@ -73,7 +78,8 @@ fn kv_get_benchmark(c: &mut Criterion) {
 }
 
 fn kv_batch_put_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
@@ -104,7 +110,8 @@ fn kv_batch_put_benchmark(c: &mut Criterion) {
 }
 
 fn kv_concurrent_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
@@ -136,7 +143,8 @@ fn kv_concurrent_benchmark(c: &mut Criterion) {
 }
 
 fn kv_delete_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
@@ -157,7 +165,8 @@ fn kv_delete_benchmark(c: &mut Criterion) {
 }
 
 fn kv_list_benchmark(c: &mut Criterion) {
-    let engine = Arc::new(make_engine());
+    let (engine, _temp_dir) = make_engine();
+    let engine = Arc::new(engine);
     engine
         .create_namespace("ns_bench", "benchmark", "user1")
         .unwrap();
