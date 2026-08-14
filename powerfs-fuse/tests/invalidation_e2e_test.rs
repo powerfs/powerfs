@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
 use powerfs_fuse::cache::{CachedEntry, ChunkCache, EntryState, HoldState, MetadataCache};
 use powerfs_fuse::invalidate_handler::InvalidateHandler;
 use powerfs_net::client_conn::{ClientConn, ConnRegistry};
@@ -117,7 +118,7 @@ async fn test_invalidation_e2e_single_client_cache_cleared() {
     let mgr = Arc::new(ServerConnectionManager::new(registry.clone()));
     let cache = Arc::new(MetadataCache::new());
     let chunk_cache = Arc::new(ChunkCache::with_defaults());
-    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache, Arc::new(DashMap::new()));
 
     let client_id: u64 = 1001;
     let addr: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
@@ -147,7 +148,7 @@ async fn test_invalidation_e2e_older_version_ignored() {
     let mgr = Arc::new(ServerConnectionManager::new(registry.clone()));
     let cache = Arc::new(MetadataCache::new());
     let chunk_cache = Arc::new(ChunkCache::with_defaults());
-    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache, Arc::new(DashMap::new()));
 
     let client_id: u64 = 1002;
     let addr: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
@@ -177,8 +178,10 @@ async fn test_invalidation_e2e_multiple_clients_isolation() {
     let cache_b = Arc::new(MetadataCache::new());
     let chunk_cache_a = Arc::new(ChunkCache::with_defaults());
     let chunk_cache_b = Arc::new(ChunkCache::with_defaults());
-    let handler_a = InvalidateHandler::new(cache_a.clone(), chunk_cache_a);
-    let handler_b = InvalidateHandler::new(cache_b.clone(), chunk_cache_b);
+    let handler_a =
+        InvalidateHandler::new(cache_a.clone(), chunk_cache_a, Arc::new(DashMap::new()));
+    let handler_b =
+        InvalidateHandler::new(cache_b.clone(), chunk_cache_b, Arc::new(DashMap::new()));
 
     // Register two clients
     let client_a: u64 = 2001;
@@ -235,8 +238,10 @@ async fn test_invalidation_e2e_broadcast_all_clients() {
     let cache_b = Arc::new(MetadataCache::new());
     let chunk_cache_a = Arc::new(ChunkCache::with_defaults());
     let chunk_cache_b = Arc::new(ChunkCache::with_defaults());
-    let handler_a = InvalidateHandler::new(cache_a.clone(), chunk_cache_a);
-    let handler_b = InvalidateHandler::new(cache_b.clone(), chunk_cache_b);
+    let handler_a =
+        InvalidateHandler::new(cache_a.clone(), chunk_cache_a, Arc::new(DashMap::new()));
+    let handler_b =
+        InvalidateHandler::new(cache_b.clone(), chunk_cache_b, Arc::new(DashMap::new()));
 
     let client_a: u64 = 3001;
     let client_b: u64 = 3002;
@@ -272,7 +277,7 @@ async fn test_invalidation_e2e_zero_inode_ignored() {
     let mgr = Arc::new(ServerConnectionManager::new(registry.clone()));
     let cache = Arc::new(MetadataCache::new());
     let chunk_cache = Arc::new(ChunkCache::with_defaults());
-    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache, Arc::new(DashMap::new()));
 
     let client_id: u64 = 4001;
     let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9301".parse().unwrap()).await;
@@ -290,7 +295,7 @@ async fn test_invalidation_e2e_multiple_inodes() {
     let mgr = Arc::new(ServerConnectionManager::new(registry.clone()));
     let cache = Arc::new(MetadataCache::new());
     let chunk_cache = Arc::new(ChunkCache::with_defaults());
-    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache, Arc::new(DashMap::new()));
 
     let client_id: u64 = 5001;
     let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9401".parse().unwrap()).await;
@@ -327,7 +332,7 @@ async fn test_invalidation_e2e_idempotent_same_version() {
     let mgr = Arc::new(ServerConnectionManager::new(registry.clone()));
     let cache = Arc::new(MetadataCache::new());
     let chunk_cache = Arc::new(ChunkCache::with_defaults());
-    let handler = InvalidateHandler::new(cache.clone(), chunk_cache);
+    let handler = InvalidateHandler::new(cache.clone(), chunk_cache, Arc::new(DashMap::new()));
 
     let client_id: u64 = 6001;
     let mut rx = setup_test_client(&registry, client_id, "127.0.0.1:9501".parse().unwrap()).await;
