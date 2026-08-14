@@ -19,7 +19,10 @@ jobs:
       with:
         fetch-depth: 0
         submodules: false
-    
+
+    - name: Checkout public submodules
+      run: git submodule update --init rfs_tester
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
