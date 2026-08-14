@@ -4,7 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::raft_group_manager::{RaftGroupManager, ShardId};
+use crate::raft_group_manager_v2::RaftGroupManagerV2;
+use crate::raft_group_manager_v2::ShardId;
 use crate::shard_strategy::ShardStrategy;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -125,7 +126,7 @@ pub struct SchedulerStatus {
 }
 
 pub struct ShardScheduler {
-    raft_group_manager: Arc<RaftGroupManager>,
+    raft_group_manager: Arc<RaftGroupManagerV2>,
     shard_strategy: Arc<ShardStrategy>,
     node_metrics: RwLock<HashMap<String, NodeMetrics>>,
     pub config: RwLock<SchedulerConfig>,
@@ -138,7 +139,7 @@ pub struct ShardScheduler {
 
 impl ShardScheduler {
     pub fn new(
-        raft_group_manager: Arc<RaftGroupManager>,
+        raft_group_manager: Arc<RaftGroupManagerV2>,
         shard_strategy: Arc<ShardStrategy>,
     ) -> Self {
         Self {
@@ -155,7 +156,7 @@ impl ShardScheduler {
     }
 
     pub fn new_with_config(
-        raft_group_manager: Arc<RaftGroupManager>,
+        raft_group_manager: Arc<RaftGroupManagerV2>,
         shard_strategy: Arc<ShardStrategy>,
         config: SchedulerConfig,
     ) -> Self {
@@ -205,63 +206,6 @@ impl ShardScheduler {
             .values()
             .cloned()
             .collect()
-    }
-
-    fn calculate_node_score(&self, node_id: &str) -> f64 {
-        let node_metrics_lock = self.node_metrics.read().unwrap();
-        let metrics = match node_metrics_lock.get(node_id) {
-            Some(m) => m,
-            None => return f64::MAX,
-        };
-
-        if !metrics.is_healthy {
-            return f64::MAX;
-        }
-
-        let avg_leader_count = self.average_leader_count();
-        let max_qps = self.max_qps();
-
-        let cpu_score = metrics.cpu_usage * 0.20;
-        let memory_score = metrics.memory_usage * 0.15;
-        let disk_score = (1.0 - metrics.disk_available_ratio()) * 0.15;
-
-        let leader_score = if avg_leader_count > 0.0 {
-            (metrics.leader_count as f64 / avg_leader_count) * 0.30
-        } else {
-            0.0
-        };
-
-        let qps_score = if max_qps > 0 {
-            (metrics.qps as f64 / max_qps as f64) * 0.20
-        } else {
-            0.0
-        };
-
-        cpu_score + memory_score + disk_score + leader_score + qps_score
-    }
-
-    fn calculate_node_score_by_address(&self, address: &str) -> f64 {
-        let node_metrics_lock = self.node_metrics.read().unwrap();
-        for (id, metrics) in node_metrics_lock.iter() {
-            if metrics.address == address {
-                return self.calculate_node_score(id);
-            }
-        }
-        f64::MAX
-    }
-
-    fn average_leader_count(&self) -> f64 {
-        let metrics = self.node_metrics.read().unwrap();
-        if metrics.is_empty() {
-            return 0.0;
-        }
-        let total: u64 = metrics.values().map(|m| m.leader_count).sum();
-        total as f64 / metrics.len() as f64
-    }
-
-    fn max_qps(&self) -> u64 {
-        let metrics = self.node_metrics.read().unwrap();
-        metrics.values().map(|m| m.qps).max().unwrap_or(0)
     }
 
     async fn collect_shard_leader_distribution(&self) -> HashMap<String, Vec<ShardId>> {
@@ -584,11 +528,10 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(
-            1,
-            "127.0.0.1:50051".to_string(),
-            data_path,
-        ));
+        let raft_group_manager =
+            RaftGroupManagerV2::new(1, "127.0.0.1:0".to_string(), format!("{}/raft", data_path))
+                .await
+                .unwrap();
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         let status = scheduler.get_status().await;
@@ -603,11 +546,10 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(
-            1,
-            "127.0.0.1:50051".to_string(),
-            data_path,
-        ));
+        let raft_group_manager =
+            RaftGroupManagerV2::new(1, "127.0.0.1:0".to_string(), format!("{}/raft", data_path))
+                .await
+                .unwrap();
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         scheduler.register_node("1", "127.0.0.1:50051");
@@ -621,36 +563,6 @@ mod tests {
         assert_eq!(metrics.node_id, "1");
         assert_eq!(metrics.address, "127.0.0.1:50051");
         assert!(metrics.is_healthy);
-    }
-
-    #[tokio::test]
-    async fn test_calculate_node_score() {
-        let tmp_dir = tempdir().unwrap();
-        let data_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(
-            1,
-            "127.0.0.1:50051".to_string(),
-            data_path,
-        ));
-        let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
-
-        scheduler.register_node("1", "127.0.0.1:50051");
-
-        let mut metrics = scheduler.get_node_metrics("1").unwrap();
-        metrics.cpu_usage = 0.5;
-        metrics.memory_usage = 0.6;
-        metrics.disk_available = 50 * 1024 * 1024 * 1024;
-        metrics.disk_total = 100 * 1024 * 1024 * 1024;
-        metrics.leader_count = 2;
-        metrics.qps = 100;
-
-        scheduler.update_node_metrics("1", metrics);
-
-        let score = scheduler.calculate_node_score("1");
-        assert!(score < 1.0);
-        assert!(score > 0.0);
     }
 
     #[tokio::test]
@@ -682,11 +594,10 @@ mod tests {
         let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
         let shard_strategy = Arc::new(ShardStrategy::new(4));
-        let raft_group_manager = Arc::new(RaftGroupManager::new(
-            1,
-            "127.0.0.1:50051".to_string(),
-            data_path,
-        ));
+        let raft_group_manager =
+            RaftGroupManagerV2::new(1, "127.0.0.1:0".to_string(), format!("{}/raft", data_path))
+                .await
+                .unwrap();
         let scheduler = ShardScheduler::new(raft_group_manager, shard_strategy);
 
         scheduler.register_node("1", "127.0.0.1:50051");

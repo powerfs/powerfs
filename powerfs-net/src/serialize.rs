@@ -13,7 +13,15 @@ use crate::errors::NetError;
 use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
 
 /// Result of decode_setattr_req: (ino, mode, uid, gid, size, mtime, atime)
-pub type SetattrResult = (u64, Option<u32>, Option<u32>, Option<u32>, Option<u64>, Option<u64>, Option<u64>);
+pub type SetattrResult = (
+    u64,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
 
 /// TLV encoder for building request/response bodies
 pub struct TlvEncoder {

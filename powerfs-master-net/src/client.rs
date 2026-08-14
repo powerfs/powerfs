@@ -336,9 +336,7 @@ impl TlvMasterClient {
             // ShardMap entries snapshot (S3): packed blob of 25-byte entries.
             // Absent on old masters → empty Vec → client falls back to
             // from_shard_count(total_shards).
-            let entries_blob = dec
-                .next_bytes(FieldId::ShardMapEntries)
-                .unwrap_or_default();
+            let entries_blob = dec.next_bytes(FieldId::ShardMapEntries).unwrap_or_default();
             shard_map_entries = entries_blob
                 .chunks_exact(25)
                 .filter_map(|c| {

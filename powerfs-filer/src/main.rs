@@ -11,10 +11,11 @@ use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventPr
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
 
+use powerfs_filer::raft_group_manager_v2::RaftGroupManagerV2;
 use powerfs_filer::{
     BucketManager, EntryManager, FilerMetaServiceImpl, FilerNetHandler, FilerServer,
-    MetaShardManager, MetadataStore, RaftGroupManager, S3Handler, ShardId, ShardScheduler,
-    ShardStrategy, TlvVolumeClient, VolumeRouter,
+    MetaShardManager, MetadataStore, S3Handler, ShardId, ShardScheduler, ShardStrategy,
+    TlvVolumeClient, VolumeRouter,
 };
 use powerfs_net::{ClientConnPool, ClientPoolConfig, PowerFsNetServer, ServerConnectionManager};
 
@@ -200,11 +201,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     std::fs::create_dir_all(&raft_data_path)
         .map_err(|e| PowerFsError::Internal(format!("failed to create raft dir: {}", e)))?;
 
-    let raft_group_manager = Arc::new(RaftGroupManager::new(
-        filer_cfg.raft_id,
-        raft_address.clone(),
-        raft_data_path,
-    ));
+    let raft_group_manager =
+        RaftGroupManagerV2::new(filer_cfg.raft_id, raft_address.clone(), raft_data_path)
+            .await
+            .map_err(|e| {
+                PowerFsError::Internal(format!("failed to create RaftGroupManagerV2: {}", e))
+            })?;
 
     let shard_data_path = format!("{}/shards", filer_cfg.data_dir);
     std::fs::create_dir_all(&shard_data_path)
@@ -249,7 +251,9 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     for peer in &peers {
         raft_group_manager.register_peer(peer.clone()).await;
     }
-    raft_group_manager.clone().start_message_transmitter().await;
+    // Note: start_message_transmitter() is no longer needed — openraft uses
+    // gRPC RaftService (MultiRaftServiceImpl) for inter-node communication,
+    // started automatically inside RaftGroupManagerV2::new().
 
     for i in 0..filer_cfg.shard_count {
         let shard_id = ShardId(i as u64);

@@ -1172,10 +1172,8 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    self.stats.record_complete(
-                        stats_id,
-                        Err(&ClientError::Network(last_err.clone())),
-                    );
+                    self.stats
+                        .record_complete(stats_id, Err(&ClientError::Network(last_err.clone())));
                     return Err(last_err);
                 }
             };
@@ -1290,10 +1288,8 @@ impl MetaShardClient {
                     if powerfs_net::is_client_error(status) {
                         self.stats.record_complete(stats_id, Ok(()));
                     } else {
-                        self.stats.record_complete(
-                            stats_id,
-                            Err(&ClientError::Server(err_msg.clone())),
-                        );
+                        self.stats
+                            .record_complete(stats_id, Err(&ClientError::Server(err_msg.clone())));
                     }
                     return Err(err_msg);
                 }
@@ -1315,10 +1311,8 @@ impl MetaShardClient {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    self.stats.record_complete(
-                        stats_id,
-                        Err(&ClientError::Network(last_err.clone())),
-                    );
+                    self.stats
+                        .record_complete(stats_id, Err(&ClientError::Network(last_err.clone())));
                     return Err(last_err);
                 }
             }

@@ -20,7 +20,6 @@ chrono = { workspace = true }
 blake3 = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
-raft = { workspace = true }
 rocksdb = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
@@ -30,7 +29,6 @@ sysinfo = "0.30"
 crc32c = "0.6"
 async-trait = "0.1"
 crc64fast = "1.1"
-protobuf = "2"
 
 [dev-dependencies]
 tempfile = "3.10"

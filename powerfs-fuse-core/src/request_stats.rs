@@ -309,7 +309,10 @@ mod tests {
         assert_eq!(snap.in_flight_count, 2);
 
         stats.record_complete(id1, Ok(()));
-        stats.record_complete(id2, Err(&ClientError::Timeout(std::time::Duration::from_secs(5))));
+        stats.record_complete(
+            id2,
+            Err(&ClientError::Timeout(std::time::Duration::from_secs(5))),
+        );
 
         let snap = stats.snapshot();
         assert_eq!(snap.total_submitted, 2);
@@ -341,7 +344,11 @@ mod tests {
         let entry = &snap.in_flight[0];
         assert_eq!(entry.msg_type_name, "ReadDir");
         assert_eq!(entry.shard_id, 5);
-        assert!(entry.age_ms >= 40, "age_ms={} should be >= 40", entry.age_ms);
+        assert!(
+            entry.age_ms >= 40,
+            "age_ms={} should be >= 40",
+            entry.age_ms
+        );
 
         stats.record_complete(id, Ok(()));
     }

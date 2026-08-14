@@ -5,8 +5,6 @@ pub mod powerfs {
 pub use powerfs::kv_cache_service_server::{KvCacheService, KvCacheServiceServer};
 pub use powerfs::lookup_volume_response::VolumeIdLocation;
 pub use powerfs::master_service_server::{MasterService, MasterServiceServer};
-pub use powerfs::raft_service_client::RaftServiceClient;
-pub use powerfs::raft_service_server::{RaftService, RaftServiceServer};
 pub use powerfs::volume_list_response::DataNodeInfo;
 pub use powerfs::{
     AddNodeRequest,
@@ -87,8 +85,6 @@ pub use powerfs::{
     PingRequest,
     PingResponse,
     PolicyUpdateResponse,
-    ProposeRequest,
-    ProposeResponse,
     PullDeltaRequest,
     PullDeltaResponse,
     PushDeltaRequest,
@@ -96,8 +92,6 @@ pub use powerfs::{
     PutBlockRequest,
     PutBlockResponse,
     RackStats,
-    RaftMessage,
-    RaftMessageResponse,
     RebalanceActionInfo,
     RemoveNodeRequest,
     RemoveNodeResponse,

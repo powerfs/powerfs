@@ -14,7 +14,7 @@ pub mod powerfs {
     tonic::include_proto!("powerfs");
 }
 pub mod provider_impl;
-pub mod raft_group_manager;
+pub mod raft_group_manager_v2;
 pub mod s3_handler;
 pub mod server;
 pub mod shard_scheduler;
@@ -34,9 +34,7 @@ pub use meta_shard_manager::{FilerStatus, MetaShardManager, ShardDetail};
 pub use metadata_store::{BucketInfo, EntryInfo, MetadataStore, VolumeRoute};
 pub use net_handler::FilerNetHandler;
 pub use posix_service::PosixMetaServiceImpl;
-pub use raft_group_manager::{
-    ApplyEntry, Peer, RaftGroup, RaftGroupManager, ShardCommand, ShardId,
-};
+pub use raft_group_manager_v2::{Peer, RaftGroupManagerV2, ShardCommand, ShardId};
 pub use s3_handler::S3Handler;
 pub use server::FilerServer;
 pub use shard_scheduler::{NodeMetrics, SchedulerConfig, SchedulerStatus, ShardScheduler};

@@ -626,7 +626,12 @@ async fn get_topology(State(state): State<Arc<AppState>>) -> Json<ApiResponse<To
     let admin_futures: Vec<_> = filers
         .iter()
         .map(|f| {
-            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let address = f
+                .address
+                .split(':')
+                .next()
+                .unwrap_or(&f.address)
+                .to_string();
             let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
             let ep = powerfs_monitor::filer_admin_client::FilerEndpoint {
                 node_id: f.node_id.clone(),
@@ -844,7 +849,12 @@ async fn resolve_filer_endpoint(
         let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
         // Strip port from address if present (gRPC ListFilers returns
         // "host:net_port" but the admin client needs just the host IP).
-        let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+        let address = f
+            .address
+            .split(':')
+            .next()
+            .unwrap_or(&f.address)
+            .to_string();
         return Ok(powerfs_monitor::filer_admin_client::FilerEndpoint {
             node_id: f.node_id,
             address,
@@ -918,7 +928,12 @@ async fn list_filer_nodes(
         .map(|f| {
             let hb = heartbeat_map.get(&f.node_id);
             // Strip port from address for display (gRPC returns "host:net_port")
-            let display_address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let display_address = f
+                .address
+                .split(':')
+                .next()
+                .unwrap_or(&f.address)
+                .to_string();
             // Default to 8888 when master reports http_port=0 (heartbeat
             // http_port is unreliable — sometimes reports gRPC port 8889).
             let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
@@ -1383,7 +1398,12 @@ async fn list_filer_endpoints(
         .into_iter()
         .map(|f| {
             // gRPC address 是 "IP:net_port" 格式, 需剥离端口; http_port 常报 0, 默认 8888
-            let address = f.address.split(':').next().unwrap_or(&f.address).to_string();
+            let address = f
+                .address
+                .split(':')
+                .next()
+                .unwrap_or(&f.address)
+                .to_string();
             let http_port = if f.http_port > 0 { f.http_port } else { 8888 };
             powerfs_monitor::filer_admin_client::FilerEndpoint {
                 node_id: f.node_id,
@@ -1401,11 +1421,15 @@ async fn list_filer_endpoints(
     if endpoints.is_empty() {
         let heartbeat_nodes = state.metric_store.get_nodes().await;
         for n in heartbeat_nodes.iter().filter(|n| n.node_type == "filer") {
-            let (address, http_port): (String, u32) = if n.address.is_empty() || n.address == "0.0.0.0" {
-                (n.id.clone(), 8888)
-            } else {
-                (n.address.clone(), if n.http_port == 0 { 8888 } else { n.http_port })
-            };
+            let (address, http_port): (String, u32) =
+                if n.address.is_empty() || n.address == "0.0.0.0" {
+                    (n.id.clone(), 8888)
+                } else {
+                    (
+                        n.address.clone(),
+                        if n.http_port == 0 { 8888 } else { n.http_port },
+                    )
+                };
             endpoints.push(powerfs_monitor::filer_admin_client::FilerEndpoint {
                 node_id: n.id.clone(),
                 address,
@@ -6580,18 +6604,21 @@ async fn evaluate_event_alerts(
     let nodes = state.metric_store.get_nodes().await;
 
     // ── 1. 节点离线告警 ──
-    let offline_nodes: Vec<_> = nodes
-        .iter()
-        .filter(|n| n.status == "offline")
-        .collect();
+    let offline_nodes: Vec<_> = nodes.iter().filter(|n| n.status == "offline").collect();
     if offline_nodes.is_empty() {
-        alert_engine.resolve_alerts_by_rule("rule-node-offline").await;
+        alert_engine
+            .resolve_alerts_by_rule("rule-node-offline")
+            .await;
     } else {
         let names: Vec<&str> = offline_nodes.iter().map(|n| n.id.as_str()).collect();
         let node_types: Vec<&str> = offline_nodes.iter().map(|n| n.node_type.as_str()).collect();
         let unique_types: Vec<&str> = {
             let mut seen = std::collections::HashSet::new();
-            node_types.iter().copied().filter(|t| seen.insert(*t)).collect()
+            node_types
+                .iter()
+                .copied()
+                .filter(|t| seen.insert(*t))
+                .collect()
         };
         let source = format!("nodes:{}", unique_types.join(","));
         if let Some(alert) = alert_engine
@@ -6616,7 +6643,12 @@ async fn evaluate_event_alerts(
         .map(|ep| {
             let ep = ep.clone();
             let client = filer_admin.clone();
-            async move { (ep.node_id.clone(), client.get_json(&ep, "/admin/status").await) }
+            async move {
+                (
+                    ep.node_id.clone(),
+                    client.get_json(&ep, "/admin/status").await,
+                )
+            }
         })
         .collect();
     let filer_status_results = futures::future::join_all(filer_status_futures).await;
@@ -6628,7 +6660,10 @@ async fn evaluate_event_alerts(
     for (node_id, result) in &filer_status_results {
         match result {
             Ok(json) => {
-                let lc = json.get("leader_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let lc = json
+                    .get("leader_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 total_leaders += lc;
                 filer_leader_counts.push((node_id.clone(), lc));
             }
@@ -6640,7 +6675,9 @@ async fn evaluate_event_alerts(
 
     // Filer 不可达告警
     if unreachable_filers.is_empty() {
-        alert_engine.resolve_alerts_by_rule("rule-filer-unreachable").await;
+        alert_engine
+            .resolve_alerts_by_rule("rule-filer-unreachable")
+            .await;
     } else {
         if let Some(alert) = alert_engine
             .trigger_event_alert(
@@ -6648,7 +6685,10 @@ async fn evaluate_event_alerts(
                 "Filer 不可达",
                 "critical",
                 &format!("filers:{}", unreachable_filers.join(",")),
-                &format!("以下 Filer admin API 不可达: {}", unreachable_filers.join(", ")),
+                &format!(
+                    "以下 Filer admin API 不可达: {}",
+                    unreachable_filers.join(", ")
+                ),
             )
             .await
         {
@@ -6671,15 +6711,31 @@ async fn evaluate_event_alerts(
 
     // Raft 组无 Leader
     if no_leader_shards.is_empty() {
-        alert_engine.resolve_alerts_by_rule("rule-no-raft-leader").await;
+        alert_engine
+            .resolve_alerts_by_rule("rule-no-raft-leader")
+            .await;
     } else {
         if let Some(alert) = alert_engine
             .trigger_event_alert(
                 "rule-no-raft-leader",
                 "Raft 组无 Leader",
                 "critical",
-                &format!("shards:{}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
-                &format!("以下分片无 Leader, Raft 选举未完成: {}", no_leader_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+                &format!(
+                    "shards:{}",
+                    no_leader_shards
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                &format!(
+                    "以下分片无 Leader, Raft 选举未完成: {}",
+                    no_leader_shards
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )
             .await
         {
@@ -6689,15 +6745,31 @@ async fn evaluate_event_alerts(
 
     // Shard 副本不足
     if insufficient_shards.is_empty() {
-        alert_engine.resolve_alerts_by_rule("rule-shard-insufficient").await;
+        alert_engine
+            .resolve_alerts_by_rule("rule-shard-insufficient")
+            .await;
     } else {
         if let Some(alert) = alert_engine
             .trigger_event_alert(
                 "rule-shard-insufficient",
                 "Shard 副本不足",
                 "warning",
-                &format!("shards:{}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
-                &format!("以下分片副本数 < 2, 可用性风险: {}", insufficient_shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")),
+                &format!(
+                    "shards:{}",
+                    insufficient_shards
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                &format!(
+                    "以下分片副本数 < 2, 可用性风险: {}",
+                    insufficient_shards
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )
             .await
         {
@@ -6707,8 +6779,16 @@ async fn evaluate_event_alerts(
 
     // ── 4. 分片不均衡 + Filer 无 Leader ──
     if !filer_leader_counts.is_empty() && total_leaders > 0 {
-        let max_lc = filer_leader_counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
-        let min_lc = filer_leader_counts.iter().map(|(_, c)| *c).min().unwrap_or(0);
+        let max_lc = filer_leader_counts
+            .iter()
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap_or(0);
+        let min_lc = filer_leader_counts
+            .iter()
+            .map(|(_, c)| *c)
+            .min()
+            .unwrap_or(0);
         let no_leader_filers: Vec<_> = filer_leader_counts
             .iter()
             .filter(|(_, c)| *c == 0)
@@ -6717,7 +6797,9 @@ async fn evaluate_event_alerts(
 
         // 分片不均衡 (max - min > 1)
         if max_lc.saturating_sub(min_lc) <= 1 {
-            alert_engine.resolve_alerts_by_rule("rule-shard-imbalance").await;
+            alert_engine
+                .resolve_alerts_by_rule("rule-shard-imbalance")
+                .await;
         } else {
             if let Some(alert) = alert_engine
                 .trigger_event_alert(
@@ -6735,7 +6817,9 @@ async fn evaluate_event_alerts(
 
         // Filer 无 Leader 分片
         if no_leader_filers.is_empty() || max_lc <= 1 {
-            alert_engine.resolve_alerts_by_rule("rule-filer-no-leader").await;
+            alert_engine
+                .resolve_alerts_by_rule("rule-filer-no-leader")
+                .await;
         } else {
             if let Some(alert) = alert_engine
                 .trigger_event_alert(
@@ -6743,7 +6827,10 @@ async fn evaluate_event_alerts(
                     "Filer 无 Leader 分片",
                     "warning",
                     &format!("filers:{}", no_leader_filers.join(",")),
-                    &format!("以下 Filer 无 Leader 分片, 而其他节点有多个: {}", no_leader_filers.join(", ")),
+                    &format!(
+                        "以下 Filer 无 Leader 分片, 而其他节点有多个: {}",
+                        no_leader_filers.join(", ")
+                    ),
                 )
                 .await
             {

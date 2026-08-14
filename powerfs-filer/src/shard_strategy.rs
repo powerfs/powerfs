@@ -1,6 +1,6 @@
 use std::sync::RwLock;
 
-use crate::raft_group_manager::ShardId;
+use crate::raft_group_manager_v2::ShardId;
 use powerfs_allocator::ShardMap;
 
 /// Shard routing strategy backed by [`ShardMap`] (range-based routing).
