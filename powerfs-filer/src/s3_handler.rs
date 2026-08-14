@@ -514,7 +514,7 @@ impl S3Handler {
                 for e in entries.drain(..) {
                     if let Some(rest) = e.key.strip_prefix(&prefix) {
                         if let Some(idx) = rest.find(delim) {
-                            let cp = format!("{}{}", &prefix, &rest[..idx + delim.len()]);
+                            let cp = format!("{}{}", prefix, &rest[..idx + delim.len()]);
                             common_prefixes.insert(cp);
                             continue;
                         }

@@ -219,7 +219,7 @@ impl RequestStats {
 
         // Sort by age descending (oldest first — most likely stuck)
         let mut sorted = in_flight_entries;
-        sorted.sort_by(|a, b| b.age_ms.cmp(&a.age_ms));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.age_ms));
 
         let per_msg_type_raw = self.per_msg_type.lock().unwrap();
         let mut per_msg_type: HashMap<String, MsgTypeStats> = HashMap::new();

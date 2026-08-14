@@ -1,6 +1,7 @@
 ./powerfs-fuse/Cargo.toml
 .trae/
 linux*
+prompt.md
 xfstests-dev/
 docs/
 kernel/
@@ -41,16 +42,6 @@ kvdesign.md
 kvplan.md
 
 note.md
-
-# Kernel module build artifacts
-kernel/**/*.o
-kernel/**/*.ko
-kernel/**/*.mod.c
-kernel/**/*.mod
-kernel/**/Module.symvers
-kernel/**/modules.order
-kernel/**/.*.cmd
-kernel/**/.*.o
 
 # Prost/tonic generated proto files (generated to OUT_DIR by build.rs)
 powerfs-filer/src/powerfs.rs

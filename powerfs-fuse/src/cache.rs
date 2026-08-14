@@ -127,7 +127,7 @@ impl CachedEntry {
             (Clean, Dirty) | (Clean, Stale) | (Clean, Tombstone) => true,
             (Dirty, Flushing) | (Dirty, Tombstone) => true,
             (Flushing, Clean) | (Flushing, Dirty) => true,
-            (Stale, Clean) | (Stale, Tombstone) => true,
+            (Stale, Clean) | (Stale, Dirty) | (Stale, Tombstone) => true,
             // Dirty/Flushing -> Stale: explicitly forbidden (core rule:
             // local authoritative data must not be invalidated).
             (Dirty, Stale) | (Flushing, Stale) => false,
@@ -399,7 +399,10 @@ impl MetadataCache {
     ///
     /// Phase 3: entry.hold is the single authoritative source for pin
     /// status. The old pinned_inodes HashMap has been removed.
-    pub fn unpin_inode(&self, inode: u64) {
+    ///
+    /// Returns `true` if the inode was fully released (open_count reached 0),
+    /// `false` if other handles are still open.
+    pub fn unpin_inode(&self, inode: u64) -> bool {
         let was_pinned;
         let released;
         {
@@ -424,6 +427,7 @@ impl MetadataCache {
             released,
             std::thread::current().id()
         );
+        released
     }
 
     /// Check if an inode is pinned (open). Pinned inodes hold a data lease,
@@ -684,6 +688,13 @@ impl MetadataCache {
                 }
                 existing.disk_size = entry.disk_size;
                 existing.generation = entry.generation;
+                // Update reliability and placement from the new entry.
+                // When the Filer migrates a file (e.g., Flat → EC), the
+                // chunks array changes but without updating reliability,
+                // the read path would still use the Flat read path for
+                // EC-encoded chunks, causing CRC32 mismatches and EIO.
+                existing.reliability = entry.reliability.clone();
+                existing.placement = entry.placement.clone();
                 // Always update cached_at to prevent TTL expiration issues
                 existing.cached_at = Instant::now();
             }
@@ -920,6 +931,37 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
             entry.chunks = chunks;
+        }
+    }
+
+    /// Truncate the chunks metadata list for an inode to `new_size`.
+    /// - Chunks entirely beyond `new_size` are removed from the metadata list.
+    /// - Chunks that straddle `new_size` have their `size` truncated.
+    /// - Chunks entirely within `new_size` are preserved.
+    ///
+    /// This is separate from `ChunkCache::truncate_chunks` (which truncates
+    /// the data cache). Both must be called during truncate to prevent
+    /// stale reads: without this, the read path uses the old chunks list
+    /// to fetch data from the Volume Server, returning pre-truncate data
+    /// for regions that should be holes.
+    pub fn truncate_chunks_metadata(&self, inode: u64, new_size: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            let before_len = entry.chunks.len();
+            entry.chunks.retain(|c| c.offset < new_size);
+            for chunk in entry.chunks.iter_mut() {
+                let chunk_end = chunk.offset + chunk.size;
+                if chunk_end > new_size {
+                    chunk.size = new_size - chunk.offset;
+                }
+            }
+            log::debug!(
+                "truncate_chunks_metadata: inode={} new_size={} chunks {} -> {}",
+                inode,
+                new_size,
+                before_len,
+                entry.chunks.len()
+            );
         }
     }
 
@@ -2223,6 +2265,46 @@ impl ChunkCache {
 
     pub fn remove_inode_chunks(&self, inode: u64) {
         self.remove(inode);
+    }
+
+    /// Truncate chunks for an inode to `new_size`.
+    /// - Chunks entirely beyond `new_size` are removed.
+    /// - Chunks that straddle `new_size` are truncated (data beyond new_size is discarded).
+    /// - Chunks entirely within `new_size` are preserved (including dirty data).
+    ///
+    /// This prevents stale data from being read after truncate-down + truncate-up sequences.
+    pub fn truncate_chunks(&self, inode: u64, new_size: u64) {
+        let chunk_size = self.chunk_size;
+        for shard in self.shards.iter() {
+            let mut cache = shard.write().unwrap();
+            let entries: Vec<_> = cache
+                .iter()
+                .filter(|((ino, _), _)| *ino == inode)
+                .map(|(k, v)| (*k, v.data.len()))
+                .collect();
+            for (key, data_len) in entries {
+                let chunk_offset = key.1 * chunk_size;
+                if chunk_offset >= new_size {
+                    // Chunk entirely beyond new_size — remove
+                    if let Some(removed) = cache.remove(&key) {
+                        self.current_bytes
+                            .fetch_sub(removed.data.len() as u64, Ordering::SeqCst);
+                    }
+                } else if chunk_offset + data_len as u64 > new_size {
+                    // Chunk straddles new_size — truncate data
+                    let keep_len = (new_size - chunk_offset) as usize;
+                    if let Some(chunk) = cache.get_mut(&key) {
+                        let old_len = chunk.data.len();
+                        chunk.data.truncate(keep_len);
+                        let freed = old_len - keep_len;
+                        if freed > 0 {
+                            self.current_bytes.fetch_sub(freed as u64, Ordering::SeqCst);
+                        }
+                    }
+                }
+                // Chunks entirely within new_size are kept as-is
+            }
+        }
     }
 
     /// Check if the inode has any dirty (unflushed) chunks.

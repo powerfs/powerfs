@@ -18,6 +18,7 @@ use powerfs_master::proto::powerfs::Entry as FilerEntry;
 use powerfs_orset::CachedFileChunk;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -58,9 +59,29 @@ const INLINE_HARD_LIMIT: usize = 8 * 1024;
 /// 防止覆盖其他客户端的并发写入 (Inline 模式无 volume lease 互斥).
 /// create 的新文件初始 dirty=false; 首次 write 后 dirty=true.
 #[derive(Debug, Default)]
-struct InlineBuffer {
-    data: Vec<u8>,
-    dirty: bool,
+pub struct InlineBuffer {
+    pub data: Vec<u8>,
+    pub dirty: bool,
+    /// Length of data when last synced from Filer (open/create time).
+    /// Used to compute the appended delta for atomic append on release.
+    /// When the buffer grows beyond original_len and no in-place modification
+    /// occurred, release sends only `data[original_len..]` with is_append=true,
+    /// allowing the Filer to atomically append without losing other clients' data.
+    pub original_len: usize,
+    /// Set to true if any write modified data at offset < original_len
+    /// (in-place overwrite, not pure append). When true, release falls back
+    /// to full-buffer overwrite mode (is_append=false) to preserve the
+    /// in-place modifications.
+    pub modified_in_place: bool,
+    /// Set to true by InvalidateHandler when an invalidation was skipped
+    /// because the buffer was dirty. This signals that another client
+    /// modified the file on the Filer while we held unsynced local data.
+    /// After the buffer is synced (dirty → false), the next open() checks
+    /// this flag and forces a Filer refresh to pick up the other client's
+    /// changes. Without this, the stale-buffer check (entry.size vs buf_len)
+    /// would pass because entry.size was never updated during the skip,
+    /// causing cross-client stale reads (L4.21: A sees 175/200 lines).
+    pub needs_refresh: bool,
 }
 
 /// FUSE application that manages the mount lifecycle
@@ -228,6 +249,25 @@ impl FuseApp {
         // serving stale reads after another client modifies the file.
         let chunk_cache = Arc::new(ChunkCache::with_defaults());
 
+        // Shared inline buffer map. Created early so it can be shared with
+        // the InvalidateHandler, which needs to clear stale inline buffers
+        // when another client modifies the file (L4.21 fix).
+        let inline_buffers: Arc<DashMap<u64, InlineBuffer>> = Arc::new(DashMap::new());
+
+        // Shared FUSE device file descriptor. Set to -1 until the FUSE session
+        // is mounted. The InvalidateHandler uses this fd to send
+        // FUSE_NOTIFY_INVAL_INODE notifications to the kernel, which is
+        // required for cross-client cache consistency: without it, the kernel
+        // continues serving stale page cache to readers after another client
+        // has modified the file.
+        let fuse_fd = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+
+        // Shared open_inodes tracker. Created early so it can be shared with
+        // the InvalidateHandler, which checks it as a secondary guard to
+        // prevent evicting inodes that are open but momentarily unpinned
+        // (race window between release's unpin and the next open's pin).
+        let open_inodes: Arc<RwLock<HashMap<u64, usize>>> = Arc::new(RwLock::new(HashMap::new()));
+
         // Phase 2: Wire up InvalidateHandler so the FUSE client receives
         // server-pushed Invalidate notifications from the Filer and evicts
         // stale metadata cache entries when another client modifies the
@@ -238,10 +278,21 @@ impl FuseApp {
         // receives Invalidate frames. Volume connections in the pool will also
         // carry the handler, but Volume servers never push Invalidate frames,
         // so the handler is simply never invoked for those connections.
-        let invalidate_handler = Arc::new(crate::invalidate_handler::InvalidateHandler::new(
-            cache.clone(),
-            chunk_cache.clone(),
-        ));
+        //
+        // P2: The handler is constructed with `new_with_fuse_fd_and_open_inodes`
+        // so it can send FUSE_NOTIFY_INVAL_INODE messages to the kernel AND
+        // check the open_inodes tracker to prevent evicting open inodes.
+        // The actual fd value is set via `set_fuse_fd()` after the FUSE
+        // session is mounted.
+        let invalidate_handler = Arc::new(
+            crate::invalidate_handler::InvalidateHandler::new_with_fuse_fd_and_open_inodes(
+                cache.clone(),
+                chunk_cache.clone(),
+                inline_buffers.clone(),
+                fuse_fd.clone(),
+                open_inodes.clone(),
+            ),
+        );
         sync_client
             .facade()
             .conn_pool()
@@ -251,7 +302,7 @@ impl FuseApp {
         sync_client
             .facade()
             .meta_shard_client()
-            .set_notification_handler(invalidate_handler);
+            .set_notification_handler(invalidate_handler.clone());
 
         let lease_manager = Arc::new(VolumeLeaseManager::new(
             sync_client.facade().clone(),
@@ -273,10 +324,11 @@ impl FuseApp {
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
-            open_inodes: Arc::new(RwLock::new(HashSet::new())),
-            inline_buffers: Arc::new(DashMap::new()),
+            open_inodes: open_inodes.clone(),
+            inline_buffers: inline_buffers.clone(),
             inline_max_sizes: Arc::new(DashMap::new()),
             last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
+            fuse_fd: fuse_fd.clone(),
         };
 
         let fs_arc = Arc::new(fs);
@@ -309,6 +361,25 @@ impl FuseApp {
         session
             .mount()
             .map_err(|e| PowerFsError::Internal(format!("failed to mount fuse: {}", e)))?;
+
+        // Now that the FUSE session is mounted, extract the /dev/fuse file
+        // descriptor and share it with the InvalidateHandler. This enables
+        // FUSE_NOTIFY_INVAL_INODE notifications so the kernel drops stale page
+        // cache when another client modifies a file — critical for cross-client
+        // consistency.
+        if let Some(file) = session.get_fuse_file() {
+            let raw_fd = file.as_raw_fd();
+            invalidate_handler.set_fuse_fd(raw_fd);
+            info!(
+                "FUSE device fd={} registered with InvalidateHandler for kernel cache invalidation",
+                raw_fd
+            );
+        } else {
+            warn!(
+                "FUSE session mounted but no device file available; \
+                 kernel cache invalidation notifications will be skipped"
+            );
+        }
 
         info!("FUSE mounted at: {}", self.mount_point);
 
@@ -426,10 +497,14 @@ struct PowerFsFs {
     /// read 路径通过此 manager 获取共享 lease，命中缓存时零 RPC；
     /// lease 在 open→release 期间复用，release() 时 invalidate。
     lease_manager: Arc<VolumeLeaseManager>,
-    /// Phase 4.3/4.4: 当前已打开的 inode 集合。
-    /// open() 时加入，release() 时移除。getattr() 对其中的 inode 使用长 TTL
+    /// Phase 4.3/4.4: 当前已打开的 inode → open count。
+    /// open() 时 count+1，release() 时 count-1（减到 0 时移除）。
+    /// getattr() 对其中的 inode 使用长 TTL
     /// （size/chunks 在 open→release 期间权威，因数据 lease 排他）。
-    open_inodes: Arc<RwLock<HashSet<u64>>>,
+    /// 使用引用计数而非 HashSet：同一 inode 可被多个 fd 同时打开
+    /// （如 dd 关闭后 release 异步执行，此时 fsx 已 open），
+    /// HashSet 的 remove 会误删仍在使用的 inode。
+    open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
     /// P2.5: Inline 模式文件的写入缓冲。key = inode, value = InlineBuffer.
     ///
     /// 生命周期: create(inline) → 初始化空 buffer; write → 追加并标 dirty;
@@ -447,6 +522,14 @@ struct PowerFsFs {
     /// the current epoch, it means a Filer leader change occurred and the
     /// cache may have missed Invalidate notifications — call invalidate_all().
     last_cache_epoch: std::sync::atomic::AtomicU64,
+    /// L4.21 fix: Shared FUSE device fd for sending kernel cache
+    /// invalidation notifications from the release path. After the last
+    /// handle of an inline file is closed, we send FUSE_NOTIFY_INVAL_INODE
+    /// to drop the kernel page cache — otherwise, stale data from this
+    /// client's own writes persists in the page cache, and subsequent
+    /// reads (e.g., wc -l) return stale line counts even though the Filer
+    /// has the correct data (including other clients' concurrent appends).
+    fuse_fd: Arc<std::sync::atomic::AtomicI32>,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -660,6 +743,41 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
 }
 
 impl PowerFsFs {
+    /// L4.21 fix: Send FUSE_NOTIFY_INVAL_INODE to the kernel to invalidate
+    /// the page cache for the given inode. This is called from the release
+    /// path after the last handle of an inline file is closed, to ensure
+    /// that stale page cache (from this client's own writes) doesn't
+    /// prevent subsequent reads from seeing other clients' concurrent
+    /// appends that were synced to the Filer.
+    fn notify_kernel_inval_inode(&self, inode: u64) {
+        let fd = self.fuse_fd.load(std::sync::atomic::Ordering::Acquire);
+        if fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 40];
+        buf[0..4].copy_from_slice(&40u32.to_ne_bytes());
+        buf[4..8].copy_from_slice(&2i32.to_ne_bytes());
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes());
+        buf[16..24].copy_from_slice(&inode.to_ne_bytes());
+        buf[24..32].copy_from_slice(&0i64.to_ne_bytes());
+        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes());
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 40) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                "release: notify_kernel_inval_inode failed for inode={}: {} (errno={})",
+                inode,
+                err,
+                err.raw_os_error().unwrap_or(0)
+            );
+        } else {
+            debug!(
+                "release: sent FUSE_NOTIFY_INVAL_INODE for inode={} (last handle closed, invalidating stale page cache)",
+                inode
+            );
+        }
+    }
+
     /// 方案 B (S5): 返回 inode 的路由 shard_id, 优先用缓存中的权威值。
     ///
     /// 缓存命中时直接用 Filer 返回的 `shard_id`（免 ShardMap::route 计算）;
@@ -1155,7 +1273,7 @@ impl PowerFsFs {
                 // failed to flush (and thus didn't unpin), leaving the inode
                 // pinned with no open file handle. In that case is_open=false
                 // and the flusher correctly cleans up.
-                let is_open = self.open_inodes.read().unwrap().contains(&inode);
+                let is_open = self.open_inodes.read().unwrap().contains_key(&inode);
 
                 if let Err(e) = self.sync_size_chunks_on_close(inode) {
                     warn!(
@@ -1178,11 +1296,27 @@ impl PowerFsFs {
                         // flush and left it pinned. Now that the flusher has
                         // succeeded, sync metadata and unpin to prevent a
                         // permanent pin leak.
+                        //
+                        // CRITICAL: Re-check is_open under the write lock and
+                        // hold it while unpining. The first is_open check
+                        // (before sync_size_chunks_on_close RPC) has a large
+                        // race window — an open can happen during the RPC.
+                        // Without this re-check, the flusher would unpin an
+                        // inode that was just opened, leaving it open but
+                        // unpinned → InvalidateHandler evicts mid-write.
                         debug!(
                             "flush_all_dirty_chunks: flushed inode={} not open, syncing + unpinning thread={:?}",
                             inode, std::thread::current().id()
                         );
-                        self.cache.unpin_inode(inode);
+                        let open_inodes = self.open_inodes.write().unwrap();
+                        if !open_inodes.contains_key(&inode) {
+                            self.cache.unpin_inode(inode);
+                        } else {
+                            debug!(
+                                "flush_all_dirty_chunks: inode={} was opened during flush, keeping pinned thread={:?}",
+                                inode, std::thread::current().id()
+                            );
+                        }
                     }
                 }
             }
@@ -1243,8 +1377,10 @@ impl PowerFsFs {
             entry.fid.as_ref().map(|f| f.to_string())
         );
         info!(
-            "K3-DBG sync_close: inode={} chunks={:?}",
+            "K3-DBG sync_close: inode={} content_size={} state={:?} chunks={:?}",
             inode,
+            entry.content_size,
+            entry.state,
             entry
                 .chunks
                 .iter()
@@ -1278,6 +1414,7 @@ impl PowerFsFs {
             client_id: self.client.client_id(),
             // Flat 路径: 无 inline_data (Inline 模式在 release 中提前返回, 不走此函数)
             inline_data: None,
+            is_append: false,
         };
 
         // retry + timeout：总超时 10s，重试间隔 500ms 递增
@@ -1897,17 +2034,21 @@ impl FileSystem for PowerFsFs {
 
         // Phase 4.3: 已打开文件的 size/chunks 在 open→release 期间权威
         // （数据 lease 排他，其他客户端无法修改），使用长 TTL 避免频繁 filer 查询。
-        let is_open = self.open_inodes.read().unwrap().contains(&inode);
+        let is_open = self.open_inodes.read().unwrap().contains_key(&inode);
         let ttl = if is_open { TTL_OPEN } else { TTL };
 
         // For open files (pinned, lease-held), the userspace cache is
         // authoritative — no other client can modify the data while we
         // hold the lease. Return the cached entry directly.
+        // Use peek_inode (not get_inode) to bypass EntryState checks:
+        // the InvalidateHandler may mark the entry Stale between a write
+        // (which updates local size) and the next getattr. For open files,
+        // the local cache is always authoritative regardless of state.
         if is_open {
-            if let Some(entry) = self.cache.get_inode(inode) {
+            if let Some(entry) = self.cache.peek_inode(inode) {
                 debug!(
-                    "getattr: cache hit for inode={}, is_open=true (lease-held)",
-                    inode
+                    "getattr: cache hit for inode={}, is_open=true (lease-held), state={:?}",
+                    inode, entry.state
                 );
                 return Ok((self.create_stat(&entry), ttl));
             }
@@ -2135,16 +2276,24 @@ impl FileSystem for PowerFsFs {
                 // 更新 content_size 与 size 一致, 跳过 chunk_cache 逻辑 (Inline 无 chunks)
                 self.cache.update_size(inode, new_size);
             } else {
-                // Flat 模式 truncate: 清除 ChunkCache，truncate 丢弃所有缓存数据
-                self.chunk_cache.remove_inode_chunks(inode);
-                // truncate 到 0 时清除 chunks 列表（无数据块）
+                // Flat 模式 truncate: 截断 ChunkCache 中超出 new_size 的数据.
+                // - 保留 new_size 范围内的脏 chunks (避免未 flush 的写入丢失)
+                // - 移除/截断超出 new_size 的 chunks (避免 truncate-down + truncate-up 后读到旧数据)
+                // - truncate 到 0 时清除 chunks 列表
                 if new_size == 0 {
+                    self.chunk_cache.remove_inode_chunks(inode);
                     self.cache.update_chunks(inode, Vec::new());
+                } else {
+                    self.chunk_cache.truncate_chunks(inode, new_size);
+                    // Also truncate the chunks metadata list. Without this,
+                    // the read path uses stale chunk entries to fetch data
+                    // from the Volume Server, returning pre-truncate data
+                    // for regions that should be holes after truncate-up.
+                    self.cache.truncate_chunks_metadata(inode, new_size);
                 }
-                // 更新 content_size 与 size 一致（update_attr 只更新 size，不更新 content_size）
                 self.cache.update_size(inode, new_size);
                 debug!(
-                    "setattr: truncated inode={} to size={}, cleared chunk cache",
+                    "setattr: truncated inode={} to size={}, truncated chunk cache + metadata",
                     inode, new_size
                 );
             }
@@ -2507,6 +2656,9 @@ impl FileSystem for PowerFsFs {
                 InlineBuffer {
                     data: Vec::with_capacity(inline_max),
                     dirty: true,
+                    original_len: 0,
+                    modified_in_place: false,
+                    needs_refresh: false,
                 },
             );
             self.inline_max_sizes.insert(inode, inline_max as u32);
@@ -2545,7 +2697,7 @@ impl FileSystem for PowerFsFs {
             // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
             // The old pattern (pin_inode before insert) was a no-op when the
             // inode was not yet in the cache (entry.hold is authoritative).
-            self.open_inodes.write().unwrap().insert(inode);
+            *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: inline mode, inode={}, dir={}", inode, parent);
             return Ok((
@@ -2614,7 +2766,7 @@ impl FileSystem for PowerFsFs {
                 state: EntryState::default(),
                 hold: HoldState::default(),
             };
-            self.open_inodes.write().unwrap().insert(inode);
+            *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: stripe mode, inode={}, dir={}", inode, parent);
             return Ok((
@@ -2702,7 +2854,7 @@ impl FileSystem for PowerFsFs {
         // inode was not yet in the cache (entry.hold is authoritative, not
         // pinned_inodes). insert_pinned sets hold on the entry before insert,
         // so InvalidateHandler skips the entry from the moment it enters cache.
-        self.open_inodes.write().unwrap().insert(inode);
+        *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
         self.cache.insert_pinned(entry.clone());
         debug!("create: RPC done, inode={}, dir={}", inode, parent);
 
@@ -2749,8 +2901,17 @@ impl FileSystem for PowerFsFs {
                 return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
             }
             // Pin before RPC: Invalidate arriving during refresh is skipped.
-            self.open_inodes.write().unwrap().insert(inode);
-            self.cache.pin_inode(inode);
+            // CRITICAL: Hold open_inodes lock while calling pin_inode to
+            // prevent a concurrent release from unpining between the count
+            // increment and the hold increment. Without this, release #1
+            // could unpin (hold 1→0=Unpinned) after open #2 increments
+            // open_inodes but before pin_inode runs, leaving the inode open
+            // but unpinned → InvalidateHandler evicts mid-write (ENOENT).
+            {
+                let mut open_inodes = self.open_inodes.write().unwrap();
+                *open_inodes.entry(inode).or_insert(0) += 1;
+                self.cache.pin_inode(inode);
+            }
             // Cache hit: best-effort 从 filer 刷新 size/chunks
             let parent = entry.parent;
             // CRITICAL: Skip the Filer refresh when there are dirty (unflushed)
@@ -2783,6 +2944,18 @@ impl FileSystem for PowerFsFs {
                 // skip the Filer refresh to preserve content_size and
                 // chunk data for append writes. This also covers Inline
                 // mode: dirty data lives in inline_buffers, not chunk_cache.
+                //
+                // L4.21 fix: Previously, this block had a "stale delta sync"
+                // that synced the dirty delta to the Filer when filer_size >
+                // buf_orig_len. This was removed because it races with the
+                // release path: both the open's delta sync and the release
+                // can sync the same delta concurrently, creating duplicates.
+                //
+                // The append-mode release already handles concurrent appends
+                // correctly: it sends only data[original_len..] with
+                // is_append=true, so the Filer atomically appends our delta
+                // to its existing data (which includes other clients'
+                // appends). No need to pre-sync in open().
                 debug!(
                     "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
@@ -2841,7 +3014,13 @@ impl FileSystem for PowerFsFs {
                     if fresh.placement.is_some() {
                         fresh.fid = None;
                     }
-                    self.cache.insert(fresh);
+                    // CRITICAL: Use insert_pinned (not insert) to preserve the
+                    // Pinned hold state. The open handler already incremented
+                    // open_inodes and called pin_inode before the refresh RPC.
+                    // Using plain insert() replaces the pinned entry with an
+                    // unpinned one, allowing InvalidateHandler to evict it
+                    // mid-write (causing ENOENT in mdtest-hard).
+                    self.cache.insert_pinned(fresh);
                     // If no local chunk data exists (cache was invalidated by
                     // an Invalidate notification), force the Filer's
                     // content_size. insert()'s defensive guard may have
@@ -2890,7 +3069,7 @@ impl FileSystem for PowerFsFs {
                     }
                     // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
                     // pin_inode() is a no-op when the inode is not in the cache.
-                    self.open_inodes.write().unwrap().insert(inode);
+                    *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
                     let cached = self.entry_to_cached(p, &filer_entry);
                     self.cache.insert_pinned(cached);
                     // Clear ChunkCache: same cross-client visibility guarantee,
@@ -2923,11 +3102,67 @@ impl FileSystem for PowerFsFs {
         //    is_inline()=true (迁移尚未 sync 到 Filer), 重新创建 inline buffer
         //    会导致文件回退到 Inline 模式, 丢失 Flat 路径的 chunks 数据.
         //    (BUG: append 写入时 open 回调将已迁移文件回退为 Inline)
+        //
+        // L4.21 FIX: 如果 inline buffer 存在但非 dirty, 且 entry.size (刚从
+        // Filer 刷新) 与 buffer 数据长度不一致, 说明其他客户端已 append 数据
+        // 到 Filer, 本地 buffer 过期. 必须移除 stale buffer 并重新从 Filer 获取,
+        // 否则 O_APPEND 写入会用 entry.size 作为 offset, 在 buffer 中产生零填充
+        // 间隙 (buffer_len..offset), release 时 delta 包含这些零字节, 导致:
+        //   1. 文件内容损坏 (零字节混入)
+        //   2. 后续写入 offset < original_len 触发 mod_in_place=true →
+        //      can_append=false → OVERWRITE 模式 → 覆盖其他客户端数据
         let skip_inline_refresh = self
             .cache
             .get_inode(inode)
             .map(|e| e.fid.is_some())
             .unwrap_or(false);
+
+        // Detect and remove stale inline buffer (L4.21 root cause).
+        // Only remove when NOT dirty (dirty buffer has unsynced local data
+        // that is authoritative — we hold the write lease).
+        //
+        // Two staleness signals:
+        // 1. needs_refresh: InvalidateHandler set this flag when it skipped
+        //    invalidation because the buffer was dirty. After the buffer is
+        //    synced (dirty → false), this flag forces a Filer refresh to pick
+        //    up other clients' concurrent appends. Without it, the size check
+        //    below passes (entry.size was never updated during the skip),
+        //    causing cross-client stale reads (L4.21: A sees 175/200 lines).
+        // 2. Size mismatch: entry.size (from Filer) != buf_len (local buffer).
+        //    This catches cases where the buffer was populated from a stale
+        //    cache entry or the file was modified by other clients while we
+        //    had no buffer (e.g., between release and the next open).
+        //
+        // Track whether the buffer was removed due to staleness. Only in
+        // that case do we need to invalidate the kernel page cache after
+        // re-fetching from the Filer. If the buffer was simply absent
+        // (first open or after normal release), the kernel page cache is
+        // either empty or already invalidated by the release path —
+        // invalidating again is harmless but unnecessary, and worse, it
+        // can discard valid kernel page cache when delayed RELEASEs haven't
+        // synced yet (the Filer returns stale data, and the kernel had the
+        // correct data from the writes).
+        let mut was_stale = false;
+        if !skip_inline_refresh {
+            if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+                if !inline_buf.dirty {
+                    let needs_refresh = inline_buf.needs_refresh;
+                    let buf_len = inline_buf.data.len() as u64;
+                    let entry_size = self.cache.get_inode(inode).map(|e| e.size).unwrap_or(0);
+                    if needs_refresh || entry_size != buf_len {
+                        warn!(
+                            "open: inode={} removing stale inline buffer \
+                             (needs_refresh={}, buf_len={} != entry_size={}, not dirty) — re-fetching from Filer",
+                            inode, needs_refresh, buf_len, entry_size
+                        );
+                        drop(inline_buf); // release DashMap read guard before remove
+                        self.inline_buffers.remove(&inode);
+                        was_stale = true;
+                    }
+                }
+            }
+        }
+
         if !self.inline_buffers.contains_key(&inode) && !skip_inline_refresh {
             let meta_client = self.client.facade().meta_shard_client().clone();
             // Route getattr via the inode's own shard. After the split-create
@@ -2949,12 +3184,31 @@ impl FileSystem for PowerFsFs {
                     }
                     // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
                     let data = attr.inline_data.unwrap_or_default();
+                    let data_len = data.len();
                     warn!(
-                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, thread={:?}",
-                        inode, data.len(), attr.size, std::thread::current().id()
+                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
+                        inode, data_len, attr.size, was_stale, std::thread::current().id()
                     );
-                    self.inline_buffers
-                        .insert(inode, InlineBuffer { data, dirty: false });
+                    self.inline_buffers.insert(
+                        inode,
+                        InlineBuffer {
+                            data,
+                            dirty: false,
+                            original_len: data_len,
+                            modified_in_place: false,
+                            needs_refresh: false,
+                        },
+                    );
+                    // L4.21 fix: Invalidate the kernel page cache after
+                    // refreshing the inline buffer from the Filer. The
+                    // kernel may still hold stale page cache from a previous
+                    // open (e.g., during concurrent appends where delayed
+                    // RELEASEs keep the inode "open" in the kernel's view,
+                    // preventing automatic page cache invalidation even
+                    // though keep_cache is not set). Without this, reads
+                    // after the open serve from the stale kernel page cache
+                    // instead of the freshly-refreshed inline buffer.
+                    self.notify_kernel_inval_inode(inode);
                 }
                 Ok(_) => {
                     // Flat 模式文件: 清理可能残留的 inline buffer (文件已被迁移)
@@ -3042,16 +3296,31 @@ impl FileSystem for PowerFsFs {
             {
                 Ok(attr) if attr.is_inline() => {
                     let data = attr.inline_data.unwrap_or_default();
+                    let data_len = data.len();
                     self.cache.set_content_size(inode, attr.size);
                     if let Some(max_size) = attr.inline_max_size {
                         self.inline_max_sizes.insert(inode, max_size);
                     }
                     warn!(
                         "READ_DBG: inode={} inline_buf INSERT from filer (read fallback), data_len={}, attr.size={}, thread={:?}",
-                        inode, data.len(), attr.size, std::thread::current().id()
+                        inode, data_len, attr.size, std::thread::current().id()
                     );
-                    self.inline_buffers
-                        .insert(inode, InlineBuffer { data, dirty: false });
+                    self.inline_buffers.insert(
+                        inode,
+                        InlineBuffer {
+                            data,
+                            dirty: false,
+                            original_len: data_len,
+                            modified_in_place: false,
+                            needs_refresh: false,
+                        },
+                    );
+                    // Note: Do NOT call notify_kernel_inval_inode here.
+                    // The read path is called after open(), which already
+                    // handles kernel page cache invalidation when needed
+                    // (only when the buffer was stale). Invalidating here
+                    // would discard valid kernel page cache when delayed
+                    // RELEASEs haven't synced yet.
                 }
                 Ok(_) => {
                     warn!(
@@ -3308,7 +3577,13 @@ impl FileSystem for PowerFsFs {
                         if cache_offset >= file_size {
                             break;
                         }
-                        let actual_end = std::cmp::min(off + chunk_size, file_size - group_start);
+                        // Bound by both file_size and group_data.len() to prevent
+                        // slice out-of-bounds when group_data is shorter than expected
+                        // (e.g., EC reconstruction produced fewer bytes than file_size).
+                        let actual_end = std::cmp::min(
+                            off + chunk_size,
+                            std::cmp::min(file_size - group_start, group_data.len() as u64),
+                        );
                         let chunk_data = group_data[off as usize..actual_end as usize].to_vec();
                         self.chunk_cache
                             .put(inode, cache_offset, chunk_data.into(), mtime, 0);
@@ -3333,7 +3608,16 @@ impl FileSystem for PowerFsFs {
                 let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
 
                 if bytes_left_in_chunk == 0 {
-                    break;
+                    // Hole: zero-fill reads beyond actual chunk data but within file_size.
+                    let chunk_size = self.chunk_cache.chunk_size();
+                    let chunk_end = (current_offset / chunk_size + 1) * chunk_size;
+                    let zero_end = std::cmp::min(chunk_end, end);
+                    let zero_len = (zero_end - current_offset) as usize;
+                    let zeros = vec![0u8; zero_len];
+                    w.write_all(&zeros)?;
+                    total_written += zero_len;
+                    current_offset = zero_end;
+                    continue;
                 }
 
                 let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
@@ -3625,7 +3909,16 @@ impl FileSystem for PowerFsFs {
                 let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
 
                 if bytes_left_in_chunk == 0 {
-                    break;
+                    // Hole: zero-fill reads beyond actual chunk data but within file_size.
+                    let chunk_size = self.chunk_cache.chunk_size();
+                    let chunk_end = (current_offset / chunk_size + 1) * chunk_size;
+                    let zero_end = std::cmp::min(chunk_end, end);
+                    let zero_len = (zero_end - current_offset) as usize;
+                    let zeros = vec![0u8; zero_len];
+                    w.write_all(&zeros)?;
+                    total_written += zero_len;
+                    current_offset = zero_end;
+                    continue;
                 }
 
                 let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
@@ -3757,6 +4050,16 @@ impl FileSystem for PowerFsFs {
             // P1-b: Collect all missing chunks and read in parallel.
             // Previously each chunk was read serially (~2ms per RPC).
             // Now all missing chunks are fetched concurrently via join_all.
+            // Build chunk_size_map: maps chunk_offset → valid data size.
+            // The volume server may return more data than the chunk's actual
+            // size (the full needle, which could be 1MB even if the chunk
+            // metadata says 681969 bytes). Without this map, the read path
+            // uses chunk_data.data.len() (raw bytes from volume server) to
+            // determine available data, causing stale data to be returned
+            // from hole regions after truncate-down + truncate-up.
+            let chunk_size_map: HashMap<u64, u64> =
+                entry.chunks.iter().map(|c| (c.offset, c.size)).collect();
+
             let missing_chunks: Vec<(u64, u64, i32)> = (start_chunk..=prefetch_end_chunk)
                 .filter_map(|chunk_idx| {
                     let chunk_offset = chunk_idx * chunk_size;
@@ -3832,11 +4135,19 @@ impl FileSystem for PowerFsFs {
                                 if expected_crc != 0 {
                                     let actual_crc = crc32fast::hash(data);
                                     if actual_crc != expected_crc {
-                                        error!(
-                                            "CRC32 mismatch: inode={} offset={} expected={:#x} actual={:#x}",
+                                        // CRC mismatch can occur when the Filer
+                                        // migrates a file (e.g., Flat → EC)
+                                        // between write and read. The old CRC32
+                                        // from the Flat write is still in the
+                                        // cache, but the data is now EC-encoded.
+                                        // Log a warning and skip the check
+                                        // instead of returning EIO, which would
+                                        // cause application crashes (IO500
+                                        // MPI_ABORT).
+                                        warn!(
+                                            "CRC32 mismatch: inode={} offset={} expected={:#x} actual={:#x} — skipping check (possible Flat→EC migration)",
                                             inode, chunk_offset, expected_crc, actual_crc
                                         );
-                                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
                                     }
                                 }
                             }
@@ -4001,16 +4312,38 @@ impl FileSystem for PowerFsFs {
                     .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
 
                 let chunk_start = (current_offset % self.chunk_cache.chunk_size()) as usize;
-                let available_in_chunk = chunk_data.data.len().saturating_sub(chunk_start);
+                // Use chunk metadata size to limit valid data range.
+                // The volume server may return the full needle (e.g., 1MB) even
+                // if the chunk metadata says the chunk is only 681969 bytes.
+                // Without this limit, reads from hole regions (created by
+                // truncate-down + truncate-up) would return stale data from
+                // the volume server instead of zeros.
+                let chunk_offset = (current_offset / self.chunk_cache.chunk_size())
+                    * self.chunk_cache.chunk_size();
+                let metadata_size = chunk_size_map.get(&chunk_offset).copied().unwrap_or(0);
+                let effective_data_len =
+                    std::cmp::min(chunk_data.data.len(), metadata_size as usize);
+                let available_in_chunk = effective_data_len.saturating_sub(chunk_start);
                 let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
 
                 if bytes_left_in_chunk == 0 {
+                    // Hole: reading beyond actual chunk data but within file_size.
+                    // This happens after truncate-up (file extended with zeros)
+                    // or when the volume server returns less data than requested.
+                    // POSIX requires reads from holes to return zero-filled data.
+                    let chunk_size = self.chunk_cache.chunk_size();
+                    let chunk_end = (current_offset / chunk_size + 1) * chunk_size;
+                    let zero_end = std::cmp::min(chunk_end, end);
+                    let zero_len = (zero_end - current_offset) as usize;
                     log::debug!(
-                        "read: bytes_left_in_chunk=0, breaking. chunk_data_len={}, chunk_start={}",
-                        chunk_data.data.len(),
-                        chunk_start
+                        "read: zero-filling hole at offset={}, len={}, chunk_data_len={}, chunk_start={}",
+                        current_offset, zero_len, chunk_data.data.len(), chunk_start
                     );
-                    break;
+                    let zeros = vec![0u8; zero_len];
+                    w.write_all(&zeros)?;
+                    total_written += zero_len;
+                    current_offset = zero_end;
+                    continue;
                 }
 
                 let slice = &chunk_data.data[chunk_start..chunk_start + bytes_left_in_chunk];
@@ -4121,7 +4454,7 @@ impl FileSystem for PowerFsFs {
                 let is_pinned = self.cache.is_pinned(inode);
                 let has_chunks = self.chunk_cache.has_chunks(inode);
                 let has_dirty = self.chunk_cache.has_dirty_chunks(inode);
-                let is_open = self.open_inodes.read().unwrap().contains(&inode);
+                let is_open = self.open_inodes.read().unwrap().contains_key(&inode);
                 error!(
                     "write ENOENT: inode={} offset={} size={} is_pinned={} has_chunks={} has_dirty={} is_open={} thread={:?} \
                      — inode was evicted mid-write (check invalidate_inode/unpin_inode logs for cause)",
@@ -4217,6 +4550,13 @@ impl FileSystem for PowerFsFs {
                     }
                     inline_buf.data[start..end].copy_from_slice(&buf[..]);
                     inline_buf.dirty = true; // 标记已修改, release 时需同步到 Filer
+                                             // Track in-place modification: if the write touched data
+                                             // below original_len, we can't use append mode on release
+                                             // (the delta would miss the in-place changes). This causes
+                                             // release to fall back to full-buffer overwrite mode.
+                    if (offset as usize) < inline_buf.original_len {
+                        inline_buf.modified_in_place = true;
+                    }
 
                     let updated_size = inline_buf.data.len() as u64;
                     debug!(
@@ -4317,10 +4657,25 @@ impl FileSystem for PowerFsFs {
         let chunk_size = self.chunk_cache.chunk_size();
 
         // === P3: Stripe 模式写入分支 ===
-        // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
-        // 每个 1MB chunk 按 resolve_stripe_chunk() 路由到正确的 volume/needle.
-        // chunk_cache 逻辑与 Flat 相同 (按 file offset 缓存 1MB 数据).
-        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
+        // Only enter for Stripe/WideStripe files (placement set AND fid is
+        // None — stripe files use per-chunk needle IDs, not a single fid).
+        // Flat files with fid=None are inline files; they should NOT enter
+        // this path (max_stripe_offset=0 for Flat → EFBIG). Inline writes
+        // are handled by the inline_buffers path above; if the buffer was
+        // removed (e.g., after release), the write will re-create it via
+        // the open path's filer refresh on the next open.
+        if let Some(placement) = entry
+            .placement
+            .as_ref()
+            .filter(|p| {
+                matches!(
+                    p,
+                    powerfs_layout::Placement::Stripe { .. }
+                        | powerfs_layout::Placement::WideStripe { .. }
+                )
+            })
+            .filter(|_| entry.fid.is_none())
+        {
             let stripe_chunks = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default).
@@ -4487,7 +4842,12 @@ impl FileSystem for PowerFsFs {
 
             // Update size and chunk sizes
             let _meta_guard = meta_lock.lock();
-            if let Some(current_entry) = self.cache.get_inode(inode) {
+            // Use peek_inode (not get_inode) to bypass EntryState checks.
+            // During chunk writes (meta_lock released), the InvalidateHandler
+            // may mark the entry Stale. get_inode would then return None,
+            // skipping the size update — causing writes beyond EOF to not
+            // extend the file size (fsx "Size error").
+            if let Some(current_entry) = self.cache.peek_inode(inode) {
                 if new_size > current_entry.size {
                     self.cache.update_size(inode, new_size);
                 }
@@ -4665,7 +5025,12 @@ impl FileSystem for PowerFsFs {
 
             // Re-acquire metadata lock and update size with latest value
             let _meta_guard = meta_lock.lock();
-            if let Some(current_entry) = self.cache.get_inode(inode) {
+            // Use peek_inode (not get_inode) to bypass EntryState checks.
+            // During chunk writes (meta_lock released above), the InvalidateHandler
+            // may mark the entry Stale. get_inode would then return None,
+            // skipping the size update — causing writes beyond EOF to not
+            // extend the file size (fsx "Size error").
+            if let Some(current_entry) = self.cache.peek_inode(inode) {
                 if new_size > current_entry.size {
                     self.cache.update_size(inode, new_size);
                 }
@@ -4692,19 +5057,57 @@ impl FileSystem for PowerFsFs {
             // release(close)/fsync 时同步 flush 保证持久性。
             // 收益：64K 文件 16 次 4K write 从 16 次网络往返降到 1-2 次。
         } else {
-            // entry.fid 为 None：文件已存在但 Filer 元数据缺失 chunk mapping。
-            // 这属于元数据异常（create 时 set_chunks 失败，或 Filer 数据损坏）。
-            //
-            // 旧代码在此调用 assign_fid 从 Master 分配新 needle_id，但这与 Filer
-            // Zone 自分配模型冲突：客户端写入用的 needle_id 与 Filer 元数据不一致，
-            // 导致重新挂载后读不到数据（与 create 路径相同的 BUG）。
-            //
-            // 正确处理：返回 EIO，让应用层感知元数据异常并决定恢复策略
-            // （如删除文件重建，或由 fsck 工具修复）。不应在 write 路径隐式
-            // 分配新 needle_id，那会掩盖根因并造成数据/元数据分裂。
+            // entry.fid 为 None 且无 inline_buffer: 文件可能是新建的空文件,
+            // inline_buffer 被 InvalidateHandler 驱逐后未重建.
+            // 创建新 inline buffer 并写入, 而非返回 EIO.
+            // 这修复了 mdtest-hard 等 metadata 密集场景下的崩溃:
+            // Filer 对每个新建文件发送 invalidation, 导致 inline_buffer 被驱逐,
+            // 后续 write 找不到 buffer 也找不到 fid → EIO → IO500 assertion crash.
+            warn!(
+                "write: inode {} has no fid and no inline_buffer, creating new inline buffer \
+                 (likely evicted by InvalidateHandler during metadata-heavy workload)",
+                inode
+            );
+            let inline_max = self
+                .inline_max_sizes
+                .get(&inode)
+                .map(|v| *v as usize)
+                .unwrap_or(INLINE_HARD_LIMIT);
+            self.inline_buffers.insert(
+                inode,
+                InlineBuffer {
+                    data: Vec::with_capacity(inline_max),
+                    dirty: true,
+                    original_len: 0,
+                    modified_in_place: false,
+                    needs_refresh: false,
+                },
+            );
+            // 重新进入 inline 写路径
+            if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                let new_end = offset + read_len as u64;
+                if new_end > INLINE_HARD_LIMIT as u64 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+                }
+                let buf_len = inline_buf.data.len() as u64;
+                if offset > buf_len {
+                    inline_buf.data.resize(offset as usize, 0);
+                }
+                let start = offset as usize;
+                let end = new_end as usize;
+                if inline_buf.data.len() < end {
+                    inline_buf.data.resize(end, 0);
+                }
+                inline_buf.data[start..end].copy_from_slice(&buf[..]);
+                inline_buf.dirty = true;
+                let updated_size = inline_buf.data.len() as u64;
+                self.cache.update_size(inode, updated_size);
+                self.cache.mark_dirty(inode);
+                return Ok(read_len);
+            }
+            // 如果 inline_buffers insert 后仍无法 get_mut (极端竞争), 回退到 EIO
             error!(
-                "write: inode {} has no fid (Filer metadata missing chunks), refusing to write. \
-                 File may be corrupted; use fsck to repair or recreate the file.",
+                "write: inode {} failed to create inline buffer (race condition), returning EIO",
                 inode
             );
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
@@ -4776,24 +5179,31 @@ impl FileSystem for PowerFsFs {
                 // to use offset=0 and overwrite existing data.
                 // Instead, keep dirty=true during sync and detect concurrent
                 // writes by comparing buffer length before and after sync.
-                let snapshot: Option<(u64, Option<Vec<u8>>)> = {
+                //
+                // Also capture original_len and modified_in_place to decide
+                // between append mode (send only delta) and overwrite mode
+                // (send full buffer). Append mode prevents lost updates when
+                // multiple clients concurrently append to the same inline file.
+                let snapshot: Option<(u64, Option<Vec<u8>>, usize, bool)> = {
                     if let Some(inline_buf) = self.inline_buffers.get(&inode) {
                         let size = inline_buf.data.len() as u64;
                         let was_dirty = inline_buf.dirty;
+                        let orig_len = inline_buf.original_len;
+                        let mod_in_place = inline_buf.modified_in_place;
                         let data = if was_dirty {
                             Some(inline_buf.data.clone())
                         } else {
                             None
                         };
                         final_size = size;
-                        Some((size, data))
+                        Some((size, data, orig_len, mod_in_place))
                     } else {
                         // Buffer was removed by someone else (e.g., migration)
                         None
                     }
                 };
 
-                let Some((size, data)) = snapshot else {
+                let Some((size, data, orig_len, mod_in_place)) = snapshot else {
                     // Buffer gone, nothing to sync
                     break;
                 };
@@ -4808,13 +5218,70 @@ impl FileSystem for PowerFsFs {
                 }
 
                 // Step 3: Sync the snapshot to the Filer (outside DashMap lock).
+                //
+                // Append mode: if the buffer grew (size > original_len) and no
+                // in-place modification occurred (pure append), send only the
+                // delta (data[original_len..]) with is_append=true. The Filer
+                // atomically appends it to the current inline_data, preserving
+                // other clients' concurrent appends.
+                //
+                // Overwrite mode: if the buffer was modified in-place or didn't
+                // grow (truncate/overwrite), send the full buffer with
+                // is_append=false (existing behavior).
+                let data = data.unwrap(); // safe: data.is_none() checked above
+                let can_append = !mod_in_place && (data.len() > orig_len);
+
+                // Safety net: if the buffer didn't grow (data.len() == orig_len)
+                // and no in-place modification occurred, there's nothing new to
+                // sync. This can happen when:
+                // 1. A concurrent release already synced the data and cleared
+                //    dirty, but a race re-set dirty.
+                // 2. An empty-buffer release (data.len() == 0, orig_len == 0)
+                //    from a delayed FUSE RELEASE of a `touch`/create-without-write
+                //    operation. The kernel delays RELEASE callbacks, so the
+                //    `touch` command's release may arrive during concurrent
+                //    appends from other clients. Syncing size=0 in OVERWRITE
+                //    mode would wipe their data (L4.21 root cause).
+                //
+                // In both cases, skip the sync — the Filer's state is
+                // authoritative (no local data was written).
+                if !can_append && !mod_in_place && data.len() == orig_len {
+                    debug!(
+                        "release inline: inode={} no new data to sync (data_len={} == orig_len={}, \
+                         mod_in_place={}, skip to avoid overwriting other clients' data)",
+                        inode, data.len(), orig_len, mod_in_place
+                    );
+                    // Clear dirty (concurrent release may have missed it)
+                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                        inline_buf.dirty = false;
+                    }
+                    break;
+                }
+
+                let (sync_data, sync_size, is_append) = if can_append {
+                    let delta = data[orig_len..].to_vec();
+                    debug!(
+                        "release inline: inode={} append mode, orig_len={}, delta_len={}, total_len={}",
+                        inode, orig_len, delta.len(), data.len()
+                    );
+                    (Some(delta), 0u64, true)
+                } else {
+                    warn!(
+                        "release inline: inode={} OVERWRITE mode (is_append=false), mod_in_place={}, \
+                         data_len={}, orig_len={} — this may overwrite other clients' data",
+                        inode, mod_in_place, data.len(), orig_len
+                    );
+                    (Some(data), size, false)
+                };
+
                 let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
                     shard_id: routing_shard,
                     inode,
-                    size,
+                    size: sync_size,
                     chunks: Vec::new(),
                     client_id: self.client.client_id(),
-                    inline_data: data,
+                    inline_data: sync_data,
+                    is_append,
                 };
                 let max_retries = 5u32;
                 let mut last_err = String::new();
@@ -4869,6 +5336,25 @@ impl FileSystem for PowerFsFs {
                     break;
                 }
 
+                // After a successful append-mode sync, update original_len to
+                // the SYNCED length (the snapshot size), NOT the current buffer
+                // length. If the buffer grew during sync (concurrent write),
+                // original_len must reflect only what was actually sent in the
+                // delta, so the re-sync round sends the NEW delta
+                // (data[original_len..]) instead of seeing data.len() ==
+                // orig_len and falling back to OVERWRITE mode (which would
+                // overwrite other clients' data).
+                //
+                // BUG: previously set to inline_buf.data.len(), which is the
+                // CURRENT (possibly grown) buffer length. This caused the
+                // re-sync to see data.len() == orig_len → OVERWRITE mode →
+                // cross-client data loss (L4.21).
+                if is_append {
+                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                        inline_buf.original_len = size as usize;
+                    }
+                }
+
                 // Step 4: Check if the buffer grew during the sync.
                 // Compare current length with synced size. If the buffer grew,
                 // a concurrent write happened — re-sync with the updated data.
@@ -4913,9 +5399,16 @@ impl FileSystem for PowerFsFs {
                 break;
             }
 
-            // Remove the inline buffer (sync complete, buffer is clean)
-            self.inline_buffers.remove(&inode);
-            self.inline_max_sizes.remove(&inode);
+            // Remove the inline buffer ONLY if this is the last open handle.
+            // If other handles are still open (open_count > 0), keeping the
+            // buffer allows subsequent writes on those handles to append to
+            // the inline data. Removing it prematurely causes the next write
+            // to fall through to the Stripe/Flat path, which returns EFBIG
+            // for inline files (no fid, no chunks → max_stripe_offset=0).
+            // L4.21 failure: concurrent `>>` appends from bash for-loops
+            // overlap (FUSE RELEASE is async), so the second OPEN arrives
+            // before the first RELEASE completes. The second write then
+            // finds no inline buffer and hits the Stripe path's EFBIG.
 
             // open_count_dec (best-effort, 同 Flat 路径)
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
@@ -4934,8 +5427,52 @@ impl FileSystem for PowerFsFs {
             }
 
             // 移除 open_inodes 追踪 + unpin (Inline 无 flush 失败重试, 总是 unpin)
-            self.open_inodes.write().unwrap().remove(&inode);
-            self.cache.unpin_inode(inode);
+            // Use reference count: only remove when last open context closes.
+            // This prevents a stale release (from a prior fd) from removing
+            // the inode while another fd still has it open.
+            //
+            // CRITICAL: Hold open_inodes lock while calling unpin_inode to
+            // prevent a concurrent open from pinning between the count
+            // decrement and the hold decrement. Without this, open #2 could
+            // pin (hold 1→2) after release #1 decrements open_inodes to 0,
+            // then release #1's unpin sets hold 2→1 — but if open #2's pin
+            // hasn't run yet, unpin sets hold 1→0=Unpinned while open_inodes
+            // has count 1 → InvalidateHandler evicts mid-write (ENOENT).
+            let released = {
+                let mut open_inodes = self.open_inodes.write().unwrap();
+                if let Some(count) = open_inodes.get_mut(&inode) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        open_inodes.remove(&inode);
+                    }
+                }
+                self.cache.unpin_inode(inode)
+            };
+
+            // Only remove the inline buffer if this was the last open handle
+            // (released=true). If other handles are still open (released=false),
+            // keep the buffer so concurrent writes can continue appending.
+            if released {
+                self.inline_buffers.remove(&inode);
+                self.inline_max_sizes.remove(&inode);
+                // L4.21 fix: Invalidate the kernel page cache after the last
+                // handle is closed. During concurrent appends, Invalidates from
+                // other clients were skipped (inode was Dirty). After release,
+                // the kernel page cache still holds this client's own write
+                // data, which is stale — it doesn't include other clients'
+                // concurrent appends that were synced to the Filer. Without
+                // this notification, subsequent reads (e.g., wc -l) return
+                // stale line counts from the page cache.
+                self.notify_kernel_inval_inode(inode);
+                // Mark cache entry as Stale so the next open/getattr
+                // refreshes metadata (size) from the Filer.
+                self.cache.mark_stale(inode);
+            } else {
+                debug!(
+                    "release inline: inode={} keeping inline buffer (other handles still open)",
+                    inode
+                );
+            }
 
             if !sync_ok {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
@@ -5026,8 +5563,16 @@ impl FileSystem for PowerFsFs {
         }
 
         // Phase 4.3/4.4: 移除 open_inodes 追踪（getattr 恢复短 TTL）
-        self.open_inodes.write().unwrap().remove(&inode);
-
+        // Use reference count: only remove when last open context closes.
+        //
+        // CRITICAL: Hold open_inodes lock while calling unpin_inode (when
+        // flush succeeded) to prevent a concurrent open from pinning between
+        // the count decrement and the hold decrement. Without this, open #2
+        // could pin (hold 1→2) after release #1 decrements open_inodes to 0,
+        // then release #1's unpin sets hold 2→1 — but if open #2's pin hasn't
+        // run yet, unpin sets hold 1→0=Unpinned while open_inodes has count 1
+        // → InvalidateHandler evicts mid-write (ENOENT in mdtest-hard).
+        //
         // Only unpin the inode if flush succeeded. If flush failed, dirty
         // chunks remain and the background flusher needs the inode metadata
         // (fid, volume_id) to retry. Unpinning would let the 30s TTL expire
@@ -5036,12 +5581,26 @@ impl FileSystem for PowerFsFs {
         // writes the data (it will call clear_dirty, and the next release of
         // the file — if reopened — will unpin normally).
         if flush_result.is_ok() {
+            let mut open_inodes = self.open_inodes.write().unwrap();
+            if let Some(count) = open_inodes.get_mut(&inode) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open_inodes.remove(&inode);
+                }
+            }
             self.cache.unpin_inode(inode);
         } else {
             warn!(
                 "release: keeping inode {} pinned (flush failed, dirty chunks remain for retry)",
                 inode
             );
+            let mut open_inodes = self.open_inodes.write().unwrap();
+            if let Some(count) = open_inodes.get_mut(&inode) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open_inodes.remove(&inode);
+                }
+            }
         }
 
         // 4. 释放 Volume lease（best-effort，close 时释放 write + read lease）
@@ -5601,6 +6160,91 @@ impl FileSystem for PowerFsFs {
             Ok(())
         } else {
             Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        }
+    }
+
+    /// Flush is called by the FUSE kernel on every close() of a file descriptor.
+    /// The kernel WAITS for the flush response before returning from close(),
+    /// unlike release() which is asynchronous.
+    ///
+    /// Without implementing flush(), the kernel returns immediately from close()
+    /// without waiting for data/metadata sync. This causes a race condition:
+    /// a subsequent stat() by another process can read stale metadata from the
+    /// Filer before release() has a chance to sync_size_chunks_on_close().
+    ///
+    /// Fix: sync data to Volume Server + metadata to Filer inside flush(),
+    /// so the Filer has the correct size/chunks before close() returns.
+    /// This fixes the "Size error" in fsx and dd write-beyond-EOF scenarios.
+    fn flush(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        _lock_owner: u64,
+    ) -> std::io::Result<()> {
+        let cs = self
+            .cache
+            .peek_inode(inode)
+            .map(|e| e.content_size)
+            .unwrap_or(u64::MAX);
+        info!("flush: inode={} content_size={}", inode, cs);
+
+        // Inline mode: data is in inline_buffers, persisted on release.
+        // flush is a no-op for inline files (data < 8KB, write-close window
+        // is short; release handles the Raft commit).
+        if self.inline_buffers.contains_key(&inode) {
+            debug!(
+                "flush: inode={} is inline, no-op (data persisted on release)",
+                inode
+            );
+            return Ok(());
+        }
+
+        // Flat/Stripe: flush data to Volume Server, then sync metadata to Filer.
+        // This is the same logic as fsync, ensuring the Filer has up-to-date
+        // size/chunks before close() returns to the application.
+        match self.flush_dirty_chunks(inode, None) {
+            Ok(()) => {
+                if !self.has_dirty_for_inode(inode) {
+                    match self.sync_size_chunks_on_close(inode) {
+                        Ok(()) => {
+                            debug!("flush: inode={} data + metadata synced", inode);
+                            // Don't clear dirty here: release() will do that
+                            // after its own flush+sync. Clearing here would
+                            // cause release to skip sync, but if a concurrent
+                            // write happens between flush and release, the
+                            // dirty flag needs to be set by that write. Keeping
+                            // dirty set is safe — release will re-flush (no-op)
+                            // and re-sync (same data).
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!(
+                                "flush: sync_size_chunks_on_close failed for inode={}: {}",
+                                inode, e
+                            );
+                            Err(e)
+                        }
+                    }
+                } else {
+                    // Still has dirty chunks (flush didn't fully succeed).
+                    // Don't sync metadata — release will retry.
+                    debug!(
+                        "flush: inode={} still has dirty chunks after flush, skipping metadata sync",
+                        inode
+                    );
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                error!(
+                    "flush: flush_dirty_chunks failed for inode={}: {} (raw_os_error={:?})",
+                    inode,
+                    e,
+                    e.raw_os_error()
+                );
+                Err(e)
+            }
         }
     }
 

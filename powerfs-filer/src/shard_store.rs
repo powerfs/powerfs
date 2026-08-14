@@ -1,7 +1,7 @@
 use log::{debug, info, warn};
 use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::crdt_orset::{ServerDirORSet, Tombstone};
@@ -76,6 +76,37 @@ pub struct InodeInfo {
     pub replica_chunks: Vec<StoredFileChunk>,
 }
 
+/// Lightweight directory entry for readdir responses.
+/// Contains only the fields needed by readdir, avoiding expensive
+/// clones of chunks/inline_data/extended/replica_chunks from full InodeInfo.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub inode: u64,
+    pub name: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
+}
+
+/// Lightweight inode metadata for cross-shard readdir resolution.
+/// Avoids cloning chunks/inline_data/extended from full InodeInfo.
+#[derive(Debug, Clone)]
+pub struct InodeMetadata {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
+}
+
 /// Stored file chunk (persisted in Filer InodeInfo)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredFileChunk {
@@ -110,7 +141,7 @@ pub struct ShardStore {
     inode_range: (u64, u64),
     db: DB,
     inodes: RwLock<HashMap<u64, InodeInfo>>,
-    directory_entries: RwLock<HashMap<u64, HashMap<String, u64>>>,
+    directory_entries: RwLock<HashMap<u64, BTreeMap<String, u64>>>,
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
     next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
@@ -545,10 +576,15 @@ impl ShardStore {
                 size,
                 chunks,
                 inline_data,
+                is_append,
             } => {
-                if let Err(e) =
-                    self.update_inode_size_chunks_atomic(inode, size, chunks, inline_data)
-                {
+                if let Err(e) = self.update_inode_size_chunks_atomic(
+                    inode,
+                    size,
+                    chunks,
+                    inline_data,
+                    is_append,
+                ) {
                     log::error!(
                         "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
                         self.shard_id.0,
@@ -1059,7 +1095,7 @@ impl ShardStore {
             // Always start with a fresh empty map for the new directory's
             // own entries. Using or_default() would keep stale entries if the
             // inode number was reused after an incomplete cleanup.
-            dir_entries.insert(inode, std::collections::HashMap::new());
+            dir_entries.insert(inode, BTreeMap::new());
         }
         {
             let mut stats = self.stats.write().unwrap();
@@ -1525,6 +1561,108 @@ impl ShardStore {
         result
     }
 
+    /// Paginated directory entry listing using BTreeMap ordering.
+    /// Returns (name, inode) pairs starting after `last_name`, up to `limit + 1`.
+    /// Fetching limit+1 allows the caller to determine has_more without a
+    /// second scan.
+    pub fn list_dir_entry_inodes_paginated(
+        &self,
+        parent_inode: u64,
+        last_name: &str,
+        limit: usize,
+    ) -> (Vec<(String, u64)>, bool) {
+        let dir_entries = self.directory_entries.read().unwrap();
+        let mut result = Vec::with_capacity(limit + 1);
+        let mut has_more = false;
+
+        if let Some(dir) = dir_entries.get(&parent_inode) {
+            for (name, &inode) in dir.iter() {
+                // BTreeMap is sorted by name; skip until past last_name
+                if !last_name.is_empty() && name.as_str() <= last_name {
+                    continue;
+                }
+                if result.len() > limit {
+                    has_more = true;
+                    break;
+                }
+                result.push((name.clone(), inode));
+            }
+        }
+
+        (result, has_more)
+    }
+
+    /// Lightweight inode metadata lookup — returns only the fields needed
+    /// for readdir without cloning chunks/inline_data/extended/replica_chunks.
+    /// Returns None if inode not found or tombstoned.
+    pub fn get_inode_metadata(&self, inode: u64) -> Option<InodeMetadata> {
+        let inodes = self.inodes.read().unwrap();
+        inodes.get(&inode).and_then(|info| {
+            if info.delete_time > 0 {
+                None
+            } else {
+                Some(InodeMetadata {
+                    mode: info.mode,
+                    uid: info.uid,
+                    gid: info.gid,
+                    size: info.size,
+                    atime: info.atime,
+                    mtime: info.mtime,
+                    ctime: info.ctime,
+                    nlink: info.nlink,
+                })
+            }
+        })
+    }
+
+    /// Paginated directory listing with lightweight DirEntry.
+    /// Uses BTreeMap ordering for efficient seek + limit.
+    /// Acquires directory_entries and inodes read locks once.
+    /// Returns (entries, has_more).
+    pub fn list_directory_paginated(
+        &self,
+        parent_inode: u64,
+        last_name: &str,
+        limit: usize,
+    ) -> (Vec<DirEntry>, bool) {
+        let dir_entries = self.directory_entries.read().unwrap();
+        let inodes = self.inodes.read().unwrap();
+
+        let mut result = Vec::with_capacity(limit + 1);
+        let mut has_more = false;
+
+        if let Some(dir) = dir_entries.get(&parent_inode) {
+            for (name, &inode) in dir.iter() {
+                if !last_name.is_empty() && name.as_str() <= last_name {
+                    continue;
+                }
+                if result.len() >= limit {
+                    has_more = true;
+                    break;
+                }
+                if let Some(info) = inodes.get(&inode) {
+                    if info.delete_time > 0 {
+                        continue;
+                    }
+                    result.push(DirEntry {
+                        inode: info.inode,
+                        name: name.clone(),
+                        mode: info.mode,
+                        uid: info.uid,
+                        gid: info.gid,
+                        size: info.size,
+                        atime: info.atime,
+                        mtime: info.mtime,
+                        ctime: info.ctime,
+                        nlink: info.nlink,
+                    });
+                }
+            }
+        }
+
+        (result, has_more)
+    }
+
     pub fn get_stats(&self) -> ShardStats {
         self.stats.read().unwrap().clone()
     }
@@ -1659,7 +1797,7 @@ impl ShardStore {
         // causing phantom files to appear in readdir (ISSUE: phantom files
         // after inode reuse).
         let mut was_dir = false;
-        if let Some((_, is_dir)) = &removed {
+        if let Some((_is_file, is_dir)) = &removed {
             if *is_dir {
                 was_dir = true;
                 let prefix = format!("{}:", inode);
@@ -2173,14 +2311,31 @@ impl ShardStore {
         size: u64,
         chunks: Vec<StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
+        is_append: bool,
     ) -> Result<(), String> {
         let cf_inodes = self
             .db
             .cf_handle(CF_INODES)
             .ok_or_else(|| "CF_INODES not found".to_string())?;
-        let mut info = self
-            .get_inode(inode)
+
+        // L4.21 fix: Hold the write lock for the ENTIRE read-modify-write
+        // sequence when is_append=true. Without this, two concurrent append
+        // RPCs (from different FUSE clients) both read the same inline_data,
+        // each append their own delta, and the last write wins — losing the
+        // other client's data. The lock must be held across the RocksDB
+        // sync write to prevent a concurrent append from reading stale data
+        // between the in-memory read and the persistent write.
+        //
+        // For is_append=false (overwrite mode), the client sends the full
+        // buffer, so there's no read-modify-write race on inline_data.
+        // We still acquire the write lock for consistency, but the critical
+        // section is the same.
+        let mut inodes_guard = self.inodes.write().unwrap();
+        let mut info = inodes_guard
+            .get(&inode)
+            .cloned()
             .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
+
         // Track what actually changed before overwriting fields. This is critical
         // for mtime correctness: the FUSE release path calls this on every close,
         // including read-only opens and delayed releases that re-sync identical
@@ -2198,13 +2353,63 @@ impl ShardStore {
         //   - Metadata sync (SETATTR via Raft): mode, uid, gid, mtime, atime
         let chunks_changed = info.chunks != chunks;
 
-        info.size = size;
-        info.blocks = size.div_ceil(512);
-        // P4: 只在 chunks 实际变化时才重置 reliability_state,
-        // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
-        // 不必要地清空 replica_chunks.
-        info.chunks = chunks;
-        info.inline_data = inline_data;
+        // IsAppend mode: atomically append inline_data to the existing
+        // inline_data instead of overwriting. This prevents lost updates
+        // when two FUSE clients concurrently append to the same inline file
+        // (L4.21: each client builds its own full buffer; without append
+        // mode, the last sync overwrites the other's data).
+        //
+        // The client sends only the delta (bytes appended since open), so
+        // the Filer's existing inline_data is preserved and the delta is
+        // concatenated. The new size = existing_size + delta_len.
+        if is_append {
+            if let Some(delta) = &inline_data {
+                let existing_len = info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0);
+                let mut combined = info.inline_data.clone().unwrap_or_default();
+                combined.extend_from_slice(delta);
+                let new_size = combined.len() as u64;
+                info.size = new_size;
+                info.blocks = new_size.div_ceil(512);
+                info.chunks = chunks; // empty for inline
+                info.inline_data = Some(combined);
+                log::info!(
+                    "Shard {} IsAppend: inode {} appended {} bytes to existing {} bytes, new_size={}",
+                    self.shard_id.0,
+                    inode,
+                    delta.len(),
+                    existing_len,
+                    info.size
+                );
+            } else {
+                // is_append without inline_data — no-op
+                return Ok(());
+            }
+        } else {
+            // Overwrite mode: log when inline_data is being replaced, to
+            // diagnose cross-client data loss (L4.21: a client sending
+            // is_append=false with stale inline_data overwrites the
+            // Filer's current data, causing other clients' appends to
+            // be lost). This is the ONLY place inline_data is overwritten
+            // (not appended), so any size regression traces back to here.
+            if inline_data.is_some() {
+                log::info!(
+                    "Shard {} Overwrite: inode {} size={} inline_len={} (existing_inline_len={}) — \
+                     is_append=false, client buffer sent in overwrite mode",
+                    self.shard_id.0,
+                    inode,
+                    size,
+                    inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                    info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                );
+            }
+            info.size = size;
+            info.blocks = size.div_ceil(512);
+            // P4: 只在 chunks 实际变化时才重置 reliability_state,
+            // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
+            // 不必要地清空 replica_chunks.
+            info.chunks = chunks;
+            info.inline_data = inline_data;
+        }
         // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
         // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
         // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
@@ -2232,8 +2437,7 @@ impl ShardStore {
         self.db
             .put_cf_opt(cf_inodes, inode.to_be_bytes(), &data, &write_opts)
             .map_err(|e| format!("put inode size/chunks: {}", e))?;
-        let mut inodes = self.inodes.write().unwrap();
-        inodes.insert(inode, info);
+        inodes_guard.insert(inode, info);
         Ok(())
     }
 
@@ -2403,6 +2607,7 @@ impl ShardStore {
     }
 
     /// Set inode attributes
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         inode: u64,

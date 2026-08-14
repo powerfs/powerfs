@@ -532,11 +532,9 @@ impl FuseClientFacade {
         // risk of routing to the wrong shard) or the topology is healthy.
         if !config.force_mount {
             if topology.shard_count == 0 {
-                return Err(format!(
-                    "Refusing to mount: master returned total_shards=0 (no healthy filer \
+                return Err("Refusing to mount: master returned total_shards=0 (no healthy filer \
                      registered yet, or old master without the extension). Set fuse.force_mount=true \
-                     to override and use the configured filer_addr as a single-shard fallback."
-                ));
+                     to override and use the configured filer_addr as a single-shard fallback.".to_string());
             }
             // 至少需要 1 个 shard entry 才能路由；shard_count>0 但 shards map 为空
             // 表示 master 下发了 total_shards 但没有 filer 注册（不可能但防御性检查）。

@@ -7,7 +7,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [fuse]
-mount_point = "/mnt/powerfs"
+mount_point = "/mnt/fuse"
 master_addresses = ["172.30.0.11", "172.30.0.12", "172.30.0.13"]
 master_net_port = 9334
 volume_net_port = 8901
@@ -17,6 +17,9 @@ replication = "000"
 threads = 8
 verbose = true
 container = true
+log_file = "/var/log/powerfs-fuse.log"
+request_timeout_secs = 10
+admin_port = 9998
 
 [fuse.lease]
 mode = "range"
