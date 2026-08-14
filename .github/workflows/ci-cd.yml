@@ -11,12 +11,20 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  CARGO_NET_OFFLINE: "true"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   # 代码质量检查
   quality:
     runs-on: [self-hosted, Linux, X64]
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -30,7 +38,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -39,10 +47,10 @@ jobs:
 
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Format Check
       run: cargo fmt --check --all
-    
+
     - name: Clippy
       run: cargo clippy --all -- -D warnings
 
@@ -50,6 +58,12 @@ jobs:
   build:
     runs-on: [self-hosted, Linux, X64]
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -61,7 +75,7 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -70,7 +84,7 @@ jobs:
 
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Build All
       run: cargo build --all --release
 
@@ -78,6 +92,12 @@ jobs:
   test:
     runs-on: [self-hosted, Linux, X64]
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -89,7 +109,7 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -98,10 +118,10 @@ jobs:
 
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Unit Tests
       run: cargo test --all -- --test-threads=2
-    
+
     - name: Benchmark Tests
       run: cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
 
@@ -110,6 +130,12 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     if: github.event_name == 'workflow_dispatch' || (contains(fromJson('["refs/heads/fronted","refs/heads/master","refs/heads/main"]'), github.ref) && github.event_name == 'push')
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -121,7 +147,7 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -130,17 +156,17 @@ jobs:
 
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Build Benchmark
       run: cargo build --package powerfs-core --release --bench kv_benchmark
-    
+
     - name: Run Benchmark
       run: |
         mkdir -p benchmark-results
         cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
-    
+
     - name: Upload Benchmark Results
       uses: actions/upload-artifact@v4
       with:
@@ -151,6 +177,12 @@ jobs:
   coverage:
     runs-on: [self-hosted, Linux, X64]
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -167,7 +199,7 @@ jobs:
 
     - name: Install grcov
       run: cargo install grcov
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -176,7 +208,7 @@ jobs:
 
     - name: Cargo Cache
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Run Tests with Coverage
       run: |
         cargo clean
@@ -184,10 +216,11 @@ jobs:
         RUSTFLAGS="-C instrument-coverage" cargo test --all
       env:
         LLVM_PROFILE_FILE: "powerfs-%p-%m.profraw"
-    
+        CARGO_NET_OFFLINE: "true"
+
     - name: Generate Coverage Report
       run: grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
-    
+
     - name: Upload Coverage Report
       uses: actions/upload-artifact@v4
       with:
@@ -200,6 +233,12 @@ jobs:
     needs: [quality, build, test]
     if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -251,6 +290,12 @@ jobs:
     needs: [docker]
     if: contains(fromJson('["refs/heads/fronted","refs/heads/master","refs/heads/main"]'), github.ref) && github.event_name == 'push'
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -267,6 +312,12 @@ jobs:
     needs: [quality, build, test, docker, deploy-test]
     if: contains(github.event.head_commit.message, 'release')
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false
@@ -289,6 +340,12 @@ jobs:
   frontend:
     runs-on: [self-hosted, Linux, X64]
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         submodules: false

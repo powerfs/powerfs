@@ -9,12 +9,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: "true"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   build:
     runs-on: [self-hosted, Linux, X64]
-    
+
     steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
