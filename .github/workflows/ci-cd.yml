@@ -225,11 +225,28 @@ jobs:
         name: coverage-report
         path: ./coverage
 
+  # Check whether Docker Hub credentials are configured (secrets context is
+  # not available in job-level `if`, so we expose it via a job output).
+  check-docker-secrets:
+    runs-on: [self-hosted, Linux, X64]
+    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+    - id: check
+      run: |
+        if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+          echo "available=true" >> $GITHUB_OUTPUT
+        else
+          echo "::warning::Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN) are not configured; skipping docker/deploy/release jobs."
+          echo "available=false" >> $GITHUB_OUTPUT
+        fi
+
   # Docker 镜像构建
   docker:
     runs-on: [self-hosted, Linux, X64]
-    needs: [quality, build, test]
-    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
+    needs: [quality, build, test, check-docker-secrets]
+    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push' && needs.check-docker-secrets.outputs.available == 'true'
     steps:
     - name: Configure Git for SSH
       run: |
@@ -243,13 +260,13 @@ jobs:
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-    
+
     - name: Login to Docker Hub
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
+
     - name: Build and Push Master Image
       uses: docker/build-push-action@v5
       with:
@@ -257,7 +274,7 @@ jobs:
         file: docker/powerfs-master.Dockerfile
         push: true
         tags: powerfs/master:latest, powerfs/master:${{ github.sha }}
-    
+
     - name: Build and Push Volume Image
       uses: docker/build-push-action@v5
       with:
@@ -265,7 +282,7 @@ jobs:
         file: docker/powerfs-volume.Dockerfile
         push: true
         tags: powerfs/volume:latest, powerfs/volume:${{ github.sha }}
-    
+
     - name: Build and Push FUSE Image
       uses: docker/build-push-action@v5
       with:
@@ -273,7 +290,7 @@ jobs:
         file: docker/powerfs-fuse.Dockerfile
         push: true
         tags: powerfs/fuse:latest, powerfs/fuse:${{ github.sha }}
-    
+
     - name: Build and Push Monitor Image
       uses: docker/build-push-action@v5
       with:

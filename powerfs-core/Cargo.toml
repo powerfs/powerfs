@@ -43,6 +43,10 @@ tempfile = "3.10"
 crc32c = "0.6"
 criterion = "0.4"
 
+[[bench]]
+name = "kv_benchmark"
+harness = false
+
 [[example]]
 name = "spdk_bdev_test"
 path = "../examples/spdk_bdev_test.rs"
