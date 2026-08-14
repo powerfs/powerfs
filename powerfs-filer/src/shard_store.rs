@@ -621,6 +621,7 @@ impl ShardStore {
             // halves can land on different shards without losing per-CF
             // atomicity.
             ShardCommand::CreateInode { info } => {
+                let info = *info;
                 if let Err(e) = self.create_inode(info.clone()) {
                     log::error!(
                         "Shard {} apply CreateInode failed for inode {}: {}",

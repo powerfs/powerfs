@@ -536,7 +536,9 @@ impl MetaShardManager {
         }
 
         // Phase A: inode record on its own hash-derived shard.
-        let cmd_ino = ShardCommand::CreateInode { info: info.clone() };
+        let cmd_ino = ShardCommand::CreateInode {
+            info: Box::new(info.clone()),
+        };
         self.raft_group_manager
             .propose(shard_ino, cmd_ino.serialize())
             .await?;

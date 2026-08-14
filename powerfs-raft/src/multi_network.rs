@@ -109,10 +109,10 @@ impl MultiGroupRouter {
         // 建立新连接
         let url = format!("http://{}", addr);
         let channel = Endpoint::from_shared(url)
-            .map_err(|e| AnyError::error(e))?
+            .map_err(AnyError::error)?
             .connect()
             .await
-            .map_err(|e| AnyError::error(e))?;
+            .map_err(AnyError::error)?;
 
         let mut channels = self.channels.lock().await;
         channels.insert(addr, channel.clone());
@@ -129,7 +129,7 @@ impl MultiGroupRouter {
             let request = pb::SnapshotRequest {
                 payload: Some(pb::snapshot_request::Payload::Chunk(chunk.to_vec())),
             };
-            tx.send(request).await.map_err(|e| AnyError::error(e))?;
+            tx.send(request).await.map_err(AnyError::error)?;
         }
         Ok(())
     }

@@ -205,7 +205,7 @@ pub enum ShardCommand {
     /// Idempotent: re-apply overwrites with same content. Pairs with
     /// `AddDirEntry` to form a complete create.
     CreateInode {
-        info: crate::shard_store::InodeInfo,
+        info: Box<crate::shard_store::InodeInfo>,
     },
     /// Write a dir entry `parent_inode:name -> inode` to `CF_DIR_ENTRIES`
     /// on `calculate_shard(parent_inode)`. Pairs with `CreateInode`.
