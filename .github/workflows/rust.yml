@@ -21,7 +21,9 @@ jobs:
         submodules: false
 
     - name: Checkout public submodules
-      run: git submodule update --init rfs_tester
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
