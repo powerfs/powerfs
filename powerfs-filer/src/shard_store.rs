@@ -1581,7 +1581,7 @@ impl ShardStore {
                 if !last_name.is_empty() && name.as_str() <= last_name {
                     continue;
                 }
-                if result.len() >= limit + 1 {
+                if result.len() > limit {
                     has_more = true;
                     break;
                 }

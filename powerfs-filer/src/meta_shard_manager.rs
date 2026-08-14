@@ -1188,8 +1188,9 @@ impl MetaShardManager {
         let (pairs, has_more_pairs) = {
             let stores = self.shard_stores.read().unwrap();
             match stores.get(&parent_shard) {
-                Some(shard_store) => shard_store
-                    .list_dir_entry_inodes_paginated(parent_inode, last_name, limit),
+                Some(shard_store) => {
+                    shard_store.list_dir_entry_inodes_paginated(parent_inode, last_name, limit)
+                }
                 None => return (Vec::new(), false),
             }
         };
