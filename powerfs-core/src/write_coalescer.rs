@@ -332,8 +332,9 @@ impl WriteCoalescer {
         let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
         if let Some(entry) = inner.entries.remove(needle_id) {
             // Keep the budget counter in sync.
-            inner.dirty_bytes_total =
-                inner.dirty_bytes_total.saturating_sub(entry.merged.capacity());
+            inner.dirty_bytes_total = inner
+                .dirty_bytes_total
+                .saturating_sub(entry.merged.capacity());
         }
     }
 

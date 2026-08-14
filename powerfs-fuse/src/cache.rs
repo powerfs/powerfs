@@ -957,7 +957,10 @@ impl MetadataCache {
             }
             log::debug!(
                 "truncate_chunks_metadata: inode={} new_size={} chunks {} -> {}",
-                inode, new_size, before_len, entry.chunks.len()
+                inode,
+                new_size,
+                before_len,
+                entry.chunks.len()
             );
         }
     }
@@ -2268,6 +2271,7 @@ impl ChunkCache {
     /// - Chunks entirely beyond `new_size` are removed.
     /// - Chunks that straddle `new_size` are truncated (data beyond new_size is discarded).
     /// - Chunks entirely within `new_size` are preserved (including dirty data).
+    ///
     /// This prevents stale data from being read after truncate-down + truncate-up sequences.
     pub fn truncate_chunks(&self, inode: u64, new_size: u64) {
         let chunk_size = self.chunk_size;

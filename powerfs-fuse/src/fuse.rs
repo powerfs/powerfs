@@ -266,8 +266,7 @@ impl FuseApp {
         // the InvalidateHandler, which checks it as a secondary guard to
         // prevent evicting inodes that are open but momentarily unpinned
         // (race window between release's unpin and the next open's pin).
-        let open_inodes: Arc<RwLock<HashMap<u64, usize>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let open_inodes: Arc<RwLock<HashMap<u64, usize>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Phase 2: Wire up InvalidateHandler so the FUSE client receives
         // server-pushed Invalidate notifications from the Filer and evicts
@@ -4058,11 +4057,8 @@ impl FileSystem for PowerFsFs {
             // uses chunk_data.data.len() (raw bytes from volume server) to
             // determine available data, causing stale data to be returned
             // from hole regions after truncate-down + truncate-up.
-            let chunk_size_map: HashMap<u64, u64> = entry
-                .chunks
-                .iter()
-                .map(|c| (c.offset, c.size))
-                .collect();
+            let chunk_size_map: HashMap<u64, u64> =
+                entry.chunks.iter().map(|c| (c.offset, c.size)).collect();
 
             let missing_chunks: Vec<(u64, u64, i32)> = (start_chunk..=prefetch_end_chunk)
                 .filter_map(|chunk_idx| {
@@ -6186,7 +6182,11 @@ impl FileSystem for PowerFsFs {
         _handle: Self::Handle,
         _lock_owner: u64,
     ) -> std::io::Result<()> {
-        let cs = self.cache.peek_inode(inode).map(|e| e.content_size).unwrap_or(u64::MAX);
+        let cs = self
+            .cache
+            .peek_inode(inode)
+            .map(|e| e.content_size)
+            .unwrap_or(u64::MAX);
         info!("flush: inode={} content_size={}", inode, cs);
 
         // Inline mode: data is in inline_buffers, persisted on release.

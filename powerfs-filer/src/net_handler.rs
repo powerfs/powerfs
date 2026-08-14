@@ -1576,9 +1576,11 @@ impl FilerNetHandler {
         // Paginated listing: BTreeMap seek + lightweight DirEntry (no
         // chunks/inline_data clone). Entries are already sorted by name
         // (BTreeMap ordering) and paginated at the source.
-        let (entries, has_more) = self
-            .meta_shard_manager
-            .list_directory_paginated(parent_ino, &last_name, limit as usize);
+        let (entries, has_more) = self.meta_shard_manager.list_directory_paginated(
+            parent_ino,
+            &last_name,
+            limit as usize,
+        );
 
         // Log entry count + first few names (avoid flooding for large dirs)
         let preview: Vec<&str> = entries.iter().take(10).map(|e| e.name.as_str()).collect();
