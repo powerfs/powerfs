@@ -10,7 +10,7 @@ use crate::crdt_orset::{
 };
 use crate::raft_group_manager_v2::RaftGroupManagerV2;
 use crate::raft_group_manager_v2::{Peer, ShardCommand, ShardId};
-use crate::shard_store::{FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
+use crate::shard_store::{DirEntry, FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
 use crate::shard_strategy::ShardStrategy;
 use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
@@ -1182,6 +1182,90 @@ impl MetaShardManager {
         result
     }
 
+    /// Paginated directory listing with lightweight DirEntry.
+    ///
+    /// Optimization over `list_directory`:
+    ///   1. Pushes pagination to ShardStore (BTreeMap seek → O(log n + limit))
+    ///      instead of fetching all entries → O(n).
+    ///   2. Returns lightweight DirEntry (no chunks/inline_data clone).
+    ///   3. Single lock acquisition per shard for inode resolution.
+    ///
+    /// Cross-shard resolution: dir entries live on the parent's shard, but
+    /// each inode record lives on `calculate_shard(inode)`. We fetch paginated
+    /// (name, inode) pairs from the parent's shard, then resolve each inode
+    /// via `get_inode_metadata` (lightweight, no chunks/inline_data).
+    pub fn list_directory_paginated(
+        &self,
+        parent_inode: u64,
+        last_name: &str,
+        limit: usize,
+    ) -> (Vec<DirEntry>, bool) {
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+
+        // Fetch paginated (name, inode) pairs from parent's shard.
+        // Request limit+1 pairs to determine has_more.
+        let (pairs, has_more_pairs) = {
+            let stores = self.shard_stores.read().unwrap();
+            match stores.get(&parent_shard) {
+                Some(shard_store) => {
+                    shard_store.list_dir_entry_inodes_paginated(parent_inode, last_name, limit)
+                }
+                None => return (Vec::new(), false),
+            }
+        };
+
+        // Fast path: if all inodes are on the same shard as the parent
+        // (common case — sequential inode allocation), use the single-shard
+        // paginated method which acquires both locks once.
+        let all_same_shard = pairs
+            .iter()
+            .all(|(_, ino)| self.shard_strategy.calculate_shard(*ino) == parent_shard);
+
+        if all_same_shard {
+            let stores = self.shard_stores.read().unwrap();
+            if let Some(shard_store) = stores.get(&parent_shard) {
+                return shard_store.list_directory_paginated(parent_inode, last_name, limit);
+            }
+            return (Vec::new(), false);
+        }
+
+        // Cross-shard path: resolve each inode from its own shard.
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::with_capacity(limit + 1);
+
+        for (name, inode) in pairs {
+            if result.len() >= limit {
+                break;
+            }
+            let inode_shard = self.shard_strategy.calculate_shard(inode);
+            if let Some(shard_store) = stores.get(&inode_shard) {
+                if let Some(meta) = shard_store.get_inode_metadata(inode) {
+                    result.push(DirEntry {
+                        inode,
+                        name,
+                        mode: meta.mode,
+                        uid: meta.uid,
+                        gid: meta.gid,
+                        size: meta.size,
+                        atime: meta.atime,
+                        mtime: meta.mtime,
+                        ctime: meta.ctime,
+                        nlink: meta.nlink,
+                    });
+                }
+            }
+        }
+
+        // has_more if we fetched limit+1 pairs (more entries in BTreeMap)
+        // or if we still have limit entries after cross-shard resolution.
+        let has_more = has_more_pairs || result.len() > limit;
+        if result.len() > limit {
+            result.truncate(limit);
+        }
+
+        (result, has_more)
+    }
+
     /// Strict empty-directory check that reads dir entries from RocksDB
     /// (bypassing the in-memory cache) to avoid stale entries from OR-Set
     /// sync. Used by `delete_directory` (rmdir) for the POSIX ENOTEMPTY
@@ -1529,6 +1613,7 @@ impl MetaShardManager {
     }
 
     /// Set inode attributes via Raft consensus
+    #[allow(clippy::too_many_arguments)]
     pub async fn setattr(
         &self,
         inode: u64,
@@ -2654,6 +2739,7 @@ impl MetaShardManager {
         size: u64,
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
+        is_append: bool,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
         let cmd = ShardCommand::UpdateInodeSizeChunks {
@@ -2661,6 +2747,7 @@ impl MetaShardManager {
             size,
             chunks,
             inline_data,
+            is_append,
         };
         self.raft_group_manager
             .propose(shard_id, cmd.serialize())
@@ -2680,7 +2767,19 @@ impl MetaShardManager {
         let mut retries = 0;
         while retries < 50 {
             if let Some(info) = shard_store.get_inode(inode) {
-                if info.size == size && info.chunks.len() == target_chunk_count {
+                if is_append {
+                    // Append mode: the Filer computes the new size, so we
+                    // can't check info.size == size. Instead, check that
+                    // inline_data is non-empty (the append succeeded).
+                    if info
+                        .inline_data
+                        .as_ref()
+                        .map(|d| !d.is_empty())
+                        .unwrap_or(false)
+                    {
+                        return Ok(());
+                    }
+                } else if info.size == size && info.chunks.len() == target_chunk_count {
                     return Ok(());
                 }
             }

@@ -4,13 +4,16 @@
 //! handling `Invalidate` messages from the Filer to maintain cache consistency.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use log::{debug, warn};
+use dashmap::DashMap;
+use log::{debug, info, warn};
 use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::{FieldId, MsgType, NetMessage, NotificationHandler};
 
 use crate::cache::{ChunkCache, MetadataCache};
+use crate::fuse::InlineBuffer;
 
 /// Handler for server-pushed Invalidate notifications
 ///
@@ -41,19 +44,208 @@ pub struct InvalidateHandler {
     cache: Arc<MetadataCache>,
     /// Reference to the FUSE client's chunk (data) cache
     chunk_cache: Arc<ChunkCache>,
+    /// Reference to the FUSE client's inline buffer map.
+    /// Used to clear stale inline buffers when another client modifies
+    /// the file, ensuring the next read re-fetches fresh data from the Filer.
+    inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
     /// Last-processed version per inode. Used to suppress duplicate
     /// Invalidate notifications for the same (inode, version) pair.
     /// Keyed by inode, value is the server version that was processed.
     processed_versions: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Raw file descriptor for /dev/fuse, used to send kernel cache
+    /// invalidation notifications (FUSE_NOTIFY_INVAL_INODE). Set to -1
+    /// until the FUSE session is mounted. This is required because the
+    /// InvalidateHandler runs in the notification thread (not the FUSE
+    /// worker thread), so it cannot use the Server's notify methods.
+    fuse_fd: Arc<AtomicI32>,
+    /// Reference to the FUSE client's open_inodes tracker.
+    /// Used as a secondary check: even if hold is momentarily Unpinned
+    /// (during the window between open_inodes increment and pin_inode),
+    /// the InvalidateHandler skips invalidation for inodes that are
+    /// tracked as open. This prevents the race where Invalidate arrives
+    /// between release's unpin and the next open's pin, causing eviction
+    /// of an inode that is being opened (ENOENT in mdtest-hard).
+    open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
 }
 
 impl InvalidateHandler {
     /// Create a new InvalidateHandler with the given metadata and chunk caches
-    pub fn new(cache: Arc<MetadataCache>, chunk_cache: Arc<ChunkCache>) -> Self {
+    pub fn new(
+        cache: Arc<MetadataCache>,
+        chunk_cache: Arc<ChunkCache>,
+        inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
+    ) -> Self {
         Self {
             cache,
             chunk_cache,
+            inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            fuse_fd: Arc::new(AtomicI32::new(-1)),
+            open_inodes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new InvalidateHandler with a shared FUSE file descriptor
+    /// for kernel cache invalidation.
+    pub fn new_with_fuse_fd(
+        cache: Arc<MetadataCache>,
+        chunk_cache: Arc<ChunkCache>,
+        inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
+        fuse_fd: Arc<AtomicI32>,
+    ) -> Self {
+        Self {
+            cache,
+            chunk_cache,
+            inline_buffers,
+            processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            fuse_fd,
+            open_inodes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new InvalidateHandler with a shared FUSE file descriptor
+    /// and the FUSE client's open_inodes tracker. The open_inodes map
+    /// is checked as a secondary guard: even if hold is momentarily
+    /// Unpinned (race between release's unpin and the next open's pin),
+    /// the handler skips invalidation for inodes tracked as open.
+    pub fn new_with_fuse_fd_and_open_inodes(
+        cache: Arc<MetadataCache>,
+        chunk_cache: Arc<ChunkCache>,
+        inline_buffers: Arc<DashMap<u64, InlineBuffer>>,
+        fuse_fd: Arc<AtomicI32>,
+        open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
+    ) -> Self {
+        Self {
+            cache,
+            chunk_cache,
+            inline_buffers,
+            processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            fuse_fd,
+            open_inodes,
+        }
+    }
+
+    /// Set the FUSE file descriptor (called after the FUSE session is mounted)
+    pub fn set_fuse_fd(&self, fd: i32) {
+        self.fuse_fd.store(fd, Ordering::Release);
+    }
+
+    /// Send a FUSE_NOTIFY_INVAL_INODE notification to the kernel to
+    /// invalidate the page cache for the given inode. This is necessary
+    /// because invalidating the FUSE client's internal cache doesn't
+    /// automatically invalidate the kernel's page cache — without this,
+    /// cross-client reads return stale data cached by the kernel.
+    ///
+    /// Writes the raw FUSE notification message directly to /dev/fuse
+    /// via libc::write(). The message format is:
+    ///   fuse_out_header { len=40, error=2 (InvalInode), unique=0 }
+    ///   fuse_notify_inval_inode_out { ino, off=0, len=-1 (entire file) }
+    fn notify_kernel_inval_inode(&self, inode: u64) {
+        let fd = self.fuse_fd.load(Ordering::Acquire);
+        if fd < 0 {
+            debug!(
+                "notify_kernel_inval_inode: fuse_fd not set yet, skipping kernel notification for inode={}",
+                inode
+            );
+            return;
+        }
+
+        // Pack the notification message as raw bytes
+        // OutHeader: len(4) + error(4) + unique(8) = 16 bytes
+        // NotifyInvalInodeOut: ino(8) + off(8) + len(8) = 24 bytes
+        // Total: 40 bytes
+        let mut buf = [0u8; 40];
+
+        // OutHeader
+        buf[0..4].copy_from_slice(&40u32.to_ne_bytes()); // len
+        buf[4..8].copy_from_slice(&2i32.to_ne_bytes()); // error = NotifyOpcode::InvalInode
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
+
+        // NotifyInvalInodeOut
+        buf[16..24].copy_from_slice(&inode.to_ne_bytes()); // ino
+        buf[24..32].copy_from_slice(&0i64.to_ne_bytes()); // off = 0
+        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes()); // len = -1 (entire file)
+
+        // Write to /dev/fuse — this is safe because the fd is a valid
+        // /dev/fuse descriptor and we're writing a well-formed notification.
+        let ret = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 40) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                "notify_kernel_inval_inode: write to /dev/fuse failed for inode={}: {} (errno={})",
+                inode,
+                err,
+                err.raw_os_error().unwrap_or(0)
+            );
+        } else {
+            info!(
+                "notify_kernel_inval_inode: sent FUSE_NOTIFY_INVAL_INODE for inode={} ({} bytes)",
+                inode, ret
+            );
+        }
+    }
+
+    /// Send a FUSE_NOTIFY_INVAL_ENTRY notification to the kernel to
+    /// invalidate the dentry cache for a directory entry.
+    ///
+    /// # WARNING: DEADLOCK RISK — DO NOT CALL FROM NOTIFICATION PATH
+    ///
+    /// This method is retained for reference but is NOT called from
+    /// `handle_notification`. FUSE_NOTIFY_INVAL_ENTRY requires the kernel
+    /// to acquire `i_rwsem` (inode_lock) on the parent directory, which
+    /// deadlocks when another VFS operation holds `i_rwsem` and is waiting
+    /// for a FUSE reply. See the comment in `handle_notification` for the
+    /// full deadlock chain.
+    ///
+    /// Use `notify_kernel_inval_inode` on the parent directory instead,
+    /// which invalidates the page cache without acquiring `i_rwsem`.
+    #[allow(dead_code)]
+    fn notify_kernel_inval_entry(&self, parent: u64, name: &str) {
+        let fd = self.fuse_fd.load(Ordering::Acquire);
+        if fd < 0 {
+            debug!(
+                "notify_kernel_inval_entry: fuse_fd not set yet, skipping for parent={}, name={}",
+                parent, name
+            );
+            return;
+        }
+
+        // Pack the notification message as raw bytes
+        // OutHeader: 16 bytes
+        // NotifyInvalEntryOut: parent(8) + namelen(4) + padding(4) = 16 bytes
+        // name: variable (including null terminator)
+        let name_bytes = name.as_bytes();
+        let name_with_null_len = name_bytes.len() + 1; // +1 for null terminator
+        let total_len = 16 + 16 + name_with_null_len;
+
+        let mut buf = vec![0u8; total_len];
+
+        // OutHeader
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes()); // len
+        buf[4..8].copy_from_slice(&3i32.to_ne_bytes()); // error = NotifyOpcode::InvalEntry
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
+
+        // NotifyInvalEntryOut
+        buf[16..24].copy_from_slice(&parent.to_ne_bytes()); // parent
+        buf[24..28].copy_from_slice(&(name_bytes.len() as u32).to_ne_bytes()); // namelen (without null)
+        buf[28..32].copy_from_slice(&0u32.to_ne_bytes()); // padding
+
+        // name (null-terminated)
+        buf[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
+        // null terminator is already 0 from vec initialization
+
+        let ret = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total_len) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                "notify_kernel_inval_entry: write to /dev/fuse failed for parent={}, name={}: {} (errno={})",
+                parent, name, err, err.raw_os_error().unwrap_or(0)
+            );
+        } else {
+            info!(
+                "notify_kernel_inval_entry: sent FUSE_NOTIFY_INVAL_ENTRY for parent={}, name={} ({} bytes)",
+                parent, name, ret
+            );
         }
     }
 
@@ -111,6 +303,10 @@ impl NotificationHandler for InvalidateHandler {
                         "InvalidateHandler: refreshing root inode (v={}) instead of evicting",
                         version
                     );
+                    // Even for the root directory, notify the kernel to drop
+                    // cached directory entries so readdir picks up changes
+                    // (create/unlink/rename by other clients) promptly.
+                    self.notify_kernel_inval_inode(inode);
                     self.cache.mark_stale(inode);
                     self.mark_processed(inode, version);
                     return;
@@ -155,6 +351,29 @@ impl NotificationHandler for InvalidateHandler {
                     return;
                 }
 
+                // Secondary guard: check open_inodes tracker. Even if hold
+                // is momentarily Unpinned — during the race window between
+                // release's unpin_inode (hold → Unpinned) and the next open's
+                // pin_inode (hold → Pinned) — the inode is still tracked in
+                // open_inodes. Without this check, the InvalidateHandler
+                // would evict the inode mid-open, causing ENOENT when the
+                // write path tries to access it (mdtest-hard crash).
+                //
+                // The open path holds open_inodes.write() while calling
+                // pin_inode, but the InvalidateHandler doesn't acquire
+                // open_inodes — it only checks inode_cache (for is_pinned).
+                // This check closes the gap: if open_inodes has the inode,
+                // an open is in progress (or just completed) and the cache
+                // will be refreshed by the open path.
+                if self.open_inodes.read().unwrap().contains_key(&inode) {
+                    debug!(
+                        "InvalidateHandler: skipping invalidation for open inode={} (is_pinned=false but open_inodes has it, server_v={}) — race window between release unpin and open pin",
+                        inode, version
+                    );
+                    self.mark_processed(inode, version);
+                    return;
+                }
+
                 // State machine check: skip invalidation for Dirty/Flushing
                 // entries. These have local authoritative data that must not
                 // be invalidated (core state machine rule: Dirty/Flushing →
@@ -174,31 +393,86 @@ impl NotificationHandler for InvalidateHandler {
                     }
                 }
 
-                // Skip invalidation if the inode has ANY chunks (dirty or clean)
-                // in the ChunkCache. This is broader than checking only dirty
-                // chunks to protect the flusher's drain window:
+                // Skip invalidation if the inode has DIRTY chunks in the
+                // ChunkCache. This protects the flusher's drain window:
                 //
-                // `flush_dirty_chunks_impl` calls `drain_dirty_for_inode` which
-                // removes dirty markers BEFORE writing the chunk data. During
-                // this window `has_dirty_chunks` returns false, but the chunk
-                // data and the cached fid are still needed. If we invalidated
-                // metadata here, the flusher would hit ENOENT or "no fid" EIO.
+                // `flush_dirty_chunks_impl` calls `drain_dirty_for_inode`
+                // which removes dirty markers BEFORE writing the chunk data.
+                // During this window `has_dirty_chunks` returns false, but
+                // the entry state is still Dirty (mark_flushing hasn't been
+                // called yet), so the Dirty/Flushing state check above
+                // catches this case and skips invalidation.
                 //
-                // Checking `has_chunks` covers both:
-                // - Dirty chunks not yet drained (normal write path)
-                // - Drained chunks still being written (flush race window)
-                // - Clean chunks from recent reads (fid needed for future ops)
-                if self.chunk_cache.has_chunks(inode) {
+                // After mark_flushing, the state is Flushing (also caught
+                // above). After the flush RPC succeeds and mark_clean is
+                // called, the chunks are clean and safe to invalidate.
+                //
+                // CRITICAL: Do NOT use `has_chunks` here. That returns true
+                // for clean chunks from reads, which would skip invalidation
+                // when another client modifies the file, causing cross-client
+                // stale reads (L4.15 failure: B reads old data after A
+                // overwrites the file because B's clean read chunks block
+                // invalidation).
+                if self.chunk_cache.has_dirty_chunks(inode) {
                     debug!(
-                        "InvalidateHandler: skipping invalidation for inode={} (has chunks in cache, preserving metadata for flush, server_v={})",
+                        "InvalidateHandler: skipping invalidation for inode={} (has dirty chunks in cache, preserving for flush, server_v={})",
                         inode, version
                     );
                     self.mark_processed(inode, version);
                     return;
                 }
 
+                // Check for dirty inline buffer — same protection as dirty
+                // chunks: if the inline buffer has unsynced local data, the
+                // local cache is authoritative (we hold the write lease).
+                // Skip invalidation to preserve the unsynced data for the
+                // upcoming release sync.
+                //
+                // L4.21 fix: Set needs_refresh=true so the next open() knows
+                // to re-fetch from the Filer after the buffer is synced.
+                // Without this, the stale-buffer check (entry.size vs
+                // buf_len) passes because entry.size was never updated
+                // during the skip, and the client reads stale data missing
+                // the other client's concurrent appends.
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    if inline_buf.dirty {
+                        inline_buf.needs_refresh = true;
+                        debug!(
+                            "InvalidateHandler: skipping invalidation for inode={} (has dirty inline buffer, preserving for release sync, server_v={}) — marked needs_refresh=true",
+                            inode, version
+                        );
+                        self.mark_processed(inode, version);
+                        return;
+                    }
+                }
+
                 // Check if our cached version is stale
                 if self.cache.is_inode_stale(inode, version) {
+                    // FINAL GUARD: Re-check is_open under read lock and HOLD
+                    // the lock through eviction. This prevents a concurrent
+                    // open from pinning the inode between the initial is_open
+                    // check (above) and the actual eviction. Without this, the
+                    // following race causes ENOENT in mdtest-hard:
+                    //   1. InvalidateHandler: is_open → false (release removed it)
+                    //   2. Open #2: acquires open_inodes.write(), adds inode,
+                    //      calls pin_inode (hold → Pinned)
+                    //   3. InvalidateHandler: invalidate_inode → evicts
+                    //      (was_pinned=true because open #2 just pinned it!)
+                    //   4. Write: ENOENT (inode was evicted)
+                    //
+                    // Holding open_inodes.read() blocks the open path's
+                    // open_inodes.write(), so open #2 can't pin until after
+                    // eviction completes. Then open #2 re-fetches from Filer.
+                    let open_guard = self.open_inodes.read().unwrap();
+                    if open_guard.contains_key(&inode) {
+                        debug!(
+                            "InvalidateHandler: skipping invalidation for open inode={} (re-check before eviction, server_v={}) — inode was opened after initial is_open check",
+                            inode, version
+                        );
+                        self.mark_processed(inode, version);
+                        return;
+                    }
+
                     // RACE_TRACE: Log eviction decision with full context.
                     // This is where the inode gets evicted — correlate with
                     // unpin_inode and flush_all_dirty_chunks logs to identify
@@ -208,11 +482,63 @@ impl NotificationHandler for InvalidateHandler {
                          — evicting stale cache (check preceding unpin_inode/flush_all_dirty_chunks logs)",
                         inode, version, std::thread::current().id()
                     );
+                    // Peek the cached entry to get parent inode and name for
+                    // dentry cache invalidation. This must happen BEFORE
+                    // invalidate_inode() removes the entry from the cache.
+                    if let Some(entry) = self.cache.peek_inode(inode) {
+                        // Invalidate the PARENT directory's page cache (readdir
+                        // results) so subsequent `ls`/`readdir` on the parent
+                        // re-fetches from the Filer. This covers the directory
+                        // listing consistency case.
+                        //
+                        // We intentionally do NOT use FUSE_NOTIFY_INVAL_ENTRY
+                        // here. That notification requires the kernel to acquire
+                        // i_rwsem (inode_lock) on the parent directory, which
+                        // can deadlock when another VFS operation (readdir,
+                        // lookup, unlink) already holds i_rwsem and is waiting
+                        // for a FUSE reply. The deadlock chain:
+                        //   1. VFS op (e.g. readdir) acquires i_rwsem(parent)
+                        //   2. VFS op sends FUSE request, waits for reply
+                        //   3. Notify thread writes FUSE_NOTIFY_INVAL_ENTRY
+                        //   4. Kernel fuse_reverse_inval_entry blocks on
+                        //      i_rwsem(parent) → write() never returns
+                        //   5. If the FUSE session can't process the pending
+                        //      request (e.g. single session thread), the
+                        //      system deadlocks permanently.
+                        //
+                        // FUSE_NOTIFY_INVAL_INODE on the parent does NOT
+                        // require i_rwsem — it only invalidates the page cache
+                        // — so it is safe. Combined with the short
+                        // entry_timeout (100ms, set in fuse.rs), stale dentries
+                        // expire quickly even without explicit dentry
+                        // invalidation.
+                        self.notify_kernel_inval_inode(entry.parent);
+                    }
+                    // Notify the kernel to drop its page cache for this inode
+                    // BEFORE we evict our userspace cache. Without this, the
+                    // kernel may continue serving stale page cache to readers
+                    // even after we've fetched fresh metadata, causing cross-
+                    // client inconsistency (client B reads old data despite
+                    // client A having written new data).
+                    self.notify_kernel_inval_inode(inode);
                     // Drop both metadata and data caches together: an Invalidate
                     // means the inode's size/chunks changed, so cached file data
                     // may no longer correspond to the current chunks list.
                     self.cache.invalidate_inode(inode);
                     self.chunk_cache.remove_inode_chunks(inode);
+                    // Also clear the inline buffer (if not dirty). The buffer
+                    // may contain stale data from a previous read; without
+                    // clearing it, the next open would see the buffer and skip
+                    // the Filer refresh, serving stale data (L4.21 A视角失败:
+                    // A's inline buffer didn't include B's appends).
+                    // Dirty buffers are protected by the check above and won't
+                    // reach this point.
+                    if self.inline_buffers.remove(&inode).is_some() {
+                        debug!(
+                            "InvalidateHandler: cleared inline buffer for inode={} (server_v={})",
+                            inode, version
+                        );
+                    }
                 } else {
                     debug!(
                         "InvalidateHandler: skipping invalidation for inode={} (already fresh, server_v={})",
@@ -288,6 +614,10 @@ mod tests {
         Arc::new(ChunkCache::with_defaults())
     }
 
+    fn make_inline_buffers() -> Arc<DashMap<u64, InlineBuffer>> {
+        Arc::new(DashMap::new())
+    }
+
     #[test]
     fn test_invalidate_stale_cache() {
         let cache = Arc::new(MetadataCache::new());
@@ -297,7 +627,8 @@ mod tests {
         assert!(cache.get_inode(inode).is_some());
 
         // Server sends version=5 (newer than cached 1)
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -313,7 +644,8 @@ mod tests {
         cache.insert(make_test_entry(inode, "fresh.txt", 10));
 
         // Server sends version=5 (older than cached 10)
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -324,7 +656,8 @@ mod tests {
     #[test]
     fn test_invalidate_inode_not_in_cache() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = make_invalidate_msg(99999, 1);
         handler.handle_notification(&msg);
@@ -335,7 +668,8 @@ mod tests {
     #[test]
     fn test_invalidate_zero_inode_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = make_invalidate_msg(0, 1);
         handler.handle_notification(&msg);
@@ -344,7 +678,8 @@ mod tests {
     #[test]
     fn test_invalidate_root_inode_never_evicted() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         // Root inode (1) is initialized by MetadataCache::new()
         assert!(cache.peek_inode(crate::cache::ROOT_INODE).is_some());
@@ -363,7 +698,8 @@ mod tests {
     #[test]
     fn test_non_invalidate_message_ignored() {
         let cache = Arc::new(MetadataCache::new());
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         let msg = NetMessage::notification(MsgType::Ping, Vec::new(), Vec::new());
 
@@ -385,7 +721,8 @@ mod tests {
 
         // Server sends version=5 (newer than cached 1) — simulates the
         // Invalidate triggered by this client's own setattr.
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
         let msg = make_invalidate_msg(inode, 5);
         handler.handle_notification(&msg);
 
@@ -421,7 +758,8 @@ mod tests {
         cache.insert(make_test_entry(inode, "write.bin", 1));
         cache.pin_inode(inode);
 
-        let handler = InvalidateHandler::new(cache.clone(), make_chunk_cache());
+        let handler =
+            InvalidateHandler::new(cache.clone(), make_chunk_cache(), make_inline_buffers());
 
         // First notification while pinned → skipped
         handler.handle_notification(&make_invalidate_msg(inode, 5));
@@ -460,7 +798,8 @@ mod tests {
         assert!(chunk_cache.has_chunks(inode));
         assert!(chunk_cache.has_dirty_chunks(inode));
 
-        let handler = InvalidateHandler::new(cache.clone(), chunk_cache.clone());
+        let handler =
+            InvalidateHandler::new(cache.clone(), chunk_cache.clone(), make_inline_buffers());
 
         // First notification → skipped (has chunks)
         handler.handle_notification(&make_invalidate_msg(inode, 5));

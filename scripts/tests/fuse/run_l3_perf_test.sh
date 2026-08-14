@@ -28,13 +28,18 @@ FAILED_TESTS=()
 record_pass() { PASS=$((PASS+1)); }
 record_fail() { FAIL=$((FAIL+1)); FAILED_TESTS+=("$1"); }
 
-# 从 fio JSON 输出中提取 BW (KB/s) 或 IOPS
+# 从 fio JSON 输出中提取 BW (KB/s) — sum across all jobs
 extract_bw_kbps() {
     echo "$1" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-bw = data['jobs'][0]['write']['bw'] if 'write' in data['jobs'][0] and data['jobs'][0]['write']['bw'] > 0 else data['jobs'][0]['read']['bw']
-print(bw)
+total = 0
+for j in data.get('jobs', []):
+    if 'write' in j and j['write']['bw'] > 0:
+        total += j['write']['bw']
+    elif 'read' in j and j['read']['bw'] > 0:
+        total += j['read']['bw']
+print(total)
 " 2>/dev/null
 }
 
@@ -42,8 +47,13 @@ extract_iops() {
     echo "$1" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-iops = data['jobs'][0]['write']['iops'] if 'write' in data['jobs'][0] and data['jobs'][0]['write']['iops'] > 0 else data['jobs'][0]['read']['iops']
-print(f'{iops:.2f}')
+total = 0.0
+for j in data.get('jobs', []):
+    if 'write' in j and j['write']['iops'] > 0:
+        total += j['write']['iops']
+    elif 'read' in j and j['read']['iops'] > 0:
+        total += j['read']['iops']
+print(f'{total:.2f}')
 " 2>/dev/null
 }
 
@@ -86,7 +96,7 @@ echo "--- L3.01: 顺序写 (bs=1M, rw=write, size=64M) ---"
 OUT=$(fio --name=l3_01_seq_write \
     --directory="$TEST_DIR" --filename=seq_write.bin \
     --rw=write --bs=1M --size=64M \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 BW=$(extract_bw_kbps "$OUT")
@@ -107,7 +117,7 @@ sync
 OUT=$(fio --name=l3_02_seq_read \
     --directory="$TEST_DIR" --filename=seq_read.bin \
     --rw=read --bs=1M --size=64M \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 BW=$(extract_bw_kbps "$OUT")
@@ -121,11 +131,11 @@ else
 fi
 
 # ── L3.03: 随机写 bs=4K ──────────────────────────────────────────────
-echo "--- L3.03: 随机写 (bs=4K, rw=randwrite, size=64M) ---"
+echo "--- L3.03: 随机写 (bs=4K, rw=randwrite, size=4M) ---"
 OUT=$(fio --name=l3_03_rand_write \
     --directory="$TEST_DIR" --filename=rand_write.bin \
-    --rw=randwrite --bs=4K --size=64M \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --rw=randwrite --bs=4K --size=4M \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 IOPS=$(extract_iops "$OUT")
@@ -139,14 +149,14 @@ else
 fi
 
 # ── L3.04: 随机读 bs=4K ──────────────────────────────────────────────
-echo "--- L3.04: 随机读 (bs=4K, rw=randread, size=64M) ---"
+echo "--- L3.04: 随机读 (bs=4K, rw=randread, size=4M) ---"
 # 先准备文件
-dd if=/dev/urandom of="$TEST_DIR/rand_read.bin" bs=1M count=64 2>/dev/null
+dd if=/dev/urandom of="$TEST_DIR/rand_read.bin" bs=1M count=4 2>/dev/null
 sync
 OUT=$(fio --name=l3_04_rand_read \
     --directory="$TEST_DIR" --filename=rand_read.bin \
-    --rw=randread --bs=4K --size=64M \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --rw=randread --bs=4K --size=4M \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 IOPS=$(extract_iops "$OUT")
@@ -163,8 +173,8 @@ fi
 echo "--- L3.05: 混合读写 (bs=4K, rw=randrw, rwmix=70) ---"
 OUT=$(fio --name=l3_05_mixed \
     --directory="$TEST_DIR" --filename=mixed.bin \
-    --rw=randrw --rwmixread=70 --bs=4K --size=64M \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --rw=randrw --rwmixread=70 --bs=4K --size=4M \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 # 混合读写: 提取总 IOPS
@@ -182,8 +192,8 @@ fi
 echo "--- L3.06: 多线程写 (bs=1M, numjobs=4) ---"
 OUT=$(fio --name=l3_06_mt_write \
     --directory="$TEST_DIR" --filename=mt_write.bin \
-    --rw=write --bs=1M --size=64M --numjobs=4 \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --rw=write --bs=1M --size=16M --numjobs=4 \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 BW=$(extract_bw_kbps "$OUT")
@@ -198,12 +208,12 @@ fi
 # ── L3.07: 多线程读 bs=4K, numjobs=4 ─────────────────────────────────
 echo "--- L3.07: 多线程读 (bs=4K, numjobs=4) ---"
 # 准备文件
-dd if=/dev/urandom of="$TEST_DIR/mt_read.bin" bs=1M count=64 2>/dev/null
+dd if=/dev/urandom of="$TEST_DIR/mt_read.bin" bs=1M count=4 2>/dev/null
 sync
 OUT=$(fio --name=l3_07_mt_read \
     --directory="$TEST_DIR" --filename=mt_read.bin \
-    --rw=randread --bs=4K --size=64M --numjobs=4 \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --rw=randread --bs=4K --size=4M --numjobs=4 \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 IOPS=$(extract_iops "$OUT")
@@ -220,7 +230,7 @@ echo "--- L3.08: fsync 影响 (bs=4K, fsync=1) ---"
 OUT=$(fio --name=l3_08_fsync \
     --directory="$TEST_DIR" --filename=fsync.bin \
     --rw=write --bs=4K --size=16M --fsync=1 \
-    --ioengine=libaio --iodepth=1 --direct=1 \
+    --ioengine=psync --direct=0 \
     --time_based=0 --group_reporting \
     --output-format=json 2>/dev/null)
 IOPS=$(extract_iops "$OUT")

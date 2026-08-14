@@ -971,6 +971,11 @@ pub enum FieldId {
     /// including post-split ranges. Absent → client falls back to
     /// `ShardMap::from_shard_count(total_shards)`.
     ShardMapEntries = 0xBD,
+    /// IsAppend flag (u8, 0/1). UpdateInodeSizeChunks request: when 1, the
+    /// Filer appends `inline_data` to the existing inline_data instead of
+    /// overwriting. Used by FUSE release to support cross-client concurrent
+    /// appends to inline files without lost updates.
+    IsAppend = 0xBE,
 }
 
 impl FieldId {
@@ -1075,6 +1080,7 @@ impl FieldId {
             0xBB => Some(Self::MemoryUsage),
             0xBC => Some(Self::XattrKeys),
             0xBD => Some(Self::ShardMapEntries),
+            0xBE => Some(Self::IsAppend),
             _ => None,
         }
     }

@@ -3,9 +3,9 @@ name: PowerFS CI/CD Pipeline
 
 on:
   push:
-    branches: [ fronted, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
   pull_request:
-    branches: [ fronted, "fs-lease-optimize" ]
+    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
   workflow_dispatch:
 
 env:
@@ -19,7 +19,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
+
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -47,7 +52,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
+
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -70,7 +80,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
+
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -88,16 +103,21 @@ jobs:
       run: cargo test --all -- --test-threads=2
     
     - name: Benchmark Tests
-      run: cargo test --package powerfs-core --test benchmark -- --test-threads=1
+      run: cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
 
   # 基准测试
   benchmark:
     runs-on: [self-hosted, Linux, X64]
-    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/fronted' && github.event_name == 'push')
+    if: github.event_name == 'workflow_dispatch' || (contains(fromJson('["refs/heads/fronted","refs/heads/master","refs/heads/main"]'), github.ref) && github.event_name == 'push')
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
+
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -112,12 +132,12 @@ jobs:
       uses: Swatinem/rust-cache@v2
     
     - name: Build Benchmark
-      run: cargo build --package powerfs-core --release --bench benchmark
+      run: cargo build --package powerfs-core --release --bench kv_benchmark
     
     - name: Run Benchmark
       run: |
         mkdir -p benchmark-results
-        ./target/release/deps/powerfs_core-* --bench --save-baseline baseline
+        cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
     
@@ -133,7 +153,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
+
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -173,11 +198,11 @@ jobs:
   docker:
     runs-on: [self-hosted, Linux, X64]
     needs: [quality, build, test]
-    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -224,11 +249,11 @@ jobs:
   deploy-test:
     runs-on: [self-hosted, Linux, X64]
     needs: [docker]
-    if: github.ref == 'refs/heads/fronted' && github.event_name == 'push'
+    if: contains(fromJson('["refs/heads/fronted","refs/heads/master","refs/heads/main"]'), github.ref) && github.event_name == 'push'
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
 
     - name: Deploy to Test Cluster
       run: |
@@ -244,7 +269,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
 
     - name: Create Release
       uses: actions/create-release@v1
@@ -266,7 +291,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        submodules: true
+        submodules: false
 
     - name: Use Node.js
       uses: actions/setup-node@v4
