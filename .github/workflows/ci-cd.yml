@@ -11,7 +11,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  CARGO_NET_OFFLINE: "true"
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
@@ -166,6 +165,7 @@ jobs:
         cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
+        CARGO_NET_OFFLINE: "true"
 
     - name: Upload Benchmark Results
       uses: actions/upload-artifact@v4
@@ -216,7 +216,6 @@ jobs:
         RUSTFLAGS="-C instrument-coverage" cargo test --all
       env:
         LLVM_PROFILE_FILE: "powerfs-%p-%m.profraw"
-        CARGO_NET_OFFLINE: "true"
 
     - name: Generate Coverage Report
       run: grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
