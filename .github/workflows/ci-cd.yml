@@ -165,7 +165,6 @@ jobs:
         cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
-        CARGO_NET_OFFLINE: "true"
 
     - name: Upload Benchmark Results
       uses: actions/upload-artifact@v4
