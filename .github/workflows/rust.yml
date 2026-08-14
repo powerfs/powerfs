@@ -95,8 +95,5 @@ jobs:
         cargo test --package powerfs-fuse --test fuse_basic_test --verbose
         cargo test --package powerfs-fuse --test coherence_phase0_test --verbose
         cargo test --package powerfs-fuse --test coherence_phase1_test --verbose
-        cargo test --package powerfs-fuse --test concurrent_consistency --verbose -- --test-threads=1
-        cargo test --package powerfs-master --test coherence_phase2_test --verbose
-        cargo test --package powerfs-master --test coherence_phase3_test --verbose
-        cargo test --package powerfs-master --test coherence_failover_test --verbose
-        cargo test --package powerfs-master --test master_outage_e2e_test --verbose -- --test-threads=1
+        cargo test --package powerfs-master --test e2e_test --verbose
+        cargo test --package powerfs-master --test raft_integration_test --verbose
