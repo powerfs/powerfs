@@ -189,6 +189,7 @@ where
     type StreamAppendStream =
         Pin<Box<dyn Stream<Item = Result<pb::AppendEntriesResponse, Status>> + Send>>;
 
+    #[allow(clippy::result_large_err)]
     async fn stream_append(
         &self,
         request: Request<Streaming<pb::AppendEntriesRequest>>,
