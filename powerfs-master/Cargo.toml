@@ -43,9 +43,10 @@ powerfs-core = { path = "../powerfs-core" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 powerfs-allocator = { path = "../powerfs-allocator" }
+powerfs-raft = { path = "../powerfs-raft" }
+openraft = { workspace = true }
 tokio = { workspace = true }
 crossbeam = { workspace = true }
-raft = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
@@ -61,8 +62,6 @@ uuid = { workspace = true }
 rand = { workspace = true }
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-protobuf = "2"
-slog = "2"
 prometheus = "0.13"
 hyper = { version = "1", features = ["full"] }
 lazy_static = "1.4"

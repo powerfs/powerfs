@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package powerfs_raftpb;
+
+// PowerFS Raft gRPC 协议（openraft 0.10 传输层）。
+//
+// 参考 openraft/examples/raft-kv-memstore-grpc/proto/raft.proto，
+// 适配 PowerFS：NodeId 由 uint64 改 string，Entry.app_data 改 bytes（serde 序列化 D）。
+
+// Node 表示集群中的一个节点。
+message Node {
+  // 节点唯一标识（PowerFS 用 String，如 "master-1"、"filer-2"）。
+  string node_id = 1;
+  // RPC 地址（gRPC target，如 "127.0.0.1:50051"）。
+  string rpc_addr = 2;
+}
+
+// LeaderId 是 Raft 中的领导者标识。
+// 对应 openraft 的 LeaderIdAdv<Term, NodeId> = { term, node_id }。
+message LeaderId {
+  uint64 term = 1;
+  string node_id = 2;
+}
+
+// Vote 表示 Raft 领导者选举中的投票信息。
+message Vote {
+  LeaderId leader_id = 1;
+  bool committed = 2;
+}
+
+// NodeIdSet 是 NodeId 集合。
+message NodeIdSet {
+  map<string, bool> node_ids = 1;
+}
+
+// Membership 配置。
+message Membership {
+  // Joint（多个 NodeIdSet）或 uniform（单个 NodeIdSet）配置。
+  repeated NodeIdSet configs = 1;
+
+  // 集群中所有节点（包括 voter 和 learner）。
+  map<string, Node> nodes = 2;
+}
+
+// LogId 表示 Raft 日志标识。
+message LogId {
+  LeaderId leader_id = 1;
+  uint64 index = 2;
+}
+
+// VoteRequest 表示领导者选举中的投票请求。
+message VoteRequest {
+  Vote vote = 1;
+  LogId last_log_id = 2;
+
+  // 如果是 leadership transfer，即使 leader lease 未过期也授权。
+  bool leadership_transfer = 3;
+
+  // 多 Raft 组路由标识（Filer 多分片场景）。单组部署（Master）留空。
+  string group_id = 10;
+}
+
+// VoteResponse 表示投票请求的响应。
+message VoteResponse {
+  Vote vote = 1;
+  bool vote_granted = 2;
+  LogId last_log_id = 3;
+}
+
+// Entry 表示 Raft 日志条目。
+message Entry {
+  LeaderId leader_id = 1;
+  uint64 index = 2;
+
+  // Normal 条目的业务数据（serde_json 序列化 C::D）。
+  // 空则表示 Blank 条目。
+  bytes app_data = 12;
+
+  // Membership 条目的配置。
+  // 空则表示非 Membership 条目。
+  Membership membership = 13;
+}
+
+// AppendEntriesRequest 表示追加日志条目请求。
+message AppendEntriesRequest {
+  //领导者的 vote（必须 committed）。
+  Vote vote = 1;
+
+  // 领导者上次发送给该 follower 的 log id。
+  LogId prev_log_id = 2;
+
+  // 要追加的日志条目。
+  repeated Entry entries = 3;
+
+  // 领导者的最后已提交 log id。
+  LogId leader_commit = 4;
+
+  // 多 Raft 组路由标识（Filer 多分片场景）。单组部署（Master）留空。
+  string group_id = 10;
+}
+
+// AppendEntriesResponse 表示追加日志条目响应。
+message AppendEntriesResponse {
+  // 如果非 None，follower 因有更高 vote 而拒绝。
+  Vote rejected_by = 1;
+
+  // follower 接受此请求的 vote，但 prev_log_id 与 follower 日志冲突。
+  bool conflict = 2;
+
+  // 如果 conflict=false：follower 接受的最后一个 log id。
+  // 如果 conflict=true（StreamAppend）：冲突的 log id。
+  LogId last_log_id = 3;
+}
+
+// SnapshotRequestMeta 是快照传输的第一块，包含元数据。
+message SnapshotRequestMeta {
+  Vote vote = 1;
+  LogId last_log_id = 2;
+  LogId last_membership_log_id = 3;
+  Membership last_membership = 4;
+
+  // 多 Raft 组路由标识（Filer 多分片场景）。单组部署（Master）留空。
+  string group_id = 10;
+}
+
+// SnapshotRequest 是快照分块流的一个 item。
+message SnapshotRequest {
+  oneof payload {
+    SnapshotRequestMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+// SnapshotResponse 是快照安装响应。
+message SnapshotResponse {
+  Vote vote = 1;
+}
+
+// ProposeRequest 是客户端写入请求转发（Filer propose forward）。
+// 当 Filer 收到 propose 但本地不是 leader 时，通过此 RPC 转发到 leader 节点。
+message ProposeRequest {
+  // 多 Raft 组路由标识（Filer 多分片场景）。单组部署（Master）留空。
+  string group_id = 1;
+  // 序列化后的业务 payload（C::D，如 FilerRequest）。
+  bytes payload = 2;
+}
+
+// ProposeResponse 是 propose 转发的响应。
+message ProposeResponse {
+  // 是否成功。
+  bool ok = 1;
+  // 失败时的错误信息。
+  string error = 2;
+  // 成功时的 log index。
+  uint64 log_index = 3;
+  // 如果 ok=false 且此字段非空，表示当前节点不是 leader，应转发到此节点。
+  string forward_leader_id = 4;
+}
+
+// RaftService 处理 Raft 节点间的内部通信。
+service RaftService {
+  // Vote 处理领导者选举中的投票请求。
+  rpc Vote(VoteRequest) returns (VoteResponse) {}
+
+  // AppendEntries 处理追加日志条目 RPC。
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
+
+  // StreamAppend 处理流式追加日志条目（pipeline replication）。
+  rpc StreamAppend(stream AppendEntriesRequest) returns (stream AppendEntriesResponse) {}
+
+  // Snapshot 处理快照安装 RPC。
+  rpc Snapshot(stream SnapshotRequest) returns (SnapshotResponse) {}
+
+  // Propose 处理客户端写入转发（Filer propose forward to leader）。
+  rpc Propose(ProposeRequest) returns (ProposeResponse) {}
+}

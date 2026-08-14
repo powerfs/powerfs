@@ -1,5 +1,4 @@
 use crate::types::{NeedleId, VolumeId};
-use raft;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -27,9 +26,6 @@ pub enum PowerFsError {
 
     #[error("address parse error: {0}")]
     AddrParse(#[from] std::net::AddrParseError),
-
-    #[error("raft error: {0}")]
-    Raft(Box<raft::Error>),
 
     #[error("volume not found: {0}")]
     VolumeNotFound(VolumeId),

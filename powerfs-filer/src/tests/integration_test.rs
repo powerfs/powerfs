@@ -4,9 +4,21 @@ use tempfile::tempdir;
 use tokio::runtime::Runtime;
 
 use crate::meta_shard_manager::MetaShardManager;
-use crate::raft_group_manager::{Peer, RaftGroupManager, ShardId};
-use crate::shard_strategy::ShardStrategy;
+use crate::raft_group_manager_v2::{Peer, ShardId};
+use crate::raft_group_manager_v2::RaftGroupManagerV2;
 use crate::shard_store::ShardStore;
+use crate::shard_strategy::ShardStrategy;
+
+/// Wait until the local node becomes leader of `shard_id`, or panic.
+async fn wait_for_leadership(mgr: &RaftGroupManagerV2, shard_id: ShardId) {
+    for _ in 0..100 {
+        if mgr.is_shard_leader(shard_id).await {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    panic!("node did not become leader of shard {}", shard_id.0);
+}
 
 #[test]
 fn test_shard_creation_and_file_operations() {
@@ -17,23 +29,33 @@ fn test_shard_creation_and_file_operations() {
     let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
     let shard_strategy = Arc::new(ShardStrategy::new(4));
-    let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50051".to_string(), data_path.clone()));
-    
-    let meta_shard_manager = Arc::new(MetaShardManager::new(
-        raft_group_manager,
-        shard_strategy.clone(),
-        data_path,
-        1, // node_id for testing
-    ));
-
-    let peers = vec![Peer {
-        id: 1,
-        address: "127.0.0.1:50051".to_string(),
-    }];
 
     rt.block_on(async {
+        let raft_group_manager = RaftGroupManagerV2::new(
+            1,
+            "127.0.0.1:50051".to_string(),
+            format!("{}/raft", data_path),
+        )
+        .await
+        .expect("failed to create RaftGroupManagerV2");
+
+        let meta_shard_manager = Arc::new(MetaShardManager::new(
+            raft_group_manager.clone(),
+            shard_strategy.clone(),
+            data_path,
+            1, // node_id for testing
+        ));
+
+        let peers = vec![Peer {
+            id: 1,
+            address: "127.0.0.1:50051".to_string(),
+            net_address: "127.0.0.1:50052".to_string(),
+        }];
+
         let result = meta_shard_manager.create_shard(ShardId(0), peers).await;
         assert!(result.is_ok(), "Failed to create shard: {:?}", result);
+
+        wait_for_leadership(&raft_group_manager, ShardId(0)).await;
 
         meta_shard_manager.register_root_inode("test-bucket", 1);
 
@@ -93,7 +115,7 @@ fn test_shard_store_persistence() {
 
     let store = ShardStore::new(ShardId(0), (0, 16384), &db_path).unwrap();
 
-    store.apply_command(crate::raft_group_manager::ShardCommand::CreateFile {
+    store.apply_command(crate::raft_group_manager_v2::ShardCommand::CreateFile {
         parent_inode: 1,
         name: "persisted-file".to_string(),
         inode: 100,
@@ -121,33 +143,59 @@ fn test_path_resolution() {
     let data_path = tmp_dir.path().to_str().unwrap().to_string();
 
     let shard_strategy = Arc::new(ShardStrategy::new(4));
-    let raft_group_manager = Arc::new(RaftGroupManager::new(1, "127.0.0.1:50052".to_string(), data_path.clone()));
-    
-    let meta_shard_manager = Arc::new(MetaShardManager::new(
-        raft_group_manager,
-        shard_strategy,
-        data_path,
-        1, // node_id for testing
-    ));
-
-    let peers = vec![Peer {
-        id: 1,
-        address: "127.0.0.1:50052".to_string(),
-    }];
 
     rt.block_on(async {
-        meta_shard_manager.create_shard(ShardId(0), peers).await.unwrap();
+        let raft_group_manager = RaftGroupManagerV2::new(
+            1,
+            "127.0.0.1:50053".to_string(),
+            format!("{}/raft", data_path),
+        )
+        .await
+        .expect("failed to create RaftGroupManagerV2");
+
+        let meta_shard_manager = Arc::new(MetaShardManager::new(
+            raft_group_manager.clone(),
+            shard_strategy,
+            data_path,
+            1, // node_id for testing
+        ));
+
+        let peers = vec![Peer {
+            id: 1,
+            address: "127.0.0.1:50053".to_string(),
+            net_address: "127.0.0.1:50054".to_string(),
+        }];
+
+        meta_shard_manager
+            .create_shard(ShardId(0), peers)
+            .await
+            .unwrap();
+        wait_for_leadership(&raft_group_manager, ShardId(0)).await;
+
         meta_shard_manager.register_root_inode("my-bucket", 1);
 
-        meta_shard_manager.create_directory(1, "level1").await.unwrap();
+        meta_shard_manager
+            .create_directory(1, "level1")
+            .await
+            .unwrap();
         let level1_info = meta_shard_manager.lookup(1, "level1").unwrap();
 
-        meta_shard_manager.create_directory(level1_info.inode, "level2").await.unwrap();
-        let level2_info = meta_shard_manager.lookup(level1_info.inode, "level2").unwrap();
+        meta_shard_manager
+            .create_directory(level1_info.inode, "level2")
+            .await
+            .unwrap();
+        let level2_info = meta_shard_manager
+            .lookup(level1_info.inode, "level2")
+            .unwrap();
 
-        meta_shard_manager.create_file(level2_info.inode, "test.txt").await.unwrap();
+        meta_shard_manager
+            .create_file(level2_info.inode, "test.txt")
+            .await
+            .unwrap();
 
-        let resolved_inode = meta_shard_manager.resolve_path("my-bucket/level1/level2/test.txt").await;
+        let resolved_inode = meta_shard_manager
+            .resolve_path("my-bucket/level1/level2/test.txt")
+            .await;
         assert!(resolved_inode.is_ok());
     });
 }

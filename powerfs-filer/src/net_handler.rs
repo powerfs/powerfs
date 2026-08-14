@@ -7,7 +7,7 @@
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
-use crate::raft_group_manager::ShardId;
+use crate::raft_group_manager_v2::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
 use log::{debug, info, warn};
@@ -21,7 +21,6 @@ use powerfs_net::{
     ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
     STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
-use protobuf::Message as ProtoMessage;
 use std::sync::Arc;
 
 /// Zone 运行时状态 (Filer 持有, 每个 Zone 独立 counter + volume 列表)
@@ -2122,10 +2121,7 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        info!(
-            "FILER_NET_REMOVEXATTR: inode={} key={}",
-            inode, key
-        );
+        info!("FILER_NET_REMOVEXATTR: inode={} key={}", inode, key);
 
         match self
             .meta_shard_manager
@@ -2360,70 +2356,15 @@ impl FilerNetHandler {
         }
     }
 
-    /// Handle Raft inter-node message (MsgType::RaftMessage).
-    ///
-    /// Replaces the gRPC FilerMetaService::send_raft_message RPC.
-    /// Decodes the TLV body (ShardId + RaftPayload), deserializes the
-    /// protobuf eraftpb::Message, and steps it into the local Raft group.
-    ///
-    /// Request TLV:
-    ///   ShardId    = shard id (u64)
-    ///   RaftPayload = serialized eraftpb::Message (bytes)
-    /// Response: STATUS_OK (empty body) or STATUS_ERR_SERVER_ERROR (error string).
+    /// Deprecated: Raft inter-node messaging is now handled by openraft's gRPC
+    /// RaftService (MultiRaftServiceImpl). TLV MsgType::RaftMessage is no longer used.
     async fn handle_raft_message(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let mut dec = TlvDecoder::new(&msg.body);
-        let shard_id_val = dec.next_u64(FieldId::ShardId).unwrap_or(0);
-        let payload = dec.next_bytes(FieldId::RaftPayload).unwrap_or_default();
-
-        if payload.is_empty() {
-            warn!(
-                "FILER_RAFT: received empty RaftPayload for shard {}",
-                shard_id_val
-            );
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_SERVER_ERROR,
-                b"empty raft payload".to_vec(),
-            ));
-        }
-
-        let mut raft_msg = raft::eraftpb::Message::new();
-        if let Err(e) = ProtoMessage::merge_from_bytes(&mut raft_msg, &payload) {
-            warn!("FILER_RAFT: failed to deserialize Raft message: {}", e);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_SERVER_ERROR,
-                format!("failed to deserialize: {}", e).into_bytes(),
-            ));
-        }
-
-        let shard_id = ShardId(shard_id_val);
-        debug!(
-            "FILER_RAFT: received raft message for shard {} (type={:?})",
-            shard_id.0, raft_msg.msg_type
-        );
-
-        match self
-            .meta_shard_manager
-            .step_raft_message(shard_id, raft_msg)
-            .await
-        {
-            Ok(_) => {
-                debug!("FILER_RAFT: stepped raft message for shard {}", shard_id.0);
-                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
-            }
-            Err(e) => {
-                warn!(
-                    "FILER_RAFT: step_raft_message failed for shard {}: {}",
-                    shard_id.0, e
-                );
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    e.into_bytes(),
-                ))
-            }
-        }
+        warn!("FILER_RAFT: received deprecated TLV RaftMessage; openraft uses gRPC RaftService");
+        Ok(Self::build_response(
+            msg,
+            STATUS_ERR_SERVER_ERROR,
+            b"TLV raft transport deprecated; openraft uses gRPC RaftService".to_vec(),
+        ))
     }
 }
 

@@ -19,6 +19,7 @@ members = [
     "powerfs-filer",
     "powerfs-coherence",
     "powerfs-init",
+    "powerfs-raft",
     "rfs_tester",
 ]
 resolver = "2"
@@ -49,7 +50,13 @@ async-trait = { version = "0.1" }
 futures = { version = "0.3" }
 tonic = { version = "0.11" }
 prost = { version = "0.12" }
-raft = { version = "0.7", features = ["default", "protobuf-codec"] }
+# openraft 0.10 (alpha) — 共识层新实现，参考 examples/raft-kv-memstore-grpc。
+# 直接用 crates.io 包（openraft/ 本地克隆仅作参考阅读，已 gitignore，不参与编译）。
+# `serde` feature 让 openraft 的 LogId/Vote/Membership 等类型可序列化到 RocksDB。
+openraft = { version = "0.10.0-alpha.33", features = ["type-alias", "serde"] }
+openraft-multi = "0.10.0-alpha.33"
+byteorder = "1.5"
+tempfile = "3.10"
 fuse-backend-rs = { version = "0.14" }
 fuser = { version = "0.16" }
 libc = { version = "0.2" }

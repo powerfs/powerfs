@@ -1,6 +1,6 @@
 use crate::collection::{CollectionInfo, CollectionManager, CollectionStats, VolumeAllocationMode};
-use crate::raft_node::{ApplyEntry, OutgoingMessage, Peer, ProposeRequest, RaftNode};
-use crate::raft_storage::RaftCommand;
+use crate::raft_v2::RaftNodeV2;
+use crate::raft_v2::{ApplyEntry, Peer, RaftCommand};
 use crate::volume_client::VolumeClientPool;
 use chrono::Utc;
 use log::{debug, error, info, warn};
@@ -17,15 +17,14 @@ use powerfs_common::{
 };
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
-use powerfs_net::serialize::TlvEncoder;
-use powerfs_net::{FieldId, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 pub use crate::proto::VolumeShortInfo;
 pub use crate::volume_assigner::{
@@ -49,10 +48,11 @@ pub struct MasterNode {
     volume_layouts: RwLock<HashMap<String, VolumeLayout>>,
     cluster_config: RwLock<ClusterConfig>,
     raft_config: RaftConfig,
-    peers: Vec<crate::raft_node::Peer>,
-    propose_tx: mpsc::Sender<ProposeRequest>,
-    step_tx: mpsc::Sender<raft::eraftpb::Message>,
-    message_tx: broadcast::Sender<OutgoingMessage>,
+    peers: Vec<crate::raft_v2::Peer>,
+    /// openraft-backed Raft node (replaces old RaftNode + propose/step/message channels).
+    /// Wrapped in `Arc` because `RaftNodeV2` is not `Clone` but `MasterNode` has a manual
+    /// `Clone` impl (each clone shares the same underlying openraft handle).
+    raft_v2: Arc<RaftNodeV2>,
     raft_id: u64,
     raft_address: String,
     is_leader: Arc<AtomicBool>,
@@ -311,34 +311,39 @@ impl MasterNode {
             String::new()
         }));
 
-        let mut raft_node = RaftNode::new(
+        let (raft_v2, mut apply_rx) = RaftNodeV2::new(
             raft_id,
             raft_address.to_string(),
             peer_list.clone(),
             raft_path,
-            leader_state.clone(),
-            leader_address.clone(),
         )
-        .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node: {}", e)))?;
+        .await
+        .map_err(|e| PowerFsError::Internal(format!("Failed to create raft node v2: {}", e)))?;
+        let raft_v2 = Arc::new(raft_v2);
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(100);
         let (notify_tx, mut notify_rx) = mpsc::channel(1000);
 
-        // Extract channel senders before spawning the Raft event loop
-        let propose_tx = raft_node.get_propose_tx();
-        let step_tx = raft_node.get_step_tx();
-        let message_tx = raft_node.get_message_tx();
-        let mut apply_rx = raft_node.take_apply_rx();
+        // P1.3: Extract Zone commands from applied entries for replay after restart.
+        // openraft persists Normal entry payloads to the `raft_state_data` CF; we scan
+        // it and filter for RegisterZone/UpdateZone commands to restore zone_registry.
+        let zone_commands = raft_v2
+            .scan_applied_entries()
+            .map_err(|e| PowerFsError::Internal(format!("Failed to scan applied entries: {}", e)))?
+            .into_iter()
+            .filter_map(|(_, payload)| {
+                serde_json::from_slice::<crate::raft_v2::RaftCommand>(&payload).ok()
+            })
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    crate::raft_v2::RaftCommand::RegisterZone { .. }
+                        | crate::raft_v2::RaftCommand::UpdateZone { .. }
+                )
+            })
+            .collect::<Vec<_>>();
 
-        // P1.3: Extract Zone commands from Raft log for replay after restart
-        let zone_commands = raft_node.take_zone_commands();
-
-        // Spawn the Raft event loop (processes ticks, proposals, and messages)
-        tokio::spawn(async move {
-            if let Err(e) = raft_node.run().await {
-                error!("Raft event loop exited: {}", e);
-            }
-        });
+        // openraft is self-driven (internal tick + network threads); no run() loop needed.
 
         let mut collections = HashMap::new();
         collections.insert(
@@ -403,9 +408,7 @@ impl MasterNode {
             cluster_config: RwLock::new(config),
             raft_config,
             peers: peer_list,
-            propose_tx,
-            step_tx,
-            message_tx,
+            raft_v2,
             raft_id,
             raft_address: raft_address.to_string(),
             is_leader: leader_state,
@@ -503,12 +506,41 @@ impl MasterNode {
             }
         });
 
-        // Start apply loop (receives committed entries from the Raft event loop)
+        // Start apply loop (receives applied log indices from openraft's state machine).
+        // For each index, read the serialized payload from `raft_state_data` CF,
+        // deserialize it into a `RaftCommand`, and replay it onto the in-memory state.
         let master_clone = master.clone();
         tokio::spawn(async move {
-            while let Some(entry) = apply_rx.recv().await {
-                if let Err(e) = master_clone.apply_command(entry).await {
-                    error!("Failed to apply command: {}", e);
+            while let Some(index) = apply_rx.recv().await {
+                match master_clone.raft_v2.read_applied_entry(index) {
+                    Ok(Some(payload)) => {
+                        match serde_json::from_slice::<crate::raft_v2::RaftCommand>(&payload) {
+                            Ok(cmd) => {
+                                let entry = ApplyEntry {
+                                    index,
+                                    command: cmd,
+                                };
+                                if let Err(e) = master_clone.apply_command(entry).await {
+                                    error!("Failed to apply command at index {}: {}", index, e);
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to deserialize RaftCommand at index {}: {}",
+                                    index, e
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(
+                            "Applied entry at index {} not found in state_data CF",
+                            index
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to read applied entry at index {}: {}", index, e);
+                    }
                 }
             }
         });
@@ -603,7 +635,7 @@ impl MasterNode {
     }
 
     pub async fn is_leader(&self) -> bool {
-        self.is_leader.load(Ordering::Relaxed)
+        self.raft_v2.is_leader()
     }
 
     pub async fn get_leader(&self) -> String {
@@ -622,7 +654,7 @@ impl MasterNode {
             return convert_to_net_addr(&leader);
         }
         // Fallback: if we are the leader, return our own net address
-        if self.is_leader.load(Ordering::Relaxed) {
+        if self.raft_v2.is_leader() {
             return convert_to_net_addr(&self.raft_address);
         }
         // 无 leader 且自身非 leader: 返回空字符串, 让调用方返回 SERVER_ERROR
@@ -652,7 +684,7 @@ impl MasterNode {
         if !leader.is_empty() {
             return convert_to_grpc_addr(&leader);
         }
-        if self.is_leader.load(Ordering::Relaxed) {
+        if self.raft_v2.is_leader() {
             return convert_to_grpc_addr(&self.raft_address);
         }
         if let Some(first_peer) = self.peers.first() {
@@ -745,31 +777,32 @@ impl MasterNode {
 
     /// Propose a command to the Raft cluster
     ///
-    /// In single-node mode, we apply the command directly to the state machine
-    /// to avoid waiting for Raft commit (which never advances without peers).
-    /// The command is also proposed to Raft for log persistence (best effort).
+    /// The command is applied directly to the local state machine for immediate
+    /// visibility (callers like `create_collection` read state right after), and
+    /// also proposed to openraft for persistence/replication. The apply loop will
+    /// re-apply the same entry when openraft commits it (idempotent for all
+    /// command variants).
     pub async fn propose_command(&self, cmd: RaftCommand) -> Result<u64> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
         }
 
-        // Single-node mode: apply directly to state machine (bypass Raft commit delay)
+        // Apply directly to local state machine for immediate visibility.
         let entry = ApplyEntry {
             index: 0,
             command: cmd.clone(),
         };
         self.apply_command(entry).await?;
 
-        // Best-effort: also propose to Raft for log persistence (don't wait for response)
+        // Propose to openraft for persistence and replication.
         let data = cmd.serialize();
-        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-        let req = crate::raft_node::ProposeRequest {
-            data,
-            response_tx: resp_tx,
-        };
-        let _ = self.propose_tx.try_send(req);
+        let index = self
+            .raft_v2
+            .propose(data)
+            .await
+            .map_err(|e| PowerFsError::Internal(format!("raft propose failed: {}", e)))?;
 
-        Ok(0)
+        Ok(index)
     }
 
     /// Apply a committed Raft command to the state machine
@@ -951,7 +984,7 @@ impl MasterNode {
         if allocated_key >= 1 && (allocated_key - 1).is_multiple_of(persist_interval) {
             // Persist the NEXT file_key (current + block, since current was just allocated)
             let new_next_key = allocated_key + block;
-            let cmd = crate::raft_storage::RaftCommand::AdvanceFileKey {
+            let cmd = crate::raft_v2::RaftCommand::AdvanceFileKey {
                 volume_id,
                 new_next_key,
             };
@@ -1202,7 +1235,7 @@ impl MasterNode {
     async fn apply_update_node_volumes(
         &self,
         node_id: &str,
-        volumes: &[crate::raft_storage::RaftVolumeShortInfo],
+        volumes: &[crate::raft_v2::RaftVolumeShortInfo],
         ip: &str,
         grpc_port: u32,
         net_port: u32,
@@ -1793,10 +1826,10 @@ impl MasterNode {
             return Err(PowerFsError::NotLeader);
         }
 
-        let short_volumes: Vec<crate::raft_storage::RaftVolumeShortInfo> = params
+        let short_volumes: Vec<crate::raft_v2::RaftVolumeShortInfo> = params
             .volumes
             .iter()
-            .map(|v| crate::raft_storage::RaftVolumeShortInfo {
+            .map(|v| crate::raft_v2::RaftVolumeShortInfo {
                 volume_id: v.volume_id,
                 size: v.size,
                 read_only: v.read_only,
@@ -1821,9 +1854,9 @@ impl MasterNode {
             current_volumes.len()
         );
 
-        let current_short: Vec<crate::raft_storage::RaftVolumeShortInfo> = current_volumes
+        let current_short: Vec<crate::raft_v2::RaftVolumeShortInfo> = current_volumes
             .into_iter()
-            .map(|v| crate::raft_storage::RaftVolumeShortInfo {
+            .map(|v| crate::raft_v2::RaftVolumeShortInfo {
                 volume_id: v.id.0,
                 size: v.size,
                 read_only: v.state == VolumeState::ReadOnly,
@@ -1833,7 +1866,7 @@ impl MasterNode {
             })
             .collect();
 
-        let short_volumes_no_used: Vec<crate::raft_storage::RaftVolumeShortInfo> = short_volumes
+        let short_volumes_no_used: Vec<crate::raft_v2::RaftVolumeShortInfo> = short_volumes
             .iter()
             .cloned()
             .map(|mut v| {
@@ -2874,7 +2907,7 @@ impl MasterNode {
                     }
                 }
                 // P1.3: propose UpdateZone (apply 到内存 + Raft 日志持久化)
-                let cmd = crate::raft_storage::RaftCommand::UpdateZone { zone: zone.clone() };
+                let cmd = crate::raft_v2::RaftCommand::UpdateZone { zone: zone.clone() };
                 if let Err(e) = self.propose_command(cmd).await {
                     warn!(
                         "MASTER_ZONE: failed to persist UpdateZone for zone_id={}: {} \
@@ -2920,7 +2953,7 @@ impl MasterNode {
         );
 
         // P1.3: propose RegisterZone (apply 到内存 + Raft 日志持久化)
-        let cmd = crate::raft_storage::RaftCommand::RegisterZone {
+        let cmd = crate::raft_v2::RaftCommand::RegisterZone {
             zone: zone_info.clone(),
         };
         if let Err(e) = self.propose_command(cmd).await {
@@ -3158,43 +3191,31 @@ impl MasterNode {
     }
 
     pub async fn get_cluster_info(&self) -> crate::proto::ClusterInfoResponse {
+        let info = self.raft_v2.get_cluster_info().await;
         crate::proto::ClusterInfoResponse {
             node_id: self.raft_id,
             address: self.raft_address.clone(),
-            is_leader: self.is_leader.load(Ordering::Relaxed),
-            term: *self.raft_term.read().unwrap(),
-            peers: Vec::new(),
+            is_leader: info.is_leader,
+            term: info.term,
+            peers: info.peers,
         }
     }
 
     pub async fn raft_propose(&self, data: Vec<u8>) -> std::result::Result<u64, String> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.propose_tx
-            .send(crate::raft_node::ProposeRequest { data, response_tx })
-            .await
-            .map_err(|e| format!("failed to send propose: {}", e))?;
-        response_rx
-            .await
-            .map_err(|e| format!("propose response error: {}", e))?
+        self.raft_v2.propose(data).await
     }
 
-    pub fn raft_step_tx(&self) -> tokio::sync::mpsc::Sender<raft::eraftpb::Message> {
-        self.step_tx.clone()
-    }
-
-    pub fn raft_transfer_leader(&self, _target_id: u64) -> std::result::Result<(), String> {
-        Err("transfer_leader not supported in single-node mode".to_string())
-    }
-
-    pub fn raft_message_tx(
-        &self,
-    ) -> tokio::sync::broadcast::Sender<crate::raft_node::OutgoingMessage> {
-        self.message_tx.clone()
+    /// Transfer leadership to `target_id`.
+    ///
+    /// Delegates to openraft's `transfer_leader`. In single-node clusters this
+    /// is a no-op (there is no other node to transfer to).
+    pub async fn raft_transfer_leader(&self, target_id: u64) -> std::result::Result<(), String> {
+        self.raft_v2.transfer_leader(target_id).await
     }
 
     pub async fn start_raft(&self, _peers: Vec<String>) -> Result<()> {
-        info!("Starting Raft (single node mode, always leader)");
-        self.is_leader.store(true, Ordering::Relaxed);
+        // openraft is self-driven; nothing to start here. Leader state is
+        // determined by openraft internally and queried via `raft_v2.is_leader()`.
         Ok(())
     }
 
@@ -3226,7 +3247,7 @@ impl MasterNode {
                 let metrics = collect_system_metrics(&mut sys, ".");
 
                 // 每次循环读取实时的 leader 状态（反映 raft 角色变更）
-                let is_leader = master_ref.is_leader.load(Ordering::Relaxed);
+                let is_leader = master_ref.raft_v2.is_leader();
 
                 let event = Event::NodeStatus(NodeStatusEvent {
                     node_id: node_id_str.clone(),
@@ -3434,105 +3455,10 @@ impl MasterNode {
             }
         }
 
-        // Start Raft message forwarder (TLV transport, replaces gRPC RaftService)
-        //
-        // Uses NetRpcClient persistent connections (one per peer) instead of
-        // call_once (which created a new TCP connection per message). Raft
-        // heartbeats are frequent (~100ms), so connection reuse is critical.
-        let message_rx = self.message_tx.subscribe();
-        let raft_peers = self.peers.clone();
-        let my_raft_id = self.raft_id;
-
-        tokio::spawn(async move {
-            let mut message_rx = message_rx;
-            // Persistent connections: peer_id → NetRpcClient
-            let mut peer_conns: std::collections::HashMap<u64, powerfs_net::NetRpcClient> =
-                std::collections::HashMap::new();
-
-            info!(
-                "RAFT_DEBUG: Raft message forwarder (TLV persistent) started for node {}",
-                my_raft_id
-            );
-
-            while let Ok(msg) = message_rx.recv().await {
-                // Find the peer net address for this message
-                let peer = match raft_peers.iter().find(|p| p.id == msg.to_id) {
-                    Some(p) => p,
-                    None => {
-                        warn!("RAFT_DEBUG: no peer found for id {}", msg.to_id);
-                        continue;
-                    }
-                };
-
-                debug!(
-                    "RAFT_DEBUG: forwarding message to peer {} at {} (TLV persistent)",
-                    msg.to_id, peer.net_address
-                );
-
-                // Build TLV body: ShardId=0 (Master single-group) + RaftPayload.
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_u64(FieldId::ShardId, 0);
-                let _ = enc.add_bytes(FieldId::RaftPayload, &msg.message);
-                let body = enc.into_bytes();
-
-                // Get or create persistent connection for this peer.
-                // client_id is stable per node (derived from raft_id) so the
-                // server can track the connection across reconnects.
-                let client_id = my_raft_id;
-                let entry = match peer_conns.entry(msg.to_id) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        match powerfs_net::NetRpcClient::connect(
-                            &peer.net_address,
-                            powerfs_net::ClientType::Master,
-                            client_id,
-                            powerfs_net::CHANNEL_DATA,
-                        )
-                        .await
-                        {
-                            Ok(client) => {
-                                info!(
-                                    "RAFT_DEBUG: established persistent connection to peer {} at {}",
-                                    msg.to_id, peer.net_address
-                                );
-                                e.insert(client)
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "RAFT_DEBUG: failed to connect to peer {} at {}: {}",
-                                    msg.to_id, peer.net_address, e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                // Send via persistent connection with auto-reconnect.
-                match entry
-                    .call_with_retry(powerfs_net::MsgType::RaftMessage, &body)
-                    .await
-                {
-                    Ok(reply) if reply.is_ok() => {}
-                    Ok(reply) => {
-                        warn!(
-                            "RAFT_DEBUG: peer {} returned status={:#06x}: {}",
-                            peer.net_address,
-                            reply.status,
-                            reply.body_str()
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "RAFT_DEBUG: failed to send TLV message to {}: {}",
-                            peer.net_address, e
-                        );
-                    }
-                }
-            }
-
-            info!("RAFT_DEBUG: Raft message forwarder (TLV persistent) stopped");
-        });
+        // Note: Raft inter-node transport is now handled entirely by openraft's
+        // gRPC RaftService (started inside `RaftNodeV2::new`). The old TLV-based
+        // message forwarder and `broadcast::Sender<OutgoingMessage>` have been
+        // removed.
 
         // Keep the master running
         tokio::signal::ctrl_c().await?;
@@ -3557,9 +3483,7 @@ impl Clone for MasterNode {
             cluster_config: RwLock::new(self.cluster_config.read().unwrap().clone()),
             raft_config: self.raft_config.clone(),
             peers: self.peers.clone(),
-            propose_tx: self.propose_tx.clone(),
-            step_tx: self.step_tx.clone(),
-            message_tx: self.message_tx.clone(),
+            raft_v2: self.raft_v2.clone(),
             raft_id: self.raft_id,
             raft_address: self.raft_address.clone(),
             is_leader: self.is_leader.clone(),

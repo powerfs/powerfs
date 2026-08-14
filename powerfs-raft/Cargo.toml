@@ -1,0 +1,47 @@
+[package]
+name = "powerfs-raft"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "PowerFS consensus layer built on openraft 0.10 (replaces raft-rs 0.7)"
+license = { workspace = true }
+
+[dependencies]
+# 共识层：openraft 0.10 alpha（见 docs/openraft-migration-plan.md）
+openraft = { workspace = true }
+openraft-multi = { workspace = true }
+
+# 异步运行时
+tokio = { workspace = true }
+
+# 序列化（D/R AppData 需要 serde；openraft 类型也走 serde feature）
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 错误处理（后续 RaftNetwork/Storage 实现）
+thiserror = { workspace = true }
+
+# 异步 trait（RaftNetwork impl）
+async-trait = { workspace = true }
+
+# gRPC 传输（阶段 2 启用，保持 powerfs tonic 0.11）
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# 日志（与 openraft 保持一致）
+tracing = "0.1"
+
+# 存储：RocksDB-backed RaftLogStorage + RaftStateMachine
+rocksdb = { workspace = true }
+byteorder = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter"] }
+
+[build-dependencies]
+tonic-build = { version = "0.11" }
+
+[lib]
+path = "src/lib.rs"
