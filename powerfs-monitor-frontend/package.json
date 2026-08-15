@@ -25,6 +25,7 @@
     "react-dom": "^18.3.0",
     "react-i18next": "^17.0.11",
     "react-router-dom": "^6.26.0",
+    "dayjs": "^1.11.13",
     "reactflow": "^11.11.4"
   },
   "devDependencies": {
