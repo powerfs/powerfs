@@ -127,6 +127,7 @@ jobs:
   # 基准测试
   benchmark:
     runs-on: [self-hosted, Linux, X64]
+    needs: test
     if: github.event_name == 'workflow_dispatch' || (contains(fromJson('["refs/heads/fronted","refs/heads/master","refs/heads/main"]'), github.ref) && github.event_name == 'push')
     steps:
     - name: Configure Git for SSH
