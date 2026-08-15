@@ -4,7 +4,7 @@
 
 Unified POSIX / S3 / KV cache in a single cluster — eliminating the three-stack fragmentation that plagues HPC+AI converged infrastructure.
 
-[Architecture](#architecture) • [Quick Start](#quick-start) • [Benchmark](#benchmark) • [Roadmap](#roadmap) • [Articles](articles/) • [License](#license)
+[Introduction](#introduction) • [Architecture](#architecture) • [Core Features](#core-features) • [Roadmap](#-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [Quick Start](#quick-start) • [Articles](articles/) • [License](#license)
 
 ---
 
@@ -111,6 +111,49 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 **Default credentials**: admin / admin123 · **S3**: powerfs / powerfs123 @ http://localhost:9000
 
 ---
+
+## Architecture
+
+PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
+
+### 3-Layer Decoupled Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                      Client Layer                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
+│  │  FUSE    │  │    S3    │  │      KV Cache Client     │  │
+│  │ (POSIX)  │  │  Client  │  │    (for LLM Inference)   │  │
+│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
+└───────┼─────────────┼────────────────────┼─────────────────┘
+        │             │                    │
+┌───────▼─────────────▼────────────────────▼─────────────────┐
+│      OR-Set CRDT Weak-Consistency Metadata Layer (Core)    │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Lockless Cache | Delta Sync | Conflict Merge        │  │
+│  │  Multi-Protocol Isolation (POSIX/KV/S3)              │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+┌─────────────────────────────▼──────────────────────────────┐
+│              Raft Global Scheduling Layer                  │
+│              (High-Availability Cluster)                   │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Cluster Management | Resource Allocation | Topology │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+┌─────────────────────────────▼──────────────────────────────┐
+│             Multi-Interface Unified Data Layer             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │      │
+│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│               [Unified Needle Binary Format]               │
+└────────────────────────────────────────────────────────────┘
+```
+
+1. **OR-Set CRDT Weak-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Lockless OR-Set CRDT directory cache with `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite. Eliminates broadcast storm via incremental delta sync, enabling unlimited client linear scaling. Native multi-protocol metadata isolation for POSIX/KV/S3.
 
 ## Benchmark
 
@@ -703,7 +746,7 @@ Options:
 │  • Multiplexed channels (data/lease/mgmt)              │
 │  • Circuit breaker for fault tolerance                 │
 │  • Automatic reconnection and retry                    │
-└─────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────┘
 ```
 
 </details>
@@ -1006,7 +1049,7 @@ PowerFS is open-source under Apache 2.0 license. We are committed to building th
 
 Welcome Star, Fork, PR and Issue to help us evolve!
 
-**GitHub**: https://github.com/powerfs/powerfs
+**GitHub**: https://github.com/FudanPPI/powerfs
 
 ---
 
