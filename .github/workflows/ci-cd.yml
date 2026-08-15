@@ -3,10 +3,14 @@ name: PowerFS CI/CD Pipeline
 
 on:
   push:
-    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
+    branches: [fronted, master, main]
   pull_request:
-    branches: [ fronted, "fs-lease-optimize", "allocator-decoupling", master, main ]
+    branches: [fronted, master, main]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +18,7 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
-  # 代码质量检查
+  # 代码质量检查 (fmt + clippy)
   quality:
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -53,7 +57,7 @@ jobs:
     - name: Clippy
       run: cargo clippy --all -- -D warnings
 
-  # 编译检查
+  # 编译检查 (release)
   build:
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -87,7 +91,7 @@ jobs:
     - name: Build All
       run: cargo build --all --release
 
-  # 单元测试
+  # 单元测试 + FUSE 集成测试
   test:
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -124,7 +128,27 @@ jobs:
     - name: Benchmark Tests
       run: cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
 
-  # 基准测试
+    - name: Check if FUSE is available
+      id: fuse-check
+      run: |
+        if [ -c /dev/fuse ] && sudo fusermount -V 2>/dev/null; then
+          echo "fuse_available=true" >> $GITHUB_OUTPUT
+          echo "FUSE is available"
+        else
+          echo "fuse_available=false" >> $GITHUB_OUTPUT
+          echo "FUSE is NOT available, skipping integration tests"
+        fi
+
+    - name: Run FUSE integration tests
+      if: steps.fuse-check.outputs.fuse_available == 'true'
+      run: |
+        cargo test --package powerfs-fuse --test fuse_minimal_test --verbose
+        cargo test --package powerfs-fuse --test fuse_basic_test --verbose
+        cargo test --package powerfs-fuse --test coherence_phase0_test --verbose
+        cargo test --package powerfs-fuse --test coherence_phase1_test --verbose
+        cargo test --package powerfs-fuse --test invalidation_e2e_test --verbose
+
+  # 基准测试 (criterion)
   benchmark:
     runs-on: [self-hosted, Linux, X64]
     needs: test
@@ -226,8 +250,7 @@ jobs:
         name: coverage-report
         path: ./coverage
 
-  # Check whether Docker Hub credentials are configured (secrets context is
-  # not available in job-level `if`, so we expose it via a job output).
+  # Check whether Docker Hub credentials are configured
   check-docker-secrets:
     runs-on: [self-hosted, Linux, X64]
     if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
