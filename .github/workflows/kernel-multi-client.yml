@@ -175,6 +175,7 @@ jobs:
               # Deploy
               cp /mnt/host/powerfs.ko /root/powerfs.ko
               insmod /root/powerfs.ko master_addr=172.30.0.11,172.30.0.12,172.30.0.13 master_port=9334 shard_count=3
+              mkdir -p /mnt/pfs
               mount -t powerfs none /mnt/pfs -o master_addr=172.30.0.11,master_port=9334
 
               # Verify
