@@ -297,7 +297,7 @@ jobs:
         context: .
         file: docker/powerfs-master.Dockerfile
         push: true
-        tags: powerfs/master:latest, powerfs/master:${{ github.sha }}
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-master:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-master:${{ github.sha }}
 
     - name: Build and Push Volume Image
       uses: docker/build-push-action@v5
@@ -305,7 +305,7 @@ jobs:
         context: .
         file: docker/powerfs-volume.Dockerfile
         push: true
-        tags: powerfs/volume:latest, powerfs/volume:${{ github.sha }}
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-volume:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-volume:${{ github.sha }}
 
     - name: Build and Push FUSE Image
       uses: docker/build-push-action@v5
@@ -313,7 +313,7 @@ jobs:
         context: .
         file: docker/powerfs-fuse.Dockerfile
         push: true
-        tags: powerfs/fuse:latest, powerfs/fuse:${{ github.sha }}
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-fuse:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-fuse:${{ github.sha }}
 
     - name: Build and Push Monitor Image
       uses: docker/build-push-action@v5
@@ -321,7 +321,7 @@ jobs:
         context: .
         file: docker/powerfs-monitor.Dockerfile
         push: true
-        tags: powerfs/monitor:latest, powerfs/monitor:${{ github.sha }}
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-monitor:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-monitor:${{ github.sha }}
 
   # 部署到测试环境
   deploy-test:
