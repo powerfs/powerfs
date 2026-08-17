@@ -158,7 +158,7 @@ jobs:
         run: |
           for PORT in ${{ env.VM1_SSH_PORT }} ${{ env.VM2_SSH_PORT }}; do
             echo "=== Deploying to VM (port $PORT) ==="
-            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost bash <<'REMOTE_EOF'
+            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh <<'REMOTE_EOF'
               # Unmount and unload if already loaded
               umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null || true
               rmmod powerfs 2>/dev/null || true
