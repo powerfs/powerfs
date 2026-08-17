@@ -33,6 +33,7 @@ env:
   VM1_SSH_PORT: "2223"
   VM2_SSH_PORT: "2224"
   TEST_MODE: ${{ github.event_name == 'schedule' && 'full' || (github.event.inputs.mode || 'smoke') }}
+  WAIT_NOTIFY_DEFAULT: "5"
 
 jobs:
   multi-client-test:
