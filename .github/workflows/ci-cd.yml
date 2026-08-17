@@ -269,6 +269,25 @@ jobs:
       with:
         submodules: false
 
+    - name: Checkout public submodules
+      run: |
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+
+    - name: Cargo Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build Release Binaries
+      run: cargo build --all --release
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -279,37 +298,13 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and Push Master Image
+    - name: Build and Push PowerFS Image
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: docker/powerfs-master.Dockerfile
+        file: docker/Dockerfile
         push: true
-        tags: ghcr.io/${{ github.repository_owner }}/powerfs-master:latest, ghcr.io/${{ github.repository_owner }}/powerfs-master:${{ github.sha }}
-
-    - name: Build and Push Volume Image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/powerfs-volume.Dockerfile
-        push: true
-        tags: ghcr.io/${{ github.repository_owner }}/powerfs-volume:latest, ghcr.io/${{ github.repository_owner }}/powerfs-volume:${{ github.sha }}
-
-    - name: Build and Push FUSE Image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/powerfs-fuse.Dockerfile
-        push: true
-        tags: ghcr.io/${{ github.repository_owner }}/powerfs-fuse:latest, ghcr.io/${{ github.repository_owner }}/powerfs-fuse:${{ github.sha }}
-
-    - name: Build and Push Monitor Image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/powerfs-monitor.Dockerfile
-        push: true
-        tags: ghcr.io/${{ github.repository_owner }}/powerfs-monitor:latest, ghcr.io/${{ github.repository_owner }}/powerfs-monitor:${{ github.sha }}
+        tags: ghcr.io/${{ github.repository_owner }}/powerfs:latest, ghcr.io/${{ github.repository_owner }}/powerfs:${{ github.sha }}
 
   # 部署到测试环境
   deploy-test:
