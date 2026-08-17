@@ -250,27 +250,14 @@ jobs:
         name: coverage-report
         path: ./coverage
 
-  # Check whether Docker Hub credentials are configured
-  check-docker-secrets:
-    runs-on: [self-hosted, Linux, X64]
-    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
-    outputs:
-      available: ${{ steps.check.outputs.available }}
-    steps:
-    - id: check
-      run: |
-        if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-          echo "available=true" >> $GITHUB_OUTPUT
-        else
-          echo "::warning::Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN) are not configured; skipping docker/deploy/release jobs."
-          echo "available=false" >> $GITHUB_OUTPUT
-        fi
-
-  # Docker 镜像构建
+  # Docker 镜像构建 (使用 GHCR, 无需外部凭据)
   docker:
     runs-on: [self-hosted, Linux, X64]
-    needs: [quality, build, test, check-docker-secrets]
-    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push' && needs.check-docker-secrets.outputs.available == 'true'
+    needs: [quality, build, test]
+    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
     steps:
     - name: Configure Git for SSH
       run: |
@@ -285,11 +272,12 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Login to Docker Hub
+    - name: Login to GHCR
       uses: docker/login-action@v3
       with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build and Push Master Image
       uses: docker/build-push-action@v5
@@ -297,7 +285,7 @@ jobs:
         context: .
         file: docker/powerfs-master.Dockerfile
         push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-master:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-master:${{ github.sha }}
+        tags: ghcr.io/${{ github.repository_owner }}/powerfs-master:latest, ghcr.io/${{ github.repository_owner }}/powerfs-master:${{ github.sha }}
 
     - name: Build and Push Volume Image
       uses: docker/build-push-action@v5
@@ -305,7 +293,7 @@ jobs:
         context: .
         file: docker/powerfs-volume.Dockerfile
         push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-volume:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-volume:${{ github.sha }}
+        tags: ghcr.io/${{ github.repository_owner }}/powerfs-volume:latest, ghcr.io/${{ github.repository_owner }}/powerfs-volume:${{ github.sha }}
 
     - name: Build and Push FUSE Image
       uses: docker/build-push-action@v5
@@ -313,7 +301,7 @@ jobs:
         context: .
         file: docker/powerfs-fuse.Dockerfile
         push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-fuse:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-fuse:${{ github.sha }}
+        tags: ghcr.io/${{ github.repository_owner }}/powerfs-fuse:latest, ghcr.io/${{ github.repository_owner }}/powerfs-fuse:${{ github.sha }}
 
     - name: Build and Push Monitor Image
       uses: docker/build-push-action@v5
@@ -321,7 +309,7 @@ jobs:
         context: .
         file: docker/powerfs-monitor.Dockerfile
         push: true
-        tags: ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-monitor:latest, ${{ secrets.DOCKERHUB_USERNAME }}/powerfs-monitor:${{ github.sha }}
+        tags: ghcr.io/${{ github.repository_owner }}/powerfs-monitor:latest, ghcr.io/${{ github.repository_owner }}/powerfs-monitor:${{ github.sha }}
 
   # 部署到测试环境
   deploy-test:
