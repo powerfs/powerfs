@@ -203,6 +203,34 @@ jobs:
           echo "BASE_B=$BASE_B" >> $GITHUB_OUTPUT
           echo "dmesg baseline: VM1=$BASE_A VM2=$BASE_B lines"
 
+      - name: Verify VM2 can see VM1's files
+        run: |
+          # Create a test file on VM1
+          ssh -p ${{ env.VM1_SSH_PORT }} -o StrictHostKeyChecking=no root@localhost "echo test > /mnt/pfs/ci_conn_test"
+          sleep 5
+          # Check on VM2
+          RESULT=$(ssh -p ${{ env.VM2_SSH_PORT }} -o StrictHostKeyChecking=no root@localhost "cat /mnt/pfs/ci_conn_test 2>/dev/null || echo NOT_FOUND")
+          if [ "$RESULT" = "test" ]; then
+            echo "VM2 can see VM1's files: OK"
+          else
+            echo "::error::VM2 cannot see VM1's files (got: $RESULT)"
+            echo "=== VM1 mount ==="
+            ssh -p ${{ env.VM1_SSH_PORT }} root@localhost "mount | grep powerfs"
+            echo "=== VM2 mount ==="
+            ssh -p ${{ env.VM2_SSH_PORT }} root@localhost "mount | grep powerfs"
+            echo "=== VM1 root dir ==="
+            ssh -p ${{ env.VM1_SSH_PORT }} root@localhost "ls -la /mnt/pfs/ | head -10"
+            echo "=== VM2 root dir ==="
+            ssh -p ${{ env.VM2_SSH_PORT }} root@localhost "ls -la /mnt/pfs/ | head -10"
+            echo "=== VM1 dmesg (last 10) ==="
+            ssh -p ${{ env.VM1_SSH_PORT }} root@localhost "dmesg | tail -10"
+            echo "=== VM2 dmesg (last 10) ==="
+            ssh -p ${{ env.VM2_SSH_PORT }} root@localhost "dmesg | tail -10"
+            exit 1
+          fi
+          # Cleanup
+          ssh -p ${{ env.VM1_SSH_PORT }} -o StrictHostKeyChecking=no root@localhost "rm -f /mnt/pfs/ci_conn_test"
+
       - name: Run multi-client tests
         id: test
         run: |
