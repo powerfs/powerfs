@@ -28,28 +28,35 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustup component add rustfmt clippy 2>/dev/null || true
+        rustc --version && cargo --version
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
         sudo chmod 666 /dev/fuse
-
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
 
     - name: Format Check
       run: cargo fmt --check --all
@@ -67,26 +74,34 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustc --version && cargo --version
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
         sudo chmod 666 /dev/fuse
-
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
 
     - name: Build All
       run: cargo build --all --release
@@ -101,26 +116,34 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustc --version && cargo --version
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
         sudo chmod 666 /dev/fuse
-
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
 
     - name: Unit Tests
       run: cargo test --all -- --test-threads=2
@@ -160,26 +183,34 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustc --version && cargo --version
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
         sudo chmod 666 /dev/fuse
-
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
 
     - name: Build Benchmark
       run: cargo build --package powerfs-core --release --bench kv_benchmark
@@ -191,11 +222,13 @@ jobs:
       env:
         BENCHMARK_RESULTS_DIR: ./benchmark-results
 
-    - name: Upload Benchmark Results
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results
-        path: ./benchmark-results
+    - name: Save artifacts locally
+      if: always()
+      run: |
+        ARTIFACT_DIR="/home/portion/actions-runner/_work/artifacts/${GITHUB_RUN_ID}"
+        mkdir -p "$ARTIFACT_DIR"
+        cp -r ./benchmark-results "$ARTIFACT_DIR/" 2>/dev/null || true
+        echo "Artifacts saved to: $ARTIFACT_DIR"
 
   # 代码覆盖率
   coverage:
@@ -207,19 +240,29 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: llvm-tools-preview
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustup component add llvm-tools-preview 2>/dev/null || true
+        rustc --version && cargo --version
 
     - name: Install grcov
       run: cargo install grcov
@@ -229,9 +272,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
         sudo chmod 666 /dev/fuse
-
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
 
     - name: Run Tests with Coverage
       run: |
@@ -244,11 +284,13 @@ jobs:
     - name: Generate Coverage Report
       run: grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
 
-    - name: Upload Coverage Report
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report
-        path: ./coverage
+    - name: Save artifacts locally
+      if: always()
+      run: |
+        ARTIFACT_DIR="/home/portion/actions-runner/_work/artifacts/${GITHUB_RUN_ID}"
+        mkdir -p "$ARTIFACT_DIR"
+        cp -r ./coverage "$ARTIFACT_DIR/" 2>/dev/null || true
+        echo "Artifacts saved to: $ARTIFACT_DIR"
 
   # Docker 镜像构建 (使用 GHCR, 无需外部凭据)
   docker:
@@ -265,51 +307,57 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
-
-    - name: Checkout public submodules
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
         git submodule update --init --force rfs_tester
         git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Ensure Rust toolchain
+      run: |
+        if ! command -v rustc &>/dev/null; then
+          echo "Rust not found, installing via rustup..."
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+        fi
+        rustc --version && cargo --version
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
 
-    - name: Cargo Cache
-      uses: Swatinem/rust-cache@v2
-
     - name: Build Release Binaries
       run: cargo build --all --release
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      with:
-        driver: docker
+    - name: Setup Docker (buildx already configured)
+      run: |
+        docker info | head -5
+        docker buildx version 2>/dev/null || docker buildx create --use --driver docker
 
     - name: Pull base image via mirror
       run: docker pull ubuntu:20.04
 
     - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
     - name: Build and Push PowerFS Image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: docker/Dockerfile
-        push: true
-        tags: ghcr.io/${{ github.repository_owner }}/powerfs:latest, ghcr.io/${{ github.repository_owner }}/powerfs:${{ github.sha }}
+      run: |
+        IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/powerfs"
+        docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
+        docker push "${IMAGE_TAG}:latest"
+        docker push "${IMAGE_TAG}:${GITHUB_SHA}"
 
   # 部署到测试环境
   deploy-test:
@@ -323,9 +371,19 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
     - name: Deploy to Test Cluster
       run: |
@@ -345,23 +403,32 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
     - name: Create Release
-      uses: actions/create-release@v1
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: v${{ github.run_number }}
-        release_name: Release v${{ github.run_number }}
-        body: |
-          **Changes in this release:**
-          
-          - See commit history for details
-        draft: false
-        prerelease: false
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="v${GITHUB_RUN_NUMBER}"
+        BODY="**Changes in this release:**\n\n- See commit history for details"
+        curl -s -X POST \
+          -H "Authorization: Bearer ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases" \
+          -d "{\"tag_name\":\"${TAG}\",\"name\":\"Release ${TAG}\",\"body\":\"${BODY}\",\"draft\":false,\"prerelease\":false}" \
+          -w "\nHTTP: %{http_code}\n"
 
   # 前端构建
   frontend:
@@ -373,19 +440,35 @@ jobs:
         git config --global http.lowSpeedLimit 1000
         git config --global http.lowSpeedTime 60
 
-    - uses: actions/checkout@v4
-      with:
-        submodules: false
+    - name: Checkout code (local git clone)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        git init
+        git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
+        git submodule update --init --force rfs_tester
+        git -C rfs_tester checkout --force HEAD
+        echo "Checked out: $(git log --oneline -1)"
 
-    - name: Use Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+    - name: Ensure Node.js
+      run: |
+        if ! command -v node &>/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
+          echo "Node 20+ not found, installing..."
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+        fi
+        node --version
 
-    - name: Install pnpm
-      uses: pnpm/action-setup@v4
-      with:
-        version: 9
+    - name: Ensure pnpm
+      run: |
+        if ! command -v pnpm &>/dev/null; then
+          npm install -g pnpm@9
+        fi
+        pnpm --version
 
     - name: Install Dependencies
       run: pnpm install --frozen-lockfile
@@ -394,9 +477,11 @@ jobs:
     - name: Build Frontend
       run: pnpm build
       working-directory: ./powerfs-monitor-frontend
-    
-    - name: Upload Frontend Build
-      uses: actions/upload-artifact@v4
-      with:
-        name: frontend-build
-        path: ./powerfs-monitor-frontend/dist
+
+    - name: Save artifacts locally
+      if: always()
+      run: |
+        ARTIFACT_DIR="/home/portion/actions-runner/_work/artifacts/${GITHUB_RUN_ID}"
+        mkdir -p "$ARTIFACT_DIR"
+        cp -r ./powerfs-monitor-frontend/dist "$ARTIFACT_DIR/" 2>/dev/null || true
+        echo "Artifacts saved to: $ARTIFACT_DIR"
