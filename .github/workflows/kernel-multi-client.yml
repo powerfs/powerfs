@@ -192,6 +192,11 @@ jobs:
               echo "::error::Deploy failed on port $PORT"
               exit 1
             fi
+            # Fix IP conflict: VM2 uses 172.30.0.101 (initramfs hardcodes 172.30.0.100)
+            if [ "$PORT" = "${{ env.VM2_SSH_PORT }}" ]; then
+              echo "Changing VM2 IP to 172.30.0.101 to avoid conflict..."
+              ssh -p $PORT -o StrictHostKeyChecking=no root@localhost "ip addr del 172.30.0.100/16 dev eth0 2>/dev/null; ip addr add 172.30.0.101/16 dev eth0; ip addr show eth0 | grep inet"
+            fi
           done
 
       - name: Record dmesg baseline
