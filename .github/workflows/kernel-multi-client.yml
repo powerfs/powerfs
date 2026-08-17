@@ -123,11 +123,13 @@ jobs:
           # Verify tap devices
           ip link show tap0 && ip link show tap1
 
-      - name: Deploy powerfs.ko to share directory
+      - name: Deploy powerfs.ko and test binaries to share directory
         run: |
           mkdir -p kernel/vm/share
           cp kernel/powerfs_mod/powerfs.ko kernel/vm/share/powerfs.ko
-          ls -la kernel/vm/share/powerfs.ko
+          # Compile static PUNCH_HOLE test binary (for MC-107, no gcc on VM)
+          gcc -static -Wall -o kernel/vm/share/test_punch_hole kernel/vm/test_punch_hole.c
+          ls -la kernel/vm/share/powerfs.ko kernel/vm/share/test_punch_hole
 
       - name: Start VM1
         run: |
