@@ -44,10 +44,21 @@ jobs:
       issues: write
       checks: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Checkout code (local git clone — bypasses codeload IP rate limit)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Self-hosted runner hits codeload.github.com 429 (IP-based rate limit)
+          # when downloading actions/checkout. Use direct git clone instead.
+          cd "$GITHUB_WORKSPACE"
+          # Clean workspace (runner ensures it's empty, but be defensive)
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout FETCH_HEAD
+          git submodule update --init --recursive --depth 1
+          echo "Checked out: $(git log --oneline -1)"
 
       - name: Check KVM availability
         run: |
@@ -277,74 +288,110 @@ jobs:
           fi
           echo "dmesg check passed on both VMs"
 
-      - name: Upload test results
+      - name: Save test artifacts (local — bypasses actions/upload-artifact)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: multi-client-test-results
-          path: |
-            /tmp/multi-client-results.xml
-            /tmp/multi-client-output.log
-            /tmp/vm1_boot.log
-            /tmp/vm2_boot.log
-          retention-days: 30
+        run: |
+          # Self-hosted runner: save artifacts locally instead of upload-artifact action
+          ARTIFACT_DIR="/home/portion/actions-runner/_work/artifacts/${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          for f in /tmp/multi-client-results.xml /tmp/multi-client-output.log /tmp/vm1_boot.log /tmp/vm2_boot.log; do
+            [ -f "$f" ] && cp "$f" "$ARTIFACT_DIR/" && echo "Saved: $f"
+          done
+          echo "Artifacts directory: $ARTIFACT_DIR"
+          ls -la "$ARTIFACT_DIR" || true
 
-      - name: Publish JUnit test report
+      - name: Publish JUnit summary to job log
         if: always() && hashFiles('/tmp/multi-client-results.xml') != ''
-        uses: dorny/test-reporter@v1
-        with:
-          name: Multi-Client Test Results
-          path: /tmp/multi-client-results.xml
-          reporter: java-junit
-          fail-on-error: false
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Inline JUnit summary (replaces dorny/test-reporter to avoid codeload dependency)
+          if [ -f /tmp/multi-client-results.xml ]; then
+            python3 - <<'PY'
+            import xml.etree.ElementTree as ET
+            try:
+                tree = ET.parse('/tmp/multi-client-results.xml')
+                root = tree.getroot()
+                total=fail=err=skip=0
+                for tc in root.iter('testcase'):
+                    total += 1
+                    if tc.find('failure') is not None: fail += 1
+                    elif tc.find('error') is not None: err += 1
+                    elif tc.find('skipped') is not None: skip += 1
+                passed = total - fail - err - skip
+                print(f"::notice::JUnit Summary: {passed} passed, {fail} failures, {err} errors, {skip} skipped (total {total})")
+                # List failures
+                for tc in root.iter('testcase'):
+                    f = tc.find('failure')
+                    e = tc.find('error')
+                    if f is not None:
+                        print(f"::error::FAIL {tc.get('name','?')}: {f.text[:200] if f.text else ''}")
+                    elif e is not None:
+                        print(f"::error::ERROR {tc.get('name','?')}: {e.text[:200] if e.text else ''}")
+            except Exception as ex:
+                print(f"::warning::Could not parse JUnit XML: {ex}")
+            PY
+          else
+            echo "No JUnit XML found"
+          fi
 
       - name: Create issue on failure
         if: failure() && github.event_name != 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let logSummary = 'Unable to read log';
-            try {
-              const log = fs.readFileSync('/tmp/multi-client-output.log', 'utf8');
-              const lines = log.split('\n');
-              const results = lines.filter(l => l.match(/PASS:|FAIL:|SKIP:|Results:/)).slice(-10);
-              logSummary = results.join('\n') || logSummary;
-            } catch (e) {}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create issue via GitHub API (replaces actions/github-script)
+          LOG_SUMMARY=$(grep -E 'PASS:|FAIL:|SKIP:|Results:' /tmp/multi-client-output.log 2>/dev/null | tail -10 || echo "Unable to read log")
+          MODE="${{ env.TEST_MODE }}"
+          COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
+          RUN_ID="$GITHUB_RUN_ID"
+          REPO="$GITHUB_REPOSITORY"
+          EVENT="$GITHUB_EVENT_NAME"
+          ARTIFACT_DIR="/home/portion/actions-runner/_work/artifacts/${RUN_ID}"
 
-            const mode = '${{ env.TEST_MODE }}';
-            const commit = context.sha.substring(0, 7);
-            const runId = context.runId;
-            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+          python3 - <<PY
+          import json, os, urllib.request
+          log_summary = os.environ.get("LOG_SUMMARY", "")
+          body = f"""## Multi-Client Test Failure
 
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `[REGRESSION] Multi-client ${mode} test failed (${commit})`,
-              labels: ['regression', 'kernel', 'multi-client'],
-              body: `## Multi-Client Test Failure
+          **Mode:** ${MODE}
+          **Commit:** ${COMMIT}
+          **Trigger:** ${EVENT}
 
-            **Mode:** ${mode}
-            **Commit:** ${commit}
-            **Trigger:** ${context.eventName}
+          ### Test Summary
+          \`\`\`
+          {log_summary}
+          \`\`\`
 
-            ### Test Summary
-            \`\`\`
-            ${logSummary}
-            \`\`\`
+          ### Artifacts
+          - [Test results](https://github.com/${REPO}/actions/runs/${RUN_ID})
+          - Logs on runner: ${ARTIFACT_DIR}
 
-            ### Artifacts
-            - [Test results](${repoUrl}/actions/runs/${runId})
-            - JUnit XML and logs available in run artifacts
-
-            ### Action Required
-            1. Download artifacts from the run
-            2. Check \`multi-client-output.log\` for failed test cases
-            3. Check \`check_dmesg_anomaly\` output for SLUB/kernel anomalies
-            4. If SLUB anomaly: investigate use-after-free in the indicated function
-            `
-            });
+          ### Action Required
+          1. Check logs at ${ARTIFACT_DIR}
+          2. Check \`multi-client-output.log\` for failed test cases
+          3. Check \`check_dmesg_anomaly\` output for SLUB/kernel anomalies
+          4. If SLUB anomaly: investigate use-after-free in the indicated function
+          """
+          payload = {
+              "title": f"[REGRESSION] Multi-client ${MODE} test failed (${COMMIT})",
+              "body": body,
+              "labels": ["regression", "kernel", "multi-client"]
+          }
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/${REPO}/issues",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer ${GH_TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"Issue created: {resp.status}")
+          except Exception as e:
+              print(f"::warning::Failed to create issue: {e}")
+          PY
 
       - name: Cleanup VMs
         if: always()
