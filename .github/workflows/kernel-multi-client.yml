@@ -1,0 +1,271 @@
+name: Kernel Multi-Client Tests
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'kernel/powerfs_mod/**'
+      - '.github/workflows/kernel-multi-client.yml'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'kernel/powerfs_mod/**'
+      - '.github/workflows/kernel-multi-client.yml'
+  schedule:
+    # Nightly full test at 02:00 UTC (10:00 CST)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Test mode (smoke or full)'
+        required: false
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - full
+
+concurrency:
+  group: kernel-multi-client-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VM1_SSH_PORT: "2223"
+  VM2_SSH_PORT: "2224"
+  TEST_MODE: ${{ github.event_name == 'schedule' && 'full' || (github.event.inputs.mode || 'smoke') }}
+
+jobs:
+  multi-client-test:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check KVM availability
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::KVM not available (/dev/kvm missing)"
+            exit 1
+          fi
+          echo "KVM available: $(ls -la /dev/kvm)"
+
+      - name: Check Docker services (powerfs backend)
+        run: |
+          # Verify powerfs backend containers are running
+          docker ps --format '{{.Names}}' | grep -E 'master|volume|filer' || {
+            echo "::error::PowerFS backend containers not running"
+            echo "Available containers:"
+            docker ps --format 'table {{.Names}}\t{{.Status}}'
+            exit 1
+          }
+          echo "PowerFS backend OK"
+
+      - name: Build kernel module
+        run: |
+          cd kernel/powerfs_mod
+          make clean || true
+          make -j$(nproc) 2>&1 | tail -5
+          ls -la powerfs.ko
+
+      - name: Build kernel (if needed)
+        run: |
+          OUTPUT_DIR="kernel/vm/output"
+          if [ ! -f "$OUTPUT_DIR/bzImage" ] || [ ! -f "$OUTPUT_DIR/initramfs.cpio.gz" ]; then
+            echo "=== Building kernel and initramfs ==="
+            cd kernel/vm
+            bash build_kernel.sh 2>&1 | tail -5
+            bash build_initramfs.sh 2>&1 | tail -5
+          else
+            echo "=== Kernel image already exists, skipping build ==="
+            ls -lh "$OUTPUT_DIR/bzImage" "$OUTPUT_DIR/initramfs.cpio.gz"
+          fi
+
+      - name: Setup network for dual VM
+        run: |
+          cd kernel/vm
+          # Setup tap0 (VM1) and tap1 (VM2)
+          sudo bash setup_network.sh || true
+          sudo bash setup_network_dual.sh || true
+          # Verify tap devices
+          ip link show tap0 && ip link show tap1
+
+      - name: Deploy powerfs.ko to share directory
+        run: |
+          mkdir -p kernel/vm/share
+          cp kernel/powerfs_mod/powerfs.ko kernel/vm/share/powerfs.ko
+          ls -la kernel/vm/share/powerfs.ko
+
+      - name: Start VM1
+        run: |
+          cd kernel/vm
+          # Kill any existing VMs
+          sudo pkill -f "qemu.*2223" 2>/dev/null || true
+          sleep 1
+          # Start VM1 in background
+          sudo nohup bash run_qemu_kernel_ssh.sh > /tmp/vm1_boot.log 2>&1 &
+          echo "VM1 starting (PID: $!)"
+          # Wait for VM1 to be ready
+          echo "Waiting for VM1 SSH..."
+          for i in $(seq 1 60); do
+            if ssh -p ${{ env.VM1_SSH_PORT }} -o StrictHostKeyChecking=no -o ConnectTimeout=2 root@localhost "true" 2>/dev/null; then
+              echo "VM1 SSH ready after ${i}s"
+              break
+            fi
+            sleep 1
+            [ $i -eq 60 ] && { echo "::error::VM1 SSH not ready after 60s"; cat /tmp/vm1_boot.log | tail -20; exit 1; }
+          done
+
+      - name: Start VM2
+        run: |
+          cd kernel/vm
+          sudo pkill -f "qemu.*2224" 2>/dev/null || true
+          sleep 1
+          sudo nohup bash run_qemu_vm2.sh > /tmp/vm2_boot.log 2>&1 &
+          echo "VM2 starting (PID: $!)"
+          echo "Waiting for VM2 SSH..."
+          for i in $(seq 1 60); do
+            if ssh -p ${{ env.VM2_SSH_PORT }} -o StrictHostKeyChecking=no -o ConnectTimeout=2 root@localhost "true" 2>/dev/null; then
+              echo "VM2 SSH ready after ${i}s"
+              break
+            fi
+            sleep 1
+            [ $i -eq 60 ] && { echo "::error::VM2 SSH not ready after 60s"; cat /tmp/vm2_boot.log | tail -20; exit 1; }
+          done
+
+      - name: Deploy powerfs.ko and mount on both VMs
+        run: |
+          for PORT in ${{ env.VM1_SSH_PORT }} ${{ env.VM2_SSH_PORT }}; do
+            echo "=== Deploying to VM (port $PORT) ==="
+            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost '
+              set -e
+              umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null || true
+              rmmod powerfs 2>/dev/null || true
+              cp /mnt/host/powerfs.ko /root/powerfs.ko
+              insmod /root/powerfs.ko master_addr=172.30.0.11,172.30.0.12,172.30.0.13 master_port=9334 shard_count=3
+              mount -t powerfs none /mnt/pfs -o master_addr=172.30.0.11,master_port=9334
+              echo "Deploy OK: $(mount | grep powerfs)"
+            ' || { echo "::error::Deploy failed on port $PORT"; exit 1; }
+          done
+
+      - name: Record dmesg baseline
+        id: dmesg_baseline
+        run: |
+          BASE_A=$(ssh -p ${{ env.VM1_SSH_PORT }} -o StrictHostKeyChecking=no root@localhost "dmesg | wc -l")
+          BASE_B=$(ssh -p ${{ env.VM2_SSH_PORT }} -o StrictHostKeyChecking=no root@localhost "dmesg | wc -l")
+          echo "BASE_A=$BASE_A" >> $GITHUB_OUTPUT
+          echo "BASE_B=$BASE_B" >> $GITHUB_OUTPUT
+          echo "dmesg baseline: VM1=$BASE_A VM2=$BASE_B lines"
+
+      - name: Run multi-client tests
+        id: test
+        run: |
+          cd kernel/vm
+          echo "Test mode: ${{ env.TEST_MODE }}"
+          bash test_multi_client.sh \
+            --mode=${{ env.TEST_MODE }} \
+            --output=junit \
+            --junit-file=/tmp/multi-client-results.xml \
+            --dmesg-check \
+            2>&1 | tee /tmp/multi-client-output.log
+          # Capture exit code (don't fail immediately, dmesg check may add context)
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "TEST_EXIT=$TEST_EXIT" >> $GITHUB_OUTPUT
+          # Show summary
+          tail -5 /tmp/multi-client-output.log
+          exit $TEST_EXIT
+
+      - name: Check dmesg for anomalies (SLUB, oops, etc.)
+        if: always()
+        run: |
+          cd kernel/vm
+          BASE_A="${{ steps.dmesg_baseline.outputs.BASE_A }}"
+          BASE_B="${{ steps.dmesg_baseline.outputs.BASE_B }}"
+          DMESG_FAIL=0
+          bash check_dmesg_anomaly.sh --port=${{ env.VM1_SSH_PORT }} --baseline=$BASE_A --label=VM1 || DMESG_FAIL=1
+          bash check_dmesg_anomaly.sh --port=${{ env.VM2_SSH_PORT }} --baseline=$BASE_B --label=VM2 || DMESG_FAIL=1
+          if [ "$DMESG_FAIL" = "1" ]; then
+            echo "::error::dmesg anomaly detected — blocking CI"
+            exit 1
+          fi
+          echo "dmesg check passed on both VMs"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-client-test-results
+          path: |
+            /tmp/multi-client-results.xml
+            /tmp/multi-client-output.log
+            /tmp/vm1_boot.log
+            /tmp/vm2_boot.log
+          retention-days: 30
+
+      - name: Publish JUnit test report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Multi-Client Test Results
+          path: /tmp/multi-client-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Create issue on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let logSummary = 'Unable to read log';
+            try {
+              const log = fs.readFileSync('/tmp/multi-client-output.log', 'utf8');
+              const lines = log.split('\n');
+              const results = lines.filter(l => l.match(/PASS:|FAIL:|SKIP:|Results:/)).slice(-10);
+              logSummary = results.join('\n') || logSummary;
+            } catch (e) {}
+
+            const mode = '${{ env.TEST_MODE }}';
+            const commit = context.sha.substring(0, 7);
+            const runId = context.runId;
+            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[REGRESSION] Multi-client ${mode} test failed (${commit})`,
+              labels: ['regression', 'kernel', 'multi-client'],
+              body: `## Multi-Client Test Failure
+
+            **Mode:** ${mode}
+            **Commit:** ${commit}
+            **Trigger:** ${context.eventName}
+
+            ### Test Summary
+            \`\`\`
+            ${logSummary}
+            \`\`\`
+
+            ### Artifacts
+            - [Test results](${repoUrl}/actions/runs/${runId})
+            - JUnit XML and logs available in run artifacts
+
+            ### Action Required
+            1. Download artifacts from the run
+            2. Check \`multi-client-output.log\` for failed test cases
+            3. Check \`check_dmesg_anomaly\` output for SLUB/kernel anomalies
+            4. If SLUB anomaly: investigate use-after-free in the indicated function
+            `
+            });
+
+      - name: Cleanup VMs
+        if: always()
+        run: |
+          echo "=== Cleaning up VMs ==="
+          sudo pkill -f "qemu.*2223" 2>/dev/null || true
+          sudo pkill -f "qemu.*2224" 2>/dev/null || true
+          sleep 2
+          # Verify cleanup
+          pgrep -af qemu | head -5 || echo "All VMs stopped"
