@@ -830,11 +830,20 @@ pub fn decode_delete_req(body: &[u8]) -> Result<(u64, bool), NetError> {
 /// Filer expects: ParentIno(u64) / Limit(u64) / LastName(string, empty for first page)
 /// The `offset` parameter (FUSE entry offset) is handled client-side by the FUSE
 /// layer; the Filer uses cursor-based pagination via LastName.
-pub fn encode_readdir_req(ino: u64, _offset: u64, count: u32) -> Result<Vec<u8>, NetError> {
+// Build a readdir request. `last_name` is the pagination cursor: the name of
+// the last entry returned in the previous page. The Filer skips entries with
+// name <= last_name (BTreeMap ordering) and returns the following page.
+// An empty last_name starts from the first entry.
+//
+// NOTE: previously this function took `_offset: u64` and hardcoded
+// `LastName=""`, which silently dropped the cursor — every readdir call
+// returned the first page, so rm -rf only ever saw the first 1000 entries
+// and the rest were never unlinked (intermittent-delete bug).
+pub fn encode_readdir_req(ino: u64, last_name: &str, count: u32) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::ParentIno, ino);
     enc.add_u64(FieldId::Limit, count as u64);
-    enc.add_string(FieldId::LastName, "")?;
+    enc.add_string(FieldId::LastName, last_name)?;
     Ok(enc.into_bytes())
 }
 

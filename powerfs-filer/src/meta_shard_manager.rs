@@ -1043,28 +1043,63 @@ impl MetaShardManager {
 
         // Fetch the inode record from its own shard (may differ from parent_shard).
         let inode_shard = self.shard_strategy.calculate_shard(inode);
-        let stores = self.shard_stores.read().unwrap();
-        let shard_store = stores.get(&inode_shard);
-        let info = match &shard_store {
-            Some(s) => s.get_inode(inode),
-            None => {
-                log::warn!(
-                    "lookup: inode_shard {} not found for inode {} (parent={}, name='{}')",
-                    inode_shard.0,
+        //
+        // === CORRECTNESS: cross-shard split-create apply lag ===================
+        // `create_file` proposes the inode record on `inode_shard` first, then
+        // proposes the dir entry on `parent_shard`. Each shard's Raft applies
+        // its own log entries asynchronously, so a client that observes the
+        // dir entry (e.g. via readdir / a prior lookup that returned it) can
+        // race with the inode_shard apply and observe:
+        //
+        //   dir_entry exists (parent_shard applied)
+        //   inode record MISSING (inode_shard not yet applied)
+        //
+        // Prior behavior: return None → open() fails with EIO from user POV.
+        // For workloads where tar create and open are back-to-back this is
+        // catastrophic; see the Linux kernel E2E test where this caused ~1%
+        // of file opens to spuriously fail.
+        //
+        // Fix: short spin-wait bounded by `CROSS_SHARD_APPLY_MAX_ATTEMPTS`.
+        // Typical apply lag is microseconds (same filer process, shared
+        // apply thread pool), so a handful of retries with 1 ms sleep is
+        // more than sufficient. If after that the inode is still missing,
+        // log a WARN and return None (the old behavior) so the failure is
+        // not silent.
+        const CROSS_SHARD_APPLY_MAX_ATTEMPTS: u32 = 50;
+        let mut info: Option<InodeInfo> = None;
+        for attempt in 0..CROSS_SHARD_APPLY_MAX_ATTEMPTS {
+            {
+                let stores = self.shard_stores.read().unwrap();
+                let shard_store = stores.get(&inode_shard);
+                info = match &shard_store {
+                    Some(s) => s.get_inode(inode),
+                    None => None,
+                };
+            }
+            if info.is_some() {
+                break;
+            }
+            if attempt == 0 {
+                log::debug!(
+                    "lookup: inode record not yet visible for inode={} shard={} \
+                     (parent={}, name='{}'), dir_entry exists — waiting for cross-shard apply...",
                     inode,
+                    inode_shard.0,
                     parent_inode,
                     name
                 );
-                return None;
             }
-        };
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         let info = match info {
             Some(i) => i,
             None => {
                 log::warn!(
-                    "lookup: inode record not found inode={} shard={} (parent={}, name='{}') \
-                     — dir_entry exists but inode record missing (cross-shard apply lag)",
+                    "lookup: inode record not found after {} retries inode={} shard={} \
+                     (parent={}, name='{}') — dir_entry exists but inode record missing \
+                     (cross-shard apply lag exceeded retry budget)",
+                    CROSS_SHARD_APPLY_MAX_ATTEMPTS,
                     inode,
                     inode_shard.0,
                     parent_inode,

@@ -1401,29 +1401,48 @@ impl FilerNetHandler {
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
 
-        info!("FILER_NET_UNLINK: parent_ino={}, name={}", parent_ino, name);
+        // Directory entries live in the shard of parent_inode.
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
 
+        info!(
+            "FILER_NET_UNLINK: parent_ino={}, name={}, shard={}",
+            parent_ino, name, shard_id.0
+        );
+
+        // Check leader BEFORE lookup. If we are not the leader for this
+        // shard, redirect immediately — do NOT return NOT_FOUND based on
+        // stale follower state.  Previously the lookup was done first; if a
+        // follower whose Raft log had not yet replicated the entry returned
+        // None, it sent STATUS_ERR_NOT_FOUND without ever checking leader.
+        // The FUSE client mapped that to ENOENT, rm -f silently ignored it,
+        // and the file survived on the real leader (intermittent delete bug).
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_UNLINK: not leader for shard {}, redirecting (parent_ino={}, name={})",
+                shard_id.0, parent_ino, name
+            );
+            return Ok(redirect);
+        }
+
+        // We are the leader — safe to read local state.
         match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
             Some(info) => {
-                // Directory entries live in the shard of parent_inode.
+                info!(
+                    "FILER_NET_UNLINK: found entry inode={} for '{}/{}', deleting",
+                    info.inode, parent_ino, name
+                );
+
                 // Use parent_ino (not info.inode) for shard calculation so
                 // the delete targets the correct shard. For hardlinks,
                 // info.inode's stored parent/name may differ from the actual
                 // entry being unlinked, so we must pass parent_ino/name
                 // directly to delete_file instead of using delete_file_by_inode.
-                let shard_id = self.shard_strategy.calculate_shard(parent_ino);
-
-                // Check leader - redirect write requests to the correct leader
-                if let Err(redirect) = self.check_leader(msg, shard_id).await {
-                    warn!(
-                        "FILER_NET_UNLINK: not leader for shard {}, redirecting",
-                        shard_id.0
-                    );
-                    return Ok(redirect);
-                }
-
                 match self.meta_shard_manager.delete_file(parent_ino, &name).await {
                     Ok(_) => {
+                        info!(
+                            "FILER_NET_UNLINK: deleted inode={} ('{}/{}')",
+                            info.inode, parent_ino, name
+                        );
                         // B5: notify 目录条目变更（parent readdir 缓存 + 被删 inode 失效）
                         let v = self.next_version();
                         self.notify_inode_change(parent_ino, v);
@@ -1431,7 +1450,10 @@ impl FilerNetHandler {
                         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
                     }
                     Err(e) => {
-                        warn!("FILER_NET_UNLINK failed: {}", e);
+                        warn!(
+                            "FILER_NET_UNLINK failed: parent_ino={}, name={}, inode={}, err={}",
+                            parent_ino, name, info.inode, e
+                        );
                         Ok(Self::build_response(
                             msg,
                             STATUS_ERR_SERVER_ERROR,
@@ -1440,7 +1462,14 @@ impl FilerNetHandler {
                     }
                 }
             }
-            None => Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new())),
+            None => {
+                // We are the leader and the entry genuinely doesn't exist.
+                warn!(
+                    "FILER_NET_UNLINK: entry not found (leader confirmed) parent_ino={}, name={}",
+                    parent_ino, name
+                );
+                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+            }
         }
     }
 

@@ -122,7 +122,7 @@ assert_eq "short" "$B_CONTENT" "L4.05 truncate 扩大内容保留"
 
 # L4.06: rename 可见性
 log "L4.06: rename 可见性"
-a "echo 'rename test' > $TEST_DIR/vis_rename_src.txt"
+a "echo 'rename test' > $TEST_DIR/Use existing I/O test tools, not hand‚Äëcrafted shell scripts.vis_rename_src.txt"
 sleep 0.3
 a "mv $TEST_DIR/vis_rename_src.txt $TEST_DIR/vis_rename_dst.txt"
 sleep 0.5

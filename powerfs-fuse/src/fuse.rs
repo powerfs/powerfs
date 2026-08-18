@@ -329,6 +329,7 @@ impl FuseApp {
             inline_max_sizes: Arc::new(DashMap::new()),
             last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
             fuse_fd: fuse_fd.clone(),
+            readdir_cursors: Arc::new(DashMap::new()),
         };
 
         let fs_arc = Arc::new(fs);
@@ -530,6 +531,26 @@ struct PowerFsFs {
     /// reads (e.g., wc -l) return stale line counts even though the Filer
     /// has the correct data (including other clients' concurrent appends).
     fuse_fd: Arc<std::sync::atomic::AtomicI32>,
+    /// readdir pagination cursors: per-directory record of the last entry
+    /// name returned in the previous page, so the next readdir(offset=N) can
+    /// resume from that name instead of restarting from the first entry.
+    ///
+    /// Without this the FUSE `offset` (a numeric cookie) was discarded by
+    /// `encode_readdir_req` (which hardcoded `LastName=""`), so every readdir
+    /// RPC returned the first page — `rm -rf` never enumerated entries beyond
+    /// the first page and they survived the deletion (intermittent-delete bug).
+    readdir_cursors: Arc<DashMap<u64, ReaddirCursor>>,
+}
+
+/// Cursor for last_name-based readdir pagination.
+/// `next_offset` is the FUSE offset value that the kernel will pass to the
+/// next readdir() call (it equals the offset assigned to the last returned
+/// DirEntry). When the kernel calls readdir(offset == next_offset), we hand
+/// the Filer `last_name` so it skips already-returned entries.
+#[derive(Clone)]
+struct ReaddirCursor {
+    next_offset: u64,
+    last_name: String,
 }
 
 const NUM_DIRTY_SHARDS: usize = 16;
@@ -2528,6 +2549,15 @@ impl FileSystem for PowerFsFs {
                 let errno = filer_error_to_errno(&e.to_string());
                 if errno == libc::EIO {
                     error!("unlink RPC failed: {}", e);
+                } else if errno == libc::ENOENT {
+                    // ENOENT on unlink is suspicious — it means the filer returned
+                    // NOT_FOUND. This can happen if the request hit a non-leader
+                    // whose Raft state was stale (pre-fix). Log at warn so it's
+                    // visible even without --verbose.
+                    warn!(
+                        "unlink: ENOENT for '{}/{}' (shard={}) — possible stale leader read; err={}",
+                        parent, name_str, shard_id, e
+                    );
                 } else {
                     debug!("unlink RPC failed: {} -> errno={}", e, errno);
                 }
@@ -4393,47 +4423,133 @@ impl FileSystem for PowerFsFs {
         }
         buf.truncate(read_len);
 
-        // Backpressure: if cache is near capacity, synchronously flush dirty
-        // chunks to free up space BEFORE adding new data. Without this, heavy
-        // writes (e.g., IO500 IOR) fill the cache with dirty chunks that
-        // cannot be evicted (eviction only removes non-dirty chunks), causing
-        // unbounded memory growth (observed 1.5GB vs 512MB limit) and OOM.
+        // === CORRECTNESS / DATA-INTEGRITY BACKPRESSURE =======================
         //
-        // The global backpressure lock serializes flushes across ALL FUSE
-        // worker threads. Without it, each worker independently triggers a
-        // flush while the others keep growing the cache, defeating the
-        // backpressure. With the lock, when one worker flushes, all others
-        // that detect the same condition block until the flush completes,
-        // effectively pausing all writes during the flush.
+        // Heavy write workloads (e.g., 96k-file kernel tarball unpack) produce
+        // dirty chunks faster than the flusher can sync them to the Filer via
+        // Raft. Naive backpressure (one-shot flush then keep writing) still
+        // leaves the cache over capacity on return, which immediately re-
+        // triggers backpressure on the next write → 53k+ backpressure events
+        // → write EIO and cascaded stat failures because tar cannot complete
+        // its operations.
+        //
+        // The correct semantics: a write that finds the cache above threshold
+        // MUST block until the cache drops BELOW the threshold. Only then is
+        // there guaranteed headroom for the new write. This trades throughput
+        // for correctness — a trade any production filesystem must accept.
+        //
+        // Implementation notes:
+        //   - The global mutex serializes flushes AND gates entry into the
+        //     write-data path below, so no new dirty data enters while one
+        //     thread is actively draining.
+        //   - We flush repeatedly in a loop because a single flush pass may
+        //     race with in-flight writes that were already queued before the
+        //     mutex was acquired (concurrent writes from different FUSE
+        //     requests that had already passed the check above the call site).
+        //   - A sanity cap (BACKPRESSURE_MAX_ITERS) prevents infinite loops
+        //     if the flusher itself is failing (e.g., Filer unreachable).
+        //     In that case we log a CRITICAL-level message and return EIO to
+        //     the caller instead of silently accumulating dirty data that
+        //     cannot be persisted — silent data loss is unacceptable.
         {
             const BACKPRESSURE_THRESHOLD_PCT: u64 = 85;
+            // After a flush pass, require the cache to drop TARGET_PCT below
+            // threshold so there is meaningful headroom (prevents thrashing
+            // between "just above → just below → just above").
+            const BACKPRESSURE_TARGET_PCT: u64 = 70;
+            const BACKPRESSURE_MAX_ITERS: u32 = 64;
             let max = self.chunk_cache.max_bytes() as u64;
             if max > 0 {
                 let threshold = max * BACKPRESSURE_THRESHOLD_PCT / 100;
-                let current = self.chunk_cache.current_bytes();
+                let target = max * BACKPRESSURE_TARGET_PCT / 100;
+                let mut current = self.chunk_cache.current_bytes();
                 if current > threshold {
-                    // Acquire global lock so only one thread flushes at a time.
-                    // Other write threads block here, preventing concurrent
-                    // cache growth during the flush.
-                    let _bp_guard = self
+                    let bp_guard = self
                         .backpressure_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    // Re-check after acquiring lock: the previous flush may have
-                    // already reduced the cache below threshold.
-                    let current = self.chunk_cache.current_bytes();
-                    if current > threshold {
-                        // RACE_TRACE: Backpressure flush can trigger the unpin race
-                        // in flush_all_dirty_chunks. Log to correlate with ENOENT.
-                        warn!(
-                            "write BACKPRESSURE: inode={} cache={} > threshold={} ({}%) thread={:?} \
-                             — calling flush_all_dirty_chunks (may unpin still-open inodes)",
-                            inode, current, threshold, BACKPRESSURE_THRESHOLD_PCT,
-                            std::thread::current().id()
-                        );
-                        let _ = self.flush_all_dirty_chunks();
+                    let mut iter: u32 = 0;
+                    loop {
+                        current = self.chunk_cache.current_bytes();
+                        if current <= target {
+                            break;
+                        }
+                        iter += 1;
+                        if iter > BACKPRESSURE_MAX_ITERS {
+                            log::error!(
+                                "BACKPRESSURE FAILURE: cache={} > target={} after {} flushes. \
+                                 inode={} thread={:?}. \
+                                 Persisting dirty data is not possible; returning EIO rather than \
+                                 risking silent data loss. Check Filer/Volume reachability and \
+                                 Raft commit latency.",
+                                current,
+                                target,
+                                BACKPRESSURE_MAX_ITERS,
+                                inode,
+                                std::thread::current().id()
+                            );
+                            drop(bp_guard);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!(
+                                    "write backpressure: cache {} exceeds target {} after {} flushes (data integrity requires flusher progress)",
+                                    current, target, BACKPRESSURE_MAX_ITERS
+                                )
+                            ));
+                        }
+                        if iter == 1 {
+                            log::warn!(
+                                "write BACKPRESSURE[ENTER]: inode={} cache={} > threshold={} ({}%), target={}, \
+                                 thread={:?} — will flush until cache <= target",
+                                inode, current, threshold, BACKPRESSURE_THRESHOLD_PCT,
+                                target, std::thread::current().id()
+                            );
+                        }
+                        if let Err(e) = self.flush_all_dirty_chunks() {
+                            log::error!(
+                                "BACKPRESSURE flush_all_dirty_chunks failed on iter {}: {}; \
+                                 continuing retry loop but flusher is unhealthy.",
+                                iter,
+                                e
+                            );
+                        }
+                        // Even after a successful flush pass the cache can
+                        // still sit above the TARGET because `put()` only
+                        // triggers eviction above `max_bytes`, leaving a
+                        // dead zone (target < current <= max) full of clean
+                        // (read-cache or post-flush pinned) chunks. Those
+                        // chunks are safe to drop — they come from files
+                        // either already persisted or read during the
+                        // unpack — so proactively evict them here. Without
+                        // this step, we loop 64 times making zero progress
+                        // (no dirty chunks to flush, no eviction triggered
+                        // by `put()`) and finally declare a spurious EIO
+                        // that cascades into thousands of user-visible I/O
+                        // errors. See evict_clean_to in cache.rs.
+                        let after_flush = self.chunk_cache.current_bytes();
+                        if after_flush > target {
+                            let freed = self.chunk_cache.evict_clean_to(target);
+                            if freed > 0 {
+                                log::debug!(
+                                    "BACKPRESSURE evict_clean_to iter={}: freed {} bytes, \
+                                     before={} after={} target={}",
+                                    iter,
+                                    freed,
+                                    after_flush,
+                                    self.chunk_cache.current_bytes(),
+                                    target
+                                );
+                            }
+                        }
                     }
-                    // Lock released here; other threads can now proceed.
+                    if iter > 1 {
+                        log::warn!(
+                            "write BACKPRESSURE[EXIT]: inode={} cache={} <= target={} after {} iters, \
+                             thread={:?}",
+                            inode, current, target, iter, std::thread::current().id()
+                        );
+                    }
+                    drop(bp_guard);
                 }
             }
         }
@@ -5795,69 +5911,165 @@ impl FileSystem for PowerFsFs {
             }
         };
 
-        let mut idx = 0u64;
-
-        if offset <= idx
-            && add_entry(DirEntry {
+        // "." and ".." are only emitted on the first page (offset <= 1).
+        // We use fixed DirEntry.offset values (1 and 2) so the kernel does
+        // not re-request them after we advance past the first page.
+        if offset == 0 {
+            match add_entry(DirEntry {
                 ino: inode,
-                offset: idx + 1,
+                offset: 1,
                 type_: 0o040000,
                 name: ".".as_bytes(),
-            })
-            .is_err()
-        {
-            return Ok(());
+            }) {
+                Ok(0) | Err(_) => return Ok(()), // buffer full or error
+                Ok(_) => {}
+            }
         }
-        idx += 1;
-
-        if offset <= idx
-            && add_entry(DirEntry {
+        if offset <= 1 {
+            match add_entry(DirEntry {
                 ino: parent_ino,
-                offset: idx + 1,
+                offset: 2,
                 type_: 0o040000,
                 name: "..".as_bytes(),
-            })
-            .is_err()
-        {
-            return Ok(());
+            }) {
+                Ok(0) | Err(_) => return Ok(()), // buffer full or error
+                Ok(_) => {}
+            }
         }
-        idx += 1;
+
+        // `idx` must continue monotonically across pages so that
+        // DirEntry.offset never regresses. If we are resuming past page 1
+        // (offset > 2), start idx at offset; otherwise (page 1) start at 2
+        // (after "." and ".."). A regressing offset would make the kernel
+        // treat it as a rewind and stop reading the directory — reproducing
+        // the readdir-only-first-page bug that caused rm -rf to leave
+        // entries beyond the first page unlinked.
+        let mut idx = if offset > 2 { offset } else { 2 };
 
         // Step 2: 通过 MetadataClient.readdir RPC 走 Filer Raft leader（强一致 Leader Lease Read）
         // 方案 B (S5): 优先用缓存的 shard_id (目录 inode 创建时 Filer 返回的权威值),
         // 缓存 miss 时回退到 calculate_shard_id(inode)。
+        //
+        // Pagination: the Filer uses a last_name cursor (BTreeMap seek), not a
+        // numeric offset. We translate the FUSE `offset` cookie into the
+        // matching `last_name` using `readdir_cursors`:
+        //   - offset == 0  → fresh read; clear cursor; last_name = ""
+        //   - offset > 0 with a stored cursor → resume; last_name = cursor.last_name
+        //     (We match loosely on offset because the FUSE kernel may pass the
+        //     last DirEntry.offset or offset+1, and exact equality was causing
+        //     cursor misses that restarted from the first page — reproducing
+        //     the very intermittent-delete bug this fixes. For sequential
+        //     readers like `rm -rf`/`find`, the cursor is monotonic, so a
+        //     stale cursor at worst repeats one page rather than skipping.)
+        //   - offset > 0 with no cursor → fallback "" (rewind past cache).
+        let last_name: String = if offset == 0 {
+            self.readdir_cursors.remove(&inode);
+            String::new()
+        } else {
+            match self.readdir_cursors.get(&inode) {
+                Some(c) => c.last_name.clone(),
+                None => {
+                    debug!(
+                        "readdir: cursor miss for inode {} offset {} (rewind/seek), restarting from head",
+                        inode, offset
+                    );
+                    String::new()
+                }
+            }
+        };
+
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(inode);
+        let ln = last_name.clone();
         let dir_entries: Vec<MetadataDirEntry> = self
             .client
-            .block_on(async move { meta_client.readdir(inode, offset, 1000, shard_id).await })
+            .block_on(async move { meta_client.readdir(inode, &ln, 1000, shard_id).await })
             .map_err(|e| {
                 error!("readdir RPC failed for inode {}: {}", inode, e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
 
-        debug!(
-            "readdir: RPC returned {} entries for dir {}",
-            dir_entries.len(),
-            inode
+        info!(
+            "READDIR_DIAG: inode={} offset={} requested_last_name={:?} filer_returned={}",
+            inode,
+            offset,
+            last_name,
+            dir_entries.len()
         );
 
-        for child in dir_entries {
+        debug!(
+            "readdir: RPC returned {} entries for dir {} (last_name={:?})",
+            dir_entries.len(),
+            inode,
+            last_name
+        );
+
+        let mut last_returned: Option<&MetadataDirEntry> = None;
+        for child in &dir_entries {
             idx += 1;
-            if offset < idx {
-                // DT_DIR=4, DT_REG=8, DT_LNK=10 等；FUSE DirEntry.type_ 用 d_type 值
-                let type_ = child.file_type as u32;
-                if add_entry(DirEntry {
-                    ino: child.inode,
-                    offset: idx,
-                    type_,
-                    name: child.name.as_bytes(),
-                })
-                .is_err()
-                {
-                    return Ok(());
+            // DT_DIR=4, DT_REG=8, DT_LNK=10 等；FUSE DirEntry.type_ 用 d_type 值
+            let type_ = child.file_type as u32;
+            // NOTE: we do NOT skip entries with `if offset < idx` here.
+            // That check was correct for a single page but, once pagination
+            // was added, `idx` resumes from `offset` (which is >= the page's
+            // first idx), so `offset < idx` was false for the WHOLE second
+            // page — silently skipping every entry past page 1 and making
+            // readdir return only the first page forever. Since we now emit
+            // "." / ".." with fixed offsets only on page 1, and `idx` starts
+            // at `offset` on subsequent pages, every entry on the current
+            // page must be emitted unconditionally.
+            //
+            // CRITICAL: fuse-backend-rs's add_dirent returns Ok(0) — NOT Err —
+            // when the kernel readdir buffer is full. Checking only .is_err()
+            // caused the loop to continue past the buffer-full point, updating
+            // last_returned to the LAST entry in the filer's sort order
+            // (e.g. "file_99.txt" in lexicographic order) instead of the last
+            // entry actually written to the buffer. The cursor then pointed
+            // to a name near the end of the BTreeMap, so the next readdir
+            // RPC returned 0 entries — silently dropping ~500/600 entries
+            // and causing rm -rf to leave most files behind.
+            match add_entry(DirEntry {
+                ino: child.inode,
+                offset: idx,
+                type_,
+                name: child.name.as_bytes(),
+            }) {
+                Ok(0) => {
+                    // Buffer full — stop adding. Do NOT update last_returned:
+                    // it must stay at the last entry successfully written so
+                    // the cursor resumes correctly on the next readdir call.
+                    break;
+                }
+                Ok(_) => {
+                    last_returned = Some(child);
+                }
+                Err(_) => {
+                    break;
                 }
             }
+        }
+
+        // Record the pagination cursor with the name of the last entry
+        // actually returned to the kernel. If we broke out early (buffer
+        // full), the next readdir() must resume right after this entry.
+        // Only skip the update when nothing was returned (empty page →
+        // end-of-directory, or all entries skipped by offset → rewind).
+        info!(
+            "READDIR_DIAG: inode={} offset={} returned_to_kernel={} last_name={:?} next_idx={}",
+            inode,
+            offset,
+            last_returned.is_some(),
+            last_returned.map(|e| e.name.as_str()).unwrap_or("(none)"),
+            idx
+        );
+        if let Some(last) = last_returned {
+            self.readdir_cursors.insert(
+                inode,
+                ReaddirCursor {
+                    next_offset: idx,
+                    last_name: last.name.clone(),
+                },
+            );
         }
 
         Ok(())

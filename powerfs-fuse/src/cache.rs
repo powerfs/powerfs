@@ -554,12 +554,38 @@ impl MetadataCache {
     }
 
     /// Insert an entry into the cache (only update path_map, keep existing inode_cache entry for hard links)
-    pub fn insert(&self, entry: CachedEntry) {
-        let parent = entry.parent;
+    pub fn insert(&self, mut entry: CachedEntry) {
         let inode = entry.inode;
+        // === CORRECTNESS GUARD: a new/cached entry must never be its own parent
+        // If the incoming entry has parent == inode, that is a fatal metadata
+        // inconsistency from either the Filer response or a stale call-site
+        // path. Rewrite parent to 1 (root) and log ERROR so we never create a
+        // self-referential chain (which would cycle every insert() call).
+        if inode != 1 && entry.parent == inode {
+            log::error!(
+                "METADATA_CORRUPTION: new entry inode={} has parent==self; rewriting parent=1 to break self-cycle. name={:?}",
+                inode, entry.name
+            );
+            entry.parent = 1;
+        }
+        let parent = entry.parent;
         let path = if inode == 1 {
             String::from("/")
         } else {
+            // === CORRECTNESS GUARD ==========================================
+            // Build the parent-chain path while holding a SINGLE read-lock on
+            // inode_cache. Previously each get_inode() call acquired and
+            // released the lock independently, allowing concurrent EVICT +
+            // re-INSERT to modify an ancestor's parent mid-traversal. That
+            // could produce a cycle: A→B→C→A, causing stat() calls against
+            // the cached path to fail with EIO.
+            //
+            // A cycle in the parent chain is a metadata corruption event —
+            // it must never happen silently. When a cycle is detected, we
+            // log an ERROR and degrade to a synthetic path so the caller can
+            // continue, but the event is loud enough to warrant fsck-level
+            // investigation.
+            let cache_guard = self.inode_cache.read().unwrap();
             let mut parts = Vec::new();
             parts.push(entry.name.clone());
             let mut current = parent;
@@ -567,16 +593,22 @@ impl MetadataCache {
             visited.insert(inode);
             while current != 1 {
                 if !visited.insert(current) {
-                    warn!("Detected cycle in path construction, breaking");
+                    log::error!(
+                        "METADATA_CORRUPTION: cycle in parent chain while inserting inode={} name={:?}; \
+                         visited_ancestors={:?}, cycle_node={}. \
+                         The filesystem cannot trust this cached path — verify with fsck.",
+                        inode, entry.name, visited, current
+                    );
                     break;
                 }
-                if let Some(e) = self.get_inode(current) {
+                if let Some(e) = cache_guard.peek(&current) {
                     parts.push(e.name.clone());
                     current = e.parent;
                 } else {
                     break;
                 }
             }
+            drop(cache_guard);
             parts.reverse();
             let mut path = String::from("/");
             for part in parts {
@@ -602,15 +634,73 @@ impl MetadataCache {
         // - If the inode exists with same name/parent: treat as hard link, preserve
         //   the original hard_link_id and update hard_link_counter if provided
         // Always update cached_at to prevent premature expiration
+        //
+        // === CORRECTNESS GUARD: rename must not create a cycle =================
+        // Compute would_cycle BEFORE entering the mutable borrow to avoid
+        // borrowing cache as both mutable & immutable in the same block. If
+        // the incoming new_parent equals the inode, or a traversal from
+        // new_parent up to root would re-enter `inode` (meaning we would make
+        // `inode` an ancestor of itself), the rename creates a cycle.
+        //
+        // This is defense-in-depth: Filer-side apply_rename is authoritative,
+        // but a client must never mirror a corrupt parent chain into its own
+        // cache, even transiently, because insert() builds paths from the
+        // parent chain and a cycle yields bogus cached paths → stat EIO.
+        //
+        // Special case: the root inode (=1) conventionally has parent=1
+        // (self-parent). It is NOT a cycle; skip the check entirely for it.
+        let new_parent = entry.parent;
+        let would_cycle: bool;
+        if inode == 1 {
+            would_cycle = false;
+        } else {
+            let ro_cache = self.inode_cache.read().unwrap();
+            let mut wc = new_parent == inode;
+            if !wc {
+                let mut cur = new_parent;
+                let mut visited2 = std::collections::HashSet::new();
+                visited2.insert(inode);
+                while cur != 1 {
+                    if !visited2.insert(cur) {
+                        wc = true;
+                        break;
+                    }
+                    if cur == inode {
+                        wc = true;
+                        break;
+                    }
+                    match ro_cache.peek(&cur) {
+                        Some(e) => cur = e.parent,
+                        None => break,
+                    }
+                }
+            }
+            would_cycle = wc;
+        }
+
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(existing) = cache.get_mut(&inode) {
             if existing.name != entry.name || existing.parent != entry.parent {
-                // Rename: replace with the new entry's metadata.
-                // Preserve xattrs from the old entry — they are local-only
-                // (not stored in the Filer) and would be lost on replace.
-                let preserved_xattrs = std::mem::take(&mut existing.xattrs);
-                *existing = entry;
-                existing.xattrs = preserved_xattrs;
+                if would_cycle {
+                    log::error!(
+                        "METADATA_CORRUPTION: rename would create cycle for inode={} \
+                         existing_parent={} new_parent={} new_name={:?}. \
+                         Rejecting rename update (keeping old entry) to preserve cache integrity.",
+                        inode,
+                        existing.parent,
+                        new_parent,
+                        entry.name
+                    );
+                    // Keep existing entry untouched; update cached_at only.
+                    existing.cached_at = std::time::Instant::now();
+                } else {
+                    // Rename: replace with the new entry's metadata.
+                    // Preserve xattrs from the old entry — they are local-only
+                    // (not stored in the Filer) and would be lost on replace.
+                    let preserved_xattrs = std::mem::take(&mut existing.xattrs);
+                    *existing = entry;
+                    existing.xattrs = preserved_xattrs;
+                }
             } else {
                 // Same name/parent: update metadata fields from the new entry.
                 //
@@ -2203,6 +2293,61 @@ impl ChunkCache {
                 break;
             }
         }
+    }
+
+    /// Evict the oldest NON-DIRTY chunks until the cache holds at most
+    /// `target_bytes` bytes of resident data. Unlike `evict_if_needed` which
+    /// only kicks in after `current > max_bytes`, this method is explicitly
+    /// called by the write backpressure path after a flush pass so that the
+    /// cache can drop from the middle region (target < current < max) back
+    /// down to target — otherwise clean (read/pinned-after-flush) chunks
+    /// permanently occupy the headroom, causing 64 futile flush iterations
+    /// followed by a spurious BACKPRESSURE FAILURE → user-visible EIO on
+    /// an otherwise healthy backend.
+    ///
+    /// Returns the number of bytes freed so callers can log progress.
+    pub fn evict_clean_to(&self, target_bytes: u64) -> u64 {
+        if self.max_bytes == 0 {
+            return 0;
+        }
+        let mut freed: u64 = 0;
+        loop {
+            if self.current_bytes.load(Ordering::SeqCst) <= target_bytes {
+                break;
+            }
+
+            let mut oldest: Option<(usize, (u64, u64))> = None;
+            let mut oldest_mtime = u64::MAX;
+            for (shard_idx, shard) in self.shards.iter().enumerate() {
+                let cache = shard.read().unwrap();
+                for (key, chunk) in cache.iter() {
+                    if !chunk.dirty && chunk.mtime < oldest_mtime {
+                        oldest_mtime = chunk.mtime;
+                        oldest = Some((shard_idx, *key));
+                    }
+                }
+            }
+
+            if let Some((shard_idx, key)) = oldest {
+                let shard = &self.shards[shard_idx];
+                let mut cache = shard.write().unwrap();
+                if let Some(removed) = cache.remove(&key) {
+                    let sz = removed.data.len() as u64;
+                    self.current_bytes.fetch_sub(sz, Ordering::SeqCst);
+                    freed = freed.saturating_add(sz);
+                }
+            } else {
+                warn!(
+                    "ChunkCache evict_clean_to: no clean chunks available, \
+                     cannot drop from current={} to target={}. All resident \
+                     chunks are dirty; backpressure depends on flusher progress.",
+                    self.current_bytes.load(Ordering::SeqCst),
+                    target_bytes
+                );
+                break;
+            }
+        }
+        freed
     }
 
     /// 移除指定 inode 中 chunk offset >= max_offset 的所有 chunk（用于 truncate）

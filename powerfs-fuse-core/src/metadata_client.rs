@@ -207,10 +207,13 @@ pub trait MetadataClient: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MetadataAttr>> + Send + '_>>;
 
     /// readdir：列出目录条目
+    /// `last_name` is the pagination cursor (name of the last entry from the
+    /// previous page; empty string starts from the first entry). The Filer
+    /// skips entries with name <= last_name and returns the next page.
     fn readdir(
         &self,
         ino: u64,
-        offset: u64,
+        last_name: &str,
         count: u32,
         shard_id: u64,
     ) -> std::pin::Pin<
