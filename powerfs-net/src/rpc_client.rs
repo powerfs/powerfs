@@ -345,26 +345,62 @@ impl RpcConnection {
             .await
             .map_err(|e| NetError::Connection(format!("send frame: {e}")))?;
 
-        // 4. Read response header.
-        let mut hdr_buf = [0u8; FrameHeader::SIZE];
-        tokio::time::timeout(opts.response_timeout, self.reader.read_exact(&mut hdr_buf))
-            .await
-            .map_err(|_| NetError::Timeout)?
-            .map_err(|e| NetError::Connection(format!("read header: {e}")))?;
-        let hdr = FrameHeader::decode_checked(&hdr_buf).map_err(|reason| {
-            // Layer 1: 帧头不变式违反
-            log::warn!(
-                "{} rpc_client: invalid response header, reason={}",
-                crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT,
-                reason
-            );
-            NetError::Protocol(format!("invalid response header: {}", reason))
-        })?;
+        // 4. Read response, skipping async notifications (e.g. TopologyChanged)
+        //    that the server may push on the same connection between the request
+        //    and its response. A notification frame has a different msg_type
+        //    (and usually seq=0); only a frame matching our msg_type+seq is the
+        //    actual response we're waiting for.
+        let expected_msg_type = msg_type.as_u16();
+        let hdr = loop {
+            let mut hdr_buf = [0u8; FrameHeader::SIZE];
+            tokio::time::timeout(opts.response_timeout, self.reader.read_exact(&mut hdr_buf))
+                .await
+                .map_err(|_| NetError::Timeout)?
+                .map_err(|e| NetError::Connection(format!("read header: {e}")))?;
+            let hdr = FrameHeader::decode_checked(&hdr_buf).map_err(|reason| {
+                log::warn!(
+                    "{} rpc_client: invalid response header, reason={}",
+                    crate::protocol::LOG_PREFIX_RX_HDR_INVARIANT,
+                    reason
+                );
+                NetError::Protocol(format!("invalid response header: {}", reason))
+            })?;
+
+            // Skip server-initiated notification frames (different msg_type or
+            // mismatched seq). Read and discard their payload, then loop.
+            if hdr.msg_type != expected_msg_type || hdr.seq != seq {
+                let skip_total = hdr.data_len as usize;
+                if skip_total > 0 {
+                    let mut skip_buf = vec![0u8; skip_total];
+                    tokio::time::timeout(
+                        opts.response_timeout,
+                        self.reader.read_exact(&mut skip_buf),
+                    )
+                    .await
+                    .map_err(|_| NetError::Timeout)?
+                    .map_err(|e| NetError::Connection(format!("read notification body: {e}")))?;
+                }
+                log::debug!(
+                    "RPC_CLIENT: skipped notification msg_type={:#x} seq={} (expected {:#x}/{})",
+                    hdr.msg_type,
+                    hdr.seq,
+                    expected_msg_type,
+                    seq
+                );
+                continue;
+            }
+            break hdr;
+        };
 
         // 5. Read response body (body + data combined; callers decode TLV).
         let total = hdr.data_len as usize;
         let body_len = hdr.body_len as usize;
         let data_len = total.saturating_sub(body_len);
+
+        log::debug!(
+            "RPC_CLIENT: response msg_type={:#x} seq={} status={:#06x} data_len={} body_len={} data_seg={}",
+            hdr.msg_type, hdr.seq, hdr.status, total, body_len, data_len
+        );
 
         // Layer 3: per-msg_type 期望响应大小校验（仅告警）
         check_resp_size(hdr.msg_type, body_len, data_len);

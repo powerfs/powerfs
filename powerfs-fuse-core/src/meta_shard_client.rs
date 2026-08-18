@@ -1282,6 +1282,59 @@ impl MetaShardClient {
                     })
                     .unwrap_or_else(|| format!("server status {}", status));
 
+                    // === Server-error retry (status 10) =====================
+                    // STATUS_ERR_SERVER_ERROR is returned for transient
+                    // failures inside the Filer — most commonly:
+                    //   "setattr/unlink/rmdir timeout waiting for apply"
+                    // when the Raft apply queue is briefly backlogged, or
+                    // "propose forward failed: leader kept changing" during
+                    // elections. These heal themselves on a retry, and
+                    // returning EIO to the caller produces a user-visible
+                    // data error (tar fails a file, rm -rf misses an entry).
+                    //
+                    // Retry only if:
+                    //   * we still have attempts left
+                    //   * status is a TRANSIENT server error (NOT_FOUND,
+                    //     ALREADY_EXISTS etc. are deterministic client
+                    //     errors and retrying them is meaningless).
+                    //
+                    // Create/rename/unlink are "at-least-once" semantically
+                    // safe to retry because the Filer checks existence
+                    // before committing. SetAttr/SetAttrData/SetAttrMeta
+                    // are idempotent because they apply absolute values
+                    // (mode uid gid size mtime atime), not deltas.
+                    //
+                    // is_client_error() already filters out deterministic
+                    // status values; the remaining non-OK statuses are
+                    // server-side and eligible. We only actually retry on
+                    // STATUS_ERR_SERVER_ERROR / NO_SPACE / REDIRECT-status
+                    // with remaining retries.
+                    const RETRYABLE_SERVER_STATUS: &[u16] = &[
+                        powerfs_net::STATUS_ERR_SERVER_ERROR,
+                        powerfs_net::STATUS_ERR_NO_SPACE,
+                        powerfs_net::STATUS_ERR_IO,
+                    ];
+                    if attempt < MAX_ATTEMPTS && RETRYABLE_SERVER_STATUS.contains(&status) {
+                        last_err = format!(
+                            "server status {} (retry {}/{}): {}",
+                            status, attempt, MAX_ATTEMPTS, err_msg
+                        );
+                        log::warn!(
+                            "send_coherence_msg: {:?} shard={} retryable server status={} \
+                             attempt {}/{} on {}: {}; backing off then retrying",
+                            msg_type,
+                            shard_id,
+                            status,
+                            attempt,
+                            MAX_ATTEMPTS,
+                            target_addr,
+                            err_msg
+                        );
+                        let delay_ms = net_backoff_ms(attempt + 1);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
                     // Client errors (ENOENT, ENODATA, EEXIST, etc.) are
                     // normal responses — the server is healthy. Don't count
                     // them as errors in stats to avoid inflating error rate.
@@ -2144,12 +2197,14 @@ impl MetadataClient for MetaShardClient {
     fn readdir(
         &self,
         ino: u64,
-        offset: u64,
+        last_name: &str,
         count: u32,
         shard_id: u64,
     ) -> Pin<Box<dyn Future<Output = FsResult<Vec<MetadataDirEntry>>> + Send + '_>> {
+        // Own the cursor string so the returned Future does not borrow it.
+        let last_name = last_name.to_owned();
         Box::pin(async move {
-            let body = serialize::encode_readdir_req(ino, offset, count).map_err(map_err)?;
+            let body = serialize::encode_readdir_req(ino, &last_name, count).map_err(map_err)?;
             let resp = self
                 .send_coherence_msg(MsgType::ReadDir, shard_id, body)
                 .await
@@ -2192,6 +2247,74 @@ impl MetadataClient for MetaShardClient {
     ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
         let params = params.clone();
         Box::pin(async move {
+            // Optimization: when NO data-plane change is needed (size=None),
+            // route through SetAttrMeta (CRDT path) which does NOT wait for
+            // Raft apply. The Filer-side handle_setattr_meta already supports
+            // mode/uid/gid/mtime/atime via an OR-Set CRDT: metadata writes are
+            // timestamp-ordered per ClientId+Seq, propagate via Invalidate
+            // notifications to other clients, and reconcile on split merge.
+            //
+            // Historically this guard required `only_timestamps` (size, mode,
+            // uid, gid ALL None). That left tar-style chmod calls (mode only)
+            // and `chown`-style updates (uid/gid) on the Raft path, triggering
+            // "setattr timeout waiting for apply" under bulk setattr storms
+            // (96k-file kernel unpack = ~192k Raft setattr proposals → apply
+            // queue backs up → ~0.1% of calls hit the hard 2s apply timeout
+            // and return EIO, failing the tar extract).
+            //
+            // Keep `size` on the strong path: truncate must be Raft-replicated
+            // to correctly evict chunks from other clients' caches + apply
+            // inline-data resize in one atomic, strongly-ordered step.
+            let crdt_safe = params.size.is_none()
+                && (params.atime.is_some()
+                    || params.mtime.is_some()
+                    || params.mode.is_some()
+                    || params.uid.is_some()
+                    || params.gid.is_some());
+
+            if crdt_safe {
+                use powerfs_net::serialize::TlvEncoder;
+                use powerfs_net::FieldId;
+                let now = chrono::Utc::now().timestamp() as u64;
+                let client_id_str = self.client_id.to_string();
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u64(FieldId::Ino, ino);
+                if let Some(mo) = params.mode {
+                    let _ = enc.add_u32(FieldId::Mode, mo);
+                }
+                if let Some(u) = params.uid {
+                    let _ = enc.add_u32(FieldId::Uid, u);
+                }
+                if let Some(g) = params.gid {
+                    let _ = enc.add_u32(FieldId::Gid, g);
+                }
+                if let Some(mt) = params.mtime {
+                    let _ = enc.add_u64(FieldId::Mtime, mt);
+                }
+                if let Some(at) = params.atime {
+                    let _ = enc.add_u64(FieldId::Atime, at);
+                }
+                let _ = enc.add_string(FieldId::ClientId, &client_id_str);
+                let _ = enc.add_u64(FieldId::Seq, now);
+                let body = enc.into_bytes();
+
+                let resp = self
+                    .send_coherence_msg(MsgType::SetAttrMeta, shard_id, body)
+                    .await
+                    .map_err(map_err)?;
+                // SetAttrMeta returns STATUS_OK + empty body (no attr).
+                // FUSE layer's setattr() uses local cache (updated via
+                // cache.update_attr with the params we passed) to build
+                // stat64, so the returned MetadataAttr is not consumed.
+                // Return a minimal attr to satisfy the trait signature.
+                log::debug!(
+                    "setattr CRDT path: ino={}, size=None, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, atime={:?}, resp_len={}",
+                    ino, params.mode, params.uid, params.gid, params.mtime, params.atime, resp.len()
+                );
+                let attr_resp = serialize::decode_attr_resp(&resp).unwrap_or_default();
+                return Ok(attr_from_resp(attr_resp));
+            }
+
             let body = serialize::encode_setattr_req(
                 ino,
                 params.mode,

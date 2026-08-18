@@ -6,4 +6,4 @@
 	url = https://github.com/FudanPPI/s3-tests.git
 [submodule "kernel"]
         path = kernel
-        url = https://github.com/powerfs/powerfs-kernel.git
+        url = git@github.com:powerfs/powerfs-kernel-private.git
