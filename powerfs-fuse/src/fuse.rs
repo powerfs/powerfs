@@ -231,16 +231,11 @@ impl FuseApp {
             self.runtime.clone(),
         ));
 
-        // Start admin/debug HTTP server if admin_port is configured.
-        // Exposes /stats (request statistics + in-flight tracking) and
-        // /health endpoints for `powerfs-cli fuse-stats` to query.
-        if self.admin_port > 0 {
-            let bind_addr = format!("0.0.0.0:{}", self.admin_port);
-            crate::admin_server::AdminServer::start(bind_addr, sync_client.stats().clone());
-            info!("Admin/debug server enabled on port {}", self.admin_port);
-        } else {
-            info!("Admin/debug server disabled (admin_port=0)");
-        }
+        // Admin/debug HTTP server is started AFTER `lock_manager` is
+        // constructed below (it needs the `FuseLockManager` Arc to
+        // expose `/lock-metrics`). The previous early-start location
+        // is preserved as a comment marker for reviewers familiar
+        // with the original layout.
 
         let cache = Arc::new(MetadataCache::new());
         // Create the chunk (data) cache up front so it can be shared with the
@@ -309,6 +304,42 @@ impl FuseApp {
             sync_client.client_id(),
         ));
 
+        // Conservative adapter (§4.1): wire up a `FuseLockManager`
+        // exposing the unified `powerfs_lock::LockManager` trait,
+        // backed by `FacadeLockBackend` (which delegates to the same
+        // `FuseClientFacade` + `MetadataCache`). This does NOT replace
+        // `VolumeLeaseManager` — existing read/write/release paths keep
+        // using it directly. The new `lock_manager` is the entry point
+        // for new code paths that prefer the unified trait (and for
+        // the kernel C client's wire protocol when it lands in 阶段四).
+        let lock_backend = Arc::new(crate::lock_backend::FacadeLockBackend::new(
+            sync_client.facade().clone(),
+            cache.clone(),
+        ));
+        let lock_manager = Arc::new(powerfs_lock_fuse::FuseLockManager::new(
+            lock_backend,
+            sync_client.client_id(),
+            30_000, // matches `lease_duration_ms`
+        ));
+        // Clone the Arc before moving into `PowerFsFs` so the admin
+        // server can keep a handle for `/lock-metrics` queries.
+        let lock_manager_for_admin = lock_manager.clone();
+
+        // Start admin/debug HTTP server if admin_port is configured.
+        // Exposes /stats (request statistics + in-flight tracking),
+        // /lock-metrics (FuseLockManager counters), and /health.
+        if self.admin_port > 0 {
+            let bind_addr = format!("0.0.0.0:{}", self.admin_port);
+            crate::admin_server::AdminServer::start(
+                bind_addr,
+                sync_client.stats().clone(),
+                Some(lock_manager_for_admin),
+            );
+            info!("Admin/debug server enabled on port {}", self.admin_port);
+        } else {
+            info!("Admin/debug server disabled (admin_port=0)");
+        }
+
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
@@ -324,6 +355,7 @@ impl FuseApp {
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
+            lock_manager,
             open_inodes: open_inodes.clone(),
             inline_buffers: inline_buffers.clone(),
             inline_max_sizes: Arc::new(DashMap::new()),
@@ -498,6 +530,16 @@ struct PowerFsFs {
     /// read 路径通过此 manager 获取共享 lease，命中缓存时零 RPC；
     /// lease 在 open→release 期间复用，release() 时 invalidate。
     lease_manager: Arc<VolumeLeaseManager>,
+    /// Conservative adapter (§4.1): unified `LockManager` trait entry
+    /// point, backed by `FacadeLockBackend`. Currently NOT called by
+    /// the existing read/write/release paths (they use `lease_manager`
+    /// directly above — migrating them would split the cache and break
+    /// the read→release invariant). New code paths added in 阶段四
+    /// (kernel C client wire protocol, Early Grant, etc.) should call
+    /// this instead. s8 will wire `lock_manager.metrics().snapshot()`
+    /// to the Prometheus exporter.
+    #[allow(dead_code)]
+    lock_manager: Arc<powerfs_lock_fuse::FuseLockManager>,
     /// Phase 4.3/4.4: 当前已打开的 inode → open count。
     /// open() 时 count+1，release() 时 count-1（减到 0 时移除）。
     /// getattr() 对其中的 inode 使用长 TTL

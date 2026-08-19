@@ -42,6 +42,7 @@ powerfs-net = { path = "../powerfs-net" }
 powerfs-orset = { path = "../powerfs-orset" }
 powerfs-coherence = { path = "../powerfs-coherence" }
 powerfs-layout = { path = "../powerfs-layout" }
+powerfs-lock-fuse = { path = "../powerfs-lock-fuse" }
 fuse-backend-rs = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
@@ -57,6 +58,7 @@ lru = { workspace = true }
 dashmap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 num_cpus = "1.16"
 uuid = { workspace = true }
 futures = { workspace = true }
