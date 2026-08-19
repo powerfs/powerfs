@@ -1,0 +1,861 @@
+//! `FuseLockManager` — the FUSE userspace Rust impl of
+//! `powerfs_lock::LockManager`.
+//!
+//! This is the conservative adapter layer (see
+//! `docs/lock-optimization-plan.md` §4.1). It does NOT replace
+//! `cache.rs::HoldState` or `VolumeLeaseManager`; it wraps the unified
+//! `LockManager` trait around a fresh `ClientLeaseState` (lease token +
+//! expiry cache) plus a `FuseLockBackend` (RPC facade abstraction).
+//!
+//! # Routing (matches `powerfs_lock::LockRequest` semantics)
+//!
+//! - `req.is_inode_level()` → `FuseLockBackend::acquire_inode_lease`
+//!   (Filer-managed, 方案 A)
+//! - `req.is_range_level()` → `FuseLockBackend::acquire_range_lease`
+//!   (Volume-managed, 方案 D). Requires a `lookup_volume_id` first if
+//!   the caller didn't supply one.
+//!
+//! # Cache hit / miss
+//!
+//! Both inode and range paths consult `ClientLeaseState` first; on hit
+//! they return a `LockGrant` echoing the cached token with no RPC.
+//! Misses call the backend, then populate the cache.
+//!
+//! # Metrics
+//!
+//! Every code path bumps `LockMetrics` counters so Prometheus (exposed
+//! in 阶段一C step 5) has a single source of truth for hit rate,
+//! conflict rate, and error rate.
+
+use crate::backend::FuseLockBackend;
+use crate::metrics::LockMetrics;
+use crate::state::{ClientLeaseState, InodeLeaseEntry, RangeLeaseEntry};
+use async_trait::async_trait;
+use powerfs_lock::{LockError, LockEventHandler, LockGrant, LockManager, LockMode, LockRequest};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+/// FUSE userspace Rust impl of `LockManager`.
+///
+/// Owns:
+/// - `state: Arc<ClientLeaseState>` — inode + range lease cache.
+/// - `backend: Arc<dyn FuseLockBackend>` — RPC facade.
+/// - `metrics: Arc<LockMetrics>` — counters.
+/// - `handler: Mutex<Option<Weak<dyn LockEventHandler>>>` — server-push
+///   callback (held as `Weak` to avoid reference cycles; see
+///   `LockManager::register_handler` docs).
+pub struct FuseLockManager {
+    state: Arc<ClientLeaseState>,
+    backend: Arc<dyn FuseLockBackend>,
+    metrics: Arc<LockMetrics>,
+    client_id: Arc<String>,
+    /// Default lease TTL when `LockRequest::timeout` is zero.
+    default_lease_ms: u64,
+    handler: Mutex<Option<Weak<dyn LockEventHandler>>>,
+}
+
+impl FuseLockManager {
+    /// Construct a new `FuseLockManager`.
+    ///
+    /// `default_lease_ms` is used when a `LockRequest` carries
+    /// `timeout == Duration::ZERO`. Pass a sensible default (the
+    /// existing FUSE client uses 30s).
+    pub fn new(
+        backend: Arc<dyn FuseLockBackend>,
+        client_id: String,
+        default_lease_ms: u64,
+    ) -> Self {
+        Self {
+            state: ClientLeaseState::new_shared(),
+            backend,
+            metrics: LockMetrics::new_shared(),
+            client_id: Arc::new(client_id),
+            default_lease_ms,
+            handler: Mutex::new(None),
+        }
+    }
+
+    /// Construct with all components injected (for tests / advanced
+    /// callers that want to share state or metrics across managers).
+    pub fn with_state_and_metrics(
+        state: Arc<ClientLeaseState>,
+        backend: Arc<dyn FuseLockBackend>,
+        metrics: Arc<LockMetrics>,
+        client_id: String,
+        default_lease_ms: u64,
+    ) -> Self {
+        Self {
+            state,
+            backend,
+            metrics,
+            client_id: Arc::new(client_id),
+            default_lease_ms,
+            handler: Mutex::new(None),
+        }
+    }
+
+    // ---------- accessors ----------
+
+    pub fn state(&self) -> &Arc<ClientLeaseState> {
+        &self.state
+    }
+
+    pub fn metrics(&self) -> &Arc<LockMetrics> {
+        &self.metrics
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Resolve the effective lease duration for a request.
+    fn effective_duration_ms(&self, req: &LockRequest) -> u64 {
+        if req.timeout == Duration::ZERO {
+            self.default_lease_ms
+        } else {
+            req.timeout.as_millis().max(1) as u64
+        }
+    }
+
+    /// Run a lazy sweep of expired cache entries. Returns the number
+    /// removed (recorded in `sweep_removed_total`).
+    ///
+    /// Cheap if nothing's expired — `ClientLeaseState::sweep_expired`
+    /// just walks two `HashMap`s and retains non-expired entries.
+    /// Called lazily from `acquire` so the cache can't grow unbounded
+    /// under churn.
+    pub fn sweep_expired(&self) -> usize {
+        let removed = self.state.sweep_expired();
+        self.metrics.record_sweep_removed(removed);
+        removed
+    }
+
+    /// Drop all cached inode/range leases for an inode, returning the
+    /// range leases that need server-side release.
+    ///
+    /// Used by the FUSE client's `release()` path (close-time cleanup)
+    /// — mirrors the existing `VolumeLeaseManager::release_all_for_inode`
+    /// API so the caller doesn't have to change shape during the
+    /// conservative-adapter migration.
+    ///
+    /// Returns `Vec<(stripe_start, token, volume_id)>` for range leases
+    /// that were cached. The caller should release each via
+    /// `FuseLockBackend::release_range_lease` (or just call
+    /// `FuseLockManager::release` per token).
+    pub fn release_all_ranges_for_inode(&self, inode: u64) -> Vec<(u64, String, u64)> {
+        self.state.drain_ranges_for_inode(inode)
+    }
+
+    /// Map a backend string error to a typed `LockError`.
+    ///
+    /// Heuristics:
+    /// - contains "conflict" (case-insensitive) → `Conflict`
+    /// - contains "quarantin" → `Quarantined`
+    /// - contains "network"/"timeout"/"unreachable"/"transport" → `Network`
+    /// - contains "not found" → `NotFound`
+    /// - otherwise → `Internal`
+    fn map_backend_error(s: String) -> LockError {
+        let lower = s.to_lowercase();
+        if lower.contains("conflict") {
+            LockError::Conflict(s)
+        } else if lower.contains("quarantin") {
+            LockError::Quarantined(s)
+        } else if lower.contains("network")
+            || lower.contains("timeout")
+            || lower.contains("unreachable")
+            || lower.contains("transport")
+            || lower.contains("connection")
+        {
+            LockError::Network(s)
+        } else if lower.contains("not found") {
+            LockError::NotFound
+        } else {
+            LockError::Internal(s)
+        }
+    }
+
+    /// Determine whether a backend error indicates a conflict, for
+    /// metric classification.
+    fn is_conflict_err(s: &str) -> bool {
+        s.to_lowercase().contains("conflict")
+    }
+
+    // ---------- inode-level ----------
+
+    async fn acquire_inode(
+        &self,
+        inode: u64,
+        mode: LockMode,
+        duration_ms: u64,
+    ) -> Result<LockGrant, LockError> {
+        // 1. Cache hit?
+        if let Some(cached) = self.state.get_inode(inode) {
+            if cached.mode == mode {
+                self.metrics.record_cache_hit();
+                log::debug!(
+                    "lock: inode cache hit inode={} mode={}",
+                    inode,
+                    mode.as_str()
+                );
+                return Ok(LockGrant {
+                    inode,
+                    token: cached.token,
+                    sn: 0,
+                    lease_ms: cached
+                        .expire_at
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64,
+                    mode,
+                    range: None,
+                });
+            }
+            // Mode mismatch — drop cached entry, fall through to RPC.
+            self.state.invalidate_inode(inode);
+        }
+
+        // 2. Cache miss → backend RPC.
+        self.metrics.record_cache_miss();
+        let (token, expire_at_ms) = self
+            .backend
+            .acquire_inode_lease(inode, &self.client_id, duration_ms)
+            .await
+            .map_err(|e| {
+                if Self::is_conflict_err(&e) {
+                    self.metrics.record_conflict();
+                } else {
+                    self.metrics.record_error();
+                }
+                Self::map_backend_error(e)
+            })?;
+
+        // 3. Cache and return.
+        let expire_at = Instant::now() + Duration::from_millis(expire_at_ms.max(duration_ms));
+        self.state.put_inode(
+            inode,
+            InodeLeaseEntry {
+                token: token.clone(),
+                expire_at,
+                mode: mode.clone(),
+            },
+        );
+
+        Ok(LockGrant {
+            inode,
+            token,
+            sn: 0,
+            lease_ms: expire_at_ms.max(duration_ms),
+            mode,
+            range: None,
+        })
+    }
+
+    // ---------- range-level ----------
+
+    async fn acquire_range(
+        &self,
+        inode: u64,
+        mode: LockMode,
+        range: powerfs_lock::Range,
+        duration_ms: u64,
+    ) -> Result<LockGrant, LockError> {
+        // The cache is keyed by (inode, stripe_start, stripe_count, exclusive).
+        // We use `range.start` as the stripe anchor and a placeholder count
+        // of 1 stripe (the existing FUSE client does 1-stripe-per-lease today;
+        // see `fuse.rs` `lease_manager.acquire(... stripe_count ...)`). A
+        // multi-stripe request splits into N single-stripe leases upstream.
+        let stripe_start = range.start;
+        let stripe_count = range
+            .end
+            .map(|end| end.saturating_sub(stripe_start))
+            .unwrap_or(1);
+        let exclusive = mode.is_exclusive();
+
+        // 1. Cache hit?
+        if let Some(cached) = self
+            .state
+            .get_range(inode, stripe_start, stripe_count, exclusive)
+        {
+            self.metrics.record_cache_hit();
+            log::debug!(
+                "lock: range cache hit inode={} stripe=[{},{}) exclusive={}",
+                inode,
+                stripe_start,
+                stripe_start + stripe_count,
+                exclusive
+            );
+            return Ok(LockGrant {
+                inode,
+                token: cached.token,
+                sn: 0,
+                lease_ms: cached
+                    .expire_at
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+                mode,
+                range: Some(range),
+            });
+        }
+
+        // 2. Cache miss → resolve volume_id, then backend RPC.
+        self.metrics.record_cache_miss();
+        let volume_id = self.backend.lookup_volume_id(inode).await.map_err(|e| {
+            self.metrics.record_error();
+            Self::map_backend_error(e)
+        })?;
+
+        let token = self
+            .backend
+            .acquire_range_lease(
+                volume_id,
+                inode,
+                stripe_start,
+                stripe_count,
+                &self.client_id,
+                exclusive,
+                duration_ms,
+            )
+            .await
+            .map_err(|e| {
+                if Self::is_conflict_err(&e) {
+                    self.metrics.record_conflict();
+                } else {
+                    self.metrics.record_error();
+                }
+                Self::map_backend_error(e)
+            })?;
+
+        // 3. Cache and return.
+        let expire_at = Instant::now() + Duration::from_millis(duration_ms);
+        self.state.put_range_for_inode(
+            inode,
+            stripe_start,
+            stripe_count,
+            RangeLeaseEntry {
+                token: token.clone(),
+                expire_at,
+                mode: mode.clone(),
+                stripe_start,
+                stripe_count,
+                volume_id,
+            },
+        );
+
+        Ok(LockGrant {
+            inode,
+            token,
+            sn: 0,
+            lease_ms: duration_ms,
+            mode,
+            range: Some(range),
+        })
+    }
+}
+
+#[async_trait]
+impl LockManager for FuseLockManager {
+    async fn acquire(&self, req: LockRequest) -> Result<LockGrant, LockError> {
+        self.metrics.record_acquire();
+        // Lazy sweep on every acquire so the cache can't grow unbounded
+        // under churn. Cheap when nothing's expired.
+        self.sweep_expired();
+
+        let duration_ms = self.effective_duration_ms(&req);
+
+        if req.is_inode_level() {
+            self.acquire_inode(req.inode, req.mode, duration_ms).await
+        } else if let Some(range) = req.effective_range() {
+            self.acquire_range(req.inode, req.mode, range, duration_ms)
+                .await
+        } else {
+            // Should be unreachable given `is_range_level` semantics, but
+            // fail safe rather than panicking on a malformed request.
+            self.metrics.record_error();
+            Err(LockError::Internal(
+                "range-level request missing effective range".to_string(),
+            ))
+        }
+    }
+
+    async fn release(&self, inode: u64, token: &str) -> Result<(), LockError> {
+        self.metrics.record_release();
+
+        // 1. Try inode-level: if the cache has an entry for this inode
+        //    with a matching token, release it server-side.
+        if self.state.remove_inode_by_token(inode, token) {
+            if let Err(e) = self
+                .backend
+                .release_inode_lease(inode, &self.client_id, token)
+                .await
+            {
+                self.metrics.record_error();
+                return Err(Self::map_backend_error(e));
+            }
+            return Ok(());
+        }
+
+        // 2. Try range-level: the token may be a range lease. Look it
+        //    up by token (O(N) scan — range cache is small).
+        if let Some((volume_id, stripe_start, stripe_count, _exclusive)) =
+            self.state.remove_range_by_token(token)
+        {
+            let _ = (inode, stripe_count); // unused, kept for clarity
+            if let Err(e) = self
+                .backend
+                .release_range_lease(volume_id, inode, stripe_start, &self.client_id, token)
+                .await
+            {
+                self.metrics.record_error();
+                return Err(Self::map_backend_error(e));
+            }
+            return Ok(());
+        }
+
+        // 3. Idempotent release: token not cached. The server may have
+        //    already released it (e.g. TTL expired), or the caller is
+        //    releasing a token from a previous process lifetime. Best-
+        //    effort: try the inode-level RPC anyway (cheap) and ignore
+        //    "not found" errors. This matches `LockManager::release`'s
+        //    contract: "releasing an already-released or expired lease
+        //    returns Ok(())".
+        match self
+            .backend
+            .release_inode_lease(inode, &self.client_id, token)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let lower = e.to_lowercase();
+                if lower.contains("not found")
+                    || lower.contains("no such")
+                    || lower.contains("unknown token")
+                {
+                    // Treat as already-released — idempotent success.
+                    Ok(())
+                } else {
+                    self.metrics.record_error();
+                    Err(Self::map_backend_error(e))
+                }
+            }
+        }
+    }
+
+    async fn renew(&self, inode: u64, token: &str, timeout: Duration) -> Result<(), LockError> {
+        self.metrics.record_renew();
+        let duration_ms = if timeout == Duration::ZERO {
+            self.default_lease_ms
+        } else {
+            timeout.as_millis().max(1) as u64
+        };
+
+        // Only inode-level leases are renewable through this trait
+        // (range-level renew is rare; the existing FUSE client re-
+        // acquires per-stripe on each read). If the token isn't in the
+        // inode cache, return `NotFound` so the caller can re-acquire.
+        let cached_mode = self.state.get_inode(inode).map(|e| e.mode);
+        let Some(mode) = cached_mode else {
+            self.metrics.record_error();
+            return Err(LockError::NotFound);
+        };
+
+        self.backend
+            .renew_inode_lease(inode, &self.client_id, token, duration_ms)
+            .await
+            .map_err(|e| {
+                self.metrics.record_error();
+                Self::map_backend_error(e)
+            })?;
+
+        // Refresh the cache entry's expiry.
+        self.state.put_inode(
+            inode,
+            InodeLeaseEntry {
+                token: token.to_string(),
+                expire_at: Instant::now() + Duration::from_millis(duration_ms),
+                mode,
+            },
+        );
+        Ok(())
+    }
+
+    fn register_handler(&self, handler: Arc<dyn LockEventHandler>) {
+        // Downgrade to Weak to avoid reference cycles (per trait docs).
+        let weak: Weak<dyn LockEventHandler> = Arc::downgrade(&handler);
+        let mut guard = self.handler.lock().unwrap();
+        *guard = Some(weak);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use powerfs_lock::{LockEventHandler, LockMode, LockRequest, Range};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    // ---------- mock backend ----------
+
+    /// Mock backend that records every call and returns canned responses.
+    struct MockBackend {
+        acquire_inode_calls: AtomicU64,
+        release_inode_calls: AtomicU64,
+        renew_inode_calls: AtomicU64,
+        acquire_range_calls: AtomicU64,
+        release_range_calls: AtomicU64,
+        lookup_volume_calls: AtomicU64,
+        /// Override responses by setting these. Default = success.
+        acquire_inode_resp: StdMutex<Result<(String, u64), String>>,
+        acquire_range_resp: StdMutex<Result<String, String>>,
+        lookup_volume_resp: StdMutex<Result<u64, String>>,
+        release_inode_resp: StdMutex<Result<(), String>>,
+        release_range_resp: StdMutex<Result<(), String>>,
+        renew_inode_resp: StdMutex<Result<(), String>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                acquire_inode_calls: AtomicU64::new(0),
+                release_inode_calls: AtomicU64::new(0),
+                renew_inode_calls: AtomicU64::new(0),
+                acquire_range_calls: AtomicU64::new(0),
+                release_range_calls: AtomicU64::new(0),
+                lookup_volume_calls: AtomicU64::new(0),
+                acquire_inode_resp: StdMutex::new(Ok(("tok-inode".to_string(), 30_000))),
+                acquire_range_resp: StdMutex::new(Ok("tok-range".to_string())),
+                lookup_volume_resp: StdMutex::new(Ok(42)),
+                release_inode_resp: StdMutex::new(Ok(())),
+                release_range_resp: StdMutex::new(Ok(())),
+                renew_inode_resp: StdMutex::new(Ok(())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FuseLockBackend for MockBackend {
+        async fn acquire_inode_lease(
+            &self,
+            _inode: u64,
+            _client_id: &str,
+            _duration_ms: u64,
+        ) -> Result<(String, u64), String> {
+            self.acquire_inode_calls.fetch_add(1, Ordering::SeqCst);
+            self.acquire_inode_resp.lock().unwrap().clone()
+        }
+        async fn release_inode_lease(
+            &self,
+            _inode: u64,
+            _client_id: &str,
+            _token: &str,
+        ) -> Result<(), String> {
+            self.release_inode_calls.fetch_add(1, Ordering::SeqCst);
+            self.release_inode_resp.lock().unwrap().clone()
+        }
+        async fn renew_inode_lease(
+            &self,
+            _inode: u64,
+            _client_id: &str,
+            _token: &str,
+            _duration_ms: u64,
+        ) -> Result<(), String> {
+            self.renew_inode_calls.fetch_add(1, Ordering::SeqCst);
+            self.renew_inode_resp.lock().unwrap().clone()
+        }
+        async fn acquire_range_lease(
+            &self,
+            _volume_id: u64,
+            _inode: u64,
+            _stripe_start: u64,
+            _stripe_count: u64,
+            _client_id: &str,
+            _exclusive: bool,
+            _duration_ms: u64,
+        ) -> Result<String, String> {
+            self.acquire_range_calls.fetch_add(1, Ordering::SeqCst);
+            self.acquire_range_resp.lock().unwrap().clone()
+        }
+        async fn release_range_lease(
+            &self,
+            _volume_id: u64,
+            _inode: u64,
+            _stripe_start: u64,
+            _client_id: &str,
+            _token: &str,
+        ) -> Result<(), String> {
+            self.release_range_calls.fetch_add(1, Ordering::SeqCst);
+            self.release_range_resp.lock().unwrap().clone()
+        }
+        async fn lookup_volume_id(&self, _inode: u64) -> Result<u64, String> {
+            self.lookup_volume_calls.fetch_add(1, Ordering::SeqCst);
+            self.lookup_volume_resp.lock().unwrap().clone()
+        }
+    }
+
+    fn make_manager() -> (FuseLockManager, Arc<MockBackend>) {
+        let backend = Arc::new(MockBackend::new());
+        let manager = FuseLockManager::new(
+            Arc::clone(&backend) as Arc<dyn FuseLockBackend>,
+            "client-A".to_string(),
+            30_000,
+        );
+        (manager, backend)
+    }
+
+    // ---------- inode-level acquire/release ----------
+
+    #[tokio::test]
+    async fn test_inode_acquire_then_cache_hit_avoids_rpc() {
+        let (mgr, backend) = make_manager();
+        let inode = 100u64;
+
+        // First acquire → cache miss → RPC.
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+        assert_eq!(grant.token, "tok-inode");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+
+        // Second acquire → cache hit → no RPC.
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        let grant2 = mgr.acquire(req2).await.expect("cache hit must succeed");
+        assert_eq!(grant2.token, "tok-inode");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            1,
+            "second acquire must be a cache hit"
+        );
+
+        // Metrics: 2 acquires, 1 miss, 1 hit.
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(snap.acquire_total, 2);
+        assert_eq!(snap.acquire_cache_miss, 1);
+        assert_eq!(snap.acquire_cache_hit, 1);
+    }
+
+    #[tokio::test]
+    async fn test_inode_release_clears_cache_and_calls_backend() {
+        let (mgr, backend) = make_manager();
+        let inode = 5u64;
+
+        let req = LockRequest::new(inode, LockMode::Exclusive, Duration::from_secs(30));
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+
+        mgr.release(inode, &grant.token)
+            .await
+            .expect("release must succeed");
+        assert_eq!(backend.release_inode_calls.load(Ordering::SeqCst), 1);
+
+        // After release, the next acquire must miss the cache and hit the backend.
+        let req2 = LockRequest::new(inode, LockMode::Exclusive, Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("acquire must succeed");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            2,
+            "after release the next acquire must miss cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inode_release_idempotent_on_unknown_token() {
+        let (mgr, backend) = make_manager();
+        // Releasing a token we never acquired should still return Ok
+        // (idempotent contract).
+        let result = mgr.release(999, "never-seen").await;
+        assert!(
+            result.is_ok(),
+            "release of unknown token must be idempotent"
+        );
+        // The manager still tries the inode-level RPC once.
+        assert_eq!(backend.release_inode_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---------- range-level acquire/release ----------
+
+    #[tokio::test]
+    async fn test_range_acquire_calls_lookup_then_acquire_range() {
+        let (mgr, backend) = make_manager();
+        let inode = 7u64;
+        let range = Range::new(0, Some(4096));
+        let req = LockRequest::new(inode, LockMode::Range(range), Duration::from_secs(30));
+
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+        assert_eq!(grant.token, "tok-range");
+        assert_eq!(backend.lookup_volume_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.acquire_range_calls.load(Ordering::SeqCst), 1);
+
+        // Second acquire of the same range → cache hit → no further RPCs.
+        let req2 = LockRequest::new(inode, LockMode::Range(range), Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("cache hit must succeed");
+        assert_eq!(backend.lookup_volume_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.acquire_range_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_range_release_uses_cached_volume_id() {
+        let (mgr, backend) = make_manager();
+        let inode = 11u64;
+        let range = Range::new(0, Some(4096));
+        let req = LockRequest::new(inode, LockMode::Range(range), Duration::from_secs(30));
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+
+        // Release via the unified trait (token only). The manager must
+        // recover (volume_id, stripe_start) from the range cache.
+        mgr.release(inode, &grant.token)
+            .await
+            .expect("release must succeed");
+        assert_eq!(backend.release_range_calls.load(Ordering::SeqCst), 1);
+        // No inode-level release should fire (the token was in range cache).
+        assert_eq!(backend.release_inode_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ---------- error mapping ----------
+
+    #[tokio::test]
+    async fn test_acquire_conflict_maps_to_lock_error_conflict() {
+        let (mgr, backend) = make_manager();
+        // Override the inode acquire to return a conflict.
+        *backend.acquire_inode_resp.lock().unwrap() =
+            Err("conflict: held by other client".to_string());
+
+        let req = LockRequest::new(1, LockMode::Exclusive, Duration::from_secs(30));
+        let err = mgr.acquire(req).await.expect_err("must fail");
+        assert!(matches!(err, LockError::Conflict(_)));
+
+        // Conflict must bump both `acquire_conflict` and `errors_total`.
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(snap.acquire_conflict, 1);
+        assert_eq!(snap.errors_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_network_error_maps_to_lock_error_network() {
+        let (mgr, backend) = make_manager();
+        *backend.acquire_inode_resp.lock().unwrap() =
+            Err("network timeout contacting filer".to_string());
+
+        let req = LockRequest::new(2, LockMode::Shared, Duration::from_secs(30));
+        let err = mgr.acquire(req).await.expect_err("must fail");
+        assert!(matches!(err, LockError::Network(_)));
+    }
+
+    // ---------- renew ----------
+
+    #[tokio::test]
+    async fn test_renew_extends_cache_expiry() {
+        let (mgr, backend) = make_manager();
+        let inode = 8u64;
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+
+        // Renew.
+        mgr.renew(inode, &grant.token, Duration::from_secs(60))
+            .await
+            .expect("renew must succeed");
+        assert_eq!(backend.renew_inode_calls.load(Ordering::SeqCst), 1);
+
+        // The cached entry must still be a hit (renewed).
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req2)
+            .await
+            .expect("cache hit must succeed after renew");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_renew_unknown_token_returns_not_found() {
+        let (mgr, _backend) = make_manager();
+        let err = mgr
+            .renew(999, "never-seen", Duration::from_secs(30))
+            .await
+            .expect_err("renew of unknown token must fail");
+        assert!(matches!(err, LockError::NotFound));
+    }
+
+    // ---------- sweep ----------
+
+    #[tokio::test]
+    async fn test_sweep_expired_is_called_on_acquire() {
+        let (mgr, backend) = make_manager();
+        let inode = 33u64;
+
+        // Override the mock to return a 1ms expiry so the cached entry
+        // expires well before the second acquire (the default mock
+        // returns 30s, which would keep the cache valid).
+        *backend.acquire_inode_resp.lock().unwrap() = Ok(("tok-short".to_string(), 1));
+
+        // Acquire once to populate cache.
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_millis(1));
+        mgr.acquire(req).await.expect("acquire must succeed");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+
+        // Wait for the lease to expire.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Acquire again — the cached entry has expired, so the cache
+        // lookup misses and we issue a fresh RPC. The lazy sweep should
+        // also evict the expired entry.
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("acquire must succeed");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            2,
+            "expired cached entry must miss and trigger fresh RPC"
+        );
+
+        // sweep_removed_total must have incremented.
+        let snap = mgr.metrics().snapshot();
+        assert!(
+            snap.sweep_removed_total >= 1,
+            "sweep must remove expired entry"
+        );
+    }
+
+    // ---------- register_handler ----------
+
+    struct CapturingHandler {
+        on_revoke_calls: AtomicU64,
+        on_invalidate_calls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl LockEventHandler for CapturingHandler {
+        fn on_revoke(&self, _inode: u64, _token: &str) {
+            self.on_revoke_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_invalidate(&self, _inode: u64, _range: Option<Range>) {
+            self.on_invalidate_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_handler_stores_weak_reference() {
+        let (mgr, _backend) = make_manager();
+        let handler = Arc::new(CapturingHandler {
+            on_revoke_calls: AtomicU64::new(0),
+            on_invalidate_calls: AtomicU64::new(0),
+        });
+        mgr.register_handler(Arc::clone(&handler) as Arc<dyn LockEventHandler>);
+
+        // The handler must still be alive (we hold a strong ref in the
+        // test); the manager's Weak must upgrade successfully. The
+        // upgraded Arc must be released (via the inner block) before we
+        // drop the original `handler` ref, otherwise the upgraded Arc
+        // itself would keep the inner value alive.
+        {
+            let guard = mgr.handler.lock().unwrap();
+            let upgraded = guard.as_ref().and_then(|w| w.upgrade());
+            assert!(
+                upgraded.is_some(),
+                "Weak handler must upgrade while strong ref exists"
+            );
+            // `upgraded` drops here, releasing its strong ref.
+        }
+
+        // Drop the strong ref — the Weak inside the manager must not
+        // keep the handler alive.
+        drop(handler);
+        let guard = mgr.handler.lock().unwrap();
+        let upgraded = guard.as_ref().and_then(|w| w.upgrade());
+        assert!(upgraded.is_none(), "Weak must not prevent handler drop");
+    }
+}

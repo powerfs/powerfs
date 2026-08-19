@@ -1,21 +1,24 @@
 //! Minimal admin/debug HTTP server for the FUSE client.
 //!
-//! Exposes request statistics and in-flight request tracking for debugging
-//! hangs and monitoring performance. Designed to be lightweight — no external
-//! HTTP framework, just raw `tokio::net::TcpListener` with manual HTTP/1.0
-//! response parsing.
+//! Exposes request statistics, lock metrics, and in-flight request tracking
+//! for debugging hangs and monitoring performance. Designed to be
+//! lightweight — no external HTTP framework, just raw
+//! `tokio::net::TcpListener` with manual HTTP/1.0 response parsing.
 //!
 //! # Endpoints
 //!
 //! - `GET /stats` — JSON snapshot of all request statistics (per-msg_type
 //!   counters, in-flight requests sorted by age, error breakdown)
+//! - `GET /lock-metrics` — JSON snapshot of `FuseLockManager` counters
+//!   (acquire hit/miss/conflict, release/renew totals, errors, sweep
+//!   removed). Mirrors `LockMetricsSnapshot` from `powerfs-lock-fuse`.
 //! - `GET /health` — Simple `{"status":"ok"}` health check
 //!
 //! # Usage
 //!
 //! ```ignore
 //! let stats = Arc::new(RequestStats::new());
-//! AdminServer::start("0.0.0.0:9999", stats);
+//! AdminServer::start("0.0.0.0:9999", stats, Some(lock_manager));
 //! ```
 
 use std::sync::Arc;
@@ -25,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use powerfs_fuse_core::RequestStats;
+use powerfs_lock_fuse::FuseLockManager;
 
 /// Admin HTTP server.
 pub struct AdminServer;
@@ -32,9 +36,19 @@ pub struct AdminServer;
 impl AdminServer {
     /// Start the admin server on the given bind address.
     ///
-    /// Spawns a background tokio task that accepts connections and handles
-    /// requests. The task runs until the tokio runtime is shut down.
-    pub fn start(bind_addr: String, stats: Arc<RequestStats>) {
+    /// `lock_metrics` is an optional `Arc<FuseLockManager>` — when
+    /// `Some`, the `/lock-metrics` endpoint is enabled. Pass `None`
+    /// when the FUSE client hasn't constructed a `FuseLockManager`
+    /// (e.g. in tests).
+    ///
+    /// Spawns a background tokio task that accepts connections and
+    /// handles requests. The task runs until the tokio runtime is
+    /// shut down.
+    pub fn start(
+        bind_addr: String,
+        stats: Arc<RequestStats>,
+        lock_metrics: Option<Arc<FuseLockManager>>,
+    ) {
         if bind_addr.is_empty() {
             return;
         }
@@ -58,8 +72,11 @@ impl AdminServer {
                 match listener.accept().await {
                     Ok((mut stream, peer)) => {
                         let stats = stats.clone();
+                        let lock_metrics = lock_metrics.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(&mut stream, &stats).await {
+                            if let Err(e) =
+                                handle_connection(&mut stream, &stats, lock_metrics.as_deref()).await
+                            {
                                 warn!("Admin connection from {} error: {}", peer, e);
                             }
                         });
@@ -76,6 +93,7 @@ impl AdminServer {
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     stats: &RequestStats,
+    lock_metrics: Option<&FuseLockManager>,
 ) -> std::io::Result<()> {
     // Read request (up to 4KB — we only care about the request line)
     let mut buf = [0u8; 4096];
@@ -101,10 +119,29 @@ async fn handle_connection(
                 ),
             }
         }
+        "/lock-metrics" => {
+            match lock_metrics {
+                Some(mgr) => {
+                    let snap = mgr.metrics().snapshot();
+                    match serde_json::to_string(&snap) {
+                        Ok(json) => ("200 OK", json),
+                        Err(e) => (
+                            "500 Internal Server Error",
+                            format!("{{\"error\":\"{}\"}}", e),
+                        ),
+                    }
+                }
+                None => (
+                    "503 Service Unavailable",
+                    r#"{"error":"lock_metrics not configured"}"#.to_string(),
+                ),
+            }
+        }
         "/health" => ("200 OK", r#"{"status":"ok"}"#.to_string()),
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","endpoints":["/stats","/health"]}"#.to_string(),
+            r#"{"error":"not found","endpoints":["/stats","/lock-metrics","/health"]}"#
+                .to_string(),
         ),
     };
 
