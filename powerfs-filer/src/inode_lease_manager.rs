@@ -37,7 +37,8 @@
 
 use crate::adaptive_grace::AdaptiveGrace;
 use crate::early_grant::{
-    AcquireOutcome, LeaseRevoker, NoopRevoker, SnAllocator, WaitQueue, Waiter,
+    AcquireOutcome, LeaseRevoker, NoopPenalty, NoopRevoker, RevokeState, RevokeTimeoutPenalty,
+    SnAllocator, WaitQueue, Waiter,
 };
 use powerfs_lease::{
     LeaseError, LeaseKey, LeaseMode, LeasePersistence, LeaseStats, LeaseStore, MemoryLeaseStore,
@@ -49,6 +50,13 @@ use tokio::sync::oneshot;
 /// Default grace period after lease expiry before allowing a new holder.
 /// This prevents data corruption when a client is slow but still alive.
 const DEFAULT_GRACE_PERIOD_MS: u64 = 5000;
+
+/// §8.3.1: how long (ms) the server waits for a holder's `RevokeAck`
+/// before force-reclaiming its lease and granting the next waiter.
+/// 2 seconds per the plan — long enough for a well-behaved client to
+/// flush dirty pages, short enough to bound waiter stall under an
+/// unresponsive / crashed holder.
+const DEFAULT_REVOKE_TIMEOUT_MS: u64 = 2000;
 
 /// Resource key for inode-level leases.
 ///
@@ -130,6 +138,19 @@ pub struct InodeLeaseManager {
     /// `max(DEFAULT_GRACE, 3 * p99_lateness)` as the effective grace
     /// period. Used in `acquire` to replace the fixed `grace_period`.
     adaptive_grace: Arc<AdaptiveGrace>,
+    /// §8.3.1: how long (ms) to wait for a holder's `RevokeAck` before
+    /// force-reclaiming its lease and granting the next waiter. Default
+    /// 2000ms per the plan. The background sweep
+    /// (`force_reclaim_expired_revokes`) measures each pending revoke
+    /// against this.
+    revoke_timeout_ms: u64,
+    /// §8.3.1: hook for recording a health penalty when a holder fails
+    /// to ACK a revoke within `revoke_timeout_ms`. Defaults to
+    /// `NoopPenalty`; the net layer wires a real bridge into
+    /// `powerfs-lock-health`'s `ClientHealth` (which feeds the §8.2
+    /// three-layer defense — quarantine / blacklist after repeated
+    /// violations).
+    penalty: Arc<dyn RevokeTimeoutPenalty>,
 }
 
 /// Result of an acquire attempt.
@@ -173,6 +194,10 @@ impl InodeLeaseManager {
             waiters: Arc::new(WaitQueue::new()),
             revoker: Arc::new(NoopRevoker),
             adaptive_grace: Arc::new(AdaptiveGrace::new()),
+            // §8.3.1 defaults: 2s revoke timeout, no-op penalty (the net
+            // layer wires a real ClientHealth bridge during startup).
+            revoke_timeout_ms: DEFAULT_REVOKE_TIMEOUT_MS,
+            penalty: Arc::new(NoopPenalty),
         }
     }
 
@@ -196,6 +221,8 @@ impl InodeLeaseManager {
             waiters: self.waiters,
             revoker: self.revoker,
             adaptive_grace: self.adaptive_grace,
+            revoke_timeout_ms: self.revoke_timeout_ms,
+            penalty: self.penalty,
         }
     }
 
@@ -211,6 +238,38 @@ impl InodeLeaseManager {
     pub fn with_revoker<R: LeaseRevoker + 'static>(self, revoker: R) -> Self {
         Self {
             revoker: Arc::new(revoker),
+            ..self
+        }
+    }
+
+    /// §8.3.1: override the RevokeAck timeout (ms). The server waits
+    /// this long after pushing a `Revoke` before force-reclaiming the
+    /// lease and granting the next waiter. Default 2000ms; raise it on
+    /// high-latency links where a well-behaved client needs more than
+    /// 2s to flush, lower it for tight latency SLOs.
+    #[must_use]
+    pub fn with_revoke_timeout_ms(self, ms: u64) -> Self {
+        Self {
+            revoke_timeout_ms: ms,
+            ..self
+        }
+    }
+
+    /// §8.3.1: attach a health-penalty recorder. When the server
+    /// force-reclaims a lease because the holder didn't ACK within the
+    /// timeout, this is called with the unresponsive holder's client id.
+    /// The net layer wires a bridge into `powerfs-lock-health`'s
+    /// `ClientHealth` (feeding the §8.2 three-layer defense — repeated
+    /// violations escalate to quarantine then blacklist). Without this
+    /// (the default `NoopPenalty`), force-reclaim still happens but no
+    /// health score is recorded.
+    #[must_use]
+    pub fn with_revoke_timeout_penalty<P: RevokeTimeoutPenalty + 'static>(
+        self,
+        penalty: P,
+    ) -> Self {
+        Self {
+            penalty: Arc::new(penalty),
             ..self
         }
     }
@@ -511,6 +570,20 @@ impl InodeLeaseManager {
                 let _ = self
                     .revoker
                     .revoke(inode, &holder_entry.token, &holder_entry.holder);
+                // §8.3.1: record the pending revoke so the background
+                // sweep can force-reclaim the lease if the holder
+                // doesn't ACK within `revoke_timeout_ms`. The snapshot
+                // captures the holder + token at revoke-send time so
+                // force-reclaim can release the correct entry even if
+                // the holder later disconnects.
+                self.waiters.record_revoke_sent(
+                    inode,
+                    RevokeState {
+                        sent_at: Instant::now(),
+                        holder: holder_entry.holder.clone(),
+                        token: holder_entry.token.clone(),
+                    },
+                );
                 log::debug!(
                     "InodeLease: early-revoke pushed inode={} holder={} waiter={}",
                     inode,
@@ -562,9 +635,13 @@ impl InodeLeaseManager {
             }
         }
 
-        // 2. Pop the next waiter (FIFO). If none, we're done — the
-        //    inode is now free and the next acquire will get it
-        //    immediately (no Early Grant needed).
+        // §8.3.1: the holder ACKed in time — clear the pending-revoke
+        // entry so the background sweep doesn't force-reclaim a lease
+        // the holder already voluntarily released.
+        self.waiters.take_revoke(inode);
+
+        // 2. Pop the next waiter (FIFO) and Early-Grant it. If none,
+        //    the inode is free for the next acquire (no Early Grant).
         let Some(waiter) = self.waiters.pop(inode) else {
             log::debug!(
                 "InodeLease: revoke-ack no waiter queued inode={} holder={}",
@@ -574,13 +651,20 @@ impl InodeLeaseManager {
             return Ok(());
         };
 
-        // 3. Early Grant: acquire the lease for the waiter. This
-        //    should not fail — we just released the holder, and the
-        //    waiter is a different client. If it does fail (e.g., a
-        //    third client raced in between), drop the waiter's sender
-        //    so its `Receiver::await` returns an error and it retries.
-        //    Allocate a fresh SN — the waiter's IO must be sequenced
-        //    behind the old holder's IO via the SN barrier.
+        self.grant_to_waiter(inode, waiter)
+    }
+
+    /// Grant the lease to a queued waiter (Early Grant). Shared by
+    /// `handle_revoke_ack` (holder ACKed in time) and
+    /// `force_reclaim_expired_revokes` (holder timed out → force-reclaim).
+    ///
+    /// Acquires the lease for the waiter, allocates a fresh SN (the
+    /// waiter's IO must be sequenced behind the old holder's IO via the
+    /// SN barrier), and fulfills the waiter's `oneshot::Sender`. If the
+    /// acquire fails (e.g., a third client raced in), the sender is
+    /// dropped so the waiter's `Receiver::await` returns an error and
+    /// it retries.
+    fn grant_to_waiter(&self, inode: u64, waiter: Waiter) -> Result<(), String> {
         match self.acquire(inode, &waiter.client_id, waiter.duration_ms) {
             Ok(result) => {
                 let _ = waiter.sender.send(result);
@@ -765,6 +849,66 @@ impl InodeLeaseManager {
     /// Called on acquire or periodically.
     pub fn cleanup_expired(&self) -> usize {
         self.store.cleanup_expired()
+    }
+
+    /// §8.3.1: force-reclaim leases whose holders didn't ACK a revoke
+    /// within `revoke_timeout_ms`. For each expired revoke:
+    /// 1. Release the stuck holder's lease (using the holder + token
+    ///    snapshot captured at revoke-send time).
+    /// 2. Pop the next queued waiter and Early-Grant it (the same
+    ///    `grant_to_waiter` path used by `handle_revoke_ack`).
+    /// 3. Record a health penalty for the unresponsive holder so the
+    ///    §8.2 three-layer defense can quarantine / blacklist repeat
+    ///    offenders.
+    ///
+    /// Returns the number of leases force-reclaimed. Intended to be
+    /// called from a periodic background sweep (the filer spawns a
+    /// 500ms `tokio::time::interval` task in `main.rs`). Safe to call
+    /// when there are no pending revokes (returns 0).
+    pub fn force_reclaim_expired_revokes(&self) -> usize {
+        let expired = self.waiters.drain_expired_revokes(self.revoke_timeout_ms);
+        if expired.is_empty() {
+            return 0;
+        }
+        let count = expired.len();
+        for (inode, state) in expired {
+            // 1. Release the stuck holder's lease. If the release fails
+            //    (e.g., the holder already reaped by TTL+grace or the
+            //    token rotated), proceed to grant the waiter anyway —
+            //    the acquire below will surface any real conflict.
+            if let Err(e) = self.release(inode, &state.holder, &state.token) {
+                log::warn!(
+                    "InodeLease: §8.3.1 force-reclaim release failed inode={} holder={}: {} \
+                     (granting waiter anyway)",
+                    inode,
+                    state.holder,
+                    e
+                );
+            }
+            // 2. Pop the next waiter and Early-Grant it. If the queue
+            //    was drained (e.g., the waiter disconnected), skip.
+            if let Some(waiter) = self.waiters.pop(inode) {
+                if let Err(e) = self.grant_to_waiter(inode, waiter) {
+                    log::warn!(
+                        "InodeLease: §8.3.1 force-reclaim grant failed inode={}: {}",
+                        inode,
+                        e
+                    );
+                }
+            }
+            // 3. Penalize the unresponsive holder's health score. The
+            //    net layer bridges this into `ClientHealth`; repeated
+            //    violations escalate to quarantine then blacklist.
+            self.penalty.on_revoke_ack_timeout(&state.holder);
+            log::warn!(
+                "InodeLease: §8.3.1 force-reclaimed inode={} holder={} \
+                 (no RevokeAck within {}ms)",
+                inode,
+                state.holder,
+                self.revoke_timeout_ms
+            );
+        }
+        count
     }
 
     /// Number of active leases (for monitoring).

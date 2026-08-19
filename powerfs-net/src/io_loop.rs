@@ -35,10 +35,12 @@ pub struct IoLoop {
     pub id: usize,
     /// 推送到 WorkQueue 的发送端
     work_tx: mpsc::Sender<Work>,
-    /// 独立锁接收队列发送端 (§8.4 方案 A). `None` 时锁消息回落到
-    /// `work_tx` (向后兼容). `Some` 时 `MsgType::is_lock_channel()` 的帧
-    /// 走此队列, 由独立锁 worker 线程池处理, 不被 IO 拥塞阻塞.
-    lock_work_tx: Option<mpsc::Sender<Work>>,
+    /// 独立锁接收队列发送端 (§8.4 方案 A + §8.5 优先级分层). `None`
+    /// 时锁消息回落到 `work_tx` (向后兼容). `Some` 时
+    /// `MsgType::is_lock_channel()` 的帧走此队列, 由独立锁 worker 线程池
+    /// 处理, 不被 IO 拥塞阻塞. §8.5: 内部是优先级堆 (`try_push` 按
+    /// MsgType 自动推导优先级), `RevokeAck`/`Release` 压过 `Acquire`/`Renew`.
+    lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
     /// 连接注册表 (断连清理时注销)
     registry: Arc<ConnRegistry>,
     /// 业务处理器 (断连通知)
@@ -62,12 +64,13 @@ impl IoLoop {
     }
 
     /// Construct with an optional dedicated lock receive queue
-    /// (§8.4 方案 A). When `lock_work_tx` is `Some`, lock/lease message
-    /// types are routed there instead of the shared `work_tx`.
+    /// (§8.4 方案 A + §8.5 优先级分层). When `lock_work_tx` is `Some`,
+    /// lock/lease message types are routed there (priority queue) instead
+    /// of the shared `work_tx` (FIFO).
     pub fn with_lock(
         id: usize,
         work_tx: mpsc::Sender<Work>,
-        lock_work_tx: Option<mpsc::Sender<Work>>,
+        lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
         registry: Arc<ConnRegistry>,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
@@ -145,7 +148,7 @@ impl IoLoop {
         mut read_half: OwnedReadHalf,
         mut write_half: OwnedWriteHalf,
         work_tx: mpsc::Sender<Work>,
-        lock_work_tx: Option<mpsc::Sender<Work>>,
+        lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
         mut shutdown_rx: mpsc::Receiver<()>,
         mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         peer: std::net::SocketAddr,
@@ -241,17 +244,31 @@ impl IoLoop {
 
                         // 封装 Work 推送到 WorkQueue
                         let work = Work::new(read_conn.clone(), msg);
-                        // §8.4 方案 A: 锁/租约消息走独立接收队列, 由独立锁
-                        // worker 线程池处理, 不被 IO 拥塞阻塞. 队列未配置
-                        // (None) 时回落到共享 WorkQueue (向后兼容).
+                        // §8.4 方案 A + §8.5 优先级分层: 锁/租约消息走独立
+                        // 优先级队列, 由独立锁 worker 线程池处理, 不被 IO
+                        // 拥塞阻塞, 且 RevokeAck(P0)/Release(P1) 压过
+                        // Acquire(P2)/Renew(P3). 队列未配置 (None) 时回落到
+                        // 共享 WorkQueue (向后兼容). try_push 非阻塞——队列满
+                        // (极罕见) 时丢弃+日志, 客户端重试或 §8.3.1
+                        // force-reclaim 兜底, 绝不阻塞 IoLoop 读循环.
                         let route_to_lock =
                             should_route_to_lock(read_lock_tx.is_some(), work.msg.msg_type());
-                        let tx = if route_to_lock {
-                            read_lock_tx.as_ref().unwrap()
-                        } else {
-                            &work_tx
-                        };
-                        if tx.send(work).await.is_err() {
+                        if route_to_lock {
+                            match read_lock_tx.as_ref().unwrap().try_push(work) {
+                                Ok(()) => {}
+                                Err(crate::lock_priority::TryPushError::Full) => {
+                                    warn!(
+                                        "IoLoop: lock priority queue full, dropping lock message"
+                                    );
+                                }
+                                Err(crate::lock_priority::TryPushError::Closed) => {
+                                    debug!(
+                                        "IoLoop: lock priority queue closed, stopping read loop"
+                                    );
+                                    break;
+                                }
+                            }
+                        } else if work_tx.send(work).await.is_err() {
                             debug!("IoLoop: WorkQueue closed, stopping read loop");
                             break;
                         }
@@ -505,10 +522,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_io_loop_with_lock_constructs() {
-        // IoLoop::with_lock must accept an optional lock queue sender
-        // without changing the existing constructor surface.
+        // IoLoop::with_lock must accept an optional §8.5 priority queue
+        // producer without changing the existing constructor surface.
         let (work_tx, _work_rx) = mpsc::channel::<Work>(16);
-        let (lock_tx, _lock_rx) = mpsc::channel::<Work>(16);
+        let (lock_tx, _lock_rx) = crate::lock_priority::channel(16);
         let registry = Arc::new(ConnRegistry::new());
         let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
         let flow_ctrl = Arc::new(FlowController::with_defaults());
@@ -522,5 +539,7 @@ mod tests {
             flow_ctrl,
         ));
         assert_eq!(io_loop.id, 0);
+        // 避免 unused warning: _lock_rx 持有消费者端
+        drop(_lock_rx);
     }
 }
