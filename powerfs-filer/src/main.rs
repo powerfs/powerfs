@@ -397,6 +397,14 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 net_port,
                 inode_notifier,
             );
+            // §8.2/§8.3.1: shared client-health store for the three-layer
+            // defense (scoring → throttle → quarantine/blacklist). Wired
+            // into the lease manager's force-reclaim penalty hook so an
+            // unresponsive holder (no RevokeAck within 2s) gets penalized;
+            // repeated violations escalate to quarantine then blacklist.
+            let client_health =
+                Arc::new(powerfs_lock_health::ClientHealth::new(Default::default()));
+            let base = base.with_client_health(client_health);
             if let Some(shard0_store) = meta_shard_manager.try_get_shard_store(ShardId(0)) {
                 let persistence = powerfs_filer::RaftLeasePersistence::new(
                     raft_group_manager.clone(),
@@ -440,6 +448,32 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     e
                 );
             }
+        }
+
+        // §8.3.1: background force-reclaim sweep. Every 500ms, checks
+        // for pending Early Revokes whose 2-second RevokeAck timeout
+        // elapsed and force-reclaims the stuck holder's lease + grants
+        // the next queued waiter + penalizes the holder's health score.
+        // Bounds waiter stall under an unresponsive / crashed holder so
+        // a stuck client can't block contended inodes indefinitely.
+        {
+            let sweep_handler = Arc::clone(&net_handler);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                // The first tick fires immediately on `tick` creation
+                // (no pending revokes at startup) — skip it.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let reclaimed = sweep_handler.force_reclaim_expired_revokes();
+                    if reclaimed > 0 {
+                        info!(
+                            "§8.3.1 force-reclaim sweep: reclaimed {} lease(s)",
+                            reclaimed
+                        );
+                    }
+                }
+            });
         }
 
         // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).

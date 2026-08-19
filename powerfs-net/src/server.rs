@@ -270,13 +270,22 @@ impl PowerFsNetServer {
     // Server lifecycle
     // ========================================================================
 
-    /// 创建锁消息独立接收队列 (§8.4). `num_lock_workers == 0` 时返回
-    /// `(None, None)` 表示禁用独立锁队列, 锁消息回落到共享 WorkQueue.
-    fn setup_lock_queue(&self) -> (Option<mpsc::Sender<Work>>, Option<mpsc::Receiver<Work>>) {
+    /// 创建锁消息独立接收队列 (§8.4 + §8.5 优先级分层).
+    /// `num_lock_workers == 0` 时返回 `(None, None)` 表示禁用独立锁队列,
+    /// 锁消息回落到共享 WorkQueue. 否则返回一个 §8.5 优先级队列
+    /// (`LockPriorityProducer` / `LockPriorityConsumer`)——内部是
+    /// `BinaryHeap` 而非 FIFO mpsc, 让 `RevokeAck` (P0) / `Release` (P1)
+    /// 压过 `Acquire` (P2) / `Renew` (P3) 先出队, 压缩 waiter stall.
+    fn setup_lock_queue(
+        &self,
+    ) -> (
+        Option<crate::lock_priority::LockPriorityProducer>,
+        Option<crate::lock_priority::LockPriorityConsumer>,
+    ) {
         if self.config.num_lock_workers == 0 {
             return (None, None);
         }
-        let (tx, rx) = mpsc::channel::<Work>(self.config.lock_queue_capacity);
+        let (tx, rx) = crate::lock_priority::channel(self.config.lock_queue_capacity);
         (Some(tx), Some(rx))
     }
 
@@ -393,12 +402,12 @@ impl PowerFsNetServer {
     /// 启动 N 个 IoLoop, 返回 IoLoop 引用列表
     ///
     /// `lock_work_tx` 为 `Some` 时, IoLoop 会把 `MsgType::is_lock_channel()`
-    /// 的帧路由到独立锁队列 (§8.4 方案 A); 为 `None` 时所有帧走共享
-    /// WorkQueue (向后兼容).
+    /// 的帧路由到独立锁队列 (§8.4 方案 A + §8.5 优先级分层); 为 `None`
+    /// 时所有帧走共享 WorkQueue (向后兼容).
     fn spawn_io_loops(
         &self,
         work_tx: mpsc::Sender<Work>,
-        lock_work_tx: Option<mpsc::Sender<Work>>,
+        lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
     ) -> Vec<Arc<IoLoop>> {
         let n = self.config.num_io_loops;
         let mut loops = Vec::with_capacity(n);
@@ -433,11 +442,47 @@ impl PowerFsNetServer {
         self.spawn_worker_pool_named("Worker", work_rx, self.config.num_workers);
     }
 
-    /// 启动锁消息独立 Worker 线程池 (§8.4/§8.6). 与 IO worker 池解耦,
-    /// 线程池大小可配置 (`num_lock_workers`, 默认 4). 锁消息处理绝不
-    /// 调用阻塞操作 (如刷盘), 保持快速.
-    fn spawn_lock_worker_pool(&self, work_rx: mpsc::Receiver<Work>) {
-        self.spawn_worker_pool_named("Lock-Worker", work_rx, self.config.num_lock_workers);
+    /// 启动锁消息独立 Worker 线程池 (§8.4/§8.6 + §8.5 优先级出队).
+    /// 与 IO worker 池解耦, 线程池大小可配置 (`num_lock_workers`,
+    /// 默认 4). 锁消息处理绝不调用阻塞操作 (如刷盘), 保持快速.
+    ///
+    /// §8.5: 出队走 `LockPriorityConsumer::recv()` (优先级堆), 让
+    /// `RevokeAck` (P0) / `Release` (P1) 压过 `Acquire` (P2) / `Renew` (P3).
+    fn spawn_lock_worker_pool(&self, work_rx: crate::lock_priority::LockPriorityConsumer) {
+        let handler = self.handler.clone();
+        let manager = self.manager.clone();
+        let flow_ctrl = self.flow_ctrl.clone();
+        let num_workers = self.config.num_lock_workers;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
+
+        tokio::spawn(async move {
+            info!(
+                "Started Lock-Worker pool (max_concurrent={}, priority queue)",
+                num_workers
+            );
+            loop {
+                let work = work_rx.recv().await;
+                let Some(work) = work else {
+                    break;
+                };
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        error!("Lock-Worker pool: semaphore closed: {:?}", e);
+                        break;
+                    }
+                };
+                let handler = handler.clone();
+                let manager = manager.clone();
+                let flow_ctrl = flow_ctrl.clone();
+                tokio::spawn(async move {
+                    let worker = Worker::new(0, handler, manager, flow_ctrl);
+                    worker.process_work(work).await;
+                    drop(permit);
+                });
+            }
+            info!("Lock-Worker pool stopped (priority queue closed)");
+        });
     }
 
     /// Shared dispatcher implementation used by the IO and lock worker pools.

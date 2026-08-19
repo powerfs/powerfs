@@ -29,6 +29,7 @@ use crate::inode_lease_manager::AcquireResult;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 /// Monotonic SN (sequence number) allocator — leader-local, optimistic.
@@ -126,6 +127,50 @@ impl LeaseRevoker for NoopRevoker {
     }
 }
 
+/// Hook for recording a health penalty when a client fails to ACK a
+/// revoke within the timeout (§8.3.1 "Revoke after 2s no ACK"). The net
+/// layer implements this to bridge into `powerfs-lock-health`'s
+/// `ClientHealth::record_revoke_ack_timeout`, which penalizes the
+/// client's health score and can trigger quarantine / blacklisting
+/// (§8.2 three-layer defense) after repeated violations.
+///
+/// The default (`NoopPenalty`) is a no-op so the manager can be
+/// constructed without a health store and still function — the
+/// force-reclaim still happens, just without the penalty recording.
+pub trait RevokeTimeoutPenalty: Send + Sync {
+    /// Called once per force-reclaimed lease, with the unresponsive
+    /// holder's client id. Must be cheap (no network / disk I/O on
+    /// the caller's critical path).
+    fn on_revoke_ack_timeout(&self, client_id: &str);
+}
+
+/// A `RevokeTimeoutPenalty` that does nothing — the default.
+#[derive(Debug, Default)]
+pub struct NoopPenalty;
+
+impl RevokeTimeoutPenalty for NoopPenalty {
+    fn on_revoke_ack_timeout(&self, _client_id: &str) {}
+}
+
+/// Snapshot of a pending Early Revoke so the server can force-reclaim
+/// the lease if the holder never ACKs (§8.3.1).
+///
+/// Recorded by `InodeLeaseManager::acquire_or_wait` when it pushes a
+/// `Revoke` to the holder, and cleared by `handle_revoke_ack` (holder
+/// ACKed in time) or by `force_reclaim_expired_revokes` (holder timed
+/// out → lease force-reclaimed + penalty recorded).
+#[derive(Clone)]
+pub(crate) struct RevokeState {
+    /// When the `Revoke` notification was pushed to the holder. The
+    /// 2-second timeout (§8.3.1) is measured from this instant.
+    pub sent_at: Instant,
+    /// The holder that was notified — used to release its lease and
+    /// record the penalty on force-reclaim.
+    pub holder: String,
+    /// The lease token the holder held — used to release on force-reclaim.
+    pub token: String,
+}
+
 /// A queued acquire request waiting for Early Grant.
 ///
 /// Created by `acquire_or_wait` when an acquire conflicts with an
@@ -163,9 +208,19 @@ impl Waiter {
 /// `inode`. The queue is FIFO so waiters are granted in arrival order
 /// (matches §5.2 "排队锁" semantics). Each `inode`'s queue is popped
 /// when the holder releases or ACKs a revoke.
+///
+/// The companion `revokes` map tracks pending Early Revoke notifications
+/// (§8.3.1): one entry per inode whose holder was notified but hasn't
+/// ACKed yet. `drain_expired_revokes` returns the entries whose 2-second
+/// timeout elapsed, so the manager can force-reclaim the lease and grant
+/// the next waiter without waiting for the (unresponsive) holder's ACK.
 #[derive(Default)]
 pub(crate) struct WaitQueue {
     queues: Mutex<HashMap<u64, VecDeque<Waiter>>>,
+    /// Pending revokes keyed by inode. Inserted by `record_revoke_sent`
+    /// (on the first waiter), removed by `take_revoke` (on RevokeAck) or
+    /// `drain_expired_revokes` (on timeout → force-reclaim).
+    revokes: Mutex<HashMap<u64, RevokeState>>,
 }
 
 impl WaitQueue {
@@ -254,6 +309,49 @@ impl WaitQueue {
         let total: usize = queues.values().map(|q| q.len()).sum();
         queues.clear();
         total
+    }
+
+    // ----- §8.3.1: pending-revoke tracking for force-reclaim -----
+
+    /// Record that a `Revoke` was pushed to the holder of `inode`'s
+    /// lease at the given instant. Called by `acquire_or_wait` on the
+    /// first waiter. If an entry already exists for `inode` (e.g., a
+    /// previous revoke timed out and wasn't cleared), it is overwritten
+    /// — the latest holder/token is what matters for force-reclaim.
+    pub fn record_revoke_sent(&self, inode: u64, state: RevokeState) {
+        self.revokes.lock().unwrap().insert(inode, state);
+    }
+
+    /// Take (remove) the pending-revoke entry for `inode`. Called by
+    /// `handle_revoke_ack` when the holder ACKs in time — the revoke
+    /// is resolved, no force-reclaim needed. Returns `None` if no
+    /// pending revoke was recorded (e.g., the holder released
+    /// voluntarily without a prior Early Revoke).
+    pub fn take_revoke(&self, inode: u64) -> Option<RevokeState> {
+        self.revokes.lock().unwrap().remove(&inode)
+    }
+
+    /// Drain all pending-revoke entries whose `sent_at + timeout` has
+    /// elapsed (§8.3.1 "Revoke after 2s no ACK"). Each returned entry
+    /// identifies an inode whose holder didn't ACK in time — the caller
+    /// (`force_reclaim_expired_revokes`) force-reclaims the lease,
+    /// grants the next waiter, and records the health penalty.
+    ///
+    /// Removed entries are taken out of the map so a single timeout
+    /// doesn't trigger repeated force-reclaims on subsequent sweeps.
+    pub fn drain_expired_revokes(&self, timeout_ms: u64) -> Vec<(u64, RevokeState)> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let now = Instant::now();
+        let mut revokes = self.revokes.lock().unwrap();
+        let expired: Vec<u64> = revokes
+            .iter()
+            .filter(|(_, st)| now.saturating_duration_since(st.sent_at) >= timeout)
+            .map(|(inode, _)| *inode)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|inode| revokes.remove(&inode).map(|st| (inode, st)))
+            .collect()
     }
 }
 

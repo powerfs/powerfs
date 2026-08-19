@@ -30,6 +30,23 @@ struct ZoneState {
     volumes: Vec<powerfs_common::types::ZoneVolume>,
 }
 
+/// §8.3.1 bridge: adapts the sync `RevokeTimeoutPenalty` trait to
+/// `powerfs_lock_health::ClientHealth::record_revoke_ack_timeout`.
+/// When the filer force-reclaims a lease because the holder didn't ACK
+/// a revoke within 2s, this penalizes the holder's health score —
+/// repeated violations escalate to quarantine then blacklist (§8.2
+/// three-layer defense). Cheap: a single in-memory HashMap bump.
+#[derive(Clone)]
+struct HealthPenaltyBridge {
+    health: Arc<powerfs_lock_health::ClientHealth>,
+}
+
+impl crate::early_grant::RevokeTimeoutPenalty for HealthPenaltyBridge {
+    fn on_revoke_ack_timeout(&self, client_id: &str) {
+        self.health.record_revoke_ack_timeout(client_id);
+    }
+}
+
 /// Filer Net Handler implementation
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
@@ -225,6 +242,45 @@ impl FilerNetHandler {
             count
         );
         Ok(count)
+    }
+
+    /// §8.3.1: attach a health-penalty recorder so force-reclaimed
+    /// holders get their `ClientHealth` score penalized (feeding the
+    /// §8.2 three-layer defense — quarantine / blacklist after
+    /// repeated violations). Mirrors `with_lease_persistence`: rebuilds
+    /// the manager with the penalty attached.
+    #[must_use]
+    pub fn with_revoke_timeout_penalty<P>(mut self, penalty: P) -> Self
+    where
+        P: crate::early_grant::RevokeTimeoutPenalty + 'static,
+    {
+        let rebuilt = (*self.inode_lease_mgr)
+            .clone()
+            .with_revoke_timeout_penalty(penalty);
+        self.inode_lease_mgr = Arc::new(rebuilt);
+        self
+    }
+
+    /// §8.3.1 convenience: wire the filer's shared `ClientHealth` store
+    /// into the lease manager's force-reclaim penalty hook. Constructs
+    /// the internal `HealthPenaltyBridge` (which delegates to
+    /// `ClientHealth::record_revoke_ack_timeout`) so `main.rs` doesn't
+    /// need to know about the bridge type.
+    #[must_use]
+    pub fn with_client_health(self, health: Arc<powerfs_lock_health::ClientHealth>) -> Self {
+        self.with_revoke_timeout_penalty(HealthPenaltyBridge { health })
+    }
+
+    /// §8.3.1: run one pass of the force-reclaim sweep. For each
+    /// pending Early Revoke whose 2-second timeout elapsed without a
+    /// `RevokeAck`, force-reclaims the stuck holder's lease, grants
+    /// the next queued waiter, and penalizes the holder's health
+    /// score. Returns the number of leases force-reclaimed.
+    ///
+    /// Intended to be called from a periodic background task (the
+    /// filer spawns a 500ms `tokio::time::interval` in `main.rs`).
+    pub fn force_reclaim_expired_revokes(&self) -> usize {
+        self.inode_lease_mgr.force_reclaim_expired_revokes()
     }
 
     /// L4.21 fix: Initialize the version counter to current time in
