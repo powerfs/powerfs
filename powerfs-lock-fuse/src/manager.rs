@@ -21,6 +21,19 @@
 //! they return a `LockGrant` echoing the cached token with no RPC.
 //! Misses call the backend, then populate the cache.
 //!
+//! # Lazy sweep (phase 4 P1 — see `docs/lock-optimization-plan.md` §五)
+//!
+//! `acquire` used to call `sweep_expired` unconditionally on every
+//! invocation, contributing ~200ns to the cache-hit hot path (per the
+//! `powerfs-bench` baseline). The lazy-sweep optimization skips the
+//! sweep on cache **hits** when the last sweep was within
+//! `sweep_threshold` (default 100ms). Cache **misses** still sweep
+//! unconditionally — the upcoming RPC dominates latency, so the sweep
+//! overhead is negligible and the cache stays clean before inserting
+//! the new entry. `ClientLeaseState::get_inode`/`get_range` already
+//! filter expired entries per-lookup, so skipping the global sweep
+//! never serves a stale lease.
+//!
 //! # Metrics
 //!
 //! Every code path bumps `LockMetrics` counters so Prometheus (exposed
@@ -35,6 +48,12 @@ use powerfs_lock::{LockError, LockEventHandler, LockGrant, LockManager, LockMode
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// Default lazy-sweep threshold (phase 4 P1). A cache-hit acquire skips
+/// `sweep_expired` when the last sweep was within this window. Picked
+/// to be small enough that expired entries don't linger long, but
+/// large enough to make back-to-back cache hits effectively free.
+pub const DEFAULT_SWEEP_THRESHOLD: Duration = Duration::from_millis(100);
+
 /// FUSE userspace Rust impl of `LockManager`.
 ///
 /// Owns:
@@ -44,6 +63,10 @@ use std::time::{Duration, Instant};
 /// - `handler: Mutex<Option<Weak<dyn LockEventHandler>>>` — server-push
 ///   callback (held as `Weak` to avoid reference cycles; see
 ///   `LockManager::register_handler` docs).
+/// - `last_sweep: Mutex<Instant>` — timestamp of the last sweep, used
+///   by the lazy-sweep fast path (phase 4 P1).
+/// - `sweep_threshold: Duration` — cache hits within this window since
+///   `last_sweep` skip `sweep_expired`.
 pub struct FuseLockManager {
     state: Arc<ClientLeaseState>,
     backend: Arc<dyn FuseLockBackend>,
@@ -52,6 +75,13 @@ pub struct FuseLockManager {
     /// Default lease TTL when `LockRequest::timeout` is zero.
     default_lease_ms: u64,
     handler: Mutex<Option<Weak<dyn LockEventHandler>>>,
+    /// Timestamp of the last `sweep_expired` call. Initialized to
+    /// `Instant::now()` so the very first acquire (a cache miss on an
+    /// empty cache) skips the sweep — there's nothing to sweep.
+    last_sweep: Mutex<Instant>,
+    /// Cache-hit acquires within this window since `last_sweep` skip
+    /// `sweep_expired`. See `DEFAULT_SWEEP_THRESHOLD`.
+    sweep_threshold: Duration,
 }
 
 impl FuseLockManager {
@@ -59,7 +89,9 @@ impl FuseLockManager {
     ///
     /// `default_lease_ms` is used when a `LockRequest` carries
     /// `timeout == Duration::ZERO`. Pass a sensible default (the
-    /// existing FUSE client uses 30s).
+    /// existing FUSE client uses 30s). The lazy-sweep threshold
+    /// defaults to [`DEFAULT_SWEEP_THRESHOLD`]; override with
+    /// [`Self::with_sweep_threshold`].
     pub fn new(
         backend: Arc<dyn FuseLockBackend>,
         client_id: String,
@@ -72,6 +104,8 @@ impl FuseLockManager {
             client_id: Arc::new(client_id),
             default_lease_ms,
             handler: Mutex::new(None),
+            last_sweep: Mutex::new(Instant::now()),
+            sweep_threshold: DEFAULT_SWEEP_THRESHOLD,
         }
     }
 
@@ -91,7 +125,19 @@ impl FuseLockManager {
             client_id: Arc::new(client_id),
             default_lease_ms,
             handler: Mutex::new(None),
+            last_sweep: Mutex::new(Instant::now()),
+            sweep_threshold: DEFAULT_SWEEP_THRESHOLD,
         }
+    }
+
+    /// Override the lazy-sweep threshold (phase 4 P1). Pass
+    /// `Duration::ZERO` to disable lazy sweep and force a sweep on
+    /// every acquire (useful for tests / benchmarking the legacy
+    /// behavior).
+    #[must_use]
+    pub fn with_sweep_threshold(mut self, threshold: Duration) -> Self {
+        self.sweep_threshold = threshold;
+        self
     }
 
     // ---------- accessors ----------
@@ -117,17 +163,42 @@ impl FuseLockManager {
         }
     }
 
-    /// Run a lazy sweep of expired cache entries. Returns the number
-    /// removed (recorded in `sweep_removed_total`).
+    /// Run a sweep of expired cache entries. Returns the number
+    /// removed (recorded in `sweep_removed_total`). Also stamps
+    /// `last_sweep` so subsequent cache-hit acquires within
+    /// `sweep_threshold` can skip the sweep (phase 4 P1).
     ///
     /// Cheap if nothing's expired — `ClientLeaseState::sweep_expired`
     /// just walks two `HashMap`s and retains non-expired entries.
-    /// Called lazily from `acquire` so the cache can't grow unbounded
-    /// under churn.
+    /// Called from `acquire` on cache misses (where the upcoming RPC
+    /// hides the sweep cost) and as a public escape hatch for
+    /// background / explicit cleanup.
     pub fn sweep_expired(&self) -> usize {
         let removed = self.state.sweep_expired();
+        *self.last_sweep.lock().unwrap() = Instant::now();
         self.metrics.record_sweep_removed(removed);
         removed
+    }
+
+    /// Lazy-sweep fast path for cache hits (phase 4 P1). If the last
+    /// sweep was within `sweep_threshold`, skip the sweep and bump
+    /// `sweep_skipped_total`. Otherwise run the sweep. Callers must
+    /// have already verified the cache hit (this method doesn't peek
+    /// the cache — it only throttles the sweep).
+    ///
+    /// Rationale: on a cache hit the entire acquire is sub-microsecond
+    /// and the ~200ns sweep is a meaningful fraction of the hot path.
+    /// On a cache miss the upcoming RPC dominates, so the sweep runs
+    /// unconditionally (see `acquire_inode` / `acquire_range`).
+    fn maybe_sweep_lazy(&self) {
+        let last = *self.last_sweep.lock().unwrap();
+        if last.elapsed() < self.sweep_threshold {
+            self.metrics.record_sweep_skipped();
+            return;
+        }
+        let removed = self.state.sweep_expired();
+        *self.last_sweep.lock().unwrap() = Instant::now();
+        self.metrics.record_sweep_removed(removed);
     }
 
     /// Drop all cached inode/range leases for an inode, returning the
@@ -192,6 +263,10 @@ impl FuseLockManager {
         if let Some(cached) = self.state.get_inode(inode) {
             if cached.mode == mode {
                 self.metrics.record_cache_hit();
+                // Lazy sweep (phase 4 P1): skip when the last sweep was
+                // recent. `get_inode` already filtered expired entries,
+                // so we never serve a stale lease.
+                self.maybe_sweep_lazy();
                 log::debug!(
                     "lock: inode cache hit inode={} mode={}",
                     inode,
@@ -213,7 +288,10 @@ impl FuseLockManager {
             self.state.invalidate_inode(inode);
         }
 
-        // 2. Cache miss → backend RPC.
+        // 2. Cache miss → sweep (clean churn before adding new entry),
+        //    then backend RPC. The RPC dominates latency so the sweep
+        //    overhead is negligible.
+        self.sweep_expired();
         self.metrics.record_cache_miss();
         let (token, expire_at_ms) = self
             .backend
@@ -276,6 +354,9 @@ impl FuseLockManager {
             .get_range(inode, stripe_start, stripe_count, exclusive)
         {
             self.metrics.record_cache_hit();
+            // Lazy sweep (phase 4 P1): skip when the last sweep was
+            // recent. `get_range` already filtered expired entries.
+            self.maybe_sweep_lazy();
             log::debug!(
                 "lock: range cache hit inode={} stripe=[{},{}) exclusive={}",
                 inode,
@@ -296,7 +377,8 @@ impl FuseLockManager {
             });
         }
 
-        // 2. Cache miss → resolve volume_id, then backend RPC.
+        // 2. Cache miss → sweep, resolve volume_id, then backend RPC.
+        self.sweep_expired();
         self.metrics.record_cache_miss();
         let volume_id = self.backend.lookup_volume_id(inode).await.map_err(|e| {
             self.metrics.record_error();
@@ -355,9 +437,9 @@ impl FuseLockManager {
 impl LockManager for FuseLockManager {
     async fn acquire(&self, req: LockRequest) -> Result<LockGrant, LockError> {
         self.metrics.record_acquire();
-        // Lazy sweep on every acquire so the cache can't grow unbounded
-        // under churn. Cheap when nothing's expired.
-        self.sweep_expired();
+        // Lazy sweep (phase 4 P1): the sweep now runs inside
+        // `acquire_inode` / `acquire_range`, conditional on cache
+        // hit/miss. See `maybe_sweep_lazy` for rationale.
 
         let duration_ms = self.effective_duration_ms(&req);
 
@@ -807,6 +889,187 @@ mod tests {
         assert!(
             snap.sweep_removed_total >= 1,
             "sweep must remove expired entry"
+        );
+    }
+
+    // ---------- lazy sweep (phase 4 P1) ----------
+
+    /// Helper: inject a stale (already-expired) inode lease directly
+    /// into the cache state so we can observe whether `sweep_expired`
+    /// actually ran. `get_inode` filters expired entries per-lookup,
+    /// so a stale entry only disappears when the sweep runs.
+    fn inject_stale_inode(mgr: &FuseLockManager, inode: u64) {
+        mgr.state().put_inode(
+            inode,
+            InodeLeaseEntry {
+                token: format!("stale-{inode}"),
+                expire_at: Instant::now() - Duration::from_secs(60),
+                mode: LockMode::Shared,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_skips_on_cache_hit_within_threshold() {
+        // Default threshold is 100ms — a cache hit immediately after a
+        // sweep must skip and bump `sweep_skipped_total`.
+        let (mgr, backend) = make_manager();
+        let inode = 42u64;
+
+        // Prime the cache (cache miss → sweep runs, sets last_sweep).
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req).await.expect("prime acquire");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+
+        // Inject a stale entry for a *different* inode so we can
+        // detect whether the sweep ran on the next acquire.
+        inject_stale_inode(&mgr, 999);
+
+        // Cache hit on inode=42 — within the 100ms threshold, so the
+        // sweep must be skipped and the stale inode=999 entry must
+        // remain in the cache.
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("cache hit must succeed");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            1,
+            "second acquire must be a cache hit"
+        );
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(
+            snap.sweep_skipped_total, 1,
+            "cache hit within threshold must skip sweep"
+        );
+        assert_eq!(
+            snap.sweep_removed_total, 0,
+            "sweep must not have run, so stale entry must still be cached"
+        );
+        // The stale entry is still in the cache (sweep didn't run).
+        assert_eq!(
+            mgr.state().inode_cache_size(),
+            2,
+            "stale entry must still be cached (sweep skipped)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_runs_on_cache_hit_when_threshold_exceeded() {
+        // With `sweep_threshold = Duration::ZERO`, the lazy check
+        // `elapsed < ZERO` is always false → sweep runs on every
+        // cache hit. This validates the "force sweep" escape hatch
+        // and proves the cache-hit path can still sweep when needed.
+        let (mgr, backend) = make_manager();
+        let mgr = mgr.with_sweep_threshold(Duration::ZERO);
+        let inode = 42u64;
+
+        // Prime the cache.
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req).await.expect("prime acquire");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+
+        // Inject a stale entry for a different inode.
+        inject_stale_inode(&mgr, 999);
+
+        // Cache hit on inode=42 — threshold=0 forces the sweep to
+        // run, which must evict the stale inode=999 entry.
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("cache hit must succeed");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            1,
+            "second acquire must be a cache hit"
+        );
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(
+            snap.sweep_skipped_total, 0,
+            "zero threshold must never skip sweep"
+        );
+        assert!(
+            snap.sweep_removed_total >= 1,
+            "sweep must run and remove the stale entry"
+        );
+        assert_eq!(
+            mgr.state().inode_cache_size(),
+            1,
+            "stale entry must be evicted; only the fresh entry remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_miss_sweeps_regardless_of_threshold() {
+        // Even with a huge threshold (so lazy-sweep would always skip),
+        // the cache-miss path must still sweep unconditionally — the
+        // upcoming RPC hides the sweep cost and the cache stays clean
+        // before inserting the new entry.
+        let (mgr, _backend) = make_manager();
+        let mgr = mgr.with_sweep_threshold(Duration::from_secs(60));
+
+        // Inject a stale entry.
+        inject_stale_inode(&mgr, 999);
+
+        // Acquire a different inode → cache miss → sweep must run
+        // (despite the 60s threshold) and evict the stale entry.
+        let req = LockRequest::new(7u64, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req).await.expect("acquire must succeed");
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(
+            snap.sweep_skipped_total, 0,
+            "cache-miss path never goes through the lazy-skip fast path"
+        );
+        assert!(
+            snap.sweep_removed_total >= 1,
+            "cache-miss sweep must evict the stale entry"
+        );
+        assert_eq!(
+            mgr.state().inode_cache_size(),
+            1,
+            "only the freshly-acquired entry should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_runs_on_cache_hit_after_threshold_elapses() {
+        // Realistic scenario: cache hit, but enough time has elapsed
+        // since the last sweep that the threshold is exceeded → the
+        // sweep runs on the cache-hit path. Uses a 1ms threshold so
+        // the test doesn't have to sleep for 100ms.
+        let (mgr, backend) = make_manager();
+        let mgr = mgr.with_sweep_threshold(Duration::from_millis(1));
+        let inode = 42u64;
+
+        // Prime the cache (sets last_sweep).
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req).await.expect("prime acquire");
+        assert_eq!(backend.acquire_inode_calls.load(Ordering::SeqCst), 1);
+
+        // Wait long enough for the threshold to elapse.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Inject a stale entry AFTER the sleep so the sweep has
+        // something to remove.
+        inject_stale_inode(&mgr, 999);
+
+        // Cache hit — threshold exceeded → sweep must run and evict
+        // the stale entry.
+        let req2 = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req2).await.expect("cache hit must succeed");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            1,
+            "second acquire must be a cache hit"
+        );
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(
+            snap.sweep_skipped_total, 0,
+            "threshold exceeded → sweep must not be skipped"
+        );
+        assert!(
+            snap.sweep_removed_total >= 1,
+            "sweep must run and remove the stale entry"
         );
     }
 

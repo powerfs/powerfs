@@ -14,6 +14,7 @@
 //! | `renew_total`            | total `LockManager::renew` calls       |
 //! | `errors_total`           | total errors (conflict + network + ...)|
 //! | `sweep_removed_total`   | total entries removed by `sweep_expired`|
+//! | `sweep_skipped_total`   | cache-hit acquires that skipped sweep (phase 4 P1 lazy sweep)|
 //!
 //! The counters are `AtomicU64` so they can be read from any thread
 //! without locking. A future Prometheus exporter can scrape them via
@@ -38,6 +39,10 @@ pub struct LockMetrics {
     pub renew_total: AtomicU64,
     pub errors_total: AtomicU64,
     pub sweep_removed_total: AtomicU64,
+    /// Cache-hit acquires that skipped `sweep_expired` because the last
+    /// sweep was within the lazy-sweep threshold (phase 4 P1). Lets
+    /// operators verify the optimization is engaging in production.
+    pub sweep_skipped_total: AtomicU64,
 }
 
 /// A consistent point-in-time snapshot of all counters.
@@ -57,6 +62,7 @@ pub struct LockMetricsSnapshot {
     pub renew_total: u64,
     pub errors_total: u64,
     pub sweep_removed_total: u64,
+    pub sweep_skipped_total: u64,
 }
 
 impl LockMetrics {
@@ -109,6 +115,12 @@ impl LockMetrics {
         }
     }
 
+    /// Record a cache-hit acquire that skipped `sweep_expired` because
+    /// the last sweep was within the lazy-sweep threshold (phase 4 P1).
+    pub fn record_sweep_skipped(&self) {
+        self.sweep_skipped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read a consistent-ish snapshot of all counters.
     pub fn snapshot(&self) -> LockMetricsSnapshot {
         LockMetricsSnapshot {
@@ -120,6 +132,7 @@ impl LockMetrics {
             renew_total: self.renew_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             sweep_removed_total: self.sweep_removed_total.load(Ordering::Relaxed),
+            sweep_skipped_total: self.sweep_skipped_total.load(Ordering::Relaxed),
         }
     }
 }
