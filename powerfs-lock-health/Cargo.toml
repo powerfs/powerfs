@@ -1,0 +1,16 @@
+[package]
+name = "powerfs-lock-health"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Client health scoring, adaptive throttle, quarantine pool, and Fencer token for PowerFS lock admission control (§8.2 + §8.3)"
+license.workspace = true
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[lib]
+name = "powerfs_lock_health"
+path = "src/lib.rs"
