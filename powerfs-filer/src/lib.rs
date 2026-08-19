@@ -1,6 +1,7 @@
 pub mod bucket_manager;
 pub mod crdt_meta;
 pub mod crdt_orset;
+pub mod early_grant;
 pub mod entry_manager;
 pub mod grpc_service;
 pub mod inode_lease_manager;

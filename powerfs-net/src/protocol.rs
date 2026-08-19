@@ -636,6 +636,14 @@ pub enum MsgType {
     AcquireInodeLease = 0x0085,
     ReleaseInodeLease = 0x0086,
     RenewInodeLease = 0x0087,
+    /// Phase 4 §5.2 Early Grant: client → Filer, acknowledges a pushed
+    /// `Revoke` (Early Revoke) notification. The holder signals it has
+    /// flushed dirty data and is releasing the lease; the Filer then
+    /// grants the next queued waiter immediately (Early Grant) without
+    /// waiting for the old holder's dirty-page writeback. The SN on the
+    /// new grant preserves global IO ordering.
+    /// Request TLV: Ino + ClientId + LeaseToken. Response: STATUS only.
+    RevokeInodeLeaseAck = 0x0088,
 
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
@@ -705,6 +713,7 @@ impl MsgType {
             0x0085 => Some(Self::AcquireInodeLease),
             0x0086 => Some(Self::ReleaseInodeLease),
             0x0087 => Some(Self::RenewInodeLease),
+            0x0088 => Some(Self::RevokeInodeLeaseAck),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -739,6 +748,7 @@ impl MsgType {
                 | MsgType::AcquireInodeLease
                 | MsgType::ReleaseInodeLease
                 | MsgType::RenewInodeLease
+                | MsgType::RevokeInodeLeaseAck
         )
     }
 }

@@ -35,11 +35,15 @@
 //! The public API (`acquire`/`release`/`renew`/`validate`/...) is preserved
 //! verbatim so `net_handler.rs` needs no changes.
 
+use crate::early_grant::{
+    AcquireOutcome, LeaseRevoker, NoopRevoker, SnAllocator, WaitQueue, Waiter,
+};
 use powerfs_lease::{
     LeaseError, LeaseKey, LeaseMode, LeasePersistence, LeaseStats, LeaseStore, MemoryLeaseStore,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 /// Default grace period after lease expiry before allowing a new holder.
 /// This prevents data corruption when a client is slow but still alive.
@@ -106,6 +110,20 @@ pub struct InodeLeaseManager {
     /// operations (`release`/`renew`/`validate`/...) rely on the store's
     /// own internal locking for atomicity.
     acquire_lock: Arc<Mutex<()>>,
+    /// Phase-4 §5.2/§5.3 SN allocator (leader-local, optimistic).
+    /// `acquire`/`acquire_or_wait`/`handle_revoke_ack` allocate an SN
+    /// on every grant. See `early_grant::SnAllocator`.
+    sn: Arc<SnAllocator>,
+    /// Phase-4 §5.2 wait queue for contended acquires. Populated by
+    /// `acquire_or_wait` on conflict; drained by `handle_revoke_ack`
+    /// (Early Grant) or `release` (normal handoff).
+    waiters: Arc<WaitQueue>,
+    /// Phase-4 §5.2 Early Revoke push transport. Defaults to a no-op
+    /// (`NoopRevoker`) so the manager works without a push channel —
+    /// in that mode `acquire_or_wait` queues waiters but never
+    /// notifies the holder, so waiters only progress via the holder's
+    /// voluntary release or TTL expiry.
+    revoker: Arc<dyn LeaseRevoker>,
 }
 
 /// Result of an acquire attempt.
@@ -113,6 +131,12 @@ pub struct InodeLeaseManager {
 pub struct AcquireResult {
     pub token: String,
     pub expire_at_ms: u64,
+    /// Global sequence number allocated by the filer leader (phase 4
+    /// §5.2/§5.3 — `SnAllocator::next_sn`). SN 0 means "not allocated"
+    /// (legacy path / before Early Grant wiring); SN > 0 orders IO
+    /// across leader switches and Early Grant handoffs. The wire
+    /// protocol carries this in `FIELD_SN` (see `powerfs-lock-net`).
+    pub sn: u64,
 }
 
 impl Default for InodeLeaseManager {
@@ -139,6 +163,9 @@ impl InodeLeaseManager {
             store: Arc::new(store),
             grace_period: grace,
             acquire_lock: Arc::new(Mutex::new(())),
+            sn: Arc::new(SnAllocator::default()),
+            waiters: Arc::new(WaitQueue::new()),
+            revoker: Arc::new(NoopRevoker),
         }
     }
 
@@ -158,7 +185,64 @@ impl InodeLeaseManager {
             store: Arc::new(new_store),
             grace_period: self.grace_period,
             acquire_lock: self.acquire_lock,
+            sn: self.sn,
+            waiters: self.waiters,
+            revoker: self.revoker,
         }
+    }
+
+    /// Attach an Early Revoke push transport (phase 4 §5.2). When set,
+    /// `acquire_or_wait` will push a `Revoke` notification to the
+    /// current holder when a new waiter queues, enabling the holder to
+    /// flush + release early instead of waiting for TTL + grace.
+    ///
+    /// Without this (the default `NoopRevoker`), `acquire_or_wait`
+    /// still queues waiters but the holder is never notified — waiters
+    /// only progress via the holder's voluntary release or TTL expiry.
+    #[must_use]
+    pub fn with_revoker<R: LeaseRevoker + 'static>(self, revoker: R) -> Self {
+        Self {
+            revoker: Arc::new(revoker),
+            ..self
+        }
+    }
+
+    /// Override the SN allocator (phase 4 §5.3). Pass a pre-seeded
+    /// `SnAllocator` on leader takeover so the new leader resumes
+    /// allocating from the highest SN recovered from the Raft log —
+    /// this avoids reusing SNs across leader switches.
+    #[must_use]
+    pub fn with_sn_allocator(self, sn: Arc<SnAllocator>) -> Self {
+        Self { sn, ..self }
+    }
+
+    /// Allocate the next SN (phase 4 §5.2). Wraps `SnAllocator::next_sn`
+    /// so callers don't need to import the `early_grant` module.
+    pub fn next_sn(&self) -> u64 {
+        self.sn.next_sn()
+    }
+
+    /// Current high-water SN. Wraps `SnAllocator::current_sn`.
+    pub fn current_sn(&self) -> u64 {
+        self.sn.current_sn()
+    }
+
+    /// Reset the SN allocator to a checkpoint value (phase 4 §5.3 —
+    /// leader takeover after Raft log replay). Wraps
+    /// `SnAllocator::reset_to`.
+    pub fn reset_sn_to(&self, sn: u64) {
+        self.sn.reset_to(sn);
+    }
+
+    /// Number of waiters queued for `inode` (phase 4 §5.2 — for
+    /// monitoring / metrics). Returns 0 if no waiters.
+    pub fn waiter_count(&self, inode: u64) -> usize {
+        self.waiters.len(inode)
+    }
+
+    /// Whether any inode has queued waiters.
+    pub fn has_queued_waiters(&self) -> bool {
+        !self.waiters.is_empty()
     }
 
     /// Load non-expired leases from the persistence backend.
@@ -209,11 +293,16 @@ impl InodeLeaseManager {
         // Idempotent re-acquire: if an active (non-expired) lease exists for
         // this inode held by the same client, return its existing token.
         // We use get_entries_by_group (excludes expired) for this check.
+        // SN is 0 on re-acquire — the caller already holds the SN from the
+        // original grant and reuses it; SN 0 means "no new SN allocated"
+        // (see `LockGrant::sn` doc in `powerfs-lock`). The store's `epoch`
+        // field is the Fencer epoch (zombie-client fencing), NOT the SN.
         for entry in self.store.get_entries_by_group(inode) {
             if entry.holder == client_id {
                 return Ok(AcquireResult {
                     token: entry.token,
                     expire_at_ms: duration_ms,
+                    sn: 0,
                 });
             }
         }
@@ -242,15 +331,20 @@ impl InodeLeaseManager {
             .acquire(key, client_id, LeaseMode::Exclusive, duration)
         {
             Ok(entry) => {
+                // Phase-4 §5.2/§5.3: allocate SN on every new grant.
+                // Idempotent re-acquires (above) reuse the original SN.
+                let sn = self.sn.next_sn();
                 log::debug!(
-                    "InodeLease: acquired inode={} holder={} duration_ms={}",
+                    "InodeLease: acquired inode={} holder={} duration_ms={} sn={}",
                     inode,
                     client_id,
-                    duration_ms
+                    duration_ms,
+                    sn
                 );
                 Ok(AcquireResult {
                     token: entry.token,
                     expire_at_ms: duration_ms,
+                    sn,
                 })
             }
             Err(LeaseError::Conflict(msg)) => Err(format!(
@@ -258,6 +352,152 @@ impl InodeLeaseManager {
                 inode, msg
             )),
             Err(e) => Err(format!("inode {} lease acquire failed: {}", inode, e)),
+        }
+    }
+
+    /// Acquire-or-wait (phase 4 §5.2 Early Grant + Early Revoke).
+    ///
+    /// Like [`acquire`], but on conflict the request is queued and the
+    /// caller is handed a `oneshot::Receiver` to await the grant
+    /// notification. The server pushes an Early Revoke to the current
+    /// holder (if a `LeaseRevoker` is configured); when the holder
+    /// ACKs via [`handle_revoke_ack`], the next queued waiter is
+    /// granted immediately (Early Grant) without waiting for the old
+    /// holder's dirty-page flush — the SN on the grant preserves IO
+    /// ordering.
+    ///
+    /// Returns:
+    /// - `AcquireOutcome::Granted(r)` on immediate success (no
+    ///   conflict, or idempotent re-acquire).
+    /// - `AcquireOutcome::Queued(rx)` on conflict; await `rx` for the
+    ///   grant. If the holder never ACKs and the TTL doesn't expire,
+    ///   the waiter blocks indefinitely — callers should wrap the wait
+    ///   in a `tokio::time::timeout`.
+    /// - `AcquireOutcome::Error(s)` on grace-period rejection or other
+    ///   failure (same conditions as `acquire`).
+    pub fn acquire_or_wait(&self, inode: u64, client_id: &str, duration_ms: u64) -> AcquireOutcome {
+        // Fast path: try a regular acquire first. The legacy path
+        // handles idempotent re-acquire, grace-period rejection, and
+        // the conflict-then-error case. On conflict we fall through
+        // to the wait queue.
+        let was_queued = self.waiters.has_waiters(inode);
+        match self.acquire(inode, client_id, duration_ms) {
+            Ok(result) => return AcquireOutcome::Granted(result),
+            Err(e) if e.contains("held by another client") => {
+                // Fall through to queue path.
+            }
+            Err(e) => return AcquireOutcome::Error(e),
+        }
+
+        // Conflict path: queue the waiter.
+        let (tx, rx) = oneshot::channel();
+        let waiter = Waiter::new(client_id.to_string(), duration_ms, tx);
+        let queue_len = self.waiters.push(inode, waiter);
+
+        // §5.2 Early Revoke: push a revoke notification to the current
+        // holder ONLY if this is the first waiter — subsequent waiters
+        // join a queue whose head has already been notified. Sending
+        // a second revoke would be redundant and could confuse the
+        // holder's state machine.
+        if queue_len == 1 && !was_queued {
+            // Look up the current holder to address the revoke.
+            if let Some(holder_entry) = self.store.get_entries_by_group(inode).into_iter().next() {
+                let _ = self
+                    .revoker
+                    .revoke(inode, &holder_entry.token, &holder_entry.holder);
+                log::debug!(
+                    "InodeLease: early-revoke pushed inode={} holder={} waiter={}",
+                    inode,
+                    holder_entry.holder,
+                    client_id
+                );
+            }
+        }
+
+        AcquireOutcome::Queued(rx)
+    }
+
+    /// Handle a RevokeAck from the current lease holder (phase 4 §5.2
+    /// Early Grant).
+    ///
+    /// Called when the holder signals it has flushed its dirty data and
+    /// is releasing the lease. The server:
+    /// 1. Releases the holder's lease (verify holder + token match).
+    /// 2. Pops the next queued waiter for this inode (FIFO).
+    /// 3. Grants the lease to the waiter immediately — Early Grant:
+    ///    the new holder gets the lease without waiting for the old
+    ///    holder's dirty pages to be written back. The SN allocated
+    ///    here preserves IO ordering (writes under the old SN are
+    ///    sequenced before writes under the new SN).
+    /// 4. Fulfills the waiter's `oneshot::Sender` with the grant.
+    ///
+    /// If no waiter is queued, the release is still performed (the
+    /// holder's ACK means "I'm done"); the inode is just free for the
+    /// next acquire (which will be a fast cache miss, not a queue pop).
+    pub fn handle_revoke_ack(
+        &self,
+        inode: u64,
+        token: &str,
+        client_id: &str,
+    ) -> Result<(), String> {
+        // 1. Release the holder's lease. The store verifies holder +
+        //    token; mismatches are errors (defensive — a misbehaving
+        //    client might ACK with a stale token).
+        match self.release(inode, client_id, token) {
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!(
+                    "InodeLease: revoke-ack release failed inode={} holder={}: {}",
+                    inode,
+                    client_id,
+                    e
+                );
+                return Err(e);
+            }
+        }
+
+        // 2. Pop the next waiter (FIFO). If none, we're done — the
+        //    inode is now free and the next acquire will get it
+        //    immediately (no Early Grant needed).
+        let Some(waiter) = self.waiters.pop(inode) else {
+            log::debug!(
+                "InodeLease: revoke-ack no waiter queued inode={} holder={}",
+                inode,
+                client_id
+            );
+            return Ok(());
+        };
+
+        // 3. Early Grant: acquire the lease for the waiter. This
+        //    should not fail — we just released the holder, and the
+        //    waiter is a different client. If it does fail (e.g., a
+        //    third client raced in between), drop the waiter's sender
+        //    so its `Receiver::await` returns an error and it retries.
+        //    Allocate a fresh SN — the waiter's IO must be sequenced
+        //    behind the old holder's IO via the SN barrier.
+        match self.acquire(inode, &waiter.client_id, waiter.duration_ms) {
+            Ok(result) => {
+                let _ = waiter.sender.send(result);
+                log::debug!(
+                    "InodeLease: early-grant inode={} new_holder={}",
+                    inode,
+                    waiter.client_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "InodeLease: early-grant failed inode={} waiter={}: {}",
+                    inode,
+                    waiter.client_id,
+                    e
+                );
+                // Sender drops here → waiter's Receiver returns an error.
+                Err(format!(
+                    "early-grant failed for {}: {}",
+                    waiter.client_id, e
+                ))
+            }
         }
     }
 
@@ -964,5 +1204,293 @@ mod tests {
         fn load_epoch(&self) -> Result<u64, LeaseError> {
             self.0.load_epoch()
         }
+    }
+
+    // =====================================================================
+    // Early Grant + Early Revoke + SN integration tests (phase 4 §5.2)
+    // =====================================================================
+
+    /// A `LeaseRevoker` test double that captures every `revoke` call
+    /// so tests can assert the Early Revoke was pushed (and how many
+    /// times). Records the `(inode, token, holder)` triple per call.
+    #[derive(Default)]
+    struct CapturingRevoker {
+        calls: Mutex<Vec<(u64, String, String)>>,
+    }
+
+    impl CapturingRevoker {
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn calls(&self) -> Vec<(u64, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::early_grant::LeaseRevoker for CapturingRevoker {
+        fn revoke(&self, inode: u64, token: &str, holder: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((inode, token.to_string(), holder.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Newtype shim so `Arc<CapturingRevoker>` satisfies `LeaseRevoker`.
+    /// (`Arc<T>` doesn't auto-impl user traits, so we wrap it.)
+    struct RevokerShim(Arc<CapturingRevoker>);
+
+    impl crate::early_grant::LeaseRevoker for RevokerShim {
+        fn revoke(&self, inode: u64, token: &str, holder: &str) -> Result<(), String> {
+            self.0.revoke(inode, token, holder)
+        }
+    }
+
+    /// Helper: build a manager wired with a shared `CapturingRevoker`.
+    fn make_early_grant_mgr() -> (InodeLeaseManager, Arc<CapturingRevoker>) {
+        let revoker = Arc::new(CapturingRevoker::default());
+        let mgr = InodeLeaseManager::new().with_revoker(RevokerShim(revoker.clone()));
+        (mgr, revoker)
+    }
+
+    #[tokio::test]
+    async fn test_acquire_or_wait_granted_on_no_conflict() {
+        let mgr = InodeLeaseManager::new();
+        let inode = 10_001u64;
+
+        // No existing holder → immediate grant.
+        let outcome = mgr.acquire_or_wait(inode, "client-A", 30_000);
+        assert!(outcome.is_granted(), "no conflict → Granted");
+        if let crate::early_grant::AcquireOutcome::Granted(r) = outcome {
+            assert!(r.sn > 0, "fresh grant must allocate SN > 0");
+            assert!(!r.token.is_empty());
+        }
+        assert!(!mgr.has_queued_waiters(), "no waiters queued on grant");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_or_wait_queued_on_conflict() {
+        let mgr = InodeLeaseManager::new();
+        let inode = 10_002u64;
+
+        // client-A holds the lease.
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+
+        // client-B conflicts → Queued.
+        let outcome = mgr.acquire_or_wait(inode, "client-B", 30_000);
+        assert!(outcome.is_queued(), "conflict → Queued");
+        assert!(mgr.has_queued_waiters(), "waiter must be queued");
+        assert_eq!(mgr.waiter_count(inode), 1);
+
+        // NoopRevoker was used → the receiver should still be pending
+        // (holder hasn't ACK'd).
+        if let crate::early_grant::AcquireOutcome::Queued(rx) = outcome {
+            assert!(rx.is_empty(), "receiver must be pending until Early Grant");
+        }
+
+        // Cleanup.
+        mgr.release(inode, "client-A", &first.token).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_early_grant_on_revoke_ack() {
+        let (mgr, _revoker) = make_early_grant_mgr();
+        let inode = 10_003u64;
+
+        // client-A holds the lease.
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+        assert!(first.sn > 0);
+
+        // client-B conflicts → Queued.
+        let outcome = mgr.acquire_or_wait(inode, "client-B", 30_000);
+        assert!(outcome.is_queued());
+
+        // Simulate client-A's RevokeAck (flushed + releasing).
+        mgr.handle_revoke_ack(inode, &first.token, "client-A")
+            .expect("revoke-ack must succeed");
+
+        // client-B's receiver should now be fulfilled (Early Grant).
+        if let crate::early_grant::AcquireOutcome::Queued(rx) = outcome {
+            let grant = tokio::time::timeout(Duration::from_millis(500), rx)
+                .await
+                .expect("receiver must resolve after Early Grant")
+                .expect("sender must not be dropped");
+
+            // The new grant must carry a strictly higher SN (SN barrier
+            // preserves IO ordering across the handoff).
+            assert!(
+                grant.sn > first.sn,
+                "new grant SN={} must exceed old SN={}",
+                grant.sn,
+                first.sn
+            );
+            assert!(!grant.token.is_empty());
+        }
+
+        // Queue must be drained.
+        assert!(!mgr.has_queued_waiters());
+        assert_eq!(mgr.waiter_count(inode), 0);
+    }
+
+    #[tokio::test]
+    async fn test_early_revoke_pushed_only_for_first_waiter() {
+        let (mgr, revoker) = make_early_grant_mgr();
+        let inode = 10_004u64;
+
+        // client-A holds the lease.
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+
+        // client-B queues (first waiter → Early Revoke pushed to A).
+        let outcome_b = mgr.acquire_or_wait(inode, "client-B", 30_000);
+        assert!(outcome_b.is_queued());
+        assert_eq!(revoker.call_count(), 1, "first waiter triggers revoke");
+
+        let pushed = revoker.calls();
+        assert_eq!(pushed[0].0, inode, "revoke targets the right inode");
+        assert_eq!(pushed[0].2, "client-A", "revoke addresses the holder");
+
+        // client-C queues (second waiter → no second revoke).
+        let outcome_c = mgr.acquire_or_wait(inode, "client-C", 30_000);
+        assert!(outcome_c.is_queued());
+        assert_eq!(
+            revoker.call_count(),
+            1,
+            "second waiter must NOT trigger a redundant revoke"
+        );
+
+        assert_eq!(mgr.waiter_count(inode), 2);
+
+        // Cleanup: ACK from client-A grants client-B (FIFO), leaving
+        // client-C still queued.
+        mgr.handle_revoke_ack(inode, &first.token, "client-A")
+            .unwrap();
+        assert_eq!(mgr.waiter_count(inode), 1, "FIFO grants the head waiter");
+    }
+
+    #[tokio::test]
+    async fn test_revoke_ack_no_waiter_just_releases() {
+        let mgr = InodeLeaseManager::new();
+        let inode = 10_005u64;
+
+        // client-A holds the lease; no one is queued.
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+        assert!(!mgr.has_queued_waiters());
+
+        // RevokeAck with no waiter → just release, no Early Grant.
+        mgr.handle_revoke_ack(inode, &first.token, "client-A")
+            .expect("revoke-ack with no waiter must succeed");
+
+        // Inode is now free; client-B can acquire immediately.
+        assert!(!mgr.has_queued_waiters());
+        let next = mgr.acquire(inode, "client-B", 30_000).unwrap();
+        assert!(next.sn > first.sn);
+    }
+
+    #[test]
+    fn test_sn_zero_on_idempotent_reacquire() {
+        let mgr = InodeLeaseManager::new();
+        let inode = 10_006u64;
+
+        // First acquire allocates SN.
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+        assert!(first.sn > 0, "fresh grant allocates SN");
+
+        // Idempotent re-acquire reuses the token and returns SN=0
+        // (no new SN allocated — the caller reuses the original SN).
+        let reacq = mgr.acquire(inode, "client-A", 30_000).unwrap();
+        assert_eq!(
+            first.token, reacq.token,
+            "idempotent re-acquire returns the same token"
+        );
+        assert_eq!(
+            reacq.sn, 0,
+            "idempotent re-acquire must NOT allocate a new SN"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_early_grant_fifo_ordering() {
+        // Three clients queue for one inode; verify FIFO grant order.
+        let (mgr, _revoker) = make_early_grant_mgr();
+        let inode = 10_007u64;
+
+        let first = mgr.acquire(inode, "client-A", 30_000).unwrap();
+
+        let outcome_b = mgr.acquire_or_wait(inode, "client-B", 30_000);
+        let outcome_c = mgr.acquire_or_wait(inode, "client-C", 30_000);
+        let outcome_d = mgr.acquire_or_wait(inode, "client-D", 30_000);
+        assert_eq!(mgr.waiter_count(inode), 3);
+
+        // client-A ACKs → client-B gets the grant (FIFO head).
+        mgr.handle_revoke_ack(inode, &first.token, "client-A")
+            .unwrap();
+        let grant_b = tokio::time::timeout(
+            Duration::from_millis(500),
+            match outcome_b {
+                crate::early_grant::AcquireOutcome::Queued(rx) => rx,
+                _ => panic!("B must be queued"),
+            },
+        )
+        .await
+        .expect("B must be granted")
+        .expect("B sender alive");
+
+        // client-B ACKs → client-C gets the grant.
+        mgr.handle_revoke_ack(inode, &grant_b.token, "client-B")
+            .unwrap();
+        let grant_c = tokio::time::timeout(
+            Duration::from_millis(500),
+            match outcome_c {
+                crate::early_grant::AcquireOutcome::Queued(rx) => rx,
+                _ => panic!("C must be queued"),
+            },
+        )
+        .await
+        .expect("C must be granted")
+        .expect("C sender alive");
+
+        // client-C ACKs → client-D gets the grant.
+        mgr.handle_revoke_ack(inode, &grant_c.token, "client-C")
+            .unwrap();
+        let grant_d = tokio::time::timeout(
+            Duration::from_millis(500),
+            match outcome_d {
+                crate::early_grant::AcquireOutcome::Queued(rx) => rx,
+                _ => panic!("D must be queued"),
+            },
+        )
+        .await
+        .expect("D must be granted")
+        .expect("D sender alive");
+
+        // SNs must be strictly increasing across the FIFO handoff.
+        assert!(grant_b.sn > first.sn);
+        assert!(grant_c.sn > grant_b.sn);
+        assert!(grant_d.sn > grant_c.sn);
+
+        assert!(!mgr.has_queued_waiters());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_or_wait_error_on_grace_period() {
+        let mgr = InodeLeaseManager::with_grace_period(100);
+        let inode = 10_008u64;
+
+        // Acquire with short TTL, then wait into grace period.
+        let first = mgr.acquire(inode, "client-A", 50).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+
+        // client-B conflicts AND the lease is in grace → Error (not
+        // queued). The wait-queue path is for live conflicts only.
+        let outcome = mgr.acquire_or_wait(inode, "client-B", 50);
+        assert!(
+            outcome.is_error(),
+            "grace-period rejection must surface as Error, not Queued"
+        );
+
+        // Cleanup.
+        mgr.release(inode, "client-A", &first.token).ok();
     }
 }
