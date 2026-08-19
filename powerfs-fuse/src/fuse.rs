@@ -366,6 +366,7 @@ impl FuseApp {
             lease_manager,
             lock_manager,
             open_inodes: open_inodes.clone(),
+            open_file_leases: Arc::new(crate::open_file_lease::OpenFileLeaseRegistry::new()),
             inline_buffers: inline_buffers.clone(),
             inline_max_sizes: Arc::new(DashMap::new()),
             last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -560,6 +561,13 @@ struct PowerFsFs {
     /// （如 dd 关闭后 release 异步执行，此时 fsx 已 open），
     /// HashSet 的 remove 会误删仍在使用的 inode。
     open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
+    /// Phase-4 §5.2 (P3): Open-file lease registry. When a file is
+    /// opened in inode-lease mode, the inode lease is pre-acquired at
+    /// `open()` time and bound here. `flush_dirty_chunks` passes the
+    /// bound token to `write_blob_batch_with_lease`, bypassing
+    /// `ensure_lease`'s cache lookup on every flush. `release()`
+    /// invalidates the binding. See `open_file_lease.rs`.
+    open_file_leases: Arc<crate::open_file_lease::OpenFileLeaseRegistry>,
     /// P2.5: Inline 模式文件的写入缓冲。key = inode, value = InlineBuffer.
     ///
     /// 生命周期: create(inline) → 初始化空 buffer; write → 追加并标 dirty;
@@ -1003,7 +1011,16 @@ impl PowerFsFs {
     fn flush_dirty_chunks(&self, inode: u64, lease_token: Option<&str>) -> std::io::Result<()> {
         let flush_lock = self.get_flush_lock(inode);
         let _guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.flush_dirty_chunks_impl(inode, lease_token)
+        // Phase-4 §5.2 (P3): If the caller didn't supply a lease
+        // token, try the open-file-lease registry (bound at open
+        // time). Falls through to `None` → `ensure_lease` if no
+        // lease is bound or it's expired — graceful degradation.
+        let bound_token = if lease_token.is_some() {
+            lease_token.map(|s| s.to_string())
+        } else {
+            self.open_file_leases.get_valid_token(inode)
+        };
+        self.flush_dirty_chunks_impl(inode, bound_token.as_deref())
     }
 
     /// Internal flush implementation — caller MUST hold the per-inode flush lock.
@@ -3376,6 +3393,47 @@ impl FileSystem for PowerFsFs {
                 "open: open_count_inc for inode {} failed (best-effort): {}",
                 inode, e
             );
+        }
+
+        // Phase-4 §5.2 (P3): Pre-acquire the inode lease at open time
+        // and bind it to the open-file registry. Subsequent
+        // `flush_dirty_chunks` calls pass this token to
+        // `write_blob_batch_with_lease`, bypassing `ensure_lease`'s
+        // cache lookup + proactive-renew path on every flush.
+        //
+        // Only applies to inode-lease mode AND files already on the
+        // volume server (fid present). Inline files (no fid) don't
+        // need a volume-server lease; newly-created files are
+        // handled by the Lockify fast path (phase 4 §5.1).
+        //
+        // Best-effort: if the acquire fails (e.g. Filer temporarily
+        // unreachable), the write path's `ensure_lease` will retry on
+        // the first flush — correctness is preserved.
+        if self.client.is_inode_lease_mode() {
+            if let Some(entry) = self.cache.get_inode(inode) {
+                if entry.fid.is_some() {
+                    let client_id = self.client.client_id();
+                    let duration_ms = self.lease_duration_ms;
+                    match self
+                        .client
+                        .acquire_inode_lease(inode, &client_id, duration_ms)
+                    {
+                        Ok((token, _expire_ms)) => {
+                            let expire_at = std::time::Instant::now()
+                                + std::time::Duration::from_millis(duration_ms);
+                            self.open_file_leases.bind(inode, token, expire_at);
+                            debug!("open: pre-acquired inode lease for inode={}", inode);
+                        }
+                        Err(e) => {
+                            debug!(
+                                "open: inode lease pre-acquire failed for inode={} \
+                                 (best-effort, ensure_lease will retry): {}",
+                                inode, e
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Ok((
@@ -5933,6 +5991,12 @@ impl FileSystem for PowerFsFs {
                 }
             }
         }
+
+        // Phase-4 §5.2 (P3): Invalidate the open-file-lease binding.
+        // The Filer-side release was handled above (success or
+        // best-effort failure); the registry is just a hint and must
+        // be cleared so a subsequent open re-binds a fresh token.
+        self.open_file_leases.invalidate(inode);
 
         sync_result?;
 
