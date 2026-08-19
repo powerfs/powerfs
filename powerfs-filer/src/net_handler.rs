@@ -38,7 +38,13 @@ pub struct FilerNetHandler {
     pub net_port: u16,
     /// Inode notification broadcaster (optional, for cache invalidation)
     pub inode_notifier: Option<Arc<InodeNotifier>>,
-    /// Inode metadata lease manager (方案 A, Phase 2)
+    /// Inode metadata lease manager (方案 A, Phase 2).
+    ///
+    /// Backed by `powerfs-lease::MemoryLeaseStore<InodeKey>`. Raft-backed
+    /// `LeasePersistence` is wired in via `InodeLeaseManager::with_persistence`
+    /// during the optimization phase (see `docs/lock-optimization-plan.md`
+    /// §6.3 P1) — for now state lives only in memory and is lost on leader
+    /// switch; clients retry acquire on the new leader.
     pub inode_lease_mgr: Arc<InodeLeaseManager>,
     /// 该 Filer 拥有的所有 Zone (多 Zone 设计: 旧 + 新)
     /// 空 Vec = 未注册, 无法分配 needle_id
