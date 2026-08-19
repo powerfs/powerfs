@@ -380,12 +380,45 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             net_manager.clone(),
         ));
 
-        let net_handler = Arc::new(FilerNetHandler::with_notifier(
-            meta_shard_manager.clone(),
-            shard_strategy.clone(),
-            net_port,
-            inode_notifier,
-        ));
+        let net_handler = {
+            // Phase 5 §5.3: wire Raft-backed lease persistence so
+            // active leases survive a Filer leader switch (closes the
+            // "leader switch loses leases" correctness hole). The
+            // backend routes LeasePut/Delete/SaveEpoch through the
+            // filer's openraft state machine; `CF_LEASES` on shard 0
+            // is the durable store. If shard 0 isn't available here
+            // (single-node boot before Raft initialization), we fall
+            // back to the in-memory lease manager — the cluster still
+            // runs, just with the old "leader switch loses leases"
+            // behavior, matching pre-phase-5 semantics.
+            let base = FilerNetHandler::with_notifier(
+                meta_shard_manager.clone(),
+                shard_strategy.clone(),
+                net_port,
+                inode_notifier,
+            );
+            if let Some(shard0_store) = meta_shard_manager.try_get_shard_store(ShardId(0)) {
+                let persistence = powerfs_filer::RaftLeasePersistence::new(
+                    raft_group_manager.clone(),
+                    shard0_store,
+                    ShardId(0),
+                );
+                base.with_lease_persistence(persistence)
+            } else {
+                base
+            }
+        };
+        let net_handler = Arc::new(net_handler);
+
+        // Phase 5 §5.3: recover any leases persisted to CF_LEASES on a
+        // previous run / previous leader. Best-effort — failures log
+        // a warning and leave the in-memory store empty, matching the
+        // pre-persistence behavior. This is the no-leader-change
+        // recovery path; the leader-takeover hook below catches the
+        // case where this node is elected leader later.
+        if let Err(e) = net_handler.recover_leases_from_persistence() {
+            warn!("startup lease recovery failed (non-fatal): {}", e);
+        }
 
         // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).
         // 启用后 handle_create 对新文件返回 Placement::Inline, 数据直接存 Filer

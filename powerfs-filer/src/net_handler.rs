@@ -174,6 +174,59 @@ impl FilerNetHandler {
         }
     }
 
+    /// Phase 5 §5.3: attach a Raft-backed `LeasePersistence` to the
+    /// inode lease manager so lease state survives leader switches.
+    ///
+    /// This is the production wiring point. The persistence backend
+    /// is `RaftLeasePersistence` (constructed by the filer main.rs
+    /// from the `RaftGroupManagerV2` + shard store handles). When
+    /// set, `acquire`/`renew`/`release` round-trip a
+    /// `ShardCommand::LeasePut`/`Delete` through Raft so all replicas
+    /// observe the same lease state, and `load_from_persistence` on
+    /// leader takeover repopulates the in-memory store from
+    /// `CF_LEASES`.
+    ///
+    /// Idempotent and must be called *before* any lease operation; we
+    /// rebuild the manager with persistence attached, so any leases
+    /// granted through the old non-persistent instance are orphaned
+    /// (acceptable since this is a one-time filer-startup transition).
+    #[must_use]
+    pub fn with_lease_persistence<P>(mut self, backend: P) -> Self
+    where
+        P: powerfs_lease::persistence::LeasePersistence + 'static,
+    {
+        let rebuilt = (*self.inode_lease_mgr).clone().with_persistence(backend);
+        self.inode_lease_mgr = Arc::new(rebuilt);
+        self
+    }
+
+    /// Phase 5 §5.3: recover lease state from persistence after this
+    /// node becomes the shard leader. Loads every non-expired lease
+    /// into the in-memory store and reseeds the Fencer epoch counter.
+    ///
+    /// Returns the count of leases recovered (excluding expired ones
+    /// that `decode_entry` skipped). On error, the in-memory store is
+    /// left empty — clients re-acquire on next request, matching the
+    /// pre-persistence behavior, so the cluster keeps making forward
+    /// progress even if recovery fails.
+    pub fn recover_leases_from_persistence(&self) -> Result<usize, String> {
+        let count = self
+            .inode_lease_mgr
+            .load_from_persistence()
+            .map_err(|e| format!("recover leases: {}", e))?;
+        // Best-effort epoch reseed. A failure here just means the
+        // Fencer epoch stays at its in-memory initial value; zombie
+        // fencing degrades to "trust" until the next save_epoch lands.
+        if let Err(e) = self.inode_lease_mgr.persist_epoch() {
+            log::warn!("recover_leases: epoch reseed failed (non-fatal): {}", e);
+        }
+        log::info!(
+            "recover_leases: loaded {} non-expired leases from persistence",
+            count
+        );
+        Ok(count)
+    }
+
     /// L4.21 fix: Initialize the version counter to current time in
     /// milliseconds. This ensures that after a Filer restart, the counter
     /// starts from a value >= any previously-sent version (which were also
