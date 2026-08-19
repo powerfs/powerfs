@@ -1,0 +1,48 @@
+[package]
+name = "powerfs-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Criterion micro-benchmarks for PowerFS lock hot paths (phase 3 baseline evaluation, see docs/lock-optimization-plan.md §四 step 7)"
+license.workspace = true
+
+# All consumers of this crate are bench harnesses (`benches/*.rs`), which are
+# compiled as dev targets. Putting the deps here keeps the workspace's
+# `cargo check` graph small and avoids pulling `powerfs-filer`'s heavy
+# transitive tree (rocksdb/axum/openraft/tonic) into the baseline runs.
+[dev-dependencies]
+powerfs-lock = { path = "../powerfs-lock" }
+powerfs-lock-net = { path = "../powerfs-lock-net" }
+powerfs-lock-fuse = { path = "../powerfs-lock-fuse" }
+powerfs-lock-health = { path = "../powerfs-lock-health" }
+powerfs-lease = { path = "../powerfs-lease" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[lib]
+name = "powerfs_bench"
+path = "src/lib.rs"
+
+# Each bench file below is a separate benchmark target. `harness = false`
+# lets us use the standard `criterion_main!` entry point instead of the
+# built-in test harness.
+[[bench]]
+name = "client_cache"
+harness = false
+path = "benches/client_cache.rs"
+
+[[bench]]
+name = "server_lease"
+harness = false
+path = "benches/server_lease.rs"
+
+[[bench]]
+name = "health_fencer"
+harness = false
+path = "benches/health_fencer.rs"
+
+[[bench]]
+name = "codec"
+harness = false
+path = "benches/codec.rs"
