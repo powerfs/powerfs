@@ -284,6 +284,35 @@ fn bench_manager_acquire_cache_hit(c: &mut Criterion) {
     });
 }
 
+/// Legacy variant (phase 4 P1 baseline comparison): disables the
+/// lazy-sweep fast path with `sweep_threshold = Duration::ZERO`, so
+/// every cache hit runs `sweep_expired`. Criterion's regression
+/// report (`target/criterion/manager/acquire_inode_cache_hit_lazy/`)
+/// shows the latency delta vs. the lazy variant above.
+fn bench_manager_acquire_cache_hit_lazy_sweep_disabled(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let backend: Arc<dyn FuseLockBackend> = Arc::new(NoopBackend::new());
+    let mgr = FuseLockManager::new(Arc::clone(&backend), "bench-legacy".to_string(), 30_000)
+        .with_sweep_threshold(Duration::ZERO);
+    let inode = 42u64;
+    // Prime the cache.
+    rt.block_on(async {
+        let req = LockRequest::new(inode, LockMode::Shared, Duration::from_secs(30));
+        mgr.acquire(req).await.expect("prime acquire");
+    });
+
+    c.bench_function("manager/acquire_inode_cache_hit_lazy_sweep_disabled", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let req =
+                    LockRequest::new(black_box(inode), LockMode::Shared, Duration::from_secs(30));
+                let grant = mgr.acquire(req).await.expect("cache hit");
+                black_box(grant);
+            });
+        });
+    });
+}
+
 fn bench_manager_acquire_cache_miss(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let backend: Arc<dyn FuseLockBackend> = Arc::new(NoopBackend::new());
@@ -382,6 +411,7 @@ criterion_group! {
         bench_metrics_record,
         bench_metrics_snapshot,
         bench_manager_acquire_cache_hit,
+        bench_manager_acquire_cache_hit_lazy_sweep_disabled,
         bench_manager_acquire_cache_miss,
         bench_manager_release_cached,
         bench_manager_range_acquire,
