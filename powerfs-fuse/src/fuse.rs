@@ -1975,6 +1975,212 @@ impl PowerFsFs {
         }
         Some(current)
     }
+
+    /// Sync dirty inline buffer data to the Filer.
+    ///
+    /// Implements the mark-snapshot → clone → sync → check-dirty-again loop
+    /// that handles concurrent writes during sync (including write-after-release
+    /// caused by the kernel's WRITEBACK_CACHE mode, where FUSE_WRITE can arrive
+    /// AFTER the FUSE_RELEASE callback has already run and cleared dirty).
+    ///
+    /// Returns `Ok(true)` if data was actually synced, `Ok(false)` if nothing to
+    /// sync (not dirty / buffer gone / no delta). Caller decides when to remove
+    /// the inline_buffers entry.
+    pub(crate) fn sync_inline_buffer(&self, inode: u64, log_prefix: &str) -> Result<bool> {
+        // inode-level write → route by routing_shard(inode). Inline data + size
+        // are stored on the inode's own shard, NOT the parent dir's shard.
+        let routing_shard = self.routing_shard(inode);
+
+        // Loop: snapshot dirty → clone → sync → check-dirty-again
+        // If a concurrent write marks the buffer dirty during the sync RPC,
+        // we re-sync the updated buffer. Max 3 iterations to avoid infinite
+        // loops under sustained write pressure.
+        let sync_ok = true;
+
+        for sync_round in 0..3u32 {
+            let snapshot: Option<(u64, Option<Vec<u8>>, usize, bool)> = {
+                if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+                    let size = inline_buf.data.len() as u64;
+                    let was_dirty = inline_buf.dirty;
+                    let orig_len = inline_buf.original_len;
+                    let mod_in_place = inline_buf.modified_in_place;
+                    let data = if was_dirty {
+                        Some(inline_buf.data.clone())
+                    } else {
+                        None
+                    };
+                    Some((size, data, orig_len, mod_in_place))
+                } else {
+                    None
+                }
+            };
+
+            let Some((size, data, orig_len, mod_in_place)) = snapshot else {
+                return Ok(false); // Buffer gone (migrated / removed), nothing synced
+            };
+
+            // Not dirty (read-only or already-synced path): skip sync entirely.
+            let Some(data) = data else {
+                debug!(
+                    "{} inode={} not dirty (round {}), skip sync",
+                    log_prefix, inode, sync_round
+                );
+                return Ok(false);
+            };
+
+            // Safety net: if the buffer didn't grow and no in-place modification
+            // occurred, there's nothing new to sync. Syncing size=0 would wipe
+            // other clients' concurrent-append data.
+            let can_append = !mod_in_place && (data.len() > orig_len);
+            if !can_append && !mod_in_place && data.len() == orig_len {
+                debug!(
+                    "{} inode={} no new data to sync (data_len={} == orig_len={}, \
+                     mod_in_place={}), skip to avoid overwriting other clients' data",
+                    log_prefix,
+                    inode,
+                    data.len(),
+                    orig_len,
+                    mod_in_place
+                );
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.dirty = false;
+                }
+                return Ok(false);
+            }
+
+            let (sync_data, sync_size, is_append) = if can_append {
+                let delta = data[orig_len..].to_vec();
+                debug!(
+                    "{} inode={} append mode, orig_len={}, delta_len={}, total_len={} round {}",
+                    log_prefix,
+                    inode,
+                    orig_len,
+                    delta.len(),
+                    data.len(),
+                    sync_round
+                );
+                (Some(delta), 0u64, true)
+            } else {
+                warn!(
+                    "{} inode={} OVERWRITE mode (is_append=false), mod_in_place={}, \
+                     data_len={}, orig_len={} round {} — may overwrite other clients' data",
+                    log_prefix,
+                    inode,
+                    mod_in_place,
+                    data.len(),
+                    orig_len,
+                    sync_round
+                );
+                (Some(data), size, false)
+            };
+
+            let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
+                shard_id: routing_shard,
+                inode,
+                size: sync_size,
+                chunks: Vec::new(),
+                client_id: self.client.client_id(),
+                inline_data: sync_data,
+                is_append,
+            };
+            let max_retries = 5u32;
+            let mut last_err = String::new();
+            let mut round_ok = false;
+            for attempt in 1..=max_retries {
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let req = req.clone();
+                let result = self
+                    .client
+                    .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
+                match result {
+                    Ok(resp) if resp.success => {
+                        info!(
+                            "{} inode={} synced size={} (round {} attempt {})",
+                            log_prefix, inode, size, sync_round, attempt
+                        );
+                        round_ok = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        last_err = resp.error;
+                        warn!(
+                            "{} inode={} round {} attempt {} failed: {}",
+                            log_prefix, inode, sync_round, attempt, last_err
+                        );
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        warn!(
+                            "{} inode={} round {} attempt {} error: {}",
+                            log_prefix, inode, sync_round, attempt, last_err
+                        );
+                    }
+                }
+                if attempt < max_retries {
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64)));
+                }
+            }
+
+            if !round_ok {
+                error!(
+                    "{} inode={} FAILED after {} attempts: {} — data may be lost",
+                    log_prefix, inode, max_retries, last_err
+                );
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.dirty = true;
+                }
+                return Err(powerfs_common::PowerFsError::Internal(last_err));
+            }
+
+            // After append-mode sync, update original_len to the synced snapshot
+            // size so a concurrent write's re-sync sends only the NEW delta
+            // (not full buffer → OVERWRITE mode → cross-client data loss).
+            if is_append {
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.original_len = size as usize;
+                }
+            }
+
+            // Check if buffer grew during sync (concurrent write). If so, re-sync.
+            let current_len = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| b.data.len())
+                .unwrap_or(0);
+
+            if current_len as u64 > size {
+                warn!(
+                    "{} inode={} buffer grew during sync (synced={}, current={}), re-syncing (round {})",
+                    log_prefix, inode, size, current_len, sync_round
+                );
+                continue;
+            }
+
+            // Buffer unchanged — mark as not dirty (caller decides remove).
+            let grew_again = {
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    let grew = inline_buf.data.len() as u64 > size;
+                    if !grew {
+                        inline_buf.dirty = false;
+                    }
+                    grew
+                } else {
+                    false
+                }
+            };
+            if grew_again {
+                warn!(
+                    "{} inode={} buffer grew between check and dirty-clear, re-syncing (round {})",
+                    log_prefix, inode, sync_round
+                );
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(sync_ok)
+    }
 }
 
 /// Parse POSIX ACL access xattr data to extract the file mode bits.
@@ -3153,6 +3359,19 @@ impl FileSystem for PowerFsFs {
                     let chunks_changed =
                         !filer_stale_empty && !chunks_match(&entry.chunks, &fresh.chunks);
                     let filer_content_size = fresh.content_size;
+                    let local_cs_before = self
+                        .cache
+                        .get_inode(inode)
+                        .map(|e| e.content_size)
+                        .unwrap_or(u64::MAX);
+                    // #region debug-point fuse-inline-data-loss-dbg-open-refresh
+                    info!(
+                        "DBG-INLINE: open refresh inode={} insert_pinned: local_cs={} filer_cs={} has_dirty_chunks={} has_dirty_inline={} hold_pinned={}",
+                        inode, local_cs_before, filer_content_size, has_local_data,
+                        entry.content_size > fresh.content_size && has_local_data,
+                        self.cache.get_inode(inode).map(|e| e.hold.is_pinned()).unwrap_or(false)
+                    );
+                    // #endregion
                     // P3: Preserve placement from existing entry. The FilerEntry
                     // returned by get_entry_by_inode does not carry FileLayout,
                     // so placement would be lost on refresh. Placement is set at
@@ -4841,6 +5060,76 @@ impl FileSystem for PowerFsFs {
                     self.cache.update_size(inode, updated_size);
                     // EntryState: 标记 Dirty 以反映 inline buffer 已修改
                     self.cache.mark_dirty(inode);
+                    // #region debug-point fuse-inline-data-loss-dbg-write-end
+                    {
+                        let cs_after = self
+                            .cache
+                            .peek_inode(inode)
+                            .map(|e| e.content_size)
+                            .unwrap_or(u64::MAX);
+                        let inline_dirty = self
+                            .inline_buffers
+                            .get(&inode)
+                            .map(|b| b.dirty)
+                            .unwrap_or(false);
+                        info!(
+                            "DBG-INLINE: write inline END inode={} offset={} len={} cs_after={} buf_len={} inline_dirty={}",
+                            inode, offset, read_len, cs_after, inline_buf.data.len(), inline_dirty
+                        );
+                    }
+                    // #endregion
+
+                    // WRITEBACK_CACHE FIX: if the last RELEASE callback already
+                    // ran for this inode (cache is NOT pinned), the kernel sent
+                    // this FUSE_WRITE via the writeback path AFTER the close
+                    // (a classic FUSE ordering pattern when WRITEBACK_CACHE is
+                    // negotiated). The normal release→sync flow already passed
+                    // — so trigger the Raft commit NOW, otherwise the data is
+                    // permanently stuck in DashMap and the Filer sees size=0.
+                    if !self.cache.is_pinned(inode) {
+                        info!(
+                            "DBG-INLINE: write inline post-release sync inode={} len={} (no open handles, immediate sync to Filer)",
+                            inode, read_len
+                        );
+                        match self.sync_inline_buffer(inode, "write inline post-release:") {
+                            Ok(_) => {
+                                // No future release will clean up this buffer
+                                // (all handles are closed). After successful
+                                // sync, dirty=false, remove explicitly to
+                                // avoid DashMap entry leak.
+                                let still_dirty = self
+                                    .inline_buffers
+                                    .get(&inode)
+                                    .map(|b| b.dirty)
+                                    .unwrap_or(true);
+                                if !still_dirty {
+                                    self.inline_buffers.remove(&inode);
+                                    self.inline_max_sizes.remove(&inode);
+                                }
+                                // DEADLOCK SAFETY: do NOT call notify_kernel_inval_inode
+                                // here. The FUSE write callback runs on the main
+                                // fuse-worker thread, which is also the thread
+                                // that reads requests from /dev/fuse. Writing a
+                                // NOTIFY_INVAL_INODE to /dev/fuse from the same
+                                // thread causes a circular wait: kernel waiting
+                                // for WRITE response, us waiting for NOTIFY to
+                                // be drained → hang forever.
+                                // Page-cache invalidation is unnecessary here
+                                // because is_pinned=false means no struct file
+                                // is open → no process has mapped pages to
+                                // discard. Subsequent reads go through open() →
+                                // Filer fetch → fresh size/data.
+                                self.cache.mark_stale(inode);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "write inline post-release sync FAILED inode={}: {} \
+                                     (data retained in DashMap; will retry on future writes)",
+                                    inode, e
+                                );
+                            }
+                        }
+                    }
                     return Ok(read_len);
                 }
             } else {
@@ -5432,257 +5721,38 @@ impl FileSystem for PowerFsFs {
         let has_inline_buffer = self.inline_buffers.contains_key(&inode);
 
         if has_inline_buffer {
-            // inode-level write → route by routing_shard(inode). Inline
-            // data + size are stored on the inode's own shard, NOT the parent
-            // dir's shard. Routing via `parent` would send the close-sync to
-            // the wrong leader and corrupt the file (size=0 / inline_data lost).
+            // WRITEBACK_CACHE FIX: sync inline data via the reusable helper
+            // function (which handles concurrent writes and the write-after-
+            // release race where FUSE_WRITE arrives AFTER release).
             let routing_shard = self.routing_shard(inode);
-
-            // Loop: mark-clean → clone → sync → check-dirty-again
-            // If a concurrent write marks the buffer dirty during the sync RPC,
-            // we re-sync the updated buffer. Max 3 iterations to avoid infinite
-            // loops under sustained write pressure.
-            let mut sync_ok = true;
-            let mut final_size = 0u64;
-
-            for sync_round in 0..3u32 {
-                // Step 1: Clone current data WITHOUT marking dirty=false.
-                // Marking dirty=false before sync creates a window where a
-                // concurrent open sees the buffer as not-dirty and refreshes
-                // stale metadata from the Filer (size=0), causing append writes
-                // to use offset=0 and overwrite existing data.
-                // Instead, keep dirty=true during sync and detect concurrent
-                // writes by comparing buffer length before and after sync.
-                //
-                // Also capture original_len and modified_in_place to decide
-                // between append mode (send only delta) and overwrite mode
-                // (send full buffer). Append mode prevents lost updates when
-                // multiple clients concurrently append to the same inline file.
-                let snapshot: Option<(u64, Option<Vec<u8>>, usize, bool)> = {
-                    if let Some(inline_buf) = self.inline_buffers.get(&inode) {
-                        let size = inline_buf.data.len() as u64;
-                        let was_dirty = inline_buf.dirty;
-                        let orig_len = inline_buf.original_len;
-                        let mod_in_place = inline_buf.modified_in_place;
-                        let data = if was_dirty {
-                            Some(inline_buf.data.clone())
-                        } else {
-                            None
-                        };
-                        final_size = size;
-                        Some((size, data, orig_len, mod_in_place))
-                    } else {
-                        // Buffer was removed by someone else (e.g., migration)
-                        None
-                    }
-                };
-
-                let Some((size, data, orig_len, mod_in_place)) = snapshot else {
-                    // Buffer gone, nothing to sync
-                    break;
-                };
-
-                // Step 2: If not dirty (read-only open), skip sync entirely.
-                if data.is_none() {
-                    debug!(
-                        "release inline: inode={} not dirty (round {}), skip sync",
-                        inode, sync_round
-                    );
-                    break;
-                }
-
-                // Step 3: Sync the snapshot to the Filer (outside DashMap lock).
-                //
-                // Append mode: if the buffer grew (size > original_len) and no
-                // in-place modification occurred (pure append), send only the
-                // delta (data[original_len..]) with is_append=true. The Filer
-                // atomically appends it to the current inline_data, preserving
-                // other clients' concurrent appends.
-                //
-                // Overwrite mode: if the buffer was modified in-place or didn't
-                // grow (truncate/overwrite), send the full buffer with
-                // is_append=false (existing behavior).
-                let data = data.unwrap(); // safe: data.is_none() checked above
-                let can_append = !mod_in_place && (data.len() > orig_len);
-
-                // Safety net: if the buffer didn't grow (data.len() == orig_len)
-                // and no in-place modification occurred, there's nothing new to
-                // sync. This can happen when:
-                // 1. A concurrent release already synced the data and cleared
-                //    dirty, but a race re-set dirty.
-                // 2. An empty-buffer release (data.len() == 0, orig_len == 0)
-                //    from a delayed FUSE RELEASE of a `touch`/create-without-write
-                //    operation. The kernel delays RELEASE callbacks, so the
-                //    `touch` command's release may arrive during concurrent
-                //    appends from other clients. Syncing size=0 in OVERWRITE
-                //    mode would wipe their data (L4.21 root cause).
-                //
-                // In both cases, skip the sync — the Filer's state is
-                // authoritative (no local data was written).
-                if !can_append && !mod_in_place && data.len() == orig_len {
-                    debug!(
-                        "release inline: inode={} no new data to sync (data_len={} == orig_len={}, \
-                         mod_in_place={}, skip to avoid overwriting other clients' data)",
-                        inode, data.len(), orig_len, mod_in_place
-                    );
-                    // Clear dirty (concurrent release may have missed it)
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.dirty = false;
-                    }
-                    break;
-                }
-
-                let (sync_data, sync_size, is_append) = if can_append {
-                    let delta = data[orig_len..].to_vec();
-                    debug!(
-                        "release inline: inode={} append mode, orig_len={}, delta_len={}, total_len={}",
-                        inode, orig_len, delta.len(), data.len()
-                    );
-                    (Some(delta), 0u64, true)
-                } else {
-                    warn!(
-                        "release inline: inode={} OVERWRITE mode (is_append=false), mod_in_place={}, \
-                         data_len={}, orig_len={} — this may overwrite other clients' data",
-                        inode, mod_in_place, data.len(), orig_len
-                    );
-                    (Some(data), size, false)
-                };
-
-                let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
-                    shard_id: routing_shard,
-                    inode,
-                    size: sync_size,
-                    chunks: Vec::new(),
-                    client_id: self.client.client_id(),
-                    inline_data: sync_data,
-                    is_append,
-                };
-                let max_retries = 5u32;
-                let mut last_err = String::new();
-                let mut round_ok = false;
-                for attempt in 1..=max_retries {
-                    let meta_client = self.client.facade().meta_shard_client().clone();
-                    let req = req.clone();
-                    let result = self
-                        .client
-                        .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
-                    match result {
-                        Ok(resp) if resp.success => {
-                            info!(
-                                "release inline: inode={} synced size={} (round {} attempt {})",
-                                inode, size, sync_round, attempt
-                            );
-                            round_ok = true;
-                            break;
-                        }
-                        Ok(resp) => {
-                            last_err = resp.error;
-                            warn!(
-                                "release inline: inode={} round {} attempt {} failed: {}",
-                                inode, sync_round, attempt, last_err
-                            );
-                        }
-                        Err(e) => {
-                            last_err = e;
-                            warn!(
-                                "release inline: inode={} round {} attempt {} error: {}",
-                                inode, sync_round, attempt, last_err
-                            );
-                        }
-                    }
-                    if attempt < max_retries {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            500 * (attempt as u64),
-                        ));
-                    }
-                }
-
-                if !round_ok {
+            let sync_result = self.sync_inline_buffer(inode, "release inline:");
+            let sync_ok = match sync_result {
+                Ok(_) => true,
+                Err(e) => {
                     error!(
-                        "release inline: inode={} FAILED after {} attempts: {} — data may be lost",
-                        inode, max_retries, last_err
+                        "release inline: sync_inline_buffer failed for inode {}: {}",
+                        inode, e
                     );
-                    sync_ok = false;
-                    // Re-mark as dirty so a future release can retry
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.dirty = true;
-                    }
-                    break;
+                    false
                 }
-
-                // After a successful append-mode sync, update original_len to
-                // the SYNCED length (the snapshot size), NOT the current buffer
-                // length. If the buffer grew during sync (concurrent write),
-                // original_len must reflect only what was actually sent in the
-                // delta, so the re-sync round sends the NEW delta
-                // (data[original_len..]) instead of seeing data.len() ==
-                // orig_len and falling back to OVERWRITE mode (which would
-                // overwrite other clients' data).
-                //
-                // BUG: previously set to inline_buf.data.len(), which is the
-                // CURRENT (possibly grown) buffer length. This caused the
-                // re-sync to see data.len() == orig_len → OVERWRITE mode →
-                // cross-client data loss (L4.21).
-                if is_append {
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.original_len = size as usize;
-                    }
-                }
-
-                // Step 4: Check if the buffer grew during the sync.
-                // Compare current length with synced size. If the buffer grew,
-                // a concurrent write happened — re-sync with the updated data.
-                let current_len = self
-                    .inline_buffers
-                    .get(&inode)
-                    .map(|b| b.data.len())
-                    .unwrap_or(0);
-
-                if current_len as u64 > size {
-                    warn!(
-                        "release inline: inode={} buffer grew during sync (synced={}, current={}), re-syncing (round {})",
-                        inode, size, current_len, sync_round
-                    );
-                    continue; // Re-sync with the updated buffer
-                }
-
-                // Buffer unchanged — mark as not dirty and remove.
-                // Use get_mut to atomically clear dirty and check size again.
-                let can_remove = {
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        if inline_buf.data.len() as u64 > size {
-                            // Buffer grew between the check above and here
-                            false
-                        } else {
-                            inline_buf.dirty = false;
-                            true
-                        }
-                    } else {
-                        false // Buffer removed by someone else
-                    }
-                };
-
-                if !can_remove {
-                    warn!(
-                        "release inline: inode={} buffer grew between check and remove, re-syncing (round {})",
-                        inode, sync_round
-                    );
-                    continue;
-                }
-
-                break;
-            }
-
-            // Remove the inline buffer ONLY if this is the last open handle.
-            // If other handles are still open (open_count > 0), keeping the
-            // buffer allows subsequent writes on those handles to append to
-            // the inline data. Removing it prematurely causes the next write
-            // to fall through to the Stripe/Flat path, which returns EFBIG
-            // for inline files (no fid, no chunks → max_stripe_offset=0).
-            // L4.21 failure: concurrent `>>` appends from bash for-loops
-            // overlap (FUSE RELEASE is async), so the second OPEN arrives
-            // before the first RELEASE completes. The second write then
-            // finds no inline buffer and hits the Stripe path's EFBIG.
+            };
+            // Determine if inline buffer can be removed after this release:
+            // - NEVER remove if dirty is still true (sync failed or pending writeback)
+            // - NEVER remove if synced=false AND buffer.data.len() > 0 (weird state, keep safe)
+            // - WRITEBACK_CACHE: even if synced=false (dirty=false, nothing to sync),
+            //   keep the buffer IN MEMORY (not removed) because kernel may later emit
+            //   FUSE_WRITE from writeback cache. Without the buffer, writeback would
+            //   fall through to the Stripe/Flat path and lose data / hit EFBIG.
+            //   The buffer is later removed either by the next write (which syncs
+            //   and then explicitly cleans up) or by the migration / unpin path.
+            let buf_state = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| (b.dirty, b.data.len()));
+            let (buf_dirty, buf_len) = buf_state.unwrap_or((false, 0));
+            let is_writeback_empty_write = !buf_dirty && buf_len == 0;
+            // Capture final size for the close completion log line:
+            let final_size = buf_len as u64;
 
             // open_count_dec (best-effort, 同 Flat 路径)
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
@@ -5723,23 +5793,77 @@ impl FileSystem for PowerFsFs {
                 self.cache.unpin_inode(inode)
             };
 
-            // Only remove the inline buffer if this was the last open handle
-            // (released=true). If other handles are still open (released=false),
-            // keep the buffer so concurrent writes can continue appending.
-            if released {
-                self.inline_buffers.remove(&inode);
-                self.inline_max_sizes.remove(&inode);
-                // L4.21 fix: Invalidate the kernel page cache after the last
-                // handle is closed. During concurrent appends, Invalidates from
-                // other clients were skipped (inode was Dirty). After release,
-                // the kernel page cache still holds this client's own write
-                // data, which is stale — it doesn't include other clients'
-                // concurrent appends that were synced to the Filer. Without
-                // this notification, subsequent reads (e.g., wc -l) return
-                // stale line counts from the page cache.
-                self.notify_kernel_inval_inode(inode);
-                // Mark cache entry as Stale so the next open/getattr
-                // refreshes metadata (size) from the Filer.
+            // Only remove the inline buffer if ALL of:
+            //   (a) this was the LAST open handle (released = true),
+            //   (b) buffer is NOT dirty,
+            //   (c) we ACTUALLY synced something (sync_helper did work so data
+            //       is on Filer) OR buffer is completely empty (pure create /
+            //       touch with no data ever written — no future writeback).
+            //
+            // WRITEBACK_CACHE FIX (L17 in hypotheses): Keep the buffer even if
+            // dirty=false and we synced nothing! This happens when the kernel
+            // delays FUSE_WRITE until after the FUSE_RELEASE callback. The
+            // writeback kernel thread will later call FUSE_WRITE with the
+            // page-cache dirty pages. If we remove the buffer now, that
+            // FUSE_WRITE falls through to the Stripe/Flat path, which errors
+            // out — data lost. Preserving the DashMap entry allows the late
+            // FUSE_WRITE's "is_pinned==false → sync immediately" branch to
+            // catch up and persist the data.
+            //
+            // Leak-safety: the buffer is guaranteed to be removed later by one of:
+            //   (1) Inline write-end → sync_inline_buffer succeeds → remove.
+            //   (2) Migration path (inline → Flat) → L4901 removes inline_buffers.
+            //   (3) Unpin cache eviction / inode forget → removes via helper.
+            //   (4) File opened by another process → fresh buffer fetched;
+            //       stale buf replaced by L3341 insert fresh (dirty=false).
+            if released && !buf_dirty {
+                // Safe to remove — writeback won't produce data for an empty
+                // buffer (the kernel has NO dirty pages for an empty file) and
+                // a successfully-synced buffer (dirty=false) has all data on Filer.
+                let safe_remove = is_writeback_empty_write || sync_ok;
+                if safe_remove {
+                    self.inline_buffers.remove(&inode);
+                    self.inline_max_sizes.remove(&inode);
+                    debug!(
+                        "release inline: inode={} removed inline buffer (empty={}, synced_ok={})",
+                        inode, is_writeback_empty_write, sync_ok
+                    );
+                } else {
+                    debug!(
+                        "release inline: inode={} keeping buffer (released but not-yet-written writeback expected) dirty={}",
+                        inode, buf_dirty
+                    );
+                }
+                // L4.21 fix: Mark cache entry Stale after the last handle is
+                // released so the next open(getattr) refreshes from the Filer
+                // (prevents TTL-stale content_size blocking append writes).
+                //
+                // DEADLOCK SAFETY: do NOT call notify_kernel_inval_inode from
+                // the release() callback. release() runs on the FUSE worker
+                // thread (which reads requests from /dev/fuse). NOTIFY writes
+                // from this thread block because kernel needs the worker to
+                // drain incoming requests before processing the out-of-band
+                // notify. Result: kernel waits for RELEASE response → we wait
+                // for NOTIFY write → deadlock → entire fuse mount hangs forever.
+                //
+                // Safe alternative: mark_stale only (in-process cache bypass).
+                // Next open() re-fetches metadata from the Filer via RPC, which
+                // is independent of kernel page cache. Since no process has an
+                // open fd at this point, page-cache contents are never used
+                // before the next open anyway (a new struct file forces a
+                // fresh lookup that fills pages from our read callback).
+                self.cache.mark_stale(inode);
+            } else if released {
+                // released=true but dirty=true (sync failed). Do NOT remove;
+                // future retry or write-end can try again. Cache still needs
+                // refreshing so getattr/re-read doesn't trust stale local
+                // content_size. Same deadlock rule as above: do NOT notify
+                // the kernel from within the release callback — mark_stale()
+                // is sufficient.
+                debug!(
+                    "release inline: inode={} dirty=true after sync failed, retaining buffer for retry",
+                    inode
+                );
                 self.cache.mark_stale(inode);
             } else {
                 debug!(
