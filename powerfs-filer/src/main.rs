@@ -420,6 +420,28 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             warn!("startup lease recovery failed (non-fatal): {}", e);
         }
 
+        // P7 可观测性: start the Prometheus metrics server for the inode
+        // lease manager. Exposes `/metrics` (Prometheus text format) +
+        // `/admin/lease-stats` (JSON) so operators can monitor active
+        // leases, acquire/conflict counts, the Fencer SN high-water
+        // (phase 4 §5.3), and Early Grant waiter backpressure (phase 4
+        // §5.2). Port is `filer_cfg.metrics_port`, defaulting to
+        // `grpc_port + 1` so existing configs need no change.
+        {
+            let metrics_port = filer_cfg.metrics_port.unwrap_or(grpc_port + 1);
+            let metrics_addr: std::net::SocketAddr =
+                format!("{}:{}", bind_ip, metrics_port).parse()?;
+            let lease_mgr = net_handler.inode_lease_mgr.clone();
+            if let Err(e) =
+                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr).await
+            {
+                warn!(
+                    "filer lease metrics server failed to start (non-fatal): {}",
+                    e
+                );
+            }
+        }
+
         // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).
         // 启用后 handle_create 对新文件返回 Placement::Inline, 数据直接存 Filer
         // 元数据 (Raft 复制), 绕过 Volume Server. 适合 IO500 mdtest 微小文件场景.

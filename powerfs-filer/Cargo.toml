@@ -63,6 +63,8 @@ clap = { workspace = true }
 env_logger = { workspace = true }
 sysinfo = "0.30"
 crc32fast = "1.4"
+prometheus = "0.13"
+lazy_static = "1.4"
 
 [build-dependencies]
 tonic-build = "0.11"
