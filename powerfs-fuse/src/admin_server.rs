@@ -75,7 +75,8 @@ impl AdminServer {
                         let lock_metrics = lock_metrics.clone();
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_connection(&mut stream, &stats, lock_metrics.as_deref()).await
+                                handle_connection(&mut stream, &stats, lock_metrics.as_deref())
+                                    .await
                             {
                                 warn!("Admin connection from {} error: {}", peer, e);
                             }
@@ -119,29 +120,26 @@ async fn handle_connection(
                 ),
             }
         }
-        "/lock-metrics" => {
-            match lock_metrics {
-                Some(mgr) => {
-                    let snap = mgr.metrics().snapshot();
-                    match serde_json::to_string(&snap) {
-                        Ok(json) => ("200 OK", json),
-                        Err(e) => (
-                            "500 Internal Server Error",
-                            format!("{{\"error\":\"{}\"}}", e),
-                        ),
-                    }
+        "/lock-metrics" => match lock_metrics {
+            Some(mgr) => {
+                let snap = mgr.metrics().snapshot();
+                match serde_json::to_string(&snap) {
+                    Ok(json) => ("200 OK", json),
+                    Err(e) => (
+                        "500 Internal Server Error",
+                        format!("{{\"error\":\"{}\"}}", e),
+                    ),
                 }
-                None => (
-                    "503 Service Unavailable",
-                    r#"{"error":"lock_metrics not configured"}"#.to_string(),
-                ),
             }
-        }
+            None => (
+                "503 Service Unavailable",
+                r#"{"error":"lock_metrics not configured"}"#.to_string(),
+            ),
+        },
         "/health" => ("200 OK", r#"{"status":"ok"}"#.to_string()),
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","endpoints":["/stats","/lock-metrics","/health"]}"#
-                .to_string(),
+            r#"{"error":"not found","endpoints":["/stats","/lock-metrics","/health"]}"#.to_string(),
         ),
     };
 
