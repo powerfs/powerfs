@@ -543,13 +543,18 @@ struct PowerFsFs {
 }
 
 /// Cursor for last_name-based readdir pagination.
-/// `next_offset` is the FUSE offset value that the kernel will pass to the
-/// next readdir() call (it equals the offset assigned to the last returned
-/// DirEntry). When the kernel calls readdir(offset == next_offset), we hand
-/// the Filer `last_name` so it skips already-returned entries.
+///
+/// HISTORICAL NOTE: A previous version stored `next_offset` here and only
+/// reused `last_name` when the kernel passed offset==next_offset exactly.
+/// That broke whenever the kernel bumped offset by more than 1 (which is
+/// permitted after an `add_entry` returned buffer-full) or when FUSE
+/// restarted with a different offset base. The current implementation
+/// uses relaxed matching: any offset>0 paired with a valid cursor reuses
+/// the `last_name` to resume pagination from the Filer, which is correct
+/// because entries are ordered by name and `last_name` is always the
+/// lexicographically-greatest name returned so far.
 #[derive(Clone)]
 struct ReaddirCursor {
-    next_offset: u64,
     last_name: String,
 }
 
@@ -4489,13 +4494,10 @@ impl FileSystem for PowerFsFs {
                                 std::thread::current().id()
                             );
                             drop(bp_guard);
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!(
+                            return Err(std::io::Error::other(format!(
                                     "write backpressure: cache {} exceeds target {} after {} flushes (data integrity requires flusher progress)",
                                     current, target, BACKPRESSURE_MAX_ITERS
-                                )
-                            ));
+                                )));
                         }
                         if iter == 1 {
                             log::warn!(
@@ -6066,7 +6068,6 @@ impl FileSystem for PowerFsFs {
             self.readdir_cursors.insert(
                 inode,
                 ReaddirCursor {
-                    next_offset: idx,
                     last_name: last.name.clone(),
                 },
             );
