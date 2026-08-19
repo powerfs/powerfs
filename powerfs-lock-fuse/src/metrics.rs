@@ -15,6 +15,10 @@
 //! | `errors_total`           | total errors (conflict + network + ...)|
 //! | `sweep_removed_total`   | total entries removed by `sweep_expired`|
 //! | `sweep_skipped_total`   | cache-hit acquires that skipped sweep (phase 4 P1 lazy sweep)|
+//! | `lockify_self_declare_total`   | local self-declarations issued (phase 4 §5.1 Lockify)|
+//! | `lockify_sync_ok_total`        | async sync RPCs that succeeded (CAS-merged server token)|
+//! | `lockify_sync_conflict_total`  | async sync RPCs that hit a server-side conflict (local entry invalidated)|
+//! | `lockify_sync_err_total`       | async sync RPCs that failed for non-conflict reasons (local token remains valid until TTL)|
 //!
 //! The counters are `AtomicU64` so they can be read from any thread
 //! without locking. A future Prometheus exporter can scrape them via
@@ -43,6 +47,27 @@ pub struct LockMetrics {
     /// sweep was within the lazy-sweep threshold (phase 4 P1). Lets
     /// operators verify the optimization is engaging in production.
     pub sweep_skipped_total: AtomicU64,
+    /// Phase-4 §5.1 Lockify: total local self-declarations issued
+    /// (one per `acquire_local` call).
+    pub lockify_self_declare_total: AtomicU64,
+    /// Phase-4 §5.1 Lockify: async sync RPCs that returned Ok. The
+    /// local token was CAS-replaced by the server-issued token.
+    pub lockify_sync_ok_total: AtomicU64,
+    /// Phase-4 §5.1 Lockify: async sync RPCs that hit a server-side
+    /// conflict (another client already owns the inode). The local
+    /// entry is invalidated so subsequent operations re-acquire via
+    /// the regular RPC path.
+    pub lockify_sync_conflict_total: AtomicU64,
+    /// Phase-4 §5.1 Lockify: async sync RPCs that failed for non-
+    /// conflict reasons (network, server error). The local token
+    /// remains valid until TTL — graceful degradation.
+    pub lockify_sync_err_total: AtomicU64,
+    /// Phase-4 §5.1 Lockify: monotonic nonce used to make each
+    /// `local-...` token unique even if the same inode is self-declared
+    /// twice (e.g. across client restarts within the same TTL window).
+    /// `Relaxed` is sufficient — uniqueness only needs to hold per
+    /// client lifetime, and `fetch_add` guarantees monotonic increment.
+    lockify_nonce: AtomicU64,
 }
 
 /// A consistent point-in-time snapshot of all counters.
@@ -63,6 +88,10 @@ pub struct LockMetricsSnapshot {
     pub errors_total: u64,
     pub sweep_removed_total: u64,
     pub sweep_skipped_total: u64,
+    pub lockify_self_declare_total: u64,
+    pub lockify_sync_ok_total: u64,
+    pub lockify_sync_conflict_total: u64,
+    pub lockify_sync_err_total: u64,
 }
 
 impl LockMetrics {
@@ -121,6 +150,44 @@ impl LockMetrics {
         self.sweep_skipped_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    // ---------- Lockify (phase 4 §5.1) ----------
+
+    /// Record a local self-declaration. Called once per
+    /// `FuseLockManager::acquire_local`. Also allocates the next
+    /// monotonic nonce used to make the local token unique; callers
+    /// must read it back via [`Self::next_lockify_nonce`].
+    pub fn record_lockify_self_declare(&self) {
+        self.lockify_self_declare_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an async sync RPC that returned Ok.
+    pub fn record_lockify_sync_ok(&self) {
+        self.lockify_sync_ok_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an async sync RPC that hit a server-side conflict. The
+    /// local entry is invalidated.
+    pub fn record_lockify_sync_conflict(&self) {
+        self.lockify_sync_conflict_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an async sync RPC that failed for non-conflict reasons
+    /// (network, server error). The local token remains valid until
+    /// TTL — graceful degradation.
+    pub fn record_lockify_sync_err(&self) {
+        self.lockify_sync_err_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Allocate the next monotonic Lockify nonce. The returned value
+    /// is strictly greater than any previously returned nonce on this
+    /// `LockMetrics` instance, so the local token
+    /// `local-{client}-{inode}-{nonce}` is unique across calls.
+    pub fn next_lockify_nonce(&self) -> u64 {
+        self.lockify_nonce.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// Read a consistent-ish snapshot of all counters.
     pub fn snapshot(&self) -> LockMetricsSnapshot {
         LockMetricsSnapshot {
@@ -133,6 +200,10 @@ impl LockMetrics {
             errors_total: self.errors_total.load(Ordering::Relaxed),
             sweep_removed_total: self.sweep_removed_total.load(Ordering::Relaxed),
             sweep_skipped_total: self.sweep_skipped_total.load(Ordering::Relaxed),
+            lockify_self_declare_total: self.lockify_self_declare_total.load(Ordering::Relaxed),
+            lockify_sync_ok_total: self.lockify_sync_ok_total.load(Ordering::Relaxed),
+            lockify_sync_conflict_total: self.lockify_sync_conflict_total.load(Ordering::Relaxed),
+            lockify_sync_err_total: self.lockify_sync_err_total.load(Ordering::Relaxed),
         }
     }
 }

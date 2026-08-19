@@ -109,6 +109,37 @@ impl ClientLeaseState {
         false
     }
 
+    /// Compare-and-swap: replace the cached inode lease **only if the
+    /// existing entry's token matches `old_token`**. Used by the
+    /// Lockify async sync completion (phase 4 §5.1) to merge the
+    /// server-issued token back into the cache without clobbering a
+    /// concurrent acquire/release.
+    ///
+    /// Returns `true` if replaced. Returns `false` if:
+    /// - the cache has no entry for `inode` (already released), or
+    /// - the cached token differs from `old_token` (re-acquired by
+    ///   another path, e.g. a regular `acquire` after invalidation).
+    ///
+    /// In both `false` cases the cache is left untouched — the caller
+    /// should treat the server-issued token as orphaned (no client is
+    /// tracking it; the server will eventually reclaim it via TTL or
+    /// the next `release` RPC).
+    pub fn replace_inode_by_token(
+        &self,
+        inode: u64,
+        old_token: &str,
+        new_entry: InodeLeaseEntry,
+    ) -> bool {
+        let mut leases = self.inode_leases.lock().unwrap();
+        if let Some(existing) = leases.get(&inode) {
+            if existing.token == old_token {
+                leases.insert(inode, new_entry);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Invalidate (drop) the cached inode lease without notifying the
     /// server. Used when the server pushes an invalidate notification.
     pub fn invalidate_inode(&self, inode: u64) {
@@ -311,6 +342,58 @@ mod tests {
             state.get_inode(inode).is_none(),
             "expired entry should not be returned"
         );
+    }
+
+    #[test]
+    fn test_replace_inode_by_token_cas() {
+        // Phase 4 §5.1 Lockify async sync CAS — see `lockify.rs`.
+        let state = ClientLeaseState::new();
+        let inode = 55u64;
+
+        // No entry → CAS must fail (no clobber).
+        assert!(!state.replace_inode_by_token(
+            inode,
+            "missing",
+            InodeLeaseEntry {
+                token: "new".to_string(),
+                expire_at: Instant::now() + Duration::from_secs(30),
+                mode: LockMode::Exclusive,
+            },
+        ));
+
+        // Seed with a "local" token (Lockify fast path).
+        state.put_inode(
+            inode,
+            InodeLeaseEntry {
+                token: "local-1".to_string(),
+                expire_at: Instant::now() + Duration::from_secs(30),
+                mode: LockMode::Exclusive,
+            },
+        );
+
+        // Wrong old_token → CAS must fail; cache unchanged.
+        assert!(!state.replace_inode_by_token(
+            inode,
+            "wrong",
+            InodeLeaseEntry {
+                token: "server-1".to_string(),
+                expire_at: Instant::now() + Duration::from_secs(30),
+                mode: LockMode::Exclusive,
+            },
+        ));
+        assert_eq!(state.get_inode(inode).unwrap().token, "local-1");
+
+        // Correct old_token → CAS succeeds; cache now has the server token.
+        assert!(state.replace_inode_by_token(
+            inode,
+            "local-1",
+            InodeLeaseEntry {
+                token: "server-1".to_string(),
+                expire_at: Instant::now() + Duration::from_secs(60),
+                mode: LockMode::Exclusive,
+            },
+        ));
+        assert_eq!(state.get_inode(inode).unwrap().token, "server-1");
     }
 
     #[test]

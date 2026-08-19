@@ -41,6 +41,7 @@
 //! conflict rate, and error rate.
 
 use crate::backend::FuseLockBackend;
+use crate::lockify::Lockify;
 use crate::metrics::LockMetrics;
 use crate::state::{ClientLeaseState, InodeLeaseEntry, RangeLeaseEntry};
 use async_trait::async_trait;
@@ -67,6 +68,10 @@ pub const DEFAULT_SWEEP_THRESHOLD: Duration = Duration::from_millis(100);
 ///   by the lazy-sweep fast path (phase 4 P1).
 /// - `sweep_threshold: Duration` — cache hits within this window since
 ///   `last_sweep` skip `sweep_expired`.
+/// - `lockify: Option<Arc<Lockify>>` — phase 4 §5.1 fast path for
+///   metadata creation (creat/mkdir/mknod). `None` disables Lockify;
+///   callers fall back to the regular `acquire` RPC path. Set via
+///   [`Self::with_lockify`].
 pub struct FuseLockManager {
     state: Arc<ClientLeaseState>,
     backend: Arc<dyn FuseLockBackend>,
@@ -82,6 +87,9 @@ pub struct FuseLockManager {
     /// Cache-hit acquires within this window since `last_sweep` skip
     /// `sweep_expired`. See `DEFAULT_SWEEP_THRESHOLD`.
     sweep_threshold: Duration,
+    /// Phase-4 §5.1 Lockify fast path. `None` by default — callers
+    /// must opt in via [`Self::with_lockify`].
+    lockify: Option<Arc<Lockify>>,
 }
 
 impl FuseLockManager {
@@ -106,6 +114,7 @@ impl FuseLockManager {
             handler: Mutex::new(None),
             last_sweep: Mutex::new(Instant::now()),
             sweep_threshold: DEFAULT_SWEEP_THRESHOLD,
+            lockify: None,
         }
     }
 
@@ -127,6 +136,7 @@ impl FuseLockManager {
             handler: Mutex::new(None),
             last_sweep: Mutex::new(Instant::now()),
             sweep_threshold: DEFAULT_SWEEP_THRESHOLD,
+            lockify: None,
         }
     }
 
@@ -137,6 +147,33 @@ impl FuseLockManager {
     #[must_use]
     pub fn with_sweep_threshold(mut self, threshold: Duration) -> Self {
         self.sweep_threshold = threshold;
+        self
+    }
+
+    /// Enable the phase-4 §5.1 Lockify fast path. After this call,
+    /// [`Self::acquire_local`] is available and will return a local
+    /// token without an RPC, spawning an async ownership sync in the
+    /// background.
+    ///
+    /// The `Lockify` helper is constructed from the manager's own
+    /// `state`/`backend`/`metrics`/`client_id`, so self-declared
+    /// leases share the same cache and metrics as regular acquires.
+    /// Pass an optional `tokio::runtime::Handle` to spawn the async
+    /// sync task on a runtime even when the calling thread has none
+    /// (e.g. when the FUSE driver calls `acquire_local` from a
+    /// synchronous context).
+    #[must_use]
+    pub fn with_lockify(mut self, runtime: Option<tokio::runtime::Handle>) -> Self {
+        let mut lockify = Lockify::new(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.client_id),
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.state),
+        );
+        if let Some(handle) = runtime {
+            lockify = lockify.with_runtime(handle);
+        }
+        self.lockify = Some(Arc::new(lockify));
         self
     }
 
@@ -152,6 +189,43 @@ impl FuseLockManager {
 
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// Borrow the optional [`Lockify`] helper, if enabled via
+    /// [`Self::with_lockify`]. `None` means the manager was not
+    /// configured for the §5.1 metadata fast path; callers should
+    /// fall back to [`LockManager::acquire`].
+    pub fn lockify(&self) -> Option<&Arc<Lockify>> {
+        self.lockify.as_ref()
+    }
+
+    /// Phase-4 §5.1 Lockify fast path: self-declare ownership of a
+    /// fresh inode without an RPC.
+    ///
+    /// Convenience wrapper around [`Lockify::self_declare`] — the
+    /// caller doesn't need to hold the `Lockify` Arc directly. The
+    /// manager must have been built with [`Self::with_lockify`] first.
+    ///
+    /// # Errors
+    ///
+    /// - [`LockError::Internal`] if `duration_ms == 0` or if Lockify
+    ///   was never enabled (caller bug — call [`Self::with_lockify`]
+    ///   during construction).
+    ///
+    /// Backend errors are surfaced asynchronously via metrics and
+    /// never synchronously on this call.
+    pub fn acquire_local(
+        &self,
+        inode: u64,
+        mode: LockMode,
+        duration_ms: u64,
+    ) -> Result<LockGrant, LockError> {
+        let Some(lockify) = &self.lockify else {
+            return Err(LockError::Internal(
+                "acquire_local called without with_lockify".to_string(),
+            ));
+        };
+        lockify.self_declare(inode, mode, duration_ms)
     }
 
     /// Resolve the effective lease duration for a request.
@@ -1120,5 +1194,149 @@ mod tests {
         let guard = mgr.handler.lock().unwrap();
         let upgraded = guard.as_ref().and_then(|w| w.upgrade());
         assert!(upgraded.is_none(), "Weak must not prevent handler drop");
+    }
+
+    // ---------- Lockify fast path (phase 4 §5.1) ----------
+
+    /// Build a manager with Lockify enabled, sharing the test's mock
+    /// backend so `acquire_local` async-syncs to the same backend
+    /// the regular `acquire` uses. Uses `with_lockify(None)` so the
+    /// spawned sync tasks run on the `#[tokio::test]` runtime.
+    fn make_manager_with_lockify(backend: Arc<MockBackend>) -> (FuseLockManager, Arc<MockBackend>) {
+        let mgr = FuseLockManager::new(
+            Arc::clone(&backend) as Arc<dyn FuseLockBackend>,
+            "client-A".to_string(),
+            30_000,
+        )
+        .with_lockify(None);
+        (mgr, backend)
+    }
+
+    #[tokio::test]
+    async fn test_acquire_local_returns_local_token_no_rpc() {
+        let (mgr, backend) = make_manager_with_lockify(Arc::new(MockBackend::new()));
+        let grant = mgr
+            .acquire_local(42, LockMode::Exclusive, 30_000)
+            .expect("acquire_local must succeed");
+
+        // Token has the local prefix.
+        assert!(grant.token.starts_with(crate::lockify::LOCAL_TOKEN_PREFIX));
+        assert_eq!(grant.inode, 42);
+        assert_eq!(grant.lease_ms, 30_000);
+        assert_eq!(grant.sn, 0);
+        assert!(grant.range.is_none());
+
+        // Synchronous path: cache hit, zero RPC.
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            0,
+            "no synchronous RPC on fast path"
+        );
+        let cached = mgr.state().get_inode(42).expect("must be cached");
+        assert_eq!(cached.token, grant.token);
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(snap.lockify_self_declare_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_local_without_with_lockify_errors() {
+        let (mgr, _backend) = make_manager();
+        let err = mgr
+            .acquire_local(1, LockMode::Exclusive, 30_000)
+            .expect_err("must require with_lockify");
+        assert!(matches!(err, LockError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_local_async_sync_cas_replaces_token() {
+        // The mock returns "tok-inode" for `acquire_inode_lease`. The
+        // async sync should CAS-replace the local token with that.
+        let (mgr, backend) = make_manager_with_lockify(Arc::new(MockBackend::new()));
+        let grant = mgr
+            .acquire_local(7, LockMode::Exclusive, 30_000)
+            .expect("acquire_local");
+
+        // Wait for the spawned sync to call the backend.
+        for _ in 0..100 {
+            if backend.acquire_inode_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Wait for the CAS to swap the cached token.
+        for _ in 0..100 {
+            if mgr
+                .state()
+                .get_inode(7)
+                .map(|e| e.token == "tok-inode")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let cached = mgr.state().get_inode(7).expect("must still be cached");
+        assert_eq!(
+            cached.token, "tok-inode",
+            "local token must be CAS-replaced by server token"
+        );
+
+        let snap = mgr.metrics().snapshot();
+        assert_eq!(snap.lockify_sync_ok_total, 1);
+
+        // The original local token (from grant) is now orphaned —
+        // releasing via the trait should hit the new cached token.
+        // (We don't release here — the assertion is just that the
+        // cache now holds the server token, not the local one.)
+        let _ = grant;
+    }
+
+    #[tokio::test]
+    async fn test_acquire_local_then_acquire_uses_cached_token() {
+        // The Lockify fast path populates the cache; a subsequent
+        // `LockManager::acquire` for the same inode must hit the
+        // cache and skip the RPC.
+        let (mgr, backend) = make_manager_with_lockify(Arc::new(MockBackend::new()));
+        let _local_grant = mgr
+            .acquire_local(11, LockMode::Exclusive, 30_000)
+            .expect("acquire_local");
+
+        // Wait briefly to allow the spawned sync to settle (it
+        // replaces the local token with the server "tok-inode").
+        for _ in 0..200 {
+            if backend.acquire_inode_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for _ in 0..200 {
+            if mgr
+                .state()
+                .get_inode(11)
+                .map(|e| e.token == "tok-inode")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let calls_before = backend.acquire_inode_calls.load(Ordering::SeqCst);
+
+        // Now a regular `acquire` — must hit the cache (the
+        // CAS-merged server token is still valid).
+        let req = LockRequest::new(11, LockMode::Exclusive, Duration::from_secs(30));
+        let grant = mgr.acquire(req).await.expect("acquire must succeed");
+        assert_eq!(grant.token, "tok-inode", "must reuse cached server token");
+        assert_eq!(
+            backend.acquire_inode_calls.load(Ordering::SeqCst),
+            calls_before,
+            "regular acquire after Lockify CAS must hit cache"
+        );
+
+        let snap = mgr.metrics().snapshot();
+        assert!(snap.acquire_cache_hit >= 1);
     }
 }
